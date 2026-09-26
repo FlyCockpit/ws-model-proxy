@@ -22,8 +22,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 const {
   authenticateModelApiTokenSecret,
   effectiveProviderEgress,
-  listVisibleModelTargetsForToken,
-  providerPrimaryMemberCount,
+  listVisibleModelTargetsWithExternalPermissionForToken,
   resolveAllowlistedModelTargets,
 } = await import("./model-api-token-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -74,8 +73,8 @@ function modelPoolRow({
     maxAttachmentBytes: null,
     optimisticBasicTranscription: false,
     protocolAdaptationEnabled: false,
-    publicEgressEnabled: false,
-    publicEgressAcknowledged: false,
+    fallbackEnabled: false,
+    fallbackForGrantees: false,
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
     User: { slug: userSlug },
@@ -114,29 +113,23 @@ function directModelRow({
 }
 
 describe("effectiveProviderEgress", () => {
-  it("requires acknowledgement for public overflow or a primary provider member only", () => {
-    expect(
-      effectiveProviderEgress({ publicEgressEnabled: true, providerPrimaryMemberCount: 0 }),
-    ).toBe(true);
-    expect(
-      effectiveProviderEgress({ publicEgressEnabled: false, providerPrimaryMemberCount: 1 }),
-    ).toBe(true);
-    expect(
-      effectiveProviderEgress({ publicEgressEnabled: false, providerPrimaryMemberCount: 0 }),
-    ).toBe(false);
-  });
-
-  it("counts primary provider targets and ignores overflow-only or local members", () => {
-    expect(
-      providerPrimaryMemberCount([
-        { tier: "PRIMARY", ExecutionTarget: { providerModelId: "provider-model" } },
-        { tier: "PRIMARY", ExecutionTarget: { providerModelId: null } },
-        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: "overflow-model" } },
-        { tier: "PRIMARY", ExecutionTarget: null },
-      ]),
-    ).toBe(1);
+  it("is true only when fallback is on and an external member is configured", () => {
+    expect(effectiveProviderEgress({ fallbackEnabled: true, externalMemberCount: 1 })).toBe(true);
+    expect(effectiveProviderEgress({ fallbackEnabled: true, externalMemberCount: 0 })).toBe(false);
+    expect(effectiveProviderEgress({ fallbackEnabled: false, externalMemberCount: 3 })).toBe(false);
   });
 });
+
+/** Visible targets for a private-only token (the targets do not depend on consent). */
+async function listVisibleModelTargetsForToken(token: {
+  id: string;
+  userId: string;
+  scopeMode: "ALL_VISIBLE" | "ALLOWLIST";
+}) {
+  return (
+    await listVisibleModelTargetsWithExternalPermissionForToken({ ...token, allowExternal: false })
+  ).targets;
+}
 
 describe("modelApiTokenAccess", () => {
   beforeEach(() => {
@@ -167,6 +160,7 @@ describe("modelApiTokenAccess", () => {
         id: "token-id",
         userId: "user-id",
         scopeMode: "ALL_VISIBLE",
+        allowExternal: false,
         lookupPrefix,
         expiresAt: null,
         lastUsedAt: now,
@@ -178,6 +172,8 @@ describe("modelApiTokenAccess", () => {
         id: "token-id",
         userId: "user-id",
         scopeMode: "ALL_VISIBLE",
+        // Private only unless a person allows external providers.
+        allowExternal: false,
         lookupPrefix,
         expiresAt: null,
         lastUsedAt: now,
@@ -190,6 +186,7 @@ describe("modelApiTokenAccess", () => {
           id: true,
           userId: true,
           scopeMode: true,
+          allowExternal: true,
           lookupPrefix: true,
           expiresAt: true,
           lastUsedAt: true,
@@ -249,9 +246,8 @@ describe("modelApiTokenAccess", () => {
           name: "Owned",
         }),
         recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
-        PoolMembers: [{ id: "provider-primary-member", tier: "PRIMARY" }],
+        fallbackEnabled: true,
+        PoolMembers: [{ id: "external-member", tier: "PUBLIC_OVERFLOW" }],
       };
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
@@ -265,26 +261,18 @@ describe("modelApiTokenAccess", () => {
 
       expect(result.modelPools[0]?.recommendedSurfaceOverride).toBeNull();
       expect(result.modelPools[0]).toMatchObject({
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
+        fallbackForGrantees: false,
+        externalMemberCount: 1,
         effectiveProviderEgress: true,
-        providerPrimaryMemberCount: 1,
       });
       expect(db.modelPool.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           select: expect.objectContaining({
             PoolMembers: {
               where: {
-                OR: [
-                  {
-                    tier: "PRIMARY",
-                    ExecutionTarget: { providerModelId: { not: null } },
-                  },
-                  {
-                    tier: "PUBLIC_OVERFLOW",
-                    ExecutionTarget: { providerModelId: { not: null } },
-                  },
-                ],
+                tier: "PUBLIC_OVERFLOW",
+                ExecutionTarget: { providerModelId: { not: null } },
               },
               select: {
                 id: true,
@@ -302,6 +290,59 @@ describe("modelApiTokenAccess", () => {
         }),
       );
       expect(JSON.stringify(db.modelPool.findMany.mock.calls)).not.toContain("isNot");
+    });
+
+    it("derives the token's external consent: ALL_VISIBLE all-or-nothing, ALLOWLIST per pool", async () => {
+      const first = modelPoolRow({
+        id: "first-pool",
+        userId: "user-id",
+        userSlug: "owner",
+        slug: "first",
+        name: "First",
+      });
+      const second = modelPoolRow({
+        id: "second-pool",
+        userId: "user-id",
+        userSlug: "owner",
+        slug: "second",
+        name: "Second",
+      });
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([first, second]);
+      db.poolGrant.findMany.mockResolvedValue([]);
+      db.modelApiTokenAllowlistEntry.findMany.mockResolvedValue([
+        {
+          target: "MODEL_POOL",
+          discoveredModelId: null,
+          modelPoolId: "first-pool",
+          includeExternal: true,
+        },
+        {
+          target: "MODEL_POOL",
+          discoveredModelId: null,
+          modelPoolId: "second-pool",
+          includeExternal: false,
+        },
+      ]);
+      const permission = async (scopeMode: "ALL_VISIBLE" | "ALLOWLIST", allowExternal: boolean) =>
+        [
+          ...(
+            await listVisibleModelTargetsWithExternalPermissionForToken({
+              id: "token-id",
+              userId: "user-id",
+              scopeMode,
+              allowExternal,
+            })
+          ).externalPoolIds,
+        ].sort();
+
+      // Private only by default, whatever the scope.
+      expect(await permission("ALL_VISIBLE", false)).toEqual([]);
+      expect(await permission("ALLOWLIST", false)).toEqual([]);
+      // ALL_VISIBLE is all-or-nothing.
+      expect(await permission("ALL_VISIBLE", true)).toEqual(["first-pool", "second-pool"]);
+      // ALLOWLIST also needs the pool entry's includeExternal.
+      expect(await permission("ALLOWLIST", true)).toEqual(["first-pool"]);
     });
 
     it("resolves ALL_VISIBLE pools from current grants on every call", async () => {
@@ -534,6 +575,28 @@ describe("modelApiTokenAccess", () => {
       ).rejects.toSatisfy((error: ORPCError) => {
         expect(error).toBeInstanceOf(ORPCError);
         expect(error.code).toBe("FORBIDDEN");
+        return true;
+      });
+    });
+
+    it("asks for the plain pool name instead of allowlisting an :external variant", async () => {
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([
+        modelPoolRow({
+          id: "owned-pool-id",
+          userId: "user-id",
+          userSlug: "owner",
+          slug: "owned",
+          name: "Owned",
+        }),
+      ]);
+      db.poolGrant.findMany.mockResolvedValue([]);
+
+      await expect(
+        resolveAllowlistedModelTargets({ userId: "user-id", modelIds: ["owner/owned:external"] }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("BAD_REQUEST");
+        expect(error.message).toContain("plain name");
         return true;
       });
     });

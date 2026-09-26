@@ -329,11 +329,13 @@ integration("PostgreSQL capacity admission primitives", () => {
             inferenceCapacityId: capacity.id,
           },
         });
+        // Provider targets are external fallback members (PRIMARY is local-only).
         const member = await writer.poolMember.create({
           data: {
             poolId: pool.id,
             executionTargetId: target.id,
-            tier: "PRIMARY",
+            tier: "PUBLIC_OVERFLOW",
+            publicOrder: index,
             capacityConcurrencyMode: "INHERIT",
           },
         });
@@ -486,11 +488,13 @@ integration("PostgreSQL capacity admission primitives", () => {
           inferenceCapacityId: capacity.id,
         },
       });
+      // Provider targets are external fallback members (PRIMARY is local-only).
       const member = await writer.poolMember.create({
         data: {
           poolId: pool.id,
           executionTargetId: target.id,
-          tier: "PRIMARY",
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
           capacityConcurrencyMode: "INHERIT",
         },
       });
@@ -793,6 +797,93 @@ integration("PostgreSQL capacity admission primitives", () => {
     } finally {
       await cleanupCapacityFixture(first, user.id);
       await Promise.all([first.$disconnect(), second.$disconnect()]);
+    }
+  });
+
+  it("admits a zero wait budget only when a slot is free right now (database clock)", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Zero budget proof", email: `zero-budget-${suffix}@example.test` },
+    });
+    try {
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `zero-budget-${suffix}`,
+          runtimeIdentityKey: `zero-budget-${suffix}`,
+          runtimeModel: "zero-budget-proof",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const account = await db.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: `zero-budget-${suffix}`,
+          baseUrl: "https://example.test",
+          endpointIdentity: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const model = await db.providerModel.create({
+        data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+      });
+      const target = await db.executionTarget.create({
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, `zero-budget-${suffix}`);
+      // The process-side deadline is far away: only the zero database-clock
+      // budget may decide these outcomes.
+      const attempt = (name: string) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: name,
+        deadlineAt: new Date(Date.now() + 10 * 60_000),
+        candidates: [
+          {
+            capacityId: capacity.id,
+            executionTargetId: target.id,
+            candidateOrder: 0,
+            waitBudgetMs: 0,
+          },
+        ],
+      });
+
+      // Idle capacity: a zero budget admits in the creating transaction.
+      const idle = await store.acquire(attempt("zero-idle"));
+      expect(idle.state).toBe("ADMITTED");
+      if (idle.state !== "ADMITTED") throw new Error("Expected zero-budget admission.");
+
+      // Busy capacity: a zero budget expires at once instead of queueing.
+      await expect(store.acquire(attempt("zero-busy"))).resolves.toEqual({ state: "EXPIRED" });
+      const busy = await db.admissionRequest.findUniqueOrThrow({
+        where: { attemptId: `zero-busy-${suffix}` },
+        include: { Waiters: true },
+      });
+      expect(busy.state).toBe("EXPIRED");
+      expect(busy.Waiters.map((waiter) => waiter.state)).toEqual(["EXPIRED"]);
+
+      // Releasing the slot never admits the expired zero-budget attempt later.
+      await store.release(idle.lease);
+      expect(
+        await db.capacityLease.count({
+          where: { attemptId: `zero-busy-${suffix}`, state: "ACTIVE" },
+        }),
+      ).toBe(0);
+    } finally {
+      await cleanupCapacityFixture(db, user.id);
+      await db.$disconnect();
     }
   });
 

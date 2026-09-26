@@ -333,6 +333,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     const excluded = new Set(MCP_TOOL_EXCLUSIONS.map((entry) => entry.target));
     for (const required of [
       "modelApiTokens.create",
+      // Human-only external-provider consent (fallback redesign C1).
+      "modelApiTokens.updateExternalAccess",
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
       "cliCredentials.deviceLoginRequest",
@@ -454,6 +456,12 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     );
     expect(tokenAccesses).toEqual([]);
     expect(invoked.filter((path) => path.startsWith("mcpTokens"))).toEqual([]);
+    // Human-only proof: no tool can reach a token's external-provider consent.
+    expect(toolTargets).not.toContain("modelApiTokens.updateExternalAccess");
+    expect([...accessed].filter((path) => path === "modelApiTokens.updateExternalAccess")).toEqual(
+      [],
+    );
+    expect(invoked).not.toContain("modelApiTokens.updateExternalAccess");
   });
 });
 

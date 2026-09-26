@@ -497,7 +497,6 @@ integration("capacity admission across operating-system processes", () => {
         slug: `cross-capacity-${suffix}`,
         name: "Cross-capacity proof",
         capacityConcurrencyLimit: 1,
-        publicEgressAcknowledged: true,
       },
     });
     const account = await db.providerAccount.create({
@@ -541,8 +540,14 @@ integration("capacity admission across operating-system processes", () => {
           inferenceCapacityId: capacity.id,
         },
       });
+      // Provider targets are external fallback members (PRIMARY is local-only).
       const member = await db.poolMember.create({
-        data: { poolId: pool.id, executionTargetId: target.id, tier: "PRIMARY" },
+        data: {
+          poolId: pool.id,
+          executionTargetId: target.id,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: index,
+        },
       });
       targets.push(target);
       members.push(member);
@@ -1052,8 +1057,7 @@ integration("capacity admission across operating-system processes", () => {
         slug: `production-pool-${suffix}`,
         name: "Production process pool",
         protocolAdaptationEnabled: true,
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       },
     });
     const keyring = parseProviderCredentialKeyring(
@@ -1064,7 +1068,6 @@ integration("capacity admission across operating-system processes", () => {
       publicOrder: number,
       providerPool = pool,
       providerCapacity = capacity,
-      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
     ) => {
       const accountId = crypto.randomUUID();
       const credentialId = crypto.randomUUID();
@@ -1137,8 +1140,8 @@ integration("capacity admission across operating-system processes", () => {
         data: {
           poolId: providerPool.id,
           executionTargetId: target.id,
-          tier,
-          ...(tier === "PUBLIC_OVERFLOW" ? { publicOrder } : {}),
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder,
         },
       });
       await db.providerPricingVersion.create({
@@ -1201,11 +1204,14 @@ integration("capacity admission across operating-system processes", () => {
       data: {
         userId: owner.id,
         name: "Production process token",
+        // External fallback needs the token's explicit consent.
+        allowExternal: true,
         lookupPrefix: credentialLookupPrefix(rawToken),
         secretDigest: hmacDigestForForwarderPurpose({ purpose: "modelApiToken", value: rawToken }),
       },
     });
-    const modelId = poolModelId({ userSlug: owner.slug, poolSlug: pool.slug });
+    // Provider members are reachable only through the `:external` variant.
+    const modelId = `${poolModelId({ userSlug: owner.slug, poolSlug: pool.slug })}:external`;
     const request = (port: number, requestedModelId = modelId, label = "hi", stream = true) =>
       fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: "POST",
@@ -1473,8 +1479,7 @@ integration("capacity admission across operating-system processes", () => {
           name: "Production low-priority proof",
           capacityPriority: 0,
           protocolAdaptationEnabled: true,
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         },
       });
       const highPool = await db.modelPool.create({
@@ -1484,14 +1489,13 @@ integration("capacity admission across operating-system processes", () => {
           name: "Production high-priority proof",
           capacityPriority: 31,
           protocolAdaptationEnabled: true,
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         },
       });
-      await createProvider("wdrr-low", 0, lowPool, capacity, "PRIMARY");
-      await createProvider("wdrr-high", 0, highPool, capacity, "PRIMARY");
-      const lowModelId = poolModelId({ userSlug: owner.slug, poolSlug: lowPool.slug });
-      const highModelId = poolModelId({ userSlug: owner.slug, poolSlug: highPool.slug });
+      await createProvider("wdrr-low", 0, lowPool, capacity);
+      await createProvider("wdrr-high", 0, highPool, capacity);
+      const lowModelId = `${poolModelId({ userSlug: owner.slug, poolSlug: lowPool.slug })}:external`;
+      const highModelId = `${poolModelId({ userSlug: owner.slug, poolSlug: highPool.slug })}:external`;
       const schedulerWorker = startWorker({ operation: "production-server" });
       children.add(schedulerWorker.child);
       const schedulerReady = await schedulerWorker.result;

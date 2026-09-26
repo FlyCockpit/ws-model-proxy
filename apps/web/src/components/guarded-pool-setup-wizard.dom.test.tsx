@@ -777,60 +777,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
   });
 
-  it("auto-sets the recommended API from a provider-first PRIMARY selection and never overwrites it with a later local", async () => {
-    const user = userEvent.setup();
-    mount();
-    const surfaceSelect = () =>
-      screen.getByLabelText(
-        "dashboard:pools.wizard.fields.recommendedSurface",
-      ) as HTMLSelectElement;
-
-    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
-    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
-    // Provider-first: step 0 permits zero locals (the empty-member schema
-    // issue targets providerModelIds, a step-2 field), so leave them all off.
-    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
-    // Adaptation keeps the OPENAI_RESPONSES default selectable for the
-    // chat-native provider, so only the first-PRIMARY-member branch (not
-    // repair) can explain the auto-set below. Under the old locals-only
-    // policy the provider selection never triggered an auto-set and the
-    // field silently kept OPENAI_RESPONSES — this test fails there.
-    await user.click(
-      screen.getByRole("radio", { name: "dashboard:pools.protocolOptions.lossless.label" }),
-    );
-    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
-    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
-
-    // Tier flip with no providers selected: the primary set stays empty.
-    await user.selectOptions(
-      screen.getByLabelText("dashboard:pools.wizard.fields.providerTier"),
-      "PRIMARY",
-    );
-    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
-
-    // (a) The first PRIMARY member (the chat-native provider) auto-sets its
-    // best-ranked native surface exactly once.
-    await user.click(
-      await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider"),
-    );
-    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
-
-    // (b) Back-nav: adding the first local later must NOT overwrite the
-    // provider-era surface even though the locals-only set transitions
-    // empty → non-empty. Under the old locals-only trigger the first branch
-    // re-ranked to the responses local's native OPENAI_RESPONSES — this
-    // assertion fails there.
-    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
-    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
-    await user.click(
-      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
-    );
-    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
-    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
-    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
-  });
-
-  it("does not auto-set on PUBLIC_OVERFLOW provider selection but does on the tier flip to PRIMARY", async () => {
+  it("offers providers only as external fallback and never auto-sets from them", async () => {
     const user = userEvent.setup();
     mount();
     const surfaceSelect = () =>
@@ -853,16 +800,12 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     );
     expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
 
-    // (d) Flipping the tier to PRIMARY makes the provider the first primary
-    // member (combined primary set empty → non-empty) and auto-sets its
-    // native surface. Under the old policy the tier change never fired the
-    // first branch and the still-selectable default was kept — this
-    // assertion fails there.
-    await user.selectOptions(
-      screen.getByLabelText("dashboard:pools.wizard.fields.providerTier"),
-      "PRIMARY",
-    );
-    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+    // (d) Provider models can only be external fallback members: plain pool
+    // names never leave the deployment, so PRIMARY is not offered.
+    const tierSelect = screen.getByLabelText(
+      "dashboard:pools.wizard.fields.providerTier",
+    ) as HTMLSelectElement;
+    expect([...tierSelect.options].map((option) => option.value)).toEqual(["PUBLIC_OVERFLOW"]);
   });
 
   it("renders the specific create failure reason inline on the review step", async () => {

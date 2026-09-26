@@ -13,6 +13,8 @@ import {
   encryptProviderCredential,
   parseProviderCredentialKeyring,
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import { env } from "@ws-model-proxy/env/server";
+import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
 import {
   claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
@@ -30,29 +32,68 @@ import {
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
 
-it("applies the deployment egress gate to provider PRIMARY dispatch", async () => {
-  await expect(
-    dispatchPublicOverflow({
-      userId: "owner",
-      poolId: "pool",
-      requestId: "request",
-      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      memberTier: "PRIMARY",
-      requestedProtocol: "openai",
-      requestedSurface: "openai-chat",
-      stream: false,
-      requiredFeatures: [],
-      path: "/v1/chat/completions",
-      headers: new Headers({ "content-type": "application/json" }),
-      body: new TextEncoder().encode("{}"),
-      signal: new AbortController().signal,
-      liability: { tokens: 1n, accountingVersion: "provider-billable-v1" },
-      releaseLocalCapacity: async () => undefined,
-      adaptationEnabled: false,
-      retrySafe: false,
-    }),
-  ).resolves.toEqual({ dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" });
+function overflowRequest(externalConsent: ExternalEgressConsent, poolId = "pool") {
+  return {
+    userId: "owner",
+    poolId,
+    requestId: "request",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+    externalConsent,
+    requestedProtocol: "openai" as const,
+    requestedSurface: "openai-chat" as const,
+    stream: false,
+    requiredFeatures: [],
+    path: "/v1/chat/completions",
+    headers: new Headers({ "content-type": "application/json" }),
+    body: new TextEncoder().encode("{}"),
+    signal: new AbortController().signal,
+    liability: { tokens: 1n, accountingVersion: "provider-billable-v1" },
+    releaseLocalCapacity: async () => undefined,
+    adaptationEnabled: false,
+    retrySafe: false,
+  };
+}
+
+function issuedConsent(poolId = "pool"): ExternalEgressConsent {
+  const decision = evaluateExternalEgress({
+    requested: true,
+    requester: { userId: "owner", source: "API_TOKEN", modelApiTokenId: "token" },
+    tokenPermitsPool: true,
+    pool: { id: poolId, ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: false },
+    // The consent is minted as if the switch were on; dispatch must still
+    // re-check the real deployment switch.
+    deploymentSwitchEnabled: true,
+  });
+  if (!decision.granted) throw new Error("expected an issued consent");
+  return decision.consent;
+}
+
+it("applies the deployment egress gate even with an issued caller consent", async () => {
+  await expect(dispatchPublicOverflow(overflowRequest(issuedConsent()))).resolves.toEqual({
+    dispatched: false,
+    reason: "DEPLOYMENT_GATE_DISABLED",
+  });
   expect(db.$transaction).not.toHaveBeenCalled();
+});
+
+it("fails closed without an issued caller consent for the exact pool", async () => {
+  const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+  mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+  try {
+    const consent = issuedConsent();
+    // A structurally identical object was never issued by the gate.
+    await expect(dispatchPublicOverflow(overflowRequest({ ...consent }))).resolves.toEqual({
+      dispatched: false,
+      reason: "CALLER_CONSENT_MISSING",
+    });
+    // A consent for another pool never authorizes this one.
+    await expect(
+      dispatchPublicOverflow(overflowRequest(issuedConsent("other-pool"))),
+    ).resolves.toEqual({ dispatched: false, reason: "CALLER_CONSENT_MISSING" });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  } finally {
+    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+  }
 });
 
 describe("provider health cooldown", () => {
@@ -135,37 +176,26 @@ describe("public overflow compatibility", () => {
 
   it.each([
     {
-      name: "accepts the exact member ceiling after margin",
-      target: { effectiveContextCeiling: 210, contextMargin: 10 },
+      name: "accepts a request that exactly fits the context window",
+      contextWindow: 200,
       expected: "COMPATIBLE",
     },
     {
-      name: "rejects one token beyond the member ceiling after margin",
-      target: { effectiveContextCeiling: 209, contextMargin: 10 },
+      name: "rejects one token beyond the context window",
+      contextWindow: 199,
       expected: "CONTEXT_EXCEEDED",
     },
-    {
-      name: "rejects one token beyond the physical runtime maximum after margin",
-      target: { physicalMaxContext: 209, contextMargin: 10 },
-      expected: "CONTEXT_EXCEEDED",
-    },
-    {
-      name: "still enforces the physical maximum when the policy ceiling is unlimited",
-      target: { effectiveContextCeiling: null, physicalMaxContext: 209, contextMargin: 10 },
-      expected: "CONTEXT_EXCEEDED",
-    },
-  ])("$name", ({ target, expected }) => {
+  ])("$name", ({ contextWindow, expected }) => {
     expect(
       publicTargetCompatibility(
         {
-          contextWindow: 1_000,
+          contextWindow,
           maxOutputTokens: 100,
           protocol: "openai",
           nativeProtocols: ["openai"],
           nativeSurfaces: ["openai-chat"],
           supportsStreaming: true,
           supportedFeatures: [],
-          ...target,
         },
         request,
       ),

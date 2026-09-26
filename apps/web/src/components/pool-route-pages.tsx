@@ -1,7 +1,9 @@
+import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -10,11 +12,15 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@ws-model-proxy/ui/components/dialog";
+import { Input } from "@ws-model-proxy/ui/components/input";
+import { Label } from "@ws-model-proxy/ui/components/label";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Gauge, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { createContext, useContext, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import {
@@ -676,6 +682,7 @@ export function PoolDetailTab({
           {t("dashboard:pools.fallbackDisabledDeployment")}
         </p>
       ) : null}
+      <PoolFallbackSettings key={`${pool.id}-fallback`} pool={pool} />
       {overflowMembers.length ? (
         <ol className="space-y-2">
           {overflowMembers.map((member, index) => (
@@ -713,6 +720,132 @@ export function PoolDetailTab({
         </div>
       ) : null}
     </section>
+  );
+}
+
+/**
+ * Owner fallback settings. Callers opt in per request with
+ * `owner/pool:external`; the plain name never leaves the deployment.
+ */
+function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const update = useMutation(
+    orpc.forwarderManagement.updateModelPool.mutationOptions({
+      onSuccess: () => {
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        toast.success(t("dashboard:pools.fallbackSettings.saved"));
+      },
+    }),
+  );
+  const form = useForm({
+    defaultValues: {
+      fallbackEnabled: pool.fallbackEnabled,
+      fallbackForGrantees: pool.fallbackForGrantees,
+      externalAfterWaitMs: String(pool.externalAfterWaitMs),
+    },
+    validators: {
+      onSubmit: z.object({
+        fallbackEnabled: z.boolean(),
+        fallbackForGrantees: z.boolean(),
+        externalAfterWaitMs: z
+          .string()
+          .trim()
+          .regex(/^\d+$/, t("dashboard:pools.fallbackSettings.waitInvalid"))
+          .refine(
+            (value) => Number(value) <= 600_000,
+            t("dashboard:pools.fallbackSettings.waitInvalid"),
+          ),
+      }),
+    },
+    onSubmit: async ({ value }) => {
+      await update
+        .mutateAsync({
+          id: pool.id,
+          // Enabling stays gated by the deployment switch server-side;
+          // disabling is always allowed and keeps members configured.
+          ...(value.fallbackEnabled !== pool.fallbackEnabled
+            ? { fallbackEnabled: value.fallbackEnabled }
+            : {}),
+          fallbackForGrantees: value.fallbackForGrantees,
+          externalAfterWaitMs: Number(value.externalAfterWaitMs),
+        })
+        .catch(() => undefined);
+    },
+  });
+  return (
+    <form
+      className="min-w-0 space-y-3 rounded-md border p-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void form.handleSubmit();
+      }}
+    >
+      <p className="text-sm text-muted-foreground">
+        {t("dashboard:pools.fallbackSettings.description", {
+          externalModelId: `${pool.canonicalModelId}:external`,
+          modelId: pool.canonicalModelId,
+        })}
+      </p>
+      <form.Field name="fallbackEnabled">
+        {(field) => (
+          <label className="flex min-h-11 items-center gap-3 text-sm">
+            <Checkbox
+              checked={field.state.value}
+              onCheckedChange={(checked) => field.handleChange(checked === true)}
+            />
+            <span>{t("dashboard:pools.fallbackSettings.enabled")}</span>
+          </label>
+        )}
+      </form.Field>
+      <form.Field name="fallbackForGrantees">
+        {(field) => (
+          <label className="flex min-h-11 items-center gap-3 text-sm">
+            <Checkbox
+              checked={field.state.value}
+              onCheckedChange={(checked) => field.handleChange(checked === true)}
+            />
+            <span>{t("dashboard:pools.fallbackSettings.forGrantees")}</span>
+          </label>
+        )}
+      </form.Field>
+      <form.Field name="externalAfterWaitMs">
+        {(field) => (
+          <div className="space-y-2">
+            <Label htmlFor={`pool-external-after-${pool.id}`}>
+              {t("dashboard:pools.fallbackSettings.externalAfterWaitMs")}
+            </Label>
+            <Input
+              id={`pool-external-after-${pool.id}`}
+              name={field.name}
+              className="min-h-11"
+              inputMode="numeric"
+              value={field.state.value}
+              onBlur={field.handleBlur}
+              onChange={(event) => field.handleChange(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.fallbackSettings.externalAfterWaitHint")}
+            </p>
+            {field.state.meta.errors.map((error) => (
+              <p key={error?.message} className="text-sm text-destructive">
+                {error?.message}
+              </p>
+            ))}
+          </div>
+        )}
+      </form.Field>
+      <form.Subscribe
+        selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
+      >
+        {({ canSubmit, isSubmitting }) => (
+          <Button type="submit" size="touch" disabled={!canSubmit || isSubmitting}>
+            {t("dashboard:pools.fallbackSettings.save")}
+          </Button>
+        )}
+      </form.Subscribe>
+    </form>
   );
 }
 

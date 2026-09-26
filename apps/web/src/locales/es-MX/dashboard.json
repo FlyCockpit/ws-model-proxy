@@ -522,7 +522,17 @@
       "media": "Medios",
       "access": "Acceso"
     },
-    "fallbackDescription": "El desbordamiento público se intenta solo cuando los miembros locales están a capacidad máxima o no son saludables.",
+    "fallbackDescription": "El respaldo externo se usa solo para solicitudes que nombran propietario/pool:external, cuando los miembros locales están a capacidad máxima o no son saludables.",
+    "fallbackSettings": {
+      "description": "Quienes llaman usan {{externalModelId}} para permitir proveedores externos. {{modelId}} siempre se queda en los miembros locales.",
+      "enabled": "Usar respaldo externo para solicitudes :external",
+      "forGrantees": "Pagar el respaldo externo que usen las personas con quienes comparto este pool",
+      "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Nunca supera el presupuesto de espera local.",
+      "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
+      "save": "Guardar ajustes de respaldo",
+      "saved": "Ajustes de respaldo guardados"
+    },
     "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
     "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
     "fallbackSteps": {
@@ -1005,7 +1015,7 @@
       "retire": "Retirar",
       "deactivate": "Desactivar",
       "createAttachmentProtection": "Crear protección del adjunto",
-      "acknowledgeEgress": "Reconocer y habilitar salida",
+      "acknowledgeEgress": "Habilitar respaldo externo",
       "attachProvider": "Adjuntar proveedor",
       "moveLater": "Mover después",
       "detachProvider": "Separar proveedor del pool",
@@ -1132,6 +1142,13 @@
     "stale": "Obsoleto"
   },
   "tokens": {
+    "externalAccess": {
+      "title": "Proveedores externos",
+      "description": "Los tokens son solo privados de forma predeterminada. Cuando se permite, una solicitud puede usar un proveedor externo solo si nombra el pool como propietario/pool:external y el propietario del pool lo permite. Los nombres de pool sin sufijo nunca salen de esta implementación.",
+      "allow": "Permitir proveedores externos para {{name}}",
+      "poolsHint": "Tokens con lista de permitidos: elige qué pools pueden usar proveedores externos.",
+      "saved": "Acceso a proveedores externos actualizado"
+    },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",
     "allowlistModels": "Modelos permitidos",

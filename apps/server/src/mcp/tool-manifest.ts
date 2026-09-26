@@ -696,7 +696,9 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     inputSchema: anyArgs(),
-    // G8a: conditional provider-egress gate (publicEgress inputs).
+    // G8a: conditional provider-egress gate (fallbackEnabled input). Owner
+    // fallback settings (fallbackForGrantees, externalAfterWaitMs) pass
+    // through; token external consent is human-only and never an MCP arg.
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
   },
@@ -707,7 +709,9 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     inputSchema: anyArgs(),
-    // Conditional provider-egress gate (publicEgress inputs). Capacity policy
+    // Conditional provider-egress gate (fallbackEnabled input). Owner
+    // fallback settings (fallbackForGrantees, externalAfterWaitMs) pass
+    // through. Capacity policy
     // fields are always admitted; there is no capacity release flag.
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updateModelPool),
@@ -1243,6 +1247,11 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Operational accounting repair (admin-operated).",
   },
   { target: "modelApiTokens.create", reason: "Returns the one-time raw token secret." },
+  {
+    target: "modelApiTokens.updateExternalAccess",
+    reason:
+      "Human-only external-provider consent: an agent must never raise its own token's egress permission.",
+  },
   { target: "cliCredentials.createToken", reason: "Returns the one-time raw token secret." },
   {
     target: "cliCredentials.exchangeDeviceCode",

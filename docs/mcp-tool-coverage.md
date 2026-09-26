@@ -89,6 +89,7 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
+| `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |

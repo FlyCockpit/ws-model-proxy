@@ -4,8 +4,8 @@ import {
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
 import {
   authenticateModelApiTokenSecret,
-  listVisibleModelTargetsForToken,
   listVisibleModelTargetsForUser,
+  listVisibleModelTargetsWithExternalPermissionForToken,
   type ModelApiTokenIdentity,
   type VisibleDirectModelTarget,
   type VisibleModelPoolTarget,
@@ -67,6 +67,24 @@ import {
   resolveChatTestRoutingMode,
 } from "./chat-test-routing-mode.js";
 import { responseWithFirstClientByte } from "./client-byte-commit.js";
+import {
+  EXTERNAL_MODEL_VARIANT,
+  type ExternalEgressConsent,
+  type ExternalEgressDenial,
+  type ExternalRouteError,
+  evaluateExternalEgress,
+  externalDenialError,
+  externalModelId,
+  externalRouteErrorResponse,
+  externalUnavailableMessage,
+  FALLBACK_HEADER,
+  FALLBACK_REASON_HEADER,
+  type FallbackRoute,
+  ROUTE_HEADER,
+  resolveRequestedModelName,
+  SERVED_MODEL_HEADER,
+  withResponseHeaders,
+} from "./external-route.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -147,7 +165,6 @@ import {
   safeProviderRetryAfter,
 } from "./protocols/index.js";
 import {
-  buildProviderAffinityTargets,
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
@@ -156,7 +173,6 @@ import {
   orderChatTestProviderTargets,
   type PublicOverflowReason,
   type PublicOverflowRequest,
-  type PublicProviderTarget,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
@@ -702,6 +718,7 @@ const poolMemberRelaySelect = {
       capacityContextCeiling: true,
       capacityContextMargin: true,
       capacityWaitBudgetMs: true,
+      externalAfterWaitMs: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -740,6 +757,8 @@ type PoolMemberRelayRow = Omit<PoolMemberRelayQueryRow, "discoveredModelId" | "D
 };
 
 type RelayMetadataCreate = {
+  /** Pool requests start "local"; external dispatch rewrites it. Null for direct. */
+  fallbackRoute?: FallbackRoute;
   userId: string;
   source: RelayRequestSourceValue;
   modelApiTokenId?: string | null;
@@ -795,16 +814,6 @@ type RelayRequester = {
   exposeTransformDebug?: boolean;
 };
 
-function boundedAdmissionDeadline(
-  nowMs: number,
-  requestDeadlineMs: number,
-  waitBudgetMs: number | null,
-) {
-  return new Date(
-    Math.min(requestDeadlineMs, waitBudgetMs === null ? requestDeadlineMs : nowMs + waitBudgetMs),
-  );
-}
-
 function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
   if (member.capacityWaitBudgetMode === "UNLIMITED") return null;
   if (
@@ -815,11 +824,26 @@ function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
   return member.ModelPool?.capacityWaitBudgetMs ?? null;
 }
 
+/**
+ * Local admission wait for one candidate. A consented `:external` caller with
+ * an external plan waits at most the pool's externalAfterWaitMs, and never
+ * longer than the member/pool budget. Null means no budget (only the request
+ * deadline). The capacity store turns this into a database-clock deadline.
+ */
+export function localAdmissionWaitBudget(
+  memberBudgetMs: number | null,
+  externalAfterWaitMs: number | null,
+): number | null {
+  if (externalAfterWaitMs === null) return memberBudgetMs;
+  const external = Math.max(0, externalAfterWaitMs);
+  return memberBudgetMs === null ? external : Math.min(memberBudgetMs, external);
+}
+
 function poolAdmissionCandidate(
   member: PoolMemberRelayRow,
   candidateOrder: number,
-  nowMs: number,
   requestDeadlineMs: number,
+  externalAfterWaitMs: number | null = null,
 ) {
   const identity = member.ExecutionTarget;
   if (!identity?.inferenceCapacityId) return null;
@@ -828,11 +852,8 @@ function poolAdmissionCandidate(
     executionTargetId: identity.id,
     poolMemberId: member.id,
     candidateOrder,
-    deadlineAt: boundedAdmissionDeadline(
-      nowMs,
-      requestDeadlineMs,
-      effectiveMemberWaitBudget(member),
-    ),
+    deadlineAt: new Date(requestDeadlineMs),
+    waitBudgetMs: localAdmissionWaitBudget(effectiveMemberWaitBudget(member), externalAfterWaitMs),
   };
 }
 
@@ -1916,6 +1937,7 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       contextCountExact: input.contextCount?.exact ?? null,
       contextSafetyMargin: input.contextCount?.safetyMargin ?? null,
       contextSerializedChars: input.contextCount?.serializedChars ?? null,
+      fallbackRoute: input.fallbackRoute ?? null,
       status: "PENDING",
     },
     select: { id: true },
@@ -2570,6 +2592,9 @@ async function writeProviderResponseStickiness(input: {
       poolGrantId: input.poolGrantId,
       nativeSurface: "OPENAI_RESPONSES",
       upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      // Provider bindings exist only for consented `owner/pool:external`
+      // requests (tryPublicOverflow and bound follow-ups).
+      fallbackRoute: "pool-external",
       expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
     },
     // Submit the complete tuple on conflict. The database trigger permits an
@@ -2591,6 +2616,9 @@ async function writeProviderResponseStickiness(input: {
       poolGrantId: input.poolGrantId,
       nativeSurface: "OPENAI_RESPONSES",
       upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      // Provider bindings exist only for consented `owner/pool:external`
+      // requests (tryPublicOverflow and bound follow-ups).
+      fallbackRoute: "pool-external",
       expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
     },
     select: { id: true },
@@ -2866,6 +2894,7 @@ async function resolveStickyRoute({
       providerUpstreamModelId: true,
       nativeSurface: true,
       upstreamResponseIdDigest: true,
+      fallbackRoute: true,
       poolGrantId: true,
       PoolGrant: {
         select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
@@ -2901,6 +2930,8 @@ async function resolveStickyRoute({
         "Response routing metadata was not found or has expired.",
       );
     if (
+      // Provider bindings are honored only when created with caller consent.
+      record.fallbackRoute !== "pool-external" ||
       !record.selectedExecutionTargetId ||
       !record.providerAccountId ||
       !record.providerModelId ||
@@ -3019,23 +3050,18 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
   });
 }
 
-function directTargetByModelId(targets: VisibleDirectModelTarget[], modelId: string) {
-  return targets.find((target) => target.modelId === modelId) ?? null;
-}
-
-function poolTargetByModelId(targets: VisibleModelPoolTarget[], modelId: string) {
-  return targets.find((target) => target.modelId === modelId) ?? null;
-}
-
 /**
  * OpenAI-compatible model list with additive multimodal advertisement fields
  * (supports_vision, capabilities, architecture.input_modalities, …). See
  * `model-list-modalities.ts`. Official OpenAI only requires id/created/object/owned_by.
  */
-async function modelListResponse(targets: {
-  directModels: VisibleDirectModelTarget[];
-  modelPools: VisibleModelPoolTarget[];
-}) {
+async function modelListResponse(
+  targets: {
+    directModels: VisibleDirectModelTarget[];
+    modelPools: VisibleModelPoolTarget[];
+  },
+  external?: { requester: RelayRequester; externalPoolIds: ReadonlySet<string> },
+) {
   const directIds = targets.directModels.map((model) => model.id);
   const poolIds = targets.modelPools.map((pool) => pool.id);
 
@@ -3067,18 +3093,19 @@ async function modelListResponse(targets: {
     poolIds.length === 0
       ? []
       : await prisma.poolMember.findMany({
-          // Model-list capabilities describe the local pool. Provider overflow
-          // is deliberately not advertised as ordinary local capacity.
+          // Plain-name capabilities describe the local pool (PRIMARY is always
+          // local). External members are read only to describe the
+          // `:external` entry of a pool that has no local members.
           where: {
             poolId: { in: poolIds },
-            tier: "PRIMARY",
             OR: [
-              { ExecutionTarget: { DiscoveredModel: { isNot: null } } },
-              { ExecutionTarget: { ProviderModel: { isNot: null } } },
+              { tier: "PRIMARY", ExecutionTarget: { DiscoveredModel: { isNot: null } } },
+              { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { ProviderModel: { isNot: null } } },
             ],
           },
           select: {
             poolId: true,
+            tier: true,
             ExecutionTarget: {
               select: {
                 DiscoveredModel: {
@@ -3171,9 +3198,15 @@ async function modelListResponse(targets: {
   );
 
   const poolFlagsById = new Map<string, ReturnType<typeof multimodalFlagsFromCapabilities>>();
+  const localPoolIds = new Set(
+    poolMemberRows.filter((row) => row.tier === "PRIMARY").map((row) => row.poolId),
+  );
   for (const poolId of poolIds) {
+    // Provider-only pools advertise their external members' capabilities on
+    // the `:external` entry; every other pool advertises its local members.
+    const memberTier = localPoolIds.has(poolId) ? "PRIMARY" : "PUBLIC_OVERFLOW";
     const memberFlags = poolMemberRows
-      .filter((row) => row.poolId === poolId)
+      .filter((row) => row.poolId === poolId && row.tier === memberTier)
       .map((row) => {
         const dm = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
         const provider = row.ExecutionTarget?.ProviderModel;
@@ -3236,15 +3269,34 @@ async function modelListResponse(targets: {
           ...openAiModelListExtensions(flags),
         };
       }),
-      ...targets.modelPools.map((pool) => {
+      ...targets.modelPools.flatMap((pool) => {
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
-        return {
-          id: pool.modelId,
+        const entry = (id: string) => ({
+          id,
           object: "model" as const,
           created: 0,
           owned_by: pool.ownerUserSlug,
           ...openAiModelListExtensions(flags),
-        };
+        });
+        const hasLocalMembers = localPoolIds.has(pool.id);
+        // A pool with only external members cannot serve its plain name.
+        const plain =
+          hasLocalMembers || pool.externalMemberCount === 0 ? [entry(pool.modelId)] : [];
+        // `owner/pool:external` is listed only when this caller could be served
+        // that way, from static configuration (never live health): switch on,
+        // this token consents for this pool, the owner allows this requester,
+        // and at least one external member is configured. No provider labels
+        // or upstream ids are advertised.
+        const externalListed =
+          external !== undefined &&
+          pool.externalMemberCount > 0 &&
+          evaluateExternalEgress({
+            requested: true,
+            requester: external.requester,
+            tokenPermitsPool: external.externalPoolIds.has(pool.id),
+            pool,
+          }).granted;
+        return externalListed ? [...plain, entry(externalModelId(pool.modelId))] : plain;
       }),
     ],
   };
@@ -3390,16 +3442,14 @@ async function relayDirect({
           sourceKind: "DIRECT",
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: boundedAdmissionDeadline(
-            Date.now(),
-            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
-            identity.directWaitBudgetMs ?? null,
-          ),
+          deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
             {
               capacityId: identity.inferenceCapacityId,
               executionTargetId: identity.id,
               candidateOrder: 0,
+              // Database-clock budget; 0 admits only if free now.
+              waitBudgetMs: identity.directWaitBudgetMs ?? null,
             },
           ],
         },
@@ -3641,6 +3691,7 @@ async function relayPool({
   limiter,
   transformDebug,
   capacityRuntime,
+  external,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -3650,6 +3701,7 @@ async function relayPool({
   limiter: ModelApiConcurrencyLimiter;
   transformDebug?: TransformDebug;
   capacityRuntime?: CapacityAdmissionRuntime;
+  external: PoolExternalRoute;
 }): Promise<Response> {
   const startedAt = new Date();
   const requestedSurface = requestedSurfaceForOperation(operation);
@@ -3675,40 +3727,34 @@ async function relayPool({
     operation: operation.capability,
     requestBytes: null,
     contextCount: operation.contextCount,
+    // Rewritten to "pool-external" only when a provider response commits.
+    fallbackRoute: "local",
   });
 
-  // A provider lease admitted by the pool-routing loop remains owned by this
-  // request until dispatch commits it to the response. Keep cleanup idempotent
-  // across the nested dispatcher and its caller so every precommit exit,
-  // including a rejected dispatch promise, releases the lease exactly once.
-  const releasedPreAdmittedProviderLeaseIds = new Set<string>();
-  const releasePreAdmittedProviderLease = async (
-    lease: Extract<
-      Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
-      { state: "ADMITTED" }
-    >["lease"],
-  ) => {
-    if (releasedPreAdmittedProviderLeaseIds.has(lease.leaseId)) return;
-    releasedPreAdmittedProviderLeaseIds.add(lease.leaseId);
-    await capacityRuntime?.release(lease);
-  };
+  // The caller's own concurrency caps (per token, per user) are never a
+  // fallback trigger, and external dispatch keeps counting against them: the
+  // caller lease is held across provider dispatch and released only when the
+  // provider response settles.
+  let globalLease: ModelApiLimitLease | undefined;
 
+  /**
+   * External fallback. Returns null (serve/fail locally) unless this request
+   * carries an issued caller consent, which exists only when the caller asked
+   * for `owner/pool:external`, its credential allows external providers, the
+   * deployment switch is on, and the owner allows it for this requester.
+   * dispatchPublicOverflow re-checks the switch, the consent, and the owner's
+   * pool flags against fresh state before any credential is decrypted.
+   */
   const tryPublicOverflow = async (
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
-    options?: {
-      onlyTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
-      forcedProviderMemberId?: string;
-      preAdmittedProviderLease?: Extract<
-        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
-        { state: "ADMITTED" }
-      >["lease"];
-    },
   ): Promise<Response | null> => {
+    const consent = external.consent;
+    if (!consent) return null;
     // Public provider dispatch is intentionally limited to replayable modern
-    // JSON operations. Stateful Responses and multipart/audio paths must retain
-    // their exact target or fail safely.
-    if (!operation.contextInput) return null;
+    // JSON operations. Multipart/audio paths must retain their exact target or
+    // fail safely.
+    if (!operation.contextInput || !requestedSurface) return null;
     const providerResponsesStickiness =
       operation.family === "responses" && operation.responseStickiness !== undefined;
     let built: BuiltRelayRequest;
@@ -3724,12 +3770,6 @@ async function relayPool({
     const publicRequestBytes = built.body.byteLength;
     const requestedProtocol: "openai" | "anthropic" =
       operation.family === "messages" ? "anthropic" : "openai";
-    const requestedSurface: ProtocolSurface =
-      operation.family === "messages"
-        ? "anthropic-messages"
-        : operation.family === "responses"
-          ? "openai-responses"
-          : "openai-chat";
     const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
     const requestedFeatures = profileSurfaceRequest(operation.contextInput);
     const requiredFeatures = Object.entries(requestedFeatures)
@@ -3772,6 +3812,7 @@ async function relayPool({
       poolId: target.id,
       requestId: relayRequestId,
       reason,
+      externalConsent: consent,
       requestedProtocol,
       requestedSurface,
       stream: operation.stream,
@@ -3783,7 +3824,7 @@ async function relayPool({
       releaseLocalCapacity: releaseProviderCapacity,
       adaptationEnabled: operation.adaptation?.poolEnabled === true,
       chatTestRoutingMode: testRoutingMode,
-      forcedPoolMemberId: options?.forcedProviderMemberId ?? forcedPoolMemberId,
+      forcedPoolMemberId,
       retrySafe:
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
@@ -3833,38 +3874,17 @@ async function relayPool({
           { state: "ADMITTED" }
         >["lease"]
       | undefined;
-    const dispatchProviderTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
-      if (options?.preAdmittedProviderLease && memberTier === "PRIMARY") {
-        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
-        try {
-          result = await dispatchPublicOverflow({
-            ...providerRequest,
-            memberTier,
-            forcedPoolMemberId: options.forcedProviderMemberId,
-          });
-        } catch (error) {
-          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
-          throw error;
-        }
-        if (!result.dispatched) {
-          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
-          return result;
-        }
-        providerCapacityLease = options.preAdmittedProviderLease;
-        return result;
-      }
+    const dispatchExternalTier = async (): Promise<
+      Awaited<ReturnType<typeof dispatchPublicOverflow>>
+    > => {
       // Provider egress never has a direct-dispatch fallback. Durable global
       // admission supplies the cross-process concurrency fence; without it a
       // provider request must fail closed even if legacy configuration exists.
-      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
-      const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
+      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+      const listed = await listPublicOverflowTargets(target.ownerUserId, target.id);
       const compatible = orderChatTestProviderTargets(
         listed.targets.flatMap((providerTarget) => {
-          if (
-            providerRequest.forcedPoolMemberId &&
-            providerTarget.poolMemberId !== providerRequest.forcedPoolMemberId
-          )
-            return [];
+          if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
           const resolvedExecution = resolvePublicProviderExecution(providerTarget, providerRequest);
           const resolvedTarget = { ...providerTarget, resolvedExecution };
           return publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
@@ -3875,11 +3895,11 @@ async function relayPool({
         requestedSurface,
         testRoutingMode,
       );
-      // A provider-backed primary is a physical execution target too. Missing
+      // An external member is a physical execution target too. Missing
       // capacity identity is a configuration error, never permission to bypass
       // durable concurrency and fencing.
       if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
-        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" } as const;
+        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
       let remaining = compatible;
       let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
@@ -3891,7 +3911,6 @@ async function relayPool({
         !request.signal.aborted &&
         remainingRelayBudgetMs(relayDeadlineMs) > 0
       ) {
-        const admissionStartedAt = Date.now();
         const admission = await acquireCapacityWithTelemetry({
           runtime: capacityRuntime,
           relayRequestId,
@@ -3910,27 +3929,23 @@ async function relayPool({
               executionTargetId: providerTarget.executionTargetId,
               poolMemberId: providerTarget.poolMemberId,
               candidateOrder,
-              deadlineAt: boundedAdmissionDeadline(
-                admissionStartedAt,
-                relayDeadlineMs,
-                providerTarget.capacityWaitBudgetMs ?? null,
-              ),
+              deadlineAt: new Date(relayDeadlineMs),
+              waitBudgetMs: providerTarget.capacityWaitBudgetMs ?? null,
             })),
           },
           signal: request.signal,
         });
         if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
-          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         const selectedPoolMemberId = admission.lease.poolMemberId;
         if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
           await capacityRuntime.release(admission.lease);
-          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         }
         let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
         try {
           result = await dispatchPublicOverflow({
             ...providerRequest,
-            memberTier,
             forcedPoolMemberId: selectedPoolMemberId,
             retrySingleTargetPrecommit: remaining.length > 1,
           });
@@ -3955,13 +3970,49 @@ async function relayPool({
       }
       return lastResult;
     };
-    let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = options?.onlyTier ?? "PRIMARY";
-    let result = await dispatchProviderTier(selectedTier);
-    if (!result.dispatched && !options?.onlyTier) {
-      selectedTier = "PUBLIC_OVERFLOW";
-      result = await dispatchProviderTier(selectedTier);
+    // H1: take (or acquire) the caller's own concurrency lease before any
+    // provider work. A caller at its own cap gets 429 exactly as it would for
+    // a local member; its cap is never a reason to go external.
+    const outerCallerLease = globalLease;
+    globalLease = undefined;
+    let callerLease: ModelApiLimitLease;
+    if (outerCallerLease) callerLease = outerCallerLease;
+    else {
+      try {
+        callerLease = limiter.acquireGlobal({
+          tokenId: requester.limitKey,
+          userId: requester.userId,
+        });
+      } catch (error) {
+        const failure: RelayFailure =
+          error instanceof ModelApiLimitError ? error.failure : "unknown";
+        await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+        await failRelayMetadata({ relayRequestId, startedAt, failure }).catch(metadataUpdateError);
+        return operationFailureResponse(operation, failure);
+      }
     }
-    if (!result.dispatched) return null;
+    let callerLeaseReleased = false;
+    const releaseCallerLease = () => {
+      if (callerLeaseReleased) return;
+      callerLeaseReleased = true;
+      callerLease.release();
+    };
+    let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+    try {
+      result = await dispatchExternalTier();
+    } catch (error) {
+      releaseCallerLease();
+      throw error;
+    }
+    if (!result.dispatched) {
+      // Hand the caller lease back to the local path that owned it.
+      if (outerCallerLease && !localCapacityReleased) {
+        callerLeaseReleased = true;
+        globalLease = outerCallerLease;
+      } else releaseCallerLease();
+      return null;
+    }
+    const externalReason = externalFallbackReasonHeader(reason);
     await prisma.relayRequest
       .update({
         where: { id: relayRequestId },
@@ -3971,11 +4022,10 @@ async function relayPool({
           selectedNativeSurface: modelApiSurface(result.nativeSurface),
           adapterMode: result.nativeSurface === requestedSurface ? "NATIVE" : "ADAPTED",
           adapterVersion: result.nativeSurface === requestedSurface ? null : "1.0.0",
-          // Provider-backed PRIMARY is still external egress even though it is
-          // not public fallback. The tier and overflow reason distinguish it.
           publicEgress: true,
-          publicOverflowReason: selectedTier === "PUBLIC_OVERFLOW" ? reason : null,
-          selectedPoolMemberTier: selectedTier,
+          publicOverflowReason: reason,
+          fallbackRoute: "pool-external",
+          selectedPoolMemberTier: "PUBLIC_OVERFLOW",
           providerAccountId: result.target.providerAccountId,
           providerModelId: result.target.providerModelId,
           providerAttemptId: result.attemptId,
@@ -3991,6 +4041,7 @@ async function relayPool({
       .catch(metadataUpdateError);
     void result.terminal
       .then(async (terminal) => {
+        releaseCallerLease();
         const completedAt = new Date();
         const usage = usageFactsFromProviderUsage(terminal.usage);
         await Promise.allSettled([
@@ -4022,28 +4073,44 @@ async function relayPool({
           operation.dispose?.() ?? Promise.resolve(),
         ]);
       })
-      .catch(metadataUpdateError);
+      .catch(metadataUpdateError)
+      .finally(releaseCallerLease);
+    const routeHeaders = {
+      [ROUTE_HEADER]: "pool-external",
+      [FALLBACK_REASON_HEADER]: externalReason,
+      [SERVED_MODEL_HEADER]: result.target.upstreamModelId,
+    };
     // Native response bytes remain opaque. Cross-protocol provider response
     // adaptation is handled by the same strict streaming/non-streaming state
-    // machines as local targets.
+    // machines as local targets. The response `model` is always the provider's
+    // served upstream id (adapters copy the source response's model).
     const commitAwareResponse = async (response: Response) => {
       const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
-      return providerCapacityLease && capacityRuntime
-        ? await holdOrReleaseCapacityResponse(
-            capacityRuntime,
-            committed,
-            providerCapacityLease,
-            request.signal,
-          )
-        : committed;
+      const held =
+        providerCapacityLease && capacityRuntime
+          ? await holdOrReleaseCapacityResponse(
+              capacityRuntime,
+              committed,
+              providerCapacityLease,
+              request.signal,
+            )
+          : committed;
+      return withResponseHeaders(held, routeHeaders);
     };
-    if (
-      result.nativeSurface === requestedSurface &&
-      (result.response.status < 200 || result.response.status >= 300)
-    ) {
-      let sanitized: Uint8Array;
-      try {
-        sanitized = await readAdaptedNonstreamBody({
+    const releaseAfterPrecommitThrow = async () => {
+      releaseCallerLease();
+      if (providerCapacityLease && capacityRuntime)
+        await releaseCapacityLeaseWithRetry({
+          store: capacityRuntime,
+          lease: providerCapacityLease,
+        });
+    };
+    try {
+      if (
+        result.nativeSurface === requestedSurface &&
+        (result.response.status < 200 || result.response.status >= 300)
+      ) {
+        const sanitized = await readAdaptedNonstreamBody({
           body: result.response.body,
           source: requestedSurface,
           target: requestedSurface,
@@ -4051,145 +4118,175 @@ async function relayPool({
           headers: result.response.headers,
           signal: request.signal,
         });
-      } catch (error) {
-        if (providerCapacityLease) await releasePreAdmittedProviderLease(providerCapacityLease);
-        throw error;
+        return await commitAwareResponse(
+          new Response(sanitized, {
+            status:
+              result.response.status >= 400 && result.response.status <= 599
+                ? result.response.status
+                : 502,
+            headers: adaptedProviderResponseHeaders(
+              requestedSurface,
+              requestedSurface,
+              result.response.headers,
+              false,
+            ),
+          }),
+        );
       }
-      return commitAwareResponse(
-        new Response(sanitized, {
-          status:
-            result.response.status >= 400 && result.response.status <= 599
-              ? result.response.status
-              : 502,
-          headers: adaptedProviderResponseHeaders(
-            requestedSurface,
-            requestedSurface,
-            result.response.headers,
-            false,
-          ),
-        }),
-      );
-    }
-    if (result.nativeSurface === requestedSurface || !operation.adaptation) {
-      const response =
-        providerResponsesStickiness && result.nativeSurface === "openai-responses"
-          ? captureProviderResponseBinding({
-              response: result.response,
-              streaming: operation.stream,
-              requester,
-              targetModelPoolId: target.id,
-              poolGrantId: target.accessGrantId,
-              target: result.target,
-              terminal: result.terminal,
-            })
-          : result.response;
-      return commitAwareResponse(response);
-    }
-    const source: ProtocolSurface = result.nativeSurface;
-    const adaptedRequestLimitations = (() => {
-      try {
-        return parseCanonicalRequest(
+      if (result.nativeSurface === requestedSurface || !operation.adaptation) {
+        const response =
+          providerResponsesStickiness && result.nativeSurface === "openai-responses"
+            ? captureProviderResponseBinding({
+                response: result.response,
+                streaming: operation.stream,
+                requester,
+                targetModelPoolId: target.id,
+                poolGrantId: target.accessGrantId,
+                target: result.target,
+                terminal: result.terminal,
+              })
+            : result.response;
+        return await commitAwareResponse(response);
+      }
+      const source: ProtocolSurface = result.nativeSurface;
+      const adaptedRequestLimitations = (() => {
+        try {
+          return parseCanonicalRequest(
+            operation.adaptation.requestedSurface,
+            operation.adaptation.payload,
+          ).limitations;
+        } catch {
+          return [];
+        }
+      })();
+      const adapterLimitations = [
+        "strict_common_subset",
+        ...(source === "anthropic-messages" ? adaptedRequestLimitations : []),
+      ].join(",");
+      // Providers return ordinary JSON error envelopes even when the successful
+      // operation would have streamed. Adapt that envelope as JSON; never feed
+      // it into an SSE state machine or advertise it as an event stream.
+      if (result.response.status < 200 || result.response.status >= 300) {
+        const adapted = await readAdaptedNonstreamBody({
+          body: result.response.body,
+          source,
+          target: operation.adaptation.requestedSurface,
+          status: result.response.status,
+          headers: result.response.headers,
+          signal: request.signal,
+        });
+        const adaptedHeaders = adaptedProviderResponseHeaders(
+          source,
           operation.adaptation.requestedSurface,
-          operation.adaptation.payload,
-        ).limitations;
-      } catch {
-        return [];
+          result.response.headers,
+        );
+        adaptedHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
+        return await commitAwareResponse(
+          new Response(adapted, {
+            status:
+              result.response.status >= 400 && result.response.status <= 599
+                ? result.response.status
+                : 502,
+            headers: adaptedHeaders,
+          }),
+        );
       }
-    })();
-    const adapterLimitations = [
-      "strict_common_subset",
-      ...(source === "anthropic-messages" ? adaptedRequestLimitations : []),
-    ].join(",");
-    // Providers return ordinary JSON error envelopes even when the successful
-    // operation would have streamed. Adapt that envelope as JSON; never feed
-    // it into an SSE state machine or advertise it as an event stream.
-    if (result.response.status < 200 || result.response.status >= 300) {
+      if (operation.stream) {
+        if (!result.response.body) {
+          const headers = new Headers(result.response.headers);
+          headers.set("x-wsmp-adapter-version", "1.0.0");
+          headers.set("x-wsmp-adapter-limitations", adapterLimitations);
+          return await commitAwareResponse(
+            new Response(null, { status: result.response.status, headers }),
+          );
+        }
+        return await commitAwareResponse(
+          new Response(
+            adaptedResponseBody({
+              body: result.response.body,
+              source,
+              target: operation.adaptation.requestedSurface,
+              stream: true,
+              status: result.response.status,
+              headers: result.response.headers,
+              signal: request.signal,
+              request: canonical ?? undefined,
+            }),
+            {
+              status: result.response.status,
+              headers: {
+                "content-type": "text/event-stream; charset=utf-8",
+                "x-wsmp-adapter-version": "1.0.0",
+                "x-wsmp-adapter-limitations": adapterLimitations,
+              },
+            },
+          ),
+        );
+      }
+      const bytes = new Uint8Array(await result.response.arrayBuffer());
       const adapted = await readAdaptedNonstreamBody({
-        body: result.response.body,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
         source,
         target: operation.adaptation.requestedSurface,
         status: result.response.status,
         headers: result.response.headers,
         signal: request.signal,
       });
-      const adaptedHeaders = adaptedProviderResponseHeaders(
-        source,
-        operation.adaptation.requestedSurface,
-        result.response.headers,
-      );
-      adaptedHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
-      return commitAwareResponse(
+      return await commitAwareResponse(
         new Response(adapted, {
-          status:
-            result.response.status >= 400 && result.response.status <= 599
-              ? result.response.status
-              : 502,
-          headers: adaptedHeaders,
+          status: result.response.status,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "x-wsmp-adapter-version": "1.0.0",
+            "x-wsmp-adapter-limitations": adapterLimitations,
+          },
         }),
       );
+    } catch (error) {
+      await releaseAfterPrecommitThrow();
+      throw error;
     }
-    if (operation.stream) {
-      if (!result.response.body) {
-        const headers = new Headers(result.response.headers);
-        headers.set("x-wsmp-adapter-version", "1.0.0");
-        headers.set("x-wsmp-adapter-limitations", adapterLimitations);
-        return commitAwareResponse(new Response(null, { status: result.response.status, headers }));
-      }
-      return commitAwareResponse(
-        new Response(
-          adaptedResponseBody({
-            body: result.response.body,
-            source,
-            target: operation.adaptation.requestedSurface,
-            stream: true,
-            status: result.response.status,
-            headers: result.response.headers,
-            signal: request.signal,
-            request: canonical ?? undefined,
-          }),
-          {
-            status: result.response.status,
-            headers: {
-              "content-type": "text/event-stream; charset=utf-8",
-              "x-wsmp-adapter-version": "1.0.0",
-              "x-wsmp-adapter-limitations": adapterLimitations,
-            },
-          },
-        ),
-      );
-    }
-    const bytes = new Uint8Array(await result.response.arrayBuffer());
-    const adapted = await readAdaptedNonstreamBody({
-      body: new ReadableStream({
-        start(controller) {
-          controller.enqueue(bytes);
-          controller.close();
-        },
-      }),
-      source,
-      target: operation.adaptation.requestedSurface,
-      status: result.response.status,
-      headers: result.response.headers,
-      signal: request.signal,
-    });
-    return commitAwareResponse(
-      new Response(adapted, {
-        status: result.response.status,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "x-wsmp-adapter-version": "1.0.0",
-          "x-wsmp-adapter-limitations": adapterLimitations,
-        },
-      }),
-    );
   };
-
-  let globalLease: ModelApiLimitLease | undefined;
 
   const listedMembers = await poolMemberRows(target.id);
   const members = forcedPoolMemberId
     ? listedMembers.filter((member) => member.id === forcedPoolMemberId)
     : listedMembers;
+  // C2: a Chat Test forced member may name an external member only on the
+  // `:external` name (where consent exists). On a plain name it can never
+  // turn into provider egress.
+  if (forcedPoolMemberId && members.length === 0 && !external.consent) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+    return externalRouteErrorResponse(operation.family, {
+      code: "forced_member_requires_external",
+      message: `The forced member is not a local member of "${target.modelId}". External members can be forced only with "${externalModelId(target.modelId)}".`,
+    });
+  }
+  // A pool whose only members are external cannot serve its plain name:
+  // plain names never leave the deployment.
+  if (listedMembers.length === 0 && target.externalMemberCount > 0 && !external.consent) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+    if (!external.requested)
+      return externalRouteErrorResponse(operation.family, {
+        code: "external_required",
+        message: `"${target.modelId}" has no local members, and plain pool names never leave this deployment. Use "${externalModelId(target.modelId)}" to allow external providers.`,
+      });
+    return externalRouteErrorResponse(
+      operation.family,
+      {
+        code: "external_unavailable",
+        message: externalUnavailableMessage(external.denial ?? "NO_EXTERNAL_MEMBERS", target),
+      },
+      { [FALLBACK_HEADER]: "unavailable" },
+    );
+  }
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
     await Promise.all(
@@ -4327,94 +4424,10 @@ async function relayPool({
       : [];
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
-  let providerPrimaryTargets: PublicProviderTarget[] = [];
-  let providerAffinityPolicy: AffinityPolicy | null = null;
-  let providerAffinityLiability: Pick<
-    PublicOverflowRequest,
-    "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
-  > | null = null;
-  if (
-    capacityRuntime &&
-    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
-    operation.contextInput &&
-    requestedSurface
-  ) {
-    const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, "PRIMARY");
-    providerAffinityPolicy = listed.affinityPolicy;
-    const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
-    const requestedOutputTokens =
-      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
-        ? BigInt(maxOutput)
-        : undefined;
-    const estimatedInputTokens =
-      operation.contextCount?.tokens !== undefined
-        ? BigInt(operation.contextCount.tokens)
-        : conservativeSerializedInputTokens(
-            new TextEncoder().encode(JSON.stringify(operation.contextInput)).byteLength,
-          );
-    const requestedFeatures = profileSurfaceRequest(operation.contextInput);
-    const requiredFeatures = Object.entries(requestedFeatures)
-      .filter(([, enabled]) => enabled === true)
-      .map(([feature]) => feature);
-    providerAffinityLiability = {
-      userId: target.ownerUserId,
-      requestedSurface,
-      estimatedInputTokens,
-      requestedOutputTokens,
-      liability:
-        requestedOutputTokens === undefined
-          ? { accountingVersion: "provider-billable-v1" }
-          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
-    };
-    const providerCompatibilityRequest = {
-      requestedProtocol: operation.family === "messages" ? "anthropic" : "openai",
-      requestedSurface,
-      stream: operation.stream,
-      requiredFeatures,
-      requestedOutputTokens,
-      adaptationEnabled: operation.adaptation?.poolEnabled === true,
-      renderForTarget: canonicalAdaptationRequest
-        ? async () => {
-            throw new Error("Compatibility probe only.");
-          }
-        : undefined,
-      liability:
-        requestedOutputTokens === undefined
-          ? { accountingVersion: "provider-billable-v1" }
-          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
-      estimatedInputTokens,
-      contextTokens:
-        requestedOutputTokens === undefined
-          ? undefined
-          : estimatedInputTokens + requestedOutputTokens,
-      path: operation.path,
-      headers: request.headers,
-      method: request.method,
-    } as const;
-    providerPrimaryTargets = (listed.acknowledged ? listed.targets : []).flatMap(
-      (providerTarget) => {
-        if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
-        const resolvedExecution = resolvePublicProviderExecution(
-          providerTarget,
-          providerCompatibilityRequest,
-        );
-        const resolvedTarget = { ...providerTarget, resolvedExecution };
-        return publicTargetCompatibility(providerTarget, providerCompatibilityRequest) ===
-          "COMPATIBLE" &&
-          matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
-          ? [resolvedTarget]
-          : [];
-      },
-    );
-  }
-  if (
-    members.length > 0 &&
-    contextEligibleMembers.length === 0 &&
-    providerPrimaryTargets.length === 0
-  ) {
-    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined, {
-      onlyTier: "PUBLIC_OVERFLOW",
-    });
+  if (members.length > 0 && contextEligibleMembers.length === 0) {
+    // (c) Context ceiling: only an explicit, consented `:external` request may
+    // go external. A plain name keeps the context error.
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
     if (overflow) return overflow;
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
@@ -4453,14 +4466,13 @@ async function relayPool({
       })(),
     );
   }
-  if (eligibleMembers.length === 0 && providerPrimaryTargets.length === 0) {
+  if (eligibleMembers.length === 0) {
+    // (b) No compatible local member.
     const overflow = await tryPublicOverflow(
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
-      { onlyTier: "PUBLIC_OVERFLOW" },
     );
     if (overflow) return overflow;
-    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
@@ -4498,86 +4510,51 @@ async function relayPool({
     ...(legacySequence.ok ? legacySequence.candidates : []),
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
-  const providerByMemberId = new Map(
-    providerPrimaryTargets.map((providerTarget) => [providerTarget.poolMemberId, providerTarget]),
-  );
-  const providerRouteCandidates = providerPrimaryTargets.map((providerTarget) => ({
-    poolMemberId: providerTarget.poolMemberId,
-    poolId: target.id,
-    discoveredModelId: "",
-    upstreamModelId: providerTarget.upstreamModelId,
-    endpointId: providerTarget.executionTargetId,
-    cliDeviceId: "",
-    weight: providerTarget.weight ?? 1,
-    healthStatus: "HEALTHY" as const,
-    consecutiveRetryableFailures: 0,
-    lastFailureClass: null,
-    lastFailureAt: null,
-    nextRetryAt: null,
-  }));
   const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
-    const provider = providerByMemberId.get(candidate.poolMemberId);
-    if (provider)
-      return provider.resolvedExecution
-        ? provider.resolvedExecution.mode === "native"
-          ? 0
-          : 1
-        : provider.nativeSurfaces.includes(requestedSurface!)
-          ? 0
-          : 1;
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
-  // Local and provider-backed PRIMARY members enter one scored sequence.
-  // Native compatibility is the first class; member weight is the shared
-  // score within a class, with stable member IDs providing deterministic ties.
-  let routeCandidates = [...localRouteCandidates, ...providerRouteCandidates].sort(
+  // PRIMARY members are always local. Native compatibility is the first class;
+  // member weight is the score within a class, with stable member IDs
+  // providing deterministic ties.
+  let routeCandidates = [...localRouteCandidates].sort(
     (left, right) =>
       routeModeRank(left) - routeModeRank(right) ||
       right.weight - left.weight ||
       left.poolMemberId.localeCompare(right.poolMemberId),
   );
   if (routeCandidates.length === 0) {
+    // (b) No healthy local member.
     const overflow = await tryPublicOverflow(
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
-      { onlyTier: "PUBLIC_OVERFLOW" },
     );
     if (overflow) return overflow;
-    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
     return operationFailureResponse(operation, "disconnected");
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
+  // An `:external` caller with an external plan leaves the local queue after
+  // the pool's externalAfterWaitMs (never later than the member budget).
+  const externalAfterWaitMs =
+    external.consent && target.externalMemberCount > 0
+      ? (eligibleMembers[0]?.ModelPool?.externalAfterWaitMs ?? null)
+      : null;
   const admissionCandidateForRoute = (
     candidate: (typeof routeCandidates)[number],
     candidateOrder: number,
-    admissionStartedAt: number,
   ) => {
     const member = memberById.get(candidate.poolMemberId);
-    if (member)
-      return poolAdmissionCandidate(member, candidateOrder, admissionStartedAt, relayDeadlineMs);
-    const provider = providerByMemberId.get(candidate.poolMemberId);
-    if (!provider?.inferenceCapacityId) return null;
-    return {
-      capacityId: provider.inferenceCapacityId,
-      executionTargetId: provider.executionTargetId,
-      poolMemberId: provider.poolMemberId,
-      candidateOrder,
-      deadlineAt: boundedAdmissionDeadline(
-        admissionStartedAt,
-        relayDeadlineMs,
-        provider.capacityWaitBudgetMs ?? null,
-      ),
-    };
+    if (!member) return null;
+    return poolAdmissionCandidate(member, candidateOrder, relayDeadlineMs, externalAfterWaitMs);
   };
   let affinityDecision: AffinityDecision | null = null;
   const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
-  const affinityPolicy = eligibleMembers[0]
+  const affinityPolicy: AffinityPolicy = eligibleMembers[0]
     ? affinityPolicyForMember(eligibleMembers[0])
-    : (providerAffinityPolicy ?? {
+    : {
         enabled: false,
         ttlSeconds: 3600,
         maxRecords: 10_000,
@@ -4585,17 +4562,8 @@ async function relayPool({
         conversationWeight: 150,
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
-      });
+      };
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
-    const providerAffinityTargets = providerAffinityLiability
-      ? await buildProviderAffinityTargets({
-          request: providerAffinityLiability,
-          targets: providerPrimaryTargets,
-        })
-      : [];
-    const providerAffinityByMember = new Map(
-      providerAffinityTargets.map((candidate) => [candidate.poolMemberId, candidate]),
-    );
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
       const affinityTarget = member
@@ -4605,7 +4573,7 @@ async function relayPool({
             executionByMember.get(member.id),
             candidate.healthStatus,
           )
-        : (providerAffinityByMember.get(candidate.poolMemberId) ?? null);
+        : null;
       return affinityTarget ? [affinityTarget] : [];
     });
     if (affinityTargets.length === routeCandidates.length) {
@@ -4632,12 +4600,8 @@ async function relayPool({
           .sort((left, right) => {
             const classDifference = routeModeRank(left.candidate) - routeModeRank(right.candidate);
             if (classDifference !== 0) return classDifference;
-            const leftTarget =
-              memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id ??
-              providerByMemberId.get(left.candidate.poolMemberId)?.executionTargetId;
-            const rightTarget =
-              memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id ??
-              providerByMemberId.get(right.candidate.poolMemberId)?.executionTargetId;
+            const leftTarget = memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id;
+            const rightTarget = memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id;
             return (
               (leftTarget
                 ? (affinityOrder.get(leftTarget) ?? left.originalIndex)
@@ -4663,12 +4627,10 @@ async function relayPool({
     await updateContextCountMetadata(relayRequestId, count);
   };
   if (capacityRuntime) {
-    const admissionStartedAt = Date.now();
     const admissionCandidates = routeCandidates.map((candidate, candidateOrder) =>
-      admissionCandidateForRoute(candidate, candidateOrder, admissionStartedAt),
+      admissionCandidateForRoute(candidate, candidateOrder),
     );
     if (admissionCandidates.some((candidate) => candidate === null)) {
-      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
       return operationFailureResponse(operation, "unsupported_capability");
@@ -4692,17 +4654,15 @@ async function relayPool({
         signal: request.signal,
       });
     } catch {
-      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
       return operationFailureResponse(operation, "unknown");
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
-      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined, {
-        onlyTier: "PUBLIC_OVERFLOW",
-      });
+      // (a) Local wait expired (member/pool budget, or externalAfterWaitMs
+      // for a consented `:external` caller), measured on the database clock.
+      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
       if (overflow) return overflow;
-      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
       return operationFailureResponse(operation, "rate_limited");
@@ -4749,6 +4709,9 @@ async function relayPool({
     return operationFailureResponse(operation, "unknown");
   }
   let finalFailure: RelayFailure = "unknown";
+  // H1: set when the caller's own per-token/per-user cap stopped the retry
+  // loop. That is never a fallback trigger; the caller gets 429.
+  let callerLimitReached = false;
   let attemptCount = 0;
   // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
   // and retry bookkeeping. Pool size never multiplies the public timeout.
@@ -4770,13 +4733,8 @@ async function relayPool({
     let candidate = selectedRouteCandidates[candidateIndex]!;
     if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
       const remaining = selectedRouteCandidates.slice(candidateIndex);
-      const admissionStartedAt = Date.now();
       const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
-        const resolved = admissionCandidateForRoute(
-          remainingCandidate,
-          candidateOrder,
-          admissionStartedAt,
-        );
+        const resolved = admissionCandidateForRoute(remainingCandidate, candidateOrder);
         if (!resolved)
           throw new Error("Capacity-enabled pool member lost execution target identity.");
         return resolved;
@@ -4841,32 +4799,13 @@ async function relayPool({
       } catch (error) {
         await releaseCapacityAttempt();
         finalFailure = error instanceof ModelApiLimitError ? error.failure : "unknown";
+        callerLimitReached = error instanceof ModelApiLimitError;
         break;
       }
     }
     if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
       finalFailure = "timeout";
       break;
-    }
-    const providerTarget = providerByMemberId.get(candidate.poolMemberId);
-    if (providerTarget) {
-      const providerLease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
-      capacityLease = undefined;
-      globalLease?.release();
-      globalLease = undefined;
-      const providerResponse = await tryPublicOverflow(
-        "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        async () => undefined,
-        {
-          onlyTier: "PRIMARY",
-          forcedProviderMemberId: providerTarget.poolMemberId,
-          preAdmittedProviderLease: providerLease,
-        },
-      );
-      if (providerResponse) return providerResponse;
-      if (providerLease) await releasePreAdmittedProviderLease(providerLease);
-      finalFailure = "upstream_5xx";
-      continue;
     }
     const member = memberById.get(candidate.poolMemberId);
     if (!member) continue;
@@ -5517,24 +5456,19 @@ async function relayPool({
     }
   }
 
+  // (a) local wait expired, or (d) a retryable pre-first-byte local failure
+  // after the other local members were tried. Never the caller's own caps.
   const overflowReason: PublicOverflowReason =
     finalFailure === "rate_limited" || finalFailure === "timeout"
       ? "LOCAL_WAIT_EXPIRED"
       : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
-  const overflow = await tryPublicOverflow(
-    overflowReason,
-    async () => {
-      const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
-      capacityLease = undefined;
-      const acquiredGlobalLease = globalLease;
-      globalLease = undefined;
-      await settleRelayCleanup([
-        () => acquiredGlobalLease?.release(),
-        () => (lease ? capacityRuntime?.release(lease) : undefined),
-      ]);
-    },
-    { onlyTier: "PUBLIC_OVERFLOW" },
-  );
+  const overflow = callerLimitReached
+    ? null
+    : await tryPublicOverflow(overflowReason, async () => {
+        const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+        capacityLease = undefined;
+        await settleRelayCleanup([() => (lease ? capacityRuntime?.release(lease) : undefined)]);
+      });
   if (overflow) return overflow;
 
   await settleRelayCleanup([
@@ -5646,19 +5580,17 @@ async function relaySelectedModelNoFailover({
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: boundedAdmissionDeadline(
-            Date.now(),
-            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
-            selectedPoolMember
-              ? effectiveMemberWaitBudget(selectedPoolMember)
-              : (selected.ExecutionTarget?.directWaitBudgetMs ?? null),
-          ),
+          deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
             {
               capacityId: identity.inferenceCapacityId,
               executionTargetId: identity.id,
               poolMemberId: selectedPoolMember?.id,
               candidateOrder: 0,
+              // Database-clock budget; 0 admits only if free now.
+              waitBudgetMs: selectedPoolMember
+                ? effectiveMemberWaitBudget(selectedPoolMember)
+                : (selected.ExecutionTarget?.directWaitBudgetMs ?? null),
             },
           ],
         },
@@ -6421,10 +6353,90 @@ function directModelIdFromRow(row: DirectModelRelayRow): string {
   return `${row.Endpoint.slug}/${row.upstreamModelId}`;
 }
 
+/**
+ * Per-request external route decision for a pool. `consent` is non-null only
+ * when every egress condition holds for this request (see external-route.ts);
+ * member availability is still checked at dispatch time.
+ */
+type PoolExternalRoute = {
+  /** The caller asked for `owner/pool:external`. */
+  requested: boolean;
+  consent: ExternalEgressConsent | null;
+  /** Why an `:external` request has no consent (serve local, `x-wsmp-fallback: unavailable`). */
+  denial: ExternalEgressDenial | null;
+};
+
+const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, denial: null };
+
+/** Only these operations may ever be dispatched to an external provider. */
+function operationAcceptsExternalVariant(
+  operation: Pick<RelayOperation, "family" | "capability">,
+): boolean {
+  return (
+    operation.capability === "chat.completions" ||
+    operation.capability === "responses.create" ||
+    operation.capability === "messages.create"
+  );
+}
+
+/** count_tokens treats `:external` as the base pool and never egresses. */
+function operationTreatsExternalAsBase(
+  operation: Pick<RelayOperation, "family" | "capability">,
+): boolean {
+  return (
+    operation.capability === "messages.countTokens" ||
+    operation.capability === "responses.countTokens"
+  );
+}
+
+function externalFallbackReasonHeader(reason: PublicOverflowReason): string {
+  if (reason === "LOCAL_WAIT_EXPIRED") return "local_wait_expired";
+  if (reason === "NO_COMPATIBLE_HEALTHY_PRIMARY") return "no_local_member";
+  if (reason === "LOCAL_CONTEXT_CEILING") return "local_context_ceiling";
+  return "local_failure";
+}
+
+/**
+ * Evaluates the egress gate for a resolved pool name. Returns an error
+ * response when the request must stop (switch off, token not permitted, MCP,
+ * or an operation that cannot use the variant); otherwise the route decision.
+ */
+function resolvePoolExternalRoute({
+  requester,
+  pool,
+  externalRequested,
+  externalPoolIds,
+  operation,
+}: {
+  requester: RelayRequester;
+  pool: VisibleModelPoolTarget;
+  externalRequested: boolean;
+  externalPoolIds: ReadonlySet<string>;
+  operation: Pick<RelayOperation, "family" | "capability">;
+}): PoolExternalRoute | ExternalRouteError {
+  if (!externalRequested || operationTreatsExternalAsBase(operation)) return NO_EXTERNAL_ROUTE;
+  if (!operationAcceptsExternalVariant(operation))
+    return {
+      code: "external_variant_unsupported",
+      message: `The ":${EXTERNAL_MODEL_VARIANT}" variant is available only for chat completions, Responses, and Messages. Use "${pool.modelId}" for this endpoint; it is always served by local members.`,
+    };
+  const decision = evaluateExternalEgress({
+    requested: true,
+    requester,
+    tokenPermitsPool: externalPoolIds.has(pool.id),
+    pool,
+  });
+  if (decision.granted) return { requested: true, consent: decision.consent, denial: null };
+  const error = externalDenialError(decision.denial, pool);
+  if (error) return error;
+  return { requested: true, consent: null, denial: decision.denial };
+}
+
 async function relayPreparedModeledRequest({
   request,
   requester,
   targets,
+  externalPoolIds = new Set<string>(),
   prepared,
   operation,
   manager,
@@ -6437,12 +6449,40 @@ async function relayPreparedModeledRequest({
     directModels: VisibleDirectModelTarget[];
     modelPools: VisibleModelPoolTarget[];
   };
+  /** Pools for which the API token consents to `:external` (empty for sessions/MCP). */
+  externalPoolIds?: ReadonlySet<string>;
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   capacityRuntime?: CapacityAdmissionRuntime;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
+  // Name resolution happens against VISIBLE targets only, after
+  // authentication, so no error reveals whether an invisible pool exists.
+  const resolution = resolveRequestedModelName(targets, prepared.model);
+  if (resolution.kind === "not_found") {
+    await prepared.dispose?.();
+    return operationFailureResponse(operation, "not_found");
+  }
+  if (resolution.kind === "error") {
+    await prepared.dispose?.();
+    return externalRouteErrorResponse(operation.family, resolution.error);
+  }
+  let external: PoolExternalRoute = NO_EXTERNAL_ROUTE;
+  if (resolution.kind === "pool") {
+    const route = resolvePoolExternalRoute({
+      requester,
+      pool: resolution.target,
+      externalRequested: resolution.externalRequested,
+      externalPoolIds,
+      operation,
+    });
+    if ("code" in route) {
+      await prepared.dispose?.();
+      return externalRouteErrorResponse(operation.family, route);
+    }
+    external = route;
+  }
   let contextCount: ContextCountTelemetry | undefined;
   if (prepared.payload) {
     try {
@@ -6455,8 +6495,8 @@ async function relayPreparedModeledRequest({
       return operationFailureResponse(operation, request.signal.aborted ? "cancelled" : "unknown");
     }
   }
-  const directTarget = directTargetByModelId(targets.directModels, prepared.model);
-  if (directTarget) {
+  if (resolution.kind === "direct") {
+    const directTarget = resolution.target;
     const transcriptionLimitError = await transcriptionUploadLimitResponse({
       profile: prepared.transcriptionProfile,
       modelOrPoolMaxBytes: directTarget.maxAttachmentBytes,
@@ -6494,101 +6534,104 @@ async function relayPreparedModeledRequest({
     });
   }
 
-  const poolTarget = poolTargetByModelId(targets.modelPools, prepared.model);
-  if (poolTarget) {
-    const transcriptionLimitError = await transcriptionUploadLimitResponse({
-      profile: prepared.transcriptionProfile,
-      modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
-    });
-    if (transcriptionLimitError) {
+  const poolTarget = resolution.target;
+  const transcriptionLimitError = await transcriptionUploadLimitResponse({
+    profile: prepared.transcriptionProfile,
+    modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
+  });
+  if (transcriptionLimitError) {
+    await prepared.dispose?.();
+    return transcriptionLimitError;
+  }
+  const limitError = await attachmentLimitResponse({
+    payload: prepared.payload,
+    requesterUserId: requester.userId,
+    modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
+  });
+  if (limitError) {
+    await prepared.dispose?.();
+    return limitError;
+  }
+  const maybeTransformed = await maybeApplyPoolMediaTransformer({
+    request,
+    requester,
+    poolId: poolTarget.id,
+    prepared,
+    operationFamily: operation.family,
+    manager,
+    limiter,
+  });
+  if (maybeTransformed instanceof Response) {
+    await prepared.dispose?.();
+    return maybeTransformed;
+  }
+  prepared = maybeTransformed;
+  if (prepared.payload) {
+    try {
+      // Media descriptions can grow or shrink the serialized request. Pool
+      // eligibility must use the payload that will actually reach members.
+      contextCount = await countSerializedRequestContext({
+        input: prepared.payload,
+        signal: request.signal,
+      });
+    } catch {
       await prepared.dispose?.();
-      return transcriptionLimitError;
+      return operationFailureResponse(operation, request.signal.aborted ? "cancelled" : "unknown");
     }
-    const limitError = await attachmentLimitResponse({
-      payload: prepared.payload,
-      requesterUserId: requester.userId,
-      modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
-    });
-    if (limitError) {
-      await prepared.dispose?.();
-      return limitError;
-    }
-    const maybeTransformed = await maybeApplyPoolMediaTransformer({
-      request,
-      requester,
-      poolId: poolTarget.id,
-      prepared,
-      operationFamily: operation.family,
-      manager,
-      limiter,
-    });
-    if (maybeTransformed instanceof Response) {
-      await prepared.dispose?.();
-      return maybeTransformed;
-    }
-    prepared = maybeTransformed;
-    if (prepared.payload) {
-      try {
-        // Media descriptions can grow or shrink the serialized request. Pool
-        // eligibility must use the payload that will actually reach members.
-        contextCount = await countSerializedRequestContext({
-          input: prepared.payload,
-          signal: request.signal,
-        });
-      } catch {
-        await prepared.dispose?.();
-        return operationFailureResponse(
-          operation,
-          request.signal.aborted ? "cancelled" : "unknown",
-        );
-      }
-    }
-
-    const relayOperation: RelayOperation = {
-      ...operation,
-      stream: prepared.stream,
-      buildRequest: prepared.buildRequest,
-      transcriptionProfile: prepared.transcriptionProfile,
-      dispose: prepared.dispose,
-      contextCount,
-      contextInput: prepared.payload ?? undefined,
-      ...(prepared.payload &&
-      (operation.family === "chat.completions" ||
-        (operation.family === "responses" && operation.capability === "responses.create") ||
-        (operation.family === "messages" && operation.capability === "messages.create"))
-        ? {
-            adaptation: {
-              poolEnabled: poolTarget.protocolAdaptationEnabled,
-              allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
-              requestedSurface:
-                operation.family === "chat.completions"
-                  ? ("openai-chat" as const)
-                  : operation.family === "responses" && operation.capability === "responses.create"
-                    ? ("openai-responses" as const)
-                    : ("anthropic-messages" as const),
-              payload: prepared.payload,
-            },
-          }
-        : {}),
-    };
-    const response = await relayPool({
-      request,
-      requester,
-      target: poolTarget,
-      operation: relayOperation,
-      manager,
-      limiter,
-      transformDebug: prepared.transformDebug,
-      capacityRuntime,
-    });
-    if (requester.exposeTransformDebug && prepared.transformDebug) {
-      return attachTransformDebug(response, prepared.transformDebug);
-    }
-    return response;
   }
 
-  await prepared.dispose?.();
-  return operationFailureResponse(operation, "not_found");
+  const relayOperation: RelayOperation = {
+    ...operation,
+    stream: prepared.stream,
+    buildRequest: prepared.buildRequest,
+    transcriptionProfile: prepared.transcriptionProfile,
+    dispose: prepared.dispose,
+    contextCount,
+    contextInput: prepared.payload ?? undefined,
+    ...(prepared.payload &&
+    (operation.family === "chat.completions" ||
+      (operation.family === "responses" && operation.capability === "responses.create") ||
+      (operation.family === "messages" && operation.capability === "messages.create"))
+      ? {
+          adaptation: {
+            poolEnabled: poolTarget.protocolAdaptationEnabled,
+            allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
+            requestedSurface:
+              operation.family === "chat.completions"
+                ? ("openai-chat" as const)
+                : operation.family === "responses" && operation.capability === "responses.create"
+                  ? ("openai-responses" as const)
+                  : ("anthropic-messages" as const),
+            payload: prepared.payload,
+          },
+        }
+      : {}),
+  };
+  let response = await relayPool({
+    request,
+    requester,
+    target: poolTarget,
+    operation: relayOperation,
+    manager,
+    limiter,
+    transformDebug: prepared.transformDebug,
+    capacityRuntime,
+    external,
+  });
+  // Tell the client which route served it. External responses already carry
+  // `x-wsmp-route: pool-external`, the reason, and the served model.
+  if (!response.headers.has(ROUTE_HEADER)) {
+    const noExternalPlan =
+      external.requested && (!external.consent || poolTarget.externalMemberCount === 0);
+    response = withResponseHeaders(response, {
+      [ROUTE_HEADER]: "local",
+      ...(noExternalPlan ? { [FALLBACK_HEADER]: "unavailable" } : {}),
+    });
+  }
+  if (requester.exposeTransformDebug && prepared.transformDebug) {
+    return attachTransformDebug(response, prepared.transformDebug);
+  }
+  return response;
 }
 
 async function authenticatedModeledHandler({
@@ -6627,11 +6670,13 @@ async function authenticatedModeledHandler({
   let responseReturned = false;
   try {
     const requester = requesterFromToken(token);
-    const targets = await listVisibleModelTargetsForToken(token);
+    const { targets, externalPoolIds } =
+      await listVisibleModelTargetsWithExternalPermissionForToken(token);
     const response = await relayPreparedModeledRequest({
       request,
       requester,
       targets,
+      externalPoolIds,
       prepared,
       operation,
       manager,
@@ -6740,6 +6785,8 @@ async function relayBoundProviderResponse(input: {
   contextInput?: JsonObject;
   contextCount?: ContextCountTelemetry;
   capacityRuntime?: CapacityAdmissionRuntime;
+  /** Caller consent for this bound external route (all egress conditions). */
+  externalConsent: ExternalEgressConsent;
 }): Promise<Response> {
   const boundStartedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -6752,6 +6799,7 @@ async function relayBoundProviderResponse(input: {
     operation: input.capability,
     requestBytes: input.body.byteLength,
     contextCount: input.contextCount,
+    fallbackRoute: "pool-external",
   });
   const maxOutput = input.contextInput?.max_output_tokens;
   const requestedOutputTokens =
@@ -6768,6 +6816,7 @@ async function relayBoundProviderResponse(input: {
     poolId: input.stickyRoute.visibleTarget.id,
     requestId: relayRequestId,
     reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+    externalConsent: input.externalConsent,
     requestedProtocol: "openai",
     requestedSurface: "openai-responses",
     stream: input.stream,
@@ -6793,13 +6842,15 @@ async function relayBoundProviderResponse(input: {
         { state: "ADMITTED" }
       >["lease"]
     | undefined;
-  const dispatchBoundTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
-    if (!input.capacityRuntime)
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+  // A bound follow-up targets exactly the external member that served the
+  // original response; there is no failover to other members or tiers.
+  const dispatchBoundTarget = async (): Promise<
+    Awaited<ReturnType<typeof dispatchPublicOverflow>>
+  > => {
+    if (!input.capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const listed = await listPublicOverflowTargets(
       input.stickyRoute.visibleTarget.ownerUserId,
       input.stickyRoute.visibleTarget.id,
-      memberTier,
     );
     const exactTarget = listed.targets.find(
       (target) =>
@@ -6808,7 +6859,7 @@ async function relayBoundProviderResponse(input: {
         target.providerModelId === input.stickyRoute.binding.providerModelId,
     );
     if (!exactTarget?.inferenceCapacityId)
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const admission = await acquireCapacityWithTelemetry({
       runtime: input.capacityRuntime,
       relayRequestId,
@@ -6821,30 +6872,25 @@ async function relayBoundProviderResponse(input: {
         poolId: input.stickyRoute.visibleTarget.id,
         basePriority: 16,
         connectionOwner: "model-api-provider-stickiness",
-        deadlineAt: new Date(Date.now() + MODEL_API_RELAY_TIMEOUT_MS),
+        deadlineAt: new Date(boundStartedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
         candidates: [
           {
             capacityId: exactTarget.inferenceCapacityId,
             executionTargetId: exactTarget.executionTargetId,
             poolMemberId: exactTarget.poolMemberId,
             candidateOrder: 0,
-            deadlineAt: boundedAdmissionDeadline(
-              Date.now(),
-              Date.now() + MODEL_API_RELAY_TIMEOUT_MS,
-              exactTarget.capacityWaitBudgetMs ?? null,
-            ),
+            waitBudgetMs: exactTarget.capacityWaitBudgetMs ?? null,
           },
         ],
       },
       signal: input.request.signal,
     });
     if (admission.state !== "ADMITTED")
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
     try {
       result = await dispatchPublicOverflow({
         ...boundRequest,
-        memberTier,
         forcedPoolMemberId: exactTarget.poolMemberId,
       });
     } catch (error) {
@@ -6858,14 +6904,9 @@ async function relayBoundProviderResponse(input: {
     providerCapacityLease = admission.lease;
     return result;
   };
-  let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
-  let result: Awaited<ReturnType<typeof dispatchBoundTier>>;
+  let result: Awaited<ReturnType<typeof dispatchBoundTarget>>;
   try {
-    result = await dispatchBoundTier("PRIMARY");
-    if (!result.dispatched) {
-      selectedTier = "PUBLIC_OVERFLOW";
-      result = await dispatchBoundTier("PUBLIC_OVERFLOW");
-    }
+    result = await dispatchBoundTarget();
   } catch (error) {
     // Admission/dispatch threw before any provider terminal exists: finalize
     // the request here so it never lingers PENDING (and is counted once).
@@ -6902,7 +6943,7 @@ async function relayBoundProviderResponse(input: {
         selectedNativeSurface: "OPENAI_RESPONSES",
         adapterMode: "NATIVE",
         publicEgress: true,
-        selectedPoolMemberTier: selectedTier,
+        selectedPoolMemberTier: "PUBLIC_OVERFLOW",
         providerAccountId: result.target.providerAccountId,
         providerModelId: result.target.providerModelId,
         providerAttemptId: result.attemptId,
@@ -6986,14 +7027,19 @@ async function relayBoundProviderResponse(input: {
     });
   }
   const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
-  return providerCapacityLease && input.capacityRuntime
-    ? await holdOrReleaseCapacityResponse(
-        input.capacityRuntime,
-        committed,
-        providerCapacityLease,
-        input.request.signal,
-      )
-    : committed;
+  const held =
+    providerCapacityLease && input.capacityRuntime
+      ? await holdOrReleaseCapacityResponse(
+          input.capacityRuntime,
+          committed,
+          providerCapacityLease,
+          input.request.signal,
+        )
+      : committed;
+  return withResponseHeaders(held, {
+    [ROUTE_HEADER]: "pool-external",
+    [SERVED_MODEL_HEADER]: result.target.upstreamModelId,
+  });
 }
 
 function responseIdParam(responseId: string | undefined): string | Response {
@@ -7029,9 +7075,12 @@ export async function responsesCreateHandler({
   const requester = chatTestUserId
     ? requesterFromChatTestUser(chatTestUserId)
     : requesterFromToken(token!);
-  const targets = chatTestUserId
-    ? await listVisibleModelTargetsForUser(chatTestUserId)
-    : await listVisibleModelTargetsForToken(token!);
+  const { targets, externalPoolIds } = chatTestUserId
+    ? {
+        targets: await listVisibleModelTargetsForUser(chatTestUserId),
+        externalPoolIds: new Set<string>(),
+      }
+    : await listVisibleModelTargetsWithExternalPermissionForToken(token!);
   const previousId = previousResponseId(prepared.payload);
   const operation: Omit<RelayOperation, "stream" | "buildRequest"> = {
     family: "responses",
@@ -7039,9 +7088,8 @@ export async function responsesCreateHandler({
     path: "/v1/responses",
     capability: "responses.create",
     additionalCapabilities: previousId ? ["responses.statefulFollowUps"] : undefined,
-    // Explicitly stateless Responses requests do not create a follow-up route
-    // and may therefore use a public provider target. Stored/default Responses
-    // remain pinned to relay targets until provider stickiness is implemented.
+    // Explicitly stateless Responses requests do not create a follow-up route.
+    // Stored/default Responses served externally record a consented binding.
     responseStickiness: prepared.payload?.store === false ? undefined : { requester },
   };
 
@@ -7050,6 +7098,7 @@ export async function responsesCreateHandler({
       request,
       requester,
       targets,
+      externalPoolIds,
       prepared,
       operation,
       manager,
@@ -7059,13 +7108,50 @@ export async function responsesCreateHandler({
   }
 
   const stickyRoute = await resolveStickyRoute({ requester, responseId: previousId, targets });
-  if (stickyRoute instanceof Response) return stickyRoute;
+  if (stickyRoute instanceof Response) {
+    await prepared.dispose?.();
+    return stickyRoute;
+  }
+  // Follow-ups match the original route on the canonical base name, so an
+  // `:external` follow-up to a locally served response stays pinned locally.
+  const resolution = resolveRequestedModelName(targets, prepared.model);
+  if (resolution.kind === "error") {
+    await prepared.dispose?.();
+    return externalRouteErrorResponse(operation.family, resolution.error);
+  }
+  const matchesRoute =
+    resolution.kind !== "not_found" &&
+    resolution.target.id === stickyRoute.visibleTarget.id &&
+    (stickyRoute.target === "DIRECT_MODEL"
+      ? resolution.kind === "direct"
+      : resolution.kind === "pool");
+  if (!matchesRoute) {
+    await prepared.dispose?.();
+    return openAiFailureJsonResponse(
+      "access_denied",
+      "Response follow-up model does not match the original route.",
+    );
+  }
+  const externalRequested = resolution.kind === "pool" && resolution.externalRequested;
   if (stickyRoute.target === "PROVIDER") {
-    if (prepared.model !== stickyRoute.visibleTarget.modelId)
-      return openAiFailureJsonResponse(
-        "access_denied",
-        "Response follow-up model does not match the original route.",
-      );
+    // C3: a response served by an external provider can only be continued
+    // with explicit, still-valid consent for the same pool.
+    if (!externalRequested) {
+      await prepared.dispose?.();
+      return externalRouteErrorResponse(operation.family, {
+        code: "external_required",
+        message: `This response was served by an external provider. Continue it with "${externalModelId(stickyRoute.visibleTarget.modelId)}"; "${stickyRoute.visibleTarget.modelId}" never leaves this deployment.`,
+      });
+    }
+    const consent = boundExternalConsent({
+      requester,
+      pool: stickyRoute.visibleTarget,
+      externalPoolIds,
+    });
+    if ("code" in consent) {
+      await prepared.dispose?.();
+      return externalRouteErrorResponse(operation.family, consent);
+    }
     const built = await prepared.buildRequest(stickyRoute.binding.upstreamModelId);
     if (!(built.body instanceof Uint8Array)) {
       await built.body.dispose();
@@ -7084,20 +7170,26 @@ export async function responsesCreateHandler({
       captureReturnedResponse: true,
       contextInput: prepared.payload ?? undefined,
       capacityRuntime,
+      externalConsent: consent,
     });
   }
-  if (
-    (stickyRoute.target === "DIRECT_MODEL" &&
-      prepared.model !== stickyRoute.visibleTarget.modelId) ||
-    (stickyRoute.target === "MODEL_POOL" && prepared.model !== stickyRoute.visibleTarget.modelId)
-  ) {
-    return openAiFailureJsonResponse(
-      "access_denied",
-      "Response follow-up model does not match the original route.",
-    );
+  if (externalRequested && stickyRoute.target === "MODEL_POOL") {
+    // The follow-up stays on its local member, but an `:external` name still
+    // honours the switch and the token's consent like any other request.
+    const route = resolvePoolExternalRoute({
+      requester,
+      pool: stickyRoute.visibleTarget,
+      externalRequested,
+      externalPoolIds,
+      operation,
+    });
+    if ("code" in route) {
+      await prepared.dispose?.();
+      return externalRouteErrorResponse(operation.family, route);
+    }
   }
 
-  return relaySelectedModelNoFailover({
+  const response = await relaySelectedModelNoFailover({
     request,
     requester,
     selectedDiscoveredModelId: stickyRoute.selectedDiscoveredModelId,
@@ -7121,6 +7213,38 @@ export async function responsesCreateHandler({
     limiter,
     capacityRuntime,
   });
+  return stickyRoute.target === "MODEL_POOL"
+    ? withResponseHeaders(response, { [ROUTE_HEADER]: "local" })
+    : response;
+}
+
+/**
+ * Consent for reaching an externally served response again (follow-up,
+ * retrieve, cancel, compact, input items, delete). The binding itself was
+ * created with consent; the caller must still hold it now.
+ */
+function boundExternalConsent({
+  requester,
+  pool,
+  externalPoolIds,
+}: {
+  requester: RelayRequester;
+  pool: VisibleModelPoolTarget;
+  externalPoolIds: ReadonlySet<string>;
+}): ExternalEgressConsent | ExternalRouteError {
+  const decision = evaluateExternalEgress({
+    requested: true,
+    requester,
+    tokenPermitsPool: externalPoolIds.has(pool.id),
+    pool,
+  });
+  if (decision.granted) return decision.consent;
+  return (
+    externalDenialError(decision.denial, pool) ?? {
+      code: "external_not_permitted",
+      message: `This response was served by an external provider, and external fallback for "${pool.modelId}" is no longer allowed for this caller.`,
+    }
+  );
 }
 
 async function responsesStickyHandler({
@@ -7147,11 +7271,22 @@ async function responsesStickyHandler({
     return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
 
   const requester = requesterFromToken(token);
-  const targets = await listVisibleModelTargetsForToken(token);
+  const { targets, externalPoolIds } =
+    await listVisibleModelTargetsWithExternalPermissionForToken(token);
   const stickyRoute = await resolveStickyRoute({ requester, responseId, targets });
   if (stickyRoute instanceof Response) return stickyRoute;
 
   if (stickyRoute.target === "PROVIDER") {
+    // C3: retrieve, delete, cancel, compact, and input items on an externally
+    // served response need a consented binding (resolveStickyRoute) AND the
+    // caller's current consent (switch, token, owner flags). Every egress
+    // condition is re-checked again inside dispatchPublicOverflow.
+    const consent = boundExternalConsent({
+      requester,
+      pool: stickyRoute.visibleTarget,
+      externalPoolIds,
+    });
+    if ("code" in consent) return externalRouteErrorResponse("responses", consent);
     const built = prepareEmptyRelayRequest(request);
     const prepared = await built(stickyRoute.binding.upstreamModelId);
     if (!(prepared.body instanceof Uint8Array)) {
@@ -7170,6 +7305,7 @@ async function responsesStickyHandler({
       stream: false,
       captureReturnedResponse: false,
       capacityRuntime,
+      externalConsent: consent,
     });
   }
 
@@ -7257,15 +7393,19 @@ export async function anthropicMessagesHandler({
   const prepared = await prepareAnthropicModeledRequest(request, ingress);
   if (prepared instanceof Response) return prepared;
   if (countTokens) prepared.stream = false;
-  const targets = chatTestUserId
-    ? await listVisibleModelTargetsForUser(chatTestUserId)
-    : await listVisibleModelTargetsForToken(token!);
+  const { targets, externalPoolIds } = chatTestUserId
+    ? {
+        targets: await listVisibleModelTargetsForUser(chatTestUserId),
+        externalPoolIds: new Set<string>(),
+      }
+    : await listVisibleModelTargetsWithExternalPermissionForToken(token!);
   const response = await relayPreparedModeledRequest({
     request,
     requester: chatTestUserId
       ? requesterFromChatTestUser(chatTestUserId)
       : requesterFromToken(token!),
     targets,
+    externalPoolIds,
     prepared,
     operation: {
       family: "messages",
@@ -7301,8 +7441,11 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
     if (!token) {
       return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
     }
-    const targets = await listVisibleModelTargetsForToken(token);
-    return c.json(await modelListResponse(targets));
+    const { targets, externalPoolIds } =
+      await listVisibleModelTargetsWithExternalPermissionForToken(token);
+    return c.json(
+      await modelListResponse(targets, { requester: requesterFromToken(token), externalPoolIds }),
+    );
   });
 
   app.post("/chat/completions", async (c) =>

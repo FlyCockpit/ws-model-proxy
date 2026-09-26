@@ -7,8 +7,8 @@ import {
 } from "@ws-model-proxy/mailer";
 
 import {
+  externalFallbackMemberWhere,
   GRANTEE_PRIVACY_CONFIRMATION_REQUIRED,
-  providerPrimaryMemberWhere,
 } from "./effective-provider-egress";
 
 export type PrivacyGrantee = {
@@ -30,7 +30,7 @@ type PrivacyTx = Pick<Prisma.TransactionClient, "poolGrant" | "poolMember" | "da
  * (`SELECT … FOR UPDATE`) before reading grants or egress state. Do not take
  * execution-target or capacity locks before that pool row lock.
  */
-export async function countProviderPrimaryMembers(
+export async function countExternalFallbackMembers(
   tx: Pick<Prisma.TransactionClient, "poolMember">,
   poolId: string,
   excludeMemberId?: string,
@@ -39,7 +39,7 @@ export async function countProviderPrimaryMembers(
     where: {
       poolId,
       ...(excludeMemberId ? { id: { not: excludeMemberId } } : {}),
-      ...providerPrimaryMemberWhere,
+      ...externalFallbackMemberWhere,
     },
   });
 }

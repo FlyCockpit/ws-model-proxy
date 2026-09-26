@@ -11,17 +11,16 @@ import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-ac
 import {
   effectiveProviderEgress,
   egressProviderAccountLabels,
-  providerPrimaryMemberWhere,
+  externalFallbackMemberWhere,
 } from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
 
 export {
   effectiveProviderEgress,
+  externalFallbackMemberWhere,
   grantPoolAccessServerMessage,
   grantPoolAccessServerMessages,
-  providerPrimaryMemberCount,
-  providerPrimaryMemberWhere,
 } from "./effective-provider-egress";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
@@ -57,15 +56,18 @@ export type VisibleModelPoolTarget = {
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
-  publicEgressEnabled: boolean;
-  publicEgressAcknowledged: boolean;
+  /** Owner allows external fallback (for `owner/pool:external` requests only). */
+  fallbackEnabled: boolean;
+  /** Owner pays for grantees' external fallback. */
+  fallbackForGrantees: boolean;
+  /** Configured external fallback (provider) members, regardless of health. */
+  externalMemberCount: number;
   /**
-   * True when a grant must acknowledge provider egress: public overflow is on,
-   * or a PRIMARY member is a provider model. Overflow-only provider members
-   * do not count unless public overflow is on.
+   * True when the pool can send `:external` traffic to a provider for some
+   * caller: fallback is on and at least one external member is configured.
+   * Plain pool names never leave the deployment.
    */
   effectiveProviderEgress: boolean;
-  providerPrimaryMemberCount: number;
   /** Display names of provider accounts that can receive traffic. Never credentials. */
   providerAccountLabels: string[];
   allowLossyDeveloperRoleCollapse: boolean;
@@ -81,6 +83,8 @@ export type ModelApiTokenIdentity = {
   id: string;
   userId: string;
   scopeMode: ModelApiTokenScopeMode;
+  /** Human-set consent for `owner/pool:external`; false (private only) by default. */
+  allowExternal: boolean;
   lookupPrefix: string;
   expiresAt: Date | null;
   lastUsedAt: Date | null;
@@ -111,17 +115,12 @@ const modelPoolSelect = {
   maxAttachmentBytes: true,
   optimisticBasicTranscription: true,
   protocolAdaptationEnabled: true,
-  publicEgressEnabled: true,
-  publicEgressAcknowledged: true,
+  fallbackEnabled: true,
+  fallbackForGrantees: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
-    where: {
-      OR: [
-        providerPrimaryMemberWhere,
-        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: { not: null } } },
-      ],
-    },
+    where: externalFallbackMemberWhere,
     select: {
       id: true,
       tier: true,
@@ -179,19 +178,15 @@ function serializeModelPool(
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
-    publicEgressEnabled: row.publicEgressEnabled,
-    publicEgressAcknowledged: row.publicEgressAcknowledged,
+    fallbackEnabled: row.fallbackEnabled,
+    fallbackForGrantees: row.fallbackForGrantees,
+    externalMemberCount: (row.PoolMembers ?? []).length,
     effectiveProviderEgress: effectiveProviderEgress({
-      publicEgressEnabled: row.publicEgressEnabled,
-      providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
-        (member) => member.tier === "PRIMARY",
-      ).length,
+      fallbackEnabled: row.fallbackEnabled,
+      externalMemberCount: (row.PoolMembers ?? []).length,
     }),
-    providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
-      (member) => member.tier === "PRIMARY",
-    ).length,
     providerAccountLabels: egressProviderAccountLabels({
-      publicEgressEnabled: row.publicEgressEnabled,
+      fallbackEnabled: row.fallbackEnabled,
       members: (row.PoolMembers ?? []).map((member) => ({
         tier: member.tier,
         accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
@@ -282,19 +277,39 @@ export async function resolveAllowlistedModelTargets({
       continue;
     }
 
+    if (modelId.includes(":") && poolByModelId.has(modelId.slice(0, modelId.indexOf(":")))) {
+      throw new ORPCError("BAD_REQUEST", {
+        message:
+          "Allowlist the pool by its plain name. External access is a separate per-pool token setting.",
+      });
+    }
+
     throw new ORPCError("FORBIDDEN", { message: "Model is not visible to this user." });
   }
 
   return { directModels, modelPools };
 }
 
-export async function listVisibleModelTargetsForToken(
-  token: Pick<ModelApiTokenIdentity, "id" | "userId" | "scopeMode">,
-): Promise<VisibleModelTargets> {
+/**
+ * Pools for which this token consents to `owner/pool:external`. ALL_VISIBLE
+ * tokens are all-or-nothing (`allowExternal`); ALLOWLIST tokens additionally
+ * need the pool entry's `includeExternal`. This is only the token's consent:
+ * the deployment switch and the owner's pool settings are separate gates.
+ */
+export type TokenExternalPermission = ReadonlySet<string>;
+
+export async function listVisibleModelTargetsWithExternalPermissionForToken(
+  token: Pick<ModelApiTokenIdentity, "id" | "userId" | "scopeMode" | "allowExternal">,
+): Promise<{ targets: VisibleModelTargets; externalPoolIds: TokenExternalPermission }> {
   const visibleTargets = await listVisibleModelTargetsForUser(token.userId);
 
   if (token.scopeMode === "ALL_VISIBLE") {
-    return visibleTargets;
+    return {
+      targets: visibleTargets,
+      externalPoolIds: new Set(
+        token.allowExternal === true ? visibleTargets.modelPools.map((pool) => pool.id) : [],
+      ),
+    };
   }
 
   const entries = await prisma.modelApiTokenAllowlistEntry.findMany({
@@ -304,6 +319,7 @@ export async function listVisibleModelTargetsForToken(
       discoveredModelId: true,
       ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
+      includeExternal: true,
     },
   });
 
@@ -319,9 +335,24 @@ export async function listVisibleModelTargetsForToken(
       .map((entry) => entry.modelPoolId),
   );
 
+  const modelPools = visibleTargets.modelPools.filter((pool) => allowedPoolIds.has(pool.id));
+  const externalEntryPoolIds = new Set(
+    entries.flatMap((entry) =>
+      entry.target === "MODEL_POOL" && entry.modelPoolId && entry.includeExternal === true
+        ? [entry.modelPoolId]
+        : [],
+    ),
+  );
   return {
-    directModels: visibleTargets.directModels.filter((model) => allowedDirectIds.has(model.id)),
-    modelPools: visibleTargets.modelPools.filter((pool) => allowedPoolIds.has(pool.id)),
+    targets: {
+      directModels: visibleTargets.directModels.filter((model) => allowedDirectIds.has(model.id)),
+      modelPools,
+    },
+    externalPoolIds: new Set(
+      token.allowExternal === true
+        ? modelPools.filter((pool) => externalEntryPoolIds.has(pool.id)).map((pool) => pool.id)
+        : [],
+    ),
   };
 }
 
@@ -339,6 +370,7 @@ export async function authenticateModelApiTokenSecret(
       id: true,
       userId: true,
       scopeMode: true,
+      allowExternal: true,
       lookupPrefix: true,
       secretDigest: true,
       lastUsedAt: true,
@@ -372,6 +404,7 @@ export async function authenticateModelApiTokenSecret(
       id: true,
       userId: true,
       scopeMode: true,
+      allowExternal: true,
       lookupPrefix: true,
       expiresAt: true,
       lastUsedAt: true,
@@ -382,6 +415,7 @@ export async function authenticateModelApiTokenSecret(
     id: updated.id,
     userId: updated.userId,
     scopeMode: String(updated.scopeMode) as ModelApiTokenScopeMode,
+    allowExternal: updated.allowExternal === true,
     lookupPrefix: updated.lookupPrefix,
     expiresAt: updated.expiresAt,
     lastUsedAt: updated.lastUsedAt,

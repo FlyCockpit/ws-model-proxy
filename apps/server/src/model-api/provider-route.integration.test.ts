@@ -343,8 +343,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     grantee?: boolean;
     cookieAuth?: boolean;
     forceProviderMember?: boolean;
-    memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
-    privatePool?: boolean;
     routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
     multiSurfaceStreamingFallback?: boolean;
     developerPrefix?: boolean;
@@ -374,15 +372,15 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         slug: `pool-${suffix}`,
         name: "Provider route pool",
         protocolAdaptationEnabled: true,
-        publicEgressEnabled: !input.privatePool,
-        // Provider PRIMARY is still external egress even when overflow is
-        // disabled, so a private pool retains explicit owner consent.
-        publicEgressAcknowledged: true,
+        // Provider members are external fallback; callers opt in with
+        // `owner/pool:external`, and the owner pays for grantees explicitly.
+        fallbackEnabled: true,
+        fallbackForGrantees: input.grantee === true,
       },
     });
     expect(pool).toMatchObject({
-      publicEgressEnabled: !input.privatePool,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: input.grantee === true,
     });
     const grant = input.grantee
       ? await modules.prisma.poolGrant.create({
@@ -493,14 +491,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       data: {
         poolId: pool.id,
         executionTargetId: target.id,
-        tier: input.memberTier ?? "PUBLIC_OVERFLOW",
-        publicOrder: (input.memberTier ?? "PUBLIC_OVERFLOW") === "PUBLIC_OVERFLOW" ? 0 : null,
-        weight:
-          (input.memberTier ?? "PUBLIC_OVERFLOW") === "PRIMARY"
-            ? input.secondBehavior
-              ? 2
-              : 1
-            : 0,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
+        weight: 0,
       },
     });
     await modules.prisma.providerPricingVersion.create({
@@ -634,16 +627,15 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           inferenceCapacityId: secondCapacity.id,
         },
       });
-      const secondTier = input.memberTier ?? "PUBLIC_OVERFLOW";
       await modules.prisma.poolMember.create({
         data: {
           poolId: pool.id,
           executionTargetId: secondTarget.id,
-          tier: secondTier,
-          publicOrder: secondTier === "PUBLIC_OVERFLOW" ? 1 : null,
-          // The first model's higher weight makes the initial selection
+          tier: "PUBLIC_OVERFLOW",
+          // The first member's lower publicOrder makes the initial selection
           // deterministic while this member remains a routable failover.
-          weight: secondTier === "PRIMARY" ? 1 : 0,
+          publicOrder: 1,
+          weight: 0,
         },
       });
       await modules.prisma.providerPricingVersion.create({
@@ -702,6 +694,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       data: {
         userId: requester.id,
         name: "Provider route token",
+        // Human-set consent for `owner/pool:external`.
+        allowExternal: true,
         lookupPrefix: modules.security.credentialLookupPrefix(rawToken),
         secretDigest: modules.security.hmacDigestForForwarderPurpose({
           purpose: "modelApiToken",
@@ -748,10 +742,11 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       : modules.routes.createModelApiRoutes({
           manager,
         });
-    const modelId = modules.identifiers.poolModelId({
+    // Provider members are reachable only through the `:external` variant.
+    const modelId = `${modules.identifiers.poolModelId({
       userSlug: user.slug,
       poolSlug: pool.slug,
-    });
+    })}:external`;
     const stream = input.behavior === "stream" || input.behavior === "crash";
     const body =
       input.requested === "openai-chat"
@@ -941,8 +936,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       statefulResponses: true,
       grantee: true,
       secondBehavior: "json",
-      memberTier: "PRIMARY",
-      privatePool: true,
     });
     if (!result.grant) throw new Error("expected exact pool grant");
     expect(result.response.status).toBe(200);
@@ -961,8 +954,11 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       providerUpstreamModelId: result.model.upstreamModelId,
       nativeSurface: "OPENAI_RESPONSES",
       poolGrantId: result.grant.id,
+      fallbackRoute: "pool-external",
     });
-    expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+    expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(
+      true,
+    );
     const observationStart = upstreamObservations.length;
     const followUp = await result.app.request("/responses", {
       method: "POST",
@@ -1089,6 +1085,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     "account",
     "credential",
     "token",
+    "external consent",
+    "owner fallback",
   ] as const)("fails closed after bound provider %s invalidation", async (invalidation) => {
     if (!modules) throw new Error("modules unavailable");
     const result = await runCase({
@@ -1148,6 +1146,16 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           data: { status: "REVOKED", revokedAt: new Date() },
         });
       });
+    else if (invalidation === "external consent")
+      await modules.prisma.modelApiToken.updateMany({
+        where: { userId: result.user.id, name: "Provider route token" },
+        data: { allowExternal: false },
+      });
+    else if (invalidation === "owner fallback")
+      await modules.prisma.modelPool.update({
+        where: { id: result.pool.id },
+        data: { fallbackEnabled: false },
+      });
     else
       await modules.prisma.modelApiToken.updateMany({
         where: { userId: result.user.id, name: "Provider route token" },
@@ -1157,7 +1165,13 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const response = await result.app.request("/responses/resp_route", {
       headers: bearerHeaders(result.rawToken),
     });
-    expect(response.status).toBe(invalidation === "token" ? 401 : 404);
+    expect(response.status).toBe(
+      invalidation === "token"
+        ? 401
+        : invalidation === "external consent" || invalidation === "owner fallback"
+          ? 403
+          : 404,
+    );
     expect(upstreamObservations).toHaveLength(observationCount);
   });
 
@@ -1208,38 +1222,36 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   }
 
   for (const requested of requestedSurfaces) {
-    it(`${requested} executes provider PRIMARY native JSON in a private pool`, async () => {
+    it(`${requested} executes external fallback native JSON for an :external request`, async () => {
       const result = await runCase({
         requested,
         native: requested,
         behavior: "json",
-        memberTier: "PRIMARY",
-        privatePool: true,
       });
       expect(result.response.status).toBe(200);
-      expect(result.pool).toMatchObject({
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: true,
-      });
+      expect(result.response.headers.get("x-wsmp-route")).toBe("pool-external");
+      expect(result.pool).toMatchObject({ fallbackEnabled: true });
       expect(result.attemptEvents).not.toHaveLength(0);
-      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(
+        true,
+      );
       expect(result.settlements).toHaveLength(result.reservations.length);
       expectExactSuccessAccounting(result);
       expectJsonEnvelope(result, requested);
       expectAdapterTelemetry(result, "native", requested, requested);
     });
 
-    it(`${requested} executes provider PRIMARY native SSE in a private pool`, async () => {
+    it(`${requested} executes external fallback native SSE for an :external request`, async () => {
       const result = await runCase({
         requested,
         native: requested,
         behavior: "stream",
-        memberTier: "PRIMARY",
-        privatePool: true,
       });
       expect(result.response.status).toBe(200);
       expect(result.attempt.state).toBe("COMPLETED");
-      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(
+        true,
+      );
       expect(result.settlements).toHaveLength(result.reservations.length);
       expectExactSuccessAccounting(result);
       expectStreamEnvelope(result, requested);
@@ -1248,17 +1260,17 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   }
 
   it.each(crossPairs)(
-    "$requested executes provider PRIMARY adapted JSON from $native in a private pool",
+    "$requested executes external fallback adapted JSON from $native",
     async ({ requested, native }) => {
       const result = await runCase({
         requested,
         native,
         behavior: "json",
-        memberTier: "PRIMARY",
-        privatePool: true,
       });
       expect(result.response.status).toBe(200);
-      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(
+        true,
+      );
       expect(result.settlements).toHaveLength(result.reservations.length);
       expectExactSuccessAccounting(result);
       expectJsonEnvelope(result, requested);
@@ -1271,24 +1283,21 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     ["openai-chat", "anthropic-messages"],
     ["openai-responses", "openai-chat"],
     ["openai-responses", "anthropic-messages"],
-  ] as const)(
-    "%s executes provider PRIMARY adapted SSE from %s in a private pool",
-    async (requested, native) => {
-      const result = await runCase({
-        requested,
-        native,
-        behavior: "stream",
-        memberTier: "PRIMARY",
-        privatePool: true,
-      });
-      expect(result.response.status).toBe(200);
-      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
-      expect(result.settlements).toHaveLength(result.reservations.length);
-      expectExactSuccessAccounting(result);
-      expectStreamEnvelope(result, requested);
-      expectAdapterTelemetry(result, "adapted", requested, native);
-    },
-  );
+  ] as const)("%s executes external fallback adapted SSE from %s", async (requested, native) => {
+    const result = await runCase({
+      requested,
+      native,
+      behavior: "stream",
+    });
+    expect(result.response.status).toBe(200);
+    expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(
+      true,
+    );
+    expect(result.settlements).toHaveLength(result.reservations.length);
+    expectExactSuccessAccounting(result);
+    expectStreamEnvelope(result, requested);
+    expectAdapterTelemetry(result, "adapted", requested, native);
+  });
 
   it.each(crossPairs)(
     "$requested executes the full non-stream matrix from $native",
@@ -1678,8 +1687,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
             userId: user.id,
             slug: `rollback-${suffix}`,
             name: "Must roll back",
-            publicEgressEnabled: false,
-            publicEgressAcknowledged: false,
+            fallbackEnabled: false,
           },
         });
         await transaction.capacityAuditEvent.create({

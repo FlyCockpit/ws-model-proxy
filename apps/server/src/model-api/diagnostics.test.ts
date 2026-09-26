@@ -35,6 +35,7 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   authenticateModelApiTokenSecret: vi.fn(),
   listVisibleModelTargetsForUser: vi.fn(),
   listVisibleModelTargetsForToken: vi.fn(),
+  listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(),
 }));
 
 const { diagnosticsCapacityRuntime, runChatCompletionDiagnostic, runPoolMemberTest } = await import(
@@ -238,10 +239,10 @@ const poolTarget: VisibleModelPoolTarget = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
-  publicEgressEnabled: false,
-  publicEgressAcknowledged: false,
+  fallbackEnabled: false,
+  fallbackForGrantees: false,
+  externalMemberCount: 0,
   effectiveProviderEgress: false,
-  providerPrimaryMemberCount: 0,
   providerAccountLabels: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,

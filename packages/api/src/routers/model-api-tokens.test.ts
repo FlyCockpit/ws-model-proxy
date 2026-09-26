@@ -47,6 +47,10 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     update: MockInstance;
   };
+  modelApiTokenAllowlistEntry: {
+    update: MockInstance;
+  };
+  $transaction: MockInstance;
 };
 
 type TokenCreateArgs = {
@@ -181,8 +185,8 @@ function poolRow({
     slug,
     name,
     description: null,
-    publicEgressEnabled: false,
-    publicEgressAcknowledged: false,
+    fallbackEnabled: false,
+    fallbackForGrantees: false,
     User: { slug: userSlug },
   };
 }
@@ -379,6 +383,7 @@ describe("modelApiTokensRouter", () => {
           userId: "user-id",
           name: "Harness",
           scopeMode: "ALLOWLIST",
+          allowExternal: false,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           secretDigest: "digest-that-must-not-leak",
           lastUsedAt: null,
@@ -405,6 +410,7 @@ describe("modelApiTokensRouter", () => {
           updatedAt,
           name: "Harness",
           scopeMode: "ALLOWLIST",
+          allowExternal: false,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           lastUsedAt: null,
           revokedAt: null,
@@ -413,6 +419,7 @@ describe("modelApiTokensRouter", () => {
             directModelCount: 1,
             modelPoolCount: 0,
             modelPoolIds: [],
+            externalModelPoolIds: [],
           },
         },
       ]);
@@ -476,6 +483,126 @@ describe("modelApiTokensRouter", () => {
           expect(capture.body).not.toContain(fragment);
       }
       expect(db.modelApiToken.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("updateExternalAccess", () => {
+    function tokenRow(scopeMode: "ALL_VISIBLE" | "ALLOWLIST", allowExternal: boolean) {
+      return {
+        id: "token-id",
+        createdAt,
+        updatedAt,
+        userId: "user-id",
+        name: "Harness",
+        scopeMode,
+        allowExternal,
+        lookupPrefix: "wsmp_model_abcd1234EFGH",
+        lastUsedAt: null,
+        revokedAt: null,
+        expiresAt: null,
+        AllowlistEntries: [],
+      };
+    }
+
+    beforeEach(() => {
+      db.$transaction.mockImplementation(async (work: (tx: typeof db) => unknown) => work(db));
+    });
+
+    it("lets the signed-in owner allow external providers on an all-visible token", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode: "ALL_VISIBLE",
+        AllowlistEntries: [],
+      });
+      db.modelApiToken.update.mockResolvedValue(tokenRow("ALL_VISIBLE", true));
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      const result = await client.updateExternalAccess({ id: "token-id", allowExternal: true });
+
+      expect(result.allowExternal).toBe(true);
+      expect(db.modelApiToken.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "token-id" }, data: { allowExternal: true } }),
+      );
+      expect(db.modelApiTokenAllowlistEntry.update).not.toHaveBeenCalled();
+    });
+
+    it("sets includeExternal only on the chosen allowlisted pools", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode: "ALLOWLIST",
+        AllowlistEntries: [
+          { id: "entry-a", modelPoolId: "pool-a" },
+          { id: "entry-b", modelPoolId: "pool-b" },
+        ],
+      });
+      db.modelApiToken.update.mockResolvedValue(tokenRow("ALLOWLIST", true));
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await client.updateExternalAccess({
+        id: "token-id",
+        allowExternal: true,
+        externalModelPoolIds: ["pool-b"],
+      });
+
+      expect(db.modelApiTokenAllowlistEntry.update.mock.calls.map(([args]) => args)).toEqual([
+        { where: { id: "entry-a" }, data: { includeExternal: false } },
+        { where: { id: "entry-b" }, data: { includeExternal: true } },
+      ]);
+    });
+
+    it.each([
+      [
+        "per-pool choices on an all-visible token",
+        "ALL_VISIBLE" as const,
+        [] as { id: string; modelPoolId: string }[],
+        ["pool-a"],
+      ],
+      [
+        "a pool that is not on the allowlist",
+        "ALLOWLIST" as const,
+        [{ id: "entry-a", modelPoolId: "pool-a" }],
+        ["pool-z"],
+      ],
+    ])("rejects %s", async (_label, scopeMode, entries, externalModelPoolIds) => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode,
+        AllowlistEntries: entries,
+      });
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await expect(
+        client.updateExternalAccess({ id: "token-id", allowExternal: true, externalModelPoolIds }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("BAD_REQUEST");
+        return true;
+      });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+    });
+
+    it("hides tokens owned by another user", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "other-user-id",
+        revokedAt: null,
+        scopeMode: "ALL_VISIBLE",
+        AllowlistEntries: [],
+      });
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await expect(
+        client.updateExternalAccess({ id: "token-id", allowExternal: true }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
     });
   });
 

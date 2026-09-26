@@ -126,6 +126,7 @@ vi.mock("@/utils/orpc", () => {
         listCliDevices: query("devices", () => []),
         key: () => ["forwarderManagement"],
         deleteModelPool: mutation("deleteModelPool"),
+        updateModelPool: mutation("updateModelPool"),
         addPoolMember: mutation(),
         updatePoolMember: mutation(),
         removePoolMember: mutation("removePoolMember"),
@@ -279,6 +280,9 @@ describe("dedicated pool pages", () => {
         name: "Primary",
         description: null,
         canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
         members: [],
         grants: [],
         compatibility: { recommendedSurface: null },
@@ -305,6 +309,17 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackSteps.model")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.ceiling")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
+    // Owner fallback settings: the plain name stays local; grantees are not
+    // covered unless the owner opts in.
+    expect(screen.getByText("dashboard:pools.fallbackSettings.enabled")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSettings.forGrantees")).toBeTruthy();
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.fallbackSettings.externalAfterWaitMs",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("2000");
   });
 
   it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {

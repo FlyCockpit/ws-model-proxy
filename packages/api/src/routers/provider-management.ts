@@ -42,6 +42,16 @@ const missing = () => new ORPCError("NOT_FOUND", { message: "Not found" });
 function enabled(): void {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED) throw new ORPCError("NOT_FOUND");
 }
+/**
+ * Kill switch off: provider management is read, revoke, and delete only, so a
+ * user can always inspect, revoke, and delete stored keys and configuration.
+ * These procedures never contact a provider. Everything that creates,
+ * enables, tests, or rotates provider access keeps the `enabled()` gate, and
+ * provider dispatch has its own fail-closed switch check.
+ */
+function readRevokeOrDeleteAllowed(): void {
+  // Intentionally no deployment-switch check.
+}
 const policy = () => ({
   allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
   egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
@@ -428,7 +438,7 @@ function budgetAuditMetadata(
 
 export const providerManagementRouter = {
   listAccounts: protectedProcedure.handler(({ context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     return prisma.providerAccount.findMany({
       where: { userId: context.session.user.id, deletedAt: null },
       orderBy: [{ label: "asc" }, { id: "asc" }],
@@ -583,7 +593,7 @@ export const providerManagementRouter = {
       }, providerWriteTransaction);
     }),
   deleteAccount: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     const now = new Date();
     await prisma.$transaction(async (tx) => {
@@ -620,7 +630,7 @@ export const providerManagementRouter = {
   listModels: protectedProcedure
     .input(z.object({ providerAccountId: id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       await accountFor(context.session.user.id, input.providerAccountId);
       return prisma.providerModel.findMany({
         where: {
@@ -812,7 +822,7 @@ export const providerManagementRouter = {
       return impactedPools ? { ...row, impactedPools } : row;
     }),
   deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${input.id} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
@@ -850,7 +860,7 @@ export const providerManagementRouter = {
   listPricingVersions: protectedProcedure
     .input(z.object({ providerModelId: id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const model = await prisma.providerModel.findFirst({
         where: {
           id: input.providerModelId,
@@ -1014,7 +1024,7 @@ export const providerManagementRouter = {
   retirePricingVersion: protectedProcedure
     .input(z.object({ id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
         const current = await tx.providerPricingVersion.findFirst({
@@ -1051,7 +1061,7 @@ export const providerManagementRouter = {
   deletePricingVersion: protectedProcedure
     .input(z.object({ id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
         const current = await tx.providerPricingVersion.findFirst({
@@ -1078,7 +1088,7 @@ export const providerManagementRouter = {
   listCredentials: protectedProcedure
     .input(z.object({ providerAccountId: id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       await accountFor(context.session.user.id, input.providerAccountId);
       return prisma.providerCredential.findMany({
         where: { userId: context.session.user.id, providerAccountId: input.providerAccountId },
@@ -1229,7 +1239,7 @@ export const providerManagementRouter = {
   revokeCredential: protectedProcedure
     .input(z.object({ id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       const candidate = await prisma.providerCredential.findFirst({
         where: { id: input.id, userId },
@@ -1274,7 +1284,7 @@ export const providerManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       if (input.providerAccountId)
         await historicalAccountFor(context.session.user.id, input.providerAccountId);
       return prisma.providerAuditEvent.findMany({
@@ -1295,7 +1305,7 @@ export const providerManagementRouter = {
       });
     }),
   listUsageReport: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     await reportScopeFor(userId, input);
     return prisma.providerUsageLedger.findMany({
@@ -1337,7 +1347,7 @@ export const providerManagementRouter = {
     });
   }),
   listBudgetActivity: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     await reportScopeFor(userId, input);
     const where = reportWhere(userId, input);
@@ -1415,7 +1425,7 @@ export const providerManagementRouter = {
   listProviderAttemptEvents: protectedProcedure
     .input(reportInput)
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await reportScopeFor(userId, input);
       return prisma.publicProviderAttemptEvent.findMany({
@@ -1455,7 +1465,7 @@ export const providerManagementRouter = {
   listUsageReportPage: protectedProcedure
     .input(pagedReportInput)
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await reportScopeFor(userId, input);
       const rows = await prisma.providerUsageLedger.findMany({
@@ -1503,7 +1513,7 @@ export const providerManagementRouter = {
       return page(rows, input.limit);
     }),
   getUsageTotals: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     await reportScopeFor(userId, input);
     const where = reportWhere(userId, input);
@@ -1541,7 +1551,7 @@ export const providerManagementRouter = {
   listProviderAttempts: protectedProcedure
     .input(pagedReportInput)
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await reportScopeFor(userId, input);
       const now = new Date();
@@ -1786,7 +1796,7 @@ export const providerManagementRouter = {
       return { ok, statusCode };
     }),
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
-    enabled();
+    readRevokeOrDeleteAllowed();
     return prisma.providerBudgetPolicy.findMany({
       where: { userId: context.session.user.id, ProviderAccount: { deletedAt: null } },
       include: { Rules: true },
@@ -1944,7 +1954,7 @@ export const providerManagementRouter = {
   deactivateBudgetPolicy: protectedProcedure
     .input(z.object({ id }))
     .handler(async ({ input, context }) => {
-      enabled();
+      readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       const current = await prisma.providerBudgetPolicy.findFirst({
         where: { id: input.id, userId },

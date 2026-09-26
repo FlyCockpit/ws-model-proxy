@@ -412,7 +412,9 @@ export function ProviderOperationsSection() {
   });
   const [attachmentDraft, setAttachmentDraft] = useState({
     poolId: "",
-    tier: "PRIMARY" as "PRIMARY" | "PUBLIC_OVERFLOW",
+    // Provider models can only be external fallback members: plain pool
+    // names never leave the deployment.
+    tier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
     publicOrder: "0",
   });
   const [privacyConfirm, setPrivacyConfirm] = useState<
@@ -1545,9 +1547,6 @@ export function ProviderOperationsSection() {
                             })
                           }
                         >
-                          <option value="PRIMARY">
-                            {t("dashboard:pools.memberTiers.PRIMARY")}
-                          </option>
                           <option value="PUBLIC_OVERFLOW">
                             {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
                           </option>
@@ -1607,8 +1606,7 @@ export function ProviderOperationsSection() {
                           onClick={() =>
                             updatePool.mutate({
                               id: attachmentDraft.poolId,
-                              publicEgressAcknowledged: true,
-                              publicEgressEnabled: true,
+                              fallbackEnabled: true,
                             })
                           }
                         >

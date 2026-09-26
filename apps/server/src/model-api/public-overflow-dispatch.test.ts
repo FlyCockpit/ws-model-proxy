@@ -83,6 +83,7 @@ vi.mock("./provider-attempt-runtime.js", () => ({
   releaseProviderHealthTrial,
 }));
 
+import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
 import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
@@ -92,6 +93,18 @@ import {
   rankPublicOverflowTargets,
   targetsForForcedPoolMember,
 } from "./public-overflow.js";
+
+/** Caller consent minted by the egress gate for the pool owner's own request. */
+function ownerConsent(requesterUserId = "owner"): ExternalEgressConsent {
+  const decision = evaluateExternalEgress({
+    requested: true,
+    requester: { userId: requesterUserId, source: "API_TOKEN", modelApiTokenId: "token" },
+    tokenPermitsPool: true,
+    pool: { id: "pool", ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: true },
+  });
+  if (!decision.granted) throw new Error("expected an issued consent");
+  return decision.consent;
+}
 
 describe("opaque native provider response headers", () => {
   it.each(["application/json", "text/event-stream"])(
@@ -187,8 +200,8 @@ function dispatchPoolFixture(
   providerType = "openai",
 ) {
   return {
-    publicEgressEnabled: true,
-    publicEgressAcknowledged: true,
+    fallbackEnabled: true,
+    fallbackForGrantees: false,
     PoolMembers: [
       {
         id: "member-heartbeat",
@@ -241,7 +254,7 @@ function dispatchPoolFixture(
   };
 }
 
-it("excludes protocol-mismatched legacy inventories from PRIMARY before egress", async () => {
+it("excludes protocol-mismatched legacy inventories before egress", async () => {
   const fixture = dispatchPoolFixture();
   const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
   model.ProviderAccount.providerType = "anthropic";
@@ -259,44 +272,77 @@ it("excludes protocol-mismatched legacy inventories from PRIMARY before egress",
     },
   });
   db.modelPool.findFirst.mockResolvedValue(fixture);
-  const listed = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
+  const listed = await listPublicOverflowTargets("owner", "pool");
   expect(listed.targets).toEqual([]);
   model.ProviderAccount.providerType = "unknown-provider";
-  const unknownPrimary = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
-  const unknownOverflow = await listPublicOverflowTargets("owner", "pool", "PUBLIC_OVERFLOW");
-  expect(unknownPrimary.targets).toEqual([]);
-  expect(unknownOverflow.targets).toEqual([]);
+  const unknown = await listPublicOverflowTargets("owner", "pool");
+  expect(unknown.targets).toEqual([]);
   expect(providerHttpsRequest).not.toHaveBeenCalled();
 });
 
-it("resolves PRIMARY context policy and physical capacity without changing overflow semantics", async () => {
-  const fixture = dispatchPoolFixture();
-  Object.assign(fixture, {
-    capacityContextCeiling: 900,
-    capacityContextMargin: 30,
-  });
-  Object.assign(fixture.PoolMembers[0]!, {
-    capacityContextCeilingMode: "LIMITED",
-    capacityContextCeiling: 700,
-    capacityContextMargin: 20,
-  });
-  Object.assign(fixture.PoolMembers[0]!.ExecutionTarget, {
-    InferenceCapacity: { physicalMaxContext: 650 },
-  });
-  db.modelPool.findFirst.mockResolvedValue(fixture);
+it("lists only external fallback members with the owner's current fallback flags", async () => {
+  db.modelPool.findFirst.mockResolvedValue({ ...dispatchPoolFixture(), fallbackForGrantees: true });
+  const listed = await listPublicOverflowTargets("owner", "pool");
+  expect(listed).toMatchObject({ enabled: true, fallbackForGrantees: true });
+  expect(listed.targets[0]).toMatchObject({ contextWindow: 10_000, publicOrder: 0 });
+  expect(db.modelPool.findFirst).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      select: expect.objectContaining({
+        PoolMembers: expect.objectContaining({
+          where: expect.objectContaining({ tier: "PUBLIC_OVERFLOW" }),
+        }),
+      }),
+    }),
+  );
+});
 
-  const primary = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
-  expect(primary.targets[0]).toMatchObject({
-    effectiveContextCeiling: 700,
-    contextMargin: 20,
-    physicalMaxContext: 650,
+describe("owner consent is re-read at dispatch", () => {
+  const baseRequest = (externalConsent: ExternalEgressConsent) => ({
+    userId: "owner",
+    poolId: "pool",
+    requestId: "request-owner-consent",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+    externalConsent,
+    requestedProtocol: "openai" as const,
+    requestedSurface: "openai-chat" as const,
+    stream: false,
+    requiredFeatures: [],
+    path: "/v1/chat/completions",
+    headers: new Headers({ "content-type": "application/json" }),
+    body: new TextEncoder().encode('{"model":"pool","messages":[]}'),
+    signal: new AbortController().signal,
+    liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+    releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+    adaptationEnabled: false,
+    retrySafe: false,
   });
 
-  const overflow = await listPublicOverflowTargets("owner", "pool", "PUBLIC_OVERFLOW");
-  expect(overflow.targets[0]).toMatchObject({ contextWindow: 10_000 });
-  expect(overflow.targets[0]?.effectiveContextCeiling).toBeUndefined();
-  expect(overflow.targets[0]?.contextMargin).toBeUndefined();
-  expect(overflow.targets[0]?.physicalMaxContext).toBeUndefined();
+  it("refuses when the owner turned fallback off after the consent was issued", async () => {
+    providerHttpsRequest.mockClear();
+    db.modelPool.findFirst.mockResolvedValue({ ...dispatchPoolFixture(), fallbackEnabled: false });
+    const request = baseRequest(ownerConsent());
+    await expect(dispatchPublicOverflow(request)).resolves.toEqual({
+      dispatched: false,
+      reason: "POOL_PRIVATE",
+    });
+    expect(request.releaseLocalCapacity).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+  });
+
+  it("refuses a grantee when the owner stopped paying for grantees", async () => {
+    providerHttpsRequest.mockClear();
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture(),
+      fallbackForGrantees: false,
+    });
+    const request = baseRequest(ownerConsent("grantee"));
+    await expect(dispatchPublicOverflow(request)).resolves.toEqual({
+      dispatched: false,
+      reason: "GRANTEE_NOT_COVERED",
+    });
+    expect(request.releaseLocalCapacity).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+  });
 });
 
 describe("public overflow terminal response dispatch", () => {
@@ -358,6 +404,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai" as const,
       requestedSurface: "openai-chat" as const,
       stream: false,
@@ -461,6 +508,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-affinity-fail-open",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -506,6 +554,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "single-history",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        externalConsent: ownerConsent(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -592,6 +641,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-ranked-retry",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -685,6 +735,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: `request-${fixture.protocol}`,
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: fixture.protocol as "openai" | "anthropic",
       requestedSurface: fixture.surface as "openai-chat" | "anthropic-messages",
       stream: fixture.stream,
@@ -766,6 +817,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: `request-accounting-failure-${fixture.label}`,
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        externalConsent: ownerConsent(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: fixture.stream,
@@ -794,8 +846,8 @@ describe("public overflow terminal response dispatch", () => {
 
   it("keeps unavailable targets with cooldown metadata eligible for half-open recovery", async () => {
     db.modelPool.findFirst.mockResolvedValue({
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: false,
       PoolMembers: [
         {
           id: "member",
@@ -855,8 +907,8 @@ describe("public overflow terminal response dispatch", () => {
 
   it("returns a non-retry-safe 429 with Retry-After and records its cooldown", async () => {
     db.modelPool.findFirst.mockResolvedValue({
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: false,
       PoolMembers: [
         {
           id: "member",
@@ -937,6 +989,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1038,6 +1091,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: `request-affinity-${fixture.label.replace(/\s+/g, "-")}`,
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        externalConsent: ownerConsent(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -1124,6 +1178,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-affinity-swallowed",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1153,8 +1208,8 @@ describe("public overflow terminal response dispatch", () => {
   it("does not record client cancellation before response as a provider transport failure", async () => {
     recordProviderOutcome.mockClear();
     db.modelPool.findFirst.mockResolvedValue({
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: false,
       PoolMembers: [
         {
           id: "member-cancel",
@@ -1233,6 +1288,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-cancel",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: ownerConsent(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1292,6 +1348,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "request-heartbeat",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        externalConsent: ownerConsent(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -1362,6 +1419,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "request-retry-heartbeat",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        externalConsent: ownerConsent(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,

@@ -27,6 +27,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
+import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
@@ -62,8 +63,9 @@ export type PublicOverflowReason =
 
 export type PublicOverflowSkipReason =
   | "DEPLOYMENT_GATE_DISABLED"
+  | "CALLER_CONSENT_MISSING"
   | "POOL_PRIVATE"
-  | "POOL_ACKNOWLEDGEMENT_MISSING"
+  | "GRANTEE_NOT_COVERED"
   | "ADAPTATION_GATE_DISABLED"
   | "NO_COMPATIBLE_PROVIDER"
   | "PROVIDER_UNHEALTHY"
@@ -81,10 +83,12 @@ export interface PublicOverflowRequest {
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
-  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline.
-   * It requires deployment approval and pool acknowledgement, but not the
-   * separate public-overflow enablement switch. */
-  memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+  /**
+   * Caller consent minted by evaluateExternalEgress for exactly this pool.
+   * Dispatch fails closed without an issued consent, and re-checks the
+   * deployment switch and the owner's pool flags against fresh state.
+   */
+  externalConsent: ExternalEgressConsent;
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
   stream: boolean;
@@ -145,17 +149,9 @@ export interface PublicProviderTarget {
   inferenceCapacityId?: string | null;
   capacityWaitBudgetMs?: number | null;
   publicOrder: number;
-  /** Pool-member weight used only by the unified PRIMARY scheduler. */
-  weight?: number;
   providerModelId: string;
   upstreamModelId: string;
   contextWindow: number | null;
-  /** PRIMARY-only pool policy resolved from the member override and pool default. */
-  effectiveContextCeiling?: number | null;
-  /** PRIMARY-only safety margin applied in addition to the requested context. */
-  contextMargin?: number;
-  /** Physical runtime ceiling shared by every target on the capacity. */
-  physicalMaxContext?: number | null;
   maxOutputTokens: number | null;
   protocol: ProviderProtocol;
   providerAccountId: string;
@@ -283,8 +279,10 @@ export function matchesExactResponsesBinding(
 }
 
 type ListedPublicOverflowTargets = {
+  /** Owner's fallback switch (`ModelPool.fallbackEnabled`). */
   enabled: boolean;
-  acknowledged: boolean;
+  /** Owner pays for grantees' external fallback. */
+  fallbackForGrantees: boolean;
   affinityPolicy: AffinityPolicy;
   targets: PublicProviderTarget[];
 };
@@ -309,7 +307,7 @@ function providerEventRouting(input: {
     poolId: input.request.poolId,
     poolMemberId: input.target.poolMemberId,
     executionTargetId: input.target.executionTargetId,
-    memberTier: input.request.memberTier ?? "PUBLIC_OVERFLOW",
+    memberTier: "PUBLIC_OVERFLOW",
     triggerReason: input.request.reason,
     affinityOutcome: input.target.affinity?.outcome ?? "NONE",
     contextCountMethod: input.request.contextCountMethod,
@@ -440,9 +438,6 @@ export function publicTargetCompatibility(
   target: Pick<
     PublicProviderTarget,
     | "contextWindow"
-    | "effectiveContextCeiling"
-    | "contextMargin"
-    | "physicalMaxContext"
     | "maxOutputTokens"
     | "nativeProtocols"
     | "nativeSurfaces"
@@ -478,17 +473,9 @@ export function publicTargetCompatibility(
       : (request.contextTokens ?? request.liability.tokens);
   if (!request.skipContextValidation) {
     if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
-    const margin = target.contextMargin ?? 0;
-    if (!Number.isSafeInteger(margin) || margin < 0) return "CONTEXT_UNKNOWN";
-    const contextWithMargin = contextTokens + BigInt(margin);
-    const ceilings = [
-      target.contextWindow,
-      target.effectiveContextCeiling,
-      target.physicalMaxContext,
-    ].filter((ceiling): ceiling is number => ceiling !== null && ceiling !== undefined);
-    if (ceilings.some((ceiling) => !Number.isSafeInteger(ceiling) || ceiling <= 0))
+    if (!Number.isSafeInteger(target.contextWindow) || target.contextWindow <= 0)
       return "CONTEXT_UNKNOWN";
-    if (ceilings.some((ceiling) => contextWithMargin > BigInt(ceiling))) return "CONTEXT_EXCEEDED";
+    if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
     if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
       return "CONTEXT_UNKNOWN";
     if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
@@ -607,18 +594,19 @@ function supportedFeatures(value: unknown): string[] {
     : [];
 }
 
+/**
+ * External fallback (PUBLIC_OVERFLOW) provider targets of an owned pool.
+ * PRIMARY members are always local, so provider targets exist only here.
+ */
 export async function listPublicOverflowTargets(
   userId: string,
   poolId: string,
-  memberTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
 ): Promise<ListedPublicOverflowTargets> {
   const pool = await prisma.modelPool.findFirst({
     where: { id: poolId, userId },
     select: {
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
-      capacityContextCeiling: true,
-      capacityContextMargin: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -629,28 +617,20 @@ export async function listPublicOverflowTargets(
       capacityWaitBudgetMs: true,
       PoolMembers: {
         where: {
-          tier: memberTier,
+          tier: "PUBLIC_OVERFLOW",
           routingStatus: "ACTIVE",
           ExecutionTarget: { ProviderModel: { isNot: null } },
         },
-        orderBy:
-          memberTier === "PUBLIC_OVERFLOW"
-            ? [{ publicOrder: "asc" }, { id: "asc" }]
-            : [{ weight: "desc" }, { id: "asc" }],
+        orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
         select: {
           id: true,
           publicOrder: true,
-          weight: true,
           capacityWaitBudgetMs: true,
           capacityWaitBudgetMode: true,
-          capacityContextCeiling: true,
-          capacityContextCeilingMode: true,
-          capacityContextMargin: true,
           ExecutionTarget: {
             select: {
               id: true,
               inferenceCapacityId: true,
-              InferenceCapacity: { select: { physicalMaxContext: true } },
               ProviderModel: {
                 select: {
                   id: true,
@@ -713,7 +693,7 @@ export async function listPublicOverflowTargets(
   if (!pool)
     return {
       enabled: false,
-      acknowledged: false,
+      fallbackForGrantees: false,
       affinityPolicy: defaultAffinityPolicy,
       targets: [],
     };
@@ -730,7 +710,7 @@ export async function listPublicOverflowTargets(
       !credential ||
       !protocol ||
       !inventoryMatchesProtocol(capabilityInventory, protocol) ||
-      (memberTier === "PUBLIC_OVERFLOW" && member.publicOrder == null) ||
+      member.publicOrder == null ||
       model.userId !== userId ||
       account.userId !== userId ||
       !model.enabled ||
@@ -754,26 +734,9 @@ export async function listPublicOverflowTargets(
               ? member.capacityWaitBudgetMs
               : pool.capacityWaitBudgetMs,
         publicOrder: member.publicOrder ?? 0,
-        weight: member.weight,
         providerModelId: model.id,
         upstreamModelId: model.upstreamModelId,
         contextWindow: model.contextWindow,
-        effectiveContextCeiling:
-          memberTier !== "PRIMARY"
-            ? undefined
-            : member.capacityContextCeilingMode === "UNLIMITED"
-              ? null
-              : member.capacityContextCeilingMode === "LIMITED"
-                ? member.capacityContextCeiling
-                : pool.capacityContextCeiling,
-        contextMargin:
-          memberTier === "PRIMARY"
-            ? (member.capacityContextMargin ?? pool.capacityContextMargin)
-            : undefined,
-        physicalMaxContext:
-          memberTier === "PRIMARY"
-            ? member.ExecutionTarget!.InferenceCapacity?.physicalMaxContext
-            : undefined,
         maxOutputTokens: model.maxOutputTokens,
         protocol,
         providerAccountId: account.id,
@@ -794,8 +757,8 @@ export async function listPublicOverflowTargets(
     ];
   });
   return {
-    enabled: pool.publicEgressEnabled,
-    acknowledged: pool.publicEgressAcknowledged,
+    enabled: pool.fallbackEnabled,
+    fallbackForGrantees: pool.fallbackForGrantees,
     affinityPolicy: {
       enabled: pool.affinityEnabled,
       ttlSeconds: pool.affinityTtlSeconds,
@@ -1687,20 +1650,27 @@ export async function buildProviderAffinityTargets(input: {
 export async function dispatchPublicOverflow(
   request: PublicOverflowRequest,
 ): Promise<PublicOverflowResult> {
-  const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
   // Kill switch: when WMP_PUBLIC_PROVIDER_EGRESS_ENABLED is false, no provider
-  // attempt leaves WSMP, including provider-backed PRIMARY members. Existing
-  // database state must not bypass an explicit disable. The flag defaults to
-  // on; on does not send data by itself.
+  // attempt leaves WSMP. Existing database state and an earlier consent must
+  // not bypass an explicit disable. The flag defaults to on; on does not send
+  // data by itself.
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
-  const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);
-  if (memberTier === "PUBLIC_OVERFLOW" && !listed.enabled)
-    return { dispatched: false, reason: "POOL_PRIVATE" };
-  // Acknowledgement is the pool owner's consent for all provider egress.
-  // publicEgressEnabled remains the separate switch that makes a pool
-  // non-private by permitting fallback to PUBLIC_OVERFLOW members.
-  if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  // Caller consent: only evaluateExternalEgress mints a consent, and only for
+  // an explicit `owner/pool:external` request whose credential allows it.
+  const consent = request.externalConsent;
+  if (
+    !isIssuedExternalConsent(consent) ||
+    consent.poolId !== request.poolId ||
+    consent.ownerUserId !== request.userId
+  )
+    return { dispatched: false, reason: "CALLER_CONSENT_MISSING" };
+  // Owner consent, re-read from the database at dispatch time: fallback on,
+  // and the owner pays for grantees when the requester is not the owner.
+  const listed = await listPublicOverflowTargets(request.userId, request.poolId);
+  if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
+  if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
+    return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.

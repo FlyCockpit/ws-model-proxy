@@ -151,11 +151,13 @@ integration("DL-1 capacity lock order for API writers", () => {
           publicEgressAcknowledged: true,
         },
       });
+      // Provider targets are external fallback members (PRIMARY is local-only).
       const member = await db.poolMember.create({
         data: {
           poolId: pool.id,
           executionTargetId: target.id,
-          tier: "PRIMARY",
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
           capacityConcurrencyMode: "INHERIT",
         },
       });

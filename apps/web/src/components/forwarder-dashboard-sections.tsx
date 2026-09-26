@@ -2917,7 +2917,8 @@ export function PoolMemberForm({
             value={memberTier}
             onChange={(event) => setMemberTier(event.target.value as typeof memberTier)}
           >
-            <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
+            {/* Provider members are external fallback only: plain pool names
+                never leave the deployment. */}
             <option value="PUBLIC_OVERFLOW">
               {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
             </option>
@@ -3118,23 +3119,22 @@ export function GrantPoolDialog({
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const [email, setEmail] = useState("");
-  const [publicEgressAcknowledged, setPublicEgressAcknowledged] = useState(false);
   const [grantError, setGrantError] = useState<string | null>(null);
   const poolId = pool?.id ?? null;
   const [trackedPoolId, setTrackedPoolId] = useState(poolId);
   if (trackedPoolId !== poolId) {
     setTrackedPoolId(poolId);
-    setPublicEgressAcknowledged(false);
     setGrantError(null);
   }
-  const providerEgress = pool?.effectiveProviderEgress === true;
+  // No grant-time egress acknowledgement: a grantee's requests leave the
+  // deployment only when they ask for `owner/pool:external` themselves and the
+  // owner pays for grantees' external fallback.
   const grant = useMutation({
     ...orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.grantAdded"));
         setEmail("");
-        setPublicEgressAcknowledged(false);
         setGrantError(null);
         onOpenChange(false);
       },
@@ -3144,8 +3144,7 @@ export function GrantPoolDialog({
     }),
     meta: { skipGlobalErrorToast: true },
   });
-  const validEmail =
-    /^\S+@\S+\.\S+$/.test(email.trim()) && (!providerEgress || publicEgressAcknowledged);
+  const validEmail = /^\S+@\S+\.\S+$/.test(email.trim());
 
   return (
     <Dialog
@@ -3169,7 +3168,6 @@ export function GrantPoolDialog({
             grant.mutate({
               poolId: pool.id,
               email: email.trim(),
-              publicEgressAcknowledged,
             });
           }}
         >
@@ -3185,15 +3183,6 @@ export function GrantPoolDialog({
             />
             <p className="text-xs text-muted-foreground">{t("dashboard:pools.exactEmailOnly")}</p>
           </div>
-          {providerEgress ? (
-            <label className="flex min-h-11 items-center gap-3 rounded-md border p-3 text-sm">
-              <Checkbox
-                checked={publicEgressAcknowledged}
-                onCheckedChange={(checked) => setPublicEgressAcknowledged(checked === true)}
-              />
-              <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
-            </label>
-          ) : null}
           {grantError ? (
             <p className="text-sm text-destructive" role="alert">
               {grantError}
@@ -3594,6 +3583,7 @@ export function ModelApiTokensSection() {
       ) : null}
       <TokenEgressWarnings pools={visibleModelsData.modelPools} />
       <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
+      <TokenExternalAccess tokens={tokensData} pools={visibleModelsData.modelPools} />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3610,6 +3600,94 @@ export function ModelApiTokensSection() {
         }}
       />
     </section>
+  );
+}
+
+/**
+ * Human-only consent for `owner/pool:external` (never exposed to MCP). New and
+ * existing tokens are private-only until a person turns this on. Allowlist
+ * tokens also choose which allowlisted pools may use external providers.
+ */
+function TokenExternalAccess({
+  tokens,
+  pools,
+}: {
+  tokens: ModelApiToken[];
+  pools: VisibleModels["modelPools"];
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const queryClient = useQueryClient();
+  const update = useMutation(
+    orpc.modelApiTokens.updateExternalAccess.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
+        toast.success(t("dashboard:tokens.externalAccess.saved"));
+      },
+    }),
+  );
+  const activeTokens = tokens.filter((token) => !token.revokedAt);
+  if (activeTokens.length === 0) return null;
+  const poolNameById = new Map(pools.map((pool) => [pool.id, pool.name] as const));
+  return (
+    <div className="mt-4 min-w-0 max-w-full space-y-3 rounded-md border p-4">
+      <div className="space-y-1">
+        <h3 className="text-sm font-medium">{t("dashboard:tokens.externalAccess.title")}</h3>
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:tokens.externalAccess.description")}
+        </p>
+      </div>
+      <ul className="divide-y">
+        {activeTokens.map((token) => {
+          const allowlistPoolIds =
+            token.scopeMode === "ALLOWLIST" ? token.allowlist.modelPoolIds : [];
+          const included = new Set(token.allowlist.externalModelPoolIds);
+          return (
+            <li key={token.id} className="min-w-0 space-y-2 py-3">
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <Checkbox
+                  checked={token.allowExternal}
+                  disabled={update.isPending}
+                  onCheckedChange={(checked) =>
+                    update.mutate({ id: token.id, allowExternal: checked === true })
+                  }
+                />
+                <span className="min-w-0 break-words">
+                  {t("dashboard:tokens.externalAccess.allow", { name: token.name })}
+                </span>
+              </label>
+              {token.allowExternal && allowlistPoolIds.length > 0 ? (
+                <div className="space-y-1 pl-8">
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:tokens.externalAccess.poolsHint")}
+                  </p>
+                  {allowlistPoolIds.map((poolId) => (
+                    <label key={poolId} className="flex min-h-11 items-center gap-3 text-sm">
+                      <Checkbox
+                        checked={included.has(poolId)}
+                        disabled={update.isPending}
+                        onCheckedChange={(checked) => {
+                          const next = new Set(included);
+                          if (checked === true) next.add(poolId);
+                          else next.delete(poolId);
+                          update.mutate({
+                            id: token.id,
+                            allowExternal: true,
+                            externalModelPoolIds: [...next],
+                          });
+                        }}
+                      />
+                      <span className="min-w-0 break-words">
+                        {poolNameById.get(poolId) ?? poolId}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 
