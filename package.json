@@ -60,19 +60,19 @@
     "postinstall": "lefthook install"
   },
   "devDependencies": {
-    "@babel/parser": "^8.0.5",
-    "@biomejs/biome": "^2.5.13",
+    "@babel/parser": "^8.0.6",
+    "@biomejs/biome": "^2.5.14",
     "@inquirer/prompts": "^8.7.2",
     "@types/node": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/i18n-translate": "workspace:*",
     "dotenv": "catalog:",
-    "knip": "^6.35.1",
+    "knip": "^6.37.0",
     "lefthook": "^2.1.14",
     "react-doctor": "^0.9.14",
     "tsx": "catalog:",
-    "turbo": "^2.10.12",
+    "turbo": "^2.11.2",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
