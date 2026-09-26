@@ -1093,7 +1093,8 @@ export function GuardedPoolSetupWizard({
                         );
                       }}
                     >
-                      <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
+                      {/* Provider models are external fallback members only:
+                          plain pool names never leave the deployment. */}
                       <option value="PUBLIC_OVERFLOW">
                         {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
                       </option>

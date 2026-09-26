@@ -217,7 +217,14 @@ integration("capacity policy production-router races", () => {
       },
     });
     const member = await modules.prisma.poolMember.create({
-      data: { poolId, executionTargetId: targetIds[1], tier: "PRIMARY", weight: 1 },
+      // Provider targets are external fallback members (PRIMARY is local-only).
+      data: {
+        poolId,
+        executionTargetId: targetIds[1],
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
+        weight: 0,
+      },
     });
     memberId = member.id;
   });
@@ -342,8 +349,8 @@ integration("capacity policy production-router races", () => {
       forwarderClient.addProviderPoolMember({
         poolId,
         providerModelId,
-        tier: "PRIMARY",
-        weight: 1,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 1,
       }),
     );
     await modules.prisma.poolMember.deleteMany({
@@ -354,8 +361,8 @@ integration("capacity policy production-router races", () => {
       forwarderClient.addProviderPoolMember({
         poolId,
         providerModelId,
-        tier: "PRIMARY",
-        weight: 1,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 1,
       }),
     ]);
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
@@ -416,7 +423,7 @@ integration("capacity policy production-router races", () => {
     const providerInput = (ids: readonly [string, string]) =>
       ids.map((id) => ({
         providerModelId: id,
-        tier: "PRIMARY" as const,
+        tier: "PUBLIC_OVERFLOW" as const,
         concurrencyLimit: 4,
         dailySpendLimit: "5",
       }));
@@ -455,7 +462,9 @@ integration("capacity policy production-router races", () => {
     expect(pools).toHaveLength(2);
     expect(pools.every((pool) => pool.PoolMembers.length === 2)).toBe(true);
     expect(
-      pools.flatMap((pool) => pool.PoolMembers).every((member) => member.tier === "PRIMARY"),
+      pools
+        .flatMap((pool) => pool.PoolMembers)
+        .every((member) => member.tier === "PUBLIC_OVERFLOW"),
     ).toBe(true);
   });
 

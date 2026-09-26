@@ -312,8 +312,7 @@ describe("forwarderManagementRouter", () => {
     const attempts = [
       rpc.updateModelPool({
         id: "foreign-pool",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       }),
       rpc.addProviderPoolMember({
         poolId: "foreign-pool",
@@ -380,7 +379,7 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
   });
 
-  it("rejects guarded overflow without acknowledgement or a positive finite spend cap", async () => {
+  it("rejects guarded provider primaries or a non-positive spend cap before any write", async () => {
     const base = {
       slug: "guarded",
       name: "Guarded",
@@ -394,13 +393,24 @@ describe("forwarderManagementRouter", () => {
         { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
       ],
     };
-    await expect(
-      client().createGuardedModelPool({ ...base, publicEgressAcknowledged: false }),
-    ).rejects.toBeDefined();
+    // Provider models are external fallback members only (plain pool names
+    // never leave the deployment); no grant-time acknowledgement exists.
     await expect(
       client().createGuardedModelPool({
         ...base,
-        publicEgressAcknowledged: true,
+        providerModels: [
+          {
+            providerModelId: "provider-id",
+            tier: "PRIMARY",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client().createGuardedModelPool({
+        ...base,
         providerModels: [
           { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "0" },
         ],
@@ -420,7 +430,6 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: null,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: false,
         providerModels: [],
         advanced: {
           physicalCountStrategy: "ENGINE_REPORTED",
@@ -471,7 +480,6 @@ describe("forwarderManagementRouter", () => {
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
       providerModels: [],
-      publicEgressAcknowledged: false,
     });
 
     expect(db.modelPool.create).toHaveBeenCalledWith(
@@ -514,7 +522,6 @@ describe("forwarderManagementRouter", () => {
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
       providerModels: [],
-      publicEgressAcknowledged: false,
     };
 
     // `advanced` omitted entirely: affinity defaults ON with standard fallbacks.
@@ -620,7 +627,6 @@ describe("forwarderManagementRouter", () => {
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
         providerModels: [],
-        publicEgressAcknowledged: false,
       }),
     ).resolves.toMatchObject({ id: "pool-id" });
 
@@ -685,7 +691,6 @@ describe("forwarderManagementRouter", () => {
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
         providerModels: [],
-        publicEgressAcknowledged: false,
         advanced: {
           physicalCountStrategy: "ENGINE_REPORTED",
           contextMargin: 0,
@@ -727,8 +732,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(
       poolRow({
         protocolAdaptationEnabled: true,
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       }),
     );
     db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
@@ -769,7 +773,6 @@ describe("forwarderManagementRouter", () => {
       memberContextCeiling: 32_768,
       reservedSlots: 1,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: true,
       advanced: {
         physicalCountStrategy: "TEMPLATE_AWARE",
         contextMargin: 2_048,
@@ -877,7 +880,7 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("creates a provider-only PRIMARY pool and derives its recommended surface", async () => {
+  it("creates a provider-only pool as external fallback with fallback enabled", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
@@ -917,11 +920,10 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: true,
         providerModels: [
           {
             providerModelId: "provider-primary",
-            tier: "PRIMARY",
+            tier: "PUBLIC_OVERFLOW",
             concurrencyLimit: 2,
             dailySpendLimit: "10.00",
           },
@@ -932,8 +934,9 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          publicEgressEnabled: false,
-          publicEgressAcknowledged: true,
+          // External members exist, so the owner's fallback is on; callers
+          // still opt in per request with `owner/pool:external`.
+          fallbackEnabled: true,
           recommendedSurfaceOverride: "OPENAI_RESPONSES",
         }),
       }),
@@ -942,9 +945,9 @@ describe("forwarderManagementRouter", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           executionTargetId: "provider-primary-target",
-          tier: "PRIMARY",
-          publicOrder: null,
-          weight: 1,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
+          weight: 0,
         }),
       }),
     );
@@ -972,7 +975,6 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: false,
         providerModels: [],
       }),
     ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
@@ -1002,7 +1004,6 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 1,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: false,
         providerModels: [],
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
@@ -1018,7 +1019,6 @@ describe("forwarderManagementRouter", () => {
     memberContextCeiling: null,
     reservedSlots: 0,
     localWaitBudgetMs: 30_000,
-    publicEgressAcknowledged: false,
     providerModels: [] as Array<Record<string, unknown>>,
   };
 
@@ -1028,7 +1028,6 @@ describe("forwarderManagementRouter", () => {
     await expect(
       client().createGuardedModelPool({
         ...guardedCreateBase,
-        publicEgressAcknowledged: true,
         providerModels: [
           { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
         ],
@@ -1056,7 +1055,6 @@ describe("forwarderManagementRouter", () => {
     await expect(
       client().createGuardedModelPool({
         ...guardedCreateBase,
-        publicEgressAcknowledged: true,
         providerModels: [
           { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
         ],
@@ -1315,52 +1313,6 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
-  it("reports the provider-context-exceeded failure reason for guarded pool create", async () => {
-    mockGuardedLocalSetup({ physicalMaxContext: 65_536, hardConcurrencyLimit: 2 });
-    db.providerModel.findMany.mockResolvedValue([
-      {
-        id: "provider-primary",
-        providerAccountId: "account-primary",
-        upstreamModelId: "provider-upstream",
-        contextWindow: 8_192,
-        concurrencyLimit: 4,
-        nativeCapabilities: {
-          version: 3,
-          protocol: "openai-compatible",
-          surfaces: {
-            openaiResponses: {
-              source: "provider",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-            },
-          },
-        },
-        PricingVersions: [{ id: "price-primary", currency: "USD" }],
-      },
-    ]);
-
-    await expect(
-      client().createGuardedModelPool({
-        ...guardedCreateBase,
-        memberContextCeiling: 16_384,
-        publicEgressAcknowledged: true,
-        providerModels: [
-          {
-            providerModelId: "provider-primary",
-            tier: "PRIMARY",
-            concurrencyLimit: 1,
-            dailySpendLimit: "10.00",
-          },
-        ],
-      }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      data: { reason: "PROVIDER_CONTEXT_EXCEEDED" },
-    });
-    expect(db.modelPool.create).not.toHaveBeenCalled();
-  });
-
   it.each([
     ["OPENAI_RESPONSES", "a surface a chat-native primary cannot serve without adaptation"],
   ] as const)("rejects %s as %s", async (recommendedSurface) => {
@@ -1377,7 +1329,6 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 8_192,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: false,
         providerModels: [],
       }),
     ).rejects.toMatchObject({
@@ -1423,7 +1374,6 @@ describe("forwarderManagementRouter", () => {
       memberContextCeiling: null,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: false,
       providerModels: [],
       advanced: guardedAdvancedBase({ protocolAdaptationEnabled: true }),
     });
@@ -1482,59 +1432,6 @@ describe("forwarderManagementRouter", () => {
     );
   });
 
-  it("rejects the recommended API when a PRIMARY provider cannot serve it natively or via adaptation", async () => {
-    db.modelPool.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValue([]);
-    db.providerModel.findMany.mockResolvedValue([
-      {
-        id: "provider-primary",
-        providerAccountId: "account-primary",
-        upstreamModelId: "provider-upstream",
-        contextWindow: 65_536,
-        concurrencyLimit: 4,
-        nativeCapabilities: {
-          version: 3,
-          protocol: "openai-compatible",
-          surfaces: {
-            openaiChatCompletions: {
-              source: "provider",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-            },
-          },
-        },
-        PricingVersions: [{ id: "price-primary", currency: "USD" }],
-      },
-    ]);
-
-    // The chat-native PRIMARY provider cannot serve OPENAI_RESPONSES without
-    // adaptation; the surface fence must hold for provider members too, not
-    // just locals.
-    await expect(
-      client().createGuardedModelPool({
-        ...guardedCreateBase,
-        slug: "guarded-provider-unservable",
-        name: "Guarded provider unservable",
-        localModelIds: [],
-        publicEgressAcknowledged: true,
-        providerModels: [
-          {
-            providerModelId: "provider-primary",
-            tier: "PRIMARY",
-            concurrencyLimit: 1,
-            dailySpendLimit: "10.00",
-          },
-        ],
-      }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      data: { reason: "SURFACE_NOT_SUPPORTED" },
-    });
-    expect(db.modelPool.create).not.toHaveBeenCalled();
-    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
-  });
-
   it("accepts any recommended API when the pool has no primary members", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.discoveredModel.findMany.mockResolvedValue([]);
@@ -1571,7 +1468,6 @@ describe("forwarderManagementRouter", () => {
       memberContextCeiling: null,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: true,
       providerModels: [
         {
           providerModelId: "provider-overflow",
@@ -1630,7 +1526,6 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: true,
         advanced: {
           physicalCountStrategy: "ENGINE_REPORTED",
           contextMargin: 1_024,
@@ -1687,7 +1582,6 @@ describe("forwarderManagementRouter", () => {
       memberContextCeiling: 31_744,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: true,
     };
 
     const localResult = await Promise.allSettled([
@@ -2026,9 +1920,7 @@ describe("forwarderManagementRouter", () => {
   it("creates and updates owned model pools without touching grant ids", async () => {
     db.modelPool.findUnique
       .mockResolvedValueOnce(null)
-      .mockResolvedValue(
-        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
-      );
+      .mockResolvedValue(poolRow({ userId: "user-id", fallbackEnabled: false }));
     db.modelPool.create.mockResolvedValue(poolRow());
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "new-general" }));
 
@@ -2096,8 +1988,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique.mockResolvedValue(
       poolRow({
         userId: "user-id",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: false,
+        fallbackEnabled: false,
         protocolAdaptationEnabled: false,
         allowLossyDeveloperRoleCollapse: false,
       }),
@@ -2110,8 +2001,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique.mockResolvedValue(
       poolRow({
         userId: "user-id",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: false,
+        fallbackEnabled: false,
         protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: false,
       }),
@@ -2124,15 +2014,109 @@ describe("forwarderManagementRouter", () => {
     ).resolves.toMatchObject({ allowLossyDeveloperRoleCollapse: true });
   });
 
-  it("fails closed when enabling public egress without acknowledgement", async () => {
+  it("enables fallback without any acknowledgement and stores the owner settings", async () => {
     db.modelPool.findUnique.mockResolvedValue(
-      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      poolRow({ userId: "user-id", fallbackEnabled: false, capacityWaitBudgetMs: 30_000 }),
+    );
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.providerBudgetPolicy.findMany.mockResolvedValue([]);
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ fallbackEnabled: true, fallbackForGrantees: true, externalAfterWaitMs: 500 }),
     );
 
     await expect(
-      client().updateModelPool({ id: "pool-id", publicEgressEnabled: true }),
+      client().updateModelPool({
+        id: "pool-id",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 500,
+      }),
+    ).resolves.toMatchObject({
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
+      externalAfterWaitMs: 500,
+    });
+    const update = db.modelPool.update.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    expect(update.data).toMatchObject({
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
+      externalAfterWaitMs: 500,
+    });
+    expect(update.data).not.toHaveProperty("publicEgressAcknowledged");
+  });
+
+  it("turns fallback off while external members stay configured, even with the switch off", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", fallbackEnabled: true }),
+    );
+    db.poolMember.count.mockResolvedValue(2);
+    db.modelPool.update.mockResolvedValue(poolRow({ fallbackEnabled: false }));
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", fallbackEnabled: false }),
+    ).resolves.toMatchObject({ fallbackEnabled: false });
+    // Disabling never inspects or removes the external members.
+    expect(db.poolMember.findMany).not.toHaveBeenCalled();
+    expect(db.poolMember.delete).not.toHaveBeenCalled();
+  });
+
+  it("rejects an external wait longer than the pool's local wait budget", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", fallbackEnabled: true, capacityWaitBudgetMs: 1_000 }),
+    );
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", externalAfterWaitMs: 2_000 }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("validates a new external wait against the budget set in the same save", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        fallbackEnabled: true,
+        capacityWaitBudgetMs: 60_000,
+        externalAfterWaitMs: 2_000,
+      }),
+    );
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        capacityWaitBudgetMs: 1_000,
+        externalAfterWaitMs: 5_000,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("never rejects a save that leaves a stored external wait above the budget unchanged", async () => {
+    // Stored default 2000 ms is above this pool's 1000 ms budget; the runtime
+    // uses min(budget, externalAfterWaitMs), so unrelated saves must succeed.
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        fallbackEnabled: true,
+        capacityWaitBudgetMs: 1_000,
+        externalAfterWaitMs: 2_000,
+      }),
+    );
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ fallbackEnabled: true, fallbackForGrantees: true }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", fallbackForGrantees: true }),
+    ).resolves.toMatchObject({ fallbackForGrantees: true });
+    // Re-sending the unchanged stored value is not a change either.
+    await expect(
+      client().updateModelPool({ id: "pool-id", externalAfterWaitMs: 2_000 }),
+    ).resolves.toBeDefined();
+    // Lowering only the budget below the stored wait is also allowed.
+    await expect(
+      client().updateModelPool({ id: "pool-id", capacityWaitBudgetMs: 500 }),
+    ).resolves.toBeDefined();
+    expect(db.modelPool.update).toHaveBeenCalledTimes(3);
   });
 
   it.each([
@@ -2143,7 +2127,7 @@ describe("forwarderManagementRouter", () => {
     "rejects public-egress enablement when an attachment policy is %s",
     async (_label, rule, activatedAt) => {
       db.modelPool.findUnique.mockResolvedValue(
-        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+        poolRow({ userId: "user-id", fallbackEnabled: false }),
       );
       db.poolMember.findMany.mockResolvedValue([
         {
@@ -2167,8 +2151,7 @@ describe("forwarderManagementRouter", () => {
       await expect(
         client().updateModelPool({
           id: "pool-id",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
       ).rejects.toMatchObject({ code: "BAD_REQUEST" });
       expect(db.modelPool.update).not.toHaveBeenCalled();
@@ -2177,7 +2160,7 @@ describe("forwarderManagementRouter", () => {
 
   it("rejects public-egress enablement when an otherwise valid policy lacks an audit", async () => {
     db.modelPool.findUnique.mockResolvedValue(
-      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      poolRow({ userId: "user-id", fallbackEnabled: false }),
     );
     db.poolMember.findMany.mockResolvedValue([
       {
@@ -2201,8 +2184,7 @@ describe("forwarderManagementRouter", () => {
     await expect(
       client().updateModelPool({
         id: "pool-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
@@ -2210,7 +2192,7 @@ describe("forwarderManagementRouter", () => {
 
   it("enables public egress only when every attachment has an audited explicit rule", async () => {
     db.modelPool.findUnique.mockResolvedValue(
-      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      poolRow({ userId: "user-id", fallbackEnabled: false }),
     );
     db.poolMember.findMany.mockResolvedValue([
       {
@@ -2243,17 +2225,14 @@ describe("forwarderManagementRouter", () => {
       },
     ]);
     db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
-    db.modelPool.update.mockResolvedValue(
-      poolRow({ publicEgressEnabled: true, publicEgressAcknowledged: true }),
-    );
+    db.modelPool.update.mockResolvedValue(poolRow({ fallbackEnabled: true }));
 
     await expect(
       client().updateModelPool({
         id: "pool-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       }),
-    ).resolves.toMatchObject({ publicEgressEnabled: true, publicEgressAcknowledged: true });
+    ).resolves.toMatchObject({ fallbackEnabled: true });
   });
 
   describe("grantee privacy confirmation", () => {
@@ -2267,19 +2246,19 @@ describe("forwarderManagementRouter", () => {
         poolRow({
           userId: "user-id",
           name: "Shared",
-          publicEgressEnabled: false,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: false,
         }),
       );
       db.poolMember.findMany.mockResolvedValue([]);
       db.providerBudgetPolicy.findMany.mockResolvedValue([]);
-      db.poolMember.count.mockResolvedValue(0);
+      // One external member is configured; turning fallback on makes the
+      // pool able to send `:external` traffic out.
+      db.poolMember.count.mockResolvedValue(1);
       db.poolGrant.findMany.mockResolvedValue([grantee]);
       db.modelPool.update.mockResolvedValue(
         poolRow({
           name: "Shared",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
       );
     }
@@ -2290,8 +2269,7 @@ describe("forwarderManagementRouter", () => {
       await expect(
         client().updateModelPool({
           id: "pool-id",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
       ).rejects.toMatchObject({
         code: "CONFLICT",
@@ -2313,11 +2291,10 @@ describe("forwarderManagementRouter", () => {
       await expect(
         client().updateModelPool({
           id: "pool-id",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
           confirmGranteePrivacyChange: true,
         }),
-      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      ).resolves.toMatchObject({ fallbackEnabled: true });
       expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
         data: [
           {
@@ -2337,8 +2314,7 @@ describe("forwarderManagementRouter", () => {
 
       await client().updateModelPool({
         id: "pool-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
         confirmGranteePrivacyChange: true,
       });
 
@@ -2362,10 +2338,9 @@ describe("forwarderManagementRouter", () => {
       await expect(
         client().updateModelPool({
           id: "pool-id",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
-      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      ).resolves.toMatchObject({ fallbackEnabled: true });
       expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
@@ -2375,8 +2350,7 @@ describe("forwarderManagementRouter", () => {
         poolRow({
           userId: "user-id",
           name: "Shared",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
       );
       db.poolMember.count.mockResolvedValue(1);
@@ -2384,19 +2358,17 @@ describe("forwarderManagementRouter", () => {
       await expect(
         client().updateModelPool({
           id: "pool-id",
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
         }),
-      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      ).resolves.toMatchObject({ fallbackEnabled: true });
       expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
-    it("requires confirmation before a provider primary is added to a private shared pool", async () => {
+    it("requires confirmation before the first external member of an enabled shared pool", async () => {
       db.modelPool.findFirst.mockResolvedValue({
         id: "pool-id",
         name: "Shared",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
       });
       db.providerModel.findFirst.mockResolvedValue({
         id: "provider-model",
@@ -2413,14 +2385,14 @@ describe("forwarderManagementRouter", () => {
       db.poolMember.count.mockResolvedValue(0);
       db.poolGrant.findMany.mockResolvedValue([grantee]);
       db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
-      db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+      db.poolMember.create.mockResolvedValue({ id: "external-provider-member" });
 
       await expect(
         client().addProviderPoolMember({
           poolId: "pool-id",
           providerModelId: "provider-model",
-          tier: "PRIMARY",
-          weight: 1,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
         }),
       ).rejects.toMatchObject({
         code: "CONFLICT",
@@ -2433,12 +2405,12 @@ describe("forwarderManagementRouter", () => {
         client().addProviderPoolMember({
           poolId: "pool-id",
           providerModelId: "provider-model",
-          tier: "PRIMARY",
-          weight: 1,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
           confirmGranteePrivacyChange: true,
         }),
       ).resolves.toEqual({
-        id: "primary-provider-member",
+        id: "external-provider-member",
         executionTargetId: "provider-target",
       });
       expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
@@ -2452,13 +2424,13 @@ describe("forwarderManagementRouter", () => {
       });
     });
 
-    it("requires confirmation before promoting a provider member to primary", async () => {
+    it("never promotes a provider member to PRIMARY", async () => {
       const member = {
         id: "member-id",
         poolId: "pool-id",
         tier: "PUBLIC_OVERFLOW",
         publicOrder: 0,
-        weight: 1,
+        weight: 0,
         routingStatus: "ACTIVE",
         capacityConcurrencyMode: "INHERIT",
         capacityConcurrencyLimit: null,
@@ -2473,8 +2445,7 @@ describe("forwarderManagementRouter", () => {
         ModelPool: {
           userId: "user-id",
           name: "Shared",
-          publicEgressEnabled: false,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: false,
           recommendedSurfaceOverride: null,
           protocolAdaptationEnabled: false,
           capacityConcurrencyLimit: null,
@@ -2491,33 +2462,6 @@ describe("forwarderManagementRouter", () => {
           ModelPool: { userId: "user-id" },
         })
         .mockResolvedValueOnce(member);
-      db.poolMember.findMany.mockResolvedValue([]);
-      db.poolMember.count.mockResolvedValue(0);
-      db.poolGrant.findMany.mockResolvedValue([grantee]);
-
-      await expect(
-        client().updatePoolMember({ id: "member-id", tier: "PRIMARY" }),
-      ).rejects.toMatchObject({
-        code: "CONFLICT",
-        message: expect.stringContaining("ada@example.com"),
-      });
-      expect(db.poolMember.update).not.toHaveBeenCalled();
-
-      db.poolMember.findUnique
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          executionTargetId: null,
-          ModelPool: { userId: "user-id" },
-        })
-        .mockResolvedValueOnce(member);
-      db.poolMember.update.mockResolvedValue({
-        id: "member-id",
-        weight: 1,
-        routingStatus: "ACTIVE",
-        tier: "PRIMARY",
-        publicOrder: null,
-      });
 
       await expect(
         client().updatePoolMember({
@@ -2525,8 +2469,9 @@ describe("forwarderManagementRouter", () => {
           tier: "PRIMARY",
           confirmGranteePrivacyChange: true,
         }),
-      ).resolves.toMatchObject({ id: "member-id", tier: "PRIMARY" });
-      expect(db.dashboardNotice.createMany).toHaveBeenCalled();
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
   });
 
@@ -2677,8 +2622,7 @@ describe("forwarderManagementRouter", () => {
       transformerImages: true,
       transformerAudio: false,
       transformerVideo: false,
-      publicEgressEnabled: false,
-      publicEgressAcknowledged: false,
+      fallbackEnabled: false,
       protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
       capacityConcurrencyLimit: 2,
@@ -2878,52 +2822,41 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("derives grant egress acknowledgement from public overflow or a primary provider", async () => {
-    const member = (
-      tier: "PRIMARY" | "PUBLIC_OVERFLOW",
-      providerModelId: string | null,
-      routingStatus = "ACTIVE",
-    ) => ({
-      id: `${tier}-${providerModelId ?? "local"}-${routingStatus}`,
+  it("marks a pool external only when fallback is on and an external member exists", async () => {
+    const member = (tier: "PRIMARY" | "PUBLIC_OVERFLOW", providerModelId: string | null) => ({
+      id: `${tier}-${providerModelId ?? "local"}`,
       tier,
-      routingStatus,
+      routingStatus: "ACTIVE",
       ExecutionTarget: { providerModelId, DiscoveredModel: null, ProviderModel: null },
       DiscoveredModel: null,
     });
     db.modelPool.findMany.mockResolvedValue([
       poolRow({
-        id: "overflow-local",
-        slug: "overflow-local",
-        publicEgressEnabled: true,
+        id: "enabled-external",
+        slug: "enabled-external",
+        fallbackEnabled: true,
+        PoolMembers: [member("PRIMARY", null), member("PUBLIC_OVERFLOW", "overflow-model")],
+      }),
+      poolRow({
+        id: "enabled-local-only",
+        slug: "enabled-local-only",
+        fallbackEnabled: true,
         PoolMembers: [member("PRIMARY", null)],
       }),
       poolRow({
-        id: "provider-primary",
-        slug: "provider-primary",
-        publicEgressEnabled: false,
-        PoolMembers: [member("PRIMARY", "provider-model", "DRAINING")],
-      }),
-      poolRow({
-        id: "provider-overflow",
-        slug: "provider-overflow",
-        publicEgressEnabled: false,
+        id: "disabled-external",
+        slug: "disabled-external",
+        fallbackEnabled: false,
         PoolMembers: [member("PUBLIC_OVERFLOW", "overflow-model")],
-      }),
-      poolRow({
-        id: "local-only",
-        slug: "local-only",
-        publicEgressEnabled: false,
-        PoolMembers: [member("PRIMARY", null)],
       }),
     ]);
 
     const pools = await client().listModelPools();
 
     expect(pools.map((pool) => [pool.id, pool.effectiveProviderEgress])).toEqual([
-      ["overflow-local", true],
-      ["provider-primary", true],
-      ["provider-overflow", false],
-      ["local-only", false],
+      ["enabled-external", true],
+      ["enabled-local-only", false],
+      ["disabled-external", false],
     ]);
   });
 
@@ -2977,12 +2910,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
-      .mockResolvedValueOnce(
-        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
-      )
-      .mockResolvedValueOnce(
-        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
-      );
+      .mockResolvedValueOnce(poolRow({ userId: "user-id", fallbackEnabled: false }))
+      .mockResolvedValueOnce(poolRow({ userId: "user-id", fallbackEnabled: false }));
     db.modelPool.create.mockResolvedValue(poolRow({ slug: "gpt-4.1-mini" }));
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "local.mixtral" }));
 
@@ -3385,7 +3314,7 @@ describe("forwarderManagementRouter", () => {
     ]);
   });
 
-  it("transactionally validates and updates provider primary routing and capacity policy", async () => {
+  it("transactionally validates and updates external member routing and capacity policy", async () => {
     db.poolMember.findUnique
       .mockResolvedValueOnce({
         id: "provider-primary-member",
@@ -3395,9 +3324,9 @@ describe("forwarderManagementRouter", () => {
       .mockResolvedValueOnce({
         id: "provider-primary-member",
         poolId: "pool-id",
-        tier: "PRIMARY",
-        publicOrder: null,
-        weight: 1,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
+        weight: 0,
         routingStatus: "ACTIVE",
         capacityConcurrencyMode: "INHERIT",
         capacityConcurrencyLimit: null,
@@ -3411,8 +3340,7 @@ describe("forwarderManagementRouter", () => {
         },
         ModelPool: {
           userId: "user-id",
-          publicEgressEnabled: false,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: false,
           capacityConcurrencyLimit: 6,
           capacityReservedSlots: 1,
         },
@@ -3420,16 +3348,15 @@ describe("forwarderManagementRouter", () => {
     db.poolMember.findMany.mockResolvedValue([]);
     db.poolMember.update.mockResolvedValue({
       id: "provider-primary-member",
-      weight: 5,
+      weight: 0,
       routingStatus: "ACTIVE",
-      tier: "PRIMARY",
-      publicOrder: null,
+      tier: "PUBLIC_OVERFLOW",
+      publicOrder: 0,
     });
 
     await expect(
       client().updatePoolMember({
         id: "provider-primary-member",
-        weight: 5,
         capacityPriority: 24,
         capacityConcurrencyMode: "LIMITED",
         capacityConcurrencyLimit: 4,
@@ -3441,13 +3368,12 @@ describe("forwarderManagementRouter", () => {
         capacityContextCeiling: 32_768,
         capacityContextMargin: 1_024,
       }),
-    ).resolves.toMatchObject({ id: "provider-primary-member", weight: 5, tier: "PRIMARY" });
+    ).resolves.toMatchObject({ id: "provider-primary-member", tier: "PUBLIC_OVERFLOW" });
 
     expect(db.poolMember.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "provider-primary-member" },
         data: expect.objectContaining({
-          weight: 5,
           capacityPriority: 24,
           capacityConcurrencyMode: "LIMITED",
           capacityConcurrencyLimit: 4,
@@ -3467,9 +3393,9 @@ describe("forwarderManagementRouter", () => {
     const member = (mode: "INHERIT" | "LIMITED" | "UNLIMITED") => ({
       id: "member-id",
       poolId: "pool-id",
-      tier: "PRIMARY",
-      publicOrder: null,
-      weight: 1,
+      tier: "PUBLIC_OVERFLOW",
+      publicOrder: 0,
+      weight: 0,
       routingStatus: "ACTIVE",
       capacityConcurrencyMode: mode,
       capacityConcurrencyLimit: mode === "LIMITED" ? 2 : null,
@@ -3483,8 +3409,7 @@ describe("forwarderManagementRouter", () => {
       },
       ModelPool: {
         userId: "user-id",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: false,
         capacityConcurrencyLimit: 6,
         capacityReservedSlots: 1,
       },
@@ -3521,9 +3446,9 @@ describe("forwarderManagementRouter", () => {
     const base = {
       id: "member-id",
       poolId: "pool-id",
-      tier: "PRIMARY",
-      publicOrder: null,
-      weight: 1,
+      tier: "PUBLIC_OVERFLOW",
+      publicOrder: 0,
+      weight: 0,
       routingStatus: "ACTIVE",
       capacityConcurrencyMode: "INHERIT",
       capacityConcurrencyLimit: null,
@@ -3537,8 +3462,7 @@ describe("forwarderManagementRouter", () => {
       },
       ModelPool: {
         userId: "user-id",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: false,
         capacityConcurrencyLimit: 8,
         capacityReservedSlots: 0,
       },
@@ -3553,10 +3477,10 @@ describe("forwarderManagementRouter", () => {
     db.poolMember.findMany.mockResolvedValue([]);
     db.poolMember.update.mockResolvedValue({
       id: "member-id",
-      weight: 1,
+      weight: 0,
       routingStatus: "ACTIVE",
-      tier: "PRIMARY",
-      publicOrder: null,
+      tier: "PUBLIC_OVERFLOW",
+      publicOrder: 0,
     });
     await expect(
       client().updatePoolMember({
@@ -3570,8 +3494,7 @@ describe("forwarderManagementRouter", () => {
   it("requires an active explicit concurrency policy before attaching public overflow", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "pool-id",
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: true,
     });
     db.providerModel.findFirst.mockResolvedValue({
       id: "provider-model",
@@ -3610,11 +3533,10 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("rejects attaching a provider primary when inherited pool capacity exceeds its hard limit", async () => {
+  it("rejects attaching an external member when inherited pool capacity exceeds its hard limit", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "pool-id",
-      publicEgressEnabled: false,
-      publicEgressAcknowledged: true,
+      fallbackEnabled: false,
       capacityConcurrencyLimit: 5,
       capacityReservedSlots: 1,
     });
@@ -3629,18 +3551,35 @@ describe("forwarderManagementRouter", () => {
       client().addProviderPoolMember({
         poolId: "pool-id",
         providerModelId: "provider-model",
-        tier: "PRIMARY",
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.providerBudgetPolicy.findFirst).not.toHaveBeenCalled();
     expect(db.poolMember.create).not.toHaveBeenCalled();
   });
 
-  it("attaches a provider PRIMARY without enabling public overflow", async () => {
+  it("never attaches a provider model at the PRIMARY tier", async () => {
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+        weight: 7,
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("external fallback"),
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
+  it("attaches an external member while fallback is off, without any acknowledgement", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "private-pool",
-      publicEgressEnabled: false,
-      publicEgressAcknowledged: true,
+      name: "Private",
+      fallbackEnabled: false,
     });
     db.providerModel.findFirst.mockResolvedValue({
       id: "provider-model",
@@ -3654,33 +3593,32 @@ describe("forwarderManagementRouter", () => {
     });
     db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
     db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
-    db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
-    // The PRIMARY surface fence reads the existing members; the pool has none,
-    // so the attachment stays valid and no overflow reorder write happens.
+    db.poolMember.create.mockResolvedValue({ id: "external-provider-member" });
     db.poolMember.findMany.mockResolvedValue([]);
 
     await expect(
       client().addProviderPoolMember({
         poolId: "private-pool",
         providerModelId: "provider-model",
-        tier: "PRIMARY",
-        weight: 7,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
       }),
     ).resolves.toEqual({
-      id: "primary-provider-member",
+      id: "external-provider-member",
       executionTargetId: "provider-target",
     });
     expect(db.poolMember.create).toHaveBeenCalledWith({
       data: {
         poolId: "private-pool",
         executionTargetId: "provider-target",
-        tier: "PRIMARY",
-        publicOrder: null,
-        weight: 7,
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
+        weight: 0,
       },
       select: { id: true },
     });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    // Fallback stays off: nothing about the pool's consent changes.
+    expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
@@ -3749,7 +3687,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique.mockResolvedValue({
       id: "pool-id",
       userId: "user-id",
-      publicEgressEnabled: false,
+      fallbackEnabled: false,
     });
     db.user.findFirst.mockResolvedValue({ id: "grantee-id" });
     db.poolGrant.upsert.mockResolvedValue({
@@ -3771,65 +3709,12 @@ describe("forwarderManagementRouter", () => {
     expect(JSON.stringify(db.user.findFirst.mock.calls)).not.toContain("contains");
   });
 
-  it("requires an exact public-egress acknowledgement before creating a pool grant", async () => {
+  it("grants access to a pool with external fallback without any egress acknowledgement", async () => {
     db.modelPool.findUnique.mockResolvedValue({
       id: "pool-id",
       userId: "user-id",
-      publicEgressEnabled: true,
+      fallbackEnabled: true,
     });
-
-    await expect(
-      client().grantPoolAccessByEmail({
-        poolId: "pool-id",
-        email: "friend@example.com",
-        publicEgressAcknowledged: false,
-      }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      message: "Provider egress acknowledgement is required for this grant.",
-    });
-    expect(db.poolMember.findFirst).not.toHaveBeenCalled();
-    expect(db.user.findFirst).not.toHaveBeenCalled();
-    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
-  });
-
-  it("requires provider-egress acknowledgement for provider PRIMARY grants", async () => {
-    db.modelPool.findUnique.mockResolvedValue({
-      id: "pool-id",
-      userId: "user-id",
-      publicEgressEnabled: false,
-    });
-    db.poolMember.findFirst.mockResolvedValue({ id: "provider-primary-member" });
-
-    await expect(
-      client().grantPoolAccessByEmail({
-        poolId: "pool-id",
-        email: "friend@example.com",
-        publicEgressAcknowledged: false,
-      }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      message: "Provider egress acknowledgement is required for this grant.",
-    });
-    expect(db.poolMember.findFirst).toHaveBeenCalledWith({
-      where: {
-        poolId: "pool-id",
-        tier: "PRIMARY",
-        ExecutionTarget: { providerModelId: { not: null } },
-      },
-      select: { id: true },
-    });
-    expect(JSON.stringify(db.poolMember.findFirst.mock.calls)).not.toContain("isNot");
-    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
-  });
-
-  it("does not require acknowledgement when the only provider member is overflow", async () => {
-    db.modelPool.findUnique.mockResolvedValue({
-      id: "pool-id",
-      userId: "user-id",
-      publicEgressEnabled: false,
-    });
-    db.poolMember.findFirst.mockResolvedValue(null);
     db.user.findFirst.mockResolvedValue({ id: "grantee-id" });
     db.poolGrant.upsert.mockResolvedValue({
       id: "grant-id",
@@ -3837,19 +3722,12 @@ describe("forwarderManagementRouter", () => {
       granteeUserId: "grantee-id",
     });
 
-    await client().grantPoolAccessByEmail({
-      poolId: "pool-id",
-      email: "friend@example.com",
-      publicEgressAcknowledged: false,
-    });
-    expect(db.poolMember.findFirst).toHaveBeenCalledWith({
-      where: {
-        poolId: "pool-id",
-        tier: "PRIMARY",
-        ExecutionTarget: { providerModelId: { not: null } },
-      },
-      select: { id: true },
-    });
+    await expect(
+      client().grantPoolAccessByEmail({ poolId: "pool-id", email: "friend@example.com" }),
+    ).resolves.toMatchObject({ id: "grant-id" });
+    // A grantee's data leaves only with its own `:external` opt-in and the
+    // owner's fallbackForGrantees; the grant itself never inspects members.
+    expect(db.poolMember.findFirst).not.toHaveBeenCalled();
     expect(db.poolGrant.upsert).toHaveBeenCalled();
   });
 
@@ -4464,47 +4342,10 @@ describe("forwarderManagementRouter", () => {
       expect(db.poolMember.create).toHaveBeenCalledTimes(1);
     });
 
-    it("rejects a provider primary attach that cannot serve the stored override", async () => {
-      db.modelPool.findFirst.mockResolvedValue({
-        id: "pool-id",
-        publicEgressEnabled: false,
-        publicEgressAcknowledged: true,
-        recommendedSurfaceOverride: "OPENAI_RESPONSES",
-        protocolAdaptationEnabled: false,
-        capacityConcurrencyLimit: null,
-        capacityReservedSlots: 0,
-        capacityContextCeiling: null,
-        capacityContextMargin: 0,
-      });
-      db.providerModel.findFirst.mockResolvedValue({
-        id: "provider-model",
-        providerAccountId: "provider-account",
-        contextWindow: 8_192,
-        concurrencyLimit: 4,
-        nativeCapabilities: chatNativeCapabilities,
-        enabled: true,
-      });
-      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
-
-      await expect(
-        client().addProviderPoolMember({
-          poolId: "pool-id",
-          providerModelId: "provider-model",
-          tier: "PRIMARY",
-        }),
-      ).rejects.toMatchObject({
-        code: "BAD_REQUEST",
-        data: { reason: "SURFACE_NOT_SUPPORTED" },
-      });
-      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
-      expect(db.poolMember.create).not.toHaveBeenCalled();
-    });
-
     it("skips the surface fence for provider overflow attaches", async () => {
       db.modelPool.findFirst.mockResolvedValue({
         id: "pool-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        fallbackEnabled: true,
         recommendedSurfaceOverride: "OPENAI_RESPONSES",
         protocolAdaptationEnabled: false,
         capacityConcurrencyLimit: null,
@@ -4542,202 +4383,6 @@ describe("forwarderManagementRouter", () => {
         }),
       ).resolves.toMatchObject({ id: "member-id" });
       expect(db.poolMember.create).toHaveBeenCalledTimes(1);
-    });
-
-    it("rejects demoting the only primary serving the stored override", async () => {
-      const memberModelPool = {
-        userId: "user-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
-        recommendedSurfaceOverride: "OPENAI_RESPONSES",
-        protocolAdaptationEnabled: false,
-        capacityConcurrencyLimit: null,
-        capacityReservedSlots: 0,
-        capacityContextCeiling: null,
-        capacityContextMargin: 0,
-      };
-      db.poolMember.findUnique
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          executionTargetId: "target-id",
-          ModelPool: { userId: "user-id" },
-        })
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          tier: "PRIMARY",
-          publicOrder: null,
-          weight: 1,
-          routingStatus: "ACTIVE",
-          capacityConcurrencyMode: "INHERIT",
-          capacityConcurrencyLimit: null,
-          capacityReservedSlots: null,
-          capacityContextCeilingMode: "INHERIT",
-          capacityContextCeiling: null,
-          capacityContextMargin: null,
-          ExecutionTarget: {
-            ProviderModel: {
-              id: "provider-model",
-              providerAccountId: "provider-account",
-              nativeCapabilities: responsesNativeCapabilities,
-            },
-            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
-          },
-          ModelPool: memberModelPool,
-        });
-      db.providerBudgetPolicy.findFirst.mockResolvedValue({
-        id: "policy",
-        activatedAt: new Date(),
-        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
-      });
-      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
-      // The exclusion-free member set includes the transitioning member
-      // (member-id, responses-native). The in-place re-tag demotes it, so the
-      // remaining primary is chat-native and cannot serve the responses
-      // override once member-id leaves the primary tier.
-      db.poolMember.findMany.mockResolvedValue([
-        surfaceMemberRow("member-id", "responses"),
-        surfaceMemberRow("member-a", "chat"),
-      ]);
-
-      await expect(
-        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
-      ).rejects.toMatchObject({
-        code: "BAD_REQUEST",
-        data: { reason: "SURFACE_NOT_SUPPORTED" },
-      });
-      expect(db.poolMember.update).not.toHaveBeenCalled();
-      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
-    });
-
-    it("rejects promoting an overflow member that strands the stored override", async () => {
-      const memberModelPool = {
-        userId: "user-id",
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
-        recommendedSurfaceOverride: "OPENAI_RESPONSES",
-        protocolAdaptationEnabled: false,
-        capacityConcurrencyLimit: null,
-        capacityReservedSlots: 0,
-        capacityContextCeiling: null,
-        capacityContextMargin: 0,
-      };
-      db.poolMember.findUnique
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          executionTargetId: "target-id",
-          ModelPool: { userId: "user-id" },
-        })
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          tier: "PUBLIC_OVERFLOW",
-          publicOrder: 0,
-          weight: 1,
-          routingStatus: "ACTIVE",
-          capacityConcurrencyMode: "INHERIT",
-          capacityConcurrencyLimit: null,
-          capacityReservedSlots: null,
-          capacityContextCeilingMode: "INHERIT",
-          capacityContextCeiling: null,
-          capacityContextMargin: null,
-          ExecutionTarget: {
-            ProviderModel: {
-              id: "provider-model",
-              providerAccountId: "provider-account",
-              nativeCapabilities: chatNativeCapabilities,
-            },
-            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
-          },
-          ModelPool: memberModelPool,
-        });
-      // The promotion re-tags member-id (chat-native) to PRIMARY in place:
-      // the post-state primaries include a member that cannot serve the
-      // responses override, so the promotion must be fenced.
-      db.poolMember.findMany.mockResolvedValue([
-        surfaceMemberRow("member-id", "chat", "PUBLIC_OVERFLOW"),
-        surfaceMemberRow("member-a", "responses"),
-      ]);
-
-      await expect(
-        client().updatePoolMember({ id: "member-id", tier: "PRIMARY" }),
-      ).rejects.toMatchObject({
-        code: "BAD_REQUEST",
-        data: { reason: "SURFACE_NOT_SUPPORTED" },
-      });
-      expect(db.poolMember.update).not.toHaveBeenCalled();
-      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
-    });
-
-    it("accepts a tier transition that keeps the override servable", async () => {
-      db.poolMember.findUnique
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          executionTargetId: "target-id",
-          ModelPool: { userId: "user-id" },
-        })
-        .mockResolvedValueOnce({
-          id: "member-id",
-          poolId: "pool-id",
-          tier: "PRIMARY",
-          publicOrder: null,
-          weight: 1,
-          routingStatus: "ACTIVE",
-          capacityConcurrencyMode: "INHERIT",
-          capacityConcurrencyLimit: null,
-          capacityReservedSlots: null,
-          capacityContextCeilingMode: "INHERIT",
-          capacityContextCeiling: null,
-          capacityContextMargin: null,
-          ExecutionTarget: {
-            ProviderModel: {
-              id: "provider-model",
-              providerAccountId: "provider-account",
-              nativeCapabilities: chatNativeCapabilities,
-            },
-            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
-          },
-          ModelPool: {
-            userId: "user-id",
-            publicEgressEnabled: true,
-            publicEgressAcknowledged: true,
-            recommendedSurfaceOverride: "OPENAI_RESPONSES",
-            protocolAdaptationEnabled: true,
-            capacityConcurrencyLimit: null,
-            capacityReservedSlots: 0,
-            capacityContextCeiling: null,
-            capacityContextMargin: 0,
-          },
-        });
-      db.providerBudgetPolicy.findFirst.mockResolvedValue({
-        id: "policy",
-        activatedAt: new Date(),
-        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
-      });
-      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
-      // Demoting the chat-only member leaves a responses-native primary that
-      // serves the override natively, so the transition must proceed.
-      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
-      db.poolMember.update.mockResolvedValue({
-        id: "member-id",
-        weight: 0,
-        routingStatus: "ACTIVE",
-        tier: "PUBLIC_OVERFLOW",
-        publicOrder: null,
-      });
-
-      await expect(
-        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
-      ).resolves.toMatchObject({ id: "member-id", tier: "PUBLIC_OVERFLOW" });
-      expect(db.poolMember.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: "member-id" },
-          data: expect.objectContaining({ tier: "PUBLIC_OVERFLOW" }),
-        }),
-      );
     });
 
     it("rejects detaching the primary that serves the stored override", async () => {
@@ -5104,7 +4749,7 @@ describe("forwarderManagementRouter", () => {
         db.modelPool.findUnique.mockResolvedValue({
           id: "pool-id",
           userId: "user-id",
-          publicEgressEnabled: false,
+          fallbackEnabled: false,
         });
         prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
         await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({

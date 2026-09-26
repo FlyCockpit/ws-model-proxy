@@ -11,17 +11,16 @@ import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-ac
 import {
   effectiveProviderEgress,
   egressProviderAccountLabels,
-  providerPrimaryMemberWhere,
+  externalFallbackMemberWhere,
 } from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
 
 export {
   effectiveProviderEgress,
+  externalFallbackMemberWhere,
   grantPoolAccessServerMessage,
   grantPoolAccessServerMessages,
-  providerPrimaryMemberCount,
-  providerPrimaryMemberWhere,
 } from "./effective-provider-egress";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
@@ -57,15 +56,18 @@ export type VisibleModelPoolTarget = {
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
-  publicEgressEnabled: boolean;
-  publicEgressAcknowledged: boolean;
+  /** Owner allows external fallback (for `owner/pool:external` requests only). */
+  fallbackEnabled: boolean;
+  /** Owner pays for grantees' external fallback. */
+  fallbackForGrantees: boolean;
+  /** Configured external fallback (provider) members, regardless of health. */
+  externalMemberCount: number;
   /**
-   * True when a grant must acknowledge provider egress: public overflow is on,
-   * or a PRIMARY member is a provider model. Overflow-only provider members
-   * do not count unless public overflow is on.
+   * True when the pool can send `:external` traffic to a provider for some
+   * caller: fallback is on and at least one external member is configured.
+   * Plain pool names never leave the deployment.
    */
   effectiveProviderEgress: boolean;
-  providerPrimaryMemberCount: number;
   /** Display names of provider accounts that can receive traffic. Never credentials. */
   providerAccountLabels: string[];
   allowLossyDeveloperRoleCollapse: boolean;
@@ -81,6 +83,8 @@ export type ModelApiTokenIdentity = {
   id: string;
   userId: string;
   scopeMode: ModelApiTokenScopeMode;
+  /** Human-set consent for `owner/pool:external`; false (private only) by default. */
+  allowExternal: boolean;
   lookupPrefix: string;
   expiresAt: Date | null;
   lastUsedAt: Date | null;
@@ -111,17 +115,12 @@ const modelPoolSelect = {
   maxAttachmentBytes: true,
   optimisticBasicTranscription: true,
   protocolAdaptationEnabled: true,
-  publicEgressEnabled: true,
-  publicEgressAcknowledged: true,
+  fallbackEnabled: true,
+  fallbackForGrantees: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
-    where: {
-      OR: [
-        providerPrimaryMemberWhere,
-        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: { not: null } } },
-      ],
-    },
+    where: externalFallbackMemberWhere,
     select: {
       id: true,
       tier: true,
@@ -179,19 +178,15 @@ function serializeModelPool(
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
-    publicEgressEnabled: row.publicEgressEnabled,
-    publicEgressAcknowledged: row.publicEgressAcknowledged,
+    fallbackEnabled: row.fallbackEnabled,
+    fallbackForGrantees: row.fallbackForGrantees,
+    externalMemberCount: (row.PoolMembers ?? []).length,
     effectiveProviderEgress: effectiveProviderEgress({
-      publicEgressEnabled: row.publicEgressEnabled,
-      providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
-        (member) => member.tier === "PRIMARY",
-      ).length,
+      fallbackEnabled: row.fallbackEnabled,
+      externalMemberCount: (row.PoolMembers ?? []).length,
     }),
-    providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
-      (member) => member.tier === "PRIMARY",
-    ).length,
     providerAccountLabels: egressProviderAccountLabels({
-      publicEgressEnabled: row.publicEgressEnabled,
+      fallbackEnabled: row.fallbackEnabled,
       members: (row.PoolMembers ?? []).map((member) => ({
         tier: member.tier,
         accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
@@ -282,19 +277,39 @@ export async function resolveAllowlistedModelTargets({
       continue;
     }
 
+    if (modelId.includes(":") && poolByModelId.has(modelId.slice(0, modelId.indexOf(":")))) {
+      throw new ORPCError("BAD_REQUEST", {
+        message:
+          "Allowlist the pool by its plain name. External access is a separate per-pool token setting.",
+      });
+    }
+
     throw new ORPCError("FORBIDDEN", { message: "Model is not visible to this user." });
   }
 
   return { directModels, modelPools };
 }
 
-export async function listVisibleModelTargetsForToken(
-  token: Pick<ModelApiTokenIdentity, "id" | "userId" | "scopeMode">,
-): Promise<VisibleModelTargets> {
+/**
+ * Pools for which this token consents to `owner/pool:external`. ALL_VISIBLE
+ * tokens are all-or-nothing (`allowExternal`); ALLOWLIST tokens additionally
+ * need the pool entry's `includeExternal`. This is only the token's consent:
+ * the deployment switch and the owner's pool settings are separate gates.
+ */
+export type TokenExternalPermission = ReadonlySet<string>;
+
+export async function listVisibleModelTargetsWithExternalPermissionForToken(
+  token: Pick<ModelApiTokenIdentity, "id" | "userId" | "scopeMode" | "allowExternal">,
+): Promise<{ targets: VisibleModelTargets; externalPoolIds: TokenExternalPermission }> {
   const visibleTargets = await listVisibleModelTargetsForUser(token.userId);
 
   if (token.scopeMode === "ALL_VISIBLE") {
-    return visibleTargets;
+    return {
+      targets: visibleTargets,
+      externalPoolIds: new Set(
+        token.allowExternal === true ? visibleTargets.modelPools.map((pool) => pool.id) : [],
+      ),
+    };
   }
 
   const entries = await prisma.modelApiTokenAllowlistEntry.findMany({
@@ -304,6 +319,7 @@ export async function listVisibleModelTargetsForToken(
       discoveredModelId: true,
       ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
+      includeExternal: true,
     },
   });
 
@@ -319,10 +335,266 @@ export async function listVisibleModelTargetsForToken(
       .map((entry) => entry.modelPoolId),
   );
 
+  const modelPools = visibleTargets.modelPools.filter((pool) => allowedPoolIds.has(pool.id));
+  const externalEntryPoolIds = new Set(
+    entries.flatMap((entry) =>
+      entry.target === "MODEL_POOL" && entry.modelPoolId && entry.includeExternal === true
+        ? [entry.modelPoolId]
+        : [],
+    ),
+  );
   return {
-    directModels: visibleTargets.directModels.filter((model) => allowedDirectIds.has(model.id)),
-    modelPools: visibleTargets.modelPools.filter((pool) => allowedPoolIds.has(pool.id)),
+    targets: {
+      directModels: visibleTargets.directModels.filter((model) => allowedDirectIds.has(model.id)),
+      modelPools,
+    },
+    externalPoolIds: new Set(
+      token.allowExternal === true
+        ? modelPools.filter((pool) => externalEntryPoolIds.has(pool.id)).map((pool) => pool.id)
+        : [],
+    ),
   };
+}
+
+/** Why a caller's `:external` consent no longer holds (see readExternalConsentDenial). */
+export type ExternalConsentStateDenial =
+  | "TOKEN_CONSENT_WITHDRAWN"
+  | "REQUESTER_NOT_VISIBLE"
+  /** The requester's account is banned or marked for deletion. */
+  | "REQUESTER_ACCESS_BLOCKED";
+
+/** Why an `:external` send is refused at the send boundary (lockExternalSendConsent). */
+export type ExternalSendConsentDenial =
+  | ExternalConsentStateDenial
+  /** The pool is gone or its owner turned `fallbackEnabled` off. */
+  | "POOL_PRIVATE"
+  /** A grantee's request, and the owner turned `fallbackForGrantees` off. */
+  | "GRANTEE_NOT_COVERED";
+
+/**
+ * The identity an `:external` consent was minted for. `accessGrantId` is the
+ * exact grant the request (or the stored-response binding it continues) was
+ * resolved under: null for the pool owner, the grant row id for a grantee. A
+ * grantee is served only while that same grant row exists; a replacement
+ * grant (revoke G1, re-grant G2) is a different consent.
+ */
+export type ExternalConsentIdentity = {
+  requesterUserId: string;
+  modelApiTokenId: string | null;
+  poolId: string;
+  ownerUserId: string;
+  accessGrantId: string | null;
+};
+
+type ConsentReadClient = Pick<
+  Prisma.TransactionClient,
+  "modelApiToken" | "modelApiTokenAllowlistEntry" | "poolGrant" | "user"
+>;
+
+type RequesterValidityClient = Pick<Prisma.TransactionClient, "modelApiToken" | "user">;
+
+/** The token and account rows whose validity can lapse without a write (time) or is not locked. */
+function readRequesterValidityRows(db: RequesterValidityClient, input: ExternalConsentIdentity) {
+  return Promise.all([
+    input.modelApiTokenId
+      ? db.modelApiToken.findUnique({
+          where: { id: input.modelApiTokenId },
+          select: {
+            userId: true,
+            scopeMode: true,
+            allowExternal: true,
+            revokedAt: true,
+            expiresAt: true,
+          },
+        })
+      : null,
+    db.user.findUnique({
+      where: { id: input.requesterUserId },
+      select: { banned: true, banExpires: true, deletionRequestedAt: true },
+    }),
+  ]);
+}
+
+async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConsentIdentity) {
+  const [[token, requester], allowlistEntry, grant] = await Promise.all([
+    readRequesterValidityRows(db, input),
+    input.modelApiTokenId
+      ? db.modelApiTokenAllowlistEntry.findUnique({
+          where: {
+            modelApiTokenId_modelPoolId: {
+              modelApiTokenId: input.modelApiTokenId,
+              modelPoolId: input.poolId,
+            },
+          },
+          select: { target: true, includeExternal: true },
+        })
+      : null,
+    input.requesterUserId === input.ownerUserId
+      ? null
+      : db.poolGrant.findUnique({
+          where: {
+            poolId_granteeUserId: { poolId: input.poolId, granteeUserId: input.requesterUserId },
+          },
+          select: { id: true, ownerUserId: true },
+        }),
+  ]);
+  return { token, requester, allowlistEntry, grant };
+}
+
+type RequesterValidityRows = Awaited<ReturnType<typeof readRequesterValidityRows>>;
+
+/**
+ * The credential-validity part of authentication
+ * (authenticateModelApiTokenSecret for a token, Better Auth's session plus the
+ * account-access guard for Chat Test), evaluated at `now`: the token exists,
+ * belongs to the requester, is not revoked or expired and allows external;
+ * the requester's account exists, is not banned and has no deletion mark
+ * (`userCredentialAccessBlocked`).
+ */
+function requesterValidityDenial(
+  input: ExternalConsentIdentity,
+  [token, requester]: RequesterValidityRows,
+  now: Date,
+): ExternalConsentStateDenial | null {
+  if (input.modelApiTokenId) {
+    if (
+      !token ||
+      token.userId !== input.requesterUserId ||
+      token.revokedAt ||
+      (token.expiresAt && token.expiresAt <= now) ||
+      token.allowExternal !== true
+    )
+      return "TOKEN_CONSENT_WITHDRAWN";
+  }
+  if (!requester || userCredentialAccessBlocked(requester, now)) return "REQUESTER_ACCESS_BLOCKED";
+  return null;
+}
+
+function callerConsentDenial(
+  input: ExternalConsentIdentity,
+  rows: Awaited<ReturnType<typeof readCallerConsentRows>>,
+  now: Date,
+): ExternalConsentStateDenial | null {
+  const validity = requesterValidityDenial(input, [rows.token, rows.requester], now);
+  if (validity) return validity;
+  if (
+    input.modelApiTokenId &&
+    String(rows.token?.scopeMode) === "ALLOWLIST" &&
+    (rows.allowlistEntry?.target !== "MODEL_POOL" || rows.allowlistEntry.includeExternal !== true)
+  )
+    return "TOKEN_CONSENT_WITHDRAWN";
+  if (
+    input.requesterUserId !== input.ownerUserId &&
+    (input.accessGrantId === null ||
+      rows.grant?.id !== input.accessGrantId ||
+      rows.grant.ownerUserId !== input.ownerUserId)
+  )
+    return "REQUESTER_NOT_VISIBLE";
+  return null;
+}
+
+/**
+ * Re-reads, from current database state, the caller-side conditions that an
+ * `:external` consent was minted from at authentication, so provider dispatch
+ * never relies on a snapshot that may be minutes old:
+ *   - API token (`modelApiTokenId` non-null): the token still exists, belongs
+ *     to the requester, is not revoked or expired, has `allowExternal`, and
+ *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
+ *   - account (every requester, including Chat Test): the requester's user
+ *     row exists, is not banned and has no deletion mark;
+ *   - visibility (any requester that is not the pool owner, including Chat
+ *     Test): the requester still holds the exact grant (`accessGrantId`) the
+ *     request was resolved under, from this pool's owner.
+ * Returns null when every condition still holds. The pool owner's own flags
+ * (fallbackEnabled, fallbackForGrantees) are re-read by the dispatcher.
+ *
+ * This is an early, unlocked check. The authoritative check is
+ * {@link lockExternalSendConsent} plus
+ * {@link recheckExternalSendRequesterValidity}, inside the send-claim
+ * transaction.
+ */
+export async function readExternalConsentDenial(
+  input: ExternalConsentIdentity,
+): Promise<ExternalConsentStateDenial | null> {
+  const rows = await readCallerConsentRows(prisma, input);
+  return callerConsentDenial(input, rows, new Date());
+}
+
+/**
+ * E0 send boundary, part 1: validates every consent condition of an
+ * `:external` send (owner's `fallbackEnabled`, `fallbackForGrantees` for a
+ * grantee, the requester's exact grant, the token's `allowExternal`,
+ * revocation, expiry and ALLOWLIST `includeExternal`, and the requester's
+ * account state) inside the caller's send-claim transaction, holding the
+ * pool, grant, token and allowlist rows FOR SHARE until it commits.
+ *
+ * Serialization: every consent withdrawal on those rows is an UPDATE or
+ * DELETE of one of them (pool flag write, pool delete, grant delete and its
+ * pool/user cascades, token revoke / `allowExternal` / `includeExternal`
+ * write, token and allowlist cascades from a user delete). Each conflicts
+ * with FOR SHARE, so a withdrawal either commits before the lock is granted
+ * (and the reads below, later READ COMMITTED statements, see it) or waits
+ * until the send is claimed. A grant replacement is a DELETE of the locked
+ * grant plus an INSERT of another id, so it is seen as the id mismatch.
+ *
+ * Two conditions are not frozen by these locks: time (token `expiresAt`, ban
+ * expiry) and the requester's user row (ban, deletion mark), which this
+ * transaction deliberately does not lock. Both are evaluated here as an early
+ * refusal and evaluated again by {@link recheckExternalSendRequesterValidity}
+ * after the last lock wait of the transaction.
+ *
+ * Lock order (documented in packages/db/src/capacity-lock-order.ts, "E0
+ * send-claim transaction"): `model_pool` -> `pool_grant` -> `model_api_token`
+ * -> `model_api_token_allowlist_entry`, all FOR SHARE, and then the caller's
+ * `provider_account` -> `provider_credential` FOR UPDATE. The transaction
+ * holds no lock before this call and takes no capacity lock at all.
+ */
+export async function lockExternalSendConsent(
+  tx: Prisma.TransactionClient,
+  input: ExternalConsentIdentity,
+): Promise<ExternalSendConsentDenial | null> {
+  const requesterIsOwner = input.requesterUserId === input.ownerUserId;
+  await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${input.ownerUserId} FOR SHARE`;
+  if (!requesterIsOwner)
+    await tx.$queryRaw`SELECT id FROM pool_grant WHERE "poolId" = ${input.poolId} AND "granteeUserId" = ${input.requesterUserId} FOR SHARE`;
+  if (input.modelApiTokenId) {
+    await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.modelApiTokenId} FOR SHARE`;
+    await tx.$queryRaw`SELECT id FROM model_api_token_allowlist_entry WHERE "modelApiTokenId" = ${input.modelApiTokenId} AND "modelPoolId" = ${input.poolId} FOR SHARE`;
+  }
+  const pool = await tx.modelPool.findFirst({
+    where: { id: input.poolId, userId: input.ownerUserId },
+    select: { fallbackEnabled: true, fallbackForGrantees: true },
+  });
+  if (!pool?.fallbackEnabled) return "POOL_PRIVATE";
+  if (!requesterIsOwner && !pool.fallbackForGrantees) return "GRANTEE_NOT_COVERED";
+  const rows = await readCallerConsentRows(tx, input);
+  return callerConsentDenial(input, rows, new Date());
+}
+
+/**
+ * E0 send boundary, part 2: the caller runs this after the last statement of
+ * the send-claim transaction that can wait on a lock (the provider
+ * account/credential FOR UPDATE) and before the durable claim. It re-reads
+ * the token and the requester's account and evaluates their validity at a
+ * `now` taken after those reads, so a token that expired, or an account that
+ * was banned or marked for deletion, while the transaction waited on provider
+ * locks is refused before anything is claimed or sent.
+ *
+ * No user-row lock: every statement after this read (the credential re-read,
+ * the `lastUsedAt` write on a row this transaction already holds FOR UPDATE,
+ * and commit) is non-blocking, and none of them writes a row the ban or
+ * deletion-mark writers read. A mark or ban that commits after this read is
+ * therefore serializable after the claim, exactly the outcome a FOR SHARE
+ * lock would force (the writer waiting for this commit), without adding the
+ * `user` row to the E0 lock order. A mark that commits before this read is
+ * seen (a later READ COMMITTED statement).
+ */
+export async function recheckExternalSendRequesterValidity(
+  tx: RequesterValidityClient,
+  input: ExternalConsentIdentity,
+): Promise<ExternalConsentStateDenial | null> {
+  const rows = await readRequesterValidityRows(tx, input);
+  return requesterValidityDenial(input, rows, new Date());
 }
 
 export async function authenticateModelApiTokenSecret(
@@ -339,6 +611,7 @@ export async function authenticateModelApiTokenSecret(
       id: true,
       userId: true,
       scopeMode: true,
+      allowExternal: true,
       lookupPrefix: true,
       secretDigest: true,
       lastUsedAt: true,
@@ -372,6 +645,7 @@ export async function authenticateModelApiTokenSecret(
       id: true,
       userId: true,
       scopeMode: true,
+      allowExternal: true,
       lookupPrefix: true,
       expiresAt: true,
       lastUsedAt: true,
@@ -382,6 +656,7 @@ export async function authenticateModelApiTokenSecret(
     id: updated.id,
     userId: updated.userId,
     scopeMode: String(updated.scopeMode) as ModelApiTokenScopeMode,
+    allowExternal: updated.allowExternal === true,
     lookupPrefix: updated.lookupPrefix,
     expiresAt: updated.expiresAt,
     lastUsedAt: updated.lastUsedAt,

@@ -16,6 +16,7 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   authenticateModelApiTokenSecret: vi.fn(),
   listVisibleModelTargetsForUser: vi.fn(),
   listVisibleModelTargetsForToken: vi.fn(),
+  listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(),
 }));
 
 const { createModelApiFileUploadHandler, createModelApiFileGetHandler } = await import(

@@ -522,7 +522,18 @@
       "media": "Media",
       "access": "Access"
     },
-    "fallbackDescription": "Public overflow is tried only after local members are at capacity or unhealthy.",
+    "fallbackDescription": "External fallback is used only for requests that name owner/pool:external, after local members are at capacity or unhealthy.",
+    "fallbackSettings": {
+      "description": "Callers use {{externalModelId}} to allow external providers. {{modelId}} always stays on local members.",
+      "enabled": "Use external fallback for :external requests",
+      "forGrantees": "Pay for external fallback used by people I share this pool with",
+      "externalAfterWaitMs": "Wait for local capacity before going external (ms)",
+      "externalAfterWaitHint": "0 goes external at once when no local member is free. If the local wait budget is shorter, the shorter wait applies.",
+      "waitInvalid": "Enter a whole number of milliseconds from 0 to 600000.",
+      "save": "Save fallback settings",
+      "saved": "Fallback settings saved",
+      "failed": "Could not save fallback settings. Try again."
+    },
     "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment.",
     "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
     "fallbackSteps": {
@@ -785,7 +796,7 @@
     "memberPolicyDetails": "Capacity and routing details",
     "memberTarget": "Execution target",
     "memberTier": "Routing tier",
-    "memberTierDisclosure": "Provider primary targets participate in normal routing and send request data outside this deployment. Public overflow is tried only after every primary target is exhausted.",
+    "memberTierDisclosure": "Primary members are always local and serve the plain pool name, which never leaves this deployment. External fallback members receive request data only for requests that name owner/pool:external, when the caller's token allows it and local members are busy, unavailable, or too small for the request.",
     "moveOverflowEarlier": "Move overflow provider earlier",
     "moveOverflowLater": "Move overflow provider later",
     "reorderFailed": "Could not reorder overflow providers",
@@ -888,6 +899,13 @@
     "unpublished": "Unpublished"
   },
   "tokens": {
+    "externalAccess": {
+      "title": "External providers",
+      "description": "Tokens are private only by default. When allowed, a request may use an external provider only if it names the pool as owner/pool:external and the pool owner allows it. Plain pool names never leave this deployment.",
+      "allow": "Allow external providers for {{name}}",
+      "poolsHint": "Allowlist tokens: choose which pools may use external providers.",
+      "saved": "External provider access updated"
+    },
     "allVisible": "All visible",
     "allowlist": "Allowlist",
     "allowlistModels": "Allowlisted models",
@@ -1082,7 +1100,7 @@
       "retire": "Retire",
       "deactivate": "Deactivate",
       "createAttachmentProtection": "Create attachment protection",
-      "acknowledgeEgress": "Acknowledge and enable egress",
+      "acknowledgeEgress": "Enable external fallback",
       "attachProvider": "Attach provider",
       "moveLater": "Move later",
       "detachProvider": "Detach provider from pool",

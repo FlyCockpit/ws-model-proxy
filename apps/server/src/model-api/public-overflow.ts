@@ -1,5 +1,11 @@
 import { Readable } from "node:stream";
 import {
+  type ExternalSendConsentDenial,
+  lockExternalSendConsent,
+  readExternalConsentDenial,
+  recheckExternalSendRequesterValidity,
+} from "@ws-model-proxy/api/lib/model-api-token-access";
+import {
   type OpenAiCompatibleCapabilities,
   parseOpenAiCompatibleCapabilities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
@@ -27,6 +33,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
+import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
@@ -47,6 +54,7 @@ import {
   type RawProviderUsage,
   reconcileProviderBudget,
 } from "./provider-budget.js";
+import { providerHealthCoolingDown } from "./provider-health-state.js";
 import {
   calculatedCostForUsage,
   liabilityFromPricing,
@@ -62,14 +70,58 @@ export type PublicOverflowReason =
 
 export type PublicOverflowSkipReason =
   | "DEPLOYMENT_GATE_DISABLED"
+  | "CALLER_CONSENT_MISSING"
+  /** The caller's token no longer allows `:external` for this pool (revoked,
+   * expired, `allowExternal` or `includeExternal` turned off). */
+  | "CALLER_CONSENT_WITHDRAWN"
+  /** A non-owner requester no longer holds the exact grant the request was resolved under. */
+  | "REQUESTER_NOT_VISIBLE"
+  /** The requester's account is banned or marked for deletion. */
+  | "REQUESTER_ACCESS_BLOCKED"
+  /** Durable provider admission did not admit within its wait budget. */
+  | "PROVIDER_SATURATED"
   | "POOL_PRIVATE"
-  | "POOL_ACKNOWLEDGEMENT_MISSING"
+  | "GRANTEE_NOT_COVERED"
   | "ADAPTATION_GATE_DISABLED"
   | "NO_COMPATIBLE_PROVIDER"
   | "PROVIDER_UNHEALTHY"
   | "BUDGET_EXCEEDED"
   | "PROTECTION_POLICY_MISSING"
-  | "PROVIDER_UNAVAILABLE";
+  /**
+   * Transient: no provider attempt could be sent right now (fence allocation,
+   * transport failure before a response, and similar). Retrying may succeed.
+   */
+  | "PROVIDER_UNAVAILABLE"
+  /**
+   * Transient: the send-claim transaction failed before any provider I/O
+   * (lock or connection timeout, credential rotated or revoked meanwhile,
+   * decrypt failure). No provider health verdict is recorded for it.
+   */
+  | "SEND_CLAIM_FAILED"
+  /**
+   * Permanent: a stored-response binding (`exactResponsesBinding`) no longer
+   * matches any configured member (target gone, endpoint identity or version,
+   * upstream model, or native Responses support changed). Waiting never
+   * makes it servable again.
+   */
+  | "BOUND_TARGET_INVALID";
+
+/**
+ * Skip reasons meaning the `:external` consent itself no longer holds (kill
+ * switch, owner flags, token, grant). They are request-wide: no other
+ * external member may be tried after one.
+ */
+export function isExternalConsentDenialReason(reason: PublicOverflowSkipReason): boolean {
+  return (
+    reason === "DEPLOYMENT_GATE_DISABLED" ||
+    reason === "CALLER_CONSENT_MISSING" ||
+    reason === "CALLER_CONSENT_WITHDRAWN" ||
+    reason === "REQUESTER_NOT_VISIBLE" ||
+    reason === "REQUESTER_ACCESS_BLOCKED" ||
+    reason === "POOL_PRIVATE" ||
+    reason === "GRANTEE_NOT_COVERED"
+  );
+}
 
 export interface PublicOverflowRequest {
   userId: string;
@@ -81,10 +133,17 @@ export interface PublicOverflowRequest {
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
-  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline.
-   * It requires deployment approval and pool acknowledgement, but not the
-   * separate public-overflow enablement switch. */
-  memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+  /**
+   * Caller consent minted by evaluateExternalEgress for exactly this pool.
+   * Dispatch fails closed without an issued consent, and re-checks the
+   * deployment switch, the owner's pool flags, and the caller's token and
+   * grant against fresh state.
+   */
+  externalConsent: ExternalEgressConsent;
+  /** The request's requester; must equal the consent's requester. */
+  requesterUserId: string;
+  /** The request's API token (null for Chat Test); must equal the consent's token. */
+  requesterModelApiTokenId: string | null;
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
   stream: boolean;
@@ -145,17 +204,9 @@ export interface PublicProviderTarget {
   inferenceCapacityId?: string | null;
   capacityWaitBudgetMs?: number | null;
   publicOrder: number;
-  /** Pool-member weight used only by the unified PRIMARY scheduler. */
-  weight?: number;
   providerModelId: string;
   upstreamModelId: string;
   contextWindow: number | null;
-  /** PRIMARY-only pool policy resolved from the member override and pool default. */
-  effectiveContextCeiling?: number | null;
-  /** PRIMARY-only safety margin applied in addition to the requested context. */
-  contextMargin?: number;
-  /** Physical runtime ceiling shared by every target on the capacity. */
-  physicalMaxContext?: number | null;
   maxOutputTokens: number | null;
   protocol: ProviderProtocol;
   providerAccountId: string;
@@ -283,10 +334,20 @@ export function matchesExactResponsesBinding(
 }
 
 type ListedPublicOverflowTargets = {
+  /** Owner's fallback switch (`ModelPool.fallbackEnabled`). */
   enabled: boolean;
-  acknowledged: boolean;
+  /** Owner pays for grantees' external fallback. */
+  fallbackForGrantees: boolean;
   affinityPolicy: AffinityPolicy;
+  /** Members that can be sent to now. */
   targets: PublicProviderTarget[];
+  /**
+   * Members that are configured and enabled but whose provider model or
+   * account is in a health cooldown right now. Never dispatched; they only
+   * let callers tell "temporarily unavailable" (503) from "no compatible
+   * external target" (400).
+   */
+  coolingDown: PublicProviderTarget[];
 };
 
 function providerEventRouting(input: {
@@ -309,7 +370,7 @@ function providerEventRouting(input: {
     poolId: input.request.poolId,
     poolMemberId: input.target.poolMemberId,
     executionTargetId: input.target.executionTargetId,
-    memberTier: input.request.memberTier ?? "PUBLIC_OVERFLOW",
+    memberTier: "PUBLIC_OVERFLOW",
     triggerReason: input.request.reason,
     affinityOutcome: input.target.affinity?.outcome ?? "NONE",
     contextCountMethod: input.request.contextCountMethod,
@@ -317,20 +378,77 @@ function providerEventRouting(input: {
   };
 }
 
+/** The consent identity an `:external` send is re-validated against at the send boundary. */
+export type ExternalSendConsentIdentity = {
+  requesterUserId: string;
+  modelApiTokenId: string | null;
+  poolId: string;
+  ownerUserId: string;
+  /** The exact grant the request or its stored-response binding was resolved under; null for the owner. */
+  accessGrantId: string | null;
+};
+
+type ExternalConsentSkipReason = Extract<
+  PublicOverflowSkipReason,
+  | "CALLER_CONSENT_WITHDRAWN"
+  | "REQUESTER_NOT_VISIBLE"
+  | "REQUESTER_ACCESS_BLOCKED"
+  | "POOL_PRIVATE"
+  | "GRANTEE_NOT_COVERED"
+>;
+
+function consentSkipReason(denial: ExternalSendConsentDenial): ExternalConsentSkipReason {
+  return denial === "TOKEN_CONSENT_WITHDRAWN" ? "CALLER_CONSENT_WITHDRAWN" : denial;
+}
+
+export type PublicProviderSendClaim =
+  | { claimed: true; secret: string }
+  | {
+      claimed: false;
+      reason: "DEPLOYMENT_GATE_DISABLED" | ExternalConsentSkipReason;
+    };
+
 /**
- * Atomically claims the current credential for a send that is about to start.
- * `lastUsedAt` is the durable boundary: credential lifecycle changes serialize
- * on the same rows, while the actual provider request happens after commit.
+ * The E0 send boundary: the last step before provider I/O. In one
+ * transaction it (1) re-validates every `:external` consent condition while
+ * holding the consent rows FOR SHARE (lockExternalSendConsent), (2) takes the
+ * provider account and credential locks, the last statements that can wait,
+ * (3) re-evaluates the time- and account-dependent validity of the requester
+ * (token expiry, ban, deletion mark) at a fresh `now`
+ * (recheckExternalSendRequesterValidity), then (4) atomically claims the
+ * current credential. `lastUsedAt` is the durable boundary: credential
+ * lifecycle changes serialize on the account/credential rows, consent
+ * withdrawals on the consent rows, and the actual provider request happens
+ * after commit. A withdrawal that commits before this transaction reaches
+ * the corresponding check is observed here; one that commits after it cannot
+ * cancel a send that has already been claimed.
+ *
+ * A throw from this function (lock or connection timeout, credential no
+ * longer current, decrypt failure) means nothing was sent; the dispatcher
+ * settles it without a provider health verdict.
+ *
+ * Lock order: model_pool -> pool_grant -> model_api_token ->
+ * model_api_token_allowlist_entry (FOR SHARE), then provider_account ->
+ * provider_credential (FOR UPDATE). See packages/db/src/capacity-lock-order.ts.
  */
 export async function claimPublicProviderCredentialForSend(input: {
   userId: string;
   target: PublicProviderTarget;
   keyring: ReturnType<typeof parseProviderCredentialKeyring>;
-}): Promise<string> {
+  consent: ExternalSendConsentIdentity;
+}): Promise<PublicProviderSendClaim> {
+  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
+    return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
   return prisma.$transaction(
-    async (tx) => {
+    async (tx): Promise<PublicProviderSendClaim> => {
+      const denial = await lockExternalSendConsent(tx, input.consent);
+      if (denial) return { claimed: false, reason: consentSkipReason(denial) };
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      // Nothing below waits on a lock: re-evaluate what time or an unlocked
+      // row (the requester's account) can have changed while we waited.
+      const lapsed = await recheckExternalSendRequesterValidity(tx, input.consent);
+      if (lapsed) return { claimed: false, reason: consentSkipReason(lapsed) };
       const current = await tx.providerCredential.findFirst({
         where: {
           id: input.target.credential.id,
@@ -367,7 +485,7 @@ export async function claimPublicProviderCredentialForSend(input: {
         where: { id: current.id },
         data: { lastUsedAt: new Date() },
       });
-      return secret;
+      return { claimed: true, secret };
     },
     { maxWait: 5_000, timeout: 10_000 },
   );
@@ -440,9 +558,6 @@ export function publicTargetCompatibility(
   target: Pick<
     PublicProviderTarget,
     | "contextWindow"
-    | "effectiveContextCeiling"
-    | "contextMargin"
-    | "physicalMaxContext"
     | "maxOutputTokens"
     | "nativeProtocols"
     | "nativeSurfaces"
@@ -478,17 +593,9 @@ export function publicTargetCompatibility(
       : (request.contextTokens ?? request.liability.tokens);
   if (!request.skipContextValidation) {
     if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
-    const margin = target.contextMargin ?? 0;
-    if (!Number.isSafeInteger(margin) || margin < 0) return "CONTEXT_UNKNOWN";
-    const contextWithMargin = contextTokens + BigInt(margin);
-    const ceilings = [
-      target.contextWindow,
-      target.effectiveContextCeiling,
-      target.physicalMaxContext,
-    ].filter((ceiling): ceiling is number => ceiling !== null && ceiling !== undefined);
-    if (ceilings.some((ceiling) => !Number.isSafeInteger(ceiling) || ceiling <= 0))
+    if (!Number.isSafeInteger(target.contextWindow) || target.contextWindow <= 0)
       return "CONTEXT_UNKNOWN";
-    if (ceilings.some((ceiling) => contextWithMargin > BigInt(ceiling))) return "CONTEXT_EXCEEDED";
+    if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
     if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
       return "CONTEXT_UNKNOWN";
     if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
@@ -607,18 +714,19 @@ function supportedFeatures(value: unknown): string[] {
     : [];
 }
 
+/**
+ * External fallback (PUBLIC_OVERFLOW) provider targets of an owned pool.
+ * PRIMARY members are always local, so provider targets exist only here.
+ */
 export async function listPublicOverflowTargets(
   userId: string,
   poolId: string,
-  memberTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
 ): Promise<ListedPublicOverflowTargets> {
   const pool = await prisma.modelPool.findFirst({
     where: { id: poolId, userId },
     select: {
-      publicEgressEnabled: true,
-      publicEgressAcknowledged: true,
-      capacityContextCeiling: true,
-      capacityContextMargin: true,
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -629,28 +737,20 @@ export async function listPublicOverflowTargets(
       capacityWaitBudgetMs: true,
       PoolMembers: {
         where: {
-          tier: memberTier,
+          tier: "PUBLIC_OVERFLOW",
           routingStatus: "ACTIVE",
           ExecutionTarget: { ProviderModel: { isNot: null } },
         },
-        orderBy:
-          memberTier === "PUBLIC_OVERFLOW"
-            ? [{ publicOrder: "asc" }, { id: "asc" }]
-            : [{ weight: "desc" }, { id: "asc" }],
+        orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
         select: {
           id: true,
           publicOrder: true,
-          weight: true,
           capacityWaitBudgetMs: true,
           capacityWaitBudgetMode: true,
-          capacityContextCeiling: true,
-          capacityContextCeilingMode: true,
-          capacityContextMargin: true,
           ExecutionTarget: {
             select: {
               id: true,
               inferenceCapacityId: true,
-              InferenceCapacity: { select: { physicalMaxContext: true } },
               ProviderModel: {
                 select: {
                   id: true,
@@ -662,6 +762,7 @@ export async function listPublicOverflowTargets(
                   nativeCapabilities: true,
                   healthStatus: true,
                   healthNextRetryAt: true,
+                  healthHalfOpenAt: true,
                   enabled: true,
                   deletedAt: true,
                   ProviderAccount: {
@@ -676,6 +777,7 @@ export async function listPublicOverflowTargets(
                       authType: true,
                       healthStatus: true,
                       healthNextRetryAt: true,
+                      healthHalfOpenAt: true,
                       enabled: true,
                       deletedAt: true,
                       CurrentCredential: {
@@ -713,12 +815,13 @@ export async function listPublicOverflowTargets(
   if (!pool)
     return {
       enabled: false,
-      acknowledged: false,
+      fallbackForGrantees: false,
       affinityPolicy: defaultAffinityPolicy,
       targets: [],
+      coolingDown: [],
     };
   const now = new Date();
-  const targets = pool.PoolMembers.flatMap((member) => {
+  const listed = pool.PoolMembers.flatMap((member) => {
     const model = member.ExecutionTarget?.ProviderModel;
     const account = model?.ProviderAccount;
     const credential = account?.CurrentCredential;
@@ -730,72 +833,60 @@ export async function listPublicOverflowTargets(
       !credential ||
       !protocol ||
       !inventoryMatchesProtocol(capabilityInventory, protocol) ||
-      (memberTier === "PUBLIC_OVERFLOW" && member.publicOrder == null) ||
+      member.publicOrder == null ||
       model.userId !== userId ||
       account.userId !== userId ||
       !model.enabled ||
       !account.enabled ||
       model.deletedAt ||
       account.deletedAt ||
-      credential.status !== "ACTIVE" ||
-      !providerHealthCooldownElapsed(model.healthStatus, model.healthNextRetryAt, now) ||
-      !providerHealthCooldownElapsed(account.healthStatus, account.healthNextRetryAt, now)
+      credential.status !== "ACTIVE"
     )
       return [];
+    // The same rule claimProviderHealthTrial applies under its locks: a
+    // pending backoff or a live half-open trial on the account or the model.
+    const coolingDown =
+      providerHealthCoolingDown(model, now) || providerHealthCoolingDown(account, now);
     return [
       {
-        poolMemberId: member.id,
-        executionTargetId: member.ExecutionTarget!.id,
-        inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
-        capacityWaitBudgetMs:
-          member.capacityWaitBudgetMode === "UNLIMITED"
-            ? null
-            : member.capacityWaitBudgetMode === "LIMITED"
-              ? member.capacityWaitBudgetMs
-              : pool.capacityWaitBudgetMs,
-        publicOrder: member.publicOrder ?? 0,
-        weight: member.weight,
-        providerModelId: model.id,
-        upstreamModelId: model.upstreamModelId,
-        contextWindow: model.contextWindow,
-        effectiveContextCeiling:
-          memberTier !== "PRIMARY"
-            ? undefined
-            : member.capacityContextCeilingMode === "UNLIMITED"
+        coolingDown,
+        target: {
+          poolMemberId: member.id,
+          executionTargetId: member.ExecutionTarget!.id,
+          inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
+          capacityWaitBudgetMs:
+            member.capacityWaitBudgetMode === "UNLIMITED"
               ? null
-              : member.capacityContextCeilingMode === "LIMITED"
-                ? member.capacityContextCeiling
-                : pool.capacityContextCeiling,
-        contextMargin:
-          memberTier === "PRIMARY"
-            ? (member.capacityContextMargin ?? pool.capacityContextMargin)
-            : undefined,
-        physicalMaxContext:
-          memberTier === "PRIMARY"
-            ? member.ExecutionTarget!.InferenceCapacity?.physicalMaxContext
-            : undefined,
-        maxOutputTokens: model.maxOutputTokens,
-        protocol,
-        providerAccountId: account.id,
-        endpointIdentity: account.endpointIdentity,
-        endpointVersion: account.endpointVersion,
-        concurrencyLimit: model.concurrencyLimit,
-        providerVersion: account.providerVersion,
-        baseUrl: account.baseUrl,
-        authType: account.authType,
-        healthStatus: model.healthStatus,
-        nativeProtocols: nativeProtocols(model.nativeCapabilities),
-        nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
-        supportsStreaming: supportsStreaming(model.nativeCapabilities),
-        supportedFeatures: supportedFeatures(model.nativeCapabilities),
-        capabilityInventory,
-        credential,
-      } satisfies PublicProviderTarget,
+              : member.capacityWaitBudgetMode === "LIMITED"
+                ? member.capacityWaitBudgetMs
+                : pool.capacityWaitBudgetMs,
+          publicOrder: member.publicOrder ?? 0,
+          providerModelId: model.id,
+          upstreamModelId: model.upstreamModelId,
+          contextWindow: model.contextWindow,
+          maxOutputTokens: model.maxOutputTokens,
+          protocol,
+          providerAccountId: account.id,
+          endpointIdentity: account.endpointIdentity,
+          endpointVersion: account.endpointVersion,
+          concurrencyLimit: model.concurrencyLimit,
+          providerVersion: account.providerVersion,
+          baseUrl: account.baseUrl,
+          authType: account.authType,
+          healthStatus: model.healthStatus,
+          nativeProtocols: nativeProtocols(model.nativeCapabilities),
+          nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
+          supportsStreaming: supportsStreaming(model.nativeCapabilities),
+          supportedFeatures: supportedFeatures(model.nativeCapabilities),
+          capabilityInventory,
+          credential,
+        } satisfies PublicProviderTarget,
+      },
     ];
   });
   return {
-    enabled: pool.publicEgressEnabled,
-    acknowledged: pool.publicEgressAcknowledged,
+    enabled: pool.fallbackEnabled,
+    fallbackForGrantees: pool.fallbackForGrantees,
     affinityPolicy: {
       enabled: pool.affinityEnabled,
       ttlSeconds: pool.affinityTtlSeconds,
@@ -805,16 +896,9 @@ export async function listPublicOverflowTargets(
       confirmedCacheWeight: pool.affinityConfirmedCacheWeight,
       loadPenaltyWeight: pool.affinityLoadPenaltyWeight,
     },
-    targets,
+    targets: listed.flatMap((item) => (item.coolingDown ? [] : [item.target])),
+    coolingDown: listed.flatMap((item) => (item.coolingDown ? [item.target] : [])),
   };
-}
-
-export function providerHealthCooldownElapsed(
-  status: string,
-  nextRetryAt: Date | null,
-  now: Date,
-): boolean {
-  return status !== "UNAVAILABLE" || (nextRetryAt !== null && nextRetryAt <= now);
 }
 
 function joinProviderPath(baseUrl: string, path: string): string {
@@ -1687,54 +1771,92 @@ export async function buildProviderAffinityTargets(input: {
 export async function dispatchPublicOverflow(
   request: PublicOverflowRequest,
 ): Promise<PublicOverflowResult> {
-  const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
   // Kill switch: when WMP_PUBLIC_PROVIDER_EGRESS_ENABLED is false, no provider
-  // attempt leaves WSMP, including provider-backed PRIMARY members. Existing
-  // database state must not bypass an explicit disable. The flag defaults to
-  // on; on does not send data by itself.
+  // attempt leaves WSMP. Existing database state and an earlier consent must
+  // not bypass an explicit disable. The flag defaults to on; on does not send
+  // data by itself.
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
-  const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);
-  if (memberTier === "PUBLIC_OVERFLOW" && !listed.enabled)
-    return { dispatched: false, reason: "POOL_PRIVATE" };
-  // Acknowledgement is the pool owner's consent for all provider egress.
-  // publicEgressEnabled remains the separate switch that makes a pool
-  // non-private by permitting fallback to PUBLIC_OVERFLOW members.
-  if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  // Caller consent: only evaluateExternalEgress mints a consent, and only for
+  // an explicit `owner/pool:external` request whose credential allows it.
+  // The consent is bound to the pool, its owner, and the exact requester and
+  // token of this request.
+  const consent = request.externalConsent;
+  if (
+    !isIssuedExternalConsent(consent) ||
+    consent.poolId !== request.poolId ||
+    consent.ownerUserId !== request.userId ||
+    consent.requesterUserId !== request.requesterUserId ||
+    consent.modelApiTokenId !== request.requesterModelApiTokenId ||
+    consent.requesterIsOwner !== (consent.requesterUserId === consent.ownerUserId) ||
+    consent.requesterIsOwner !== (consent.accessGrantId === null)
+  )
+    return { dispatched: false, reason: "CALLER_CONSENT_MISSING" };
+  const sendConsent: ExternalSendConsentIdentity = {
+    requesterUserId: consent.requesterUserId,
+    modelApiTokenId: consent.modelApiTokenId,
+    poolId: consent.poolId,
+    ownerUserId: consent.ownerUserId,
+    accessGrantId: consent.accessGrantId,
+  };
+  // Owner and caller consent, re-read from the database at dispatch time
+  // (the consent was minted at authentication, possibly minutes ago): the
+  // owner's fallback flags, the caller's token consent, and the requester's
+  // exact grant, and the requester's account state. Nothing is decrypted or
+  // sent unless all of them still hold.
+  const [listed, callerDenial] = await Promise.all([
+    listPublicOverflowTargets(request.userId, request.poolId),
+    readExternalConsentDenial(sendConsent),
+  ]);
+  if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
+  if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
+    return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
+  if (callerDenial) return { dispatched: false, reason: consentSkipReason(callerDenial) };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
   const binding = request.exactResponsesBinding;
-  const memberEligible = targetsForForcedPoolMember(listed.targets, request.forcedPoolMemberId);
-  const eligible = binding
-    ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
-    : request.requireNativeSurface
-      ? memberEligible.filter(
-          (target) =>
-            target.nativeSurfaces.includes(request.requireNativeSurface!) &&
-            (request.requireNativeSurface !== "anthropic-messages" ||
-              target.protocol === "anthropic"),
-        )
-      : memberEligible;
   const compatibilityRequest = {
     ...request,
     liability: request.liability,
     contextTokens: 0n,
   };
-  const compatible = eligible.flatMap((target) => {
-    const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
-    const resolvedTarget = { ...target, resolvedExecution };
-    if (
-      publicTargetCompatibility(target, compatibilityRequest) !== "COMPATIBLE" ||
-      !matchesChatTestProviderMode(
-        resolvedTarget,
-        request.requestedSurface,
-        request.chatTestRoutingMode,
+  const compatibleTargets = (targets: PublicProviderTarget[]) => {
+    const memberEligible = targetsForForcedPoolMember(targets, request.forcedPoolMemberId);
+    const eligible = binding
+      ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
+      : request.requireNativeSurface
+        ? memberEligible.filter(
+            (target) =>
+              target.nativeSurfaces.includes(request.requireNativeSurface!) &&
+              (request.requireNativeSurface !== "anthropic-messages" ||
+                target.protocol === "anthropic"),
+          )
+        : memberEligible;
+    return eligible.flatMap((target) => {
+      const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
+      const resolvedTarget = { ...target, resolvedExecution };
+      if (
+        publicTargetCompatibility(target, compatibilityRequest) !== "COMPATIBLE" ||
+        !matchesChatTestProviderMode(
+          resolvedTarget,
+          request.requestedSurface,
+          request.chatTestRoutingMode,
+        )
       )
-    )
-      return [];
-    return [resolvedTarget];
-  });
+        return [];
+      return [resolvedTarget];
+    });
+  };
+  const compatible = compatibleTargets(listed.targets);
+  // A compatible member exists but its provider is in a health cooldown:
+  // temporarily unavailable, not an incompatible request.
+  if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
+    return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
+  // A stored-response binding that matches no servable or cooling member is
+  // permanently invalid: no retry can make it match again.
+  if (compatible.length === 0 && binding)
+    return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
   if (compatible.length === 0) {
     await Promise.allSettled(
       listed.targets.map((target) =>
@@ -1777,6 +1899,13 @@ export async function dispatchPublicOverflow(
   if (!keyringValue) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
   const keyring = parseProviderCredentialKeyring(keyringValue);
   let lastAdmission: ProviderBudgetAdmission | undefined;
+  // The transient reason the last admitted attempt did not send, when it
+  // reached the health claim or beyond (see the final return).
+  let lastSendFailure:
+    | "PROVIDER_UNHEALTHY"
+    | "SEND_CLAIM_FAILED"
+    | "PROVIDER_UNAVAILABLE"
+    | undefined;
   let attemptCount = 0;
 
   const rankedTargets = orderChatTestProviderTargets(
@@ -1959,6 +2088,9 @@ export async function dispatchPublicOverflow(
       fencingToken,
     }).catch(() => "COOLDOWN" as const);
     if (healthClaim === "COOLDOWN") {
+      // Another trial is in flight or the cooldown started after listing:
+      // temporarily unavailable.
+      lastSendFailure = "PROVIDER_UNHEALTHY";
       await reconcileProviderBudget({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -2036,17 +2168,123 @@ export async function dispatchPublicOverflow(
       metadata: { healthClaim },
     }).catch(() => undefined);
 
+    // E0 send boundary, the last step before provider I/O. One transaction
+    // re-validates the caller's and owner's consent while holding the consent
+    // rows FOR SHARE, takes the same account-then-credential locks used by
+    // lifecycle mutations, re-evaluates the requester's time- and
+    // account-dependent validity after those waits, then claims the
+    // credential. A consent withdrawal, revoke or grant replacement that
+    // commits before this transaction is rejected here; one that commits
+    // afterwards cannot retroactively cancel a send that has already been
+    // claimed. Never hold database locks across provider I/O.
+    let claim: PublicProviderSendClaim | "FAILED";
     try {
-      // Establish a durable send-start boundary while holding the same
-      // account-then-credential locks used by lifecycle mutations. A revoke or
-      // replacement that commits before this transaction is rejected here; one
-      // that commits afterwards cannot retroactively cancel a send that has
-      // already been claimed. Never hold database locks across provider I/O.
-      const secret = await claimPublicProviderCredentialForSend({
+      claim = await claimPublicProviderCredentialForSend({
         userId: request.userId,
         target,
         keyring,
+        consent: sendConsent,
       });
+    } catch {
+      // The claim failed before any provider I/O (lock or connection
+      // timeout, credential rotated or revoked meanwhile, decrypt failure).
+      // That is no evidence about the provider: hand the health trial back
+      // without a verdict and settle the attempt as never sent.
+      claim = "FAILED";
+    }
+    if (claim === "FAILED") {
+      stopHeartbeat();
+      lastSendFailure = "SEND_CLAIM_FAILED";
+      await releaseProviderHealthTrial({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        attemptId,
+        fencingToken,
+      }).catch(() => false);
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: request.signal.aborted ? "CANCELLED" : "SEND_CLAIM_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
+      if (!request.retrySafe) break;
+      continue;
+    }
+    if (!claim.claimed) {
+      // Nothing was sent. Consent is caller/pool-wide, so no other target
+      // may be tried either: settle this attempt's reservations, hand back
+      // the half-open health trial without a health verdict, and return
+      // the same typed denial as the dispatch-entry check. Callers release
+      // the provider capacity lease and the caller lease on this result.
+      stopHeartbeat();
+      await releaseProviderHealthTrial({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        attemptId,
+        fencingToken,
+      }).catch(() => false);
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: "CANCELLED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: claim.reason,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: "CANCELLED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
+      return { dispatched: false, reason: claim.reason };
+    }
+    try {
+      const secret = claim.secret;
       const response = await providerHttpsRequest(
         target.baseUrl,
         {
@@ -2513,6 +2751,7 @@ export async function dispatchPublicOverflow(
       };
     } catch {
       stopHeartbeat();
+      lastSendFailure = "PROVIDER_UNAVAILABLE";
       // A caller disappearing before provider response is not evidence that
       // the provider transport is unhealthy. Keep the existing health state;
       // cancellation still terminalizes and reconciles the durable attempt.
@@ -2570,6 +2809,9 @@ export async function dispatchPublicOverflow(
       if (!request.retrySafe) break;
     }
   }
+  // Every reason below is transient (retry later); none means the target
+  // or a stored-response binding is gone (BOUND_TARGET_INVALID is returned
+  // before any attempt).
   return {
     dispatched: false,
     reason:
@@ -2577,7 +2819,7 @@ export async function dispatchPublicOverflow(
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
           ? "PROTECTION_POLICY_MISSING"
           : "BUDGET_EXCEEDED"
-        : "PROVIDER_UNAVAILABLE",
+        : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }
 

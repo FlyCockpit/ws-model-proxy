@@ -10,6 +10,7 @@ import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
+import type { PublicProviderTarget } from "./public-overflow.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -65,17 +66,34 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
-vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
-  authenticateModelApiTokenSecret: vi.fn(),
-  listVisibleModelTargetsForUser: vi.fn(),
-  listVisibleModelTargetsForToken: vi.fn(),
-}));
+// The token's external-provider consent (allowExternal / includeExternal).
+// Private only unless a test lists pool ids here.
+const externalConsent = vi.hoisted(() => ({ poolIds: [] as string[] }));
+vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => {
+  const listVisibleModelTargetsForToken = vi.fn();
+  return {
+    authenticateModelApiTokenSecret: vi.fn(),
+    listVisibleModelTargetsForUser: vi.fn(),
+    listVisibleModelTargetsForToken,
+    // Routes read the visible targets and the token's external consent in one
+    // call. Tests keep stubbing the targets through the plain listing.
+    listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(async (token: unknown) => ({
+      targets: await listVisibleModelTargetsForToken(token),
+      externalPoolIds: new Set(externalConsent.poolIds),
+    })),
+  };
+});
 
-const { captureProviderResponseBinding, createModelApiRoutes } = await import("./routes.js");
+const {
+  captureProviderResponseBinding,
+  chatTestCompletionsHandler,
+  createModelApiRoutes,
+  localAdmissionWaitBudget,
+  resumedLocalWaitBudget,
+} = await import("./routes.js");
 const { contextCounterRegistry } = await import("./capacity/counter-registry.js");
-const { MODEL_API_MAX_REQUEST_BODY_BYTES, ModelApiConcurrencyLimiter } = await import(
-  "./limits.js"
-);
+const { MODEL_API_MAX_REQUEST_BODY_BYTES, ModelApiConcurrencyLimiter, ModelApiLimitError } =
+  await import("./limits.js");
 const tokenAccess = await import("@ws-model-proxy/api/lib/model-api-token-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
@@ -222,6 +240,7 @@ const token: ModelApiTokenIdentity = {
   id: "token-id",
   userId: "user-id",
   scopeMode: "ALL_VISIBLE",
+  allowExternal: false,
   lookupPrefix: "wsmp_model_lookup",
   expiresAt: null,
   lastUsedAt: null,
@@ -253,14 +272,45 @@ const poolTarget: VisibleModelPoolTarget = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
-  publicEgressEnabled: false,
-  publicEgressAcknowledged: false,
+  fallbackEnabled: false,
+  fallbackForGrantees: false,
+  externalMemberCount: 0,
   effectiveProviderEgress: false,
-  providerPrimaryMemberCount: 0,
   providerAccountLabels: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };
+
+/** Owner pool with external fallback on and one external member configured. */
+const externalPoolTarget: VisibleModelPoolTarget = {
+  ...poolTarget,
+  fallbackEnabled: true,
+  externalMemberCount: 1,
+  effectiveProviderEgress: true,
+};
+
+const EXTERNAL_MODEL_ID = `${externalPoolTarget.modelId}:external`;
+
+function listedExternalTargets(
+  targets: ReturnType<typeof externalProviderTarget>[],
+  overrides: { enabled?: boolean; fallbackForGrantees?: boolean } = {},
+) {
+  return {
+    enabled: overrides.enabled ?? true,
+    fallbackForGrantees: overrides.fallbackForGrantees ?? false,
+    affinityPolicy: {
+      enabled: false,
+      ttlSeconds: 3600,
+      maxRecords: 10_000,
+      prefixWeight: 100,
+      conversationWeight: 150,
+      confirmedCacheWeight: 250,
+      loadPenaltyWeight: 100,
+    },
+    targets,
+    coolingDown: [],
+  };
+}
 
 function directRow({
   id = "model-id",
@@ -382,6 +432,7 @@ function poolMemberRow({
   capacityWaitBudgetMs,
   affinityEnabled = false,
   countStrategy,
+  externalAfterWaitMs = 2_000,
 }: {
   id: string;
   discoveredModelId: string;
@@ -402,6 +453,7 @@ function poolMemberRow({
   capacityWaitBudgetMs?: number | null;
   affinityEnabled?: boolean;
   countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
+  externalAfterWaitMs?: number;
 }) {
   return {
     id,
@@ -424,6 +476,7 @@ function poolMemberRow({
       capacityContextCeiling: poolContextCeiling,
       capacityContextMargin: poolContextMargin,
       capacityWaitBudgetMs: 30_000,
+      externalAfterWaitMs,
       affinityEnabled,
       affinityTtlSeconds: 3600,
       affinityMaxRecords: 10_000,
@@ -517,14 +570,13 @@ function requestBody(model = directTarget.modelId) {
   });
 }
 
-function providerPrimaryTarget(poolMemberId = "primary-provider-member") {
+function externalProviderTarget(poolMemberId = "primary-provider-member") {
   return {
     poolMemberId,
     executionTargetId: `${poolMemberId}-target`,
     inferenceCapacityId: `${poolMemberId}-capacity`,
     capacityWaitBudgetMs: 30_000,
     publicOrder: 0,
-    weight: 1,
     providerModelId: `${poolMemberId}-model`,
     upstreamModelId: "provider-upstream",
     contextWindow: 128_000,
@@ -539,7 +591,7 @@ function providerPrimaryTarget(poolMemberId = "primary-provider-member") {
     authType: "BEARER" as const,
     healthStatus: "HEALTHY" as const,
     nativeProtocols: ["openai" as const],
-    nativeSurfaces: ["openai-chat" as const],
+    nativeSurfaces: ["openai-chat"] as PublicProviderTarget["nativeSurfaces"],
     supportsStreaming: true,
     supportedFeatures: [],
     capabilityInventory: {
@@ -610,6 +662,28 @@ async function completeJsonRelay({
   manager.complete(requestId);
 }
 
+describe("X1 local wait budgets", () => {
+  it("never lets :external wait less locally in total than the plain name", () => {
+    // B = member/pool budget, E = externalAfterWaitMs.
+    for (const [budget, external] of [
+      [30_000, 2_000],
+      [1_000, 2_000],
+      [0, 2_000],
+      [5_000, 0],
+    ] as const) {
+      const first = localAdmissionWaitBudget(budget, external);
+      const resumed = resumedLocalWaitBudget(budget, external);
+      expect(first).toBe(Math.min(budget, external));
+      expect((first ?? 0) + (resumed ?? 0)).toBe(budget);
+    }
+    // No budget: the first wait is E, the resumed wait is unbounded again.
+    expect(localAdmissionWaitBudget(null, 2_000)).toBe(2_000);
+    expect(resumedLocalWaitBudget(null, 2_000)).toBeNull();
+    // E >= B leaves "admit only if free now".
+    expect(resumedLocalWaitBudget(1_000, 2_000)).toBe(0);
+  });
+});
+
 describe("model API routes", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -666,9 +740,10 @@ describe("model API routes", () => {
       dispatched: false,
       reason: "DEPLOYMENT_GATE_DISABLED",
     });
+    externalConsent.poolIds = [];
     publicOverflow.list.mockResolvedValue({
       enabled: false,
-      acknowledged: false,
+      fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
         ttlSeconds: 3600,
@@ -679,6 +754,7 @@ describe("model API routes", () => {
         loadPenaltyWeight: 100,
       },
       targets: [],
+      coolingDown: [],
     });
     publicOverflow.buildAffinityTargets.mockImplementation(async ({ targets }) =>
       targets.map((target: { poolMemberId: string; executionTargetId: string }) => ({
@@ -765,8 +841,7 @@ describe("model API routes", () => {
         }),
       }),
     );
-    // Provider-backed and local primaries are discovered before scoring, but
-    // successful PRIMARY execution never inspects PUBLIC_OVERFLOW members.
+    // A plain pool name never inspects external (PUBLIC_OVERFLOW) members.
     expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
@@ -2631,77 +2706,233 @@ describe("model API routes", () => {
     expect(direct?.supports_vision).toBe(true);
   });
 
-  it("unions enabled provider PRIMARY modalities into provider-only and mixed pool listings", async () => {
-    db.discoveredModel.findMany.mockResolvedValue([]);
-    db.poolMember.findMany.mockResolvedValue([
-      {
-        poolId: poolTarget.id,
-        ExecutionTarget: {
-          DiscoveredModel: null,
-          ProviderModel: {
-            enabled: true,
-            deletedAt: null,
-            nativeCapabilities: {
-              version: 3,
-              protocol: "openai-compatible",
-              surfaces: {
-                openaiChatCompletions: {
-                  source: "declared",
-                  confidence: "exact",
-                  supported: true,
-                  inputImages: true,
-                  inputAudio: true,
-                },
+  function externalMemberListRow(poolId: string) {
+    return {
+      poolId,
+      tier: "PUBLIC_OVERFLOW",
+      ExecutionTarget: {
+        DiscoveredModel: null,
+        ProviderModel: {
+          enabled: true,
+          deletedAt: null,
+          nativeCapabilities: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                inputImages: true,
+                inputAudio: true,
               },
             },
-            ProviderAccount: { enabled: true, deletedAt: null },
           },
+          ProviderAccount: { enabled: true, deletedAt: null },
         },
-        DiscoveredModel: null,
       },
-      {
-        poolId: poolTarget.id,
-        ExecutionTarget: {
-          DiscoveredModel: {
-            capabilityOverrideMode: "OVERRIDE",
-            capabilityOverrideMetadata: {
-              version: 1,
-              protocol: "openai-compatible",
-              chatCompletions: { supported: true, streaming: true, video: true },
-            },
-            Endpoint: { capabilityMetadata: null },
-          },
-          ProviderModel: null,
-        },
-        DiscoveredModel: null,
-      },
-    ]);
+      DiscoveredModel: null,
+    };
+  }
 
+  function localMemberListRow(poolId: string) {
+    return {
+      poolId,
+      tier: "PRIMARY",
+      ExecutionTarget: {
+        DiscoveredModel: {
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideMetadata: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true, streaming: true, video: true },
+          },
+          Endpoint: { capabilityMetadata: null },
+        },
+        ProviderModel: null,
+      },
+      DiscoveredModel: null,
+    };
+  }
+
+  type ListedModel = {
+    id: string;
+    supports_vision: boolean;
+    supports_audio_input: boolean;
+    supports_video_input: boolean;
+  };
+
+  async function listedModels() {
     const response = await appWith(new FakeRelayManager()).request("/models", {
       headers: { authorization: "Bearer wsmp_model_test" },
     });
     expect(response.status).toBe(200);
-    const body = (await response.json()) as {
-      data: Array<{
-        id: string;
-        supports_vision: boolean;
-        supports_audio_input: boolean;
-        supports_video_input: boolean;
-      }>;
-    };
-    expect(body.data.find((entry) => entry.id === poolTarget.modelId)).toMatchObject({
-      supports_vision: true,
-      supports_audio_input: true,
-      supports_video_input: true,
+    return ((await response.json()) as { data: ListedModel[] }).data;
+  }
+
+  it("lists owner/pool:external only for tokens that can be served that way", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
     });
-    expect(db.poolMember.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ tier: "PRIMARY" }),
-      }),
-    );
-    expect(stringifyPersistenceCalls(db.poolMember.findMany.mock.calls)).not.toContain(
-      "PUBLIC_OVERFLOW",
-    );
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([
+      localMemberListRow(externalPoolTarget.id),
+      externalMemberListRow(externalPoolTarget.id),
+    ]);
+
+    // Private-only token: the plain name only.
+    expect((await listedModels()).map((entry) => entry.id)).toEqual([externalPoolTarget.modelId]);
+
+    externalConsent.poolIds = [externalPoolTarget.id];
+    const listed = await listedModels();
+    expect(listed.map((entry) => entry.id)).toEqual([
+      externalPoolTarget.modelId,
+      EXTERNAL_MODEL_ID,
+    ]);
+    // Both entries advertise the LOCAL pool's capabilities, never provider
+    // labels or upstream ids.
+    for (const entry of listed)
+      expect(entry).toMatchObject({
+        supports_video_input: true,
+        supports_vision: false,
+        supports_audio_input: false,
+      });
+    expect(JSON.stringify(listed)).not.toContain("provider");
+
+    // A grantee is listed only when the owner pays for grantees.
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...externalPoolTarget, ownerUserId: "pool-owner-id", accessGrantId: "grant" }],
+    });
+    expect((await listedModels()).map((entry) => entry.id)).toEqual([externalPoolTarget.modelId]);
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [
+        {
+          ...externalPoolTarget,
+          ownerUserId: "pool-owner-id",
+          accessGrantId: "grant",
+          fallbackForGrantees: true,
+        },
+      ],
+    });
+    expect((await listedModels()).map((entry) => entry.id)).toEqual([
+      externalPoolTarget.modelId,
+      EXTERNAL_MODEL_ID,
+    ]);
+  });
+
+  it("lists a provider-only pool only as :external with its external capabilities", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([externalMemberListRow(externalPoolTarget.id)]);
+
+    const listed = await listedModels();
+    expect(listed.map((entry) => entry.id)).toEqual([EXTERNAL_MODEL_ID]);
+    expect(listed[0]).toMatchObject({ supports_vision: true, supports_audio_input: true });
+  });
+
+  it("hides :external names and answers them with 403 when the deployment switch is off", async () => {
+    const { env } = await import("@ws-model-proxy/env/server");
+    const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    try {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.poolMember.findMany.mockResolvedValue([
+        localMemberListRow(externalPoolTarget.id),
+        externalMemberListRow(externalPoolTarget.id),
+      ]);
+      expect((await listedModels()).map((entry) => entry.id)).toEqual([externalPoolTarget.modelId]);
+
+      const chat = await appWith(new FakeRelayManager()).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      expect(chat.status).toBe(403);
+      const chatBody = (await chat.json()) as { error: { code: string; message: string } };
+      expect(chatBody.error.code).toBe("external_providers_disabled");
+      expect(chatBody.error.message).toContain(`"${externalPoolTarget.modelId}"`);
+
+      const messages = await appWith(new FakeRelayManager()).request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: EXTERNAL_MODEL_ID, max_tokens: 8, messages: [] }),
+      });
+      expect(messages.status).toBe(403);
+      await expect(messages.json()).resolves.toMatchObject({
+        type: "error",
+        error: { type: "permission_error" },
+      });
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    } finally {
+      mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    }
+  });
+
+  it.each([
+    ["an unknown variant", `${poolTarget.modelId}:fallback`],
+    ["an uppercase variant", `${poolTarget.modelId}:EXTERNAL`],
+    ["a stacked variant", `${poolTarget.modelId}:external:external`],
+    ["a suffix on a direct model id", `${directTarget.modelId}:external`],
+  ])("answers %s with a clear 404 model_not_found", async (_label, model) => {
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(model),
+    });
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("model_not_found");
+    expect(body.error.message).not.toBe("Model not found.");
+    expect(db.relayRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("does not reveal whether an invisible pool exists for a suffixed name", async () => {
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody("someone-else/private-pool:external"),
+    });
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "not_found", message: "Model not found." },
+    });
+  });
+
+  it.each([
+    ["/embeddings", { input: "hello" }],
+    ["/audio/speech", { input: "hello", voice: "alloy" }],
+  ])("rejects :external on %s with external_variant_unsupported", async (path, extra) => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    const response = await appWith(new FakeRelayManager()).request(path, {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: EXTERNAL_MODEL_ID, ...extra }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "external_variant_unsupported" },
+    });
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
   it("rejects missing or invalid bearer tokens with 401", async () => {
@@ -4379,46 +4610,18 @@ describe("model API routes", () => {
     expect((await responsePromise).status).toBe(200);
   });
 
-  it("routes provider PRIMARY before public overflow without silently changing tiers", async () => {
-    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-      directModels: [],
-      modelPools: [poolTarget],
-    });
-    db.poolMember.findMany.mockResolvedValue([]);
-    publicOverflow.list.mockResolvedValue({
-      enabled: true,
-      acknowledged: true,
-      affinityPolicy: {
-        enabled: false,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-      },
-      targets: [providerPrimaryTarget()],
-    });
-    publicOverflow.dispatch.mockResolvedValueOnce({
-      dispatched: false,
-      reason: "NO_COMPATIBLE_PROVIDER",
-    });
-    publicOverflow.dispatch.mockResolvedValueOnce({
+  function externalDispatchResult(
+    target: ReturnType<typeof externalProviderTarget>,
+    body: unknown = { id: "external", model: target.upstreamModelId },
+  ) {
+    return {
       dispatched: true,
-      response: new Response(JSON.stringify({ id: "overflow" }), {
+      response: new Response(JSON.stringify(body), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
-      target: {
-        poolMemberId: "overflow-member",
-        executionTargetId: "overflow-target",
-        providerAccountId: "provider-account",
-        providerModelId: "provider-model",
-        endpointIdentity: "https://provider.example/v1",
-        endpointVersion: 1,
-        upstreamModelId: "provider-upstream",
-      },
-      attemptId: "overflow-attempt",
+      target,
+      attemptId: `${target.poolMemberId}-attempt`,
       fencingToken: 1n,
       nativeSurface: "openai-chat",
       attemptCount: 1,
@@ -4429,33 +4632,100 @@ describe("model API routes", () => {
       }),
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
+    };
+  }
+
+  // R1-A: a grantee's consent carries the exact grant the request was
+  // resolved under, which the send claim requires to still exist.
+  it("binds a grantee's :external consent to the grant the request was resolved under", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [
+        {
+          ...externalPoolTarget,
+          ownerUserId: "pool-owner-id",
+          accessGrantId: "grant",
+          fallbackForGrantees: true,
+        },
+      ],
     });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([provider], { fallbackForGrantees: true }),
+    );
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(provider));
 
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/chat/completions",
       {
         method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(poolTarget.modelId),
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
       },
     );
 
     expect(response.status).toBe(200);
-    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.memberTier)).toEqual([
-      "PRIMARY",
-      "PUBLIC_OVERFLOW",
-    ]);
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      affinityAccessGrantId: "grant",
+      externalConsent: expect.objectContaining({ requesterIsOwner: false, accessGrantId: "grant" }),
+    });
+  });
+
+  it("serves an owner's :external request from external fallback with route headers", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(provider));
+
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(response.headers.get("x-wsmp-fallback-reason")).toBe("no_local_member");
+    expect(response.headers.get("x-wsmp-served-model")).toBe("provider-upstream");
+    expect(response.headers.get("access-control-expose-headers")).toContain("x-wsmp-route");
+    await expect(response.json()).resolves.toMatchObject({ model: "provider-upstream" });
+    expect(publicOverflow.list).toHaveBeenCalledWith("user-id", "pool-id");
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    const dispatched = publicOverflow.dispatch.mock.calls[0]?.[0];
+    expect(dispatched).toMatchObject({
+      poolId: "pool-id",
+      userId: "user-id",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      externalConsent: expect.objectContaining({ poolId: "pool-id", requesterIsOwner: true }),
+    });
     expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           publicEgress: true,
+          fallbackRoute: "pool-external",
+          publicOverflowReason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
           selectedPoolMemberTier: "PUBLIC_OVERFLOW",
         }),
       }),
     );
+    // M2: the route is unknown when the request row is created.
+    expect(db.relayRequest.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ fallbackRoute: null }) }),
+    );
+    expect(dispatched).toMatchObject({
+      requesterUserId: "user-id",
+      requesterModelApiTokenId: "token-id",
+    });
     // Provider terminal: the same status-guarded transition, with the usage
     // that settled billing mapped to prompt-free facts.
     await vi.waitFor(() =>
@@ -4474,156 +4744,142 @@ describe("model API routes", () => {
     );
   });
 
-  it("records provider PRIMARY as external egress without an overflow reason", async () => {
+  it.each([
+    ["the plain name", () => requestBody(externalPoolTarget.modelId), [externalPoolTarget.id]],
+    ["a token without external consent", () => requestBody(EXTERNAL_MODEL_ID), [] as string[]],
+  ])("never lists or dispatches external members for %s", async (_label, body, consentPoolIds) => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
-    db.poolMember.findMany.mockResolvedValue([]);
-    publicOverflow.list.mockResolvedValue({
-      enabled: false,
-      acknowledged: true,
-      affinityPolicy: {
-        enabled: true,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-      },
-      targets: [providerPrimaryTarget()],
-    });
-    publicOverflow.dispatch.mockResolvedValueOnce({
-      dispatched: true,
-      response: new Response(JSON.stringify({ id: "primary" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
+    externalConsent.poolIds = consentPoolIds;
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
       }),
-      target: {
-        poolMemberId: "primary-provider-member",
-        executionTargetId: "primary-provider-target",
-        providerAccountId: "provider-account",
-        providerModelId: "provider-model",
-        endpointIdentity: "https://provider.example/v1",
-        endpointVersion: 1,
-        upstreamModelId: "provider-upstream",
-      },
-      attemptId: "primary-attempt",
-      fencingToken: 1n,
-      nativeSurface: "openai-chat",
-      attemptCount: 1,
-      terminal: Promise.resolve({ ok: true, responseBytes: 16 }),
-      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
-      affinity: undefined,
+    ]);
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([externalProviderTarget()]));
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async () => ({ state: "EXPIRED" as const })),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const response = await appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: body(),
     });
+
+    expect([403, 429]).toContain(response.status);
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it("answers a provider-only pool's plain name with external_required", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([externalProviderTarget()]));
 
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/chat/completions",
       {
         method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(poolTarget.modelId),
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
       },
     );
-
-    expect(response.status).toBe(200);
-    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
-    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({ memberTier: "PRIMARY" });
-    expect(affinity.rank).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ownerId: "user-id",
-        resourceOwnerId: "user-id",
-        targets: [expect.objectContaining({ poolMemberId: "primary-provider-member" })],
-      }),
-    );
-    expect(db.relayRequest.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          publicEgress: true,
-          publicOverflowReason: null,
-          selectedPoolMemberTier: "PRIMARY",
-        }),
-      }),
-    );
-  });
-
-  it("fails provider-backed routing closed when durable global capacity is unavailable", async () => {
-    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-      directModels: [],
-      modelPools: [poolTarget],
-    });
-    db.poolMember.findMany.mockResolvedValue([]);
-    publicOverflow.list.mockResolvedValue({
-      enabled: false,
-      acknowledged: true,
-      affinityPolicy: {
-        enabled: false,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-      },
-      targets: [providerPrimaryTarget()],
-    });
-
-    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
-      method: "POST",
-      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-      body: requestBody(poolTarget.modelId),
-    });
 
     expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("external_required");
+    expect(body.error.message).toContain(EXTERNAL_MODEL_ID);
     expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
-  it("re-admits remaining provider overflow members after a retry-safe precommit failure", async () => {
+  it.each([
+    ["the plain name", () => externalPoolTarget.modelId],
+    [":external", () => EXTERNAL_MODEL_ID],
+  ])(
+    "explains that token counting needs local members on a provider-only pool (%s)",
+    async (label, model) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/responses/count_tokens",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify({ model: model(), input: "count me" }),
+        },
+      );
+
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("local_members_required");
+      // Never tells the caller to use the name it already sent.
+      expect(body.error.message).not.toContain(`Use "${EXTERNAL_MODEL_ID}"`);
+      if (label === ":external") expect(body.error.message).toContain("is counted as");
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails provider-backed routing closed when durable global capacity is unavailable", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
+    externalConsent.poolIds = [externalPoolTarget.id];
     db.poolMember.findMany.mockResolvedValue([]);
-    const first = providerPrimaryTarget("overflow-a");
-    const second = providerPrimaryTarget("overflow-b");
-    publicOverflow.list.mockImplementation(
-      async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
-        enabled: tier === "PUBLIC_OVERFLOW",
-        acknowledged: true,
-        affinityPolicy: {
-          enabled: false,
-          ttlSeconds: 3600,
-          maxRecords: 10_000,
-          prefixWeight: 100,
-          conversationWeight: 150,
-          confirmedCacheWeight: 250,
-          loadPenaltyWeight: 100,
-        },
-        targets: tier === "PUBLIC_OVERFLOW" ? [first, second] : [],
-      }),
-    );
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([externalProviderTarget()]));
+
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+
+    // X1: a provider-only pool never answers 400 for a transient condition;
+    // without durable capacity nothing can be dispatched (503 + header).
+    expect(response.status).toBe(503);
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "external_unavailable" },
+    });
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("re-admits remaining external members after a retry-safe precommit failure", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
     publicOverflow.dispatch
       .mockResolvedValueOnce({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" })
-      .mockResolvedValueOnce({
-        dispatched: true,
-        response: new Response(JSON.stringify({ id: "secondary" }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-        target: second,
-        attemptId: "secondary-attempt",
-        fencingToken: 2n,
-        nativeSurface: "openai-chat",
-        attemptCount: 1,
-        terminal: Promise.resolve({ ok: true, responseBytes: 18 }),
-        markFirstClientByte: vi.fn().mockResolvedValue(undefined),
-        affinity: undefined,
-      });
+      .mockResolvedValueOnce(externalDispatchResult(second, { id: "secondary" }));
     const admittedMembers: string[][] = [];
     const capacityRuntime: CapacityAdmissionRuntime = {
       acquire: vi.fn(async (attempt) => {
@@ -4652,11 +4908,8 @@ describe("model API routes", () => {
       "/chat/completions",
       {
         method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(poolTarget.modelId),
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
       },
     );
 
@@ -4670,30 +4923,84 @@ describe("model API routes", () => {
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
 
-  it("releases an admitted provider lease when dispatch rejects without re-admitting", async () => {
+  it("ends the external phase on a send-boundary consent denial without trying other members", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
+    externalConsent.poolIds = [externalPoolTarget.id];
     db.poolMember.findMany.mockResolvedValue([]);
-    const first = providerPrimaryTarget("overflow-a");
-    const second = providerPrimaryTarget("overflow-b");
-    publicOverflow.list.mockImplementation(
-      async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
-        enabled: tier === "PUBLIC_OVERFLOW",
-        acknowledged: true,
-        affinityPolicy: {
-          enabled: false,
-          ttlSeconds: 3600,
-          maxRecords: 10_000,
-          prefixWeight: 100,
-          conversationWeight: 150,
-          confirmedCacheWeight: 250,
-          loadPenaltyWeight: 100,
-        },
-        targets: tier === "PUBLIC_OVERFLOW" ? [first, second] : [],
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    // The dispatcher's send-claim transaction found the token's consent gone.
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: false,
+      reason: "CALLER_CONSENT_WITHDRAWN",
+    });
+    const release = vi.fn(async () => true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
       }),
+      release,
+      hold: vi.fn((response) => response),
+    };
+    const limiter = new ModelApiConcurrencyLimiter();
+    const callerReleases = vi.fn();
+    const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+    vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+      const lease = acquireGlobal(identity);
+      return {
+        release: () => {
+          callerReleases();
+          lease.release();
+        },
+      };
+    });
+
+    const response = await appWith(new FakeRelayManager(), capacityRuntime, limiter).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
     );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "external_unavailable" },
+    });
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(expect.objectContaining({ poolMemberId: "overflow-a" }));
+    expect(callerReleases).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an admitted external lease and the caller lease when dispatch rejects", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
     const dispatchError = new Error("provider dispatch rejected");
     publicOverflow.dispatch.mockRejectedValueOnce(dispatchError);
     const release = vi.fn(async () => true);
@@ -4716,23 +5023,31 @@ describe("model API routes", () => {
       release,
       hold: vi.fn((response) => response),
     };
+    const limiter = new ModelApiConcurrencyLimiter();
+    const callerReleases = vi.fn();
+    const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+    vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+      const lease = acquireGlobal(identity);
+      return {
+        release: () => {
+          callerReleases();
+          lease.release();
+        },
+      };
+    });
 
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+    const response = await appWith(new FakeRelayManager(), capacityRuntime, limiter).request(
       "/chat/completions",
       {
         method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(poolTarget.modelId),
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
       },
     );
 
     expect(response.status).toBe(500);
     expect(consoleError).toHaveBeenCalledWith(dispatchError);
-
     expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
     expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
@@ -4740,17 +5055,577 @@ describe("model API routes", () => {
       expect.objectContaining({ leaseId: "lease-overflow-a", poolMemberId: "overflow-a" }),
     );
     expect(capacityRuntime.hold).not.toHaveBeenCalled();
+    expect(callerReleases).toHaveBeenCalledTimes(1);
   });
 
-  it("admits local and provider PRIMARY members through one scored capacity candidate set", async () => {
-    const grantedPoolTarget = {
-      ...poolTarget,
+  it("serves a grantee locally with x-wsmp-fallback: unavailable when the owner does not pay", async () => {
+    const grantedPoolTarget: VisibleModelPoolTarget = {
+      ...externalPoolTarget,
       ownerUserId: "pool-owner-id",
       accessGrantId: "grant-id",
+      fallbackForGrantees: false,
     };
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
       modelPools: [grantedPoolTarget],
+    });
+    externalConsent.poolIds = [grantedPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+      }),
+    ]);
+    const capacityRuntime = admittingCapacityRuntime();
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(`${grantedPoolTarget.modelId}:external`),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("local");
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    // A grantee's plan has no external route, so the local wait is the
+    // member/pool budget, never the external deadline.
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        candidates: [
+          expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 30_000 }),
+        ],
+      }),
+      expect.any(AbortSignal),
+    );
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("bounds an :external caller's local wait by externalAfterWaitMs on the database clock", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+        externalAfterWaitMs: 0,
+      }),
+    ]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(provider));
+    const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+      const candidate = attempt.candidates[0]!;
+      // The local member is full: its zero budget expires at once. The
+      // external member is then admitted.
+      if (candidate.poolMemberId === "local-primary") return { state: "EXPIRED" as const };
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${candidate.poolMemberId}`,
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      };
+    });
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire,
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const response = await appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-fallback-reason")).toBe("local_wait_expired");
+    expect(acquire.mock.calls[0]?.[0].candidates).toEqual([
+      expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 0 }),
+    ]);
+    expect(manager.sent).toHaveLength(0);
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      reason: "LOCAL_WAIT_EXPIRED",
+    });
+  });
+
+  describe("X1: consented :external with no dispatchable external plan", () => {
+    const localMember = () =>
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+        externalAfterWaitMs: 2_000,
+      });
+    /** Local admission answers from `local`, the provider from `provider`. */
+    const scriptedRuntime = (script: {
+      local: Array<"ADMITTED" | "EXPIRED">;
+      provider: "ADMITTED" | "EXPIRED";
+    }) => {
+      const localStates = [...script.local];
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        const state =
+          candidate.poolMemberId === "local-primary"
+            ? (localStates.shift() ?? "EXPIRED")
+            : script.provider;
+        if (state === "EXPIRED") return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      return { acquire, runtime };
+    };
+    const localBudgets = (acquire: ReturnType<typeof scriptedRuntime>["acquire"]) =>
+      acquire.mock.calls
+        .map(([attempt]) => attempt.candidates[0])
+        .filter((candidate) => candidate?.poolMemberId === "local-primary")
+        .map((candidate) => candidate?.waitBudgetMs);
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+    });
+
+    it("resumes the local wait for B - min(B, E) when the provider is saturated and serves locally", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "EXPIRED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      // Pool budget B = 30 s, E = 2 s: 2 s first, then the remaining 28 s.
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      // M2: the local attempt decides the route.
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ fallbackRoute: "local" }) }),
+      );
+    });
+
+    it("fails like the plain name (429) with the header when the resumed wait also expires", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "EXPIRED"],
+        provider: "EXPIRED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      // One external phase per request; precommit failover across external
+      // members follows the existing retry rules.
+      expect(publicOverflow.list).toHaveBeenCalledTimes(1);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(manager.sent).toHaveLength(0);
+    });
+
+    it("answers 429 (not 400) with the header on a provider-only pool whose provider is saturated", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { runtime } = scriptedRuntime({ local: [], provider: "EXPIRED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      // No route was ever decided for this request (M2).
+      expect(db.relayRequest.update).toHaveBeenCalled();
+      for (const [update] of db.relayRequest.update.mock.calls)
+        expect((update as { data: Record<string, unknown> }).data.fallbackRoute).toBeUndefined();
+    });
+
+    it("answers 400 with the header on a provider-only pool with no compatible external target", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      // A configured, healthy external member that cannot serve this request
+      // (no chat surface): incompatible, not temporarily unavailable. Uses
+      // the real listing so health and compatibility are both evaluated.
+      const realOverflow =
+        await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+      db.modelPool.findFirst.mockResolvedValue(
+        cooldownPoolFixture(externalPoolTarget.ownerUserId, "openai-responses"),
+      );
+      publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(400);
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "unsupported_capability" },
+      });
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["provider model", "model"],
+      ["provider account", "account"],
+    ] as const)(
+      "answers 503 (not 400) on a provider-only pool whose compatible %s is in health cooldown",
+      async (_label, cooling) => {
+        db.poolMember.findMany.mockResolvedValue([]);
+        const realOverflow =
+          await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+        const fixture = cooldownPoolFixture(externalPoolTarget.ownerUserId);
+        const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+        db.modelPool.findFirst.mockResolvedValue(fixture);
+        // Control: the same member is listed while its cooldown has elapsed.
+        expect(
+          (
+            await realOverflow.listPublicOverflowTargets(
+              externalPoolTarget.ownerUserId,
+              externalPoolTarget.id,
+            )
+          ).targets,
+        ).toHaveLength(1);
+        const coolingUntil = new Date(Date.now() + 60_000);
+        if (cooling === "model") model.healthNextRetryAt = coolingUntil;
+        else model.ProviderAccount.healthNextRetryAt = coolingUntil;
+        const listed = await realOverflow.listPublicOverflowTargets(
+          externalPoolTarget.ownerUserId,
+          externalPoolTarget.id,
+        );
+        expect(listed.targets).toHaveLength(0);
+        expect(listed.coolingDown).toHaveLength(1);
+        publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
+        const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+        const response = await appWith(new FakeRelayManager(), runtime).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+
+        expect(response.status).toBe(503);
+        expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        await expect(response.json()).resolves.toMatchObject({
+          error: { code: "external_unavailable" },
+        });
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+    );
+
+    it("answers 400 when the only cooling-down external member is incompatible anyway", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      const realOverflow =
+        await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+      const fixture = cooldownPoolFixture(externalPoolTarget.ownerUserId, "openai-responses");
+      fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.healthNextRetryAt = new Date(
+        Date.now() + 60_000,
+      );
+      db.modelPool.findFirst.mockResolvedValue(fixture);
+      publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "unsupported_capability" },
+      });
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it("answers 503 with the header when the owner or caller consent is gone at dispatch", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "CALLER_CONSENT_WITHDRAWN",
+      });
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "external_unavailable" },
+      });
+      expect(runtime.release).toHaveBeenCalledWith(
+        expect.objectContaining({ poolMemberId: "overflow-member" }),
+      );
+    });
+
+    it("keeps the plain-name context error plus the header when a needed external dispatch fails", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "tiny-local",
+          discoveredModelId: "tiny-model",
+          upstreamModelId: "tiny-upstream",
+          cliDeviceId: "cli-local",
+          physicalMaxContext: 1,
+        }),
+      ]);
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([]));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    });
+
+    it("sends no header when a consented request is served locally before any trigger", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+    });
+
+    it("R-J: releases the held local lease and the caller lease once when the external tier throws", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockRejectedValue(new Error("provider listing database error"));
+      const realNow = Date.now();
+      const runtime = admittingCapacityRuntime();
+      const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+      vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+        const admitted = await admit(attempt, signal);
+        // The relay deadline passes while the local lease is held, so the
+        // retry loop ends with the lease still admitted.
+        vi.spyOn(Date, "now").mockReturnValue(realNow + 60 * 60_000);
+        return admitted;
+      });
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerRelease = vi.fn();
+      vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime, limiter).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(500);
+      expect(publicOverflow.list).toHaveBeenCalledTimes(1);
+      expect(runtime.release).toHaveBeenCalledTimes(1);
+      expect(runtime.release).toHaveBeenCalledWith(
+        expect.objectContaining({ leaseId: "lease-local-primary" }),
+      );
+      expect(callerRelease).toHaveBeenCalledTimes(1);
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: expect.objectContaining({ status: "FAILED" }),
+        }),
+      );
+    });
+  });
+
+  it("returns 429 without going external when the caller's own cap is reached", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+      }),
+    ]);
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([externalProviderTarget()]));
+    const limiter = new ModelApiConcurrencyLimiter();
+    const held = Array.from({ length: MODEL_API_MAX_ACTIVE_PER_TOKEN }, () =>
+      limiter.acquireGlobal({ tokenId: token.id, userId: token.userId }),
+    );
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const response = await appWith(manager, admittingCapacityRuntime(), limiter).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+
+    expect(response.status).toBe(429);
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    expect(manager.sent).toHaveLength(0);
+    for (const lease of held) lease.release();
+  });
+
+  it("keeps the context-ceiling error for a plain name but lets :external go external", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "tiny-local",
+        discoveredModelId: "tiny-model",
+        upstreamModelId: "tiny-upstream",
+        cliDeviceId: "cli-local",
+        physicalMaxContext: 1,
+      }),
+    ]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const plain = await appWith(manager, admittingCapacityRuntime()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(externalPoolTarget.modelId),
+    });
+    expect(plain.status).toBe(400);
+    await expect(plain.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+
+    const external = await appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    expect(external.status).toBe(200);
+    expect(external.headers.get("x-wsmp-fallback-reason")).toBe("local_context_ceiling");
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      reason: "LOCAL_CONTEXT_CEILING",
+    });
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it("does not let a Chat Test forced member reach an external member on a plain name", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([
       poolMemberRow({
@@ -4758,296 +5633,175 @@ describe("model API routes", () => {
         discoveredModelId: "local-model",
         upstreamModelId: "local-upstream",
         cliDeviceId: "cli-local",
-        weight: 1,
-        affinityEnabled: true,
       }),
     ]);
-    const provider = { ...providerPrimaryTarget(), weight: 5 };
-    publicOverflow.list.mockResolvedValue({
-      enabled: false,
-      acknowledged: true,
-      affinityPolicy: {
-        enabled: true,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-      },
-      targets: [provider],
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
+    const request = (model: string) =>
+      chatTestCompletionsHandler({
+        request: new Request("http://chat.test/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-wsmp-chat-test-member-id": "overflow-member",
+          },
+          body: requestBody(model),
+        }),
+        userId: "user-id",
+        manager: new FakeRelayManager(),
+        limiter: new ModelApiConcurrencyLimiter(),
+        capacityRuntime: admittingCapacityRuntime(),
+      });
+
+    const plain = await request(externalPoolTarget.modelId);
+    expect(plain.status).toBe(400);
+    await expect(plain.json()).resolves.toMatchObject({
+      error: { code: "forced_member_requires_external" },
     });
-    publicOverflow.dispatch.mockResolvedValue({
-      dispatched: true,
-      response: new Response(JSON.stringify({ id: "provider-primary" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+
+    // The signed-in user choosing the `:external` name is their own consent.
+    const external = await request(EXTERNAL_MODEL_ID);
+    expect(external.status).toBe(200);
+    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ forcedPoolMemberId: "overflow-member" }),
+    );
+  });
+
+  it("treats a Chat Test forced external member like provider-only for transient outcomes", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
       }),
-      target: provider,
-      attemptId: "provider-attempt",
-      fencingToken: 7n,
-      nativeSurface: "openai-chat",
-      attemptCount: 1,
-      terminal: Promise.resolve({ ok: true, responseBytes: 25 }),
-      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
-      affinity: undefined,
+    ]);
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([externalProviderTarget("overflow-member")]),
+    );
+    const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+      const candidate = attempt.candidates[0]!;
+      expect(candidate.poolMemberId).toBe("overflow-member");
+      return { state: "EXPIRED" as const };
     });
     const capacityRuntime: CapacityAdmissionRuntime = {
-      acquire: vi.fn(async (attempt) => {
-        const selected = attempt.candidates[0]!;
-        return {
-          state: "ADMITTED" as const,
-          lease: {
-            leaseId: "provider-lease",
-            attemptId: attempt.attemptId,
-            capacityId: selected.capacityId,
-            executionTargetId: selected.executionTargetId,
-            poolMemberId: selected.poolMemberId,
-            fencingToken: 3n,
-            expiresAt: new Date(Date.now() + 30_000),
-          },
-        };
-      }),
+      acquire,
       release: vi.fn(async () => true),
       hold: vi.fn((response) => response),
     };
-    const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-local"];
-
-    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
-      },
-      body: requestBody(grantedPoolTarget.modelId),
-    });
-    await vi.waitFor(() => {
-      expect(publicOverflow.dispatch.mock.calls.length + manager.sent.length).toBeGreaterThan(0);
-    });
-    if (manager.sent[0]) await completeJsonRelay({ manager, requestId: manager.sent[0].requestId });
-    const response = await responsePromise;
-
-    expect(response.status).toBe(200);
-    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ownerId: "pool-owner-id",
-        candidates: expect.arrayContaining([
-          expect.objectContaining({ poolMemberId: provider.poolMemberId }),
-          expect.objectContaining({ poolMemberId: "local-primary" }),
-        ]),
+    const response = await chatTestCompletionsHandler({
+      request: new Request("http://chat.test/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-wsmp-chat-test-member-id": "overflow-member",
+        },
+        body: requestBody(EXTERNAL_MODEL_ID),
       }),
-      expect.any(AbortSignal),
-    );
-    expect(affinity.rank).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ownerId: "user-id",
-        resourceOwnerId: "pool-owner-id",
-        accessGrantId: "grant-id",
-        targets: expect.arrayContaining([
-          expect.objectContaining({ poolMemberId: provider.poolMemberId }),
-          expect.objectContaining({ poolMemberId: "local-primary" }),
-        ]),
-      }),
-    );
-    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
-      expect.objectContaining({ affinityAccessGrantId: "grant-id" }),
-    );
+      userId: "user-id",
+      manager: new FakeRelayManager(),
+      limiter: new ModelApiConcurrencyLimiter(),
+      capacityRuntime,
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    expect(response.headers.get("x-wsmp-route")).toBeNull();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    for (const [update] of db.relayRequest.update.mock.calls)
+      expect((update as { data: Record<string, unknown> }).data.fallbackRoute).toBeUndefined();
   });
 
-  it("releases a pre-admitted provider PRIMARY lease once when dispatch rejects", async () => {
+  it("rejects :external from MCP diagnostics without contacting a provider", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    const response = await chatTestCompletionsHandler({
+      request: new Request("http://diagnostic.internal/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      }),
+      userId: "user-id",
+      manager: new FakeRelayManager(),
+      limiter: new ModelApiConcurrencyLimiter(),
+      capacityRuntime: admittingCapacityRuntime(),
+      source: "MCP",
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "external_not_supported_for_mcp" },
+    });
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("never turns a caller cap hit during local retries into external fallback", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
-    db.poolMember.findMany.mockResolvedValue([]);
-    const provider = providerPrimaryTarget();
-    publicOverflow.list.mockResolvedValue({
-      enabled: false,
-      acknowledged: true,
-      affinityPolicy: {
-        enabled: false,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-      },
-      targets: [provider],
-    });
-    const dispatchError = new Error("pre-admitted provider dispatch rejected");
-    publicOverflow.dispatch.mockRejectedValueOnce(dispatchError);
-    const release = vi.fn(async () => true);
-    const hold = vi.fn((response) => response);
-    const capacityRuntime: CapacityAdmissionRuntime = {
-      acquire: vi.fn(async (attempt) => {
-        const selected = attempt.candidates[0]!;
-        return {
-          state: "ADMITTED" as const,
-          lease: {
-            leaseId: "pre-admitted-provider-lease",
-            attemptId: attempt.attemptId,
-            capacityId: selected.capacityId,
-            executionTargetId: selected.executionTargetId,
-            poolMemberId: selected.poolMemberId,
-            fencingToken: 1n,
-            expiresAt: new Date(Date.now() + 30_000),
-          },
-        };
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
       }),
-      release,
-      hold,
-    };
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+      }),
+    ]);
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([externalProviderTarget()]));
+    const limiter = new ModelApiConcurrencyLimiter();
+    let globalAcquisitions = 0;
+    const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+    vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+      globalAcquisitions += 1;
+      // The retry for the second local member finds the caller at its cap.
+      if (globalAcquisitions === 2)
+        throw new ModelApiLimitError("Too many active model API requests.");
+      return acquireGlobal(identity);
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
 
-    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+    const responsePromise = appWith(manager, admittingCapacityRuntime(), limiter).request(
       "/chat/completions",
       {
         method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(poolTarget.modelId),
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
       },
     );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+    const response = await responsePromise;
 
-    expect(response.status).toBe(500);
-    expect(consoleError).toHaveBeenCalledWith(dispatchError);
-    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
-    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
-    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        memberTier: "PRIMARY",
-        forcedPoolMemberId: provider.poolMemberId,
-      }),
-    );
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(release).toHaveBeenCalledWith(
-      expect.objectContaining({ leaseId: "pre-admitted-provider-lease" }),
-    );
-    expect(hold).not.toHaveBeenCalled();
+    expect(response.status).toBe(429);
+    expect(globalAcquisitions).toBe(2);
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    expect(manager.sent).toHaveLength(1);
   });
-
-  it.each([
-    { nativeKind: "provider" as const, expectedMember: "provider-primary" },
-    { nativeKind: "local" as const, expectedMember: "local-primary" },
-  ])(
-    "keeps the $nativeKind native PRIMARY ahead of an affinity-preferred adapted target",
-    async ({ nativeKind, expectedMember }) => {
-      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-        directModels: [],
-        modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
-      });
-      const responsesOnly = {
-        version: 3 as const,
-        protocol: "openai-compatible" as const,
-        surfaces: {
-          openaiResponses: {
-            source: "declared" as const,
-            confidence: "exact" as const,
-            supported: true,
-            streaming: true,
-          },
-        },
-      };
-      db.poolMember.findMany.mockResolvedValue([
-        poolMemberRow({
-          id: "local-primary",
-          discoveredModelId: "local-model",
-          upstreamModelId: "local-upstream",
-          cliDeviceId: "cli-local",
-          affinityEnabled: true,
-          capabilityOverrideMetadata: nativeKind === "provider" ? responsesOnly : null,
-        }),
-      ]);
-      const provider = {
-        ...providerPrimaryTarget("provider-primary"),
-        ...(nativeKind === "local"
-          ? {
-              nativeSurfaces: ["openai-responses" as const],
-              capabilityInventory: responsesOnly,
-            }
-          : {}),
-      };
-      publicOverflow.list.mockResolvedValue({
-        enabled: false,
-        acknowledged: true,
-        affinityPolicy: {
-          enabled: true,
-          ttlSeconds: 3600,
-          maxRecords: 10_000,
-          prefixWeight: 100,
-          conversationWeight: 150,
-          confirmedCacheWeight: 250,
-          loadPenaltyWeight: 100,
-        },
-        targets: [provider],
-      });
-      // Deliberately prefer the adapted target. Affinity may reorder only
-      // within a native/adapted class, never across that compatibility boundary.
-      affinity.rank.mockResolvedValue({
-        orderedTargetIds:
-          nativeKind === "provider"
-            ? ["local-primary-target", "provider-primary-target"]
-            : ["provider-primary-target", "local-primary-target"],
-        scores: {},
-        prefixDepths: {},
-        conversationMatches: {},
-        reasons: {},
-        matchedPrefixDepth: 0,
-      });
-      const selectedMembers: string[] = [];
-      const capacityRuntime: CapacityAdmissionRuntime = {
-        acquire: vi.fn(async (attempt) => {
-          const selected = attempt.candidates[0]!;
-          selectedMembers.push(selected.poolMemberId!);
-          return {
-            state: "ADMITTED" as const,
-            lease: {
-              leaseId: "lease",
-              attemptId: attempt.attemptId,
-              capacityId: selected.capacityId,
-              executionTargetId: selected.executionTargetId,
-              poolMemberId: selected.poolMemberId,
-              fencingToken: 1n,
-              expiresAt: new Date(Date.now() + 30_000),
-            },
-          };
-        }),
-        release: vi.fn(async () => true),
-        hold: vi.fn((response) => response),
-      };
-      publicOverflow.dispatch.mockResolvedValue({
-        dispatched: true,
-        response: new Response(JSON.stringify({ id: "provider" }), {
-          headers: { "content-type": "application/json" },
-        }),
-        target: provider,
-        attemptId: "attempt",
-        fencingToken: 1n,
-        nativeSurface: nativeKind === "provider" ? "openai-chat" : "openai-responses",
-        attemptCount: 1,
-        terminal: Promise.resolve({ ok: true, responseBytes: 10 }),
-        markFirstClientByte: vi.fn().mockResolvedValue(undefined),
-      });
-      const manager = new FakeRelayManager();
-      manager.activeCliDeviceIds = ["cli-local"];
-      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: requestBody(poolTarget.modelId),
-      });
-      await vi.waitFor(() => expect(selectedMembers).toHaveLength(1));
-      expect(selectedMembers[0]).toBe(expectedMember);
-      if (nativeKind === "local") {
-        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
-        await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
-      }
-      expect((await responsePromise).status).toBe(200);
-    },
-  );
 
   it("returns Anthropic-shaped pool compatibility failures", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
@@ -5196,13 +5950,13 @@ describe("model API routes", () => {
     expect(capacityAttempts[0]?.requestId).not.toBe(capacityAttempts[1]?.requestId);
     expect(capacityAttempts[0]?.attemptId).not.toBe(capacityAttempts[1]?.attemptId);
     expect(capacityAttempts[0]?.candidates).toHaveLength(2);
+    // Wait budgets travel as durations; the capacity store turns them into
+    // database-clock deadlines (a process clock never decides a budget).
     const firstAdmissionCandidates = capacityAttempts[0]?.candidates as Array<{
       poolMemberId: string;
-      deadlineAt: Date;
+      waitBudgetMs: number | null;
     }>;
-    expect(firstAdmissionCandidates[1]!.deadlineAt.getTime()).toBeGreaterThan(
-      firstAdmissionCandidates[0]!.deadlineAt.getTime() + 1_000,
-    );
+    expect(firstAdmissionCandidates.map((candidate) => candidate.waitBudgetMs)).toEqual([50, null]);
     expect(capacityAttempts[1]?.candidates).toMatchObject([{ poolMemberId: "member-b" }]);
     expect(capacityEvents).toEqual([
       "acquire:member-a",
@@ -5983,6 +6737,7 @@ describe("model API routes", () => {
           providerUpstreamModelId: "gpt-response",
           poolGrantId: null,
           nativeSurface: "OPENAI_RESPONSES",
+          fallbackRoute: "pool-external",
         }),
       }),
     );
@@ -5993,11 +6748,12 @@ describe("model API routes", () => {
   it("round-trips stored provider Responses through one native immutable binding", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
+    externalConsent.poolIds = [externalPoolTarget.id];
     db.poolMember.findMany.mockResolvedValue([]);
     const providerTarget = {
-      ...providerPrimaryTarget("provider-member"),
+      ...externalProviderTarget("provider-member"),
       executionTargetId: "provider-target",
       providerAccountId: "provider-account",
       providerModelId: "provider-model",
@@ -6019,8 +6775,8 @@ describe("model API routes", () => {
       },
     };
     publicOverflow.list.mockResolvedValue({
-      enabled: false,
-      acknowledged: true,
+      enabled: true,
+      fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
         ttlSeconds: 3600,
@@ -6031,6 +6787,7 @@ describe("model API routes", () => {
         loadPenaltyWeight: 100,
       },
       targets: [providerTarget],
+      coolingDown: [],
     });
     const capacityRuntime = admittingCapacityRuntime();
     publicOverflow.dispatch.mockResolvedValueOnce({
@@ -6054,9 +6811,10 @@ describe("model API routes", () => {
         authorization: "Bearer wsmp_model_test",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
+      body: JSON.stringify({ model: EXTERNAL_MODEL_ID, input: "hello", store: true }),
     });
     expect(create.status).toBe(200);
+    expect(create.headers.get("x-wsmp-route")).toBe("pool-external");
     await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
     const binding = db.responseStickinessRecord.upsert.mock.calls.at(-1)?.[0].create;
@@ -6071,6 +6829,7 @@ describe("model API routes", () => {
       providerUpstreamModelId: "gpt-response",
       poolGrantId: null,
       nativeSurface: "OPENAI_RESPONSES",
+      fallbackRoute: "pool-external",
     });
     expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
       requestedSurface: "openai-responses",
@@ -6499,9 +7258,12 @@ describe("model API routes", () => {
   it("never falls back to a relay or adapter when an exact provider binding is unavailable", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [externalPoolTarget],
     });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([]));
     db.responseStickinessRecord.findUnique.mockResolvedValue({
+      fallbackRoute: "pool-external",
       routingVersion: 3,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -6535,6 +7297,508 @@ describe("model API routes", () => {
     expect(response.status).toBe(404);
     expect(manager.sent).toEqual([]);
     expect(affinity.rank).not.toHaveBeenCalled();
+    expect(publicOverflow.list).toHaveBeenCalledWith("user-id", "pool-id");
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  function consentedProviderBinding(overrides: Record<string, unknown> = {}) {
+    return {
+      routingVersion: 3,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: null,
+      selectedExecutionTargetId: "provider-target",
+      providerAccountId: "provider-account",
+      providerModelId: "provider-model",
+      providerEndpointIdentity: "https://provider.example/v1",
+      providerEndpointVersion: 1,
+      providerUpstreamModelId: "gpt-response",
+      poolGrantId: null,
+      PoolGrant: null,
+      nativeSurface: "OPENAI_RESPONSES",
+      fallbackRoute: "pool-external",
+      upstreamResponseIdDigest: hmacDigestForForwarderPurpose({
+        purpose: "responsesStickinessUpstreamId",
+        value: "resp_provider",
+      }),
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: null },
+      expiresAt: new Date(Date.now() + 60_000),
+      ...overrides,
+    };
+  }
+
+  it("requires :external to continue an externally served response", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/responses",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: externalPoolTarget.modelId,
+          previous_response_id: "resp_provider",
+          input: "next",
+        }),
+      },
+    );
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("external_required");
+    expect(body.error.message).toContain(EXTERNAL_MODEL_ID);
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["retrieve", "GET", "/responses/resp_provider"],
+    ["delete", "DELETE", "/responses/resp_provider"],
+    ["cancel", "POST", "/responses/resp_provider/cancel"],
+    ["compact", "POST", "/responses/resp_provider/compact"],
+    ["input items", "GET", "/responses/resp_provider/input_items"],
+  ])(
+    "refuses %s on an externally served response once the token no longer allows external",
+    async (_label, method, path) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [];
+      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        path,
+        { method, headers: { authorization: "Bearer wsmp_model_test" } },
+      );
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "external_not_permitted" },
+      });
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  describe("bound provider operations (H1, E0-TOCTOU, C3)", () => {
+    // A member that matches consentedProviderBinding() in full: execution
+    // target, account, model, endpoint identity and version, upstream model,
+    // and native Responses support.
+    const boundProvider = () => ({
+      ...externalProviderTarget("provider"),
+      upstreamModelId: "gpt-response",
+      nativeSurfaces: ["openai-responses"] as PublicProviderTarget["nativeSurfaces"],
+    });
+    const boundOperations = [
+      ["follow-up create", "POST", "/responses", true],
+      ["retrieve", "GET", "/responses/resp_provider", false],
+      ["delete", "DELETE", "/responses/resp_provider", false],
+      ["cancel", "POST", "/responses/resp_provider/cancel", false],
+      ["compact", "POST", "/responses/resp_provider/compact", false],
+      ["input items", "GET", "/responses/resp_provider/input_items", false],
+    ] as const;
+    const boundRequest = (method: string, create: boolean) => ({
+      method,
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        ...(create ? { "content-type": "application/json" } : {}),
+      },
+      ...(create
+        ? {
+            body: JSON.stringify({
+              model: EXTERNAL_MODEL_ID,
+              previous_response_id: "resp_provider",
+              input: "next",
+            }),
+          }
+        : {}),
+    });
+    const boundDispatch = (
+      terminal: Promise<{ ok: boolean; responseBytes: number }> = Promise.resolve({
+        ok: true,
+        responseBytes: 2,
+      }),
+    ) => ({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "resp_next", object: "response" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: boundProvider(),
+      attemptId: "bound-attempt",
+      fencingToken: 1n,
+      nativeSurface: "openai-responses",
+      attemptCount: 1,
+      terminal,
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()]));
+    });
+
+    it.each(boundOperations)(
+      "H1: %s returns 429 at the caller's own cap before any listing or dispatch",
+      async (_label, method, path, create) => {
+        const limiter = new ModelApiConcurrencyLimiter();
+        const held = Array.from({ length: MODEL_API_MAX_ACTIVE_PER_TOKEN }, () =>
+          limiter.acquireGlobal({ tokenId: token.id, userId: token.userId }),
+        );
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          path,
+          boundRequest(method, create),
+        );
+
+        expect(response.status).toBe(429);
+        expect(publicOverflow.list).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        for (const lease of held) lease.release();
+      },
+    );
+
+    it.each(boundOperations)(
+      "H1: %s holds the caller lease until the provider terminal settles",
+      async (_label, method, path, create) => {
+        let settle!: (terminal: { ok: boolean; responseBytes: number }) => void;
+        publicOverflow.dispatch.mockResolvedValueOnce(
+          boundDispatch(
+            new Promise((resolve) => {
+              settle = resolve;
+            }),
+          ),
+        );
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        const acquireGlobal = vi
+          .spyOn(limiter, "acquireGlobal")
+          .mockReturnValue({ release: callerRelease });
+
+        const response = await appWith(
+          new FakeRelayManager(),
+          admittingCapacityRuntime(),
+          limiter,
+        ).request(path, boundRequest(method, create));
+
+        expect(response.status).toBe(200);
+        expect(acquireGlobal).toHaveBeenCalledWith({ tokenId: token.id, userId: token.userId });
+        expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+          requesterUserId: "user-id",
+          requesterModelApiTokenId: "token-id",
+        });
+        expect(callerRelease).not.toHaveBeenCalled();
+        settle({ ok: true, responseBytes: 2 });
+        await vi.waitFor(() => expect(callerRelease).toHaveBeenCalledTimes(1));
+        await response.text();
+        // M2: the bound request records its route only on commit.
+        expect(db.relayRequest.create.mock.calls.at(-1)?.[0].data.fallbackRoute).toBeNull();
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ fallbackRoute: "pool-external" }),
+          }),
+        );
+      },
+    );
+
+    it("H1: releases the caller lease exactly once when nothing is dispatched or dispatch throws", async () => {
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerRelease = vi.fn();
+      vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      const unavailable = await appWith(
+        new FakeRelayManager(),
+        admittingCapacityRuntime(),
+        limiter,
+      ).request("/responses/resp_provider", boundRequest("GET", false));
+      expect(unavailable.status).toBe(503);
+      expect(callerRelease).toHaveBeenCalledTimes(1);
+
+      publicOverflow.dispatch.mockRejectedValueOnce(new Error("provider dispatch disconnected"));
+      const thrown = await appWith(
+        new FakeRelayManager(),
+        admittingCapacityRuntime(),
+        limiter,
+      ).request("/responses/resp_provider", boundRequest("GET", false));
+      expect(thrown.status).toBe(500);
+      expect(callerRelease).toHaveBeenCalledTimes(2);
+
+      // A saturated bound target is transient: 429, not "gone".
+      const saturated: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async () => ({ state: "EXPIRED" as const })),
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const busy = await appWith(new FakeRelayManager(), saturated, limiter).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(busy.status).toBe(429);
+      expect(callerRelease).toHaveBeenCalledTimes(3);
+    });
+
+    it.each(boundOperations)(
+      "%s answers 503 (not 404) while the bound provider is in health cooldown",
+      async (_label, method, path, create) => {
+        publicOverflow.list.mockResolvedValue({
+          ...listedExternalTargets([]),
+          coolingDown: [boundProvider()],
+        });
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          path,
+          boundRequest(method, create),
+        );
+
+        expect(response.status).toBe(503);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    // R1-A: a bound operation's consent carries the binding's own grant, so
+    // the send claim refuses it once that grant is replaced.
+    it("binds a grantee's bound operation consent to the binding's grant", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "binding-grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      db.responseStickinessRecord.findUnique.mockResolvedValue(
+        consentedProviderBinding({
+          poolGrantId: "binding-grant",
+          PoolGrant: {
+            id: "binding-grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce(boundDispatch());
+
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        externalConsent: expect.objectContaining({
+          requesterIsOwner: false,
+          accessGrantId: "binding-grant",
+        }),
+      });
+    });
+
+    // R4: the cooldown shortcut applies the full binding match. A cooling
+    // member whose endpoint version (or upstream model, or native Responses
+    // support) no longer matches the binding can never serve it again: 404.
+    it.each([
+      ["endpoint version", { endpointVersion: 99 }],
+      ["endpoint identity", { endpointIdentity: "https://other.example/v1" }],
+      ["upstream model", { upstreamModelId: "another-model" }],
+      [
+        "native Responses support",
+        { nativeSurfaces: ["openai-chat"] as PublicProviderTarget["nativeSurfaces"] },
+      ],
+    ] as const)(
+      "answers 404 for a cooling member whose %s no longer matches the binding",
+      async (_label, change) => {
+        publicOverflow.list.mockResolvedValue({
+          ...listedExternalTargets([]),
+          coolingDown: [{ ...boundProvider(), ...change }],
+        });
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          "/responses/resp_provider",
+          boundRequest("GET", false),
+        );
+
+        expect(response.status).toBe(404);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("answers 404 when a listed member no longer matches the binding's endpoint version", async () => {
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([{ ...boundProvider(), endpointVersion: 99 }]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(404);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(runtime.acquire).not.toHaveBeenCalled();
+    });
+
+    // R3: only a permanently invalid binding is "gone". Every transient
+    // dispatcher outcome after listing is 503 with both leases released.
+    it.each([
+      ["PROVIDER_UNHEALTHY", 503],
+      ["SEND_CLAIM_FAILED", 503],
+      ["PROVIDER_UNAVAILABLE", 503],
+      ["BUDGET_EXCEEDED", 503],
+      ["BOUND_TARGET_INVALID", 404],
+      ["REQUESTER_ACCESS_BLOCKED", 403],
+    ] as const)("maps a bound dispatch result %s to %i", async (reason, status) => {
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerRelease = vi.fn();
+      vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+      const runtime = admittingCapacityRuntime();
+
+      const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(status);
+      expect(runtime.release).toHaveBeenCalledTimes(1);
+      expect(callerRelease).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(boundOperations)(
+      "E0-TOCTOU: %s answers 403 when consent is withdrawn between authentication and dispatch",
+      async (_label, method, path, create) => {
+        // Authentication saw consent; the dispatch-time re-read no longer does.
+        publicOverflow.dispatch.mockResolvedValueOnce({
+          dispatched: false,
+          reason: "CALLER_CONSENT_WITHDRAWN",
+        });
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          path,
+          boundRequest(method, create),
+        );
+
+        expect(response.status).toBe(403);
+        await expect(response.json()).resolves.toMatchObject({
+          error: { code: "external_not_permitted" },
+        });
+        expect(runtime.release).toHaveBeenCalledTimes(1);
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("C3 (r1-F3): an :external follow-up after token consent was withdrawn is 403 with no dispatch", async () => {
+      externalConsent.poolIds = [];
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/responses",
+        boundRequest("POST", true),
+      );
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "external_not_permitted" },
+      });
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+  });
+
+  it("ignores provider bindings created before caller consent existed", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.responseStickinessRecord.findUnique.mockResolvedValue(
+      consentedProviderBinding({ fallbackRoute: null }),
+    );
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/responses/resp_provider",
+      { headers: { authorization: "Bearer wsmp_model_test" } },
+    );
+    expect(response.status).toBe(404);
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("keeps an :external follow-up to a locally served response on its local member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+      }),
+    ]);
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+    );
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a"];
+    const responsePromise = appWith(manager).request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: EXTERNAL_MODEL_ID,
+        previous_response_id: "resp_local",
+        input: "next",
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, JSON.stringify({ id: "resp_next", object: "response" }));
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("local");
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
   it("does not resurrect a grantee binding after its exact grant is replaced", async () => {
@@ -7207,3 +8471,68 @@ describe("model API routes", () => {
     });
   });
 });
+
+/**
+ * A pool with one external member as `listPublicOverflowTargets` reads it
+ * from the database, with every health cooldown elapsed (UNAVAILABLE status,
+ * next retry in the past: a half-open candidate).
+ */
+function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
+  return {
+    fallbackEnabled: true,
+    fallbackForGrantees: false,
+    PoolMembers: [
+      {
+        id: "member-cooldown",
+        publicOrder: 0,
+        ExecutionTarget: {
+          id: "target-cooldown",
+          inferenceCapacityId: "capacity-cooldown",
+          ProviderModel: {
+            id: "model-cooldown",
+            userId: ownerUserId,
+            upstreamModelId: "upstream-model",
+            contextWindow: 10_000,
+            maxOutputTokens: 1_000,
+            concurrencyLimit: null,
+            nativeCapabilities: {
+              protocols: ["openai"],
+              surfaces: [surface],
+              streaming: true,
+              features: [],
+            },
+            healthStatus: "UNAVAILABLE",
+            healthNextRetryAt: new Date(0),
+            enabled: true,
+            deletedAt: null,
+            ProviderAccount: {
+              id: "account-cooldown",
+              userId: ownerUserId,
+              providerType: "openai",
+              providerVersion: null,
+              baseUrl: "https://provider.example",
+              endpointIdentity: "https://provider.example",
+              endpointVersion: 1,
+              authType: "BEARER",
+              healthStatus: "UNAVAILABLE",
+              healthNextRetryAt: new Date(0),
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: {
+                id: "credential-cooldown",
+                credentialType: "BEARER",
+                aadVersion: 1,
+                algorithm: "AES-256-GCM",
+                keyVersion: "v1",
+                ciphertext: new Uint8Array(),
+                nonce: new Uint8Array(),
+                authTag: new Uint8Array(),
+                status: "ACTIVE",
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+}

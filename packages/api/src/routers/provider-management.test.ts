@@ -148,12 +148,40 @@ describe("providerManagementRouter security boundary", () => {
     );
   });
 
-  it("is hidden by default for authenticated callers and still requires authentication", async () => {
+  const newAccount = {
+    providerType: "openai",
+    label: "Provider",
+    baseUrl: "https://api.example.test/v1",
+    authType: "BEARER" as const,
+  };
+
+  it("hides provider creation and credential tests while the switch is off and still requires authentication", async () => {
     const client = createRouterClient(providerManagementRouter, { context });
-    await expect(client.listAccounts()).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(client.createAccount(newAccount)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
     const anonymous = createRouterClient(providerManagementRouter, { context: { session: null } });
     await expect(anonymous.listAccounts()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
-    expect(db.providerAccount.findMany).not.toHaveBeenCalled();
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(egressMock.request).not.toHaveBeenCalled();
+  });
+
+  it("keeps stored provider keys viewable, revocable, and deletable while the switch is off", async () => {
+    db.providerAccount.findMany.mockResolvedValue([]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listAccounts()).resolves.toEqual([]);
+    expect(db.providerAccount.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "owner", deletedAt: null } }),
+    );
+    // Revoke and delete are not hidden behind the switch: an unknown account
+    // is a plain owner-scoped NOT_FOUND from the procedure itself.
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    await expect(client.deleteAccount({ id: "missing-account" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.$transaction).toHaveBeenCalled();
+    expect(egressMock.request).not.toHaveBeenCalled();
   });
 
   it("enforces the same disabled gate through the HTTP RPC transport", async () => {
@@ -172,8 +200,8 @@ describe("providerManagementRouter security boundary", () => {
     const client = createORPCClient(link) as ReturnType<
       typeof createRouterClient<typeof providerManagementRouter>
     >;
-    await expect(client.listAccounts()).rejects.toMatchObject({ code: "NOT_FOUND" });
-    expect(db.providerAccount.findMany).not.toHaveBeenCalled();
+    await expect(client.createAccount(newAccount)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerAccount.create).not.toHaveBeenCalled();
   });
 
   it("enforces authentication through the HTTP RPC transport when provider egress is enabled", async () => {

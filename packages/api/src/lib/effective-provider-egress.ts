@@ -1,49 +1,43 @@
 /**
- * PRIMARY members whose execution target is a provider model.
+ * External fallback members: PUBLIC_OVERFLOW members whose execution target is
+ * a provider model. PRIMARY members are always local (enforced by the schema
+ * hardening tier trigger), so this is every provider member of a pool.
  * `ProviderModel: { isNot: null }` is not equivalent: that relation also
  * includes `userId`, which is never null, so the check matches every target.
- * Routing status is intentionally omitted so a non-active primary still
- * requires the same acknowledgement as an active one.
  */
-export const providerPrimaryMemberWhere = {
-  tier: "PRIMARY" as const,
+export const externalFallbackMemberWhere = {
+  tier: "PUBLIC_OVERFLOW" as const,
   ExecutionTarget: { providerModelId: { not: null } },
 };
 
-export function providerPrimaryMemberCount(
-  members: ReadonlyArray<{
-    tier: string;
-    ExecutionTarget?: { providerModelId?: string | null } | null;
-  }>,
-): number {
-  let count = 0;
-  for (const member of members) {
-    if (member.tier === "PRIMARY" && member.ExecutionTarget?.providerModelId != null) count += 1;
-  }
-  return count;
-}
-
-/** Single acknowledgement rule shared by grants, pool lists, and token visibility. */
+/**
+ * Whether a pool can serve `owner/pool:external` for some caller: the owner
+ * enabled fallback and at least one external member is configured. Plain pool
+ * names never leave the deployment, so this is the badge rule shared by pool
+ * lists and token visibility.
+ */
 export function effectiveProviderEgress(input: {
-  publicEgressEnabled: boolean;
-  providerPrimaryMemberCount: number;
+  fallbackEnabled: boolean;
+  externalMemberCount: number;
 }): boolean {
-  return input.publicEgressEnabled || input.providerPrimaryMemberCount > 0;
+  return input.fallbackEnabled && input.externalMemberCount > 0;
 }
 
 /**
- * Account labels that can receive pool traffic. Overflow members count only
- * when public overflow is on. Labels are display names, never credentials.
+ * Account labels that can receive `:external` pool traffic. Only external
+ * fallback members count, and only while fallback is on. Labels are display
+ * names, never credentials.
  */
 export function egressProviderAccountLabels(input: {
-  publicEgressEnabled: boolean;
+  fallbackEnabled: boolean;
   members: ReadonlyArray<{ tier: string; accountLabel?: string | null }>;
 }): string[] {
+  if (!input.fallbackEnabled) return [];
   const labels = new Set<string>();
   for (const member of input.members) {
     const label = member.accountLabel;
-    if (!label) continue;
-    if (member.tier === "PRIMARY" || input.publicEgressEnabled) labels.add(label);
+    if (!label || member.tier !== "PUBLIC_OVERFLOW") continue;
+    labels.add(label);
   }
   return [...labels].sort((left, right) => left.localeCompare(right));
 }
@@ -54,7 +48,6 @@ export const GRANTEE_PRIVACY_CONFIRMATION_REQUIRED = "GRANTEE_PRIVACY_CONFIRMATI
 export const grantPoolAccessServerMessages = {
   userNotFound: "User not found.",
   cannotGrantToSelf: "Cannot grant a pool to yourself.",
-  egressAcknowledgementRequired: "Provider egress acknowledgement is required for this grant.",
 } as const;
 
 const grantPoolAccessServerMessageList: readonly string[] = Object.values(

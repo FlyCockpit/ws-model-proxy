@@ -60,7 +60,23 @@ Unlike authorization, discovery, MCP login/consent, and \`/mcp\`, grant and
 token *revocation* and the settings page are deliberately NOT gated on
 \`WMP_MCP_ENABLED\` (invariant 13): humans must be able to kill outstanding
 authorization during an emergency MCP shutdown. Personal-token *creation*
-is gated on the flag. Normal browser authentication still applies.`;
+is gated on the flag. Normal browser authentication still applies.
+
+## Human-only external fallback settings
+
+Sending request data to external providers needs consent a person gave.
+MCP tools can never grant it:
+
+- \`modelApiTokens.updateExternalAccess\` (a token's \`allowExternal\` and
+  per-pool \`includeExternal\`) is excluded from the catalog;
+- \`forwarder_model_pool_create\` and \`forwarder_model_pool_update\` reject
+  \`fallbackEnabled\` and \`fallbackForGrantees\` in their input schemas
+  (advertised as \`not: {}\`), whatever the value;
+- \`forwarder_guarded_pool_create\` rejects non-empty \`providerModels\`,
+  because attaching external members there turns fallback on.
+
+Confirmed MCP writes for the fallback switches are planned together with the
+MCP fallback tools. Pinned by \`apps/server/src/mcp/tool-manifest.test.ts\`.`;
 
 interface CoverageRow {
   readonly target: string;

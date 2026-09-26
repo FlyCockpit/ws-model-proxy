@@ -81,6 +81,43 @@
  *   delete uses (device at L0, user at L7, then its cascade into
  *   `device_code` and the device credentials).
  *
+ * The E0 send-claim transaction (external provider egress,
+ * packages/api/src/lib/model-api-token-access.ts `lockExternalSendConsent`
+ * then apps/server/src/model-api/public-overflow.ts
+ * `claimPublicProviderCredentialForSend`) is also outside the capacity
+ * domain. It starts holding nothing and takes, in this order:
+ *
+ *   C1  `model_pool` FOR SHARE (the pool being sent for);
+ *   C2  `pool_grant` FOR SHARE (the requester's grant, grantees only);
+ *   C3  `model_api_token` FOR SHARE (the requester's token, if any);
+ *   C4  `model_api_token_allowlist_entry` FOR SHARE (that token's entry for
+ *       the pool);
+ *   C5  `provider_account` FOR UPDATE, then `provider_credential` FOR UPDATE
+ *       (the order every provider lifecycle writer uses).
+ *
+ * After C5 (the last statement that can wait) it re-reads the requester's
+ * token and `user` row WITHOUT a lock and re-evaluates token expiry, ban and
+ * deletion mark at a fresh `now` (`recheckExternalSendRequesterValidity`).
+ * No `user` lock is needed: every statement after that read is non-blocking
+ * (the credential row is already held) and none writes a row the ban or
+ * deletion-mark writers read, so a mark committing after the read serializes
+ * after the claim, the same order a FOR SHARE would force, and the `user`
+ * row stays out of this order.
+ *
+ * It takes no capacity lock and writes only the credential's `lastUsedAt`, so
+ * no admitter ever waits on it (FOR SHARE does not conflict with the FOR KEY
+ * SHARE of child inserts), and its C1 wait on an L1 holder closes no cycle.
+ * Every transaction that holds a C-row in a conflicting mode and then waits
+ * on a later C-level takes them in the same order: pool writers and deletes
+ * (L1 first, then their grant/allowlist cascades), grant upserts (pool L1
+ * first), grant revokes (single statement), user deletes (L1 on every owned
+ * and granted pool before the L7 cascade into grants, tokens, entries and
+ * provider rows), `updateExternalAccess` (the caller's own token FOR NO KEY
+ * UPDATE, scoped by `userId`, before its entries), token revoke (single
+ * statement). Provider writers that hold C5
+ * take no C1-C4 lock in a conflicting mode (their pool references are FK KEY
+ * SHARE, which FOR SHARE admits).
+ *
  * The user-row writers that wait while holding the row (the deletion mark
  * and archive, each then deleting session rows; the ordered delete's
  * cascade) never hold a row either transaction waits on first. The static

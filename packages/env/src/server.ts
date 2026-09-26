@@ -159,9 +159,13 @@ export const env = createEnv({
       .positive()
       .default(15 * 60 * 1000),
     // Kill switch for direct public-provider egress. On by default. Off stops
-    // provider HTTP; on does not send data by itself — a pool still needs the
-    // owner's acknowledgement and a provider member. When on with no keyring,
-    // startup warns once and does not log the key.
+    // provider HTTP, hides `owner/pool:external` names, and answers them with
+    // 403 external_providers_disabled; provider keys stay viewable, revocable,
+    // and deletable. On does not send data by itself: a request must name
+    // `owner/pool:external`, its token must allow external providers, and the
+    // pool owner must enable fallback (and pay for grantees). Plain pool names
+    // never leave the deployment. When on with no keyring, startup warns once
+    // and does not log the key.
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(true),
     // Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd
     // plugins, /mcp, discovery, MCP login/consent). On by default. Set false

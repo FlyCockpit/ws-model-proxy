@@ -329,7 +329,7 @@ export const ENV_VARS: EnvVar[] = [
     default: "true",
     comment: [
       "Kill switch for direct public-provider egress. On by default.",
-      "Off stops provider HTTP. On does not send data by itself: a pool still needs the owner's acknowledgement and a provider member.",
+      "Off stops provider HTTP and hides owner/pool:external names. On does not send data by itself: a request must name owner/pool:external, its token must allow external providers, and the pool owner must allow it.",
       "When on with no keyring, startup warns once and does not log the key.",
     ],
   },

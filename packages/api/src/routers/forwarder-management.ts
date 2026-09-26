@@ -49,11 +49,9 @@ import {
   effectiveProviderEgress,
   egressProviderAccountLabels,
   grantPoolAccessServerMessages,
-  providerPrimaryMemberCount,
-  providerPrimaryMemberWhere,
 } from "../lib/effective-provider-egress";
 import {
-  countProviderPrimaryMembers,
+  countExternalFallbackMembers,
   deliverGranteePrivacyEmails,
   gateSharedPoolPrivacyChange,
   recordGranteePrivacyNotices,
@@ -218,6 +216,42 @@ function assertLossyDeveloperRoleCollapseRequiresAdaptation(
       ...(reason !== undefined ? { data: { reason } } : {}),
     });
   }
+}
+
+/** Owner fallback settings on the pool create/update procedures (and MCP pool update). */
+const poolFallbackFields = {
+  /** Owner allows external fallback for `owner/pool:external` requests. */
+  fallbackEnabled: z.boolean().optional(),
+  /** Owner pays for grantees' external fallback. Off by default. */
+  fallbackForGrantees: z.boolean().optional(),
+  /** How long an `:external` request waits for local capacity (0 = only if free now). */
+  externalAfterWaitMs: z.number().int().min(0).max(600_000).optional(),
+};
+
+/**
+ * A save that sets a NEW external-fallback wait must not exceed the pool's
+ * resulting local wait budget (the value after this save). A save that does
+ * not change the external wait is never rejected because of it: the stored
+ * value may exceed a budget lowered later, and the runtime always waits
+ * min(budget, externalAfterWaitMs), so an out-of-order pair is harmless.
+ */
+function assertExternalAfterWaitWithinBudget({
+  externalAfterWaitMs,
+  currentExternalAfterWaitMs,
+  capacityWaitBudgetMs,
+}: {
+  externalAfterWaitMs: number | undefined;
+  /** Stored value, or null when creating a pool. */
+  currentExternalAfterWaitMs: number | null;
+  /** The pool's local wait budget after this save (null = unbounded). */
+  capacityWaitBudgetMs: number | null;
+}): void {
+  if (externalAfterWaitMs === undefined || externalAfterWaitMs === currentExternalAfterWaitMs)
+    return;
+  if (capacityWaitBudgetMs !== null && externalAfterWaitMs > capacityWaitBudgetMs)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "The external fallback wait cannot exceed the pool's local wait budget.",
+    });
 }
 
 function assertProviderEgressReleaseGate(reason?: GuardedPoolCreateFailureReason): void {
@@ -590,12 +624,11 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,
       maxAttachmentBytes: pool.maxAttachmentBytes,
-      publicEgressEnabled: pool.publicEgressEnabled,
-      publicEgressAcknowledged: pool.publicEgressAcknowledged,
+      fallbackEnabled: pool.fallbackEnabled,
+      fallbackForGrantees: pool.fallbackForGrantees,
       effectiveProviderEgress: pool.effectiveProviderEgress,
       providerAccountLabels: egressProviderAccountLabels({
-        publicEgressEnabled:
-          serializedPools.get(pool.id)?.publicEgressEnabled ?? pool.publicEgressEnabled,
+        fallbackEnabled: serializedPools.get(pool.id)?.fallbackEnabled ?? pool.fallbackEnabled,
         members: (serializedPools.get(pool.id)?.members ?? []).map((member) => ({
           tier: member.tier,
           accountLabel: member.providerModel?.ProviderAccount.label ?? null,
@@ -860,11 +893,15 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
-    publicEgressEnabled: row.publicEgressEnabled,
-    publicEgressAcknowledged: row.publicEgressAcknowledged,
+    fallbackEnabled: row.fallbackEnabled,
+    fallbackForGrantees: row.fallbackForGrantees,
+    externalAfterWaitMs: row.externalAfterWaitMs,
     effectiveProviderEgress: effectiveProviderEgress({
-      publicEgressEnabled: row.publicEgressEnabled,
-      providerPrimaryMemberCount: providerPrimaryMemberCount(row.PoolMembers),
+      fallbackEnabled: row.fallbackEnabled,
+      externalMemberCount: row.PoolMembers.filter(
+        (member) =>
+          member.tier === "PUBLIC_OVERFLOW" && member.ExecutionTarget?.providerModelId != null,
+      ).length,
     }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
@@ -993,7 +1030,7 @@ function serializePool(row: ModelPoolRow) {
 async function ownedPool(poolId: string, userId: string) {
   const pool = await prisma.modelPool.findUnique({
     where: { id: poolId },
-    select: { id: true, userId: true, publicEgressEnabled: true },
+    select: { id: true, userId: true, fallbackEnabled: true },
   });
   if (!pool || pool.userId !== userId) {
     throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -1295,8 +1332,9 @@ const poolSelect = {
   maxAttachmentBytes: true,
   optimisticBasicTranscription: true,
   protocolAdaptationEnabled: true,
-  publicEgressEnabled: true,
-  publicEgressAcknowledged: true,
+  fallbackEnabled: true,
+  fallbackForGrantees: true,
+  externalAfterWaitMs: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   capacityPriority: true,
@@ -1529,7 +1567,8 @@ export const forwarderManagementRouter = {
             memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable().default(null),
             reservedSlots: z.number().int().min(0).max(10_000),
             localWaitBudgetMs: z.number().int().min(0).max(600_000),
-            publicEgressAcknowledged: z.boolean(),
+            /** Deprecated and ignored: external fallback needs per-request caller opt-in. */
+            publicEgressAcknowledged: z.boolean().optional(),
             advanced: z
               .object({
                 physicalCountStrategy: z.enum([
@@ -1606,12 +1645,14 @@ export const forwarderManagementRouter = {
                 message: "Reserved slots exceed member concurrency",
               });
             }
-            if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
-              ctx.addIssue({
-                code: "custom",
-                path: ["publicEgressAcknowledged"],
-                message: "Provider egress acknowledgement is required",
-              });
+            for (const [index, provider] of input.providerModels.entries()) {
+              if (provider.tier === "PRIMARY")
+                ctx.addIssue({
+                  code: "custom",
+                  path: ["providerModels", index, "tier"],
+                  message:
+                    "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+                });
             }
             if (new Set(input.localModelIds).size !== input.localModelIds.length) {
               ctx.addIssue({
@@ -2006,8 +2047,9 @@ export const forwarderManagementRouter = {
             protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
             allowLossyDeveloperRoleCollapse:
               input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
-            publicEgressEnabled: hasPublicOverflow,
-            publicEgressAcknowledged: input.publicEgressAcknowledged,
+            // Fallback on only when external members are configured. Callers
+            // still opt in per request with `owner/pool:external`.
+            fallbackEnabled: hasPublicOverflow,
             recommendedSurfaceOverride: input.recommendedSurface,
             capacityPriority: 16,
             capacityConcurrencyLimit: input.memberConcurrencyLimit,
@@ -2463,8 +2505,7 @@ export const forwarderManagementRouter = {
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
-        publicEgressEnabled: z.boolean().optional(),
-        publicEgressAcknowledged: z.literal(true).optional(),
+        ...poolFallbackFields,
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         ...poolTransformerFields,
@@ -2479,8 +2520,12 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
-        assertProviderEgressReleaseGate();
+      if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
+      assertExternalAfterWaitWithinBudget({
+        externalAfterWaitMs: input.externalAfterWaitMs,
+        currentExternalAfterWaitMs: null,
+        capacityWaitBudgetMs: input.capacityWaitBudgetMs ?? null,
+      });
       assertLossyDeveloperRoleCollapseRequiresAdaptation({
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
@@ -2514,8 +2559,11 @@ export const forwarderManagementRouter = {
           : {}),
         optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
-        publicEgressEnabled: input.publicEgressEnabled ?? false,
-        publicEgressAcknowledged: input.publicEgressAcknowledged ?? false,
+        fallbackEnabled: input.fallbackEnabled ?? false,
+        fallbackForGrantees: input.fallbackForGrantees ?? false,
+        ...(input.externalAfterWaitMs !== undefined
+          ? { externalAfterWaitMs: input.externalAfterWaitMs }
+          : {}),
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
         recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
         transformerDiscoveredModelId: input.transformerDiscoveredModelId ?? null,
@@ -2587,8 +2635,7 @@ export const forwarderManagementRouter = {
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
-        publicEgressEnabled: z.boolean().optional(),
-        publicEgressAcknowledged: z.literal(true).optional(),
+        ...poolFallbackFields,
         confirmGranteePrivacyChange: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
@@ -2613,8 +2660,9 @@ export const forwarderManagementRouter = {
           transformerAudio: true,
           transformerVideo: true,
           transformerCacheMode: true,
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
+          capacityWaitBudgetMs: true,
+          externalAfterWaitMs: true,
           protocolAdaptationEnabled: true,
           allowLossyDeveloperRoleCollapse: true,
         },
@@ -2628,17 +2676,20 @@ export const forwarderManagementRouter = {
       }
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
 
-      const nextPublicEgressEnabled = input.publicEgressEnabled ?? existing.publicEgressEnabled;
-      const nextPublicEgressAcknowledged =
-        input.publicEgressAcknowledged ?? existing.publicEgressAcknowledged;
-      if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
-        assertProviderEgressReleaseGate();
-      if (nextPublicEgressEnabled && !nextPublicEgressAcknowledged) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Acknowledge public egress before enabling it.",
-        });
-      }
-      if (input.publicEgressEnabled === true) {
+      // Turning fallback OFF is always allowed (members stay configured and
+      // the runtime stops using them). Turning it ON needs the deployment
+      // switch and audited protection policies on every external member. No
+      // separate acknowledgement: callers opt in per request with `:external`.
+      if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
+      assertExternalAfterWaitWithinBudget({
+        externalAfterWaitMs: input.externalAfterWaitMs,
+        currentExternalAfterWaitMs: existing.externalAfterWaitMs,
+        capacityWaitBudgetMs:
+          input.capacityWaitBudgetMs !== undefined
+            ? input.capacityWaitBudgetMs
+            : existing.capacityWaitBudgetMs,
+      });
+      if (input.fallbackEnabled === true) {
         const attachments = await prisma.poolMember.findMany({
           where: { poolId: existing.id, tier: "PUBLIC_OVERFLOW" },
           select: {
@@ -2745,7 +2796,7 @@ export const forwarderManagementRouter = {
           select: {
             userId: true,
             name: true,
-            publicEgressEnabled: true,
+            fallbackEnabled: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
@@ -2754,18 +2805,18 @@ export const forwarderManagementRouter = {
         if (!current || current.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         }
-        const providerPrimaryCount = await countProviderPrimaryMembers(tx, input.id);
-        const lockedPublicEgressEnabled = input.publicEgressEnabled ?? current.publicEgressEnabled;
+        const externalMemberCount = await countExternalFallbackMembers(tx, input.id);
+        const lockedFallbackEnabled = input.fallbackEnabled ?? current.fallbackEnabled;
         const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
           poolId: input.id,
           poolName: current.name,
           currentlyNonPrivate: effectiveProviderEgress({
-            publicEgressEnabled: current.publicEgressEnabled,
-            providerPrimaryMemberCount: providerPrimaryCount,
+            fallbackEnabled: current.fallbackEnabled,
+            externalMemberCount,
           }),
           nextNonPrivate: effectiveProviderEgress({
-            publicEgressEnabled: lockedPublicEgressEnabled,
-            providerPrimaryMemberCount: providerPrimaryCount,
+            fallbackEnabled: lockedFallbackEnabled,
+            externalMemberCount,
           }),
           confirmed: input.confirmGranteePrivacyChange === true,
         });
@@ -2847,11 +2898,14 @@ export const forwarderManagementRouter = {
             ...(input.protocolAdaptationEnabled !== undefined
               ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
               : {}),
-            ...(input.publicEgressEnabled !== undefined
-              ? { publicEgressEnabled: input.publicEgressEnabled }
+            ...(input.fallbackEnabled !== undefined
+              ? { fallbackEnabled: input.fallbackEnabled }
               : {}),
-            ...(input.publicEgressAcknowledged !== undefined
-              ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
+            ...(input.fallbackForGrantees !== undefined
+              ? { fallbackForGrantees: input.fallbackForGrantees }
+              : {}),
+            ...(input.externalAfterWaitMs !== undefined
+              ? { externalAfterWaitMs: input.externalAfterWaitMs }
               : {}),
             ...(input.allowLossyDeveloperRoleCollapse !== undefined
               ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
@@ -3140,6 +3194,11 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       assertProviderEgressReleaseGate();
+      if (input.tier === "PRIMARY")
+        throw new ORPCError("BAD_REQUEST", {
+          message:
+            "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+        });
       const userId = context.session.user.id;
       const attached = await runSerializableTransaction(async (tx) => {
         const candidatePool = await tx.modelPool.findFirst({
@@ -3153,10 +3212,7 @@ export const forwarderManagementRouter = {
           select: {
             id: true,
             name: true,
-            publicEgressEnabled: true,
-            publicEgressAcknowledged: true,
-            recommendedSurfaceOverride: true,
-            protocolAdaptationEnabled: true,
+            fallbackEnabled: true,
             capacityConcurrencyLimit: true,
             capacityReservedSlots: true,
             capacityContextCeiling: true,
@@ -3164,17 +3220,9 @@ export const forwarderManagementRouter = {
           },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        if (!pool.publicEgressAcknowledged) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Acknowledge provider egress before adding a provider target.",
-          });
-        }
-        if (input.tier === "PUBLIC_OVERFLOW" && !pool.publicEgressEnabled) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Acknowledge and enable public egress before adding an overflow target.",
-          });
-        }
-        if (input.tier === "PUBLIC_OVERFLOW" && input.publicOrder === undefined) {
+        // External members may be configured while fallback is off; the owner's
+        // fallback switch and each caller's `:external` opt-in gate their use.
+        if (input.publicOrder === undefined) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Public overflow targets require an explicit order.",
           });
@@ -3196,21 +3244,6 @@ export const forwarderManagementRouter = {
         }
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
-        }
-        // Attaching at PRIMARY tier changes the primary member set: the
-        // effective recommended surface must stay servable before any write.
-        if (input.tier === "PRIMARY") {
-          const surfaceMembers = await loadPoolSurfaceMembers(tx, input.poolId);
-          surfaceMembers.push({
-            id: providerModel.id,
-            tier: "PRIMARY",
-            capabilities: providerModelSurfaceCapabilities(providerModel.nativeCapabilities),
-          });
-          assertRecommendedSurfaceServable({
-            override: parseModelApiSurface(pool.recommendedSurfaceOverride),
-            members: surfaceMembers,
-            adaptationEnabled: pool.protocolAdaptationEnabled,
-          });
         }
         await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
         // Fast rejection; the same invariant is checked again after the target
@@ -3272,16 +3305,18 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
-        const providerPrimaryCount = await countProviderPrimaryMembers(tx, pool.id);
-        const currentlyNonPrivate = effectiveProviderEgress({
-          publicEgressEnabled: pool.publicEgressEnabled,
-          providerPrimaryMemberCount: providerPrimaryCount,
-        });
+        const externalMemberCount = await countExternalFallbackMembers(tx, pool.id);
         const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
           poolId: pool.id,
           poolName: pool.name,
-          currentlyNonPrivate,
-          nextNonPrivate: input.tier === "PRIMARY" || currentlyNonPrivate,
+          currentlyNonPrivate: effectiveProviderEgress({
+            fallbackEnabled: pool.fallbackEnabled,
+            externalMemberCount,
+          }),
+          nextNonPrivate: effectiveProviderEgress({
+            fallbackEnabled: pool.fallbackEnabled,
+            externalMemberCount: externalMemberCount + 1,
+          }),
           confirmed: input.confirmGranteePrivacyChange === true,
         });
         const existingTarget = await tx.executionTarget.findUnique({
@@ -3518,8 +3553,7 @@ export const forwarderManagementRouter = {
                 select: {
                   userId: true,
                   name: true,
-                  publicEgressEnabled: true,
-                  publicEgressAcknowledged: true,
+                  fallbackEnabled: true,
                   recommendedSurfaceOverride: true,
                   protocolAdaptationEnabled: true,
                   capacityConcurrencyLimit: true,
@@ -3545,13 +3579,12 @@ export const forwarderManagementRouter = {
             throw new ORPCError("BAD_REQUEST", {
               message: "Only provider-backed members can change tier.",
             });
-          if (providerModel && !member.ModelPool.publicEgressAcknowledged)
+          // PRIMARY is local-only (also enforced by the schema-hardening tier
+          // trigger): plain pool names never leave the deployment.
+          if (providerModel && nextTier === "PRIMARY")
             throw new ORPCError("BAD_REQUEST", {
-              message: "Acknowledge provider egress before updating a provider target.",
-            });
-          if (nextTier === "PUBLIC_OVERFLOW" && !member.ModelPool.publicEgressEnabled)
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Acknowledge and enable public egress before moving a target to overflow.",
+              message:
+                "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
             });
           const nextConcurrencyMode =
             input.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
@@ -3685,8 +3718,8 @@ export const forwarderManagementRouter = {
                 poolId: member.poolId,
                 poolName: member.ModelPool.name,
                 currentlyNonPrivate: effectiveProviderEgress({
-                  publicEgressEnabled: member.ModelPool.publicEgressEnabled,
-                  providerPrimaryMemberCount: await countProviderPrimaryMembers(
+                  fallbackEnabled: member.ModelPool.fallbackEnabled,
+                  externalMemberCount: await countExternalFallbackMembers(
                     tx,
                     member.poolId,
                     member.id,
@@ -4115,41 +4148,24 @@ export const forwarderManagementRouter = {
       z.object({
         poolId: idSchema,
         email: z.string().trim().email().max(320),
-        publicEgressAcknowledged: z.boolean().default(false),
       }),
     )
     .handler(async ({ input, context }) => {
       const pool = await ownedPool(input.poolId, context.session.user.id);
       const userId = context.session.user.id;
-      // Lock the pool row before re-reading egress so a privacy transition
-      // cannot commit between this check and the grant insert.
+      // No grant-time egress acknowledgement: a grantee's data leaves the
+      // deployment only when the grantee asks for `owner/pool:external` with
+      // a consenting credential AND the owner enabled fallbackForGrantees.
+      // The pool row lock keeps grants serialized with pool privacy changes
+      // (lock order: model_pool first).
       return runSerializableTransaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const locked = await tx.modelPool.findUnique({
           where: { id: pool.id },
-          select: { id: true, userId: true, publicEgressEnabled: true },
+          select: { id: true, userId: true },
         });
         if (!locked || locked.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        }
-        // Skip the member lookup when overflow is already on; the shared rule
-        // still requires acknowledgement from publicEgressEnabled alone.
-        const providerPrimary = locked.publicEgressEnabled
-          ? null
-          : await tx.poolMember.findFirst({
-              where: { poolId: locked.id, ...providerPrimaryMemberWhere },
-              select: { id: true },
-            });
-        if (
-          effectiveProviderEgress({
-            publicEgressEnabled: locked.publicEgressEnabled,
-            providerPrimaryMemberCount: providerPrimary ? 1 : 0,
-          }) &&
-          !input.publicEgressAcknowledged
-        ) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: grantPoolAccessServerMessages.egressAcknowledgementRequired,
-          });
         }
         const grantee = await tx.user.findFirst({
           where: { email: { equals: input.email, mode: "insensitive" } },

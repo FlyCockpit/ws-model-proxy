@@ -26,6 +26,7 @@ const tokenSelection = {
   userId: true,
   name: true,
   scopeMode: true,
+  allowExternal: true,
   lookupPrefix: true,
   lastUsedAt: true,
   revokedAt: true,
@@ -36,6 +37,7 @@ const tokenSelection = {
       discoveredModelId: true,
       ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
+      includeExternal: true,
     },
   },
 } satisfies Prisma.ModelApiTokenSelect;
@@ -49,6 +51,8 @@ function serializeToken(row: TokenListRow) {
     updatedAt: row.updatedAt,
     name: row.name,
     scopeMode: String(row.scopeMode),
+    /** Human-set consent for `owner/pool:external`; false means private only. */
+    allowExternal: row.allowExternal,
     lookupPrefix: row.lookupPrefix,
     lastUsedAt: row.lastUsedAt,
     revokedAt: row.revokedAt,
@@ -64,6 +68,12 @@ function serializeToken(row: TokenListRow) {
       ).length,
       modelPoolIds: row.AllowlistEntries.flatMap((entry) =>
         entry.target === "MODEL_POOL" && entry.modelPoolId ? [entry.modelPoolId] : [],
+      ),
+      /** Allowlisted pools whose `:external` variant this token may use. */
+      externalModelPoolIds: row.AllowlistEntries.flatMap((entry) =>
+        entry.target === "MODEL_POOL" && entry.modelPoolId && entry.includeExternal
+          ? [entry.modelPoolId]
+          : [],
       ),
     },
   };
@@ -86,10 +96,9 @@ function serializeTargets(targets: VisibleModelTargets) {
       id: pool.modelId,
       name: pool.name,
       description: pool.description,
-      publicEgressEnabled: pool.publicEgressEnabled,
-      publicEgressAcknowledged: pool.publicEgressAcknowledged,
+      fallbackEnabled: pool.fallbackEnabled,
+      fallbackForGrantees: pool.fallbackForGrantees,
       effectiveProviderEgress: pool.effectiveProviderEgress,
-      providerPrimaryMemberCount: pool.providerPrimaryMemberCount,
       providerAccountLabels: pool.providerAccountLabels,
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
@@ -198,6 +207,77 @@ export const modelApiTokensRouter = {
         token: serializeToken(created),
         secret: rawSecret,
       };
+    }),
+
+  /**
+   * Human-only (excluded from MCP): whether this token may use
+   * `owner/pool:external`. ALL_VISIBLE tokens are all-or-nothing; ALLOWLIST
+   * tokens also choose which allowlisted pools include external providers.
+   * An agent must never be able to raise its own egress permission.
+   */
+  updateExternalAccess: protectedProcedure
+    .input(
+      z.object({
+        id: z.string().min(1),
+        allowExternal: z.boolean(),
+        /** ALLOWLIST tokens only: allowlisted pool ids that include external providers. */
+        externalModelPoolIds: z.array(z.string().min(1)).max(200).optional(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        // Canonical consent-row order (see lockExternalSendConsent): the token
+        // row before its allowlist entries. The E0 send-claim transaction holds
+        // token then entry FOR SHARE; taking the entries first here would let
+        // the two wait on each other. The lock is scoped to the caller's own
+        // token (`userId` never changes), so no caller can lock, and so stall,
+        // another user's token row.
+        await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        const existing = await tx.modelApiToken.findUnique({
+          where: { id: input.id, userId },
+          select: {
+            id: true,
+            userId: true,
+            revokedAt: true,
+            scopeMode: true,
+            AllowlistEntries: {
+              where: { target: "MODEL_POOL", modelPoolId: { not: null } },
+              select: { id: true, modelPoolId: true },
+            },
+          },
+        });
+        if (!existing || existing.userId !== userId || existing.revokedAt) {
+          throw new ORPCError("NOT_FOUND", { message: "Model API token not found." });
+        }
+        if (input.externalModelPoolIds !== undefined) {
+          if (existing.scopeMode !== "ALLOWLIST" && input.externalModelPoolIds.length > 0)
+            throw new ORPCError("BAD_REQUEST", {
+              message:
+                "All-visible tokens allow external providers for every pool or none; per-pool choices need an allowlist token.",
+            });
+          const allowlisted = new Set(existing.AllowlistEntries.map((entry) => entry.modelPoolId));
+          if (input.externalModelPoolIds.some((poolId) => !allowlisted.has(poolId)))
+            throw new ORPCError("BAD_REQUEST", {
+              message: "External access can only include pools on this token's allowlist.",
+            });
+          const included = new Set(input.externalModelPoolIds);
+          for (const entry of existing.AllowlistEntries) {
+            await tx.modelApiTokenAllowlistEntry.update({
+              where: { id: entry.id },
+              data: {
+                includeExternal: entry.modelPoolId !== null && included.has(entry.modelPoolId),
+              },
+            });
+          }
+        }
+        const updated = await tx.modelApiToken.update({
+          where: { id: existing.id },
+          data: { allowExternal: input.allowExternal },
+          select: tokenSelection,
+        });
+        return serializeToken(updated);
+      });
     }),
 
   revoke: protectedProcedure

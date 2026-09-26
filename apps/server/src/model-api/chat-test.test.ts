@@ -24,6 +24,7 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   authenticateModelApiTokenSecret: vi.fn(),
   listVisibleModelTargetsForUser: vi.fn(),
   listVisibleModelTargetsForToken: vi.fn(),
+  listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(),
 }));
 
 const { createChatTestRoutes } = await import("./chat-test.js");
@@ -180,10 +181,10 @@ const poolTarget: VisibleModelPoolTarget = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
-  publicEgressEnabled: false,
-  publicEgressAcknowledged: false,
+  fallbackEnabled: false,
+  fallbackForGrantees: false,
+  externalMemberCount: 0,
   effectiveProviderEgress: false,
-  providerPrimaryMemberCount: 0,
   providerAccountLabels: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
@@ -295,8 +296,8 @@ function poolMemberRow(native: "chat" | "responses" = "responses") {
 
 function publicOverflowPoolRow() {
   return {
-    publicEgressEnabled: true,
-    publicEgressAcknowledged: true,
+    fallbackEnabled: true,
+    fallbackForGrantees: false,
     PoolMembers: [
       {
         id: "provider-member-id",
@@ -506,8 +507,8 @@ describe("chat test routes", () => {
         {
           ...poolTarget,
           protocolAdaptationEnabled: true,
-          publicEgressEnabled: true,
-          publicEgressAcknowledged: true,
+          fallbackEnabled: true,
+          externalMemberCount: 1,
           recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
         },
       ],

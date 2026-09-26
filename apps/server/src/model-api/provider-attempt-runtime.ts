@@ -1,15 +1,14 @@
 import prisma from "@ws-model-proxy/db";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
+import { providerHealthCoolingDown } from "./provider-health-state.js";
 
 // The product spec requires bounded cooldown/half-open recovery but does not
 // prescribe a duration. Cap both local backoff and untrusted Retry-After at
 // five minutes so a provider response cannot disable a configured target
 // indefinitely; repeated failures re-enter the same bounded cooldown.
 export const PROVIDER_MAX_COOLDOWN_MS = 5 * 60_000;
-// A half-open claim is a lease, not a permanent latch. Provider attempts are
-// heartbeated every ten seconds, so one minute allows ample scheduling jitter
-// while guaranteeing recovery after a worker dies between claim and outcome.
-export const PROVIDER_HALF_OPEN_LEASE_MS = 60_000;
+export { PROVIDER_HALF_OPEN_LEASE_MS } from "./provider-health-state.js";
+
 const BASE_COOLDOWN_MS = 1_000;
 
 export type ProviderFailureClass =
@@ -161,15 +160,7 @@ export async function claimProviderHealthTrial(input: {
       return "COOLDOWN";
     const cooldowns = [account, model].filter((health) => health.healthNextRetryAt !== null);
     if (cooldowns.length === 0) return "READY";
-    const liveLeaseCutoff = new Date(now.getTime() - PROVIDER_HALF_OPEN_LEASE_MS);
-    if (
-      cooldowns.some(
-        (health) =>
-          health.healthNextRetryAt! > now ||
-          (health.healthHalfOpenAt !== null && health.healthHalfOpenAt > liveLeaseCutoff),
-      )
-    )
-      return "COOLDOWN";
+    if (cooldowns.some((health) => providerHealthCoolingDown(health, now))) return "COOLDOWN";
     await Promise.all([
       tx.providerAccount.update({
         where: { id: input.providerAccountId, userId: input.userId },

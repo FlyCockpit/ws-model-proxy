@@ -199,35 +199,35 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
   ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
 
+-- Fallback redesign: a pool's plain name never leaves the deployment.
+-- PRIMARY members are always local (discovered) models; provider models can
+-- only be PUBLIC_OVERFLOW (external fallback) members, which the runtime uses
+-- only for `owner/pool:external` requests with caller, token, and owner
+-- consent. The owner's fallback switch ("publicEgressEnabled", Prisma
+-- `fallbackEnabled`) is a runtime gate, not a membership precondition, so the
+-- owner can turn fallback off without deleting configured members. The legacy
+-- "publicEgressAcknowledged" column is no longer required anywhere.
 CREATE OR REPLACE FUNCTION enforce_pool_member_tier_source()
 RETURNS trigger LANGUAGE plpgsql AS $pool_member_tier_source$
 DECLARE
   target_kind "ExecutionTargetKind";
   target_owner TEXT;
   pool_owner TEXT;
-  public_enabled BOOLEAN;
-  public_ack BOOLEAN;
 BEGIN
   SELECT kind, "userId" INTO target_kind, target_owner
     FROM execution_target WHERE id = NEW."executionTargetId";
-  SELECT "userId", "publicEgressEnabled", "publicEgressAcknowledged"
-    INTO pool_owner, public_enabled, public_ack
+  SELECT "userId" INTO pool_owner
     FROM model_pool WHERE id = NEW."poolId";
   IF target_owner IS DISTINCT FROM pool_owner THEN
     RAISE EXCEPTION 'pool member target must have the same owner as its pool'
       USING ERRCODE = '23514';
   END IF;
-  IF NEW.tier = 'PRIMARY' AND target_kind NOT IN ('DISCOVERED_MODEL', 'PROVIDER_MODEL') THEN
-    RAISE EXCEPTION 'primary pool members must be discovered or provider models'
+  IF NEW.tier = 'PRIMARY' AND target_kind IS DISTINCT FROM 'DISCOVERED_MODEL' THEN
+    RAISE EXCEPTION 'primary pool members must be local discovered models; provider models belong to the external fallback tier'
       USING ERRCODE = '23514';
   END IF;
-  IF target_kind = 'PROVIDER_MODEL' AND NOT public_ack THEN
-    RAISE EXCEPTION 'provider pool members require explicit pool egress acknowledgement'
-      USING ERRCODE = '23514';
-  END IF;
-  IF NEW.tier = 'PUBLIC_OVERFLOW' AND
-     (target_kind IS DISTINCT FROM 'PROVIDER_MODEL' OR NOT public_enabled OR NOT public_ack) THEN
-    RAISE EXCEPTION 'public overflow requires an acknowledged public pool and provider target'
+  IF NEW.tier = 'PUBLIC_OVERFLOW' AND target_kind IS DISTINCT FROM 'PROVIDER_MODEL' THEN
+    RAISE EXCEPTION 'external fallback pool members must be provider models'
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -239,32 +239,60 @@ CREATE TRIGGER pool_member_tier_source
 BEFORE INSERT OR UPDATE OF "poolId", "executionTargetId", tier, "publicOrder" ON pool_member
 FOR EACH ROW EXECUTE FUNCTION enforce_pool_member_tier_source();
 
-CREATE OR REPLACE FUNCTION enforce_pool_public_disable()
-RETURNS trigger LANGUAGE plpgsql AS $pool_public_disable$
-BEGIN
-  IF NOT NEW."publicEgressAcknowledged" AND EXISTS (
-    SELECT 1 FROM pool_member member
-    JOIN execution_target target ON target.id = member."executionTargetId"
-    WHERE member."poolId" = NEW.id AND target.kind = 'PROVIDER_MODEL'
-  ) THEN
-    RAISE EXCEPTION 'remove provider members before revoking provider egress acknowledgement'
-      USING ERRCODE = '23514';
-  END IF;
-  IF NOT NEW."publicEgressEnabled" AND EXISTS (
-    SELECT 1 FROM pool_member
-     WHERE "poolId" = NEW.id AND tier = 'PUBLIC_OVERFLOW'
-  ) THEN
-    RAISE EXCEPTION 'remove public overflow members before disabling public egress'
-      USING ERRCODE = '23514';
-  END IF;
-  RETURN NEW;
-END;
-$pool_public_disable$;
-
+-- The former "remove members before disabling / revoking acknowledgement"
+-- rules are gone: disabling fallback keeps members configured and the runtime
+-- stops using them.
 DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool;
-CREATE TRIGGER model_pool_public_disable
-BEFORE UPDATE OF "publicEgressEnabled", "publicEgressAcknowledged" ON model_pool
-FOR EACH ROW EXECUTE FUNCTION enforce_pool_public_disable();
+DROP FUNCTION IF EXISTS enforce_pool_public_disable();
+
+-- Fallback redesign data step (idempotent; a no-op once applied). Provider
+-- PRIMARY members move to the external fallback tier, in this order:
+--   1. enable fallback on affected pools (callers must still opt in per
+--      request with `:external`, so this is less egress than before);
+--   2. assign each moved member a publicOrder after the pool's existing
+--      fallback members, unique per pool (weight desc, id);
+--   3. switch the tier in the same statement, so the tier shape check and the
+--      unique fallback order index hold for every row.
+UPDATE model_pool pool
+   SET "publicEgressEnabled" = TRUE
+ WHERE NOT pool."publicEgressEnabled"
+   AND EXISTS (
+     SELECT 1
+       FROM pool_member member
+       JOIN execution_target target ON target.id = member."executionTargetId"
+      WHERE member."poolId" = pool.id
+        AND member.tier = 'PRIMARY'
+        AND target.kind = 'PROVIDER_MODEL'
+   );
+
+WITH provider_primary AS (
+  SELECT member.id,
+         member."poolId",
+         row_number() OVER (
+           PARTITION BY member."poolId" ORDER BY member.weight DESC, member.id
+         ) AS position
+    FROM pool_member member
+    JOIN execution_target target ON target.id = member."executionTargetId"
+   WHERE member.tier = 'PRIMARY'
+     AND target.kind = 'PROVIDER_MODEL'
+), next_public_order AS (
+  SELECT provider_primary."poolId",
+         COALESCE((
+           SELECT MAX(existing."publicOrder") + 1
+             FROM pool_member existing
+            WHERE existing."poolId" = provider_primary."poolId"
+              AND existing.tier = 'PUBLIC_OVERFLOW'
+         ), 0) AS base
+    FROM provider_primary
+   GROUP BY provider_primary."poolId"
+)
+UPDATE pool_member member
+   SET tier = 'PUBLIC_OVERFLOW',
+       "publicOrder" = next_public_order.base + provider_primary.position - 1,
+       weight = 0
+  FROM provider_primary
+  JOIN next_public_order ON next_public_order."poolId" = provider_primary."poolId"
+ WHERE member.id = provider_primary.id;
 
 CREATE OR REPLACE FUNCTION enforce_model_pool_owner_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $model_pool_owner_immutable$
@@ -378,6 +406,7 @@ BEGIN
     OR NEW."providerUpstreamModelId" IS DISTINCT FROM OLD."providerUpstreamModelId"
     OR NEW."nativeSurface" IS DISTINCT FROM OLD."nativeSurface"
     OR NEW."upstreamResponseIdDigest" IS DISTINCT FROM OLD."upstreamResponseIdDigest"
+    OR NEW."fallbackRoute" IS DISTINCT FROM OLD."fallbackRoute"
   ) THEN
     RAISE EXCEPTION 'provider Responses binding is immutable' USING ERRCODE = '23514';
   END IF;
@@ -1156,13 +1185,6 @@ BEGIN
                 'PUBLIC_OVERFLOW'::"PoolMemberTier"
               )
          )
-         OR ((NOT pool."publicEgressEnabled" OR NOT pool."publicEgressAcknowledged")
-           AND EXISTS (
-             SELECT 1 FROM pool_member member
-              WHERE member."poolId" = record."targetModelPoolId"
-                AND member."executionTargetId" = record."selectedExecutionTargetId"
-                AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
-           ))
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
@@ -1199,6 +1221,37 @@ BEGIN
   END IF;
 END;
 $invalid_consumers$;
+
+-- Fallback redesign: a provider (external) Responses binding is honored only
+-- when the request that created it explicitly asked for `owner/pool:external`
+-- with caller consent. Version-3 bindings written before consent existed
+-- (provider-backed PRIMARY members and automatic overflow) are invalidated
+-- here; their follow-ups fail closed with "not found". Runs after the audit
+-- above so invalid rows still stop hardening for operator review. A no-op once
+-- applied: every new provider binding carries its route.
+DELETE FROM response_stickiness_record
+ WHERE "routingVersion" >= 3
+   AND "fallbackRoute" IS NULL;
+
+ALTER TABLE response_stickiness_record
+  DROP CONSTRAINT IF EXISTS response_stickiness_fallback_route_check;
+ALTER TABLE response_stickiness_record
+  ADD CONSTRAINT response_stickiness_fallback_route_check CHECK (
+    -- NULL-safe: a CHECK that evaluates to NULL passes, so a v3 row with a
+    -- NULL route must compare FALSE here, not NULL.
+    ("routingVersion" < 3 AND "fallbackRoute" IS NULL)
+    OR ("routingVersion" >= 3 AND "fallbackRoute" IS NOT DISTINCT FROM 'pool-external')
+  );
+
+ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_fallback_route_check;
+ALTER TABLE relay_request ADD CONSTRAINT relay_request_fallback_route_check CHECK (
+  "fallbackRoute" IS NULL OR "fallbackRoute" IN ('local', 'pool-external')
+);
+
+ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_external_after_wait_check;
+ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK (
+  "externalAfterWaitMs" BETWEEN 0 AND 600000
+);
 
 -- Canonicalize compatibility writes before uniqueness and consistency checks.
 -- This closes the mixed-representation hole where one row used only the
@@ -1443,19 +1496,8 @@ BEGIN
         RAISE EXCEPTION 'provider stickiness binding must match its exact account, model, target, pool, endpoint, and visibility graph'
           USING ERRCODE = '23514';
       END IF;
-      IF EXISTS (
-        SELECT 1
-          FROM pool_member member
-          JOIN model_pool provider_pool ON provider_pool.id = member."poolId"
-         WHERE member."poolId" = NEW."targetModelPoolId"
-           AND member."executionTargetId" = NEW."selectedExecutionTargetId"
-           AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
-           AND (NOT provider_pool."publicEgressEnabled"
-             OR NOT provider_pool."publicEgressAcknowledged")
-      ) THEN
-        RAISE EXCEPTION 'provider overflow stickiness requires acknowledged public egress'
-          USING ERRCODE = '23514';
-      END IF;
+      -- Whether the owner still allows external fallback is a runtime gate
+      -- (checked on every follow-up), not a binding-write invariant.
       IF NEW."modelApiTokenId" IS NOT NULL THEN
         SELECT "userId" INTO token_owner FROM model_api_token
          WHERE id = NEW."modelApiTokenId";

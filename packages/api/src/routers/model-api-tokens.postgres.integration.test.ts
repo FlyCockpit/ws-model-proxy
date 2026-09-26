@@ -123,13 +123,18 @@ integration("model API token allowlists with real PostgreSQL", () => {
     expect(entry.discoveredModelId).toBe(model.id);
     expect(entry.executionTargetId).toBe(executionTarget.id);
 
-    const targets = await modules.access.listVisibleModelTargetsForToken({
-      id: created.token.id,
-      userId: user.id,
-      scopeMode: "ALLOWLIST",
-    });
+    const { targets, externalPoolIds } =
+      await modules.access.listVisibleModelTargetsWithExternalPermissionForToken({
+        id: created.token.id,
+        userId: user.id,
+        scopeMode: "ALLOWLIST",
+        allowExternal: created.token.allowExternal,
+      });
     expect(targets.directModels.map((target) => target.id)).toEqual([model.id]);
     expect(targets.modelPools.map((target) => target.id)).toEqual([pool.id]);
+    // New tokens are private only until a person allows external providers.
+    expect(created.token.allowExternal).toBe(false);
+    expect([...externalPoolIds]).toEqual([]);
   });
 
   it("refuses model API token authentication after the owner is marked for deletion", async () => {
