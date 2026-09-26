@@ -35,9 +35,36 @@ const db = client as unknown as {
 };
 const NOW = new Date("2026-09-25T12:00:00.000Z");
 
-function row(id: string, attempts = 0) {
-  return { id, deletionGeneration: `generation-${id}`, deletionSweepAttempts: attempts };
+const REQUESTED = new Date("2026-09-25T11:00:00.000Z");
+
+function row(id: string, attempts = 0, requestedAt = REQUESTED) {
+  return {
+    id,
+    deletionGeneration: `generation-${id}`,
+    deletionSweepAttempts: attempts,
+    deletionRequestedAt: requestedAt,
+  };
 }
+
+/** The eligibility filter of the queue read at NOW (unchanged by the cursor). */
+const ELIGIBLE = {
+  deletionRequestedAt: {
+    not: null,
+    lte: new Date(NOW.getTime() - USER_DELETION_SWEEP_GRACE_MS),
+  },
+  deletionGeneration: { not: null },
+  OR: [{ deletionSweepNextAttemptAt: null }, { deletionSweepNextAttemptAt: { lte: NOW } }],
+};
+const QUEUE_READ = {
+  orderBy: [{ deletionRequestedAt: "asc" }, { id: "asc" }],
+  select: {
+    id: true,
+    deletionGeneration: true,
+    deletionSweepAttempts: true,
+    deletionRequestedAt: true,
+  },
+  take: USER_DELETION_SWEEP_BATCH,
+};
 
 describe("sweepPendingUserDeletions", () => {
   beforeEach(() => {
@@ -55,23 +82,78 @@ describe("sweepPendingUserDeletions", () => {
       abandoned: 0,
       failed: 0,
     });
-    expect(db.user.findMany).toHaveBeenCalledWith({
-      where: {
-        deletionRequestedAt: {
-          not: null,
-          lte: new Date(NOW.getTime() - USER_DELETION_SWEEP_GRACE_MS),
-        },
-        deletionGeneration: { not: null },
-        OR: [{ deletionSweepNextAttemptAt: null }, { deletionSweepNextAttemptAt: { lte: NOW } }],
-      },
-      orderBy: [
-        { deletionSweepNextAttemptAt: { sort: "asc", nulls: "first" } },
-        { deletionRequestedAt: "asc" },
-      ],
-      select: { id: true, deletionGeneration: true, deletionSweepAttempts: true },
-      take: USER_DELETION_SWEEP_BATCH,
-    });
+    // Round-robin order over the immutable key (deletionRequestedAt, id),
+    // from the oldest when the loop has no position yet.
+    expect(db.user.findMany).toHaveBeenCalledTimes(1);
+    expect(db.user.findMany).toHaveBeenCalledWith({ ...QUEUE_READ, where: ELIGIBLE });
     expect(complete).not.toHaveBeenCalled();
+  });
+
+  it("continues after the loop's position and wraps to the oldest on a short page (G2-01)", async () => {
+    const later = new Date(REQUESTED.getTime() + 1_000);
+    const queue = { after: { requestedAt: REQUESTED, userId: "b" } };
+    // After the cursor: c; the wrap from the oldest returns a, b, c again.
+    db.user.findMany
+      .mockResolvedValueOnce([row("c", 0, later)])
+      .mockResolvedValueOnce([row("a"), row("b"), row("c", 0, later)]);
+    const complete = vi.fn(async (_db: unknown, _userId: string, _generation: string) => false);
+    await sweepPendingUserDeletions({ prisma, now: NOW, complete, queue });
+    expect(db.user.findMany.mock.calls).toEqual([
+      [
+        {
+          ...QUEUE_READ,
+          where: {
+            AND: [
+              ELIGIBLE,
+              {
+                OR: [
+                  { deletionRequestedAt: { gt: REQUESTED } },
+                  { deletionRequestedAt: REQUESTED, id: { gt: "b" } },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+      [{ ...QUEUE_READ, where: ELIGIBLE }],
+    ]);
+    // Each user once, in round-robin order, and the position is the last one.
+    expect(complete.mock.calls.map((call) => call[1])).toEqual(["c", "a", "b"]);
+    expect(queue.after).toEqual({ requestedAt: REQUESTED, userId: "b" });
+  });
+
+  it("moves the position past the page even when every user and every recovery write fails (G2-01)", async () => {
+    const queue: { after?: { requestedAt: Date; userId: string } } = {};
+    db.user.findMany.mockResolvedValueOnce(
+      Array.from({ length: USER_DELETION_SWEEP_BATCH }, (_, index) => row(`u${index}`)),
+    );
+    db.$executeRaw.mockRejectedValue(
+      Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }),
+    );
+    const complete = vi.fn(async () => {
+      throw Object.assign(new Error("busy"), { code: "P2028" });
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await sweepPendingUserDeletions({ prisma, now: NOW, complete, queue });
+    } finally {
+      errors.mockRestore();
+    }
+    expect(queue.after).toEqual({
+      requestedAt: REQUESTED,
+      userId: `u${USER_DELETION_SWEEP_BATCH - 1}`,
+    });
+    // A full page needs no wrap read.
+    expect(db.user.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed queue read keeps the loop's position", async () => {
+    const queue = { after: { requestedAt: REQUESTED, userId: "b" } };
+    db.user.findMany.mockRejectedValueOnce(new Error("connect timeout"));
+    await expect(sweepPendingUserDeletions({ prisma, now: NOW, queue })).rejects.toThrow(
+      "connect timeout",
+    );
+    expect(queue.after).toEqual({ requestedAt: REQUESTED, userId: "b" });
   });
 
   it("completes each marked user, notifies deleted ones, and keeps transient failures", async () => {
@@ -376,6 +458,31 @@ describe("startUserDeletionSweep stop (SWEEPER-STOP)", () => {
     await stop();
     expect(sweep).toHaveBeenCalledTimes(1);
     expect(sweep.mock.calls[0]?.[0].prisma).toBe(prisma);
+  });
+
+  it("hands every tick the same queue position, starting from the oldest (G2-01)", async () => {
+    vi.useFakeTimers();
+    const empty: UserDeletionSweepResult = { deleted: 0, abandoned: 0, failed: 0 };
+    const queues: unknown[] = [];
+    const seen: unknown[] = [];
+    const sweep = vi.fn(async (options: { queue?: { after?: unknown } }) => {
+      queues.push(options.queue);
+      seen.push(options.queue?.after);
+      if (options.queue) options.queue.after = { tick: queues.length };
+      return empty;
+    });
+    const stop = startUserDeletionSweep({ prisma, intervalMs: 1_000, sweep });
+    try {
+      await vi.advanceTimersByTimeAsync(2_000);
+    } finally {
+      await stop();
+    }
+    expect(queues.length).toBeGreaterThanOrEqual(2);
+    expect(queues[0]).toBeDefined();
+    expect(new Set(queues).size).toBe(1);
+    // The first tick starts from the oldest; each later one sees the
+    // position the previous one left.
+    expect(seen).toEqual(queues.map((_, index) => (index === 0 ? undefined : { tick: index })));
   });
 
   // F2-07d: a tick that fails outright (its queue read could not connect)

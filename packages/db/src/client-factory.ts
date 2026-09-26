@@ -1,16 +1,21 @@
-/// <reference path="./pg.d.ts" />
 import { PrismaPg } from "@prisma/adapter-pg";
 import {
   Client,
+  type ClientBase,
   type ClientConfig,
-  type ConnectCallback,
-  Query,
-  type QueryCallback,
+  type QueryArrayConfig,
   type QueryConfig,
   type QueryResult,
   type Submittable,
 } from "pg";
 import { PrismaClient } from "../prisma/generated/client";
+import {
+  type PgConnectCallback,
+  PgInternalQuery,
+  type PgPoolRelease,
+  type PgQueryCallback,
+  type PgSubmittable,
+} from "./pg-internals";
 import {
   DbDispatchFenceError,
   isDbShutdownFenceArmed,
@@ -256,7 +261,7 @@ const TRANSACTION_END_TEXTS: ReadonlySet<string> = new Set(["COMMIT", "ROLLBACK"
  * only when its turn comes), and a returned Error fails the query without
  * writing anything, leaving the connection ready for the next query.
  */
-function fenceDispatch(query: Submittable & { readonly text?: string | undefined }): void {
+function fenceDispatch(query: PgSubmittable): void {
   const submit = query.submit;
   query.submit = (connection) => {
     if (
@@ -270,7 +275,7 @@ function fenceDispatch(query: Submittable & { readonly text?: string | undefined
 }
 
 /** pg's own test for a query object it runs as is (`Client#query`). */
-function isSubmittable(config: string | QueryConfig | Submittable): config is Submittable {
+function isSubmittable(config: string | QueryConfig | PgSubmittable): config is PgSubmittable {
   return typeof config === "object" && "submit" in config && typeof config.submit === "function";
 }
 
@@ -282,9 +287,9 @@ function isSubmittable(config: string | QueryConfig | Submittable): config is Su
  * a connect already started are not interrupted; the connection's
  * `statement_timeout` and the pool's connect timeout bound them.
  *
- * `query` builds pg's own {@link Query} for text and config calls (as
- * `Client#query` does) and gates its `submit`; submittables passed in are
- * gated the same way. The one difference from pg: a per-query
+ * `query` builds pg's own `Query` ({@link PgInternalQuery}) for text and
+ * config calls (as `Client#query` does) and gates its `submit`; submittables
+ * passed in are gated the same way. The one difference from pg: a per-query
  * `query_timeout` in a config object is not read (pg reads it off the object
  * it is given); nothing here sets one.
  *
@@ -306,7 +311,7 @@ function isSubmittable(config: string | QueryConfig | Submittable): config is Su
  */
 class DispatchFencedClient extends Client {
   readonly #pool: BoundedPoolState;
-  #poolRelease: ((error?: Error | boolean) => void) | undefined;
+  #poolRelease: PgPoolRelease | undefined;
 
   constructor(config: ClientConfig | undefined, pool: BoundedPoolState) {
     super(config);
@@ -323,11 +328,11 @@ class DispatchFencedClient extends Client {
    * pg-pool assigns `release` on every checkout (`_acquireClient`); the
    * setter keeps its function and the getter wraps it with the guard.
    */
-  set release(poolRelease: (error?: Error | boolean) => void) {
+  set release(poolRelease: PgPoolRelease) {
     this.#poolRelease = poolRelease;
   }
 
-  get release(): (error?: Error | boolean) => void {
+  get release(): PgPoolRelease {
     return (error?: Error | boolean) => {
       if (this.#poolRelease === undefined) {
         throw new Error("A statement-bounded connection was released outside its pool.");
@@ -348,9 +353,9 @@ class DispatchFencedClient extends Client {
     return this.readyForQuery === true && this.getTransactionStatus() === "I";
   }
 
-  override connect(): Promise<void>;
-  override connect(callback: ConnectCallback): void;
-  override connect(callback?: ConnectCallback): Promise<void> | undefined {
+  override connect(): Promise<Client>;
+  override connect(callback: PgConnectCallback): void;
+  override connect(callback?: PgConnectCallback): Promise<Client> | undefined {
     if (isDbShutdownFenceArmed() || this.#pool.quarantined) {
       // Never connects, so no "end" follows: stop tracking it here.
       this.#pool.untrack(this);
@@ -364,18 +369,22 @@ class DispatchFencedClient extends Client {
     return undefined;
   }
 
-  override query(config: string | QueryConfig, values?: readonly unknown[]): Promise<QueryResult>;
+  override query<T extends Submittable>(query: T): T;
+  override query(
+    config: string | QueryConfig | QueryArrayConfig,
+    values?: readonly unknown[],
+  ): Promise<QueryResult>;
+  override query(config: string | QueryConfig | QueryArrayConfig, callback: PgQueryCallback): void;
   override query(
     config: string | QueryConfig,
     values: readonly unknown[] | undefined,
-    callback: QueryCallback,
-  ): undefined;
-  override query<T extends Submittable>(query: T): T;
+    callback: PgQueryCallback,
+  ): void;
   override query(
-    config: string | QueryConfig | Submittable,
-    values?: readonly unknown[] | QueryCallback,
-    callback?: QueryCallback,
-  ): Promise<QueryResult> | Submittable | undefined {
+    config: string | QueryConfig | PgSubmittable,
+    values?: readonly unknown[] | PgQueryCallback,
+    callback?: PgQueryCallback,
+  ): Promise<QueryResult> | PgSubmittable | undefined {
     if (isSubmittable(config)) {
       // A submittable runs as given; its callback is attached the way pg does.
       if (config.callback === undefined) {
@@ -385,7 +394,7 @@ class DispatchFencedClient extends Client {
       fenceDispatch(config);
       return super.query(config);
     }
-    const query = new Query(config, values, callback);
+    const query = new PgInternalQuery(config, values, callback);
     fenceDispatch(query);
     if (query.callback !== undefined) {
       super.query(query);
@@ -417,7 +426,7 @@ class ConnectionNotIdleError extends Error {
  * transaction-local).
  */
 async function enforceSessionSettings(
-  client: Client,
+  client: ClientBase,
   { statementTimeoutMs, applicationName }: { statementTimeoutMs: number; applicationName: string },
 ) {
   await client.query(

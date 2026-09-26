@@ -988,25 +988,87 @@ export type PendingUserDeletion = {
   attempts: number;
 };
 
-/** Users with a recorded deletion intent older than `before`, fairest first. */
+/**
+ * Position of the sweep's round-robin over the marked users: the immutable
+ * sort key `(deletionRequestedAt, id)` of the last user it selected. It is a
+ * keyset bound only; the user it names need not exist any more (deleted,
+ * abandoned or marked again with a new `deletionRequestedAt`).
+ */
+export type UserDeletionSweepCursor = { requestedAt: Date; userId: string };
+
+/**
+ * Queue state of one sweep loop, owned by that loop and passed to each tick
+ * (in memory only; a new process starts from the beginning). An empty object
+ * starts from the oldest marked user.
+ */
+export type UserDeletionSweepQueue = { after?: UserDeletionSweepCursor };
+
+/**
+ * Eligible marked users (a recorded deletion intent older than `before`, with
+ * no unexpired backoff at `now`), round-robin: in `(deletionRequestedAt, id)`
+ * order starting strictly after `after`, wrapping to the oldest when fewer
+ * than `limit` remain after it (no user twice). `next` is the key of the last
+ * user selected, the `after` of the following call; it moves on whatever
+ * happens to the selected users, so every eligible user is selected within
+ * `ceil(eligible / limit)` calls even when completion and the backoff write
+ * both fail (a user row held locked by another session). A plain read: no
+ * row lock (no lock-order edge; ./capacity-lock-order.ts).
+ */
 export async function listPendingUserDeletions(
   db: Db,
-  { before, limit = 10, now = new Date() }: { before: Date; limit?: number; now?: Date },
-): Promise<PendingUserDeletion[]> {
-  const rows = await db.user.findMany({
-    where: {
-      deletionRequestedAt: { not: null, lte: before },
-      deletionGeneration: { not: null },
-      OR: [{ deletionSweepNextAttemptAt: null }, { deletionSweepNextAttemptAt: { lte: now } }],
+  {
+    before,
+    limit = 10,
+    now = new Date(),
+    after,
+  }: { before: Date; limit?: number; now?: Date; after?: UserDeletionSweepCursor },
+): Promise<{ pending: PendingUserDeletion[]; next: UserDeletionSweepCursor | undefined }> {
+  const eligible = {
+    deletionRequestedAt: { not: null, lte: before },
+    deletionGeneration: { not: null },
+    OR: [{ deletionSweepNextAttemptAt: null }, { deletionSweepNextAttemptAt: { lte: now } }],
+  };
+  const query = {
+    orderBy: [{ deletionRequestedAt: "asc" as const }, { id: "asc" as const }],
+    select: {
+      id: true,
+      deletionGeneration: true,
+      deletionSweepAttempts: true,
+      deletionRequestedAt: true,
     },
-    orderBy: [
-      { deletionSweepNextAttemptAt: { sort: "asc", nulls: "first" } },
-      { deletionRequestedAt: "asc" },
-    ],
-    select: { id: true, deletionGeneration: true, deletionSweepAttempts: true },
     take: limit,
+  };
+  const rows = await db.user.findMany({
+    ...query,
+    where: after
+      ? {
+          AND: [
+            eligible,
+            {
+              OR: [
+                { deletionRequestedAt: { gt: after.requestedAt } },
+                { deletionRequestedAt: after.requestedAt, id: { gt: after.userId } },
+              ],
+            },
+          ],
+        }
+      : eligible,
   });
-  return rows.flatMap((row) =>
+  if (after && rows.length < limit) {
+    // Wrap: the oldest users, up to the page size, skipping any already taken.
+    const taken = new Set(rows.map((row) => row.id));
+    const wrapped = await db.user.findMany({ ...query, where: eligible });
+    for (const row of wrapped) {
+      if (rows.length >= limit) break;
+      if (!taken.has(row.id)) rows.push(row);
+    }
+  }
+  const last = rows.at(-1);
+  const next =
+    last?.deletionRequestedAt != null
+      ? { requestedAt: last.deletionRequestedAt, userId: last.id }
+      : undefined;
+  const pending = rows.flatMap((row) =>
     row.deletionGeneration
       ? [
           {
@@ -1017,6 +1079,7 @@ export async function listPendingUserDeletions(
         ]
       : [],
   );
+  return { pending, next };
 }
 
 const SWEEP_BACKOFF_BASE_MS = 30_000;

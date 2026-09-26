@@ -18,7 +18,12 @@
  *    `abandonUserDeletion`), the fallback the refusal recommends;
  *  - transient failure, or a residual above the final-phase bound found by
  *    the in-transaction recount: logged, retried after an exponential backoff
- *    (per generation attempt count) so other pending users get a turn.
+ *    (per generation attempt count).
+ *
+ * Fairness: each tick takes the next page of eligible marked users in a
+ * round-robin over `(deletionRequestedAt, id)` (the loop's in-memory cursor,
+ * see {@link sweepPendingUserDeletions}), so no set of failing users, even
+ * ones whose backoff write fails too, keeps the others from their turn.
  *
  * Concurrency: a sweep and a request (or two replicas) completing the same
  * user interleave safely. Drain batches take rows with SKIP LOCKED, the
@@ -83,6 +88,7 @@ import {
   isPermanentParentDeletionFailure,
   listPendingUserDeletions,
   recordUserDeletionSweepFailure,
+  type UserDeletionSweepQueue,
 } from "@ws-model-proxy/db/parent-deletion";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import { runWithDeadline } from "./graceful-shutdown.js";
@@ -251,6 +257,17 @@ function logShutdownStop(): void {
  * {@link createUserDeletionSweepClient}; there is deliberately no default, so
  * no caller falls back to the shared client).
  *
+ * Queue: `queue` is the loop's round-robin position
+ * (`listPendingUserDeletions`): the tick selects up to
+ * {@link USER_DELETION_SWEEP_BATCH} eligible users after it, wrapping to the
+ * oldest, and moves it past them before completing any. So the page moves on
+ * whatever happens to its users, and users whose completion and recovery
+ * write both keep failing (their rows held locked by another session) cannot
+ * hold every later user back: each eligible user is attempted within
+ * `ceil(eligible / USER_DELETION_SWEEP_BATCH)` ticks. It defaults to a fresh
+ * position (the oldest first); {@link startUserDeletionSweep} keeps one per
+ * loop, in memory only.
+ *
  * Per-user isolation: a failure of one user's recovery write (the abandon or
  * the backoff; e.g. a statement timeout, 57014) is logged by class and the
  * tick goes on with the next user, unless shutdown began. The failed write
@@ -269,20 +286,27 @@ export async function sweepPendingUserDeletions({
   complete = completeUserDeletion,
   notify = notifyUserDeleted,
   shouldStop = () => false,
+  queue = {},
 }: {
   prisma: SweepPrisma;
   now?: Date;
+  /** Round-robin position of the loop, advanced by this tick. */
+  queue?: UserDeletionSweepQueue;
   complete?: typeof completeUserDeletion;
   notify?: (userId: string) => Promise<void>;
   /** True once shutdown began: no further user is started. */
   shouldStop?: () => boolean;
 }): Promise<UserDeletionSweepResult> {
   const result: UserDeletionSweepResult = { deleted: 0, abandoned: 0, failed: 0 };
-  const pending = await listPendingUserDeletions(prisma, {
+  const { pending, next } = await listPendingUserDeletions(prisma, {
     before: new Date(now.getTime() - USER_DELETION_SWEEP_GRACE_MS),
     limit: USER_DELETION_SWEEP_BATCH,
     now,
+    after: queue.after,
   });
+  // Advance before any completion: the next tick starts after this page
+  // whether or not any write below succeeds.
+  queue.after = next;
   // Every transition below acts on the generation this sweep selected: a
   // deletion abandoned and requested again meanwhile is left to its own
   // generation (completion returns false, abandon and backoff match nothing).
@@ -361,9 +385,12 @@ export function startUserDeletionSweep({
   let stopped = false;
   let inFlight: Promise<void> | null = null;
   let failedTicks = 0;
+  // Round-robin position of this loop (in memory; a restart begins again at
+  // the oldest marked user).
+  const queue: UserDeletionSweepQueue = {};
   const tick = async () => {
     try {
-      const result = await sweep({ prisma, shouldStop: () => stopped });
+      const result = await sweep({ prisma, shouldStop: () => stopped, queue });
       failedTicks = 0;
       if (result.deleted + result.abandoned > 0)
         console.log(

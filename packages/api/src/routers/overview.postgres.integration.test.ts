@@ -38,7 +38,11 @@ integration("overview metrics with real PostgreSQL", () => {
 
   afterAll(async () => {
     if (!prisma) return;
-    await prisma.user.deleteMany({ where: { id: { in: created } } });
+    // One user per statement: a single DELETE of an owner together with a
+    // requester of its rollups is row-order dependent (the
+    // usage_rollup_detach_requester trigger can re-insert history under the
+    // owner the same statement removed, failing the owner FK).
+    for (const id of created) await prisma.user.deleteMany({ where: { id } });
   });
 
   async function user(label: string) {

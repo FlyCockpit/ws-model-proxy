@@ -96,6 +96,8 @@ catalog:
   zod: ^4.6.5
   "@types/node": ^26.5.1
   "@types/ws": ^8.18.1
+  # Types for pg (packages/db); keep on the pg 8.x line of packages/db.
+  "@types/pg": ^8.23.1
   hono: ^4.13.7
   "@orpc/server": ^1.15.0
   "@orpc/openapi": ^1.15.0

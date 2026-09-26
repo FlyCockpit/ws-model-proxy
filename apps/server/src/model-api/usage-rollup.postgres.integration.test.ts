@@ -55,6 +55,19 @@ integration("usage rollups with real PostgreSQL", () => {
     });
   }
 
+  /**
+   * Cleanup: one user per DELETE statement. A single DELETE of a resource
+   * owner together with a requester of that owner's rollups is order
+   * dependent: the usage_rollup_detach_requester trigger of a requester row
+   * processed before the owner row re-inserts the history under the owner, whose
+   * row the same statement already removed, and fails the owner FK
+   * (usage_rollup_minute_ownerUserId_fkey). Production deletes one user per
+   * statement; separate statements are correct in any order.
+   */
+  async function deleteUsers(ids: string[]) {
+    for (const id of ids) await db.user.deleteMany({ where: { id } });
+  }
+
   function facts(overrides: Partial<import("./usage-rollup.js").RelayRollupRow> = {}) {
     return {
       id: "unused",
@@ -166,7 +179,7 @@ integration("usage rollups with real PostgreSQL", () => {
         errors: 0,
       });
     } finally {
-      await db.user.deleteMany({ where: { id: { in: [owner.id, grantee.id] } } });
+      await deleteUsers([owner.id, grantee.id]);
     }
   });
 
@@ -227,7 +240,7 @@ integration("usage rollups with real PostgreSQL", () => {
       expect(await db.usageRollupMinute.count({ where: { ownerUserId: owner.id } })).toBe(0);
       expect(await db.usageRollupHour.count({ where: { ownerUserId: owner.id } })).toBe(0);
     } finally {
-      await db.user.deleteMany({ where: { id: { in: [owner.id, requester.id, earlier.id] } } });
+      await deleteUsers([owner.id, requester.id, earlier.id]);
     }
   });
 

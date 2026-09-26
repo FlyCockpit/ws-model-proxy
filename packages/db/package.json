@@ -52,6 +52,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@types/pg": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
     "prisma": "^7.10.0",
     "typescript": "catalog:"

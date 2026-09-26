@@ -476,7 +476,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       expect(marked.deletionRequestedAt).not.toBeNull();
       expect(marked.banned).toBe(true);
       expect(await prisma.session.count({ where: { userId: g.user.id } })).toBe(0);
-      const pending = await deletion.listPendingUserDeletions(prisma, { before: new Date() });
+      const { pending } = await deletion.listPendingUserDeletions(prisma, {
+        before: new Date(),
+        limit: 1_000,
+      });
       const selected = pending.find((entry) => entry.userId === g.user.id);
       expect(selected?.generation).toBe(marked.deletionGeneration);
       // What the sweeper does on its next tick.
@@ -934,6 +937,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         data: { deletionRequestedAt: new Date(base + index * 1000) },
       });
     }
+    // The sweep below completes whatever it selects: only these two are due.
+    await hideOtherMarkers([blocked.user.id, next.user.id]);
     // A writer of the terminal request's execution rows (the cascade child).
     const held = await holdRowLock(
       `SELECT id FROM relay_execution_event WHERE id = '${event.id}' FOR SHARE`,
@@ -1270,28 +1275,327 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         data: { deletionRequestedAt: new Date(base + n * 1000) },
       });
     }
+    // Only this test's users are due: the sweep below completes for real
+    // whatever it selects, so it must not reach other tests' marked users.
+    await hideOtherMarkers(ids);
     const attempted = new Map<string, number>();
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const now = new Date();
+    const tick = () =>
+      sweepPendingUserDeletions({
+        prisma,
+        now,
+        complete: async (_db: unknown, id: string, generation: string) => {
+          if (!ids.includes(id)) throw new Error(`the sweep selected a foreign user ${id}`);
+          attempted.set(id, (attempted.get(id) ?? 0) + 1);
+          if (ids.slice(0, 10).includes(id)) {
+            throw Object.assign(new Error("injected timeout"), { code: "P2028" });
+          }
+          return deletion.completeUserDeletion(prisma, id, generation);
+        },
+        notify: async () => undefined,
+      });
     try {
-      for (let tick = 0; tick < 3; tick++) {
-        await sweepPendingUserDeletions({
-          prisma,
-          now: new Date(),
-          complete: async (_db: unknown, id: string, generation: string) => {
-            attempted.set(id, (attempted.get(id) ?? 0) + 1);
-            if (ids.slice(0, 10).includes(id)) {
-              throw Object.assign(new Error("injected timeout"), { code: "P2028" });
-            }
-            return deletion.completeUserDeletion(prisma, id, generation);
-          },
-          notify: async () => undefined,
-        });
-      }
+      for (let n = 0; n < 3; n++) await tick();
+      expect(attempted.get(ids[10])).toBeGreaterThanOrEqual(1);
     } finally {
       errors.mockRestore();
+      await retireMarkedUsers(ids);
     }
-    expect(attempted.get(ids[10])).toBeGreaterThanOrEqual(1);
     expect(await prisma.user.count({ where: { id: ids[10] } })).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // G2-01: the sweep's queue is a round-robin over the immutable key
+  // (deletionRequestedAt, id), so no page of failing users (not even one
+  // whose backoff writes fail too) holds back the users after it. Each test
+  // marks its users inside its own window before 1970, each older than the
+  // previous test's, and sweeps with `now` just past that window: every other
+  // fixture in this database is marked later, so only the test's own users are
+  // eligible. Leftovers are made not due afterwards.
+  // ---------------------------------------------------------------------------
+
+  let roundRobinWindows = 0;
+  /** Start of a fresh window, older than every earlier one. */
+  function roundRobinWindow(): number {
+    roundRobinWindows += 1;
+    return -1_000_000_000_000 - roundRobinWindows * 100_000_000;
+  }
+
+  /** The sweep's `now` that makes exactly the window's first `count` seconds eligible. */
+  async function roundRobinNow(base: number, count: number): Promise<Date> {
+    const { USER_DELETION_SWEEP_GRACE_MS } = await import(
+      "../../../../apps/server/src/user-deletion-sweep.js"
+    );
+    return new Date(base + count * 1000 + USER_DELETION_SWEEP_GRACE_MS);
+  }
+
+  /** A marked user with a chosen id and `deletionRequestedAt`. */
+  async function markedAt(id: string, at: Date) {
+    const { prisma, deletion } = required();
+    await prisma.user.create({
+      data: { id, name: "round-robin", email: `${id}@example.test`, slug: id, emailVerified: true },
+    });
+    const mark = await deletion.requestUserDeletion(prisma, id);
+    if (!mark) throw new Error("mark failed");
+    await prisma.user.update({ where: { id }, data: { deletionRequestedAt: at } });
+    return { id, generation: mark.generation };
+  }
+
+  /**
+   * A sweeping test's leftovers: still-marked users among `ids` become not
+   * due for every later sweep (none in these suites runs at 2099 or later).
+   */
+  async function retireMarkedUsers(ids: string[]) {
+    await required().observer.user.updateMany({
+      where: { id: { in: ids }, deletionRequestedAt: { not: null } },
+      data: { deletionSweepNextAttemptAt: new Date("2099-01-01T00:00:00.000Z") },
+    });
+  }
+
+  it("G2-01: a locked full page whose completion and recovery writes fail does not starve later users", async () => {
+    const { observer } = required();
+    const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
+    const base = roundRobinWindow();
+    const tag = crypto.randomUUID().replaceAll("-", "");
+    const ids: string[] = [];
+    for (let n = 0; n < 12; n++)
+      ids.push(
+        (await markedAt(`rrpage${tag}${String(n).padStart(2, "0")}`, new Date(base + n * 1000))).id,
+      );
+    const blocked = ids.slice(0, 10);
+    const healthy = ids.slice(10);
+    const now = await roundRobinNow(base, ids.length);
+    // Another session holds the ten oldest user rows: their drain's owner
+    // lock and their backoff UPDATE both time out, so nothing about them
+    // changes (the durable queue keys stay as they were).
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let locked!: () => void;
+    const isLocked = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const holding = observer.$transaction(
+      async (tx) => {
+        await tx.$queryRawUnsafe(
+          `SELECT id FROM "user" WHERE id IN (${blocked.map((id) => `'${id}'`).join(", ")}) ORDER BY id FOR UPDATE`,
+        );
+        locked();
+        await released;
+      },
+      { timeout: 300_000 },
+    );
+    await isLocked;
+    const handle = await productionSweepHandle();
+    const queue: import("@ws-model-proxy/db/parent-deletion").UserDeletionSweepQueue = {};
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const tick = () =>
+      sweep.sweepPendingUserDeletions({
+        prisma: handle.prisma,
+        now,
+        queue,
+        notify: async () => undefined,
+      });
+    try {
+      try {
+        await expect(tick()).resolves.toEqual({ deleted: 0, abandoned: 0, failed: 10 });
+        expect(await observer.user.count({ where: { id: { in: healthy } } })).toBe(2);
+        // Tick 2 continues after the page (then wraps to eight of the ten).
+        await expect(tick()).resolves.toEqual({ deleted: 2, abandoned: 0, failed: 8 });
+        expect(await observer.user.count({ where: { id: { in: healthy } } })).toBe(0);
+        // Every recovery write failed: no backoff was recorded for the ten.
+        const recoveryFailures = errors.mock.calls.filter(
+          (call) => call[0] === "[auth] user deletion sweep could not record the outcome:",
+        );
+        expect(recoveryFailures).toHaveLength(18);
+        expect(
+          await observer.user.count({
+            where: {
+              id: { in: blocked },
+              deletionSweepAttempts: 0,
+              deletionSweepNextAttemptAt: null,
+            },
+          }),
+        ).toBe(10);
+      } finally {
+        release();
+        await holding;
+      }
+      // Released: the next tick reaches all ten (nobody is skipped forever).
+      await expect(tick()).resolves.toEqual({ deleted: 10, abandoned: 0, failed: 0 });
+      expect(await observer.user.count({ where: { id: { in: ids } } })).toBe(0);
+    } finally {
+      errors.mockRestore();
+      release();
+      await handle.prisma.$disconnect();
+      await retireMarkedUsers(ids);
+    }
+  }, 240_000);
+
+  it("G2-01: a short page wraps to the oldest without repeating a user; a lone user is attempted every tick", async () => {
+    const { prisma } = required();
+    const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
+    const base = roundRobinWindow();
+    const tag = crypto.randomUUID().replaceAll("-", "");
+    const users = [];
+    for (const [n, letter] of ["a", "b", "c"].entries())
+      users.push(await markedAt(`rrwrap${tag}${letter}`, new Date(base + n * 1000)));
+    const [a, b, c] = users.map((user) => user.id);
+    const now = await roundRobinNow(base, users.length);
+    const ids = users.map((user) => user.id);
+    const attempted: string[] = [];
+    const complete = async (_db: unknown, id: string) => {
+      attempted.push(id);
+      return false;
+    };
+    const tick = async (queue: { after?: { requestedAt: Date; userId: string } }, at: Date) => {
+      attempted.length = 0;
+      await sweep.sweepPendingUserDeletions({ prisma, now: at, complete, queue });
+      return [...attempted];
+    };
+    try {
+      const queue: { after?: { requestedAt: Date; userId: string } } = {};
+      expect(await tick(queue, now)).toEqual([a, b, c]);
+      // Nothing after c: the page wraps, each user once.
+      expect(await tick(queue, now)).toEqual([a, b, c]);
+      queue.after = { requestedAt: new Date(base), userId: a! };
+      expect(await tick(queue, now)).toEqual([b, c, a]);
+      expect(queue.after).toEqual({ requestedAt: new Date(base), userId: a });
+
+      // A window older than a, b and c (made after them: `now` below
+      // excludes the newer window).
+      const lone = roundRobinWindow();
+      const loneUser = await markedAt(`rrlone${tag}`, new Date(lone));
+      ids.push(loneUser.id);
+      const loneNow = await roundRobinNow(lone, 1);
+      const loneQueue: { after?: { requestedAt: Date; userId: string } } = {};
+      for (let n = 0; n < 3; n++) expect(await tick(loneQueue, loneNow)).toEqual([loneUser.id]);
+    } finally {
+      await retireMarkedUsers(ids);
+    }
+  });
+
+  it("G2-01: users marked at the same instant are taken in id order", async () => {
+    const { prisma, deletion } = required();
+    const base = roundRobinWindow();
+    const tag = crypto.randomUUID().replaceAll("-", "");
+    const at = new Date(base);
+    // Created in reverse: the order is by id, not by insertion.
+    const ids = [];
+    for (const letter of ["c", "b", "a"]) ids.push((await markedAt(`rreq${tag}${letter}`, at)).id);
+    const [c, b, a] = ids;
+    const now = await roundRobinNow(base, 1);
+    const before = new Date(base + 1000);
+    try {
+      const first = await deletion.listPendingUserDeletions(prisma, { before, now });
+      expect(first.pending.map((entry) => entry.userId)).toEqual([a, b, c]);
+      expect(first.next).toEqual({ requestedAt: at, userId: c });
+      const second = await deletion.listPendingUserDeletions(prisma, {
+        before,
+        now,
+        after: { requestedAt: at, userId: a! },
+      });
+      expect(second.pending.map((entry) => entry.userId)).toEqual([b, c, a]);
+      expect(second.next).toEqual({ requestedAt: at, userId: a });
+    } finally {
+      await retireMarkedUsers(ids);
+    }
+  });
+
+  it.each(["deleted", "abandoned", "re-marked"] as const)(
+    "G2-01: a position at a user since %s still continues the round-robin",
+    async (change) => {
+      const { prisma, deletion } = required();
+      const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
+      const base = roundRobinWindow();
+      const tag = crypto.randomUUID().replaceAll("-", "");
+      const users = [];
+      for (const [n, letter] of ["a", "b", "c"].entries())
+        users.push(await markedAt(`rrgone${tag}${letter}`, new Date(base + n * 1000)));
+      const [a, b, c] = users;
+      const now = await roundRobinNow(base, 4);
+      const queue = { after: { requestedAt: new Date(base + 1000), userId: b!.id } };
+      let remarked: string | undefined;
+      if (change === "deleted") {
+        await expect(deletion.completeUserDeletion(prisma, b!.id, b!.generation)).resolves.toBe(
+          true,
+        );
+      } else {
+        await expect(deletion.abandonUserDeletion(prisma, b!.id, b!.generation)).resolves.toBe(
+          true,
+        );
+        if (change === "re-marked") {
+          const mark = await deletion.requestUserDeletion(prisma, b!.id);
+          remarked = mark?.generation;
+          // Marked again later: a new key, after c.
+          await prisma.user.update({
+            where: { id: b!.id },
+            data: { deletionRequestedAt: new Date(base + 3000) },
+          });
+        }
+      }
+      const attempted: Array<[string, string]> = [];
+      try {
+        await sweep.sweepPendingUserDeletions({
+          prisma,
+          now,
+          queue,
+          complete: async (_db: unknown, id: string, generation: string) => {
+            attempted.push([id, generation]);
+            return false;
+          },
+        });
+        expect(attempted).toEqual(
+          change === "re-marked"
+            ? [
+                [c!.id, c!.generation],
+                [b!.id, remarked],
+                [a!.id, a!.generation],
+              ]
+            : [
+                [c!.id, c!.generation],
+                [a!.id, a!.generation],
+              ],
+        );
+        expect(remarked).not.toBe(b!.generation);
+      } finally {
+        await retireMarkedUsers(users.map((user) => user!.id));
+      }
+    },
+  );
+
+  it("G2-01: a user whose backoff has not expired is not selected, not even by the wrap", async () => {
+    const { prisma, deletion } = required();
+    const base = roundRobinWindow();
+    const tag = crypto.randomUUID().replaceAll("-", "");
+    const waiting = await markedAt(`rrwait${tag}a`, new Date(base));
+    const due = await markedAt(`rrwait${tag}b`, new Date(base + 1000));
+    const now = await roundRobinNow(base, 2);
+    const before = new Date(base + 2000);
+    await prisma.user.update({
+      where: { id: waiting.id },
+      data: { deletionSweepNextAttemptAt: new Date(now.getTime() + 60_000) },
+    });
+    try {
+      const fromStart = await deletion.listPendingUserDeletions(prisma, { before, now });
+      expect(fromStart.pending.map((entry) => entry.userId)).toEqual([due.id]);
+      const wrapped = await deletion.listPendingUserDeletions(prisma, {
+        before,
+        now,
+        after: { requestedAt: new Date(base + 1000), userId: due.id },
+      });
+      expect(wrapped.pending.map((entry) => entry.userId)).toEqual([due.id]);
+      // Once expired it is due again.
+      const later = await deletion.listPendingUserDeletions(prisma, {
+        before,
+        now: new Date(now.getTime() + 60_000),
+      });
+      expect(later.pending.map((entry) => entry.userId)).toEqual([waiting.id, due.id]);
+    } finally {
+      await retireMarkedUsers([waiting.id, due.id]);
+    }
   });
 
   it("refuses unarchive while deletion is pending", async () => {
