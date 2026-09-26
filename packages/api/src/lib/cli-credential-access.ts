@@ -417,19 +417,32 @@ async function deleteCliDeviceInCapacityLockOrder({
  * Re-login reattaches: when the user already has a device with this slug, the
  * new credential joins that device (id, name, grants, pools, endpoints and
  * model ids are kept) and every other active credential of that device is
- * revoked. One transaction does all of it, in this order:
+ * revoked. One transaction does all of it, in the lock order the ordered
+ * user delete uses (device row at L0, user row at L7, then its cascade into
+ * `device_code` and the device's credentials; see
+ * @ws-model-proxy/db/capacity-lock-order), so the two never wait on each
+ * other in a cycle:
  *
- * 1. Consume the device code with a conditional delete (still approved, same
- *    user, unexpired). Exactly one row must go, so a code mints at most once even under
- *    concurrent exchanges (the loser blocks on the row lock, then deletes 0).
- * 2. Find or create the device. The upsert (a native `INSERT … ON CONFLICT
+ * 1. Find or create the device. The upsert (a native `INSERT … ON CONFLICT
  *    DO UPDATE`) takes the device row lock, so two logins for one slug (two
- *    different codes) run one after the other, whether or not the device
- *    existed before: the later one reattaches to the device and revokes the
- *    earlier one's credential. Last approved login wins; the earlier CLI
- *    already holds a revoked secret and its relay auth fails until it logs in
- *    again.
- * 3. Mint the credential, then revoke the device's other active credentials.
+ *    different codes, or two redeemers of one code) run one after the other,
+ *    whether or not the device existed before: the later one reattaches to
+ *    the device and revokes the earlier one's credential. Last approved
+ *    login wins; the earlier CLI already holds a revoked secret and its relay
+ *    auth fails until it logs in again.
+ * 2. Take the owner row FOR SHARE and refuse (FORBIDDEN, `access_denied`)
+ *    when a deletion is pending or a ban is active, the same rule every CLI
+ *    credential use applies (`userCredentialAccessBlocked`). FOR SHARE
+ *    conflicts with the deletion mark's UPDATE, so a mark either committed
+ *    before this read (refused here) or waits until the credential exists
+ *    (and then refuses its every use). A user row deleted meanwhile, or a
+ *    device upsert that fails on the user foreign key because the ordered
+ *    delete committed first, is the same refusal.
+ * 3. Consume the device code with a conditional delete (still approved, same
+ *    user, unexpired). Exactly one row must go, so a code mints at most once
+ *    even under concurrent exchanges (the loser waits on the device row, then
+ *    deletes 0 and rolls back its device touch).
+ * 4. Mint the credential, then revoke the device's other active credentials.
  *
  * The caller closes live relay sessions of the returned revoked ids after the
  * commit (`ContextServices.onCliCredentialsRevoked`). Manually created
@@ -517,52 +530,83 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
 
   const userId = row.userId;
   const secret = generateProductCredentialSecret("deviceCredential");
-  return prisma.$transaction(async (tx) => {
-    const consumed = await tx.deviceCode.deleteMany({
-      where: { id: row.id, status: "approved", userId, expiresAt: { gt: now } },
-    });
-    if (consumed.count !== 1) {
-      throw new ORPCError("NOT_FOUND", { message: "Device code not found." });
-    }
-
-    // Prisma runs this as one native `INSERT … ON CONFLICT ("userId", "slug")
-    // DO UPDATE`, so a concurrent first login of the same new slug never fails
-    // with a unique violation: it waits for the other transaction and then
-    // takes the update branch on the row it created.
-    const cliDevice = await tx.cliDevice.upsert({
-      where: { userId_slug: { userId, slug: boundSlug } },
-      create: { userId, slug: boundSlug },
-      // Nothing user-owned changes; the write takes the device row lock.
-      update: { updatedAt: now },
-      select: { id: true },
-    });
-    const created = await tx.cliDeviceCredential.create({
-      data: {
-        userId,
-        cliDeviceId: cliDevice.id,
-        lookupPrefix: credentialLookupPrefix(secret),
-        secretDigest: digestCliDeviceCredentialSecret(secret),
-      },
-      select: { id: true, userId: true },
-    });
-    const previous = await tx.cliDeviceCredential.findMany({
-      where: { cliDeviceId: cliDevice.id, revokedAt: null, id: { not: created.id } },
-      select: { id: true },
-    });
-    const revokedIds = previous.map((credential) => credential.id);
-    if (revokedIds.length > 0) {
-      await tx.cliDeviceCredential.updateMany({
-        where: { id: { in: revokedIds }, revokedAt: null },
-        data: { revokedAt: now },
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // Prisma runs this as one native `INSERT … ON CONFLICT ("userId", "slug")
+      // DO UPDATE`, so a concurrent first login of the same new slug never
+      // fails with a unique violation: it waits for the other transaction and
+      // then takes the update branch on the row it created.
+      const cliDevice = await tx.cliDevice.upsert({
+        where: { userId_slug: { userId, slug: boundSlug } },
+        create: { userId, slug: boundSlug },
+        // Nothing user-owned changes; the write takes the device row lock.
+        update: { updatedAt: now },
+        select: { id: true },
       });
-    }
+      // After the device row, before the code row (see the order above).
+      const owners = await tx.$queryRaw<
+        Array<{ banned: boolean | null; banExpires: Date | null; deletionRequestedAt: Date | null }>
+      >`
+        SELECT banned, "banExpires", "deletionRequestedAt" FROM "user"
+         WHERE id = ${userId}
+           FOR SHARE`;
+      const owner = owners[0];
+      if (!owner || userCredentialAccessBlocked(owner, new Date())) throw inactiveOwnerRefusal();
 
-    return {
-      credentialId: created.id,
-      userId: created.userId,
-      cliDeviceId: cliDevice.id,
-      secret,
-      revoked: { kind: "deviceCredential" as const, ids: revokedIds },
-    };
+      const consumed = await tx.deviceCode.deleteMany({
+        where: { id: row.id, status: "approved", userId, expiresAt: { gt: now } },
+      });
+      if (consumed.count !== 1) {
+        throw new ORPCError("NOT_FOUND", { message: "Device code not found." });
+      }
+
+      const created = await tx.cliDeviceCredential.create({
+        data: {
+          userId,
+          cliDeviceId: cliDevice.id,
+          lookupPrefix: credentialLookupPrefix(secret),
+          secretDigest: digestCliDeviceCredentialSecret(secret),
+        },
+        select: { id: true, userId: true },
+      });
+      const previous = await tx.cliDeviceCredential.findMany({
+        where: { cliDeviceId: cliDevice.id, revokedAt: null, id: { not: created.id } },
+        select: { id: true },
+      });
+      const revokedIds = previous.map((credential) => credential.id);
+      if (revokedIds.length > 0) {
+        await tx.cliDeviceCredential.updateMany({
+          where: { id: { in: revokedIds }, revokedAt: null },
+          data: { revokedAt: now },
+        });
+      }
+
+      return {
+        credentialId: created.id,
+        userId: created.userId,
+        cliDeviceId: cliDevice.id,
+        secret,
+        revoked: { kind: "deviceCredential" as const, ids: revokedIds },
+      };
+    });
+  } catch (error) {
+    // The ordered user delete committed first: the device upsert found no
+    // user row for its foreign key.
+    if (isForeignKeyViolation(error)) {
+      throw inactiveOwnerRefusal();
+    }
+    throw error;
+  }
+}
+
+function isForeignKeyViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && Reflect.get(error, "code") === "P2003";
+}
+
+/** The approving account is being deleted, is banned, or is gone. */
+function inactiveOwnerRefusal(): ORPCError<"FORBIDDEN", { deviceFlowError: DeviceFlowError }> {
+  return new ORPCError("FORBIDDEN", {
+    message: "The account that approved this login is not active.",
+    data: deviceFlowErrorData("access_denied"),
   });
 }

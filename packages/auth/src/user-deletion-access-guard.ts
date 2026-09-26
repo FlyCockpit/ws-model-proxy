@@ -22,11 +22,14 @@
  * ban and lets the session through. So the contract is enforced at the
  * consumers:
  * - session creation: {@link refuseSessionForDeletingUser} (every session
- *   mint: sign-in, impersonation; the device-code exchange mints a
- *   `cli_device_credential`, not a session);
+ *   mint: sign-in, impersonation);
  * - MCP admission, CLI credentials, model API tokens, relay registration and
  *   CLI command admission: `userCredentialAccessBlocked` in
- *   `@ws-model-proxy/db/user-deletion-access`.
+ *   `@ws-model-proxy/db/user-deletion-access`;
+ * - the device-code exchange (it mints a `cli_device_credential`, not a
+ *   session): the same rule, read FOR SHARE inside its transaction
+ *   (`mintCliDeviceCredentialFromApprovedDeviceCode`), so a mark committed
+ *   first refuses it and a later mark waits for it.
  *
  * As defense in depth (not the proof: the check below and the route's write
  * are separate statements) the admin routes that would restore or reshape a

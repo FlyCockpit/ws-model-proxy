@@ -17,3 +17,14 @@ export const TERMINAL_BROWSER_JSON_WINDOW_MS = 10_000;
  * it, and sends it again on the next socket.
  */
 export const TERMINAL_BROWSER_JSON_BUDGET = 16;
+
+/**
+ * Accepted text frames one browser socket may have waiting or running on the
+ * relay at once. At least {@link TERMINAL_BROWSER_JSON_BUDGET}, so everything
+ * a browser may send in one window is queued and answered even when the
+ * network delivers it in one burst. Only a non-conforming client, or relay
+ * handlers that fall a whole window behind, can pass it; such a frame is
+ * answered `rate_limited` (refused unread: the browser sends it again) and
+ * the frames accepted before it run on. The socket is not closed.
+ */
+export const TERMINAL_BROWSER_TEXT_PENDING_LIMIT = TERMINAL_BROWSER_JSON_LIMIT;

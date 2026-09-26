@@ -50,6 +50,7 @@ const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
   cliToken: {
     findUnique: MockInstance;
     findMany: MockInstance;
@@ -89,6 +90,10 @@ describe("cliCredentialAccess", () => {
     );
     db.deviceCode.deleteMany.mockResolvedValue({ count: 1 });
     db.cliDevice.upsert.mockResolvedValue({ id: "cli-device-id" });
+    // The FOR SHARE read of the approving owner: active, no deletion pending.
+    db.$queryRaw.mockResolvedValue([
+      { banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
     db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-id", userId: "user-id" });
     db.cliDeviceCredential.findMany.mockResolvedValue([]);
     db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
@@ -315,6 +320,10 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     );
     db.deviceCode.deleteMany.mockResolvedValue({ count: 1 });
     db.cliDevice.upsert.mockResolvedValue({ id: "cli-device-id" });
+    // The FOR SHARE read of the approving owner: active, no deletion pending.
+    db.$queryRaw.mockResolvedValue([
+      { banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
     db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-id", userId: "user-id" });
     db.cliDeviceCredential.findMany.mockResolvedValue([]);
     db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
@@ -407,7 +416,7 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     expect(result.revoked).toEqual({ kind: "deviceCredential", ids: ["old-1", "old-2"] });
   });
 
-  it("consumes the code conditionally, first, inside one transaction", async () => {
+  it("takes the device, then the owner row, then consumes the code, inside one transaction", async () => {
     db.deviceCode.findUnique.mockResolvedValue(approvedRow());
     db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "old-1" }]);
 
@@ -422,13 +431,22 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
         expiresAt: { gt: now },
       },
     });
-    const order = [
-      db.deviceCode.deleteMany,
+    // The ordered user delete's order: device (L0), user (L7), then the
+    // cascade into device_code and credentials.
+    const ordered = [
       db.cliDevice.upsert,
+      db.$queryRaw,
+      db.deviceCode.deleteMany,
       db.cliDeviceCredential.create,
       db.cliDeviceCredential.updateMany,
-    ].map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
+    ];
+    // Every call must exist before comparing indices: an absent call maps to
+    // Number.NaN and would silently satisfy (or silently break) the sort check.
+    for (const mock of ordered) expect(mock).toHaveBeenCalledTimes(1);
+    const order = ordered.map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
     expect(order).toEqual([...order].sort((a, b) => a - b));
+    const ownerRead = db.$queryRaw.mock.calls[0]?.[0] as TemplateStringsArray;
+    expect(ownerRead.join("?")).toMatch(/FROM "user"[\s\S]*FOR SHARE/);
   });
 
   it("mints nothing when a concurrent exchange consumed the code first", async () => {
@@ -440,9 +458,46 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
       expect(error.data).toBeUndefined();
       return true;
     });
-    expect(db.cliDevice.upsert).not.toHaveBeenCalled();
+    // The device upsert ran first and rolls back with the transaction.
     expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
     expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a deletion is pending", [{ banned: true, banExpires: null, deletionRequestedAt: now }]],
+    [
+      "an unbanned row still carries the marker",
+      [{ banned: false, banExpires: null, deletionRequestedAt: now }],
+    ],
+    [
+      "an indefinite ban is active",
+      [{ banned: true, banExpires: null, deletionRequestedAt: null }],
+    ],
+    ["the owner row is gone", []],
+  ])("refuses with access_denied when %s, before consuming the code", async (_label, rows) => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.$queryRaw.mockResolvedValue(rows);
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ deviceFlowError: "access_denied" });
+      return true;
+    });
+    expect(db.deviceCode.deleteMany).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses with access_denied when the owner was deleted before the device upsert", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.$transaction.mockRejectedValue(
+      Object.assign(new Error("Foreign key constraint violated"), { code: "P2003" }),
+    );
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ deviceFlowError: "access_denied" });
+      return true;
+    });
   });
 
   it("rejects an exchange for a slug other than the approved one", async () => {
@@ -609,14 +664,18 @@ describe("deleteCliDeviceAndCredentials", () => {
       userId: "user-id",
       cliDeviceIds: ["cli-device-id"],
     });
-    const order = [
+    const orderedMocks = [
       prepareParentDeletion,
       db.cliDevice.updateMany,
       db.cliDeviceCredential.findMany,
       db.cliToken.updateMany,
       lockCapacityGraphForDelete,
       db.cliDevice.delete,
-    ].map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
+    ];
+    // Every call must exist before comparing indices: an absent call maps to
+    // Number.NaN and would silently satisfy (or silently break) the sort check.
+    for (const mock of orderedMocks) expect(mock).toHaveBeenCalledTimes(1);
+    const order = orderedMocks.map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     expect(result.revoked).toEqual([
       { kind: "deviceCredential", ids: ["device-credential-1"] },

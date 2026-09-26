@@ -10,6 +10,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     | {
         prisma: typeof import("@ws-model-proxy/db").default;
         access: typeof import("./cli-credential-access");
+        deletion: typeof import("@ws-model-proxy/db/parent-deletion");
       }
     | undefined;
   let blocker: ReturnType<typeof import("@ws-model-proxy/db/client-factory").createPrismaClient>;
@@ -21,12 +22,13 @@ integration("device-code exchange with real PostgreSQL", () => {
     process.env.NODE_ENV = "test";
     process.env.BETTER_AUTH_SECRET = "test-better-auth-secret-at-least-thirty-two";
     process.env.BETTER_AUTH_URL = "https://proxy.example.test";
-    const [db, dbFactory, access] = await Promise.all([
+    const [db, dbFactory, access, deletion] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/client-factory"),
       import("./cli-credential-access"),
+      import("@ws-model-proxy/db/parent-deletion"),
     ]);
-    modules = { prisma: db.default, access };
+    modules = { prisma: db.default, access, deletion };
     blocker = dbFactory.createPrismaClient(databaseUrl);
     observer = dbFactory.createPrismaClient(databaseUrl);
   });
@@ -79,6 +81,8 @@ integration("device-code exchange with real PostgreSQL", () => {
     id: string,
     operations: Array<() => Promise<T>>,
   ): Promise<PromiseSettledResult<T>[]> {
+    // Waiters are counted on either table: an operation queued behind another
+    // one's device row waits there, not on `table`.
     let release: (() => void) | undefined;
     let reportLocked: (() => void) | undefined;
     const released = new Promise<void>((resolve) => {
@@ -108,7 +112,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         FROM pg_stat_activity
         WHERE datname = current_database()
           AND wait_event_type = 'Lock'
-          AND query ILIKE ${`%${table}%`}
+          AND (query ILIKE '%device_code%' OR query ILIKE '%cli_device%')
       `;
       waiters = Number(rows[0]?.count ?? 0n);
     }
@@ -120,6 +124,8 @@ integration("device-code exchange with real PostgreSQL", () => {
     return outcomes;
   }
 
+  // Exchanges take the device row before the code row (the ordered user
+  // delete's order), so the second redeemer may wait on either.
   it("mints once when two exchanges race for one approved code", async () => {
     const { prisma, access } = required();
     const user = await createUser();
@@ -329,5 +335,248 @@ integration("device-code exchange with real PostgreSQL", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(await prisma.deviceCode.count({ where: { deviceCode } })).toBe(1);
     expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+  });
+  async function deadlocks(): Promise<number> {
+    const rows = await observer.$queryRaw<Array<{ deadlocks: bigint }>>`
+      SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`;
+    return Number(rows[0]?.deadlocks ?? 0n);
+  }
+
+  async function lockWaiters(pattern: string): Promise<number> {
+    const rows = await observer.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(*)::bigint AS count FROM pg_stat_activity
+       WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE ${pattern}`;
+    return Number(rows[0]?.count ?? 0n);
+  }
+
+  /** Resolves once `pattern` waits on a lock or `settled` settles, whichever is first. */
+  async function waitingOrSettled(pattern: string, settled: Promise<unknown>): Promise<void> {
+    let done = false;
+    void settled.finally(() => {
+      done = true;
+    });
+    for (let attempt = 0; attempt < 500 && !done; attempt++) {
+      if ((await lockWaiters(pattern)) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  function outcome<T>(work: Promise<T>) {
+    return work.then(
+      (value) => ({ ok: true as const, value }),
+      (error: { code?: string; data?: { deviceFlowError?: string } }) => ({
+        ok: false as const,
+        code: error.code,
+        deviceFlowError: error.data?.deviceFlowError,
+        error,
+      }),
+    );
+  }
+
+  /**
+   * Pauses, inside the exchange's transaction, right after `event` on
+   * `table` for this test's rows (a disposable trigger waiting on an
+   * advisory lock that `blocker` holds). Removed by `drop()`.
+   */
+  async function pauseAfter(
+    table: "device_code" | "cli_device",
+    event: "DELETE" | "INSERT",
+    userId: string,
+    key: number,
+  ) {
+    const { prisma } = required();
+    const name = `p16_pause_${table}_${event.toLowerCase()}`;
+    const row = event === "DELETE" ? "OLD" : "NEW";
+    await prisma.$executeRawUnsafe(
+      `CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $f$
+       BEGIN
+         IF ${row}."userId" = '${userId}' THEN
+           PERFORM set_config('deadlock_timeout', '100ms', true);
+           PERFORM pg_advisory_xact_lock(${key});
+         END IF;
+         RETURN ${row};
+       END $f$`,
+    );
+    await prisma.$executeRawUnsafe(
+      `CREATE TRIGGER ${name} AFTER ${event} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${name}()`,
+    );
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held!: () => void;
+    const isHeld = new Promise<void>((resolve) => {
+      held = resolve;
+    });
+    const holding = blocker.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(${key})`);
+        held();
+        await released;
+      },
+      { timeout: 30_000 },
+    );
+    await isHeld;
+    return {
+      release: async () => {
+        release();
+        await holding;
+      },
+      drop: async () => {
+        release();
+        await holding.catch(() => undefined);
+        await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS ${name} ON ${table}`);
+        await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${name}()`);
+      },
+    };
+  }
+
+  it("refuses an exchange for an account marked for deletion (f1-F1)", async () => {
+    const { prisma, access, deletion } = required();
+    const user = await createUser();
+    const deviceCode = await approvedCode(user.id, "marked-login");
+    await deletion.requestUserDeletion(prisma, user.id);
+
+    await expect(
+      access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "marked-login" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", data: { deviceFlowError: "access_denied" } });
+    expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+    expect(await prisma.cliDeviceCredential.count({ where: { userId: user.id } })).toBe(0);
+  });
+
+  it("an exchange racing the ordered delete of its marked user: no deadlock, a typed refusal (F2-04)", async () => {
+    const { prisma, access, deletion } = required();
+    const user = await createUser();
+    await prisma.cliDevice.create({ data: { userId: user.id, slug: "delete-race" } });
+    const deviceCode = await approvedCode(user.id, "delete-race");
+    const mark = await deletion.requestUserDeletion(prisma, user.id);
+    const before = await deadlocks();
+    // Where the pre-fix exchange held the code row while it went for the device.
+    const pause = await pauseAfter("device_code", "DELETE", user.id, 16_004_001);
+    try {
+      const login = outcome(
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({
+          deviceCode,
+          cliSlug: "delete-race",
+        }),
+      );
+      await waitingOrSettled("%device_code%", login);
+      const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
+      await waitingOrSettled('%DELETE FROM "public"."user"%', deleting);
+      await pause.release();
+      const [loginResult, deleteResult] = await Promise.all([login, deleting]);
+
+      expect(deleteResult).toEqual({ ok: true, value: true });
+      expect(loginResult).toMatchObject({
+        ok: false,
+        code: "FORBIDDEN",
+        deviceFlowError: "access_denied",
+      });
+      expect(await deadlocks()).toBe(before);
+      expect(await prisma.user.count({ where: { id: user.id } })).toBe(0);
+      expect(await prisma.cliDeviceCredential.count({ where: { userId: user.id } })).toBe(0);
+    } finally {
+      await pause.drop();
+    }
+  });
+
+  it("an exchange in flight when the user is marked finishes first; the delete then removes it (F2-04)", async () => {
+    const { prisma, access, deletion } = required();
+    const user = await createUser();
+    await prisma.cliDevice.create({ data: { userId: user.id, slug: "mark-race" } });
+    const deviceCode = await approvedCode(user.id, "mark-race");
+    const before = await deadlocks();
+    const pause = await pauseAfter("device_code", "DELETE", user.id, 16_004_002);
+    try {
+      const login = outcome(
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "mark-race" }),
+      );
+      await waitingOrSettled("%device_code%", login);
+      // The exchange holds the device and has read the owner FOR SHARE: the
+      // mark waits for it instead of deleting around it.
+      const deleting = outcome(deletion.deleteUserDurably(prisma, user.id));
+      await waitingOrSettled('%UPDATE "user"%', deleting);
+      await pause.release();
+      const [loginResult, deleteResult] = await Promise.all([login, deleting]);
+
+      expect(loginResult.ok).toBe(true);
+      expect(deleteResult).toEqual({ ok: true, value: "deleted" });
+      expect(await deadlocks()).toBe(before);
+      expect(await prisma.cliDeviceCredential.count({ where: { userId: user.id } })).toBe(0);
+      expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+    } finally {
+      await pause.drop();
+    }
+  });
+
+  it("a first login inserting its device while the ordered delete waits on the user row (F2-04)", async () => {
+    const { prisma, access, deletion } = required();
+    const user = await createUser();
+    const deviceCode = await approvedCode(user.id, "new-slug-race");
+    const mark = await deletion.requestUserDeletion(prisma, user.id);
+    const before = await deadlocks();
+    // After the device insert and its foreign-key check (FOR KEY SHARE on the
+    // user), before the exchange's own FOR SHARE read of the user row.
+    const pause = await pauseAfter("cli_device", "INSERT", user.id, 16_004_003);
+    try {
+      const login = outcome(
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({
+          deviceCode,
+          cliSlug: "new-slug-race",
+        }),
+      );
+      await waitingOrSettled("%cli_device%", login);
+      const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
+      await waitingOrSettled('%FROM "user"%', deleting);
+      await pause.release();
+      const [loginResult, deleteResult] = await Promise.all([login, deleting]);
+
+      expect(loginResult).toMatchObject({
+        ok: false,
+        code: "FORBIDDEN",
+        deviceFlowError: "access_denied",
+      });
+      expect(deleteResult).toEqual({ ok: true, value: true });
+      expect(await deadlocks()).toBe(before);
+      expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+    } finally {
+      await pause.drop();
+    }
+  });
+  it("an exchange arriving while the ordered delete holds its device: no deadlock, a typed refusal (F2-04)", async () => {
+    const { prisma, access, deletion } = required();
+    const user = await createUser();
+    await prisma.cliDevice.create({ data: { userId: user.id, slug: "delete-first" } });
+    const deviceCode = await approvedCode(user.id, "delete-first");
+    const mark = await deletion.requestUserDeletion(prisma, user.id);
+    const before = await deadlocks();
+    // Inside the ordered delete's cascade: it holds the device (L0), the user
+    // row (L7) and is deleting the device.
+    const pause = await pauseAfter("cli_device", "DELETE", user.id, 16_004_004);
+    try {
+      const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
+      await waitingOrSettled('%DELETE FROM "public"."user"%', deleting);
+      const login = outcome(
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({
+          deviceCode,
+          cliSlug: "delete-first",
+        }),
+      );
+      await waitingOrSettled("%cli_device%", login);
+      await pause.release();
+      const [loginResult, deleteResult] = await Promise.all([login, deleting]);
+
+      expect(deleteResult).toEqual({ ok: true, value: true });
+      // The upsert waited for the device, then found no user for its foreign key.
+      expect(loginResult).toMatchObject({
+        ok: false,
+        code: "FORBIDDEN",
+        deviceFlowError: "access_denied",
+      });
+      expect(await deadlocks()).toBe(before);
+      expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+    } finally {
+      await pause.drop();
+    }
   });
 });

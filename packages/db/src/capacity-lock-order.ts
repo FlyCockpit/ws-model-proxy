@@ -65,13 +65,34 @@
  * (schema-hardening.sql) reads the session owner's `user` row FOR SHARE on
  * every session INSERT (DEL-STATE commit point). A session inserter holds no
  * capacity lock and takes none afterwards, so its waits (on a deletion mark,
- * an L7 user lock or another user writer) close no cycle. The static guard
- * (apps/server/src/model-api/capacity/lock-order.test.ts) lists it as the one
+ * an L7 user lock or another user writer) close no cycle. Two more
+ * transactions outside the capacity domain take the user row FOR SHARE:
+ *
+ * - A user-deletion drain batch (./parent-deletion.ts,
+ *   `runParentDeletionDrainBatch`) takes it first, on its deletion
+ *   generation, then only history rows with SKIP LOCKED and their cascades,
+ *   every statement bounded by a transaction-local `statement_timeout` (and
+ *   every lock wait by the lower `lock_timeout`). It never waits on an L0-L6
+ *   lock, so the ordered user delete (L0-L6, then this row FOR UPDATE)
+ *   waiting on it closes no cycle.
+ * - The CLI device-code exchange
+ *   (packages/api/src/lib/cli-credential-access.ts) takes it after the
+ *   device row and before the device-code row, the order the ordered user
+ *   delete uses (device at L0, user at L7, then its cascade into
+ *   `device_code` and the device credentials).
+ *
+ * The user-row writers that wait while holding the row (the deletion mark
+ * and archive, each then deleting session rows; the ordered delete's
+ * cascade) never hold a row either transaction waits on first. The static
+ * guard (apps/server/src/model-api/capacity/lock-order.test.ts) lists every
  * reviewed FOR SHARE site.
  */
 import type { PrismaClient } from "../prisma/generated/client";
 import { Prisma } from "../prisma/generated/client";
-import { assertFinalPhaseResidualWithinBound } from "./parent-deletion-residual";
+import {
+  assertFinalPhaseResidualWithinBound,
+  ParentDeletionOwnerRequiredError,
+} from "./parent-deletion-residual";
 
 type Tx = Prisma.TransactionClient;
 
@@ -272,7 +293,11 @@ export async function lockCrossCapacityAdmissionRequests(
  * (the model-API routes' attempt start/finalization transactions and relay
  * telemetry recovery) write attempt, event and relay rows and take no
  * admission or capacity lock, so the wait does not close a cycle with an
- * admitter. It is the same wait retention had at HEAD.
+ * admitter. It is the same wait retention had at HEAD. The parent-deletion
+ * drain runs this in a batch with transaction-local `lock_timeout` and
+ * `statement_timeout`, so there the wait is bounded in time (the statement
+ * bound covers a cascade that waits on several rows in turn, which the
+ * per-lock bound alone does not).
  */
 export async function deleteTerminalRelayRequestsWithoutWaiting(
   tx: Tx,
@@ -558,9 +583,7 @@ export async function lockCapacityGraphForDelete(
     )}) ORDER BY id FOR UPDATE`;
   if (scope.wholeUser) {
     const generation = scope.userDeletionGeneration;
-    if (generation === undefined) {
-      throw new Error("A whole-user delete must name the deletion generation it owns.");
-    }
+    if (generation === undefined) throw new ParentDeletionOwnerRequiredError();
     // lock-order:L7 — the user row is taken last, after every capacity lock.
     // From here on no transaction can insert a row that references this
     // user, so the re-plan below is final. The generation predicate is
@@ -594,6 +617,28 @@ type TransactionRunner = Pick<PrismaClient, "$transaction">;
  * any history size only because every ordered delete drains its request
  * history first (./parent-deletion.ts, DL1-TXBOUND); a new ordered delete
  * must do the same.
+ *
+ * The cap is Prisma's client-side transaction timeout, so it does not cancel
+ * the server-side statement: on the shared client a statement that has not
+ * returned when the cap fires can still be running, with its locks still held
+ * (the known issue on the request paths' capacity-ordered final delete in the
+ * release notes). The user-deletion sweep runs this on its own client, whose
+ * connections carry a server-side `statement_timeout`
+ * (apps/server/src/user-deletion-sweep.ts), so there every statement is
+ * cancelled server-side at that bound; the resulting 57014 is not retried
+ * here and the sweep backs off. That client is also fenced at dispatch
+ * (./client-factory.ts): once the shutdown fence arms it sends no further
+ * statement but the `COMMIT` / `ROLLBACK`, including the separate queries a
+ * single Prisma call issues (the admission read in
+ * `resolveCapacityDeleteLockSet` selects its `Waiters` and `Lease`
+ * relations as queries of their own), so what is left at shutdown is one
+ * statement and the end of its transaction, not every statement of one
+ * call. The end of a transaction has no server-side bound (a `COMMIT` can
+ * wait on synchronous replication); shutdown waits on the sweep for its
+ * join deadline and then quarantines the sweep's connections
+ * (`shutDownUserDeletionSweep`), so the server finishes that transaction by
+ * commit or rollback after the process leaves. The drain batches set a
+ * transaction-local `statement_timeout` for every caller.
  */
 export async function runCapacityOrderedTransaction<T>(
   db: TransactionRunner,

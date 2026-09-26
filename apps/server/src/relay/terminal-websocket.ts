@@ -6,6 +6,7 @@ import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-
 import {
   TERMINAL_BROWSER_JSON_LIMIT,
   TERMINAL_BROWSER_JSON_WINDOW_MS,
+  TERMINAL_BROWSER_TEXT_PENDING_LIMIT,
 } from "@ws-model-proxy/config/terminal-socket-policy";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
@@ -39,10 +40,12 @@ const BROWSER_JSON_LIMIT = TERMINAL_BROWSER_JSON_LIMIT;
 const BROWSER_JSON_WINDOW_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
 /**
  * Accepted text frames a browser may have waiting or running at once. A slow
- * database lookup must not let one socket pile up work; past this the socket
- * is closed with 1008.
+ * database lookup must not let one socket pile up work; a frame past this is
+ * answered `rate_limited` unread and the accepted ones run on. Not below the
+ * browser's per-window budget, so a conforming burst always fits
+ * (TERMINAL_BROWSER_TEXT_PENDING_LIMIT).
  */
-const BROWSER_TEXT_QUEUE_LIMIT = 8;
+const BROWSER_TEXT_QUEUE_LIMIT = TERMINAL_BROWSER_TEXT_PENDING_LIMIT;
 /** Per terminal tab. Key repeat runs at about 30 frames per second. */
 const BROWSER_BINARY_LIMIT = 300;
 /** Per terminal, across every viewer, so many tabs cannot multiply the CLI's input load. */
@@ -426,6 +429,14 @@ export class TerminalBrowserHub {
     // Registered synchronously on open and forgotten on close, so an unknown
     // socket is one that already closed.
     if (!conn) return Promise.resolve();
+    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
+      // Refused unread, like a rate-limited frame, and answered so the
+      // browser can send it again. The frames already accepted keep running;
+      // the socket stays open. Checked before the rate window so a refused
+      // frame does not use up a slot.
+      this.sendError(conn, "rate_limited", rawFrameRef(frame));
+      return Promise.resolve();
+    }
     if (!this.allowJson(conn)) {
       // Answer the refused frame itself: a Decline refused here must reach a
       // state the person can retry, and an open must not shift the browser's
@@ -435,12 +446,6 @@ export class TerminalBrowserHub {
     }
     if (utf8ByteLengthExceeds(frame, BROWSER_JSON_MAX_BYTES)) {
       this.sendError(conn, "invalid");
-      return Promise.resolve();
-    }
-    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
-      this.detachAll(conn);
-      if (conn.socket.readyState === 1) conn.socket.close(1008, "too_many_pending");
-      this.forgetConn(conn);
       return Promise.resolve();
     }
     conn.pendingText += 1;

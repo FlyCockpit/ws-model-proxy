@@ -1,3 +1,4 @@
+/// <reference path="./pg.d.ts" />
 import { Client } from "pg";
 
 export class PostgresNotificationListener {

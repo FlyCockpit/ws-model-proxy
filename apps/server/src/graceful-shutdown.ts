@@ -141,12 +141,17 @@ function settleLogged(
   })();
 }
 
+/**
+ * Resolves "done" when `work` settled (its failure is logged) or "timeout"
+ * when the deadline came first (a warning is logged; the work keeps running
+ * unobserved).
+ */
 export async function runWithDeadline(
   work: () => void | Promise<void>,
   timeoutMs: number,
   label: string,
   deps: DeadlineLogger = {},
-): Promise<void> {
+): Promise<"done" | "timeout"> {
   const warn = deps.warn ?? defaultWarn;
   const logError = deps.logError ?? defaultLogError;
   const deadline = deadlineAfter(timeoutMs);
@@ -156,6 +161,7 @@ export async function runWithDeadline(
       deadline.reached,
     ]);
     if (result === "timeout") warn(`[server] ${label} did not finish before its deadline.`);
+    return result;
   } finally {
     deadline.cancel();
   }

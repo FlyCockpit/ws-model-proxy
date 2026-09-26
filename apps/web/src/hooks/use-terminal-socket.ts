@@ -185,6 +185,14 @@ function reconnectDelayMs(attempt: number): number {
   return Math.min(15_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
 }
 
+/**
+ * A socket that stayed open this long resets the reconnect backoff when it
+ * closes. Opening alone does not: a relay that accepts and then closes at
+ * once (a refused admission, a close right after a reconnect burst) would
+ * otherwise be retried every half second forever.
+ */
+const RECONNECT_STABLE_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
+
 export function useTerminalSocket(
   enabled: boolean,
   handlers: TerminalSocketHandlers,
@@ -239,9 +247,10 @@ export function useTerminalSocket(
       closeOutbox(outboxRef.current);
       const outbox = newOutbox(ws);
       outboxRef.current = outbox;
+      let openedAt: number | null = null;
       ws.onopen = () => {
         if (disposed || socket !== ws) return;
-        attempt = 0;
+        openedAt = performance.now();
         setStatus("open");
         handlersRef.current.onOpen?.();
         enqueue(outbox, JSON.stringify({ type: "list" }), false);
@@ -271,6 +280,7 @@ export function useTerminalSocket(
         if (disposed) return;
         setStatus("closed");
         handlersRef.current.onDisconnect?.();
+        if (openedAt !== null && performance.now() - openedAt >= RECONNECT_STABLE_MS) attempt = 0;
         timer = window.setTimeout(connect, reconnectDelayMs(attempt));
         attempt += 1;
       };

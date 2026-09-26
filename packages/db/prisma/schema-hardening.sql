@@ -2360,7 +2360,9 @@ FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 --    two writers of overlapping sentinel keys never wait on each other in
 --    opposite orders.
 --
--- Accepted, self-healing deadlocks (not prevented here): when the user being
+-- Known issue F2-02 (user-accepted; deferred to DL-1 design (d), which makes
+-- the history telemetry tables foreign-key free): transient deadlocks, not
+-- prevented here, recovered as described below. When the user being
 -- deleted is also a resource OWNER, (a) an in-flight finalizer of a request
 -- on the user's pool/target holds that relay_request row lock and inserts a
 -- new rollup row whose ownerUserId FK takes KEY SHARE on this "user" row,

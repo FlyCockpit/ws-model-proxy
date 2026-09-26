@@ -245,4 +245,34 @@ describe("useTerminalSocket", () => {
     expect(texts()).toHaveLength(TERMINAL_BROWSER_JSON_BUDGET + 3);
     vi.useRealTimers();
   });
+  it("backs off a socket that closes right after opening, and resets after a stable one", () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    render(<SocketProbe />);
+    const reconnectAfter = (delayMs: number) => {
+      const before = MockWebSocket.instances.length;
+      vi.advanceTimersByTime(delayMs - 1);
+      expect(MockWebSocket.instances).toHaveLength(before);
+      vi.advanceTimersByTime(1);
+      expect(MockWebSocket.instances).toHaveLength(before + 1);
+      return MockWebSocket.instances.at(-1);
+    };
+    // Accepted, then closed at once (a refused admission): opening alone
+    // does not reset the backoff, so the retries slow down.
+    const first = MockWebSocket.instances[0];
+    first?.open();
+    first?.close();
+    const second = reconnectAfter(500);
+    second?.open();
+    second?.close();
+    const third = reconnectAfter(1_000);
+    third?.open();
+    // A socket that stayed open a whole window resets it.
+    vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS);
+    third?.close();
+    reconnectAfter(500);
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
 });

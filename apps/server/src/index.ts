@@ -32,7 +32,11 @@ import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
-import { startUserDeletionSweep } from "./user-deletion-sweep.js";
+import {
+  createUserDeletionSweepClient,
+  shutDownUserDeletionSweep,
+  startUserDeletionSweep,
+} from "./user-deletion-sweep.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -170,8 +174,13 @@ const stopOauthCleanup = startOauthCleanup();
 const stopSessionCleanup = startSessionCleanup();
 // Accepted user deletions whose completion failed transiently or was cut
 // short by a restart: the durable marker (User.deletionRequestedAt) is
-// resumed here until the user is gone (see user-deletion-sweep.ts).
-const stopUserDeletionSweep = startUserDeletionSweep();
+// resumed here until the user is gone (see user-deletion-sweep.ts). The sweep
+// runs on its own fenced client whose connections carry a server-side
+// statement_timeout; shutdown waits on it for a bounded time and quarantines
+// it past that (shutDownUserDeletionSweep below). Request paths keep the
+// shared client.
+const userDeletionSweepClient = createUserDeletionSweepClient(env.DATABASE_URL);
+const stopUserDeletionSweep = startUserDeletionSweep({ prisma: userDeletionSweepClient.prisma });
 // Metrics retention: reaps abandoned PENDING relay requests, deletes raw
 // RelayRequest rows past RELAY_REQUEST_RETENTION_DAYS, compacts minute usage
 // rollups to hourly after 30 days and drops hourly rollups after 13 months.
@@ -226,8 +235,8 @@ const stopTerminalSessionRecheck = startUnrefInterval(() => {
 
 let isShuttingDown = false;
 let userDeletionSweepStopped: Promise<void> | null = null;
-/** Bound on joining the user-deletion tick in flight at shutdown. */
-const USER_DELETION_SWEEP_JOIN_TIMEOUT_MS = 5_000;
+// The sweep's shutdown bounds (join, disconnect) live in ./shutdown-timeouts.ts
+// next to the sweep client's statement and connect bounds.
 
 async function shutdown(signal: string) {
   if (isShuttingDown) return;
@@ -257,12 +266,13 @@ async function shutdown(signal: string) {
     closeBrowserSockets: () => {
       terminalBrowserHub.closeAll();
     },
-    closeRelaySessions: () =>
-      runWithDeadline(
+    closeRelaySessions: async () => {
+      await runWithDeadline(
         () => relaySessionManager.closeRelaySessions(),
         RELAY_CLOSE_TIMEOUT_MS,
         "relay session close",
-      ),
+      );
+    },
     // 1. Stop accepting new connections and drain in-flight requests.
     //    ORDER: admission stops first (relay drain flag makes terminal and
     //    CLI upgrades return 503; server.close stops new connections), THEN
@@ -337,14 +347,19 @@ async function shutdown(signal: string) {
     },
     // 3. Close database connections last.
     disconnectPrisma: async () => {
-      // Join the user-deletion tick in flight (bounded): the fence armed by
-      // closeMcpHandler stops its drain between batches, and an ordered
-      // transaction commits or rolls back, before the connections close.
-      await runWithDeadline(
-        () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
-        USER_DELETION_SWEEP_JOIN_TIMEOUT_MS,
-        "user deletion sweep join",
-      );
+      // The user-deletion sweep's client goes first, then the shared one.
+      // Once the fence armed by closeMcpHandler is on, the sweep's client
+      // dispatches no further statement or connect (only the COMMIT /
+      // ROLLBACK ending a transaction). shutDownUserDeletionSweep joins the
+      // tick in flight for at most the join deadline, quarantines the sweep's
+      // pool if it has not settled (a COMMIT can outlast every server-side
+      // bound), and disconnects it under a short deadline: this step waits on
+      // the sweep for at most USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
+      // USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS.
+      await shutDownUserDeletionSweep({
+        stopped: () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
+        client: userDeletionSweepClient,
+      });
       await prisma.$disconnect();
     },
   });

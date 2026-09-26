@@ -20,6 +20,7 @@ const { cliCredentialsRouter } = await import("./cli-credentials");
 
 const db = prisma as unknown as {
   $transaction: ReturnType<typeof vi.fn>;
+  $queryRaw: ReturnType<typeof vi.fn>;
   appSetting: {
     findUnique: ReturnType<typeof vi.fn>;
   };
@@ -111,6 +112,10 @@ describe("cliCredentialsRouter", () => {
       callback(db),
     );
     db.deviceCode.deleteMany.mockResolvedValue({ count: 1 });
+    // The exchange's FOR SHARE read of the approving owner: active.
+    db.$queryRaw.mockResolvedValue([
+      { banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
     db.cliDevice.findUnique.mockResolvedValue(null);
     db.cliDevice.upsert.mockResolvedValue({ id: "cli-device-1" });
     db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-1", userId: "user-1" });

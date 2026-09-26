@@ -193,6 +193,22 @@ export class ParentDeletionDrainPendingError extends Error {
   }
 }
 
+/**
+ * A whole-user drain or ordered delete was called without naming the
+ * deletion generation it works for (or, for a drain, naming another user's).
+ * A programming error in the caller: the operation refuses before touching
+ * any row, since without an owner it would delete for a generation that may
+ * already have been abandoned. Thrown by the drain (./parent-deletion.ts) and
+ * by `lockCapacityGraphForDelete` (./capacity-lock-order.ts).
+ */
+export class ParentDeletionOwnerRequiredError extends Error {
+  readonly code = "PARENT_DELETION_OWNER_REQUIRED";
+  constructor() {
+    super("A whole-user deletion must name the deletion generation it owns.");
+    this.name = "ParentDeletionOwnerRequiredError";
+  }
+}
+
 /** What a parent delete removes, for the drain and the preflight. */
 export type ParentDeletionScope = CapacityDeleteScope;
 
@@ -430,9 +446,10 @@ export async function countFinalPhaseResidualRows(
  *   locked at all (`cli_device`, `model_pool`, `execution_target`,
  *   `pool_member`, `discovered_model`, `model_api_token`, `provider_*`,
  *   `pool_grant`) are not closed to producers (FOR NO KEY UPDATE does not
- *   conflict with a child insert's FOR KEY SHARE). Accepted residual: rows
- *   such producers commit between this recount and the caller's DELETE, one
- *   statement later. Its size is the producer rate times one statement, not
+ *   conflict with a child insert's FOR KEY SHARE). Known issue F2-01
+ *   (user-accepted; closed by DL-1 design (d), which drops these cascades):
+ *   rows such producers commit between this recount and the caller's DELETE,
+ *   one statement later, are not counted. Its size is the producer rate times one statement, not
  *   a lock wait. Holding those parents FOR UPDATE would close it but needs
  *   its own lock-cycle proof against producers that hold FOR KEY SHARE.
  */

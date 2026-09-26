@@ -110,8 +110,9 @@ export function throwParentDeletionPendingConflict(error: unknown): void {
 /**
  * Phases 1 and 2 of a parent delete (see @ws-model-proxy/db/parent-deletion):
  * refuses retained history before anything changes, then drains the request
- * history the cascade would delete or detach in short batches that never
- * wait on a row lock. Call it after the caller's own read-only checks
+ * history the cascade would delete or detach in short batches that take
+ * their rows with SKIP LOCKED and bound every other lock wait (a timeout is
+ * a `delete_pending` CONFLICT). Call it after the caller's own read-only checks
  * (ownership, staleness, attachment) and before
  * {@link runCapacityDeleteTransaction}, which then deletes only the capacity
  * graph and the residual under the capacity locks.

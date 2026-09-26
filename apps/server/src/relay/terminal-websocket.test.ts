@@ -1,6 +1,13 @@
+import { once } from "node:events";
 import type { WebSocketLike } from "@hono/node-server";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { Session } from "@ws-model-proxy/auth";
+import {
+  TERMINAL_BROWSER_JSON_BUDGET,
+  TERMINAL_BROWSER_JSON_LIMIT,
+  TERMINAL_BROWSER_JSON_WINDOW_MS,
+  TERMINAL_BROWSER_TEXT_PENDING_LIMIT,
+} from "@ws-model-proxy/config/terminal-socket-policy";
 import { Hono } from "hono";
 import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
@@ -1171,7 +1178,7 @@ describe("terminal browser hub", () => {
     expect(db.cliDevice.findMany).toHaveBeenCalledTimes(1);
   });
 
-  it("closes a socket whose queued text frames pass the cap during a stalled lookup", async () => {
+  it("answers a text frame past the pending cap with rate_limited and keeps the socket (F2-08)", async () => {
     const browser = attachBrowser();
     let releaseList: (() => void) | undefined;
     const lookupStarted = new Promise<void>((started) => {
@@ -1183,20 +1190,223 @@ describe("terminal browser hub", () => {
           }),
       );
     });
-    const accepted = [terminalBrowserHub.handleText(browser, '{"type":"list"}')];
+    const accepted = [terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"l_0"}')];
     await lookupStarted;
-    for (let index = 1; index < 8; index += 1) {
-      accepted.push(terminalBrowserHub.handleText(browser, '{"type":"list"}'));
+    for (let index = 1; index < TERMINAL_BROWSER_TEXT_PENDING_LIMIT; index += 1) {
+      accepted.push(
+        terminalBrowserHub.handleText(browser, `{"type":"list","requestId":"l_${index}"}`),
+      );
     }
+    await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"over"}');
+    // Refused unread and answered at once, while the accepted frames wait.
+    expect(browser.jsonSends()).toEqual([
+      expect.objectContaining({ type: "error", code: "rate_limited", requestId: "over" }),
+    ]);
     expect(browser.closes).toEqual([]);
-    await terminalBrowserHub.handleText(browser, '{"type":"list"}');
-    expect(browser.closes).toEqual([{ code: 1008, reason: "too_many_pending" }]);
-    // Further frames on the closed socket are dropped outright.
-    await terminalBrowserHub.handleText(browser, '{"type":"list"}');
     releaseList?.();
     await Promise.all(accepted);
-    // Only the frame already running reached the database.
-    expect(db.cliDevice.findMany).toHaveBeenCalledTimes(1);
+    const answered = browser
+      .jsonSends()
+      .filter((message) => message.type === "terminals")
+      .map((message) => message.requestId);
+    expect(answered).toEqual(
+      Array.from({ length: TERMINAL_BROWSER_TEXT_PENDING_LIMIT }, (_, index) => `l_${index}`),
+    );
+    expect(browser.closes).toEqual([]);
+  });
+
+  it("a frame refused at the pending cap consumes no rate-window slot (F2-08)", async () => {
+    const browser = attachBrowser();
+    db.cliDevice.findMany.mockResolvedValue([]);
+    // Freeze time so the rate window can be filled and then aged out
+    // deterministically: the pending cap counts frames, the rate window
+    // counts stamps in the last TERMINAL_BROWSER_JSON_WINDOW_MS.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const base = Date.now();
+      // One stalled lookup; the frames behind it pile up as pending.
+      let release: (() => void) | undefined;
+      db.cliDevice.findMany.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve([]);
+          }),
+      );
+      // Fill the pending cap with frames that are each spaced past the rate
+      // window, so every one takes a fresh rate slot and the window holds
+      // only the most recent stamp.
+      const accepted: Array<Promise<void>> = [];
+      for (let index = 0; index < TERMINAL_BROWSER_TEXT_PENDING_LIMIT; index += 1) {
+        vi.setSystemTime(base + index * (TERMINAL_BROWSER_JSON_WINDOW_MS + 1));
+        accepted.push(
+          terminalBrowserHub.handleText(browser, `{"type":"list","requestId":"s_${index}"}`),
+        );
+      }
+      const refusedAt =
+        base + TERMINAL_BROWSER_TEXT_PENDING_LIMIT * (TERMINAL_BROWSER_JSON_WINDOW_MS + 1);
+      vi.setSystemTime(refusedAt);
+      // The pending cap is now full and the rate window has aged out. Send a
+      // frame plus a burst: all are refused at the cap, and none of them may
+      // record a rate stamp (the cap check runs before the rate window).
+      const refusals = ["cap"];
+      await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"cap"}');
+      for (let index = 0; index < TERMINAL_BROWSER_JSON_LIMIT + 1; index += 1) {
+        refusals.push(`after_${index}`);
+        await terminalBrowserHub.handleText(
+          browser,
+          `{"type":"list","requestId":"after_${index}"}`,
+        );
+      }
+      expect(
+        browser
+          .jsonSends()
+          .filter((message) => message.code === "rate_limited")
+          .map((message) => message.requestId),
+      ).toEqual(refusals);
+      // The window is still aged out: a burst of cap refusals that each spent
+      // a slot would leave it full and refuse the next frame by rate.
+      release?.();
+      await Promise.all(accepted);
+      await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"free"}');
+      const answered = browser
+        .jsonSends()
+        .filter((message) => message.type === "terminals")
+        .map((message) => message.requestId);
+      expect(answered).toContain("free");
+      // The accepted frame past the pre-fill still ran.
+      expect(answered).toContain(`s_${TERMINAL_BROWSER_TEXT_PENDING_LIMIT - 1}`);
+      expect(browser.closes).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("over a real loopback WebSocket (F2-08)", () => {
+    type Loopback = Awaited<ReturnType<typeof loopback>>;
+    let current: Loopback | undefined;
+
+    afterEach(async () => {
+      await current?.dispose();
+      current = undefined;
+    });
+
+    /**
+     * A `ws` server whose connection runs through the real hub (admitted like
+     * a production socket after its admission read) and a `ws` client.
+     */
+    async function loopback() {
+      const { WebSocket, WebSocketServer } = await import("ws");
+      const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+      await once(server, "listening");
+      const address = server.address();
+      if (typeof address !== "object" || address === null) throw new Error("no port");
+      const connection = once(server, "connection");
+      const client = new WebSocket(`ws://127.0.0.1:${address.port}`, { perMessageDeflate: false });
+      const [socket] = (await connection) as [InstanceType<typeof WebSocket>];
+      await once(client, "open");
+      const answers: Array<{ type: string; code?: string; requestId?: string }> = [];
+      client.on("message", (data, isBinary) => {
+        if (!isBinary) answers.push(JSON.parse(data.toString()));
+      });
+      const closes: Array<{ code: number; reason: string }> = [];
+      client.on("close", (code, reason) => closes.push({ code, reason: reason.toString() }));
+      let received = 0;
+      socket.on("message", (data, isBinary) => {
+        if (isBinary) return;
+        received += 1;
+        void terminalBrowserHub.handleText(socket, data.toString());
+      });
+      db.session.findUnique.mockResolvedValueOnce({
+        userId: "user-id",
+        expiresAt: new Date(Date.now() + 60_000),
+        user: { deletionRequestedAt: null, banned: false, banExpires: null },
+      });
+      await admitBrowserConnection({ socket, userId: "user-id", sessionId: "session-id" });
+      return {
+        answers,
+        closes,
+        received: () => received,
+        /** Sends every frame in one write, so they arrive as one delivery. */
+        burst(frames: string[]) {
+          const transport = (client as unknown as { _socket: import("node:net").Socket })._socket;
+          transport.cork();
+          for (const frame of frames) client.send(frame);
+          transport.uncork();
+        },
+        dispose: async () => {
+          client.terminate();
+          for (const peer of server.clients) peer.terminate();
+          await new Promise((resolve) => server.close(resolve));
+        },
+      };
+    }
+
+    async function until(condition: () => boolean, timeoutMs = 5_000) {
+      const started = Date.now();
+      while (!condition()) {
+        if (Date.now() - started > timeoutMs) throw new Error("timed out");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+
+    function stallFirstList() {
+      let release: (() => void) | undefined;
+      db.cliDevice.findMany.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve([]);
+          }),
+      );
+      return () => release?.();
+    }
+
+    it("answers the browser's whole per-window budget sent in one delivery and stays open", async () => {
+      current = await loopback();
+      const peer = current;
+      expect(TERMINAL_BROWSER_JSON_BUDGET).toBeLessThanOrEqual(TERMINAL_BROWSER_TEXT_PENDING_LIMIT);
+      // The first lookup stalls, so every frame of the burst is pending at
+      // once: the worst case for any split of the burst into reads.
+      const release = stallFirstList();
+      const ids = Array.from({ length: TERMINAL_BROWSER_JSON_BUDGET }, (_, index) => `b_${index}`);
+      try {
+        peer.burst(ids.map((requestId) => JSON.stringify({ type: "list", requestId })));
+        await until(() => peer.received() === ids.length || peer.closes.length > 0);
+      } finally {
+        release();
+      }
+      await until(() => peer.answers.length === ids.length || peer.closes.length > 0);
+      expect(peer.closes).toEqual([]);
+      expect(peer.answers.map((message) => message.requestId)).toEqual(ids);
+      expect(peer.answers.every((message) => message.type === "terminals")).toBe(true);
+      expect(peer.closes).toEqual([]);
+    });
+
+    it("answers every frame of a non-conforming burst, refusing only the excess", async () => {
+      current = await loopback();
+      const peer = current;
+      const release = stallFirstList();
+      const total = TERMINAL_BROWSER_TEXT_PENDING_LIMIT + 5;
+      const ids = Array.from({ length: total }, (_, index) => `n_${index}`);
+      try {
+        peer.burst(ids.map((requestId) => JSON.stringify({ type: "list", requestId })));
+        await until(() => peer.received() === total || peer.closes.length > 0);
+      } finally {
+        release();
+      }
+      await until(() => peer.answers.length === total || peer.closes.length > 0);
+      expect(peer.closes).toEqual([]);
+      const byId = new Map(peer.answers.map((message) => [message.requestId, message]));
+      expect([...byId.keys()].sort()).toEqual([...ids].sort());
+      const refused = ids.filter((id) => byId.get(id)?.type === "error");
+      expect(refused).toEqual(ids.slice(TERMINAL_BROWSER_TEXT_PENDING_LIMIT));
+      expect(refused.every((id) => byId.get(id)?.code === "rate_limited")).toBe(true);
+      expect(
+        ids
+          .slice(0, TERMINAL_BROWSER_TEXT_PENDING_LIMIT)
+          .every((id) => byId.get(id)?.type === "terminals"),
+      ).toBe(true);
+      expect(peer.closes).toEqual([]);
+    });
   });
 
   it("keeps order for accepted frames and frees queue slots as they finish", async () => {

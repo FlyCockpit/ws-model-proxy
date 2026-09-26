@@ -59,6 +59,10 @@ const REVIEWED_KEY_COLUMN_UPDATES: Record<string, string> = {
 const REVIEWED_SHARE_LOCKS: Record<string, string> = {
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
     "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no capacity lock and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, an L7 user lock or a user writer is outside the capacity domain and closes no cycle.",
+  "packages/db/src/parent-deletion.ts:user.FOR SHARE":
+    "lockUserDeletionOwner (F2-03): the first lock of a user-deletion drain batch, on its deletion generation. The batch takes no capacity lock; afterwards it takes only history rows with SKIP LOCKED and their cascades, every lock wait bounded by a transaction-local lock_timeout and every statement by a transaction-local statement_timeout. It never waits on an L0-L6 lock, so the ordered user delete waiting for it at L7 closes no cycle; abandon, restore and a new mark wait for the batch and then withdraw the generation.",
+  "packages/api/src/lib/cli-credential-access.ts:user.FOR SHARE":
+    "mintCliDeviceCredentialFromApprovedDeviceCode (F2-04): the owner's marker read, after the device row and before the device-code row, the order the ordered user delete takes them (device L0, user L7, then its cascade into device_code and credentials). No capacity lock is held or taken.",
 };
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -286,6 +290,11 @@ function findSqlLockOrderViolations(file: string, source: string): Finding[] {
  * `lock-order:L7` annotation alone exempts nothing: a tagged statement
  * elsewhere, or one that precedes an L0-L6 lock in its function, is a
  * finding (the pass-8 inversion carried the tag).
+ *
+ * Known issue F2-05 (user-accepted): the check is lexical. It compares source
+ * positions, so a deliberately deferred closure (defined before L7, called
+ * after it) or a lock a caller takes after the helper returns would pass.
+ * DL-1 design (d) moves this enforcement into fences and triggers.
  */
 const L7_SITE = {
   file: "packages/db/src/capacity-lock-order.ts",

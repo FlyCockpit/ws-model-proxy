@@ -349,8 +349,9 @@ describe("runWithDeadline", () => {
           forceCloseConnections: () => {},
           warn: () => {},
         }),
-      closeRelaySessions: () =>
-        runWithDeadline(hang, 5_000, "relay session close", { warn: () => {} }),
+      closeRelaySessions: async () => {
+        await runWithDeadline(hang, 5_000, "relay session close", { warn: () => {} });
+      },
       closeMcpHandler: async () => {},
       disconnectPrisma: async () => {
         order.push("disconnectPrisma");
