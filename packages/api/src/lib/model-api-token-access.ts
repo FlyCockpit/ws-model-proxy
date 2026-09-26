@@ -388,36 +388,44 @@ export type ExternalConsentIdentity = {
 
 type ConsentReadClient = Pick<
   Prisma.TransactionClient,
-  "modelApiToken" | "modelApiTokenAllowlistEntry" | "poolGrant" | "user"
+  "$queryRaw" | "modelApiTokenAllowlistEntry" | "poolGrant"
 >;
 
-type RequesterValidityClient = Pick<Prisma.TransactionClient, "modelApiToken" | "user">;
+type RequesterValidityClient = Pick<Prisma.TransactionClient, "$queryRaw">;
 
-/** The token and account rows whose validity can lapse without a write (time) or is not locked. */
-function readRequesterValidityRows(db: RequesterValidityClient, input: ExternalConsentIdentity) {
-  return Promise.all([
-    input.modelApiTokenId
-      ? db.modelApiToken.findUnique({
-          where: { id: input.modelApiTokenId },
-          select: {
-            userId: true,
-            scopeMode: true,
-            allowExternal: true,
-            revokedAt: true,
-            expiresAt: true,
-          },
-        })
-      : null,
-    db.user.findUnique({
-      where: { id: input.requesterUserId },
-      select: { banned: true, banExpires: true, deletionRequestedAt: true },
-    }),
-  ]);
+type RequesterValidity = {
+  tokenValid: boolean;
+  scopeMode: string | null;
+  requesterValid: boolean;
+};
+
+/**
+ * Evaluate the unlocked user snapshot and token expiry in ONE statement, with
+ * that statement's database clock. Never compare an old ban expiry with the
+ * time its result reaches JS: a concurrently renewed ban could then appear
+ * expired even though the requester was continuously banned. Transaction
+ * now() is also too old after a provider-lock wait; statement_timestamp()
+ * advances for the post-lock recheck.
+ */
+async function readRequesterValidity(db: RequesterValidityClient, input: ExternalConsentIdentity) {
+  const [validity] = await db.$queryRaw<RequesterValidity[]>`
+    SELECT
+      (t.id IS NOT NULL AND t."userId" = ${input.requesterUserId}
+        AND t."revokedAt" IS NULL AND t."allowExternal" = true
+        AND (t."expiresAt" IS NULL OR t."expiresAt" > statement_timestamp())) AS "tokenValid",
+      t."scopeMode" AS "scopeMode",
+      (u.id IS NOT NULL AND u."deletionRequestedAt" IS NULL
+        AND (u.banned IS NOT TRUE
+          OR (u."banExpires" IS NOT NULL AND u."banExpires" < statement_timestamp()))) AS "requesterValid"
+    FROM (VALUES (1)) AS singleton(value)
+    LEFT JOIN model_api_token t ON t.id = ${input.modelApiTokenId}
+    LEFT JOIN "user" u ON u.id = ${input.requesterUserId}`;
+  return validity;
 }
 
 async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConsentIdentity) {
-  const [[token, requester], allowlistEntry, grant] = await Promise.all([
-    readRequesterValidityRows(db, input),
+  const [validity, allowlistEntry, grant] = await Promise.all([
+    readRequesterValidity(db, input),
     input.modelApiTokenId
       ? db.modelApiTokenAllowlistEntry.findUnique({
           where: {
@@ -438,51 +446,25 @@ async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConse
           select: { id: true, ownerUserId: true },
         }),
   ]);
-  return { token, requester, allowlistEntry, grant };
+  return { validity, allowlistEntry, grant };
 }
 
-type RequesterValidityRows = Awaited<ReturnType<typeof readRequesterValidityRows>>;
-
-/**
- * The credential-validity part of authentication
- * (authenticateModelApiTokenSecret for a token, Better Auth's session plus the
- * account-access guard for Chat Test), evaluated at `now`: the token exists,
- * belongs to the requester, is not revoked or expired and allows external;
- * the requester's account exists, is not banned and has no deletion mark
- * (`userCredentialAccessBlocked`).
- */
+/** Consume the database decision without reinterpreting it against a later clock. */
 function requesterValidityDenial(
   input: ExternalConsentIdentity,
-  [token, requester]: RequesterValidityRows,
-  now: Date,
+  validity: RequesterValidity | undefined,
 ): ExternalConsentStateDenial | null {
-  if (input.modelApiTokenId) {
-    if (
-      !token ||
-      token.userId !== input.requesterUserId ||
-      token.revokedAt ||
-      (token.expiresAt && token.expiresAt <= now) ||
-      token.allowExternal !== true
-    )
-      return "TOKEN_CONSENT_WITHDRAWN";
-  }
-  if (!requester || userCredentialAccessBlocked(requester, now)) return "REQUESTER_ACCESS_BLOCKED";
+  if (input.modelApiTokenId && validity?.tokenValid !== true) return "TOKEN_CONSENT_WITHDRAWN";
+  if (validity?.requesterValid !== true) return "REQUESTER_ACCESS_BLOCKED";
   return null;
 }
 
 function callerConsentDenial(
   input: ExternalConsentIdentity,
   rows: Awaited<ReturnType<typeof readCallerConsentRows>>,
-  now: Date,
 ): ExternalConsentStateDenial | null {
-  const validity = requesterValidityDenial(input, [rows.token, rows.requester], now);
-  if (validity) return validity;
-  if (
-    input.modelApiTokenId &&
-    String(rows.token?.scopeMode) === "ALLOWLIST" &&
-    (rows.allowlistEntry?.target !== "MODEL_POOL" || rows.allowlistEntry.includeExternal !== true)
-  )
-    return "TOKEN_CONSENT_WITHDRAWN";
+  // A lost exact grant permanently invalidates a binding, even when
+  // restorable token or pool consent has also been withdrawn.
   if (
     input.requesterUserId !== input.ownerUserId &&
     (input.accessGrantId === null ||
@@ -490,6 +472,14 @@ function callerConsentDenial(
       rows.grant.ownerUserId !== input.ownerUserId)
   )
     return "REQUESTER_NOT_VISIBLE";
+  const validity = requesterValidityDenial(input, rows.validity);
+  if (validity) return validity;
+  if (
+    input.modelApiTokenId &&
+    rows.validity?.scopeMode === "ALLOWLIST" &&
+    (rows.allowlistEntry?.target !== "MODEL_POOL" || rows.allowlistEntry.includeExternal !== true)
+  )
+    return "TOKEN_CONSENT_WITHDRAWN";
   return null;
 }
 
@@ -517,7 +507,7 @@ export async function readExternalConsentDenial(
   input: ExternalConsentIdentity,
 ): Promise<ExternalConsentStateDenial | null> {
   const rows = await readCallerConsentRows(prisma, input);
-  return callerConsentDenial(input, rows, new Date());
+  return callerConsentDenial(input, rows);
 }
 
 /**
@@ -565,19 +555,21 @@ export async function lockExternalSendConsent(
     where: { id: input.poolId, userId: input.ownerUserId },
     select: { fallbackEnabled: true, fallbackForGrantees: true },
   });
+  const rows = await readCallerConsentRows(tx, input);
+  const callerDenial = callerConsentDenial(input, rows);
+  if (callerDenial === "REQUESTER_NOT_VISIBLE") return callerDenial;
   if (!pool?.fallbackEnabled) return "POOL_PRIVATE";
   if (!requesterIsOwner && !pool.fallbackForGrantees) return "GRANTEE_NOT_COVERED";
-  const rows = await readCallerConsentRows(tx, input);
-  return callerConsentDenial(input, rows, new Date());
+  return callerDenial;
 }
 
 /**
  * E0 send boundary, part 2: the caller runs this after the last statement of
  * the send-claim transaction that can wait on a lock (the provider
  * account/credential FOR UPDATE) and before the durable claim. It re-reads
- * the token and the requester's account and evaluates their validity at a
- * `now` taken after those reads, so a token that expired, or an account that
- * was banned or marked for deletion, while the transaction waited on provider
+ * the token and the requester's account and evaluates their validity in one
+ * SQL statement against statement_timestamp(), so a token that expired, or an
+ * account that was banned or marked for deletion while the transaction waited on provider
  * locks is refused before anything is claimed or sent.
  *
  * No user-row lock: every statement after this read (the credential re-read,
@@ -593,8 +585,8 @@ export async function recheckExternalSendRequesterValidity(
   tx: RequesterValidityClient,
   input: ExternalConsentIdentity,
 ): Promise<ExternalConsentStateDenial | null> {
-  const rows = await readRequesterValidityRows(tx, input);
-  return requesterValidityDenial(input, rows, new Date());
+  const validity = await readRequesterValidity(tx, input);
+  return requesterValidityDenial(input, validity);
 }
 
 export async function authenticateModelApiTokenSecret(

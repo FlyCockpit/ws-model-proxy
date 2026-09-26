@@ -348,6 +348,8 @@ type ListedPublicOverflowTargets = {
    * external target" (400).
    */
   coolingDown: PublicProviderTarget[];
+  /** Live identities unavailable due to model/account disablement or missing active credentials. */
+  unavailable: Array<Parameters<typeof matchesExactResponsesBinding>[0]>;
 };
 
 function providerEventRouting(input: {
@@ -819,8 +821,10 @@ export async function listPublicOverflowTargets(
       affinityPolicy: defaultAffinityPolicy,
       targets: [],
       coolingDown: [],
+      unavailable: [],
     };
   const now = new Date();
+  const unavailable: ListedPublicOverflowTargets["unavailable"] = [];
   const listed = pool.PoolMembers.flatMap((member) => {
     const model = member.ExecutionTarget?.ProviderModel;
     const account = model?.ProviderAccount;
@@ -830,19 +834,33 @@ export async function listPublicOverflowTargets(
     if (
       !model ||
       !account ||
-      !credential ||
       !protocol ||
       !inventoryMatchesProtocol(capabilityInventory, protocol) ||
       member.publicOrder == null ||
       model.userId !== userId ||
       account.userId !== userId ||
-      !model.enabled ||
-      !account.enabled ||
       model.deletedAt ||
-      account.deletedAt ||
-      credential.status !== "ACTIVE"
+      account.deletedAt
     )
       return [];
+    // Preserve the immutable live identity BEFORE applying readiness filters.
+    // A credential can be restored and enablement can be toggled without
+    // changing the binding; neither makes a stored response permanently gone.
+    const identity = {
+      executionTargetId: member.ExecutionTarget!.id,
+      providerModelId: model.id,
+      upstreamModelId: model.upstreamModelId,
+      protocol,
+      providerAccountId: account.id,
+      endpointIdentity: account.endpointIdentity,
+      endpointVersion: account.endpointVersion,
+      nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
+      capabilityInventory,
+    };
+    if (!model.enabled || !account.enabled || !credential || credential.status !== "ACTIVE") {
+      unavailable.push(identity);
+      return [];
+    }
     // The same rule claimProviderHealthTrial applies under its locks: a
     // pending backoff or a live half-open trial on the account or the model.
     const coolingDown =
@@ -851,8 +869,8 @@ export async function listPublicOverflowTargets(
       {
         coolingDown,
         target: {
+          ...identity,
           poolMemberId: member.id,
-          executionTargetId: member.ExecutionTarget!.id,
           inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
           capacityWaitBudgetMs:
             member.capacityWaitBudgetMode === "UNLIMITED"
@@ -861,24 +879,16 @@ export async function listPublicOverflowTargets(
                 ? member.capacityWaitBudgetMs
                 : pool.capacityWaitBudgetMs,
           publicOrder: member.publicOrder ?? 0,
-          providerModelId: model.id,
-          upstreamModelId: model.upstreamModelId,
           contextWindow: model.contextWindow,
           maxOutputTokens: model.maxOutputTokens,
-          protocol,
-          providerAccountId: account.id,
-          endpointIdentity: account.endpointIdentity,
-          endpointVersion: account.endpointVersion,
           concurrencyLimit: model.concurrencyLimit,
           providerVersion: account.providerVersion,
           baseUrl: account.baseUrl,
           authType: account.authType,
           healthStatus: model.healthStatus,
           nativeProtocols: nativeProtocols(model.nativeCapabilities),
-          nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
           supportsStreaming: supportsStreaming(model.nativeCapabilities),
           supportedFeatures: supportedFeatures(model.nativeCapabilities),
-          capabilityInventory,
           credential,
         } satisfies PublicProviderTarget,
       },
@@ -898,6 +908,7 @@ export async function listPublicOverflowTargets(
     },
     targets: listed.flatMap((item) => (item.coolingDown ? [] : [item.target])),
     coolingDown: listed.flatMap((item) => (item.coolingDown ? [item.target] : [])),
+    unavailable,
   };
 }
 
@@ -1808,6 +1819,7 @@ export async function dispatchPublicOverflow(
     listPublicOverflowTargets(request.userId, request.poolId),
     readExternalConsentDenial(sendConsent),
   ]);
+  if (callerDenial === "REQUESTER_NOT_VISIBLE") return { dispatched: false, reason: callerDenial };
   if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
   if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
     return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
@@ -1853,7 +1865,9 @@ export async function dispatchPublicOverflow(
   // temporarily unavailable, not an incompatible request.
   if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
     return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
-  // A stored-response binding that matches no servable or cooling member is
+  if (binding && listed.unavailable.some((target) => matchesExactResponsesBinding(target, binding)))
+    return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+  // A stored-response binding that matches no live member is
   // permanently invalid: no retry can make it match again.
   if (compatible.length === 0 && binding)
     return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
@@ -2101,6 +2115,7 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         reason: "FAILED",
+        dispatchOutcome: "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
@@ -2192,7 +2207,7 @@ export async function dispatchPublicOverflow(
       // without a verdict and settle the attempt as never sent.
       claim = "FAILED";
     }
-    if (claim === "FAILED") {
+    if (claim === "FAILED" || request.signal.aborted || attemptController.signal.aborted) {
       stopHeartbeat();
       lastSendFailure = "SEND_CLAIM_FAILED";
       await releaseProviderHealthTrial({
@@ -2212,6 +2227,7 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        dispatchOutcome: "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
@@ -2260,6 +2276,7 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         reason: "CANCELLED",
+        dispatchOutcome: "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
@@ -2283,28 +2300,33 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       return { dispatched: false, reason: claim.reason };
     }
+    let providerIoStarted = false;
     try {
-      const secret = claim.secret;
+      // Finish local argument construction before marking I/O as possible.
+      // A malformed URL/auth value can throw without invoking the transport.
+      const options = {
+        method: request.method ?? "POST",
+        path: joinProviderPath(target.baseUrl, upstream.path),
+        headers: Object.fromEntries(upstream.headers.entries()),
+        body: upstream.body,
+        signal: AbortSignal.any([
+          request.signal,
+          attemptController.signal,
+          AbortSignal.timeout(14 * 60_000),
+        ]),
+      };
+      const auth = providerAuth(target, claim.secret);
+      providerIoStarted = true;
       const response = await providerHttpsRequest(
         target.baseUrl,
-        {
-          method: request.method ?? "POST",
-          path: joinProviderPath(target.baseUrl, upstream.path),
-          headers: Object.fromEntries(upstream.headers.entries()),
-          body: upstream.body,
-          signal: AbortSignal.any([
-            request.signal,
-            attemptController.signal,
-            AbortSignal.timeout(14 * 60_000),
-          ]),
-        },
+        options,
         {
           egressEnabled: true,
           allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
           timeoutMs: 60_000,
         },
         upstream.protocol,
-        providerAuth(target, secret),
+        auth,
       );
       destroyAttempt = (error) => response.destroy(error);
       const status = response.statusCode ?? 502;
@@ -2755,7 +2777,7 @@ export async function dispatchPublicOverflow(
       // A caller disappearing before provider response is not evidence that
       // the provider transport is unhealthy. Keep the existing health state;
       // cancellation still terminalizes and reconciles the durable attempt.
-      if (!request.signal.aborted && !attemptController.signal.aborted) {
+      if (providerIoStarted && !request.signal.aborted && !attemptController.signal.aborted) {
         await recordProviderOutcome({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -2766,7 +2788,7 @@ export async function dispatchPublicOverflow(
           fencingToken,
         }).catch(() => undefined);
       }
-      if (request.signal.aborted || attemptController.signal.aborted) {
+      if (!providerIoStarted || request.signal.aborted || attemptController.signal.aborted) {
         await releaseProviderHealthTrial({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -2785,6 +2807,7 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        dispatchOutcome: providerIoStarted ? undefined : "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
@@ -2797,7 +2820,11 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         eventType: "TERMINAL",
-        reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
+        reason: request.signal.aborted
+          ? "CANCELLED"
+          : providerIoStarted
+            ? "TRANSPORT"
+            : "REQUEST_SETUP_FAILED",
         ...providerEventRouting({ request, target, nativeSurface }),
         reservationId: admission.reservationIds[0],
         reservationIds: admission.reservationIds,

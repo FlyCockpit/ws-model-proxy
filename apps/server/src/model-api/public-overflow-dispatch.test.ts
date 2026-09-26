@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -38,6 +39,7 @@ const db = vi.hoisted(() => ({
   capacityWaiter: { groupBy: vi.fn().mockResolvedValue([]) },
   relayRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
   $transaction: vi.fn(),
+  $queryRaw: vi.fn(),
 }));
 
 const MockDecimal = vi.hoisted(
@@ -119,7 +121,12 @@ import {
   targetsForForcedPoolMember,
 } from "./public-overflow.js";
 
-beforeEach(resetConsentState);
+beforeEach(() => {
+  resetConsentState();
+  db.$queryRaw.mockImplementation((strings: TemplateStringsArray, ...values: unknown[]) =>
+    mockRequesterValidityQuery(strings, values, consentDelegates()),
+  );
+});
 
 /**
  * The consent rows the E0 send-claim transaction locks and re-reads: the same
@@ -557,6 +564,8 @@ describe("owner consent is re-read at dispatch", () => {
 
   it("refuses a grantee when the owner stopped paying for grantees", async () => {
     providerHttpsRequest.mockClear();
+    consentState.token = { ...consentState.token, userId: "grantee" };
+    consentState.grant = currentGrant();
     db.modelPool.findFirst.mockResolvedValue({
       ...dispatchPoolFixture(),
       fallbackForGrantees: false,
@@ -568,6 +577,13 @@ describe("owner consent is re-read at dispatch", () => {
     });
     expect(request.releaseLocalCapacity).not.toHaveBeenCalled();
     expect(providerHttpsRequest).not.toHaveBeenCalled();
+    // Losing the exact grant is permanent even alongside these flags.
+    consentState.grant = null;
+    consentState.token = { ...consentState.token, allowExternal: false };
+    await expect(dispatchPublicOverflow(request)).resolves.toEqual({
+      dispatched: false,
+      reason: "REQUESTER_NOT_VISIBLE",
+    });
   });
 });
 
@@ -700,6 +716,19 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
         reason: "REQUESTER_ACCESS_BLOCKED",
       },
     ],
+    [
+      "grant replacement alongside token and pool consent",
+      {
+        requester: "grantee",
+        withdraw: (fixture) => {
+          consentState.grant = { id: "replacement-grant", ownerUserId: "owner" };
+          consentState.token = { ...consentState.token, allowExternal: false };
+          fixture.fallbackEnabled = false;
+          fixture.fallbackForGrantees = false;
+        },
+        reason: "REQUESTER_NOT_VISIBLE",
+      },
+    ],
   ];
 
   /** Consent fields for the withdrawal's requester kind (API token or Chat Test session). */
@@ -743,7 +772,9 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
       fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential;
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        if (strings.join("").includes('AS "requesterValid"'))
+          return mockRequesterValidityQuery(strings, values, consentDelegates());
         lockedSql.push(strings.join("?").replace(/\s+/g, " "));
         return [];
       }),
@@ -778,7 +809,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
     // handed back without a health verdict against the provider.
     expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
     expect(reconcileProviderBudget).toHaveBeenCalledWith(
-      expect.objectContaining({ reason: "CANCELLED", poolId: "pool" }),
+      expect.objectContaining({ reason: "CANCELLED", poolId: "pool", dispatchOutcome: "NOT_SENT" }),
     );
     expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
     expect(recordProviderOutcome).not.toHaveBeenCalled();
@@ -816,7 +847,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
     },
   );
 
-  it.each([withdrawals[0]!, withdrawals[5]!, withdrawals[6]!, withdrawals[7]!])(
+  it.each([withdrawals[0]!, withdrawals[5]!, withdrawals[6]!, withdrawals[7]!, withdrawals[10]!])(
     "refuses a stored-response DELETE when %s is withdrawn during budget admission",
     async (_label, withdrawal) => {
       const fixture = dispatchPoolFixture("openai", "openai-responses");
@@ -878,7 +909,9 @@ describe("requester validity lapsing during the send claim's provider-lock wait"
       fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential;
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        if (strings.join("").includes('AS "requesterValid"'))
+          return mockRequesterValidityQuery(strings, values, consentDelegates());
         if (strings.join("?").includes("FROM provider_account")) onAccountLock();
         return [];
       }),
@@ -959,7 +992,7 @@ describe("requester validity lapsing during the send claim's provider-lock wait"
       expect(providerHttpsRequest).not.toHaveBeenCalled();
       expect(tx.providerCredential.update).not.toHaveBeenCalled();
       expect(reconcileProviderBudget).toHaveBeenCalledWith(
-        expect.objectContaining({ reason: "CANCELLED" }),
+        expect.objectContaining({ reason: "CANCELLED", dispatchOutcome: "NOT_SENT" }),
       );
       expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
       expect(recordProviderOutcome).not.toHaveBeenCalled();
@@ -976,21 +1009,36 @@ describe("send-claim failures before provider I/O", () => {
   it.each([
     ["a lock or connection timeout", "timeout"],
     ["the credential is no longer current", "not-current"],
+    ["request argument construction fails after the claim", "request-options"],
   ] as const)("records no provider health verdict for %s", async (_label, failure) => {
     providerHttpsRequest.mockReset();
     reconcileProviderBudget.mockClear();
     releaseProviderHealthTrial.mockClear();
     recordProviderOutcome.mockClear();
     const fixture = dispatchPoolFixture();
+    if (failure === "request-options")
+      fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.baseUrl = "invalid-url";
     db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        if (strings.join("").includes('AS "requesterValid"'))
+          return mockRequesterValidityQuery(strings, values, consentDelegates());
         if (failure === "timeout" && strings.join("?").includes("FROM provider_account"))
           throw new Error("canceling statement due to lock timeout");
         return [];
       }),
-      providerCredential: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() },
+      providerCredential: {
+        findFirst: vi
+          .fn()
+          .mockResolvedValue(
+            failure === "request-options"
+              ? fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount
+                  .CurrentCredential
+              : null,
+          ),
+        update: vi.fn(),
+      },
     };
     db.$transaction.mockImplementation(async (callback: (value: typeof tx) => unknown) =>
       callback(tx),
@@ -1017,13 +1065,16 @@ describe("send-claim failures before provider I/O", () => {
       retrySafe: false,
     });
 
-    expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
+    expect(result).toEqual({
+      dispatched: false,
+      reason: failure === "request-options" ? "PROVIDER_UNAVAILABLE" : "SEND_CLAIM_FAILED",
+    });
     expect(providerHttpsRequest).not.toHaveBeenCalled();
     expect(recordProviderOutcome).not.toHaveBeenCalled();
     expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
     expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
     expect(reconcileProviderBudget).toHaveBeenCalledWith(
-      expect.objectContaining({ reason: "FAILED" }),
+      expect.objectContaining({ reason: "FAILED", dispatchOutcome: "NOT_SENT" }),
     );
   });
 });
@@ -1074,6 +1125,72 @@ describe("bound (stored-response) dispatch classification", () => {
     exactResponsesBinding: binding,
   });
 
+  it.each(["model", "account"] as const)(
+    "treats reversible %s disable as unavailable and re-enable as ready",
+    async (which) => {
+      providerHttpsRequest.mockReset();
+      const fixture = boundFixture();
+      const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+      const disabled = which === "model" ? model : model.ProviderAccount;
+      disabled.enabled = false;
+      db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+      const listed = await listPublicOverflowTargets("owner", "pool");
+      expect(listed.targets).toEqual([]);
+      expect(listed.coolingDown).toEqual([]);
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(listed.unavailable).toHaveLength(1);
+      disabled.enabled = true;
+      const recovered = await listPublicOverflowTargets("owner", "pool");
+      expect(recovered.targets).toHaveLength(1);
+      expect(recovered.unavailable).toEqual([]);
+      // The same immutable binding becomes dispatchable without recreation.
+      vi.mocked(claimProviderHealthTrial).mockResolvedValueOnce("COOLDOWN");
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNHEALTHY",
+      });
+      // Deleted identities and changed identities remain permanently invalid,
+      // including while the same rows are disabled.
+      disabled.enabled = false;
+      Object.assign(model.ProviderAccount, { endpointVersion: 99 });
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "BOUND_TARGET_INVALID",
+      });
+      Object.assign(model.ProviderAccount, { endpointVersion: 1 });
+      Object.assign(disabled, { deletedAt: new Date() });
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "BOUND_TARGET_INVALID",
+      });
+    },
+  );
+
+  it.each(["missing", "revoked"] as const)(
+    "keeps a binding unavailable while its credential is %s",
+    async (state) => {
+      providerHttpsRequest.mockReset();
+      const fixture = boundFixture();
+      const account = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount;
+      const credential = structuredClone(account.CurrentCredential);
+      Object.assign(account, {
+        CurrentCredential: state === "missing" ? null : { ...credential, status: "REVOKED" },
+      });
+      db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      account.CurrentCredential = credential;
+      expect((await listPublicOverflowTargets("owner", "pool")).targets).toHaveLength(1);
+    },
+  );
+
   it("reports a binding that no longer matches its endpoint as permanently invalid", async () => {
     providerHttpsRequest.mockReset();
     const fixture = boundFixture();
@@ -1097,20 +1214,29 @@ describe("bound (stored-response) dispatch classification", () => {
     expect(providerHttpsRequest).not.toHaveBeenCalled();
   });
 
-  it("reports a health-trial COOLDOWN at dispatch as unhealthy (transient)", async () => {
-    providerHttpsRequest.mockReset();
-    recordProviderOutcome.mockClear();
-    const fixture = boundFixture();
-    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
-    // Another request's half-open trial started after this request listed.
-    vi.mocked(claimProviderHealthTrial).mockResolvedValueOnce("COOLDOWN");
-    await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
-      dispatched: false,
-      reason: "PROVIDER_UNHEALTHY",
-    });
-    expect(providerHttpsRequest).not.toHaveBeenCalled();
-    expect(recordProviderOutcome).not.toHaveBeenCalled();
-  });
+  it.each(["COOLDOWN", "exception"] as const)(
+    "reports health-trial %s at dispatch as unhealthy and never sent",
+    async (outcome) => {
+      providerHttpsRequest.mockReset();
+      recordProviderOutcome.mockClear();
+      const fixture = boundFixture();
+      db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+      reconcileProviderBudget.mockClear();
+      // Another request's half-open trial started after this request listed.
+      if (outcome === "exception")
+        vi.mocked(claimProviderHealthTrial).mockRejectedValueOnce(new Error("trial claim failed"));
+      else vi.mocked(claimProviderHealthTrial).mockResolvedValueOnce("COOLDOWN");
+      await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNHEALTHY",
+      });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ dispatchOutcome: "NOT_SENT" }),
+      );
+    },
+  );
 
   it("classifies a member with a live half-open trial as cooling down at listing", async () => {
     const fixture = boundFixture();
@@ -1265,7 +1391,9 @@ describe("public overflow terminal response dispatch", () => {
     db.providerAttempt.groupBy.mockRejectedValueOnce(new Error("affinity load unavailable"));
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1397,7 +1525,9 @@ describe("public overflow terminal response dispatch", () => {
     db.providerPricingVersion.findFirst.mockReset().mockResolvedValue(null);
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1494,7 +1624,9 @@ describe("public overflow terminal response dispatch", () => {
     );
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1577,7 +1709,9 @@ describe("public overflow terminal response dispatch", () => {
       db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
       const tx = {
         ...consentDelegates(),
-        $queryRaw: vi.fn().mockResolvedValue([]),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -1750,7 +1884,9 @@ describe("public overflow terminal response dispatch", () => {
     });
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential",
@@ -1853,7 +1989,9 @@ describe("public overflow terminal response dispatch", () => {
       db.providerPricingVersion.findFirst.mockResolvedValue(null);
       const tx = {
         ...consentDelegates(),
-        $queryRaw: vi.fn().mockResolvedValue([]),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -1937,7 +2075,9 @@ describe("public overflow terminal response dispatch", () => {
     db.providerPricingVersion.findFirst.mockResolvedValue(null);
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1999,7 +2139,7 @@ describe("public overflow terminal response dispatch", () => {
     rememberAffinity.mockResolvedValue(undefined);
   });
 
-  it("does not record client cancellation before response as a provider transport failure", async () => {
+  it("settles cancellation before provider I/O as not sent with no health verdict", async () => {
     recordProviderOutcome.mockClear();
     db.modelPool.findFirst.mockResolvedValue({
       fallbackEnabled: true,
@@ -2056,7 +2196,9 @@ describe("public overflow terminal response dispatch", () => {
     });
     const tx = {
       ...consentDelegates(),
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-cancel",
@@ -2076,7 +2218,8 @@ describe("public overflow terminal response dispatch", () => {
     );
     const controller = new AbortController();
     controller.abort(new Error("client disconnected"));
-    providerHttpsRequest.mockRejectedValueOnce(controller.signal.reason);
+    providerHttpsRequest.mockReset();
+    reconcileProviderBudget.mockClear();
 
     const result = await dispatchPublicOverflow({
       userId: "owner",
@@ -2099,8 +2242,12 @@ describe("public overflow terminal response dispatch", () => {
       retrySafe: false,
     });
 
-    expect(result).toEqual({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
+    expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
     expect(recordProviderOutcome).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "CANCELLED", dispatchOutcome: "NOT_SENT" }),
+    );
   });
 
   it("aborts a pending provider request when heartbeat ownership is lost", async () => {
@@ -2112,7 +2259,9 @@ describe("public overflow terminal response dispatch", () => {
       db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
       const tx = {
         ...consentDelegates(),
-        $queryRaw: vi.fn().mockResolvedValue([]),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -2185,7 +2334,9 @@ describe("public overflow terminal response dispatch", () => {
       db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
       const tx = {
         ...consentDelegates(),
-        $queryRaw: vi.fn().mockResolvedValue([]),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
 const db = vi.hoisted(() => ({ $transaction: vi.fn() }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
@@ -580,7 +581,9 @@ describe("public overflow compatibility", () => {
     const envelope = encryptProviderCredential("provider-secret", identity, keyring);
     const order: string[] = [];
     const tx = {
-      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        if (strings.join("").includes('AS "requesterValid"'))
+          return mockRequesterValidityQuery(strings, values, tx);
         order.push(`lock:${lockedTable(strings)}`);
         return [];
       }),
@@ -710,7 +713,9 @@ describe("public overflow compatibility", () => {
     async (_label, change, reason) => {
       const order: string[] = [];
       const tx = {
-        $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+          if (strings.join("").includes('AS "requesterValid"'))
+            return mockRequesterValidityQuery(strings, values, tx);
           order.push(`lock:${lockedTable(strings)}`);
           return [];
         }),
@@ -785,7 +790,9 @@ describe("public overflow compatibility", () => {
           token: { expiresAt: new Date(CLAIM_START.getTime() + 1_000) },
         });
         const tx = {
-          $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+          $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+            if (strings.join("").includes('AS "requesterValid"'))
+              return mockRequesterValidityQuery(strings, values, tx);
             const table = lockedTable(strings);
             order.push(`lock:${table}`);
             // The change commits while the claim waits for the account lock.
@@ -821,6 +828,73 @@ describe("public overflow compatibility", () => {
     },
   );
 
+  it.each(["initial", "post-lock"] as const)(
+    "rejects a continuously renewed ban at the %s requester read despite delayed delivery",
+    async (phase) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(CLAIM_START);
+      try {
+        const keyring = parseProviderCredentialKeyring(
+          `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+        );
+        const identity = {
+          credentialId: "credential",
+          userId: "owner",
+          providerAccountId: "account",
+          credentialType: "BEARER" as const,
+          aadVersion: 1,
+        };
+        const envelope = encryptProviderCredential("test-provider-secret", identity, keyring);
+        let banned = phase === "initial";
+        let liveBanExpires = new Date(Date.now() + 1000);
+        let observations = 0;
+        const rows = consentTx([]);
+        rows.user.findUnique.mockImplementation(async () => {
+          if (!banned) return { banned: false, banExpires: null, deletionRequestedAt: null };
+          const readAt = Date.now();
+          const snapshot = { banned: true, banExpires: liveBanExpires, deletionRequestedAt: null };
+          expect(liveBanExpires.getTime()).toBeGreaterThan(readAt);
+          liveBanExpires = new Date(readAt + 3000);
+          await Promise.resolve();
+          vi.setSystemTime(readAt + 2000);
+          observations += 1;
+          expect(liveBanExpires.getTime()).toBeGreaterThan(Date.now());
+          return snapshot;
+        });
+        const tx = {
+          ...rows,
+          $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+            if (strings.join("").includes("FROM provider_account")) banned = true;
+            return mockRequesterValidityQuery(strings, values, rows);
+          }),
+          providerCredential: {
+            findFirst: vi
+              .fn()
+              .mockResolvedValue({ ...identity, id: identity.credentialId, ...envelope }),
+            update: vi.fn().mockResolvedValue({ id: identity.credentialId }),
+          },
+        };
+        db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
+          callback(tx),
+        );
+        await expect(
+          withEgressEnabled(() =>
+            claimPublicProviderCredentialForSend({
+              userId: "owner",
+              target: claimTarget(),
+              keyring,
+              consent: GRANTEE_TOKEN_CONSENT,
+            }),
+          ),
+        ).resolves.toEqual({ claimed: false, reason: "REQUESTER_ACCESS_BLOCKED" });
+        expect(observations).toBe(1);
+        expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("refuses the send claim with the deployment switch off without opening a transaction", async () => {
     db.$transaction.mockClear();
     const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
@@ -837,7 +911,9 @@ describe("public overflow compatibility", () => {
 
   it("fails a send-start claim when revocation won the lifecycle lock", async () => {
     const tx = {
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, tx),
+      ),
       ...consentTx([]),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(null),

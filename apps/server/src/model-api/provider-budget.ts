@@ -97,6 +97,8 @@ export interface ProviderBudgetTerminal {
   attemptId: string;
   fencingToken: bigint;
   reason: "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "CRASH_RECOVERY";
+  /** Explicit proof that provider I/O never began. Omission conservatively assumes it may have. */
+  dispatchOutcome?: "NOT_SENT";
   /** Stable upstream usage revision identity. Duplicate delivery is idempotent. */
   sourceVersion?: string;
   /** Provider-scoped, strictly increasing sequence for this attempt. */
@@ -265,6 +267,7 @@ function terminalPayloadHash(
     attemptId: terminal.attemptId,
     fencingToken: terminal.fencingToken,
     reason: terminal.reason,
+    dispatchOutcome: terminal.dispatchOutcome,
     sourceVersion,
     revisionSequence: terminal.revisionSequence,
     revisionKind: terminal.revisionKind,
@@ -706,6 +709,16 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.revisionSequence > MAX_SIGNED_BIGINT
   )
     throw new ProviderBudgetConfigurationError("Invalid fencing token");
+  if (
+    terminal.dispatchOutcome === "NOT_SENT" &&
+    (terminal.usage ||
+      terminal.reason === "COMPLETED" ||
+      terminal.reason === "CRASH_RECOVERY" ||
+      terminal.revisionKind !== "SNAPSHOT")
+  )
+    throw new ProviderBudgetConfigurationError(
+      "Not-sent settlement requires a failed/cancelled snapshot without usage",
+    );
   assertUsage(terminal.usage);
   if (
     terminal.observationComplete !== undefined &&
@@ -895,7 +908,9 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       const settledCost = costKnown ? decimal(suppliedCost) : null;
 
       for (const reservation of reservations) {
+        const notSent = terminal.dispatchOutcome === "NOT_SENT";
         const trustworthy =
+          notSent ||
           reservation.metric === "CONCURRENCY" ||
           (reservation.metric === "TOKENS" &&
             accountingMatches &&
@@ -907,11 +922,13 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           _sum: { settledValue: true },
         });
         const priorTotal = prior._sum.settledValue ?? new Prisma.Decimal(0);
-        const observation = trustworthy
-          ? reservation.metric === "SPEND" && settledCost
-            ? settledCost
-            : terminalValue(reservation.metric, usage)
-          : reservation.reservedValue;
+        const observation = notSent
+          ? new Prisma.Decimal(0)
+          : trustworthy
+            ? reservation.metric === "SPEND" && settledCost
+              ? settledCost
+              : terminalValue(reservation.metric, usage)
+            : reservation.reservedValue;
         const delta =
           terminal.revisionKind === "SNAPSHOT"
             ? observation.minus(priorTotal)

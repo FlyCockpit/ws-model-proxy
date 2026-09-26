@@ -96,8 +96,11 @@
  *       (the order every provider lifecycle writer uses).
  *
  * After C5 (the last statement that can wait) it re-reads the requester's
- * token and `user` row WITHOUT a lock and re-evaluates token expiry, ban and
- * deletion mark at a fresh `now` (`recheckExternalSendRequesterValidity`).
+ * token and `user` row WITHOUT a lock in one SQL statement that evaluates
+ * token expiry, ban and deletion mark against statement_timestamp()
+ * (`recheckExternalSendRequesterValidity`). The snapshot and its clock must
+ * be coherent: comparing a returned ban expiry with a later JS clock could
+ * accept a continuously renewed ban. Transaction now() predates the C5 wait.
  * No `user` lock is needed: every statement after that read is non-blocking
  * (the credential row is already held) and none writes a row the ban or
  * deletion-mark writers read, so a mark committing after the read serializes

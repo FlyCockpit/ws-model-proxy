@@ -7125,9 +7125,11 @@ async function relayBoundProviderResponse(input: {
     // The full immutable binding (execution target, account, model, endpoint
     // identity and version, upstream model, native Responses support), the
     // same predicate the dispatcher applies.
-    const isBoundTarget = (target: (typeof listed.targets)[number]) =>
+    const isBoundTarget = (target: Parameters<typeof matchesExactResponsesBinding>[0]) =>
       matchesExactResponsesBinding(target, input.stickyRoute.binding);
     const exactTarget = listed.targets.find(isBoundTarget);
+    if (!exactTarget && listed.unavailable.some(isBoundTarget))
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     // The bound member still matches but is in a provider health cooldown or
     // has a half-open trial in flight: temporarily unavailable (503), not gone.
     if (!exactTarget && listed.coolingDown.some(isBoundTarget))
@@ -7205,22 +7207,22 @@ async function relayBoundProviderResponse(input: {
         ? "access_denied"
         : result.reason === "PROVIDER_SATURATED"
           ? "rate_limited"
-          : result.reason === "BOUND_TARGET_INVALID"
+          : result.reason === "BOUND_TARGET_INVALID" || result.reason === "REQUESTER_NOT_VISIBLE"
             ? "not_found"
             : "disconnected";
     await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
       metadataUpdateError,
     );
-    // Consent withdrawn at dispatch (switch, owner flags, token, grant): a
-    // permission error, never a success-shaped or "gone" response.
+    // Restorable consent withdrawals are permission errors; a lost exact
+    // grant permanently invalidates the binding, just as at arrival.
     if (denied) return externalRouteErrorResponse("responses", denied);
     if (failure === "rate_limited" || failure === "cancelled")
       return openAiFailureJsonResponse(failure);
     if (failure === "disconnected")
-      return openAiFailureJsonResponse(
-        failure,
-        "The bound provider Responses target is temporarily unavailable. Try again later.",
-      );
+      return externalRouteErrorResponse("responses", {
+        code: "external_unavailable",
+        message: "The bound provider Responses target is temporarily unavailable. Try again later.",
+      });
     return openAiFailureJsonResponse(
       "not_found",
       "The bound provider Responses target is no longer available.",
@@ -7347,6 +7349,7 @@ function boundDispatchDenial(
   reason: PublicOverflowSkipReason,
   pool: Pick<VisibleModelPoolTarget, "modelId">,
 ): ExternalRouteError | null {
+  if (reason === "REQUESTER_NOT_VISIBLE") return null;
   if (reason === "DEPLOYMENT_GATE_DISABLED")
     return externalDenialError("DEPLOYMENT_DISABLED", pool);
   if (isExternalConsentDenialReason(reason))

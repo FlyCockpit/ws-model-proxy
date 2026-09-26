@@ -602,3 +602,63 @@ describe("modelApiTokenAccess", () => {
     });
   });
 });
+
+// E0 uses the same authoritative statement-clock decision on arrival and
+// after provider locks; the latter must not reuse transaction-start now().
+describe("external requester validity SQL", () => {
+  const identity = {
+    requesterUserId: "owner",
+    ownerUserId: "owner",
+    poolId: "pool",
+    modelApiTokenId: null,
+    accessGrantId: null,
+  };
+
+  it.each(["entry", "post-lock"] as const)("uses a coherent DB decision at %s", async (phase) => {
+    const { readExternalConsentDenial, recheckExternalSendRequesterValidity } = await import(
+      "./model-api-token-access"
+    );
+    const raw = vi
+      .mocked(prisma.$queryRaw)
+      .mockResolvedValueOnce([{ tokenValid: false, scopeMode: null, requesterValid: true }]);
+    raw.mockClear();
+    const result =
+      phase === "entry"
+        ? await readExternalConsentDenial(identity)
+        : await recheckExternalSendRequesterValidity(prisma, identity);
+    expect(result).toBeNull();
+    const [strings, ...values] = raw.mock.calls[0]!;
+    const sql = Array.isArray(strings) ? strings.join("?") : "";
+    expect(sql).toContain('t."expiresAt" > statement_timestamp()');
+    expect(sql).toContain('u."banExpires" < statement_timestamp()');
+    expect(sql).toContain('u."deletionRequestedAt" IS NULL');
+    expect(sql).toContain('t."revokedAt" IS NULL');
+    expect(sql).not.toMatch(/FOR (SHARE|UPDATE)|\bnow\(\)/);
+    expect(values).toEqual(["owner", null, "owner"]);
+  });
+
+  it.each([
+    [true, true, null],
+    [false, true, "TOKEN_CONSENT_WITHDRAWN"],
+    [true, false, "REQUESTER_ACCESS_BLOCKED"],
+  ] as const)(
+    "consumes tokenValid=%s, requesterValid=%s without a later clock comparison",
+    async (tokenValid, requesterValid, expected) => {
+      const { recheckExternalSendRequesterValidity } = await import("./model-api-token-access");
+      vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([
+        { tokenValid, requesterValid, scopeMode: "ALL_VISIBLE" },
+      ]);
+      await expect(
+        recheckExternalSendRequesterValidity(prisma, { ...identity, modelApiTokenId: "token" }),
+      ).resolves.toBe(expected);
+    },
+  );
+
+  it("fails closed on an absent requester result", async () => {
+    const { recheckExternalSendRequesterValidity } = await import("./model-api-token-access");
+    vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([]);
+    await expect(recheckExternalSendRequesterValidity(prisma, identity)).resolves.toBe(
+      "REQUESTER_ACCESS_BLOCKED",
+    );
+  });
+});

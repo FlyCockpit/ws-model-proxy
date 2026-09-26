@@ -309,6 +309,7 @@ function listedExternalTargets(
     },
     targets,
     coolingDown: [],
+    unavailable: [],
   };
 }
 
@@ -755,6 +756,7 @@ describe("model API routes", () => {
       },
       targets: [],
       coolingDown: [],
+      unavailable: [],
     });
     publicOverflow.buildAffinityTargets.mockImplementation(async ({ targets }) =>
       targets.map((target: { poolMemberId: string; executionTargetId: string }) => ({
@@ -6788,6 +6790,7 @@ describe("model API routes", () => {
       },
       targets: [providerTarget],
       coolingDown: [],
+      unavailable: [],
     });
     const capacityRuntime = admittingCapacityRuntime();
     publicOverflow.dispatch.mockResolvedValueOnce({
@@ -7577,6 +7580,89 @@ describe("model API routes", () => {
       },
     );
 
+    it.each(boundOperations)(
+      "%s answers 503 for a disabled binding and works after re-enable",
+      async (_label, method, path, create) => {
+        publicOverflow.list.mockResolvedValue({
+          ...listedExternalTargets([]),
+          unavailable: [boundProvider()],
+        });
+        const runtime = admittingCapacityRuntime();
+        const app = appWith(new FakeRelayManager(), runtime);
+        const response = await app.request(path, boundRequest(method, create));
+        expect(response.status).toBe(503);
+        expect(await response.json()).toMatchObject({ error: { code: "external_unavailable" } });
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()]));
+        publicOverflow.dispatch.mockResolvedValueOnce(boundDispatch());
+        const recovered = await app.request(path, boundRequest(method, create));
+        expect(recovered.status).toBe(200);
+        await recovered.text();
+      },
+    );
+
+    it.each(boundOperations)(
+      "%s answers 404 when the binding's grant is lost at the send boundary",
+      async (_label, method, path, create) => {
+        publicOverflow.dispatch.mockResolvedValueOnce({
+          dispatched: false,
+          reason: "REQUESTER_NOT_VISIBLE",
+        });
+        const runtime = admittingCapacityRuntime();
+        const limiter = new ModelApiConcurrencyLimiter();
+        const release = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release });
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          path,
+          boundRequest(method, create),
+        );
+        expect(response.status).toBe(404);
+        expect(runtime.release).toHaveBeenCalledTimes(1);
+        expect(release).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each(boundOperations)(
+      "%s keeps revoked and replaced grants not found at arrival",
+      async (_label, method, path, create) => {
+        for (const replacement of [null, "replacement-grant"]) {
+          mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+            directModels: [],
+            modelPools: replacement
+              ? [
+                  {
+                    ...externalPoolTarget,
+                    ownerUserId: "pool-owner-id",
+                    accessGrantId: replacement,
+                    fallbackForGrantees: true,
+                  },
+                ]
+              : [],
+          });
+          db.responseStickinessRecord.findUnique.mockResolvedValue(
+            consentedProviderBinding({
+              poolGrantId: "original-grant",
+              PoolGrant: replacement
+                ? {
+                    id: "original-grant",
+                    poolId: "pool-id",
+                    ownerUserId: "pool-owner-id",
+                    granteeUserId: "user-id",
+                  }
+                : null,
+            }),
+          );
+          const response = await appWith(
+            new FakeRelayManager(),
+            admittingCapacityRuntime(),
+          ).request(path, boundRequest(method, create));
+          expect(response.status).toBe(404);
+          expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        }
+      },
+    );
+
     // R1-A: a bound operation's consent carries the binding's own grant, so
     // the send claim refuses it once that grant is replaced.
     it("binds a grantee's bound operation consent to the binding's grant", async () => {
@@ -7676,6 +7762,10 @@ describe("model API routes", () => {
       ["PROVIDER_UNAVAILABLE", 503],
       ["BUDGET_EXCEEDED", 503],
       ["BOUND_TARGET_INVALID", 404],
+      ["REQUESTER_NOT_VISIBLE", 404],
+      ["POOL_PRIVATE", 403],
+      ["GRANTEE_NOT_COVERED", 403],
+      ["CALLER_CONSENT_WITHDRAWN", 403],
       ["REQUESTER_ACCESS_BLOCKED", 403],
     ] as const)("maps a bound dispatch result %s to %i", async (reason, status) => {
       publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });

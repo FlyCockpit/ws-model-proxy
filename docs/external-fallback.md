@@ -42,8 +42,8 @@ someone other than the owner, the exact pool grant the request was resolved
 under; a revoked and re-created grant does not count). That last check runs
 in the same database transaction that claims the provider credential for the
 send, and it holds those settings unchanged until the send is claimed; token
-expiry and the account state are evaluated again after that transaction's
-last lock wait. If any of them no longer holds, nothing is sent. A change
+expiry and the account state are evaluated together against the database's
+statement clock, again after that transaction's last lock wait. If any of them no longer holds, nothing is sent. A change
 saved after that point applies from the next send.
 
 The request goes external only after local routing could not serve it:
@@ -102,18 +102,25 @@ All of these carry `x-wsmp-fallback: unavailable`.
 `/v1/models` lists `owner/pool:external` only when this token could be served
 that way (switch, token, owner settings, at least one external member).
 
+Attempts that are refused before provider I/O settle their token and spend
+reservations at zero. If bytes may have reached the provider and no trustworthy
+usage is available, settlement retains the conservative reserved amount.
+
 ## Stored Responses
 
 A response served externally can be continued, retrieved, cancelled, compacted,
 listed, or deleted only with `owner/pool:external`-level consent that still
-holds (switch, token, grant, and owner settings), checked on arrival and again
-before sending. Without it the answer is `403 external_not_permitted` (or
+holds (switch, token, and owner settings), checked on arrival and again
+before sending. Withdrawing these restorable permissions gives `403 external_not_permitted` (or
 `403 external_providers_disabled` with the switch off). A plain-name follow-up
 gets `400 external_required`. A busy provider gives `429`. A provider that is
-temporarily unavailable (health cooldown, a recovery probe already in flight,
-a failure before anything was sent) gives `503`; retry later. Only a binding
+temporarily unavailable (a disabled model or account, health cooldown, a recovery
+probe already in flight, a failure before anything was sent) gives
+`503 external_unavailable`; retry later. Only a binding
 that can never be served again (its member, endpoint identity or version,
-upstream model, or native Responses support changed) gives `404`. `:external`
+upstream model, or native Responses support changed, or its exact grant was
+revoked or replaced) gives `404`, whether detected on arrival or at the send
+boundary. Re-granting access cannot revive an old binding. `:external`
 follow-ups to locally served responses stay on their local member.
 
 ## Breaking changes in this release
