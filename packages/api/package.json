@@ -71,6 +71,9 @@
     "./lib/provider-protocol": {
       "default": "./src/lib/provider-protocol.ts"
     },
+    "./lib/provider-catalog-model": {
+      "default": "./src/lib/provider-catalog-model.ts"
+    },
     "./lib/relay-protocol-version": {
       "default": "./src/lib/relay-protocol-version.ts"
     },

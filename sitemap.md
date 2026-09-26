@@ -33,7 +33,7 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard/pools` | Own model pools and provider operations; pool cards lead to their dedicated detail pages. |
 | `/{lang}/dashboard/pools/new` | Guided model-pool creation. |
 | `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool overview, identity editor, and local members. |
-| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only public fallback and overflow providers. |
+| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only public fallback and overflow providers, plus the external-equivalent model picker (OpenRouter catalog). |
 | `/{lang}/dashboard/pools/{poolId}/routing` | Owner-only protocol compatibility and cache-affinity settings. |
 | `/{lang}/dashboard/pools/{poolId}/capacity` | Owner-only pool admission and capacity policy. |
 | `/{lang}/dashboard/pools/{poolId}/media` | Owner-only media transformer, transcription fallback, and attachment settings. |
