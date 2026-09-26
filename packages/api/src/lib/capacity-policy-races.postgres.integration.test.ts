@@ -462,7 +462,9 @@ integration("capacity policy production-router races", () => {
     expect(pools).toHaveLength(2);
     expect(pools.every((pool) => pool.PoolMembers.length === 2)).toBe(true);
     expect(
-      pools.flatMap((pool) => pool.PoolMembers).every((member) => member.tier === "PRIMARY"),
+      pools
+        .flatMap((pool) => pool.PoolMembers)
+        .every((member) => member.tier === "PUBLIC_OVERFLOW"),
     ).toBe(true);
   });
 

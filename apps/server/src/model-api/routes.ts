@@ -4348,8 +4348,13 @@ async function relayPool({
   }
   // Routing is decided from here on: a pool with local members serves or
   // fails on the local path unless an external response commits.
-  const providerOnly = listedMembers.length === 0;
-  if (!providerOnly) decidedRoute = "local";
+  const providerOnly =
+    listedMembers.length === 0 ||
+    (forcedPoolMemberId != null && members.length === 0 && external.consent);
+  if (!providerOnly) {
+    decidedRoute = "local";
+    externalAttempt.localRouteDecided = true;
+  }
   /**
    * X1 / D5: a consented `:external` request on a pool with no local members
    * whose external attempt did not dispatch. Never 400 for a transient
@@ -6547,7 +6552,11 @@ type ExternalAttemptOutcome =
   | { kind: "unavailable"; reason: ExternalUnavailableReason };
 
 /** Observed by the caller of relayPool to set `x-wsmp-fallback: unavailable`. */
-type ExternalAttemptRecord = { unavailable: ExternalUnavailableReason | null };
+type ExternalAttemptRecord = {
+  unavailable: ExternalUnavailableReason | null;
+  /** Set when the request commits to the local member path (for response headers). */
+  localRouteDecided?: boolean;
+};
 
 function externalUnavailableReason(
   reason: PublicOverflowSkipReason,
@@ -6840,10 +6849,10 @@ async function relayPreparedModeledRequest({
       (!external.consent ||
         poolTarget.externalMemberCount === 0 ||
         externalAttempt.unavailable !== null);
-    response = withResponseHeaders(response, {
-      [ROUTE_HEADER]: "local",
-      ...(noExternalPlan ? { [FALLBACK_HEADER]: "unavailable" } : {}),
-    });
+    const headers: Record<string, string> = {};
+    if (externalAttempt.localRouteDecided) headers[ROUTE_HEADER] = "local";
+    if (noExternalPlan) headers[FALLBACK_HEADER] = "unavailable";
+    if (Object.keys(headers).length > 0) response = withResponseHeaders(response, headers);
   }
   if (requester.exposeTransformDebug && prepared.transformDebug) {
     return attachTransformDebug(response, prepared.transformDebug);

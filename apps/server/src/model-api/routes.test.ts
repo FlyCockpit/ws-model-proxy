@@ -5192,6 +5192,7 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(429);
       expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
       // No route was ever decided for this request (M2).
       expect(db.relayRequest.update).toHaveBeenCalled();
@@ -5212,6 +5213,7 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(400);
       expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
       await expect(response.json()).resolves.toMatchObject({
         error: { code: "unsupported_capability" },
       });
@@ -5467,6 +5469,55 @@ describe("model API routes", () => {
     expect(publicOverflow.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({ forcedPoolMemberId: "overflow-member" }),
     );
+  });
+
+  it("treats a Chat Test forced external member like provider-only for transient outcomes", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+      }),
+    ]);
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([externalProviderTarget("overflow-member")]),
+    );
+    const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+      const candidate = attempt.candidates[0]!;
+      expect(candidate.poolMemberId).toBe("overflow-member");
+      return { state: "EXPIRED" as const };
+    });
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire,
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const response = await chatTestCompletionsHandler({
+      request: new Request("http://chat.test/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-wsmp-chat-test-member-id": "overflow-member",
+        },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      }),
+      userId: "user-id",
+      manager: new FakeRelayManager(),
+      limiter: new ModelApiConcurrencyLimiter(),
+      capacityRuntime,
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    expect(response.headers.get("x-wsmp-route")).toBeNull();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    for (const [update] of db.relayRequest.update.mock.calls)
+      expect((update as { data: Record<string, unknown> }).data.fallbackRoute).toBeUndefined();
   });
 
   it("rejects :external from MCP diagnostics without contacting a provider", async () => {
