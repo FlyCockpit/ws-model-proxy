@@ -5,9 +5,12 @@ import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
+  canonicalUsageFromCounts,
   ignoreUnknownEnvelopeFields,
   object,
+  type ProtocolUsageCounts,
   parseProtocolUsage,
+  parseProtocolUsageCounts,
   rejectUnknown,
 } from "./parse-utils.js";
 import { SseDecoder, type SseRecord } from "./sse.js";
@@ -54,6 +57,8 @@ export class CanonicalStreamParser {
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
   #chatUsageSeen = false;
+  /** Anthropic input counts seen so far; later events update only what they carry. */
+  #anthropicInput: ProtocolUsageCounts = { inputParts: {} };
   #droppedReasoningText = false;
   readonly #seenEnvelopeFields = new Set<string>();
   #messageId?: string;
@@ -885,8 +890,7 @@ export class CanonicalStreamParser {
           "Anthropic message_start envelope is invalid.",
         );
     }
-    const initialUsage =
-      type === "message_start" ? usageEvent(message.usage, "anthropic-messages", "any") : undefined;
+    const initialUsage = type === "message_start" ? this.#anthropicUsage(message.usage) : undefined;
     if (type === "message_start" && initialUsage?.usage.inputTokens === undefined)
       throw new AdapterError("invalid_usage", "Anthropic message_start requires input_tokens.");
     const events =
@@ -969,7 +973,7 @@ export class CanonicalStreamParser {
           "unsupported_stop_sequence",
           "Anthropic stop_sequence detail is not safely adaptable.",
         );
-      const usage = usageEvent(value.usage, "anthropic-messages", "any");
+      const usage = this.#anthropicUsage(value.usage);
       if (usage) events.push(usage);
       if (delta.stop_reason != null) events.push(...this.#stop(stopReason(delta.stop_reason)));
     } else if (type === "message_stop") events.push(...this.#complete());
@@ -985,6 +989,35 @@ export class CanonicalStreamParser {
       });
     }
     return events;
+  }
+
+  /**
+   * Anthropic stream usage is cumulative, but `message_delta` may send null (or
+   * omit) input and cache counts it does not restate. Merge per count so the
+   * canonical input, which adds cache reads and writes, never drops a count
+   * reported earlier. Input is emitted only when the event carries an input
+   * count, so an output-only delta keeps the earlier input untouched.
+   */
+  #anthropicUsage(value: unknown): Extract<CanonicalEvent, { type: "usage" }> | undefined {
+    const counts = parseProtocolUsageCounts(value, "anthropic-messages", "stream.usage", "any");
+    if (!counts) return undefined;
+    const seen = this.#anthropicInput;
+    let carriesInput = counts.input !== undefined;
+    if (counts.input !== undefined) seen.input = counts.input;
+    for (const [key, count] of Object.entries(counts.inputParts))
+      if (count !== undefined) {
+        seen.inputParts[key] = count;
+        carriesInput = true;
+      }
+    const usage = canonicalUsageFromCounts(
+      {
+        ...(carriesInput && seen.input !== undefined ? { input: seen.input } : {}),
+        ...(counts.output !== undefined ? { output: counts.output } : {}),
+        inputParts: seen.inputParts,
+      },
+      "stream.usage",
+    );
+    return { type: "usage", usage };
   }
 
   #streamError(value: unknown, eventRequestId?: string) {

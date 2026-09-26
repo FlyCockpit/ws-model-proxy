@@ -181,8 +181,12 @@ type UsageFields = {
   input: string;
   output: string;
   total?: string;
-  /** Other top-level counts: validated, not carried canonically. */
-  counts: readonly string[];
+  /**
+   * Input counts the surface reports outside `input` (Anthropic cache read and
+   * write). Canonical input adds them so it always means every input token
+   * processed, as OpenAI `prompt_tokens` and Responses `input_tokens` do.
+   */
+  inputParts: readonly string[];
   /** Known counts the protocol allows to be null. Null means absent. */
   nullable: readonly string[];
   /** Known detail objects (null means absent) and the counts validated inside. */
@@ -194,7 +198,7 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
     input: "prompt_tokens",
     output: "completion_tokens",
     total: "total_tokens",
-    counts: [],
+    inputParts: [],
     nullable: [],
     details: {
       prompt_tokens_details: ["cached_tokens", "audio_tokens"],
@@ -210,7 +214,7 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
     input: "input_tokens",
     output: "output_tokens",
     total: "total_tokens",
-    counts: [],
+    inputParts: [],
     nullable: [],
     details: {
       input_tokens_details: ["cached_tokens"],
@@ -218,9 +222,10 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
     },
   },
   "anthropic-messages": {
+    // Anthropic `input_tokens` excludes cache reads and writes.
     input: "input_tokens",
     output: "output_tokens",
-    counts: ["cache_creation_input_tokens", "cache_read_input_tokens"],
+    inputParts: ["cache_creation_input_tokens", "cache_read_input_tokens"],
     // Streamed `message_delta` usage may carry null input and cache counts.
     nullable: ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
     details: { cache_creation: ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] },
@@ -250,25 +255,38 @@ function usageObject(value: unknown, path: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Validated counts from one usage object. Undefined means absent or null. */
+export type ProtocolUsageCounts = {
+  input?: number;
+  output?: number;
+  /** The surface's separately reported input counts, by field name. */
+  inputParts: Record<string, number | undefined>;
+};
+
 /**
- * The one usage parser for stream and non-stream replies. Known counts use the
- * surface's fixed names and must be non-negative safe integers. Unknown keys,
- * at the top level or inside a known detail object, are ignored: they carry
- * no answer text. `required` names which canonical counts must be present.
+ * Validates one usage object. Known counts use the surface's fixed names and
+ * must be non-negative safe integers. `total_tokens` is type-checked but not
+ * reconciled: vendors differ on whether it counts reasoning, and it is never
+ * carried canonically. Unknown keys, at the top level or inside a known detail
+ * object, are ignored: they carry no answer text. `required` names which of
+ * input and output must be present.
  */
-export function parseProtocolUsage(
+export function parseProtocolUsageCounts(
   value: unknown,
   surface: ProtocolSurface,
   path: string,
   required: "both" | "any",
-): CanonicalUsage | undefined {
+): ProtocolUsageCounts | undefined {
   if (value === undefined || value === null) return undefined;
   const fields = usageFields[surface];
   const usage = usageObject(value, path);
   const nullable = new Set(fields.nullable);
   const input = usageCount(usage, fields.input, path, nullable.has(fields.input));
   const output = usageCount(usage, fields.output, path, nullable.has(fields.output));
-  for (const key of fields.counts) usageCount(usage, key, path, nullable.has(key));
+  const inputParts: Record<string, number | undefined> = {};
+  for (const key of fields.inputParts)
+    inputParts[key] = usageCount(usage, key, path, nullable.has(key));
+  if (fields.total) usageCount(usage, fields.total, path, false);
   for (const [key, counts] of Object.entries(fields.details)) {
     if (usage[key] === undefined || usage[key] === null) continue;
     const details = usageObject(usage[key], `${path}.${key}`);
@@ -279,23 +297,51 @@ export function parseProtocolUsage(
     (input === undefined && output === undefined)
   )
     throw new AdapterError("invalid_usage", `${path} is missing required token counts.`, path);
-  const total = fields.total ? usageCount(usage, fields.total, path, false) : undefined;
+  return {
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    inputParts,
+  };
+}
+
+/**
+ * Canonical usage from validated counts: input is every input token processed
+ * (the surface's input plus its separate input parts; an absent part is 0).
+ * Undefined input stays undefined.
+ */
+export function canonicalUsageFromCounts(
+  counts: ProtocolUsageCounts,
+  path: string,
+): CanonicalUsage {
+  const input =
+    counts.input === undefined
+      ? undefined
+      : Object.values(counts.inputParts).reduce<number>(
+          (sum, part) => sum + (part ?? 0),
+          counts.input,
+        );
   if (
-    total !== undefined &&
-    (input === undefined ||
-      output === undefined ||
-      !Number.isSafeInteger(input + output) ||
-      total !== input + output)
+    (input !== undefined && !Number.isSafeInteger(input)) ||
+    (input !== undefined &&
+      counts.output !== undefined &&
+      !Number.isSafeInteger(input + counts.output))
   )
-    throw new AdapterError(
-      "invalid_usage",
-      `${path}.${fields.total} must equal input plus output tokens.`,
-      `${path}.${fields.total}`,
-    );
+    throw new AdapterError("invalid_usage", `${path} token counts overflow.`, path);
   return {
     ...(input !== undefined ? { inputTokens: input } : {}),
-    ...(output !== undefined ? { outputTokens: output } : {}),
+    ...(counts.output !== undefined ? { outputTokens: counts.output } : {}),
   };
+}
+
+/** The shared usage parser for one self-contained usage object. */
+export function parseProtocolUsage(
+  value: unknown,
+  surface: ProtocolSurface,
+  path: string,
+  required: "both" | "any",
+): CanonicalUsage | undefined {
+  const counts = parseProtocolUsageCounts(value, surface, path, required);
+  return counts ? canonicalUsageFromCounts(counts, path) : undefined;
 }
 
 export function texts(value: unknown, parameter: string): CanonicalText[] {
