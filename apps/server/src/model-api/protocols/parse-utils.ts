@@ -1,5 +1,11 @@
-import type { CanonicalText, CanonicalTool, CanonicalToolChoice } from "./canonical.js";
-import { invalid, unsupported } from "./errors.js";
+import type {
+  CanonicalText,
+  CanonicalTool,
+  CanonicalToolChoice,
+  CanonicalUsage,
+  ProtocolSurface,
+} from "./canonical.js";
+import { AdapterError, invalid, unsupported } from "./errors.js";
 
 export function object(value: unknown, parameter = "body"): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -24,7 +30,14 @@ export function rejectUnknown(
     unsupported(`${path}.${unknown}`, "has unknown semantics and is not safely adaptable");
 }
 
-/** Drop envelope keys that are not allowlisted. Log names only, and only when one was ignored. */
+const MAX_LOGGED_FIELDS = 10;
+const MAX_LOGGED_FIELD_CHARS = 64;
+
+/**
+ * Drop envelope keys that are not allowlisted. Log names only, and only when
+ * one was ignored. Names come from upstream, so the log holds at most
+ * MAX_LOGGED_FIELDS names of MAX_LOGGED_FIELD_CHARS each plus an omitted count.
+ */
 export function ignoreUnknownEnvelopeFields(
   value: Record<string, unknown>,
   allowed: readonly string[],
@@ -32,17 +45,24 @@ export function ignoreUnknownEnvelopeFields(
   seen?: Set<string>,
 ) {
   const set = new Set(allowed);
-  const fields = Object.keys(value).filter((key) => !set.has(key));
-  const fresh = seen
-    ? fields.filter((field) => {
-        const key = `${path}\0${field}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-    : fields;
+  const fields = Object.keys(value)
+    .filter((key) => !set.has(key))
+    .map((key) => key.slice(0, MAX_LOGGED_FIELD_CHARS));
+  const fresh = [...new Set(fields)].filter((field) => {
+    if (!seen) return true;
+    const key = `${path}\0${field}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   if (fresh.length === 0) return;
-  console.debug("[model-api] ignored upstream envelope fields", { path, fields: fresh });
+  const logged = fresh.slice(0, MAX_LOGGED_FIELDS);
+  const omitted = fresh.length - logged.length;
+  console.debug("[model-api] ignored upstream envelope fields", {
+    path,
+    fields: logged,
+    ...(omitted > 0 ? { omitted } : {}),
+  });
 }
 
 const chatEnvelopeNullFields = [
@@ -157,13 +177,125 @@ export function acceptChatMessageExtras(
   return { droppedReasoningText: droppedField !== undefined };
 }
 
-export function acceptTokenCountDetails(value: unknown, path: string, allowed: readonly string[]) {
-  if (value == null) return;
-  const details = object(value, path);
-  rejectUnknown(details, allowed, path);
-  for (const [name, count] of Object.entries(details))
-    if (!Number.isInteger(count) || (count as number) < 0)
-      invalid(`${path}.${name}`, "must be a non-negative integer");
+type UsageFields = {
+  input: string;
+  output: string;
+  total?: string;
+  /** Other top-level counts: validated, not carried canonically. */
+  counts: readonly string[];
+  /** Known counts the protocol allows to be null. Null means absent. */
+  nullable: readonly string[];
+  /** Known detail objects (null means absent) and the counts validated inside. */
+  details: Readonly<Record<string, readonly string[]>>;
+};
+
+const usageFields: Record<ProtocolSurface, UsageFields> = {
+  "openai-chat": {
+    input: "prompt_tokens",
+    output: "completion_tokens",
+    total: "total_tokens",
+    counts: [],
+    nullable: [],
+    details: {
+      prompt_tokens_details: ["cached_tokens", "audio_tokens"],
+      completion_tokens_details: [
+        "reasoning_tokens",
+        "audio_tokens",
+        "accepted_prediction_tokens",
+        "rejected_prediction_tokens",
+      ],
+    },
+  },
+  "openai-responses": {
+    input: "input_tokens",
+    output: "output_tokens",
+    total: "total_tokens",
+    counts: [],
+    nullable: [],
+    details: {
+      input_tokens_details: ["cached_tokens"],
+      output_tokens_details: ["reasoning_tokens"],
+    },
+  },
+  "anthropic-messages": {
+    input: "input_tokens",
+    output: "output_tokens",
+    counts: ["cache_creation_input_tokens", "cache_read_input_tokens"],
+    // Streamed `message_delta` usage may carry null input and cache counts.
+    nullable: ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
+    details: { cache_creation: ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] },
+  },
+};
+
+function usageCount(
+  source: Record<string, unknown>,
+  key: string,
+  path: string,
+  nullable: boolean,
+): number | undefined {
+  const value = source[key];
+  if (value === undefined || (value === null && nullable)) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    throw new AdapterError(
+      "invalid_usage",
+      `${path}.${key} must be a non-negative integer.`,
+      `${path}.${key}`,
+    );
+  return value;
+}
+
+function usageObject(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new AdapterError("invalid_usage", `${path} must be an object.`, path);
+  return value as Record<string, unknown>;
+}
+
+/**
+ * The one usage parser for stream and non-stream replies. Known counts use the
+ * surface's fixed names and must be non-negative safe integers. Unknown keys,
+ * at the top level or inside a known detail object, are ignored: they carry
+ * no answer text. `required` names which canonical counts must be present.
+ */
+export function parseProtocolUsage(
+  value: unknown,
+  surface: ProtocolSurface,
+  path: string,
+  required: "both" | "any",
+): CanonicalUsage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const fields = usageFields[surface];
+  const usage = usageObject(value, path);
+  const nullable = new Set(fields.nullable);
+  const input = usageCount(usage, fields.input, path, nullable.has(fields.input));
+  const output = usageCount(usage, fields.output, path, nullable.has(fields.output));
+  for (const key of fields.counts) usageCount(usage, key, path, nullable.has(key));
+  for (const [key, counts] of Object.entries(fields.details)) {
+    if (usage[key] === undefined || usage[key] === null) continue;
+    const details = usageObject(usage[key], `${path}.${key}`);
+    for (const count of counts) usageCount(details, count, `${path}.${key}`, false);
+  }
+  if (
+    (required === "both" && (input === undefined || output === undefined)) ||
+    (input === undefined && output === undefined)
+  )
+    throw new AdapterError("invalid_usage", `${path} is missing required token counts.`, path);
+  const total = fields.total ? usageCount(usage, fields.total, path, false) : undefined;
+  if (
+    total !== undefined &&
+    (input === undefined ||
+      output === undefined ||
+      !Number.isSafeInteger(input + output) ||
+      total !== input + output)
+  )
+    throw new AdapterError(
+      "invalid_usage",
+      `${path}.${fields.total} must equal input plus output tokens.`,
+      `${path}.${fields.total}`,
+    );
+  return {
+    ...(input !== undefined ? { inputTokens: input } : {}),
+    ...(output !== undefined ? { outputTokens: output } : {}),
+  };
 }
 
 export function texts(value: unknown, parameter: string): CanonicalText[] {

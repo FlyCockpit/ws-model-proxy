@@ -5,9 +5,9 @@ import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
-  acceptTokenCountDetails,
   ignoreUnknownEnvelopeFields,
   object,
+  parseProtocolUsage,
   rejectUnknown,
 } from "./parse-utils.js";
 import { SseDecoder, type SseRecord } from "./sse.js";
@@ -329,12 +329,28 @@ export class CanonicalStreamParser {
         "multiple_candidates",
         "Multiple stream candidates are not adaptable.",
       );
-    const observedUsage = usageEvent(value.usage, true);
-    if (observedUsage) events.push(observedUsage);
-    const choice = choices[0] ? object(choices[0], "choices[0]") : undefined;
-    if (!choice) return events;
+    const usage = usageEvent(value.usage, "openai-chat", "both");
+    if (choices[0] !== undefined)
+      events.push(...this.#chatChoice(object(choices[0], "choices[0]")));
+    // One usage site for both the choice and the `choices: []` shapes: a chunk
+    // emits usage at most once, and a second usage-bearing chunk is an error.
+    if (usage) {
+      if (this.#chatUsageSeen)
+        throw new AdapterError("duplicate_usage", "Chat stream emitted usage twice.");
+      this.#chatUsageSeen = true;
+      events.push(usage);
+    }
+    return events;
+  }
+
+  #chatChoice(choice: Record<string, unknown>): CanonicalEvent[] {
+    const events: CanonicalEvent[] = [];
     if (choice.index !== undefined && choice.index !== 0)
       throw new AdapterError("multiple_candidates", "Only candidate zero is adaptable.");
+    // Only a finish chunk may omit `delta`; elsewhere a missing delta could
+    // hide answer text under an ignored key and complete silently empty.
+    if (choice.delta == null && choice.finish_reason == null)
+      throw new AdapterError("invalid_stream_event", "Chat stream choice requires delta.");
     acceptChatChoiceExtras(choice, "choices[0]", "delta", this.#seenEnvelopeFields);
     if (choice.logprobs != null) unsupported("choices[0].logprobs");
     const delta = object(choice.delta ?? {}, "choices[0].delta");
@@ -401,13 +417,6 @@ export class CanonicalStreamParser {
       if (this.#pendingChatStop)
         throw new AdapterError("duplicate_stop", "Chat emitted more than one finish_reason.");
       this.#pendingChatStop = stopReason(choice.finish_reason);
-    }
-    const usage = usageEvent(value.usage, true);
-    if (usage) {
-      if (this.#chatUsageSeen)
-        throw new AdapterError("duplicate_usage", "Chat stream emitted usage twice.");
-      this.#chatUsageSeen = true;
-      events.push(usage);
     }
     return events;
   }
@@ -802,7 +811,7 @@ export class CanonicalStreamParser {
           "terminal_output_mismatch",
           "Responses terminal output did not match completed items.",
         );
-      const usage = usageEvent(response.usage, true);
+      const usage = usageEvent(response.usage, "openai-responses", "both");
       if (usage) events.push(usage);
       events.push(
         ...this.#stop(stopReason(type === "response.incomplete" ? "length" : "stop")),
@@ -876,7 +885,8 @@ export class CanonicalStreamParser {
           "Anthropic message_start envelope is invalid.",
         );
     }
-    const initialUsage = type === "message_start" ? usageEvent(message.usage) : undefined;
+    const initialUsage =
+      type === "message_start" ? usageEvent(message.usage, "anthropic-messages", "any") : undefined;
     if (type === "message_start" && initialUsage?.usage.inputTokens === undefined)
       throw new AdapterError("invalid_usage", "Anthropic message_start requires input_tokens.");
     const events =
@@ -959,7 +969,7 @@ export class CanonicalStreamParser {
           "unsupported_stop_sequence",
           "Anthropic stop_sequence detail is not safely adaptable.",
         );
-      const usage = usageEvent(value.usage);
+      const usage = usageEvent(value.usage, "anthropic-messages", "any");
       if (usage) events.push(usage);
       if (delta.stop_reason != null) events.push(...this.#stop(stopReason(delta.stop_reason)));
     } else if (type === "message_stop") events.push(...this.#complete());
@@ -1005,56 +1015,11 @@ export class CanonicalStreamParser {
 
 function usageEvent(
   value: unknown,
-  requireBoth = false,
+  surface: ProtocolSurface,
+  required: "both" | "any",
 ): Extract<CanonicalEvent, { type: "usage" }> | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const usage = object(value);
-  rejectUnknown(
-    usage,
-    [
-      "input_tokens",
-      "output_tokens",
-      "prompt_tokens",
-      "completion_tokens",
-      "total_tokens",
-      "input_tokens_details",
-      "output_tokens_details",
-      "prompt_tokens_details",
-      "completion_tokens_details",
-    ],
-    "stream.usage",
-  );
-  acceptTokenCountDetails(usage.prompt_tokens_details, "stream.usage.prompt_tokens_details", [
-    "cached_tokens",
-  ]);
-  const input = usage.input_tokens ?? usage.prompt_tokens;
-  const output = usage.output_tokens ?? usage.completion_tokens;
-  if (
-    (input !== undefined && (!Number.isSafeInteger(input) || (input as number) < 0)) ||
-    (output !== undefined && (!Number.isSafeInteger(output) || (output as number) < 0))
-  )
-    throw new AdapterError("invalid_usage", "Stream usage tokens must be non-negative integers.");
-  if (
-    (requireBoth && (input === undefined || output === undefined)) ||
-    (!requireBoth && input === undefined && output === undefined)
-  )
-    throw new AdapterError("invalid_usage", "Stream usage is missing required token counts.");
-  const total = usage.total_tokens;
-  if (
-    total !== undefined &&
-    (!Number.isSafeInteger(total) ||
-      input === undefined ||
-      output === undefined ||
-      total !== (input as number) + (output as number))
-  )
-    throw new AdapterError("invalid_usage", "Stream total_tokens must equal input plus output.");
-  return {
-    type: "usage",
-    usage: {
-      ...(typeof input === "number" ? { inputTokens: input } : {}),
-      ...(typeof output === "number" ? { outputTokens: output } : {}),
-    },
-  };
+  const usage = parseProtocolUsage(value, surface, "stream.usage", required);
+  return usage ? { type: "usage", usage } : undefined;
 }
 
 function validateResponseEnvelope(response: Record<string, unknown>) {
@@ -1160,7 +1125,7 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     rejectUnknown(details, ["reason"], "response.incomplete_details");
     if (details.reason !== "max_output_tokens") unsupported("response.incomplete_details.reason");
   }
-  if (response.usage !== null && response.usage !== undefined) usageEvent(response.usage, true);
+  usageEvent(response.usage, "openai-responses", "both");
   if (
     response.status === "failed" &&
     (!Array.isArray(response.output) ||

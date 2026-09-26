@@ -112,7 +112,7 @@ describe("protocol adaptation orchestration", () => {
     }
   });
 
-  it("accepts prompt token details only in the cached-token shape", () => {
+  it("validates known prompt token details and ignores unknown detail keys", () => {
     const withDetails = (prompt_tokens_details: unknown) =>
       adaptNonstreamResponse({
         source: "openai-chat",
@@ -124,7 +124,10 @@ describe("protocol adaptation orchestration", () => {
         },
       });
     expect(withDetails({ cached_tokens: 4 }).ok).toBe(true);
-    expect(() => withDetails({ cached_tokens: 4, audio_tokens: 0 })).toThrow(/audio_tokens/u);
+    expect(withDetails({ cached_tokens: 4, audio_tokens: 0 }).ok).toBe(true);
+    expect(withDetails({ cached_tokens: 4, future_tokens: "n/a" }).ok).toBe(true);
+    expect(() => withDetails({ cached_tokens: -1 })).toThrow(/cached_tokens/u);
+    expect(() => withDetails({ audio_tokens: "0" })).toThrow(/audio_tokens/u);
   });
 
   it("rejects a non-null chat envelope or choice field outside the ignorable null set", () => {

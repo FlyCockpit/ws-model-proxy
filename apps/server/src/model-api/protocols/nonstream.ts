@@ -10,9 +10,9 @@ import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
-  acceptTokenCountDetails,
   ignoreUnknownEnvelopeFields,
   object,
+  parseProtocolUsage,
   rejectUnknown,
   string,
 } from "./parse-utils.js";
@@ -208,7 +208,7 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
     id: string(body.id, "response.id"),
     ...(typeof body.model === "string" ? { model: body.model } : {}),
     items,
-    usage: parseUsage(body.usage),
+    usage: parseProtocolUsage(body.usage, "openai-chat", "usage", "both"),
     stopReason: stopReason(choice.finish_reason),
   };
 }
@@ -311,7 +311,7 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
     id: string(body.id, "response.id"),
     ...(typeof body.model === "string" ? { model: body.model } : {}),
     items,
-    usage: parseUsage(body.usage),
+    usage: parseProtocolUsage(body.usage, "openai-responses", "usage", "both"),
     stopReason: items.some((item) => item.type === "tool_call") ? "tool" : "stop",
   };
 }
@@ -369,55 +369,8 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
     id: string(body.id, "response.id"),
     ...(typeof body.model === "string" ? { model: body.model } : {}),
     items,
-    usage: parseUsage(body.usage),
+    usage: parseProtocolUsage(body.usage, "anthropic-messages", "usage", "both"),
     stopReason: reason,
-  };
-}
-
-function parseUsage(value: unknown) {
-  if (value == null) return undefined;
-  const usage = object(value, "usage");
-  const allowed = [
-    "input_tokens",
-    "output_tokens",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_tokens",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-    "input_tokens_details",
-    "output_tokens_details",
-    "prompt_tokens_details",
-  ];
-  rejectUnknown(usage, allowed, "usage");
-  const input = usage.input_tokens ?? usage.prompt_tokens;
-  const output = usage.output_tokens ?? usage.completion_tokens;
-  if (input !== undefined && (typeof input !== "number" || !Number.isInteger(input) || input < 0))
-    invalid("usage.input_tokens", "is invalid");
-  if (
-    output !== undefined &&
-    (typeof output !== "number" || !Number.isInteger(output) || output < 0)
-  )
-    invalid("usage.output_tokens", "is invalid");
-  if (typeof input !== "number" || typeof output !== "number")
-    invalid("usage", "must include both input and output token counts");
-  if (
-    usage.total_tokens !== undefined &&
-    (!Number.isInteger(usage.total_tokens) || usage.total_tokens !== input + output)
-  )
-    invalid("usage.total_tokens", "must equal input plus output tokens");
-  acceptTokenCountDetails(usage.input_tokens_details, "usage.input_tokens_details", [
-    "cached_tokens",
-  ]);
-  acceptTokenCountDetails(usage.prompt_tokens_details, "usage.prompt_tokens_details", [
-    "cached_tokens",
-  ]);
-  acceptTokenCountDetails(usage.output_tokens_details, "usage.output_tokens_details", [
-    "reasoning_tokens",
-  ]);
-  return {
-    ...(typeof input === "number" ? { inputTokens: input } : {}),
-    ...(typeof output === "number" ? { outputTokens: output } : {}),
   };
 }
 

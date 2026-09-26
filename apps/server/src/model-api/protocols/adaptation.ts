@@ -3,6 +3,7 @@ import {
   renderAnthropicMessagesRequest,
 } from "./anthropic-messages.js";
 import type { CanonicalEvent, CanonicalRequest, ProtocolSurface } from "./canonical.js";
+import { logAdapterRejection } from "./errors.js";
 import { parseProtocolResponse, renderProtocolResponse } from "./nonstream.js";
 import { parseOpenAiChatRequest, renderOpenAiChatRequest } from "./openai-chat.js";
 import { parseOpenAiResponsesRequest, renderOpenAiResponsesRequest } from "./openai-responses.js";
@@ -96,14 +97,20 @@ export function adaptNonstreamResponse({
   status: number;
   headers?: Headers;
 }) {
-  const parsed = parseProtocolResponse({ surface: source, body, status, headers });
-  return parsed.ok
-    ? {
-        ok: true as const,
-        metadata: parsed.metadata,
-        body: renderProtocolResponse(target, parsed.response),
-      }
-    : { ok: false as const, metadata: parsed.metadata, error: parsed.error };
+  try {
+    const parsed = parseProtocolResponse({ surface: source, body, status, headers });
+    return parsed.ok
+      ? {
+          ok: true as const,
+          metadata: parsed.metadata,
+          body: renderProtocolResponse(target, parsed.response),
+        }
+      : { ok: false as const, metadata: parsed.metadata, error: parsed.error };
+  } catch (error) {
+    // Callers map a rejection to a generic 502 without the parameter.
+    logAdapterRejection(error, { source, target });
+    throw error;
+  }
 }
 
 export function createProtocolAdaptationTransform({
@@ -148,6 +155,8 @@ export function createProtocolAdaptationTransform({
   const prepare = (event: CanonicalEvent) =>
     withAnthropicInitialUsage(withCumulativeUsage(event), target, request);
   const recover = (error: unknown, controller: TransformStreamDefaultController<Uint8Array>) => {
+    // Every parser and renderer failure passes here, recovered or rethrown.
+    logAdapterRejection(error, { source, target });
     if (!recoverProtocolErrors || !hasOutput) throw error;
     failed = true;
     onProtocolError?.(error);

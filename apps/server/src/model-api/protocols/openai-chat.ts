@@ -280,6 +280,10 @@ export function renderOpenAiChatRequest(
       : {}),
     ...(request.tools.length ? { parallel_tool_calls: false } : {}),
     stream: request.stream,
+    // Adapted streams report usage only when asked. Chat sources reject
+    // `stream_options` and are never rendered back to Chat, so there is no
+    // caller value to merge.
+    ...(request.stream ? { stream_options: { include_usage: true } } : {}),
     ...(request.sampling.temperature !== undefined
       ? { temperature: request.sampling.temperature }
       : {}),

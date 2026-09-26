@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
-import { createProtocolAdaptationTransform } from "./adaptation.js";
+import { describe, expect, it, vi } from "vitest";
+import { adaptNonstreamResponse, createProtocolAdaptationTransform } from "./adaptation.js";
 import { ADAPTER_VERSION, type CanonicalEvent, type CanonicalRequest } from "./canonical.js";
 import { CanonicalStreamParser, CanonicalStreamRenderer } from "./streams.js";
 
@@ -413,5 +413,198 @@ describe("cross-protocol streaming conformance", () => {
     const renderer = new CanonicalStreamRenderer("openai-responses");
     renderer.push({ type: "message_start", id: "m", model: "model" });
     expect(() => renderer.push({ type: "usage", usage })).toThrow("safe integer");
+  });
+});
+
+const llamaUsage = { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 };
+const llamaTimings = { prompt_n: 9, predicted_n: 3, predicted_per_second: 42.5 };
+const llamaChunk = (value: Record<string, unknown>) =>
+  encode(
+    `data: ${JSON.stringify({
+      id: "llama",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "local",
+      ...value,
+    })}\n\n`,
+  );
+const llamaText = () =>
+  llamaChunk({
+    choices: [{ index: 0, delta: { role: "assistant", content: "pong" }, finish_reason: null }],
+  });
+const llamaFinish = (extra: Record<string, unknown> = {}) =>
+  llamaChunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], ...extra });
+const llamaUsageOnly = () => llamaChunk({ choices: [], usage: llamaUsage, timings: llamaTimings });
+const done = () => encode("data: [DONE]\n\n");
+
+async function adaptChat(
+  target: "openai-responses" | "anthropic-messages",
+  chunks: Uint8Array[],
+  onProtocolError?: (error: unknown) => void,
+) {
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  }).pipeThrough(
+    createProtocolAdaptationTransform({
+      source: "openai-chat",
+      target,
+      request: pingRequest,
+      recoverProtocolErrors: onProtocolError !== undefined,
+      onProtocolError,
+    }),
+  );
+  return new Response(readable).text();
+}
+
+function captureConsole(method: "debug" | "warn") {
+  return vi.spyOn(console, method).mockImplementation(() => undefined);
+}
+
+const adaptedUsage = {
+  "openai-responses": '"usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}',
+  "anthropic-messages":
+    '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":9,"output_tokens":3}',
+} as const;
+const adaptedTargets = ["openai-responses", "anthropic-messages"] as const;
+
+describe("Chat stream usage through the full adaptation transform", () => {
+  it.each(
+    adaptedTargets.flatMap((target) => [
+      {
+        target,
+        shape: "a finish chunk that also carries usage",
+        chunks: () => [
+          llamaText(),
+          llamaFinish({ usage: llamaUsage, timings: llamaTimings }),
+          done(),
+        ],
+      },
+      {
+        target,
+        shape: "a choices: [] usage chunk after the finish chunk",
+        chunks: () => [llamaText(), llamaFinish(), llamaUsageOnly(), done()],
+      },
+    ]),
+  )("emits usage exactly once for $shape into $target", async ({ target, chunks }) => {
+    const debug = captureConsole("debug");
+    const onProtocolError = vi.fn();
+    try {
+      const output = await adaptChat(target, chunks(), onProtocolError);
+      expect(onProtocolError).not.toHaveBeenCalled();
+      expect(output).not.toContain("event: error");
+      expect(output.split(adaptedUsage[target])).toHaveLength(2);
+      expect(output).toContain(
+        target === "openai-responses" ? "event: response.completed" : "event: message_stop",
+      );
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it.each(
+    adaptedTargets.flatMap((target) => [
+      {
+        target,
+        shape: "a usage finish chunk and a usage-only chunk",
+        chunks: () => [llamaText(), llamaFinish({ usage: llamaUsage }), llamaUsageOnly(), done()],
+      },
+      {
+        target,
+        shape: "two usage-only chunks",
+        chunks: () => [llamaText(), llamaFinish(), llamaUsageOnly(), llamaUsageOnly(), done()],
+      },
+    ]),
+  )("rejects $shape into $target as a protocol error", async ({ target, chunks }) => {
+    const debug = captureConsole("debug");
+    const warn = captureConsole("warn");
+    const errors: unknown[] = [];
+    try {
+      const output = await adaptChat(target, chunks(), (error) => errors.push(error));
+      expect(errors).toEqual([expect.objectContaining({ code: "duplicate_usage" })]);
+      expect(output).toContain("event: error");
+      expect(output).toContain("The upstream stream violated the adapted protocol.");
+      expect(output).not.toContain(adaptedUsage[target]);
+    } finally {
+      debug.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("logs an adapted stream rejection by code and parameter, never its message", async () => {
+    const secret = "DO_NOT_LOG_stop_reason";
+    const warn = captureConsole("warn");
+    try {
+      await adaptChat(
+        "openai-responses",
+        [llamaText(), llamaChunk({ choices: [{ index: 0, delta: {}, finish_reason: secret }] })],
+        () => undefined,
+      );
+      await adaptChat(
+        "anthropic-messages",
+        [llamaText(), llamaFinish({ usage: { ...llamaUsage, prompt_tokens: "9" } }), done()],
+        () => undefined,
+      );
+      const calls = warn.mock.calls.map((call) => [...call]);
+      expect(JSON.stringify(calls)).not.toContain(secret);
+      expect(calls).toEqual([
+        [
+          "[model-api] adapter rejected upstream reply",
+          {
+            source: "openai-chat",
+            target: "openai-responses",
+            code: "unsupported_stop_reason",
+            parameter: null,
+          },
+        ],
+        [
+          "[model-api] adapter rejected upstream reply",
+          {
+            source: "openai-chat",
+            target: "anthropic-messages",
+            code: "invalid_usage",
+            parameter: "stream.usage.prompt_tokens",
+          },
+        ],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("logs a non-stream rejection by code and parameter", () => {
+    const warn = captureConsole("warn");
+    try {
+      expect(() =>
+        adaptNonstreamResponse({
+          source: "openai-chat",
+          target: "anthropic-messages",
+          status: 200,
+          body: {
+            id: "c",
+            object: "chat.completion",
+            choices: [
+              { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+            ],
+            usage: { ...llamaUsage, completion_tokens: -3 },
+          },
+        }),
+      ).toThrow(/completion_tokens/u);
+      expect(warn.mock.calls.map((call) => [...call])).toEqual([
+        [
+          "[model-api] adapter rejected upstream reply",
+          {
+            source: "openai-chat",
+            target: "anthropic-messages",
+            code: "invalid_usage",
+            parameter: "usage.completion_tokens",
+          },
+        ],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
