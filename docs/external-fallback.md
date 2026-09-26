@@ -186,6 +186,9 @@ provides the signed-in person’s consent for that test.
 Provider management remains on the Pools and Fallback pages when the deployment
 switch is off. Stored account and key details remain visible, with revoke and
 delete actions available. Creation, edits, imports, and credential tests are
-hidden or disabled. Token consent and pool fallback switches are disabled too;
-saved choices remain intact. While deployment flags load, the UI shows skeletons;
-a failed fetch shows a retry state. Secrets are never returned.
+hidden or disabled. Token and pool consent can still be withdrawn: turn external
+access off, uncheck per-pool consent, and disable pool fallback or grantee
+coverage; wait-time edits still save. Turning consent on or enabling fallback
+while the switch is off is blocked in the UI with feedback. Saved choices
+remain intact. While deployment flags load, the UI shows skeletons; a failed
+fetch shows a retry state. Secrets are never returned.

@@ -531,9 +531,10 @@
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",
       "failed": "No se pudieron guardar los ajustes de respaldo. Inténtalo de nuevo.",
+      "enableBlockedDeployment": "No puedes activar el respaldo ni la cobertura para usuarios con acceso compartido mientras los proveedores externos estén desactivados en esta implementación.",
       "granteesHint": "Tú pagas los cargos del proveedor de las personas con quienes compartes este pool. Sus solicitudes aún necesitan :external y un token que permita proveedores externos."
     },
-    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
+    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación. Aún puedes desactivar el respaldo y la cobertura para usuarios con acceso compartido y cambiar los tiempos de espera; activarlos no está disponible hasta que se habiliten los proveedores.",
     "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
     "fallbackSteps": {
       "account": "Agrega una cuenta y credencial de proveedor",
@@ -1138,12 +1139,12 @@
       "title": "Proveedores externos",
       "description": "Desactivado de forma predeterminada. Habilitarlo permite enviar prompts, adjuntos, herramientas y resultados fuera de esta implementación a proveedores externos. Las solicitudes deben usar <pool>:external, el propietario debe permitir el respaldo y los miembros locales no deben poder atender la solicitud. Los nombres simples permanecen locales.",
       "allow": "Permitir proveedores externos para {{name}}",
-      "poolsHint": "Los tokens nuevos incluyen cada grupo seleccionado. Desmarca cualquier grupo para mantenerlo solo local.",
+      "poolsHint": "Los tokens nuevos incluyen cada pool seleccionado. Desmarca cualquier pool para mantenerlo solo local.",
       "saved": "Acceso a proveedores externos actualizado",
       "createAllow": "Permitir proveedores externos",
       "createFailed": "Se creó el token, pero no se pudo confirmar la actualización de acceso externo. Copia el secreto ahora y revisa sus permisos abajo antes de usarlo.",
-      "disabledDeployment": "Los proveedores externos están desactivados en esta implementación. Se conservan tus permisos guardados; no puedes cambiarlos mientras los proveedores estén desactivados.",
-      "savedPoolsHint": "Elige qué grupos pueden usar proveedores externos. Al desactivar y reactivar el acceso externo se conservan estas opciones."
+      "disabledDeployment": "Los proveedores externos están desactivados en esta implementación. Se conservan tus permisos guardados. Puedes desactivar el acceso externo y retirar el consentimiento por pool; activar el acceso o agregar pools no está disponible mientras los proveedores estén desactivados.",
+      "savedPoolsHint": "Elige qué pools pueden usar proveedores externos. La primera vez que actives el acceso, marca cada pool individualmente; ninguno se incluye automáticamente. Al desactivar y reactivar el acceso externo se conservan estas opciones."
     },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",

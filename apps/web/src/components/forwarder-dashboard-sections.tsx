@@ -3742,7 +3742,7 @@ function TokenExternalAccess({
               <label className="flex min-h-11 items-center gap-3 text-sm">
                 <Checkbox
                   checked={token.allowExternal}
-                  disabled={!providerEgressEnabled || update.isPending}
+                  disabled={update.isPending || (!providerEgressEnabled && !token.allowExternal)}
                   onCheckedChange={(checked) =>
                     update.mutate({
                       id: token.id,
@@ -3763,7 +3763,9 @@ function TokenExternalAccess({
                     <label key={poolId} className="flex min-h-11 items-center gap-3 text-sm">
                       <Checkbox
                         checked={included.has(poolId)}
-                        disabled={!providerEgressEnabled || update.isPending}
+                        disabled={
+                          update.isPending || (!providerEgressEnabled && !included.has(poolId))
+                        }
                         onCheckedChange={(checked) => {
                           const next = new Set(included);
                           if (checked === true) next.add(poolId);

@@ -805,12 +805,14 @@ function PoolFallbackSettings({
       // Send only what changed, so an unrelated stored value can never make
       // this save fail. Enabling stays gated by the deployment switch
       // server-side; disabling is always allowed and keeps members configured.
-      if (
-        !providerEgressEnabled &&
-        (value.fallbackEnabled !== pool.fallbackEnabled ||
-          value.fallbackForGrantees !== pool.fallbackForGrantees)
-      )
-        return;
+      if (!providerEgressEnabled) {
+        const enablingFallback = value.fallbackEnabled && !pool.fallbackEnabled;
+        const enablingGrantees = value.fallbackForGrantees && !pool.fallbackForGrantees;
+        if (enablingFallback || enablingGrantees) {
+          toast.error(t("dashboard:pools.fallbackSettings.enableBlockedDeployment"));
+          return;
+        }
+      }
       const externalAfterWaitMs = Number(value.externalAfterWaitMs);
       const changes = {
         ...(value.fallbackEnabled !== pool.fallbackEnabled
@@ -849,7 +851,7 @@ function PoolFallbackSettings({
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
-              disabled={!providerEgressEnabled || update.isPending}
+              disabled={update.isPending || (!providerEgressEnabled && !field.state.value)}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />
@@ -861,7 +863,7 @@ function PoolFallbackSettings({
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
-              disabled={!providerEgressEnabled || update.isPending}
+              disabled={update.isPending || (!providerEgressEnabled && !field.state.value)}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />

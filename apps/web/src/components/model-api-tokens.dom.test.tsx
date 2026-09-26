@@ -322,18 +322,80 @@ it("restores per-pool opt-outs across disable, re-enable and reopening", async (
   ]);
 });
 
-it("disables create, existing-token and per-pool external consent when providers are off", async () => {
+it("blocks granting external consent when providers are off but allows withdrawal", async () => {
   state.providerEgressEnabled = false;
   state.tokens = [existingToken()];
   mount();
-  for (const name of ["dashboard:tokens.externalAccess.allow", "one", "two"]) {
-    const control = screen.getByRole("checkbox", { name });
-    expect(
-      control.getAttribute("aria-disabled") === "true" || control.hasAttribute("disabled"),
-    ).toBe(true);
-    fireEvent.click(control);
-  }
+  expect(
+    screen.getAllByText("dashboard:tokens.externalAccess.disabledDeployment").length,
+  ).toBeGreaterThan(0);
+
+  const master = screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.allow" });
+  expect(master.getAttribute("aria-disabled")).not.toBe("true");
+  fireEvent.click(master);
+  await waitFor(() =>
+    expect(state.calls.map((call) => call.input)).toContainEqual({
+      id: "existing",
+      allowExternal: false,
+    }),
+  );
+
+  cleanup();
+  state.calls = [];
+  state.tokens = [
+    {
+      ...existingToken(),
+      allowExternal: false,
+      allowlist: {
+        ...existingToken().allowlist,
+        externalModelPoolIds: [],
+      },
+    },
+  ];
+  mount();
+  const blockedMaster = screen.getByRole("checkbox", {
+    name: "dashboard:tokens.externalAccess.allow",
+  });
+  expect(
+    blockedMaster.getAttribute("aria-disabled") === "true" ||
+      blockedMaster.hasAttribute("disabled"),
+  ).toBe(true);
+  fireEvent.click(blockedMaster);
   expect(state.calls).toEqual([]);
+
+  cleanup();
+  state.tokens = [existingToken()];
+  mount();
+  const poolTwo = screen.getByRole("checkbox", { name: "two" });
+  expect(poolTwo.getAttribute("aria-disabled")).not.toBe("true");
+  fireEvent.click(poolTwo);
+  await waitFor(() =>
+    expect(state.calls.map((call) => call.input)).toContainEqual({
+      id: "existing",
+      allowExternal: true,
+      externalModelPoolIds: ["one"],
+    }),
+  );
+
+  cleanup();
+  state.calls = [];
+  state.tokens = [
+    {
+      ...existingToken(),
+      allowlist: {
+        ...existingToken().allowlist,
+        externalModelPoolIds: ["one"],
+      },
+    },
+  ];
+  mount();
+  const blockedPool = screen.getByRole("checkbox", { name: "two" });
+  expect(
+    blockedPool.getAttribute("aria-disabled") === "true" || blockedPool.hasAttribute("disabled"),
+  ).toBe(true);
+  fireEvent.click(blockedPool);
+  expect(state.calls).toEqual([]);
+
   openCreate();
   const consent = screen.getByRole("checkbox", {
     name: "dashboard:tokens.externalAccess.createAllow",
@@ -342,9 +404,6 @@ it("disables create, existing-token and per-pool external consent when providers
     true,
   );
   fireEvent.click(consent);
-  expect(
-    screen.getAllByText("dashboard:tokens.externalAccess.disabledDeployment").length,
-  ).toBeGreaterThan(0);
   submit();
   await waitFor(() => expect(state.calls).toHaveLength(1));
   expect(state.calls[0]?.name).toBe("create");

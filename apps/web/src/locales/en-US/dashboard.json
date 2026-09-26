@@ -531,9 +531,10 @@
       "save": "Save fallback settings",
       "saved": "Fallback settings saved",
       "failed": "Could not save fallback settings. Try again.",
+      "enableBlockedDeployment": "Turning fallback or grantee coverage on is unavailable while external providers are disabled for this deployment.",
       "granteesHint": "You pay provider charges for people you share this pool with. Their requests still need :external and a token that allows external providers."
     },
-    "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment.",
+    "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment. You can still turn fallback and grantee coverage off and change wait times; turning them on is unavailable until providers are enabled.",
     "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
     "fallbackSteps": {
       "account": "Add a provider account and credential",
@@ -895,8 +896,8 @@
       "saved": "External provider access updated",
       "createAllow": "Allow external providers",
       "createFailed": "Token created, but its external-access update could not be confirmed. Copy the secret now and check its permissions below before using it.",
-      "disabledDeployment": "External providers are disabled on this deployment. Your saved permissions are kept; changes are unavailable while providers are disabled.",
-      "savedPoolsHint": "Choose which pools may use external providers. Turning external access off and on preserves these choices."
+      "disabledDeployment": "External providers are disabled on this deployment. Your saved permissions are kept. You can turn external access off and withdraw per-pool consent; turning access on or adding pools is unavailable while providers are disabled.",
+      "savedPoolsHint": "Choose which pools may use external providers. The first time you enable access, check each pool individually; none are included automatically. Turning external access off and on preserves these choices."
     },
     "allVisible": "All visible",
     "allowlist": "Allowlist",

@@ -430,7 +430,7 @@ describe("dedicated pool pages", () => {
     });
   });
 
-  it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {
+  it("allows fallback withdrawal and wait-time edits when provider egress is off", async () => {
     state.providerEgressEnabled = false;
     state.tab = "fallback";
     state.pools = [
@@ -440,6 +440,9 @@ describe("dedicated pool pages", () => {
         name: "Primary",
         description: null,
         canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 2000,
         members: [],
         grants: [],
         compatibility: { recommendedSurface: null },
@@ -450,6 +453,74 @@ describe("dedicated pool pages", () => {
     mount(<PoolDetailPage poolId="pool-1" />);
 
     expect(screen.getByText("dashboard:pools.fallbackDisabledDeployment")).toBeTruthy();
+
+    const enableFallback = screen.getByRole("checkbox", {
+      name: "dashboard:pools.fallbackSettings.enabled",
+    });
+    const forGrantees = screen.getByRole("checkbox", {
+      name: "dashboard:pools.fallbackSettings.forGrantees",
+    });
+    expect(enableFallback.getAttribute("aria-disabled")).not.toBe("true");
+    expect(forGrantees.getAttribute("aria-disabled")).not.toBe("true");
+
+    fireEvent.click(enableFallback);
+    fireEvent.click(forGrantees);
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(state.mutationCalls.filter((call) => call.name === "updateModelPool")).toHaveLength(1),
+    );
+    expect(state.mutationCalls[0]?.variables).toEqual({
+      id: "pool-1",
+      fallbackEnabled: false,
+      fallbackForGrantees: false,
+    });
+
+    state.mutationCalls = [];
+    state.pools = [
+      {
+        ...(state.pools[0] as Record<string, unknown>),
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+      },
+    ];
+    cleanup();
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.change(
+      screen.getByLabelText("dashboard:pools.fallbackSettings.externalAfterWaitMs"),
+      { target: { value: "4500" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(state.mutationCalls.filter((call) => call.name === "updateModelPool")).toHaveLength(1),
+    );
+    expect(state.mutationCalls[0]?.variables).toEqual({
+      id: "pool-1",
+      externalAfterWaitMs: 4500,
+    });
+  });
+
+  it("blocks turning fallback on when provider egress is off", async () => {
+    state.providerEgressEnabled = false;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
     for (const name of [
       "dashboard:pools.fallbackSettings.enabled",
       "dashboard:pools.fallbackSettings.forGrantees",
