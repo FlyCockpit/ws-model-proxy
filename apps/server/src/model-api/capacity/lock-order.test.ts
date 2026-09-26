@@ -79,6 +79,93 @@ const scannedRoots = [
   "scripts",
 ];
 
+/**
+ * PR2-C10 provider writer inventory, including implicit pricing/audit FK locks.
+ * Order: budget advisories -> L0 (if needed) -> account -> pricing advisory
+ * -> model -> pricing -> credential/attempt -> child inserts -> L2 -> L5.
+ * Counts make new writer sites require review, even in an already known file.
+ * The five pricing writers have executable sequence/timeout tests in
+ * provider-management.test.ts; import has its own sequence tests. This census
+ * bounds those proofs; it does not prove arbitrary control-flow lock order.
+ */
+const PROVIDER_WRITER_INVENTORY = {
+  "packages/api/src/routers/provider-management.ts": {
+    // Account/credential/policy mutations hold account first; policies first
+    // take budget advisories. createModel uses a fresh id; updateModel takes
+    // L0 -> account -> model -> L2/L5. deleteAccount/Model are account-first.
+    // Five pricing procedures use lockPricingParents. Repair-request audit
+    // is an autocommit INSERT, holding no other lock.
+    "providerAccount.create": 1,
+    "providerAccount.update": 2,
+    "providerAccount.updateMany": 4,
+    "providerModel.create": 1,
+    "providerModel.update": 2,
+    "providerModel.updateMany": 3,
+    "providerPricingVersion.create": 1,
+    "providerPricingVersion.update": 3,
+    "providerPricingVersion.updateMany": 1,
+    "providerPricingVersion.delete": 1,
+    "providerAuditEvent.create": 21,
+  },
+  "packages/api/src/routers/provider-catalog.ts": {
+    // Existing/restore: L0 -> account -> advisory -> model -> pricing;
+    // new model: account -> private model id. Audits re-enter held account.
+    "providerModel.create": 1,
+    "providerModel.update": 2,
+    "providerModel.updateMany": 1,
+    "providerPricingVersion.create": 1,
+    "providerPricingVersion.updateMany": 1,
+    "providerAuditEvent.create": 4,
+  },
+  "apps/server/src/model-api/provider-attempt-runtime.ts": {
+    // All five runtime transactions lock account before model/attempt or
+    // credential. Writes to already-held parents add no reverse wait edge.
+    "providerAccount.update": 3,
+    "providerAccount.updateMany": 2,
+    "providerModel.update": 2,
+    "providerModel.updateMany": 2,
+  },
+  "packages/api/src/routers/forwarder-management.ts": {
+    // Wizard: L1 -> L0 -> target FK KEY SHARE(model) -> budget/audit FK(account).
+    // Tier edit: capacity policy locks -> audit FK(account), no model row lock.
+    // Pricing writers take neither L1 nor capacity locks; their model NO KEY
+    // UPDATE is compatible with target FK KEY SHARE. Import/updateModel share
+    // the wizard/attach L0 fence before their provider rows.
+    "providerAuditEvent.create": 2,
+  },
+};
+// Deferred, not proven safe: provider-budget.ts admission/reservation/ledger
+// inserts acquire account/model FK locks in RI trigger order. Settlement's
+// attempt -> ledger FK parents and user-deletion's L7 user -> provider cascade
+// versus provider child user-FKs remain separate follow-ups. Generic parent
+// deletion delegates/cascades are not direct writers in this census.
+const providerRoots = scannedRoots.slice(0, 4);
+
+function providerWriterInventory(): Record<string, Record<string, number>> {
+  const inventory: Record<string, Record<string, number>> = {};
+  for (const root of providerRoots) {
+    for (const path of sourceFiles(join(repoRoot, root))) {
+      const source = readFileSync(path, "utf8");
+      const counts: Record<string, number> = {};
+      for (const match of source.matchAll(
+        /\.(providerAccount|providerModel|providerPricingVersion|providerAuditEvent)\.(create(?:Many(?:AndReturn)?)?|update(?:Many(?:AndReturn)?)?|delete(?:Many)?|upsert)\s*\(/gu,
+      )) {
+        const site = `${match[1]}.${match[2]}`;
+        counts[site] = (counts[site] ?? 0) + 1;
+      }
+      // A raw-SQL bypass also requires an explicit inventory/proof update.
+      for (const match of source.matchAll(
+        /\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(provider_account|provider_model|provider_pricing_version|provider_audit_event)\b/giu,
+      )) {
+        const site = `${match[2]}.${match[1]}`;
+        counts[site] = (counts[site] ?? 0) + 1;
+      }
+      if (Object.keys(counts).length > 0) inventory[relative(repoRoot, path)] = counts;
+    }
+  }
+  return inventory;
+}
+
 function sourceFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = join(directory, entry.name);
@@ -384,6 +471,10 @@ function scan(): Finding[] {
 }
 
 describe("capacity-domain lock order", () => {
+  it("keeps every provider row writer and audit insert in the reviewed inventory", () => {
+    expect(providerWriterInventory()).toEqual(PROVIDER_WRITER_INVENTORY);
+  });
+
   it("derives key columns from the Prisma schema", () => {
     const target = MODELS.get("ExecutionTarget");
     expect(target?.table).toBe("execution_target");

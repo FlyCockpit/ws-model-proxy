@@ -1,11 +1,12 @@
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
-import { createRouterClient } from "@orpc/server";
+import { createRouterClient, type RouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
+import { CATALOG_CHARGE_RULES } from "../lib/provider-catalog-model";
 
 const envMock = { enabled: false };
 const egressMock = vi.hoisted(() => ({ request: vi.fn() }));
@@ -110,7 +111,7 @@ const session = {
     updatedAt: new Date(),
   },
 } as Session;
-const context: Context = { session };
+const context: Context = { session, services: undefined };
 
 function createHttpClient(
   rpcContext: Context = context,
@@ -133,9 +134,7 @@ function createHttpClient(
       return result.response;
     },
   });
-  return createORPCClient(link) as ReturnType<
-    typeof createRouterClient<typeof providerManagementRouter>
-  >;
+  return createORPCClient(link) as RouterClient<typeof providerManagementRouter>;
 }
 
 describe("providerManagementRouter security boundary", () => {
@@ -161,7 +160,9 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
-    const anonymous = createRouterClient(providerManagementRouter, { context: { session: null } });
+    const anonymous = createRouterClient(providerManagementRouter, {
+      context: { session: null, services: undefined },
+    });
     await expect(anonymous.listAccounts()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
     expect(db.$transaction).not.toHaveBeenCalled();
     expect(egressMock.request).not.toHaveBeenCalled();
@@ -197,9 +198,7 @@ describe("providerManagementRouter security boundary", () => {
         return result.response;
       },
     });
-    const client = createORPCClient(link) as ReturnType<
-      typeof createRouterClient<typeof providerManagementRouter>
-    >;
+    const client = createORPCClient(link) as RouterClient<typeof providerManagementRouter>;
     await expect(client.createAccount(newAccount)).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.providerAccount.create).not.toHaveBeenCalled();
   });
@@ -212,15 +211,13 @@ describe("providerManagementRouter security boundary", () => {
       fetch: async (request, init) => {
         const result = await handler.handle(new Request(request, init), {
           prefix: "/rpc",
-          context: { session: null },
+          context: { session: null, services: undefined },
         });
         if (!result.matched) return new Response(null, { status: 404 });
         return result.response;
       },
     });
-    const client = createORPCClient(link) as ReturnType<
-      typeof createRouterClient<typeof providerManagementRouter>
-    >;
+    const client = createORPCClient(link) as RouterClient<typeof providerManagementRouter>;
     await expect(client.listAccounts()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
     expect(db.providerAccount.findMany).not.toHaveBeenCalled();
   });
@@ -241,9 +238,7 @@ describe("providerManagementRouter security boundary", () => {
         return result.response;
       },
     });
-    const client = createORPCClient(link) as ReturnType<
-      typeof createRouterClient<typeof providerManagementRouter>
-    >;
+    const client = createORPCClient(link) as RouterClient<typeof providerManagementRouter>;
     await expect(
       client.listUsageReportPage({ providerAccountId: "foreign-account" }),
     ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Not found" });
@@ -676,6 +671,7 @@ describe("providerManagementRouter security boundary", () => {
 
   it("creates owner-scoped draft pricing with explicit accounting rules and audit", async () => {
     envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([{ id: "locked-parent" }]);
     db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
     db.providerPricingVersion.create.mockResolvedValue({
       id: "price",
@@ -1836,5 +1832,151 @@ describe("providerManagementRouter security boundary", () => {
     expect(egressMock.request).not.toHaveBeenCalled();
     expect(db.$transaction).not.toHaveBeenCalled();
     expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+  });
+});
+
+// All pricing mutations must acquire their FK parents before touching pricing
+// rows. Recording writes as well as SELECT locks catches the implicit audit /
+// pricing FK inversions, including create's database-dependent RI trigger order.
+describe("provider pricing writer lock order", () => {
+  const trace: string[] = [];
+  const pricing = {
+    id: "price",
+    providerAccountId: "account",
+    providerModelId: "model",
+    version: "v1",
+    effectiveAt: new Date("2026-01-01T00:00:00Z"),
+    pricing: { ratesPerMillion: { input: "1", output: "2" } },
+  };
+  const client = createRouterClient(providerManagementRouter, { context });
+  const writers = [
+    [
+      "create",
+      () =>
+        client.createPricingVersion({
+          providerModelId: "model",
+          version: "v1",
+          currency: "USD",
+          accountingVersion: "provider-billable-v1",
+          confidence: "CALCULATED",
+          ratesPerMillion: { input: "1", output: "2" },
+          chargeRules: CATALOG_CHARGE_RULES,
+          effectiveAt: pricing.effectiveAt,
+        }),
+    ],
+    ["update", () => client.updatePricingVersion({ id: "price", currency: "EUR" })],
+    ["activate", () => client.activatePricingVersion({ id: "price" })],
+    ["retire", () => client.retirePricingVersion({ id: "price" })],
+    ["delete", () => client.deletePricingVersion({ id: "price" })],
+  ] as const;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    envMock.enabled = true;
+    trace.length = 0;
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.$queryRaw.mockImplementation(async (sql: TemplateStringsArray, ...values: unknown[]) => {
+      expect(values).toContain("owner");
+      const table = sql.join("?").match(/FROM (provider_\w+)/u)?.[1];
+      expect(sql.join("?")).toContain(
+        table === "provider_account" ? "FOR UPDATE" : "FOR NO KEY UPDATE",
+      );
+      trace.push(String(table));
+      return [{ id: table === "provider_account" ? "account" : "model" }];
+    });
+    db.$executeRaw.mockImplementation(async (_sql: TemplateStringsArray, key: string) => {
+      trace.push(key);
+      return 1;
+    });
+    db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+    db.providerPricingVersion.findFirst.mockResolvedValue(pricing);
+    db.providerPricingVersion.findMany.mockResolvedValue([]);
+    for (const method of ["create", "update", "updateMany", "delete"] as const) {
+      db.providerPricingVersion[method].mockImplementation(async () => {
+        trace.push(`pricing.${method}`);
+        return pricing;
+      });
+    }
+    for (const mock of [db.providerModel.update, db.providerModel.updateMany]) {
+      mock.mockImplementation(async () => {
+        trace.push("model.write");
+        return { count: 1 };
+      });
+    }
+    db.providerAuditEvent.create.mockImplementation(async () => {
+      trace.push("audit.insert");
+      return { id: "audit" };
+    });
+  });
+
+  it.each(writers)(
+    "%s locks account, pricing advisory and model before pricing and audit writes",
+    async (_name, write) => {
+      await write();
+      expect(trace.slice(0, 3)).toEqual([
+        "provider_account",
+        "provider-pricing:owner:model",
+        "provider_model",
+      ]);
+      expect(trace[3]).toMatch(/^pricing\./u);
+      expect(trace.at(-1)).toBe("audit.insert");
+      expect(trace.filter((entry) => entry === "audit.insert")).toHaveLength(1);
+      expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: "Serializable",
+        maxWait: 5_000,
+        timeout: 10_000,
+      });
+    },
+  );
+
+  it.each(writers)(
+    "%s refuses an absent or foreign pricing graph before locking",
+    async (_name, write) => {
+      db.providerModel.findFirst.mockResolvedValue(null);
+      db.providerPricingVersion.findFirst.mockResolvedValue(null);
+      await expect(write()).rejects.toMatchObject({ code: "NOT_FOUND" });
+      expect(trace).toEqual([]);
+    },
+  );
+
+  for (const missingParent of ["account", "model"] as const) {
+    it.each(writers)(
+      `%s refuses a missing/deleted ${missingParent} under its lock`,
+      async (_name, write) => {
+        if (missingParent === "model") db.$queryRaw.mockResolvedValueOnce([{ id: "account" }]);
+        db.$queryRaw.mockResolvedValueOnce([]);
+        await expect(write()).rejects.toMatchObject({ code: "NOT_FOUND" });
+        expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+        expect(trace.some((entry) => entry.startsWith("pricing."))).toBe(false);
+      },
+    );
+  }
+
+  it.each(writers)(
+    "%s stops on a lock timeout without a pricing or audit write",
+    async (_name, write) => {
+      const timeout = new Error("lock timeout");
+      db.$executeRaw.mockRejectedValueOnce(timeout);
+      await expect(write()).rejects.toThrow(timeout);
+      expect(trace).toEqual(["provider_account"]);
+      expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("locks the model even when scheduled activation does not update its pointer", async () => {
+    db.providerPricingVersion.findFirst.mockResolvedValue({
+      ...pricing,
+      effectiveAt: new Date(Date.now() + 60_000),
+    });
+    await client.activatePricingVersion({ id: "price" });
+    expect(trace.slice(0, 3)).toEqual([
+      "provider_account",
+      "provider-pricing:owner:model",
+      "provider_model",
+    ]);
+    expect(db.providerModel.update).not.toHaveBeenCalled();
+    expect(trace.at(-1)).toBe("audit.insert");
   });
 });

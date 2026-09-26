@@ -33,6 +33,8 @@ import {
 } from "../lib/provider-egress";
 import {
   inventoryProtocolForProviderType,
+  providerCredentialProbeUrl,
+  providerInventorySurfacesAllowed,
   providerProtocolForType,
 } from "../lib/provider-protocol";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
@@ -74,12 +76,48 @@ const providerWriteTransaction = {
   maxWait: 5_000,
   timeout: 10_000,
 } as const;
+
+/**
+ * Provider order in capacity-lock-order.ts: account -> pricing advisory ->
+ * model -> pricing rows -> child inserts. Lock both FK parents explicitly so
+ * pricing/audit inserts cannot acquire them in RI trigger order. These writers
+ * never create targets or edit capacity policy, so they need no L0 fence.
+ * The model's non-key pricing fields need only NO KEY UPDATE, which also
+ * stays compatible with target-insert FK KEY SHARE during pool setup.
+ * Call inside the same serializable transaction as the identity pre-read and
+ * writes; a concurrent graph change aborts the snapshot instead of bypassing
+ * ownership/liveness checks. The locks last through the final audit insert.
+ */
+async function lockPricingParents(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  identity: { providerAccountId: string; providerModelId: string },
+): Promise<void> {
+  const accounts = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT id FROM provider_account
+    WHERE id = ${identity.providerAccountId} AND "userId" = ${userId}
+      AND "deletedAt" IS NULL FOR UPDATE`;
+  if (accounts.length === 0) throw missing();
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${identity.providerModelId}`}, 0))`;
+  const models = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT id FROM provider_model
+    WHERE id = ${identity.providerModelId} AND "userId" = ${userId}
+      AND "providerAccountId" = ${identity.providerAccountId}
+      AND "deletedAt" IS NULL FOR NO KEY UPDATE`;
+  if (models.length === 0) throw missing();
+}
+
 function assertInventoryMatchesProviderType(
   providerType: string,
   inventory: z.infer<typeof openAiCompatibleCapabilitiesSchema> | null | undefined,
 ) {
   const expected = inventoryProtocolForProviderType(providerType);
-  if (expected === null || (inventory && inventory.protocol !== expected))
+  if (
+    expected === null ||
+    (inventory &&
+      (inventory.protocol !== expected ||
+        !providerInventorySurfacesAllowed(providerType, inventory)))
+  )
     throw new ORPCError("BAD_REQUEST", {
       message: "Invalid provider protocol configuration.",
     });
@@ -893,6 +931,10 @@ export const providerManagementRouter = {
           select: { id: true, providerAccountId: true },
         });
         if (!model) throw missing();
+        await lockPricingParents(tx, userId, {
+          providerAccountId: model.providerAccountId,
+          providerModelId: model.id,
+        });
         const row = await tx.providerPricingVersion.create({
           data: {
             userId,
@@ -938,6 +980,7 @@ export const providerManagementRouter = {
           },
         });
         if (!current) throw missing();
+        await lockPricingParents(tx, userId, current);
         const row = await tx.providerPricingVersion.update({
           where: { id: current.id },
           data: {
@@ -974,7 +1017,7 @@ export const providerManagementRouter = {
           },
         });
         if (!candidate) throw missing();
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${candidate.providerModelId}`}, 0))`;
+        await lockPricingParents(tx, userId, candidate);
         const current = await tx.providerPricingVersion.findFirst({
           where: {
             id: candidate.id,
@@ -1036,6 +1079,7 @@ export const providerManagementRouter = {
           },
         });
         if (!current) throw missing();
+        await lockPricingParents(tx, userId, current);
         const now = new Date();
         const retiredAt =
           now > current.effectiveAt ? now : new Date(current.effectiveAt.getTime() + 1);
@@ -1073,6 +1117,7 @@ export const providerManagementRouter = {
           },
         });
         if (!current) throw missing();
+        await lockPricingParents(tx, userId, current);
         await tx.providerPricingVersion.delete({ where: { id: current.id } });
         await tx.providerAuditEvent.create({
           data: {
@@ -1754,7 +1799,7 @@ export const providerManagementRouter = {
             ? ({ type: "BEARER", token: secret } as const)
             : ({ type: "API_KEY", apiKey: secret } as const);
         const response = await providerHttpsRequest(
-          account.baseUrl,
+          providerCredentialProbeUrl(account.providerType, account.baseUrl),
           { method: "GET", headers: { accept: "application/json" } },
           policy(),
           protocol,
