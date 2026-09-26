@@ -7,7 +7,11 @@ import {
   runProcessShutdown,
   runWithDeadline,
 } from "./graceful-shutdown";
-import { PROCESS_SHUTDOWN_DEADLINE_MS, SHARED_DISCONNECT_TIMEOUT_MS } from "./shutdown-timeouts";
+import {
+  CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+  PROCESS_SHUTDOWN_DEADLINE_MS,
+  SHARED_DISCONNECT_TIMEOUT_MS,
+} from "./shutdown-timeouts";
 
 /**
  * Graceful-shutdown ORDERING tests (Phase 4 item 4): the MCP
@@ -371,6 +375,32 @@ describe("runWithDeadline", () => {
     await run;
     expect(done).toBe(true);
     expect(warnings).toEqual(["[server] relay session close did not finish before its deadline."]);
+  });
+
+  it("continues shutdown when capacity runtime close hangs on a stalled release", async () => {
+    const order: string[] = [];
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: async () => {
+        order.push("closeCapacityRuntimes");
+        await hang();
+      },
+      closeMcpHandler: async () => {
+        order.push("closeMcpHandler");
+      },
+      disconnectPrisma: async () => {
+        order.push("disconnectPrisma");
+      },
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS);
+    await sequence;
+    expect(order).toEqual(["closeCapacityRuntimes", "closeMcpHandler", "disconnectPrisma"]);
   });
 
   it("lets a whole shutdown sequence finish while relay persistence hangs", async () => {

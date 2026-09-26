@@ -1,3 +1,3 @@
-// Run the driver-level regression in the server's normal CI Vitest lane.
-// Its fixture lives in db so pg/adapter mocks resolve against that package.
+// UTC driver regression runs in the server Vitest lane; fixture lives in db
+// (pg + adapter mocks) but is excluded from @ws-model-proxy/db check-types.
 import "../../../packages/db/src/client-factory.test-helper";

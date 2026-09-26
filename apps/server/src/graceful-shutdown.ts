@@ -13,7 +13,8 @@
  *      in-flight model requests can finish. Its DB writes are bounded too
  *      (`runWithDeadline`), so a locked row cannot hang shutdown;
  *   5. close capacity runtimes: cancel remaining dispatches and release their
- *      leases AFTER drain, BEFORE the MCP gate arms the database fence;
+ *      leases AFTER drain, BEFORE the MCP gate arms the database fence
+ *      (`runWithDeadline`, same as relay close);
  *   6. close the module-lifetime MCP handler — aborts in-flight modern MCP
  *      exchanges and closes their per-request servers. AFTER the HTTP drain
  *      so no live request loses its server mid-flight, and BEFORE Prisma
@@ -32,7 +33,11 @@
  * would leak Postgres connections).
  */
 
-import { PROCESS_SHUTDOWN_DEADLINE_MS, SHARED_DISCONNECT_TIMEOUT_MS } from "./shutdown-timeouts.js";
+import {
+  CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+  PROCESS_SHUTDOWN_DEADLINE_MS,
+  SHARED_DISCONNECT_TIMEOUT_MS,
+} from "./shutdown-timeouts.js";
 
 export interface ShutdownSequenceDeps {
   stopPeriodicJobs: () => void | Promise<void>;
@@ -98,7 +103,12 @@ export async function runGracefulShutdownSequence(deps: ShutdownSequenceDeps): P
 
   // Keep owners live until drain ends; their cleanup precedes the DB fence.
   try {
-    await deps.closeCapacityRuntimes();
+    await runWithDeadline(
+      () => deps.closeCapacityRuntimes(),
+      CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+      "capacity runtime close",
+      { logError },
+    );
     log("[server] Capacity runtimes closed.");
   } catch (error) {
     logError("[server] Error closing capacity runtimes:", error);

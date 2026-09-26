@@ -6,5 +6,6 @@
     "sourceMap": true,
     "outDir": "dist",
     "composite": true
-  }
+  },
+  "exclude": ["src/**/*.test-helper.ts"]
 }

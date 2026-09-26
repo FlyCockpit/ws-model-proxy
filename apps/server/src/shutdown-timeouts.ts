@@ -150,6 +150,15 @@ export const HTTP_DRAIN_TIMEOUT_MS = 10_000;
 export const RELAY_CLOSE_TIMEOUT_MS = 5_000;
 
 /**
+ * Bound on production and diagnostic capacity runtime close after HTTP drain:
+ * each owner's dispatch is aborted synchronously, then durable release runs on
+ * the shared client (with the shutdown permit). A release blocked on a row lock
+ * or a stalled server must not hold the sequence past this bound; durable lease
+ * expiry recovers the slot.
+ */
+export const CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
  * Cap on the MCP close's shadow-await of admitted exchanges
  * (apps/server/src/mcp/auth.ts), the longest wait of the MCP close step.
  */
@@ -162,10 +171,10 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * pending. It is the sum of the step bounds plus a margin, so it never fires
  * before a bounded step finishes:
  *
- *   HTTP drain 10 s + relay close 5 s + MCP close 10 s
- *   + sweep join 7.5 s + sweep disconnect 1 s + shared disconnect 2 s
- *   = 35.5 s, plus a 4.5 s margin (periodic-job stop, browser socket close,
- *   JavaScript continuations) = 40 s.
+ *   HTTP drain 10 s + relay close 5 s + capacity runtime close 5 s
+ *   + MCP close 10 s + sweep join 7.5 s + sweep disconnect 1 s
+ *   + shared disconnect 2 s = 40.5 s, plus a 4.5 s margin (periodic-job
+ *   stop, browser socket close, JavaScript continuations) = 45 s.
  *
  * Any future step that waits without a bound still ends here. The timer is
  * unref'd, so it never keeps an otherwise finished process alive, and it uses
@@ -178,7 +187,7 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * can land anywhere in the sequence (for the sweep, the same uncertain-outcome
  * case as a quarantine; the durable marker and generation make it
  * recoverable). A deployment that wants every step to finish sets its
- * platform's stop grace to at least this deadline plus a margin, 45 s
- * (`docker stop -t 45`, compose `stop_grace_period: 45s`).
+ * platform's stop grace to at least this deadline plus a margin, 50 s
+ * (`docker stop -t 50`, compose `stop_grace_period: 50s`).
  */
-export const PROCESS_SHUTDOWN_DEADLINE_MS = 40_000;
+export const PROCESS_SHUTDOWN_DEADLINE_MS = 45_000;
