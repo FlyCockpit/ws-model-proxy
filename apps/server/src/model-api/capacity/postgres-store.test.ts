@@ -12,11 +12,37 @@ import {
 } from "@ws-model-proxy/db/shutdown-fence";
 import {
   allocateReservationSlots,
+  candidateDeadlineAt,
   isRetryableCapacityTransactionError,
   PostgresCapacityAdmissionStore,
   runCapacitySerializable,
   waitWithCapacityPolling,
 } from "./postgres-store.js";
+
+describe("candidate wait budgets on the database clock", () => {
+  const now = new Date("2026-09-26T12:00:00.000Z");
+  const upper = new Date("2026-09-26T12:15:00.000Z");
+
+  it("derives the deadline from the database clock, capped by the absolute bound", () => {
+    expect(candidateDeadlineAt({ waitBudgetMs: 2_000 }, upper, now)).toEqual(
+      new Date("2026-09-26T12:00:02.000Z"),
+    );
+    expect(candidateDeadlineAt({ waitBudgetMs: 60 * 60_000 }, upper, now)).toEqual(upper);
+    expect(
+      candidateDeadlineAt(
+        { deadlineAt: new Date("2026-09-26T12:00:01.000Z"), waitBudgetMs: 5_000 },
+        upper,
+        now,
+      ),
+    ).toEqual(new Date("2026-09-26T12:00:01.000Z"));
+  });
+
+  it("treats a zero budget as 'now' and a missing budget as the absolute bound only", () => {
+    expect(candidateDeadlineAt({ waitBudgetMs: 0 }, upper, now)).toEqual(now);
+    expect(candidateDeadlineAt({ waitBudgetMs: null }, upper, now)).toEqual(upper);
+    expect(candidateDeadlineAt({}, upper, now)).toEqual(upper);
+  });
+});
 
 describe("capacity reservation allocation", () => {
   it("caps overcommitted owners proportionally with deterministic remainder order", () => {

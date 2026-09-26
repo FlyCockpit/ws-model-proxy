@@ -353,7 +353,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 poolId: attempt.poolId,
                 poolMemberId: candidate.poolMemberId,
                 candidateOrder: candidate.candidateOrder,
-                deadlineAt: candidate.deadlineAt ?? attempt.deadlineAt,
+                deadlineAt: candidateDeadlineAt(candidate, attempt.deadlineAt, now),
                 effectivePriority: candidate.priority,
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
                 effectiveConcurrencyScope: candidate.concurrencyScope,
@@ -365,16 +365,46 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           },
         }));
 
-      for (const capacityId of orderedCapacityIds) await this.#admitOne(tx, capacityId, now);
+      // A newly created attempt may carry zero wait budgets, whose DB-clock
+      // deadline is exactly `now`. They are eligible in THIS transaction only
+      // ("admit only if free now"), so the creating pass admits them before
+      // the deadline sweep; afterwards they expire below.
+      for (const capacityId of orderedCapacityIds)
+        await this.#admitOne(tx, capacityId, now, existing ? undefined : request.id);
       const refreshed = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
         include: { Lease: true },
       });
+      if (refreshed.Lease?.state === "ACTIVE")
+        return {
+          result: { state: "ADMITTED", lease: leaseHandle(refreshed.Lease) } as const,
+          notify: capacityIds,
+        };
+      if (!existing) {
+        const expiredNow = await tx.capacityWaiter.updateMany({
+          where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
+          data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
+        });
+        if (expiredNow.count > 0) {
+          const liveWaiters = await tx.capacityWaiter.count({
+            where: { admissionRequestId: request.id, state: "WAITING" },
+          });
+          if (liveWaiters === 0) {
+            await tx.admissionRequest.update({
+              where: { id: request.id },
+              data: { state: "EXPIRED", terminalAt: now, terminalReason: "candidate_deadlines" },
+            });
+            if (request.relayRequestId)
+              await tx.relayRequest.updateMany({
+                where: { id: request.relayRequestId, admissionAttemptId: attempt.attemptId },
+                data: { admissionTerminalState: "EXPIRED" },
+              });
+            return { result: { state: "EXPIRED" } as const, notify: capacityIds };
+          }
+        }
+      }
       return {
-        result:
-          refreshed.Lease?.state === "ACTIVE"
-            ? ({ state: "ADMITTED", lease: leaseHandle(refreshed.Lease) } as const)
-            : ({ state: "WAITING", requestId: refreshed.id } as const),
+        result: { state: "WAITING", requestId: refreshed.id } as const,
         notify: capacityIds,
       };
     });
@@ -465,9 +495,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     );
   }
 
-  async #admitOne(tx: Prisma.TransactionClient, capacityId: string, now: Date): Promise<boolean> {
+  async #admitOne(
+    tx: Prisma.TransactionClient,
+    capacityId: string,
+    now: Date,
+    /** The attempt created in this transaction: its zero-budget waiters are still eligible. */
+    creatingRequestId?: string,
+  ): Promise<boolean> {
     await tx.capacityWaiter.updateMany({
-      where: { capacityId, state: "WAITING", deadlineAt: { lte: now } },
+      where: {
+        capacityId,
+        state: "WAITING",
+        deadlineAt: { lte: now },
+        ...(creatingRequestId ? { NOT: { admissionRequestId: creatingRequestId } } : {}),
+      },
       data: {
         state: "EXPIRED",
         stateChangedAt: now,
@@ -486,18 +527,28 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: {
         capacityId,
         state: "WAITING",
-        OR: [{ deadlineAt: null }, { deadlineAt: { gt: now } }],
+        OR: [
+          { deadlineAt: null },
+          { deadlineAt: { gt: now } },
+          ...(creatingRequestId
+            ? [{ admissionRequestId: creatingRequestId, deadlineAt: { gte: now } }]
+            : []),
+        ],
         AdmissionRequest: {
           state: "WAITING",
-          OR: [{ deadlineAt: null }, { deadlineAt: { gt: now } }],
+          OR: [
+            { deadlineAt: null },
+            { deadlineAt: { gt: now } },
+            ...(creatingRequestId ? [{ id: creatingRequestId }] : []),
+          ],
         },
       },
       include: { AdmissionRequest: true, PoolMember: true },
     });
     const configuredReservationMembers = await tx.poolMember.findMany({
-      // Every PRIMARY execution target sharing this physical capacity takes
-      // part in the same reservation accounting, including provider-backed
-      // primaries. PUBLIC_OVERFLOW remains outside the primary scheduler.
+      // Every PRIMARY (always local) execution target sharing this physical
+      // capacity takes part in the same reservation accounting. External
+      // fallback (PUBLIC_OVERFLOW) members stay outside the primary scheduler.
       where: {
         tier: "PRIMARY",
         ExecutionTarget: {
@@ -1031,6 +1082,24 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   async #serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
     return runCapacitySerializable(this.db, work);
   }
+}
+
+/**
+ * Effective candidate deadline on the database clock (`now` is the in-
+ * transaction clock_timestamp()). Process clocks never decide a wait budget.
+ */
+export function candidateDeadlineAt(
+  candidate: { deadlineAt?: Date; waitBudgetMs?: number | null },
+  attemptDeadlineAt: Date,
+  now: Date,
+): Date {
+  const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
+  if (candidate.waitBudgetMs === undefined || candidate.waitBudgetMs === null) return upperBound;
+  const budgetMs = Number.isFinite(candidate.waitBudgetMs)
+    ? Math.max(0, Math.floor(candidate.waitBudgetMs))
+    : 0;
+  const relative = new Date(now.getTime() + budgetMs);
+  return relative < upperBound ? relative : upperBound;
 }
 
 function schedulerDeficits(value: Prisma.JsonValue): number[] {

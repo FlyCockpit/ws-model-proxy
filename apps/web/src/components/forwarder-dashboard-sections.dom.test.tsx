@@ -207,8 +207,9 @@ const editablePool = {
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
   allowLossyDeveloperRoleCollapse: false,
-  publicEgressEnabled: false,
-  publicEgressAcknowledged: false,
+  fallbackEnabled: false,
+  fallbackForGrantees: false,
+  externalAfterWaitMs: 2_000,
   effectiveProviderEgress: false,
   recommendedSurfaceOverride: null as
     | "ANTHROPIC_MESSAGES"
@@ -905,7 +906,7 @@ describe("CliEndpointsModelsSection device names", () => {
 function mountGrantDialog(pool: {
   id: string;
   effectiveProviderEgress: boolean;
-  publicEgressEnabled: boolean;
+  fallbackEnabled: boolean;
   members: Array<{ tier: string; providerModel: { id: string } | null }>;
 }) {
   return render(
@@ -925,52 +926,20 @@ function grantEmail(value: string) {
   fireEvent.change(screen.getByLabelText("dashboard:pools.email"), { target: { value } });
 }
 
-describe("GrantPoolDialog provider egress acknowledgement", () => {
-  it("shows the checkbox for public overflow with no provider members and submits the acknowledgement", async () => {
+describe("GrantPoolDialog", () => {
+  it.each([
+    ["a pool with external fallback", true],
+    ["a local-only pool", false],
+  ])("grants %s without any egress acknowledgement", async (_label, external) => {
     mountGrantDialog({
-      id: "pool-overflow",
-      publicEgressEnabled: true,
-      effectiveProviderEgress: true,
-      members: [{ tier: "PRIMARY", providerModel: null }],
+      id: "pool-grant",
+      fallbackEnabled: external,
+      effectiveProviderEgress: external,
+      members: external ? [{ tier: "PUBLIC_OVERFLOW", providerModel: { id: "external" } }] : [],
     });
 
-    expect(screen.getByRole("checkbox")).toBeTruthy();
-    expect(screen.getByText("dashboard:pools.grantEgressAcknowledge")).toBeTruthy();
-    grantEmail("friend@example.com");
-    expect(
-      (screen.getByRole("button", { name: "dashboard:pools.grant" }) as HTMLButtonElement).disabled,
-    ).toBe(true);
-
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
-
-    await waitFor(() => expect(state.mutationCalls).toEqual(["grantPoolAccessByEmail"]));
-    expect(state.mutationPayloads[0]?.input).toEqual({
-      poolId: "pool-overflow",
-      email: "friend@example.com",
-      publicEgressAcknowledged: true,
-    });
-  });
-
-  it("shows the checkbox for a primary provider member when overflow is off", () => {
-    mountGrantDialog({
-      id: "pool-primary",
-      publicEgressEnabled: false,
-      effectiveProviderEgress: true,
-      members: [{ tier: "PRIMARY", providerModel: { id: "provider-model" } }],
-    });
-
-    expect(screen.getByRole("checkbox")).toBeTruthy();
-  });
-
-  it("hides the checkbox for an overflow-only provider member when overflow is off", async () => {
-    mountGrantDialog({
-      id: "pool-overflow-member",
-      publicEgressEnabled: false,
-      effectiveProviderEgress: false,
-      members: [{ tier: "PUBLIC_OVERFLOW", providerModel: { id: "overflow-model" } }],
-    });
-
+    // Grantees' data leaves only when they ask for `owner/pool:external`
+    // themselves and the owner pays for grantees; the grant has no checkbox.
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByText("dashboard:pools.grantEgressAcknowledge")).toBeNull();
     grantEmail("friend@example.com");
@@ -978,16 +947,14 @@ describe("GrantPoolDialog provider egress acknowledgement", () => {
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["grantPoolAccessByEmail"]));
     expect(state.mutationPayloads[0]?.input).toEqual({
-      poolId: "pool-overflow-member",
+      poolId: "pool-grant",
       email: "friend@example.com",
-      publicEgressAcknowledged: false,
     });
   });
 
   it.each([
     grantPoolAccessServerMessages.userNotFound,
     grantPoolAccessServerMessages.cannotGrantToSelf,
-    grantPoolAccessServerMessages.egressAcknowledgementRequired,
   ])("shows the server grant message %s instead of raw oRPC JSON", async (message) => {
     state.nextReject = {
       name: "grantPoolAccessByEmail",
@@ -1001,7 +968,7 @@ describe("GrantPoolDialog provider egress acknowledgement", () => {
     };
     mountGrantDialog({
       id: "pool-local",
-      publicEgressEnabled: false,
+      fallbackEnabled: false,
       effectiveProviderEgress: false,
       members: [],
     });
@@ -1024,7 +991,7 @@ describe("GrantPoolDialog provider egress acknowledgement", () => {
     };
     mountGrantDialog({
       id: "pool-local",
-      publicEgressEnabled: false,
+      fallbackEnabled: false,
       effectiveProviderEgress: false,
       members: [],
     });

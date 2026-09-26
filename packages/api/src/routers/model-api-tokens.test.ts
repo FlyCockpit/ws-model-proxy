@@ -47,6 +47,10 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     update: MockInstance;
   };
+  modelApiTokenAllowlistEntry: {
+    update: MockInstance;
+  };
+  $transaction: MockInstance;
 };
 
 type TokenCreateArgs = {
@@ -181,8 +185,8 @@ function poolRow({
     slug,
     name,
     description: null,
-    publicEgressEnabled: false,
-    publicEgressAcknowledged: false,
+    fallbackEnabled: false,
+    fallbackForGrantees: false,
     User: { slug: userSlug },
   };
 }
@@ -197,6 +201,8 @@ function mockTokenCreate() {
       userId: createArgs.data.userId,
       name: createArgs.data.name,
       scopeMode: createArgs.data.scopeMode,
+      // Column default: new tokens are private only.
+      allowExternal: false,
       lookupPrefix: createArgs.data.lookupPrefix,
       lastUsedAt: null,
       revokedAt: null,
@@ -205,6 +211,7 @@ function mockTokenCreate() {
         target: entry.target,
         discoveredModelId: entry.discoveredModelId ?? null,
         modelPoolId: entry.modelPoolId ?? null,
+        includeExternal: false,
       })),
     });
   });
@@ -276,13 +283,20 @@ describe("modelApiTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        allowExternal: false,
         allowlist: {
           directModelCount: 1,
           modelPoolCount: 2,
           modelPoolIds: ["owned-pool-id", "granted-pool-id"],
+          externalModelPoolIds: [],
         },
       });
       expect(JSON.stringify(result.token)).not.toContain(result.secret);
+      // T1: external consent is human-only and never set at creation.
+      const createData = (db.modelApiToken.create.mock.calls[0]![0] as TokenCreateArgs).data;
+      expect(createData).not.toHaveProperty("allowExternal");
+      for (const entry of createData.AllowlistEntries.create)
+        expect(entry).not.toHaveProperty("includeExternal");
 
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
       expect(createCall.data.secretDigest).not.toBe(result.secret);
@@ -313,12 +327,15 @@ describe("modelApiTokensRouter", () => {
         scopeMode: "ALL_VISIBLE",
       });
 
+      expect(result.token.allowExternal).toBe(false);
       expect(result.token.allowlist).toEqual({
         directModelCount: 0,
         modelPoolCount: 0,
         modelPoolIds: [],
+        externalModelPoolIds: [],
       });
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
+      expect(createCall.data).not.toHaveProperty("allowExternal");
       expect(createCall.data.AllowlistEntries.create).toEqual([]);
     });
 
@@ -379,6 +396,7 @@ describe("modelApiTokensRouter", () => {
           userId: "user-id",
           name: "Harness",
           scopeMode: "ALLOWLIST",
+          allowExternal: false,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           secretDigest: "digest-that-must-not-leak",
           lastUsedAt: null,
@@ -405,6 +423,7 @@ describe("modelApiTokensRouter", () => {
           updatedAt,
           name: "Harness",
           scopeMode: "ALLOWLIST",
+          allowExternal: false,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           lastUsedAt: null,
           revokedAt: null,
@@ -413,6 +432,7 @@ describe("modelApiTokensRouter", () => {
             directModelCount: 1,
             modelPoolCount: 0,
             modelPoolIds: [],
+            externalModelPoolIds: [],
           },
         },
       ]);
@@ -476,6 +496,146 @@ describe("modelApiTokensRouter", () => {
           expect(capture.body).not.toContain(fragment);
       }
       expect(db.modelApiToken.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("updateExternalAccess", () => {
+    function tokenRow(scopeMode: "ALL_VISIBLE" | "ALLOWLIST", allowExternal: boolean) {
+      return {
+        id: "token-id",
+        createdAt,
+        updatedAt,
+        userId: "user-id",
+        name: "Harness",
+        scopeMode,
+        allowExternal,
+        lookupPrefix: "wsmp_model_abcd1234EFGH",
+        lastUsedAt: null,
+        revokedAt: null,
+        expiresAt: null,
+        AllowlistEntries: [],
+      };
+    }
+
+    beforeEach(() => {
+      db.$transaction.mockImplementation(async (work: (tx: typeof db) => unknown) => work(db));
+    });
+
+    it("lets the signed-in owner allow external providers on an all-visible token", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode: "ALL_VISIBLE",
+        AllowlistEntries: [],
+      });
+      db.modelApiToken.update.mockResolvedValue(tokenRow("ALL_VISIBLE", true));
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      const result = await client.updateExternalAccess({ id: "token-id", allowExternal: true });
+
+      expect(result.allowExternal).toBe(true);
+      expect(db.modelApiToken.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "token-id" }, data: { allowExternal: true } }),
+      );
+      expect(db.modelApiTokenAllowlistEntry.update).not.toHaveBeenCalled();
+    });
+
+    it("sets includeExternal only on the chosen allowlisted pools", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode: "ALLOWLIST",
+        AllowlistEntries: [
+          { id: "entry-a", modelPoolId: "pool-a" },
+          { id: "entry-b", modelPoolId: "pool-b" },
+        ],
+      });
+      db.modelApiToken.update.mockResolvedValue(tokenRow("ALLOWLIST", true));
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await client.updateExternalAccess({
+        id: "token-id",
+        allowExternal: true,
+        externalModelPoolIds: ["pool-b"],
+      });
+
+      expect(db.modelApiTokenAllowlistEntry.update.mock.calls.map(([args]) => args)).toEqual([
+        { where: { id: "entry-a" }, data: { includeExternal: false } },
+        { where: { id: "entry-b" }, data: { includeExternal: true } },
+      ]);
+      // Canonical consent-row order shared with the E0 send claim: the token
+      // row is locked before any of its allowlist entries is written.
+      const tokenLock = db.$queryRaw.mock.calls.findIndex(([strings]) =>
+        String((strings as TemplateStringsArray).join("?")).includes(
+          'FROM model_api_token WHERE id = ? AND "userId" = ? FOR NO KEY UPDATE',
+        ),
+      );
+      expect(tokenLock).toBeGreaterThanOrEqual(0);
+      expect(db.$queryRaw.mock.invocationCallOrder[tokenLock]).toBeLessThan(
+        Math.min(...db.modelApiTokenAllowlistEntry.update.mock.invocationCallOrder),
+      );
+    });
+
+    it.each([
+      [
+        "per-pool choices on an all-visible token",
+        "ALL_VISIBLE" as const,
+        [] as { id: string; modelPoolId: string }[],
+        ["pool-a"],
+      ],
+      [
+        "a pool that is not on the allowlist",
+        "ALLOWLIST" as const,
+        [{ id: "entry-a", modelPoolId: "pool-a" }],
+        ["pool-z"],
+      ],
+    ])("rejects %s", async (_label, scopeMode, entries, externalModelPoolIds) => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode,
+        AllowlistEntries: entries,
+      });
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await expect(
+        client.updateExternalAccess({ id: "token-id", allowExternal: true, externalModelPoolIds }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("BAD_REQUEST");
+        return true;
+      });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+    });
+
+    it("hides tokens owned by another user", async () => {
+      // Scoped to the caller, the lookup finds no row for another user's token.
+      db.modelApiToken.findUnique.mockResolvedValue(null);
+      db.$queryRaw.mockClear();
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await expect(
+        client.updateExternalAccess({ id: "token-id", allowExternal: true }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+      // N2: the row lock itself is scoped to the caller's own token, so no
+      // caller can lock (and stall) another user's token row.
+      const lock = db.$queryRaw.mock.calls.find(([strings]) =>
+        String((strings as TemplateStringsArray).join("?")).includes("FROM model_api_token"),
+      );
+      if (!lock) throw new Error("expected a token row lock");
+      expect(String((lock[0] as TemplateStringsArray).join("?"))).toContain(
+        'WHERE id = ? AND "userId" = ? FOR NO KEY UPDATE',
+      );
+      expect(lock.slice(1)).toEqual(["token-id", "user-id"]);
+      expect(db.modelApiToken.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "token-id", userId: "user-id" } }),
+      );
     });
   });
 

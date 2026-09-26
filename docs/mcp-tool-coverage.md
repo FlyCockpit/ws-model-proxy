@@ -89,6 +89,7 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
+| `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
@@ -169,3 +170,19 @@ token *revocation* and the settings page are deliberately NOT gated on
 `WMP_MCP_ENABLED` (invariant 13): humans must be able to kill outstanding
 authorization during an emergency MCP shutdown. Personal-token *creation*
 is gated on the flag. Normal browser authentication still applies.
+
+## Human-only external fallback settings
+
+Sending request data to external providers needs consent a person gave.
+MCP tools can never grant it:
+
+- `modelApiTokens.updateExternalAccess` (a token's `allowExternal` and
+  per-pool `includeExternal`) is excluded from the catalog;
+- `forwarder_model_pool_create` and `forwarder_model_pool_update` reject
+  `fallbackEnabled` and `fallbackForGrantees` in their input schemas
+  (advertised as `not: {}`), whatever the value;
+- `forwarder_guarded_pool_create` rejects non-empty `providerModels`,
+  because attaching external members there turns fallback on.
+
+Confirmed MCP writes for the fallback switches are planned together with the
+MCP fallback tools. Pinned by `apps/server/src/mcp/tool-manifest.test.ts`.

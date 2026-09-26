@@ -333,6 +333,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     const excluded = new Set(MCP_TOOL_EXCLUSIONS.map((entry) => entry.target));
     for (const required of [
       "modelApiTokens.create",
+      // Human-only external-provider consent (fallback redesign C1).
+      "modelApiTokens.updateExternalAccess",
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
       "cliCredentials.deviceLoginRequest",
@@ -454,6 +456,12 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     );
     expect(tokenAccesses).toEqual([]);
     expect(invoked.filter((path) => path.startsWith("mcpTokens"))).toEqual([]);
+    // Human-only proof: no tool can reach a token's external-provider consent.
+    expect(toolTargets).not.toContain("modelApiTokens.updateExternalAccess");
+    expect([...accessed].filter((path) => path === "modelApiTokens.updateExternalAccess")).toEqual(
+      [],
+    );
+    expect(invoked).not.toContain("modelApiTokens.updateExternalAccess");
   });
 });
 
@@ -497,6 +505,43 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     expect(byName.get("forwarder_model_pool_update")?.featureDependencies).toEqual([
       PROVIDER_EGRESS,
     ]);
+  });
+
+  it("D-K: MCP pool tools cannot change the owner's external fallback switches", async () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    for (const name of ["forwarder_model_pool_create", "forwarder_model_pool_update"]) {
+      const schema = byName.get(name)!.inputSchema;
+      for (const key of ["fallbackEnabled", "fallbackForGrantees"])
+        for (const value of [true, false]) {
+          const result = (await schema["~standard"].validate({ id: "pool", [key]: value })) as {
+            issues?: { message: string; path?: readonly PropertyKey[] }[];
+          };
+          expect(result.issues?.[0]?.path).toEqual([key]);
+          expect(result.issues?.[0]?.message).toContain("only by a person");
+        }
+      // Other owner settings, including the external wait, still pass through.
+      const allowed = await schema["~standard"].validate({
+        id: "pool",
+        name: "Pool",
+        externalAfterWaitMs: 500,
+      });
+      expect(allowed).not.toHaveProperty("issues");
+      const { toJSONSchema } = await import("zod");
+      const json: unknown = toJSONSchema(schema as unknown as Parameters<typeof toJSONSchema>[0]);
+      expect(json).toMatchObject({
+        properties: { fallbackEnabled: { not: {} }, fallbackForGrantees: { not: {} } },
+      });
+    }
+    // Guarded create turns fallback on when it attaches external members, so
+    // MCP may create only local-only guarded pools.
+    const guarded = byName.get("forwarder_guarded_pool_create")!.inputSchema;
+    const withExternal = (await guarded["~standard"].validate({
+      providerModels: [{ providerModelId: "provider-model" }],
+    })) as { issues?: unknown[] };
+    expect(withExternal.issues).toHaveLength(1);
+    expect(
+      await guarded["~standard"].validate({ localModelIds: ["model"], providerModels: [] }),
+    ).not.toHaveProperty("issues");
   });
 
   it("tools without runtime feature gates advertise none", () => {

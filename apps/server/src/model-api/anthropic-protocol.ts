@@ -13,6 +13,7 @@ export function anthropicErrorResponse(
   type:
     | "invalid_request_error"
     | "authentication_error"
+    | "permission_error"
     | "not_found_error"
     | "rate_limit_error"
     | "request_too_large"

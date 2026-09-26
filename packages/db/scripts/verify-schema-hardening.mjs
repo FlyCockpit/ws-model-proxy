@@ -68,6 +68,12 @@ const requiredFragments = [
   "provider_pricing_version_shape_check",
   "enforce_provider_pricing_version_immutability",
   "response_stickiness_provider_binding_check",
+  "response_stickiness_fallback_route_check",
+  'DELETE FROM response_stickiness_record\n WHERE "routingVersion" >= 3\n   AND "fallbackRoute" IS NULL',
+  "DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool",
+  "primary pool members must be local discovered models",
+  "model_pool_external_after_wait_check",
+  "relay_request_fallback_route_check",
   "enforce_response_stickiness_provider_binding_immutable",
   "activated provider pricing billing fields are immutable",
   "provider pricing lifecycle timestamps are immutable",
@@ -517,6 +523,31 @@ try {
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
     VALUES ('pre-provider-member', NOW(), NOW(), 'pre-provider-pool',
       'pre-provider-target', 'PUBLIC_OVERFLOW', 0);
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('pre-primary-provider-model', NOW(), NOW(), 'owner-a', 'pre-provider-account',
+              'pre-primary-model'),
+           ('pre-primary-second-model', NOW(), NOW(), 'owner-a', 'pre-provider-account',
+              'pre-primary-second');
+    INSERT INTO execution_target
+      (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
+    VALUES ('pre-primary-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+              'pre-primary-provider-model'),
+           ('pre-primary-second-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+              'pre-primary-second-model');
+    -- A provider-only pool from the previous release: fallback off, two
+    -- provider-backed PRIMARY members (the heavier one must keep order 0).
+    INSERT INTO model_pool
+      (id, "createdAt", "updatedAt", "userId", slug, name,
+       "publicEgressEnabled", "publicEgressAcknowledged")
+    VALUES ('pre-primary-pool', NOW(), NOW(), 'owner-a', 'pre-primary', 'Pre primary',
+      FALSE, TRUE);
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, weight)
+    VALUES ('pre-primary-provider-member', NOW(), NOW(), 'pre-primary-pool',
+              'pre-primary-provider-target', 'PRIMARY', 5),
+           ('pre-primary-second-member', NOW(), NOW(), 'pre-primary-pool',
+              'pre-primary-second-target', 'PRIMARY', 1);
     INSERT INTO pool_grant
       (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
     VALUES ('pre-provider-grant', NOW(), NOW(), 'pre-provider-pool', 'owner-a', 'owner-b');
@@ -737,13 +768,37 @@ try {
        AND "selectedExecutionTargetId" = 'pre-provider-target'
        AND "poolGrantId" = 'pre-provider-grant'
   `);
-  if (preservedGranteeBinding.rows[0]?.count !== 1) {
-    throw new Error("Hardening rejected or rewrote a valid pre-existing grantee binding");
+  // Provider bindings written before caller consent existed (automatic
+  // overflow or provider-backed PRIMARY) are invalidated by the fallback
+  // redesign even when their graph is otherwise valid.
+  if (preservedGranteeBinding.rows[0]?.count !== 0) {
+    throw new Error("Hardening kept a provider binding that predates caller consent");
   }
+  const migratedProviderPrimary = await client.query(`
+    SELECT member.tier::text AS tier, member."publicOrder" AS "publicOrder",
+           pool."publicEgressEnabled" AS enabled
+      FROM pool_member member
+      JOIN model_pool pool ON pool.id = member."poolId"
+     WHERE member.id IN ('pre-primary-provider-member', 'pre-primary-second-member')
+     ORDER BY member.id
+  `);
+  if (
+    migratedProviderPrimary.rowCount !== 2 ||
+    migratedProviderPrimary.rows.some((row) => row.tier !== "PUBLIC_OVERFLOW" || !row.enabled) ||
+    migratedProviderPrimary.rows[0].publicOrder !== 0 ||
+    migratedProviderPrimary.rows[1].publicOrder !== 1
+  ) {
+    throw new Error("Provider PRIMARY members were not moved to ordered external fallback");
+  }
+  // PRIMARY is local-only after the redesign.
   await expectConstraintFailure(`
-    UPDATE response_stickiness_record
-       SET "poolGrantId" = NULL
-     WHERE id = 'pre-valid-grantee-binding'
+    UPDATE pool_member SET tier = 'PRIMARY', "publicOrder" = NULL
+     WHERE id = 'pre-primary-provider-member'
+  `);
+  // Disabling fallback no longer requires removing configured members.
+  await client.query(`
+    UPDATE model_pool SET "publicEgressEnabled" = FALSE, "publicEgressAcknowledged" = FALSE
+     WHERE id = 'pre-primary-pool'
   `);
 
   // Exercise the provider Responses v3 binding on real PostgreSQL. Endpoint
@@ -801,23 +856,23 @@ try {
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
        "providerEndpointVersion", "providerUpstreamModelId", "poolGrantId", "nativeSurface",
-       "upstreamResponseIdDigest", "expiresAt")
+       "upstreamResponseIdDigest", "fallbackRoute", "expiresAt")
     VALUES ('sticky-provider-binding', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
       'sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
       'gpt-responses', NULL, 'OPENAI_RESPONSES',
-      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', NOW() + INTERVAL '1 hour');
+      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', 'pool-external', NOW() + INTERVAL '1 hour');
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
        "providerEndpointVersion", "providerUpstreamModelId", "poolGrantId", "nativeSurface",
-       "upstreamResponseIdDigest", "expiresAt")
+       "upstreamResponseIdDigest", "fallbackRoute", "expiresAt")
     VALUES ('grantee-provider-binding', NOW(), NOW(), 'owner-b', 'grantee-provider-token',
       'grantee-sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
       'gpt-responses', 'sticky-provider-grant', 'OPENAI_RESPONSES',
-      'efghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcd',
+      'efghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcd', 'pool-external',
       NOW() + INTERVAL '1 hour');
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
@@ -853,12 +908,12 @@ try {
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
        "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
-       "upstreamResponseIdDigest", "expiresAt")
+       "upstreamResponseIdDigest", "fallbackRoute", "expiresAt")
     VALUES ('cross-wired-provider-model', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
       'cross-wired-provider-model-digest', 3, 'sticky-provider-pool',
       'sticky-provider-target', 'sticky-provider-account', 'other-provider-model',
       'https://api.example.test/v1', 1, 'gpt-other', 'OPENAI_RESPONSES',
-      'bcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-a',
+      'bcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-a', 'pool-external',
       NOW() + INTERVAL '1 hour')
   `);
   await expectConstraintFailure(`
@@ -867,12 +922,12 @@ try {
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
        "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
-       "upstreamResponseIdDigest", "expiresAt")
+       "upstreamResponseIdDigest", "fallbackRoute", "expiresAt")
     VALUES ('cross-wired-provider-account', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
       'cross-wired-provider-account-digest', 3, 'sticky-provider-pool',
       'sticky-provider-target', 'other-provider-account', 'sticky-provider-model',
       'https://other.example.test/v1', 1, 'gpt-responses', 'OPENAI_RESPONSES',
-      'cdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-ab',
+      'cdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-ab', 'pool-external',
       NOW() + INTERVAL '1 hour')
   `);
   await expectConstraintFailure(`
@@ -881,13 +936,33 @@ try {
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
        "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
-       "upstreamResponseIdDigest", "expiresAt")
+       "upstreamResponseIdDigest", "fallbackRoute", "expiresAt")
     VALUES ('cross-wired-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
       'cross-wired-provider-pool-digest', 3, 'sticky-provider-pool',
       'other-provider-target', 'sticky-provider-account', 'other-provider-model',
       'https://api.example.test/v1', 1, 'gpt-other', 'OPENAI_RESPONSES',
-      'defghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abc',
+      'defghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abc', 'pool-external',
       NOW() + INTERVAL '1 hour')
+  `);
+  // A provider binding must record the consented route that created it.
+  await expectConstraintFailure(`
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('unconsented-provider-binding', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'unconsented-provider-binding-digest', 3, 'sticky-provider-pool',
+      'sticky-provider-target', 'sticky-provider-account', 'sticky-provider-model',
+      'https://api.example.test/v1', 1, 'gpt-responses', 'OPENAI_RESPONSES',
+      'hijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdefg',
+      NOW() + INTERVAL '1 hour')
+  `);
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "fallbackRoute" = 'local'
+     WHERE id = 'sticky-provider-binding'
   `);
   await client.query(`
     UPDATE provider_account

@@ -45,6 +45,7 @@ import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
+import { splitModelVariant } from "./external-route.js";
 import {
   type ModelApiConcurrencyLimiter,
   ModelApiLimitError,
@@ -356,6 +357,13 @@ export async function runChatCompletionDiagnostic({
   signal?: AbortSignal;
 } & DiagnosticCoreDependencies &
   ChatCompletionDiagnosticInput): Promise<ChatCompletionDiagnosticResult> {
+  // C2: MCP has no external-consent channel in v1. The chat core rejects the
+  // variant too (MCP source); this keeps the diagnostic's reason explicit.
+  if (typeof body.model === "string" && splitModelVariant(body.model).variant !== null)
+    return {
+      outcome: "invalid-request",
+      reason: "model variants such as :external are not available to MCP diagnostics",
+    };
   const request = new Request("http://diagnostic.internal/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },

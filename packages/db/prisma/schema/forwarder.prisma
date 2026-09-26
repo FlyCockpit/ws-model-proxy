@@ -443,9 +443,10 @@ model DiscoveredModel {
   @@map("discovered_model")
 }
 
-/// Dormant reusable public-provider configuration. Management APIs and egress
-/// remain feature-gated until credential, SSRF, admission, and budget controls
-/// are implemented.
+/// User-owned external provider configuration. Management and egress are gated
+/// by the deployment switch (WMP_PUBLIC_PROVIDER_EGRESS_ENABLED); pool traffic
+/// reaches a provider only through a pool's external fallback tier when the
+/// caller explicitly requests `owner/pool:external`.
 model ProviderAccount {
   id                         String                       @id @default(cuid(2))
   createdAt                  DateTime                     @default(now())
@@ -964,9 +965,20 @@ model ModelPool {
   optimisticBasicTranscription    Boolean                       @default(false)
   /// Permit the documented strict-subset translation between modern model APIs.
   protocolAdaptationEnabled       Boolean                       @default(false)
-  /// Explicit owner opt-in. Provider members are inert unless both this and
-  /// publicEgressAcknowledged are true and the deployment gate is enabled.
-  publicEgressEnabled             Boolean                       @default(false)
+  /// Owner opt-in to external (provider) fallback for this pool. External
+  /// members are used only when a caller asks for `owner/pool:external`, the
+  /// caller's token allows external providers, and the deployment switch is on.
+  /// Stored in the legacy `publicEgressEnabled` column (no data migration).
+  fallbackEnabled                 Boolean                       @default(false) @map("publicEgressEnabled")
+  /// When true the owner pays for grantees' external fallback. Off by default
+  /// for every pool; the owner's own `:external` requests never need it.
+  fallbackForGrantees             Boolean                       @default(false)
+  /// How long an `:external` request waits for local capacity before going
+  /// external. 0 means go external at once when no local member is free now.
+  /// Bounded by the local wait budget (it never makes a caller wait longer).
+  externalAfterWaitMs             Int                           @default(2000)
+  /// Deprecated. No longer read or required anywhere; dropped by the final
+  /// cleanup release (APPLY_SCHEMA=dangerous).
   publicEgressAcknowledged        Boolean                       @default(false)
   /// Permit developer instructions to collapse into the target protocol's system role.
   allowLossyDeveloperRoleCollapse Boolean                       @default(false)
@@ -1054,7 +1066,8 @@ model PoolMember {
   discoveredModelId            String?
   executionTargetId            String?
   tier                         PoolMemberTier          @default(PRIMARY)
-  /// Stable owner-defined order for PUBLIC_OVERFLOW targets. Null for primaries.
+  /// Stable owner-defined order for PUBLIC_OVERFLOW (external fallback)
+  /// targets. Null for primaries. PRIMARY members are always local models.
   publicOrder                  Int?
   /// Null inherits the owning pool policy.
   capacityPriority             Int?
@@ -1303,6 +1316,10 @@ model ModelApiToken {
   userId                    String
   name                      String
   scopeMode                 ModelApiTokenScopeMode        @default(ALL_VISIBLE)
+  /// Human-only consent for `owner/pool:external` requests. False (private
+  /// only) by default. ALLOWLIST tokens additionally need the pool entry's
+  /// includeExternal; ALL_VISIBLE tokens are all-or-nothing.
+  allowExternal             Boolean                       @default(false)
   lookupPrefix              String
   secretDigest              String
   lastUsedAt                DateTime?
@@ -1330,6 +1347,9 @@ model ModelApiTokenAllowlistEntry {
   discoveredModelId String?
   executionTargetId String?
   modelPoolId       String?
+  /// Per-pool external consent for ALLOWLIST tokens (requires the token's
+  /// allowExternal too). Ignored for direct-model entries.
+  includeExternal   Boolean                      @default(false)
   ModelApiToken     ModelApiToken                @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel   DiscoveredModel?             @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget   ExecutionTarget?             @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1370,6 +1390,10 @@ model ResponseStickinessRecord {
   poolGrantId               String?
   nativeSurface             String?
   upstreamResponseIdDigest  String?
+  /// Version 3 provider bindings: the consented route that created the
+  /// binding ("pool-external"). Null provider bindings predate caller consent
+  /// and are never honored.
+  fallbackRoute             String?
   expiresAt                 DateTime?
   User                      User             @relation("ResponseStickinessOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1458,6 +1482,9 @@ model RelayRequest {
   /// Prompt-free public overflow correlation and commitment telemetry.
   publicEgress               Boolean                 @default(false)
   publicOverflowReason       String?
+  /// Prompt-free route that served the request: "local" or "pool-external".
+  /// Null for requests that never reached a pool route decision.
+  fallbackRoute              String?
   selectedPoolMemberTier     String?
   providerAccountId          String?
   providerModelId            String?

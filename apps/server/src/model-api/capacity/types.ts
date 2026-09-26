@@ -3,8 +3,16 @@ export type AdmissionCandidate = {
   executionTargetId: string;
   poolMemberId?: string;
   candidateOrder: number;
-  /** Candidate-local deadline; sibling candidates may remain eligible longer. */
+  /** Candidate-local absolute upper bound; sibling candidates may remain eligible longer. */
   deadlineAt?: Date;
+  /**
+   * Candidate wait budget in milliseconds, measured on the DATABASE clock
+   * when the attempt is first persisted: the effective deadline is
+   * min(deadlineAt ?? attempt.deadlineAt, db_now + waitBudgetMs). 0 means
+   * "admit only if free in the creating transaction, else expire". Undefined
+   * or null means no budget (only the absolute bound applies).
+   */
+  waitBudgetMs?: number | null;
 };
 
 export type AdmissionAttempt = {

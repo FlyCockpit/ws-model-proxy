@@ -442,13 +442,15 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
           },
         });
         const members: Array<{ id: string }> = [];
-        for (const targetIndex of targetIndexes)
+        // Provider targets are external fallback members (PRIMARY is local-only).
+        for (const [order, targetIndex] of targetIndexes.entries())
           members.push(
             await fixtures.poolMember.create({
               data: {
                 poolId: created.id,
                 executionTargetId: targets[targetIndex] as string,
-                tier: "PRIMARY",
+                tier: "PUBLIC_OVERFLOW",
+                publicOrder: order,
                 capacityConcurrencyMode: "INHERIT",
               },
             }),
