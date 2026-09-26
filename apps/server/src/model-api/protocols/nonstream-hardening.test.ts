@@ -598,7 +598,7 @@ describe("upstream reply envelopes ignore unknown fields", () => {
     expect(debug).toEqual([]);
   });
 
-  it("still rejects unknown output items, content blocks, and usage fields", () => {
+  it("still rejects unknown output items and content blocks, and ignores unknown usage keys", () => {
     const debug = withDebug(() => {
       expect(() =>
         parseProtocolResponse({
@@ -634,24 +634,23 @@ describe("upstream reply envelopes ignore unknown fields", () => {
           },
         }),
       ).toThrow(/cache_control/u);
-      expect(() =>
-        parseProtocolResponse({
-          surface: "openai-chat",
-          status: 200,
-          body: {
-            id: "c",
-            object: "chat.completion",
-            choices: [
-              {
-                index: 0,
-                message: { role: "assistant", content: "ok" },
-                finish_reason: "stop",
-              },
-            ],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, extra_usage: 1 },
-          },
-        }),
-      ).toThrow(/extra_usage/u);
+      const parsed = parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: {
+          id: "c",
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: "ok" },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, extra_usage: 1 },
+        },
+      });
+      expect(parsed.ok && parsed.response.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
     });
     expect(debug).toEqual([]);
   });

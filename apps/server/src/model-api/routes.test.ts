@@ -1046,6 +1046,110 @@ describe("model API routes", () => {
     );
   });
 
+  it.each([
+    {
+      route: "/responses",
+      body: { stream: true, input: "ping" },
+      usage: '"usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}',
+    },
+    {
+      route: "/messages",
+      body: { max_tokens: 8, stream: true, messages: [{ role: "user", content: "ping" }] },
+      usage:
+        '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":9,"output_tokens":3}',
+    },
+  ])(
+    "serves $route from a llama.cpp Chat member whose finish chunk carries usage",
+    async ({ route, body, usage }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "chat-member",
+          discoveredModelId: "chat-model",
+          upstreamModelId: "upstream-chat",
+          cliDeviceId: "cli-chat",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                streaming: true,
+              },
+            },
+          },
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-chat"];
+      const responsePromise = appWith(manager).request(route, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          ...(route === "/messages" ? { "anthropic-version": "2023-06-01" } : {}),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: poolTarget.modelId, ...body }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.path).toBe("/v1/chat/completions");
+      expect(JSON.parse(await relayBodyText(sent))).toMatchObject({
+        stream: true,
+        stream_options: { include_usage: true },
+      });
+      const chunk = (value: Record<string, unknown>) =>
+        `data: ${JSON.stringify({
+          id: "chatcmpl-llama",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "upstream-chat",
+          ...value,
+        })}\n\n`;
+      manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+      manager.body(
+        sent.requestId,
+        chunk({
+          choices: [
+            { index: 0, delta: { role: "assistant", content: "pong" }, finish_reason: null },
+          ],
+        }),
+      );
+      const response = await responsePromise;
+      manager.body(
+        sent.requestId,
+        chunk({
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+          timings: { prompt_n: 9, predicted_n: 3 },
+        }),
+      );
+      manager.body(sent.requestId, "data: [DONE]\n\n");
+      manager.complete(sent.requestId);
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain("event: error");
+      expect(text.split(usage)).toHaveLength(2);
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "SUCCEEDED" }),
+          }),
+        ),
+      );
+      expect(db.relayRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ errorClass: "protocol_error" }),
+        }),
+      );
+    },
+  );
+
   it("adapts Claude Code top_k onto a CLI Chat member and drops cache metadata", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

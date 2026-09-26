@@ -35,6 +35,31 @@ describe("strict cross-surface rendering", () => {
     ).toThrow("explicitly disable parallel");
   });
 
+  it("asks a Chat target for stream usage only when the request streams", () => {
+    const canonical = (stream: boolean) =>
+      parseAnthropicMessagesRequest({
+        model: "m",
+        max_tokens: 8,
+        stream,
+        messages: [{ role: "user", content: "hello" }],
+      });
+    expect(renderOpenAiChatRequest(canonical(true), "upstream")).toMatchObject({
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    expect(renderOpenAiChatRequest(canonical(false), "upstream")).not.toHaveProperty(
+      "stream_options",
+    );
+    expect(() =>
+      parseOpenAiChatRequest({
+        model: "m",
+        stream: true,
+        stream_options: { include_usage: false },
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    ).toThrow(/stream_options/u);
+  });
+
   it("rejects stop sequences when targeting Responses instead of silently dropping them", () => {
     const canonical = parseOpenAiChatRequest({
       model: "m",
@@ -261,6 +286,44 @@ describe("upstream reply stream envelopes", () => {
     expectIgnored(debug, "choices[0]", ["llama_choice"], secret);
   });
 
+  it("caps the ignored-field log at ten truncated names plus an omitted count", () => {
+    const parser = new CanonicalStreamParser("openai-chat");
+    const long = `vendor_${"x".repeat(100)}`;
+    const extras = Object.fromEntries(
+      [long, ...Array.from({ length: 11 }, (_, index) => `vendor_${index}`)].map((key) => [
+        key,
+        "DO_NOT_LOG_value",
+      ]),
+    );
+    const chunk = (content: string) =>
+      sse({
+        id: "c",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "m",
+        choices: [{ index: 0, delta: { content }, finish_reason: null }],
+        ...extras,
+      });
+    const debug = withDebug(() => {
+      parser.push(chunk("a"));
+      parser.push(chunk("b"));
+    });
+    expect(JSON.stringify(debug)).not.toContain("DO_NOT_LOG_value");
+    expect(debug).toEqual([
+      [
+        ignoredEnvelopeLog,
+        {
+          path: "stream.data",
+          fields: [
+            long.slice(0, 64),
+            ...Array.from({ length: 9 }, (_, index) => `vendor_${index}`),
+          ],
+          omitted: 2,
+        },
+      ],
+    ]);
+  });
+
   it("ignores unknown Responses stream envelope fields and logs names only", () => {
     const parser = new CanonicalStreamParser("openai-responses");
     const secretEvent = "DO_NOT_LOG_event_value";
@@ -399,6 +462,32 @@ describe("upstream reply stream envelopes", () => {
       ).toThrow(/prompt_logprobs/u);
     });
     expect(debug).toEqual([]);
+  });
+
+  it("requires delta on a chat stream choice unless the chunk only finishes", () => {
+    const chunk = (choice: Record<string, unknown>) =>
+      sse({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [choice] });
+    const withoutDelta = new CanonicalStreamParser("openai-chat");
+    const debug = withDebug(() => {
+      expect(() =>
+        withoutDelta.push(chunk({ index: 0, text: "legacy answer", finish_reason: null })),
+      ).toThrow(/requires delta/u);
+    });
+    expect(debug).toEqual([]);
+    expect(() =>
+      new CanonicalStreamParser("openai-chat").push(
+        chunk({ index: 0, delta: null, finish_reason: null }),
+      ),
+    ).toThrow(/requires delta/u);
+    for (const finish of [{}, { delta: {} }]) {
+      const parser = new CanonicalStreamParser("openai-chat");
+      const events = [
+        ...parser.push(chunk({ index: 0, delta: { content: "pong" }, finish_reason: null })),
+        ...parser.push(chunk({ index: 0, finish_reason: "stop", ...finish })),
+        ...parser.push(bytes("data: [DONE]\n\n")),
+      ];
+      expect(events.at(-1)?.type).toBe("complete");
+    }
   });
 
   it("completes a chat stream when reasoning_content is empty", () => {
