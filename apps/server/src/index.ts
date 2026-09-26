@@ -271,7 +271,7 @@ async function runShutdownSequence() {
       stopCliCommandSweep();
       stopTerminalSessionRecheck();
       relaySessionManager.dispose();
-      await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()]);
+      await capacityLifecycle?.stopMaintenance();
     },
     closeBrowserSockets: () => {
       terminalBrowserHub.closeAll();
@@ -333,6 +333,11 @@ async function runShutdownSequence() {
           nodeServer.closeIdleConnections?.();
         },
       }),
+    // After HTTP drain, before the MCP gate arms the database fence. Owners
+    // must keep renewing and admitting requests throughout the drain window.
+    closeCapacityRuntimes: async () => {
+      await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()]);
+    },
     // 2. Close the admission gate AND the module-lifetime MCP handler —
     //    AFTER the HTTP drain (normal-drain requests finished; nothing
     //    admitted loses its exchange prematurely) and BEFORE the Prisma

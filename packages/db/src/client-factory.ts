@@ -23,7 +23,9 @@ import {
 } from "./shutdown-fence";
 
 export function createPrismaClient(connectionString: string) {
-  return new PrismaClient({ adapter: new PrismaPg({ connectionString }) });
+  return new PrismaClient({
+    adapter: new PrismaPg({ connectionString, onConnect: enforceSessionSettings }),
+  });
 }
 
 export type StatementBoundedClientOptions = {
@@ -416,7 +418,16 @@ class ConnectionNotIdleError extends Error {
 }
 
 /**
- * Sets the bound and the name on a new connection at session level (pg-pool
+ * Every Prisma pool uses this initialization before its first checkout.
+ * Prisma DateTime columns are timestamp WITHOUT time zone and use UTC wall
+ * time. Database-clock comparisons, assignments and defaults must use the
+ * same zone, including on the shared request client and replacement connections.
+ * Set UTC after startup so URL options, PGOPTIONS and role/database/server
+ * defaults cannot override it. Application SQL must not change TimeZone later.
+ * As with the bounded settings, this requires session-preserving connections
+ * (direct PostgreSQL is the supported topology, not transaction-mode pooling).
+ *
+ * Also sets the optional bound and name at session level (pg-pool
  * `onConnect`: runs once per connection, before its first checkout; a
  * failure closes the connection and fails that checkout), then reads them
  * back and refuses the connection unless they took effect. A session setting
@@ -427,8 +438,16 @@ class ConnectionNotIdleError extends Error {
  */
 async function enforceSessionSettings(
   client: ClientBase,
-  { statementTimeoutMs, applicationName }: { statementTimeoutMs: number; applicationName: string },
+  bounds?: { statementTimeoutMs: number; applicationName: string },
 ) {
+  const timezone = await client.query<{ time_zone: string }>(
+    "SELECT set_config('TimeZone', 'UTC', false) AS time_zone",
+  );
+  if (timezone.rows[0]?.time_zone !== "UTC") {
+    throw new Error("A database connection did not take its UTC session setting.");
+  }
+  if (!bounds) return;
+  const { statementTimeoutMs, applicationName } = bounds;
   await client.query(
     "SELECT set_config('statement_timeout', $1, false), set_config('application_name', $2, false)",
     [`${statementTimeoutMs}ms`, applicationName],

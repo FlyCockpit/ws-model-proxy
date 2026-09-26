@@ -36,9 +36,12 @@ Raw store acquisition elsewhere is confined to PostgreSQL test fixtures/process 
 `hold` adopts the same owner, preserving heartbeat cadence and any in-flight renewal. The
 response wrapper adds body EOF/error/cancel cleanup; it never creates another owner for a runtime
 handle. Bodyless responses explicitly release before returning. Repeated release calls for the
-same handle join one bounded retry sequence. Shutdown closes both the production and shared
-diagnostics runtimes, cancels pending admissions and dispatches, releases owners, and rejects new
-admissions. Runtime shutdown/owner terminal flags are lifecycle states, not locks or permits.
+same handle join one retry sequence. Shutdown first stops maintenance and the wake source;
+admissions and owner heartbeats remain available throughout HTTP drain. After drain completes or
+reaches its deadline, shutdown closes both production and shared diagnostics runtimes, cancels
+remaining admissions and dispatches, and awaits owner release before the MCP gate arms the DB
+fence and Prisma disconnects. Runtime shutdown/owner terminal flags are lifecycle states, not
+locks or permits.
 
 PostgreSQL remains the durable admission ledger; admission commits before dispatch, including its
 lease identity and fencing token. No new persistent state or external effect precedes admission.
@@ -52,6 +55,19 @@ token and unexpired predicates prevent renewal of a released/reclaimed lease. Bo
 renewal racing their earlier read wins without being overwritten. Admission/release/reclaim retain
 L0-L7 ordering from `packages/db/src/capacity-lock-order.ts`; only durable release/terminalization
 use the existing shutdown cleanup permit. Heartbeats get no shutdown or request-abort exemption.
+
+Every Prisma pool initializes each connection with session `TimeZone=UTC` in
+`packages/db/src/client-factory.ts`, after startup options and role/database defaults. This keeps
+database-clock comparisons and assignments consistent with Prisma's UTC wall-time `DateTime`
+columns, including heartbeat expiry and reclaim. Application SQL must preserve that setting;
+direct PostgreSQL/session-preserving connections are required. A failed initialization refuses
+checkout. Replacement connections run the same initialization.
+
+Renewal intentionally fails closed on the first error or lost fence; it never retries a false
+ownership result. There is no arbitrary owner lifetime cap: long-running responses remain valid
+while renewal succeeds. All route exits must release or hand off to the response wrapper; client
+abort, expiry watchdog and post-drain shutdown are the other termination paths. A future missing
+release would leak until one of those events, so release-path coverage remains load-bearing.
 
 The isolated runtime and route regressions use fake timers to cover dispatch exceeding 30 seconds,
 ownership loss, stalled renewal, handoff without a duplicate timer, failover/re-entry, EOF/error/

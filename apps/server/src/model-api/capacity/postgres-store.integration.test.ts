@@ -617,10 +617,18 @@ integration("PostgreSQL capacity admission primitives", () => {
     }
   }, 30_000);
 
-  it("uses the database clock across managers for deadlines, heartbeats, and lease expiry", async () => {
+  const startupTimezones = ["UTC", "Asia/Tokyo", "America/New_York"];
+  it.each(startupTimezones)("DB clock with startup zone %s", async (timezone) => {
     if (!databaseUrl) return;
-    const first = createPrismaClient(databaseUrl);
-    const second = createPrismaClient(databaseUrl);
+    // Startup options override role/database defaults; pool initialization must
+    // override these in turn, on every connection (including lock contenders).
+    const url = new URL(databaseUrl);
+    url.searchParams.set(
+      "options",
+      `${url.searchParams.get("options") ?? ""} -c TimeZone=${timezone}`.trim(),
+    );
+    const first = createPrismaClient(url.toString());
+    const second = createPrismaClient(url.toString());
     const suffix = crypto.randomUUID();
     const user = await first.user.create({
       data: { name: "Database clock proof", email: `database-clock-${suffix}@example.test` },

@@ -26,6 +26,19 @@ describe("shutdown wiring", () => {
     .filter((line) => !line.trim().startsWith("//"))
     .join("\n");
 
+  it("stops only capacity maintenance before drain and closes both runtimes in the owner teardown step", () => {
+    const stop = code.match(/stopPeriodicJobs: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
+    expect(stop).toContain("await capacityLifecycle?.stopMaintenance()");
+    expect(stop).not.toContain("capacityLifecycle?.close()");
+    expect(stop).not.toContain("closeDiagnosticsCapacityRuntime()");
+    const close = code.match(/closeCapacityRuntimes: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
+    expect(close).toContain(
+      "await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()])",
+    );
+    expect(code.match(/capacityLifecycle\?\.close\(\)/g)).toHaveLength(1);
+    expect(code.match(/closeDiagnosticsCapacityRuntime\(\)/g)).toHaveLength(1);
+  });
+
   it("disconnectPrisma runs disconnectDatabaseClients: the sweep's bounded shutdown, then the shared client", () => {
     const step = code.match(/disconnectPrisma: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
     expect(step).toBeDefined();

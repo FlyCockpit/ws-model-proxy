@@ -12,11 +12,13 @@
  *   4. close relay sessions after the drain, while Prisma is still up, so
  *      in-flight model requests can finish. Its DB writes are bounded too
  *      (`runWithDeadline`), so a locked row cannot hang shutdown;
- *   5. close the module-lifetime MCP handler — aborts in-flight modern MCP
+ *   5. close capacity runtimes: cancel remaining dispatches and release their
+ *      leases AFTER drain, BEFORE the MCP gate arms the database fence;
+ *   6. close the module-lifetime MCP handler — aborts in-flight modern MCP
  *      exchanges and closes their per-request servers. AFTER the HTTP drain
  *      so no live request loses its server mid-flight, and BEFORE Prisma
  *      disconnect so an in-flight tool teardown can still touch the DB;
- *   6. disconnect the database clients last (`disconnectDatabaseClients`):
+ *   7. disconnect the database clients last (`disconnectDatabaseClients`):
  *      the user-deletion sweep's client under its join and disconnect
  *      deadlines, then the shared client under `SHARED_DISCONNECT_TIMEOUT_MS`.
  *
@@ -39,6 +41,8 @@ export interface ShutdownSequenceDeps {
   drainHttp: () => Promise<void>;
   /** Cancel terminals and commands, close CLI sockets, mark devices disconnected. */
   closeRelaySessions: () => void | Promise<void>;
+  /** Release production and diagnostic lease owners after drain, before the DB fence. */
+  closeCapacityRuntimes: () => Promise<void>;
   /** Close the module-lifetime MCP handler (`McpHttpHandler.close()`). */
   closeMcpHandler: () => Promise<void>;
   disconnectPrisma: () => Promise<void>;
@@ -92,7 +96,15 @@ export async function runGracefulShutdownSequence(deps: ShutdownSequenceDeps): P
     logError("[server] Error closing relay sessions:", error);
   }
 
-  // After HTTP drain, BEFORE Prisma disconnect (see module doc).
+  // Keep owners live until drain ends; their cleanup precedes the DB fence.
+  try {
+    await deps.closeCapacityRuntimes();
+    log("[server] Capacity runtimes closed.");
+  } catch (error) {
+    logError("[server] Error closing capacity runtimes:", error);
+  }
+
+  // After HTTP drain and capacity cleanup, BEFORE Prisma disconnect (see module doc).
   try {
     await deps.closeMcpHandler();
     log("[server] MCP handler closed.");
