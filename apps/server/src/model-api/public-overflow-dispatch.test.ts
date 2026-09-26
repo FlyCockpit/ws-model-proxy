@@ -1,12 +1,32 @@
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const heartbeatProviderAttempt = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const releaseProviderHealthTrial = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const reconcileProviderBudget = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+/** Current caller-side consent state re-read at dispatch (token and grant). */
+const consentState = vi.hoisted(() => ({
+  token: null as null | Record<string, unknown>,
+  allowlistEntry: null as null | Record<string, unknown>,
+  grant: null as null | Record<string, unknown>,
+}));
+function resetConsentState() {
+  consentState.token = {
+    userId: "owner",
+    scopeMode: "ALL_VISIBLE",
+    allowExternal: true,
+    revokedAt: null,
+    expiresAt: null,
+  };
+  consentState.allowlistEntry = null;
+  consentState.grant = null;
+}
 const db = vi.hoisted(() => ({
+  modelApiToken: { findUnique: vi.fn(async () => consentState.token) },
+  modelApiTokenAllowlistEntry: { findUnique: vi.fn(async () => consentState.allowlistEntry) },
+  poolGrant: { findUnique: vi.fn(async () => consentState.grant) },
   modelPool: { findFirst: vi.fn() },
   providerAttempt: { groupBy: vi.fn().mockResolvedValue([]) },
   providerPricingVersion: { findFirst: vi.fn() },
@@ -93,6 +113,18 @@ import {
   rankPublicOverflowTargets,
   targetsForForcedPoolMember,
 } from "./public-overflow.js";
+
+beforeEach(resetConsentState);
+
+/** The consent plus the request identity it is bound to. */
+function ownerConsentFields(requesterUserId = "owner") {
+  const externalConsent = ownerConsent(requesterUserId);
+  return {
+    externalConsent,
+    requesterUserId: externalConsent.requesterUserId,
+    requesterModelApiTokenId: externalConsent.modelApiTokenId,
+  };
+}
 
 /** Caller consent minted by the egress gate for the pool owner's own request. */
 function ownerConsent(requesterUserId = "owner"): ExternalEgressConsent {
@@ -303,6 +335,8 @@ describe("owner consent is re-read at dispatch", () => {
     requestId: "request-owner-consent",
     reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
     externalConsent,
+    requesterUserId: externalConsent.requesterUserId,
+    requesterModelApiTokenId: externalConsent.modelApiTokenId,
     requestedProtocol: "openai" as const,
     requestedSurface: "openai-chat" as const,
     stream: false,
@@ -327,6 +361,110 @@ describe("owner consent is re-read at dispatch", () => {
     });
     expect(request.releaseLocalCapacity).not.toHaveBeenCalled();
     expect(providerHttpsRequest).not.toHaveBeenCalled();
+  });
+
+  // E0-TOCTOU: the caller-side consent is re-read at dispatch, not trusted
+  // from the authentication-time snapshot.
+  const expectRefused = async (
+    request: ReturnType<typeof baseRequest>,
+    reason: string,
+  ): Promise<void> => {
+    providerHttpsRequest.mockClear();
+    // The owner's own flags still allow it (fallback on, pays for grantees).
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture(),
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
+    });
+    await expect(dispatchPublicOverflow(request)).resolves.toEqual({
+      dispatched: false,
+      reason,
+    });
+    // No credential decrypt and no bytes sent: local capacity is never even
+    // released for the provider attempt.
+    expect(request.releaseLocalCapacity).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+  };
+
+  it("refuses when the token's allowExternal was turned off after authentication", async () => {
+    consentState.token = { ...consentState.token, allowExternal: false };
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+  });
+
+  it("refuses when the token was revoked or expired after authentication", async () => {
+    consentState.token = { ...consentState.token, revokedAt: new Date() };
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+    resetConsentState();
+    consentState.token = { ...consentState.token, expiresAt: new Date(Date.now() - 1_000) };
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+    resetConsentState();
+    consentState.token = null;
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+  });
+
+  it("refuses when an ALLOWLIST token's includeExternal was cleared for the pool", async () => {
+    consentState.token = { ...consentState.token, scopeMode: "ALLOWLIST" };
+    consentState.allowlistEntry = { target: "MODEL_POOL", includeExternal: false };
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+    // Removing the pool from the allowlist withdraws consent too.
+    consentState.allowlistEntry = null;
+    await expectRefused(baseRequest(ownerConsent()), "CALLER_CONSENT_WITHDRAWN");
+    expect(db.modelApiTokenAllowlistEntry.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          modelApiTokenId_modelPoolId: { modelApiTokenId: "token", modelPoolId: "pool" },
+        },
+      }),
+    );
+  });
+
+  it("refuses an API-token grantee whose grant was revoked after authentication", async () => {
+    consentState.token = { ...consentState.token, userId: "grantee" };
+    consentState.grant = null;
+    await expectRefused(baseRequest(ownerConsent("grantee")), "REQUESTER_NOT_VISIBLE");
+    expect(db.poolGrant.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { poolId_granteeUserId: { poolId: "pool", granteeUserId: "grantee" } },
+      }),
+    );
+  });
+
+  it("refuses a Chat Test grantee whose grant was revoked after authentication", async () => {
+    const decision = evaluateExternalEgress({
+      requested: true,
+      requester: { userId: "grantee", source: "CHAT_TEST", modelApiTokenId: null },
+      tokenPermitsPool: false,
+      pool: { id: "pool", ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: true },
+    });
+    if (!decision.granted) throw new Error("expected an issued consent");
+    consentState.grant = null;
+    await expectRefused(baseRequest(decision.consent), "REQUESTER_NOT_VISIBLE");
+    // With the grant still in place the same Chat Test consent passes the
+    // caller-side re-check (no token is read for a session).
+    db.modelApiToken.findUnique.mockClear();
+    consentState.grant = { ownerUserId: "owner" };
+    providerHttpsRequest.mockClear();
+    db.modelPool.findFirst.mockResolvedValue({ ...dispatchPoolFixture(), fallbackEnabled: false });
+    await expect(dispatchPublicOverflow(baseRequest(decision.consent))).resolves.toEqual({
+      dispatched: false,
+      reason: "POOL_PRIVATE",
+    });
+    expect(db.modelApiToken.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("refuses a consent that belongs to another requester or token", async () => {
+    await expectRefused(
+      { ...baseRequest(ownerConsent()), requesterUserId: "someone-else" },
+      "CALLER_CONSENT_MISSING",
+    );
+    await expectRefused(
+      { ...baseRequest(ownerConsent()), requesterModelApiTokenId: "other-token" },
+      "CALLER_CONSENT_MISSING",
+    );
+    await expectRefused(
+      { ...baseRequest(ownerConsent()), requesterModelApiTokenId: null },
+      "CALLER_CONSENT_MISSING",
+    );
   });
 
   it("refuses a grantee when the owner stopped paying for grantees", async () => {
@@ -404,7 +542,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai" as const,
       requestedSurface: "openai-chat" as const,
       stream: false,
@@ -508,7 +646,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-affinity-fail-open",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -554,7 +692,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "single-history",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        externalConsent: ownerConsent(),
+        ...ownerConsentFields(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -641,7 +779,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-ranked-retry",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -735,7 +873,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: `request-${fixture.protocol}`,
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: fixture.protocol as "openai" | "anthropic",
       requestedSurface: fixture.surface as "openai-chat" | "anthropic-messages",
       stream: fixture.stream,
@@ -817,7 +955,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: `request-accounting-failure-${fixture.label}`,
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        externalConsent: ownerConsent(),
+        ...ownerConsentFields(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: fixture.stream,
@@ -989,7 +1127,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1091,7 +1229,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: `request-affinity-${fixture.label.replace(/\s+/g, "-")}`,
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        externalConsent: ownerConsent(),
+        ...ownerConsentFields(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -1178,7 +1316,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-affinity-swallowed",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1288,7 +1426,7 @@ describe("public overflow terminal response dispatch", () => {
       poolId: "pool",
       requestId: "request-cancel",
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      externalConsent: ownerConsent(),
+      ...ownerConsentFields(),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: false,
@@ -1348,7 +1486,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "request-heartbeat",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        externalConsent: ownerConsent(),
+        ...ownerConsentFields(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -1419,7 +1557,7 @@ describe("public overflow terminal response dispatch", () => {
         poolId: "pool",
         requestId: "request-retry-heartbeat",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        externalConsent: ownerConsent(),
+        ...ownerConsentFields(),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,

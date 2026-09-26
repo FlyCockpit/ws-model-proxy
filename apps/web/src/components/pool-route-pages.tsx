@@ -32,11 +32,17 @@ import {
   PoolMemberForm,
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
+import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
 
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
+import {
+  type GranteePrivacyConfirm,
+  granteePrivacyConfirmationFromError,
+} from "@/lib/grantee-privacy-confirmation";
+import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 function PageSkeleton() {
@@ -730,14 +736,32 @@ export function PoolDetailTab({
 function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const update = useMutation(
-    orpc.forwarderManagement.updateModelPool.mutationOptions({
+  const [privacyConfirm, setPrivacyConfirm] = useState<
+    (GranteePrivacyConfirm & { retry: () => void }) | null
+  >(null);
+  const update = useMutation({
+    ...orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
+        setPrivacyConfirm(null);
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.fallbackSettings.saved"));
       },
+      onError: (error, variables) => {
+        // Turning fallback on for a shared pool with external members needs
+        // the owner's explicit confirmation (grantee privacy change).
+        const confirmation = granteePrivacyConfirmationFromError(error);
+        if (confirmation) {
+          setPrivacyConfirm({
+            ...confirmation,
+            retry: () => update.mutate({ ...variables, confirmGranteePrivacyChange: true }),
+          });
+          return;
+        }
+        toast.error(friendly(error, t("dashboard:pools.fallbackSettings.failed")));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
   const form = useForm({
     defaultValues: {
       fallbackEnabled: pool.fallbackEnabled,
@@ -759,18 +783,22 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
       }),
     },
     onSubmit: async ({ value }) => {
-      await update
-        .mutateAsync({
-          id: pool.id,
-          // Enabling stays gated by the deployment switch server-side;
-          // disabling is always allowed and keeps members configured.
-          ...(value.fallbackEnabled !== pool.fallbackEnabled
-            ? { fallbackEnabled: value.fallbackEnabled }
-            : {}),
-          fallbackForGrantees: value.fallbackForGrantees,
-          externalAfterWaitMs: Number(value.externalAfterWaitMs),
-        })
-        .catch(() => undefined);
+      // Send only what changed, so an unrelated stored value can never make
+      // this save fail. Enabling stays gated by the deployment switch
+      // server-side; disabling is always allowed and keeps members configured.
+      const externalAfterWaitMs = Number(value.externalAfterWaitMs);
+      const changes = {
+        ...(value.fallbackEnabled !== pool.fallbackEnabled
+          ? { fallbackEnabled: value.fallbackEnabled }
+          : {}),
+        ...(value.fallbackForGrantees !== pool.fallbackForGrantees
+          ? { fallbackForGrantees: value.fallbackForGrantees }
+          : {}),
+        ...(externalAfterWaitMs !== pool.externalAfterWaitMs ? { externalAfterWaitMs } : {}),
+      };
+      if (Object.keys(changes).length === 0) return;
+      // Errors are surfaced by the mutation's onError (toast or confirmation).
+      await update.mutateAsync({ id: pool.id, ...changes }).catch(() => undefined);
     },
   });
   return (
@@ -845,6 +873,14 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
           </Button>
         )}
       </form.Subscribe>
+      <GranteePrivacyConfirmDialog
+        confirmation={privacyConfirm}
+        pending={update.isPending}
+        onOpenChange={(open) => {
+          if (!open) setPrivacyConfirm(null);
+        }}
+        onConfirm={() => privacyConfirm?.retry()}
+      />
     </form>
   );
 }

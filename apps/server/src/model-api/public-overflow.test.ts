@@ -39,6 +39,8 @@ function overflowRequest(externalConsent: ExternalEgressConsent, poolId = "pool"
     requestId: "request",
     reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
     externalConsent,
+    requesterUserId: "owner",
+    requesterModelApiTokenId: "token",
     requestedProtocol: "openai" as const,
     requestedSurface: "openai-chat" as const,
     stream: false,
@@ -55,17 +57,23 @@ function overflowRequest(externalConsent: ExternalEgressConsent, poolId = "pool"
 }
 
 function issuedConsent(poolId = "pool"): ExternalEgressConsent {
-  const decision = evaluateExternalEgress({
-    requested: true,
-    requester: { userId: "owner", source: "API_TOKEN", modelApiTokenId: "token" },
-    tokenPermitsPool: true,
-    pool: { id: poolId, ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: false },
-    // The consent is minted as if the switch were on; dispatch must still
-    // re-check the real deployment switch.
-    deploymentSwitchEnabled: true,
-  });
-  if (!decision.granted) throw new Error("expected an issued consent");
-  return decision.consent;
+  // The consent is minted while the switch is on; dispatch must still
+  // re-check the real deployment switch (off again below).
+  const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+  const previous = mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
+  mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+  try {
+    const decision = evaluateExternalEgress({
+      requested: true,
+      requester: { userId: "owner", source: "API_TOKEN", modelApiTokenId: "token" },
+      tokenPermitsPool: true,
+      pool: { id: poolId, ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: false },
+    });
+    if (!decision.granted) throw new Error("expected an issued consent");
+    return decision.consent;
+  } finally {
+    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = previous;
+  }
 }
 
 it("applies the deployment egress gate even with an issued caller consent", async () => {

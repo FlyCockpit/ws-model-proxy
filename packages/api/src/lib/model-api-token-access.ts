@@ -356,6 +356,83 @@ export async function listVisibleModelTargetsWithExternalPermissionForToken(
   };
 }
 
+/** Why a caller's `:external` consent no longer holds (see readExternalConsentDenial). */
+export type ExternalConsentStateDenial = "TOKEN_CONSENT_WITHDRAWN" | "REQUESTER_NOT_VISIBLE";
+
+/**
+ * Re-reads, from current database state, the caller-side conditions that an
+ * `:external` consent was minted from at authentication, so provider dispatch
+ * never relies on a snapshot that may be minutes old:
+ *   - API token (`modelApiTokenId` non-null): the token still exists, belongs
+ *     to the requester, is not revoked or expired, has `allowExternal`, and
+ *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
+ *   - visibility (any requester that is not the pool owner, including Chat
+ *     Test): the requester still holds a grant for this pool from its owner,
+ *     the same owner-or-grant rule `listVisibleModelTargetsForUser` applies.
+ * Returns null when every condition still holds. The pool owner's own flags
+ * (fallbackEnabled, fallbackForGrantees) are re-read by the dispatcher.
+ */
+export async function readExternalConsentDenial(input: {
+  requesterUserId: string;
+  modelApiTokenId: string | null;
+  poolId: string;
+  ownerUserId: string;
+  now?: Date;
+}): Promise<ExternalConsentStateDenial | null> {
+  const now = input.now ?? new Date();
+  const [token, allowlistEntry, grant] = await Promise.all([
+    input.modelApiTokenId
+      ? prisma.modelApiToken.findUnique({
+          where: { id: input.modelApiTokenId },
+          select: {
+            userId: true,
+            scopeMode: true,
+            allowExternal: true,
+            revokedAt: true,
+            expiresAt: true,
+          },
+        })
+      : null,
+    input.modelApiTokenId
+      ? prisma.modelApiTokenAllowlistEntry.findUnique({
+          where: {
+            modelApiTokenId_modelPoolId: {
+              modelApiTokenId: input.modelApiTokenId,
+              modelPoolId: input.poolId,
+            },
+          },
+          select: { target: true, includeExternal: true },
+        })
+      : null,
+    input.requesterUserId === input.ownerUserId
+      ? null
+      : prisma.poolGrant.findUnique({
+          where: {
+            poolId_granteeUserId: { poolId: input.poolId, granteeUserId: input.requesterUserId },
+          },
+          select: { ownerUserId: true },
+        }),
+  ]);
+  if (input.modelApiTokenId) {
+    if (
+      !token ||
+      token.userId !== input.requesterUserId ||
+      token.revokedAt ||
+      (token.expiresAt && token.expiresAt <= now) ||
+      token.allowExternal !== true
+    )
+      return "TOKEN_CONSENT_WITHDRAWN";
+    if (
+      String(token.scopeMode) === "ALLOWLIST" &&
+      (allowlistEntry?.target !== "MODEL_POOL" || allowlistEntry.includeExternal !== true)
+    )
+      return "TOKEN_CONSENT_WITHDRAWN";
+  }
+  if (input.requesterUserId !== input.ownerUserId && grant?.ownerUserId !== input.ownerUserId)
+    return "REQUESTER_NOT_VISIBLE";
+  return null;
+}
+
 export async function authenticateModelApiTokenSecret(
   rawSecret: string,
 ): Promise<ModelApiTokenIdentity | null> {

@@ -282,6 +282,42 @@ function anyArgs(): StandardSchemaWithJSON {
   return withInputSizeBound(z.looseObject({}));
 }
 
+/**
+ * Owner fallback switches that only a person may change (fallback redesign
+ * D-K): turning external fallback on, or paying for grantees' external use.
+ * Confirmed MCP writes for these arrive with the MCP fallback tools (PR4).
+ */
+const HUMAN_ONLY_POOL_FALLBACK_MESSAGE =
+  "External fallback switches can be changed only by a person in the dashboard.";
+
+/**
+ * Loose pool-write args that can never carry `fallbackEnabled` or
+ * `fallbackForGrantees`. The keys are advertised as forbidden (`not: {}`)
+ * and any value, including `false`, is rejected before the procedure runs.
+ */
+function poolArgsWithoutFallbackSwitches(): StandardSchemaWithJSON {
+  return withInputSizeBound(
+    z.looseObject({
+      fallbackEnabled: z.never(HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
+      fallbackForGrantees: z.never(HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
+    }),
+  );
+}
+
+/**
+ * Guarded create turns fallback on implicitly when it attaches provider
+ * (external) members, so MCP may use it only for local-only pools. External
+ * members can still be attached with `forwarder_provider_member_add`,
+ * which never turns fallback on.
+ */
+function guardedPoolArgsWithoutExternalMembers(): StandardSchemaWithJSON {
+  return withInputSizeBound(
+    z.looseObject({
+      providerModels: z.array(z.unknown()).max(0, HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
+    }),
+  );
+}
+
 /** Loose object that additionally requires the exact confirmation literal. */
 function confirmedArgs(confirmation: Exclude<McpToolConfirmation, null>): StandardSchemaWithJSON {
   return withInputSizeBound(z.looseObject({ confirm: z.literal(confirmation) }));
@@ -625,7 +661,10 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    inputSchema: anyArgs(),
+    // D-K: no external members here, because attaching them turns fallback on.
+    inputSchema: guardedPoolArgsWithoutExternalMembers(),
+    descriptionNote:
+      "Local members only: attaching external (provider) members turns external fallback on, which only a person can do.",
     // G8a: conditional provider-egress gate (providerModels.length > 0).
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker(
@@ -695,10 +734,12 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    inputSchema: anyArgs(),
-    // G8a: conditional provider-egress gate (fallbackEnabled input). Owner
-    // fallback settings (fallbackForGrantees, externalAfterWaitMs) pass
-    // through; token external consent is human-only and never an MCP arg.
+    // D-K: fallbackEnabled / fallbackForGrantees are human-only (confirmed MCP
+    // writes come with PR4); externalAfterWaitMs passes through. Token
+    // external consent is human-only and never an MCP arg.
+    inputSchema: poolArgsWithoutFallbackSwitches(),
+    descriptionNote:
+      "fallbackEnabled and fallbackForGrantees are rejected: only a person can change external fallback switches.",
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
   },
@@ -708,11 +749,12 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    inputSchema: anyArgs(),
-    // Conditional provider-egress gate (fallbackEnabled input). Owner
-    // fallback settings (fallbackForGrantees, externalAfterWaitMs) pass
-    // through. Capacity policy
-    // fields are always admitted; there is no capacity release flag.
+    // D-K: fallbackEnabled / fallbackForGrantees are human-only (confirmed MCP
+    // writes come with PR4); externalAfterWaitMs passes through. Capacity
+    // policy fields are always admitted; there is no capacity release flag.
+    inputSchema: poolArgsWithoutFallbackSwitches(),
+    descriptionNote:
+      "fallbackEnabled and fallbackForGrantees are rejected: only a person can change external fallback switches.",
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updateModelPool),
   },

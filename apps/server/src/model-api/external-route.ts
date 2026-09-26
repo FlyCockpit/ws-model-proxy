@@ -14,9 +14,10 @@
  *
  * `evaluateExternalEgress` is the only way to obtain an
  * `ExternalEgressConsent`. Provider dispatch (`dispatchPublicOverflow`)
- * requires an issued consent for the exact pool and re-checks the switch and
- * the pool flags against fresh database state, so a missing or forged consent
- * fails closed.
+ * requires an issued consent for the exact pool, requester and token, and
+ * re-checks the switch, the pool flags, the token's consent and the
+ * requester's grant against fresh database state immediately before sending,
+ * so a missing, forged, or withdrawn consent fails closed.
  */
 import type {
   VisibleDirectModelTarget,
@@ -64,7 +65,8 @@ export type ExternalRouteErrorCode =
   | "external_not_supported_for_mcp"
   | "forced_member_requires_external"
   | "external_required"
-  | "external_unavailable";
+  | "external_unavailable"
+  | "local_members_required";
 
 export type ExternalRouteError = { code: ExternalRouteErrorCode; message: string };
 
@@ -77,6 +79,7 @@ const errorStatus: Record<ExternalRouteErrorCode, number> = {
   forced_member_requires_external: 400,
   external_required: 400,
   external_unavailable: 503,
+  local_members_required: 400,
 };
 
 /**
@@ -259,11 +262,10 @@ export function evaluateExternalEgress(input: {
   requester: ExternalEgressRequester;
   tokenPermitsPool: boolean;
   pool: ExternalEgressPool;
-  deploymentSwitchEnabled?: boolean;
 }): ExternalEgressDecision {
   if (!input.requested) return { granted: false, denial: "NOT_REQUESTED" };
-  const switchEnabled = input.deploymentSwitchEnabled ?? env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
-  if (switchEnabled !== true) return { granted: false, denial: "DEPLOYMENT_DISABLED" };
+  if (env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED !== true)
+    return { granted: false, denial: "DEPLOYMENT_DISABLED" };
   if (input.requester.source === "API_TOKEN") {
     if (!input.requester.modelApiTokenId || input.tokenPermitsPool !== true)
       return { granted: false, denial: "TOKEN_NOT_PERMITTED" };

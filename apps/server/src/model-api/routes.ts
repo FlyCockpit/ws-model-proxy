@@ -173,6 +173,7 @@ import {
   orderChatTestProviderTargets,
   type PublicOverflowReason,
   type PublicOverflowRequest,
+  type PublicOverflowSkipReason,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
@@ -802,6 +803,8 @@ type RelayMetadataUpdate = {
    * them for affinity evidence too); parsed here when absent. Never both.
    */
   usage?: RelayUsageFacts;
+  /** Pool route decided for this request; omitted leaves the column as is. */
+  fallbackRoute?: FallbackRoute;
 };
 
 type RelayRequester = {
@@ -2036,6 +2039,7 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
     ...(update.transformerErrorClass !== undefined
       ? { transformerErrorClass: update.transformerErrorClass }
       : {}),
+    ...(update.fallbackRoute ? { fallbackRoute: update.fallbackRoute } : {}),
   };
   if (update.localExecution && update.userId) {
     const localTerminal = update.localTerminal ?? update.terminal;
@@ -2187,6 +2191,8 @@ async function updateContextCountMetadata(
 
 type LocalExecutionTelemetry = NonNullable<RelayMetadataUpdate["execution"]> & {
   requestedSurface: string;
+  /** Pool requests: a local attempt starting decides the "local" route. */
+  fallbackRoute?: FallbackRoute;
   attemptKind?: "EXECUTION" | "CONTEXT_COUNT";
   poolId?: string;
   contextCount?: ContextCountTelemetry;
@@ -2265,6 +2271,7 @@ async function startLocalExecutionTelemetry(
         adapterMode: execution.adapterMode,
         adapterVersion: execution.adapterVersion ?? null,
         localAttemptId: execution.localAttemptId,
+        ...(execution.fallbackRoute ? { fallbackRoute: execution.fallbackRoute } : {}),
       },
       select: { id: true },
     });
@@ -2480,6 +2487,7 @@ async function failRelayMetadata({
   localExecution,
   userId,
   localTerminal,
+  fallbackRoute,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -2493,6 +2501,7 @@ async function failRelayMetadata({
   localExecution?: LocalExecutionTelemetry;
   userId?: string;
   localTerminal?: RelayAttemptTerminal;
+  fallbackRoute?: FallbackRoute;
 }) {
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
@@ -2512,6 +2521,7 @@ async function failRelayMetadata({
     localExecution,
     userId,
     localTerminal,
+    fallbackRoute,
     terminal: {
       ok: false,
       failure,
@@ -3692,6 +3702,7 @@ async function relayPool({
   transformDebug,
   capacityRuntime,
   external,
+  externalAttempt,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -3702,6 +3713,8 @@ async function relayPool({
   transformDebug?: TransformDebug;
   capacityRuntime?: CapacityAdmissionRuntime;
   external: PoolExternalRoute;
+  /** Set when a consented external attempt did not dispatch (D5 header). */
+  externalAttempt: ExternalAttemptRecord;
 }): Promise<Response> {
   const startedAt = new Date();
   const requestedSurface = requestedSurfaceForOperation(operation);
@@ -3727,9 +3740,18 @@ async function relayPool({
     operation: operation.capability,
     requestBytes: null,
     contextCount: operation.contextCount,
-    // Rewritten to "pool-external" only when a provider response commits.
-    fallbackRoute: "local",
+    // fallbackRoute stays null until a route is decided: "local" once the
+    // request is served or fails on the local path (or a local attempt
+    // starts), "pool-external" only when a provider response commits.
   });
+  let decidedRoute: FallbackRoute | undefined;
+  const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
+    failRelayMetadata({ ...input, fallbackRoute: input.fallbackRoute ?? decidedRoute });
+  const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
+    updateRelayMetadata(relayRequestId, {
+      ...update,
+      fallbackRoute: update.fallbackRoute ?? decidedRoute,
+    });
 
   // The caller's own concurrency caps (per token, per user) are never a
   // fallback trigger, and external dispatch keeps counting against them: the
@@ -3738,34 +3760,51 @@ async function relayPool({
   let globalLease: ModelApiLimitLease | undefined;
 
   /**
-   * External fallback. Returns null (serve/fail locally) unless this request
-   * carries an issued caller consent, which exists only when the caller asked
-   * for `owner/pool:external`, its credential allows external providers, the
+   * External fallback, at most one attempt per request. Returns
+   * `not_applicable` (behave as the plain name) unless this request carries
+   * an issued caller consent, which exists only when the caller asked for
+   * `owner/pool:external`, its credential allows external providers, the
    * deployment switch is on, and the owner allows it for this requester.
-   * dispatchPublicOverflow re-checks the switch, the consent, and the owner's
-   * pool flags against fresh state before any credential is decrypted.
+   * dispatchPublicOverflow re-checks the switch, the owner's pool flags, and
+   * the caller's token and grant against fresh state before any credential
+   * is decrypted. Every consented attempt that does not dispatch returns
+   * `unavailable` and is recorded for the `x-wsmp-fallback` header; a later
+   * trigger returns the same outcome without retrying.
    */
   const tryPublicOverflow = async (
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
-  ): Promise<Response | null> => {
-    const consent = external.consent;
-    if (!consent) return null;
+  ): Promise<ExternalAttemptOutcome> => {
+    if (!external.consent) return { kind: "not_applicable" };
+    if (externalAttempt.unavailable)
+      return { kind: "unavailable", reason: externalAttempt.unavailable };
+    const outcome = await attemptPublicOverflow(external.consent, reason, releaseLocalCapacity);
+    if (outcome instanceof Response) return { kind: "response", response: outcome };
+    const unavailable = externalUnavailableReason(outcome.reason, request.signal.aborted);
+    externalAttempt.unavailable = unavailable;
+    return { kind: "unavailable", reason: unavailable };
+  };
+  const attemptPublicOverflow = async (
+    consent: ExternalEgressConsent,
+    reason: PublicOverflowReason,
+    releaseLocalCapacity: () => Promise<void>,
+  ): Promise<Response | { dispatched: false; reason: PublicOverflowSkipReason }> => {
     // Public provider dispatch is intentionally limited to replayable modern
     // JSON operations. Multipart/audio paths must retain their exact target or
     // fail safely.
-    if (!operation.contextInput || !requestedSurface) return null;
+    if (!operation.contextInput || !requestedSurface)
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const providerResponsesStickiness =
       operation.family === "responses" && operation.responseStickiness !== undefined;
     let built: BuiltRelayRequest;
     try {
       built = await operation.buildRequest("__public_provider_model__");
     } catch {
-      return null;
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     }
     if (!(built.body instanceof Uint8Array)) {
       await built.body.dispose();
-      return null;
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     }
     const publicRequestBytes = built.body.byteLength;
     const requestedProtocol: "openai" | "anthropic" =
@@ -3813,6 +3852,8 @@ async function relayPool({
       requestId: relayRequestId,
       reason,
       externalConsent: consent,
+      requesterUserId: requester.userId,
+      requesterModelApiTokenId: requester.modelApiTokenId,
       requestedProtocol,
       requestedSurface,
       stream: operation.stream,
@@ -3936,7 +3977,7 @@ async function relayPool({
           signal: request.signal,
         });
         if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
-          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+          return { dispatched: false, reason: "PROVIDER_SATURATED" };
         const selectedPoolMemberId = admission.lease.poolMemberId;
         if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
           await capacityRuntime.release(admission.lease);
@@ -3987,7 +4028,9 @@ async function relayPool({
         const failure: RelayFailure =
           error instanceof ModelApiLimitError ? error.failure : "unknown";
         await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
-        await failRelayMetadata({ relayRequestId, startedAt, failure }).catch(metadataUpdateError);
+        await failPoolRelayMetadata({ relayRequestId, startedAt, failure }).catch(
+          metadataUpdateError,
+        );
         return operationFailureResponse(operation, failure);
       }
     }
@@ -4001,7 +4044,17 @@ async function relayPool({
     try {
       result = await dispatchExternalTier();
     } catch (error) {
+      // Nothing was dispatched and the error ends the request: release the
+      // caller lease and the local capacity lease exactly once (both are
+      // idempotent here), dispose the operation, and finalize the request so
+      // it never lingers PENDING (R-J).
       releaseCallerLease();
+      await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+      await failPoolRelayMetadata({
+        relayRequestId,
+        startedAt,
+        failure: request.signal.aborted ? "cancelled" : "unknown",
+      }).catch(metadataUpdateError);
       throw error;
     }
     if (!result.dispatched) {
@@ -4010,7 +4063,7 @@ async function relayPool({
         callerLeaseReleased = true;
         globalLease = outerCallerLease;
       } else releaseCallerLease();
-      return null;
+      return { dispatched: false, reason: result.reason };
     }
     const externalReason = externalFallbackReasonHeader(reason);
     await prisma.relayRequest
@@ -4262,7 +4315,7 @@ async function relayPool({
   // turn into provider egress.
   if (forcedPoolMemberId && members.length === 0 && !external.consent) {
     await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
     return externalRouteErrorResponse(operation.family, {
       code: "forced_member_requires_external",
       message: `The forced member is not a local member of "${target.modelId}". External members can be forced only with "${externalModelId(target.modelId)}".`,
@@ -4272,7 +4325,13 @@ async function relayPool({
   // plain names never leave the deployment.
   if (listedMembers.length === 0 && target.externalMemberCount > 0 && !external.consent) {
     await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+    // Token counting never uses external providers, whatever name was sent.
+    if (operationTreatsExternalAsBase(operation))
+      return externalRouteErrorResponse(operation.family, {
+        code: "local_members_required",
+        message: `"${target.modelId}" has only external members, and token counting is always done by local members, so it is not available for this pool${external.variantIgnored ? ` (":${EXTERNAL_MODEL_VARIANT}" is counted as "${target.modelId}")` : ""}.`,
+      });
     if (!external.requested)
       return externalRouteErrorResponse(operation.family, {
         code: "external_required",
@@ -4287,6 +4346,34 @@ async function relayPool({
       { [FALLBACK_HEADER]: "unavailable" },
     );
   }
+  // Routing is decided from here on: a pool with local members serves or
+  // fails on the local path unless an external response commits.
+  const providerOnly = listedMembers.length === 0;
+  if (!providerOnly) decidedRoute = "local";
+  /**
+   * X1 / D5: a consented `:external` request on a pool with no local members
+   * whose external attempt did not dispatch. Never 400 for a transient
+   * condition; the caller sees `x-wsmp-fallback: unavailable`.
+   */
+  const providerOnlyUnavailableResponse = async (
+    reason: ExternalUnavailableReason,
+  ): Promise<Response> => {
+    const failure: RelayFailure =
+      reason === "NO_COMPATIBLE"
+        ? "unsupported_capability"
+        : reason === "SATURATED"
+          ? "rate_limited"
+          : reason === "CANCELLED"
+            ? "cancelled"
+            : "disconnected";
+    await operation.dispose?.();
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
+    if (reason !== "UNAVAILABLE") return operationFailureResponse(operation, failure);
+    return externalRouteErrorResponse(operation.family, {
+      code: "external_unavailable",
+      message: `No external provider for "${externalModelId(target.modelId)}" is available right now, and the pool has no local members. Try again later.`,
+    });
+  };
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
     await Promise.all(
@@ -4428,9 +4515,10 @@ async function relayPool({
     // (c) Context ceiling: only an explicit, consented `:external` request may
     // go external. A plain name keeps the context error.
     const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
-    if (overflow) return overflow;
+    if (overflow.kind === "response") return overflow.response;
+    // Not dispatched: the plain-name context error (plus the D5 header).
     await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
     return contextExceededResponse(
       operation,
       "Request context exceeds every compatible pool member ceiling.",
@@ -4472,9 +4560,11 @@ async function relayPool({
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
     );
-    if (overflow) return overflow;
+    if (overflow.kind === "response") return overflow.response;
+    if (providerOnly && overflow.kind === "unavailable")
+      return providerOnlyUnavailableResponse(overflow.reason);
     await operation.dispose?.();
-    await failRelayMetadata({
+    await failPoolRelayMetadata({
       relayRequestId,
       startedAt,
       failure: "unsupported_capability",
@@ -4529,9 +4619,9 @@ async function relayPool({
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
     );
-    if (overflow) return overflow;
+    if (overflow.kind === "response") return overflow.response;
     await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
     return operationFailureResponse(operation, "disconnected");
   }
 
@@ -4542,14 +4632,51 @@ async function relayPool({
     external.consent && target.externalMemberCount > 0
       ? (eligibleMembers[0]?.ModelPool?.externalAfterWaitMs ?? null)
       : null;
+  // Local wait per admission (X1): "shortened" waits min(B, E) and then tries
+  // external once; after an external attempt that did not dispatch, the same
+  // candidates wait the rest, B - min(B, E) ("remaining"), so `:external`
+  // never gets less local service than the plain name; every later admission
+  // waits the full budget ("full"). Without an external plan it is "full".
+  let localWaitMode: "shortened" | "remaining" | "full" =
+    externalAfterWaitMs !== null ? "shortened" : "full";
   const admissionCandidateForRoute = (
     candidate: (typeof routeCandidates)[number],
     candidateOrder: number,
   ) => {
     const member = memberById.get(candidate.poolMemberId);
     if (!member) return null;
-    return poolAdmissionCandidate(member, candidateOrder, relayDeadlineMs, externalAfterWaitMs);
+    const admission = poolAdmissionCandidate(member, candidateOrder, relayDeadlineMs);
+    if (!admission || externalAfterWaitMs === null || localWaitMode === "full") return admission;
+    const memberBudgetMs = effectiveMemberWaitBudget(member);
+    return {
+      ...admission,
+      waitBudgetMs:
+        localWaitMode === "shortened"
+          ? localAdmissionWaitBudget(memberBudgetMs, externalAfterWaitMs)
+          : resumedLocalWaitBudget(memberBudgetMs, externalAfterWaitMs),
+    };
   };
+  const admitLocalCandidates = (
+    runtime: CapacityAdmissionRuntime,
+    candidates: NonNullable<ReturnType<typeof admissionCandidateForRoute>>[],
+  ) =>
+    acquireCapacityWithTelemetry({
+      runtime,
+      relayRequestId,
+      attempt: {
+        requestId: crypto.randomUUID(),
+        relayRequestId,
+        attemptId: crypto.randomUUID(),
+        ownerId: target.ownerUserId,
+        sourceKind: "POOL",
+        poolId: target.id,
+        basePriority: 16,
+        connectionOwner: "model-api",
+        deadlineAt: new Date(relayDeadlineMs),
+        candidates,
+      },
+      signal: request.signal,
+    });
   let affinityDecision: AffinityDecision | null = null;
   const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
   const affinityPolicy: AffinityPolicy = eligibleMembers[0]
@@ -4632,40 +4759,53 @@ async function relayPool({
     );
     if (admissionCandidates.some((candidate) => candidate === null)) {
       await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
       return operationFailureResponse(operation, "unsupported_capability");
     }
     try {
-      capacityLease = await acquireCapacityWithTelemetry({
-        runtime: capacityRuntime,
-        relayRequestId,
-        attempt: {
-          requestId: crypto.randomUUID(),
-          relayRequestId,
-          attemptId: crypto.randomUUID(),
-          ownerId: target.ownerUserId,
-          sourceKind: "POOL",
-          poolId: target.id,
-          basePriority: 16,
-          connectionOwner: "model-api",
-          deadlineAt: new Date(relayDeadlineMs),
-          candidates: admissionCandidates.filter((candidate) => candidate !== null),
-        },
-        signal: request.signal,
-      });
+      capacityLease = await admitLocalCandidates(
+        capacityRuntime,
+        admissionCandidates.filter((candidate) => candidate !== null),
+      );
     } catch {
       await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
       return operationFailureResponse(operation, "unknown");
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
       // (a) Local wait expired (member/pool budget, or externalAfterWaitMs
       // for a consented `:external` caller), measured on the database clock.
       const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
-      if (overflow) return overflow;
-      await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
-      return operationFailureResponse(operation, "rate_limited");
+      if (overflow.kind === "response") return overflow.response;
+      if (
+        overflow.kind === "unavailable" &&
+        overflow.reason !== "CANCELLED" &&
+        localWaitMode === "shortened"
+      ) {
+        // External did not dispatch: resume the local wait for the same
+        // candidates with the rest of the budget (queue position is not kept).
+        localWaitMode = "remaining";
+        try {
+          capacityLease = await admitLocalCandidates(
+            capacityRuntime,
+            routeCandidates.flatMap((candidate, candidateOrder) => {
+              const resumed = admissionCandidateForRoute(candidate, candidateOrder);
+              return resumed ? [resumed] : [];
+            }),
+          );
+        } catch {
+          await operation.dispose?.();
+          await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+          return operationFailureResponse(operation, "unknown");
+        } finally {
+          localWaitMode = "full";
+        }
+      }
+      if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+        await operation.dispose?.();
+        await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+        return operationFailureResponse(operation, "rate_limited");
+      }
     }
     const selectedPoolMemberId = capacityLease.lease.poolMemberId;
     try {
@@ -4676,7 +4816,7 @@ async function relayPool({
         () => capacityRuntime.release(admittedLease),
         () => operation.dispose?.(),
       ]);
-      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
         metadataUpdateError,
       );
       return operationFailureResponse(operation, "unknown");
@@ -4700,10 +4840,10 @@ async function relayPool({
       () => operation.dispose?.(),
     ]);
     if (error instanceof ModelApiLimitError) {
-      await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
       return operationFailureResponse(operation, error.failure);
     }
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
       metadataUpdateError,
     );
     return operationFailureResponse(operation, "unknown");
@@ -4740,26 +4880,37 @@ async function relayPool({
         return resolved;
       });
       try {
-        capacityLease = await acquireCapacityWithTelemetry({
-          runtime: capacityRuntime,
-          relayRequestId,
-          attempt: {
-            requestId: crypto.randomUUID(),
-            relayRequestId,
-            attemptId: crypto.randomUUID(),
-            ownerId: target.ownerUserId,
-            sourceKind: "POOL",
-            poolId: target.id,
-            basePriority: 16,
-            connectionOwner: "model-api",
-            deadlineAt: new Date(relayDeadlineMs),
-            candidates: admissionCandidates,
-          },
-          signal: request.signal,
-        });
+        capacityLease = await admitLocalCandidates(capacityRuntime, admissionCandidates);
       } catch {
         finalFailure = "unknown";
         break;
+      }
+      if (
+        (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) &&
+        localWaitMode === "shortened"
+      ) {
+        // (a) inside the retry loop: this round's shortened wait expired.
+        const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
+        if (overflow.kind === "response") return overflow.response;
+        if (overflow.kind === "unavailable" && overflow.reason !== "CANCELLED") {
+          localWaitMode = "remaining";
+          try {
+            capacityLease = await admitLocalCandidates(
+              capacityRuntime,
+              remaining.map((remainingCandidate, candidateOrder) => {
+                const resumed = admissionCandidateForRoute(remainingCandidate, candidateOrder);
+                if (!resumed)
+                  throw new Error("Capacity-enabled pool member lost execution target identity.");
+                return resumed;
+              }),
+            );
+          } catch {
+            finalFailure = "unknown";
+            break;
+          } finally {
+            localWaitMode = "full";
+          }
+        } else localWaitMode = "full";
       }
       if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
         finalFailure = "rate_limited";
@@ -4944,6 +5095,7 @@ async function relayPool({
       adapterVersion: adaptedSource ? "1.0.0" : undefined,
       localAttemptId: crypto.randomUUID(),
       poolId: target.id,
+      fallbackRoute: "local",
       contextCount: operation.contextCount,
       admission:
         capacityLease?.state === "ADMITTED"
@@ -5342,7 +5494,7 @@ async function relayPool({
                     failure: "protocol_error",
                   })
                 : Promise.resolve(),
-            updateRelayMetadata(relayRequestId, {
+            updatePoolRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
               status: terminalStatus(terminal),
               startedAt,
@@ -5437,7 +5589,7 @@ async function relayPool({
             : undefined,
         () => operation.dispose?.(),
       ]);
-      await updateRelayMetadata(relayRequestId, {
+      await updatePoolRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
         status: servedFailureStatus(terminal),
         startedAt,
@@ -5462,14 +5614,14 @@ async function relayPool({
     finalFailure === "rate_limited" || finalFailure === "timeout"
       ? "LOCAL_WAIT_EXPIRED"
       : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
-  const overflow = callerLimitReached
-    ? null
+  const overflow: ExternalAttemptOutcome = callerLimitReached
+    ? { kind: "not_applicable" }
     : await tryPublicOverflow(overflowReason, async () => {
         const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
         capacityLease = undefined;
         await settleRelayCleanup([() => (lease ? capacityRuntime?.release(lease) : undefined)]);
       });
-  if (overflow) return overflow;
+  if (overflow.kind === "response") return overflow.response;
 
   await settleRelayCleanup([
     () => globalLease?.release(),
@@ -5479,7 +5631,7 @@ async function relayPool({
         : undefined,
     () => operation.dispose?.(),
   ]);
-  await failRelayMetadata({
+  await failPoolRelayMetadata({
     relayRequestId,
     startedAt,
     failure: finalFailure,
@@ -6364,9 +6516,62 @@ type PoolExternalRoute = {
   consent: ExternalEgressConsent | null;
   /** Why an `:external` request has no consent (serve local, `x-wsmp-fallback: unavailable`). */
   denial: ExternalEgressDenial | null;
+  /** count_tokens named `:external`; it is counted as the plain name. */
+  variantIgnored?: boolean;
 };
 
 const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, denial: null };
+
+/**
+ * Why a consented `:external` request needed an external dispatch but none
+ * happened. Drives the provider-only pool status (D5 / X1):
+ *   NO_COMPATIBLE -> 400 unsupported_capability (no external target fits);
+ *   SATURATED     -> 429 rate_limited (provider admission did not admit);
+ *   UNAVAILABLE   -> 503 external_unavailable (unhealthy, precommit failure,
+ *                    owner or caller consent withdrawn at dispatch, ...);
+ *   CANCELLED     -> the client went away; stays a cancel.
+ */
+type ExternalUnavailableReason = "NO_COMPATIBLE" | "SATURATED" | "UNAVAILABLE" | "CANCELLED";
+
+/**
+ * Typed result of one external fallback attempt in relayPool:
+ *   response        -> return it (dispatched, or a terminal error such as the
+ *                      caller's own cap);
+ *   not_applicable  -> the request has no caller consent; behave exactly as
+ *                      the plain name;
+ *   unavailable     -> consented, a trigger fired, nothing was dispatched.
+ */
+type ExternalAttemptOutcome =
+  | { kind: "response"; response: Response }
+  | { kind: "not_applicable" }
+  | { kind: "unavailable"; reason: ExternalUnavailableReason };
+
+/** Observed by the caller of relayPool to set `x-wsmp-fallback: unavailable`. */
+type ExternalAttemptRecord = { unavailable: ExternalUnavailableReason | null };
+
+function externalUnavailableReason(
+  reason: PublicOverflowSkipReason,
+  aborted: boolean,
+): ExternalUnavailableReason {
+  if (aborted) return "CANCELLED";
+  if (reason === "NO_COMPATIBLE_PROVIDER") return "NO_COMPATIBLE";
+  if (reason === "PROVIDER_SATURATED") return "SATURATED";
+  return "UNAVAILABLE";
+}
+
+/**
+ * Remaining local wait after an external attempt that did not dispatch:
+ * externalAfterWaitMs only shortens the local wait in favour of an external
+ * target, so the total local wait is still the member/pool budget B:
+ * B - min(B, E). Null (no budget) stays null; 0 admits only if free now.
+ */
+export function resumedLocalWaitBudget(
+  memberBudgetMs: number | null,
+  externalAfterWaitMs: number,
+): number | null {
+  if (memberBudgetMs === null) return null;
+  return memberBudgetMs - Math.min(memberBudgetMs, Math.max(0, externalAfterWaitMs));
+}
 
 /** Only these operations may ever be dispatched to an external provider. */
 function operationAcceptsExternalVariant(
@@ -6414,7 +6619,9 @@ function resolvePoolExternalRoute({
   externalPoolIds: ReadonlySet<string>;
   operation: Pick<RelayOperation, "family" | "capability">;
 }): PoolExternalRoute | ExternalRouteError {
-  if (!externalRequested || operationTreatsExternalAsBase(operation)) return NO_EXTERNAL_ROUTE;
+  if (!externalRequested) return NO_EXTERNAL_ROUTE;
+  if (operationTreatsExternalAsBase(operation))
+    return { ...NO_EXTERNAL_ROUTE, variantIgnored: true };
   if (!operationAcceptsExternalVariant(operation))
     return {
       code: "external_variant_unsupported",
@@ -6607,6 +6814,7 @@ async function relayPreparedModeledRequest({
         }
       : {}),
   };
+  const externalAttempt: ExternalAttemptRecord = { unavailable: null };
   let response = await relayPool({
     request,
     requester,
@@ -6617,12 +6825,21 @@ async function relayPreparedModeledRequest({
     transformDebug: prepared.transformDebug,
     capacityRuntime,
     external,
+    externalAttempt,
   });
   // Tell the client which route served it. External responses already carry
   // `x-wsmp-route: pool-external`, the reason, and the served model.
+  // `x-wsmp-fallback: unavailable` is set exactly when `:external` was asked
+  // for and not served externally because there was no consent (owner-side
+  // denial), no external members, or a needed external dispatch did not
+  // happen. A consented request served locally before any trigger fired
+  // carries no header.
   if (!response.headers.has(ROUTE_HEADER)) {
     const noExternalPlan =
-      external.requested && (!external.consent || poolTarget.externalMemberCount === 0);
+      external.requested &&
+      (!external.consent ||
+        poolTarget.externalMemberCount === 0 ||
+        externalAttempt.unavailable !== null);
     response = withResponseHeaders(response, {
       [ROUTE_HEADER]: "local",
       ...(noExternalPlan ? { [FALLBACK_HEADER]: "unavailable" } : {}),
@@ -6785,6 +7002,8 @@ async function relayBoundProviderResponse(input: {
   contextInput?: JsonObject;
   contextCount?: ContextCountTelemetry;
   capacityRuntime?: CapacityAdmissionRuntime;
+  /** The caller's own concurrency caps; external dispatch counts against them (H1). */
+  limiter: ModelApiConcurrencyLimiter;
   /** Caller consent for this bound external route (all egress conditions). */
   externalConsent: ExternalEgressConsent;
 }): Promise<Response> {
@@ -6799,8 +7018,32 @@ async function relayBoundProviderResponse(input: {
     operation: input.capability,
     requestBytes: input.body.byteLength,
     contextCount: input.contextCount,
-    fallbackRoute: "pool-external",
+    // fallbackRoute is recorded only when a provider response commits.
   });
+  // H1: the caller's own cap applies to every bound operation exactly as to
+  // relayPool: a caller at its cap gets 429 before any listing or dispatch,
+  // and the lease is held until the provider response settles. Released
+  // exactly once on every exit (not dispatched, throw, precommit throw,
+  // terminal including abort and client disconnect).
+  let callerLease: ModelApiLimitLease;
+  try {
+    callerLease = input.limiter.acquireGlobal({
+      tokenId: input.requester.limitKey,
+      userId: input.requester.userId,
+    });
+  } catch (error) {
+    const failure: RelayFailure = error instanceof ModelApiLimitError ? error.failure : "unknown";
+    await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
+      metadataUpdateError,
+    );
+    return openAiFailureJsonResponse(failure);
+  }
+  let callerLeaseReleased = false;
+  const releaseCallerLease = () => {
+    if (callerLeaseReleased) return;
+    callerLeaseReleased = true;
+    callerLease.release();
+  };
   const maxOutput = input.contextInput?.max_output_tokens;
   const requestedOutputTokens =
     typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
@@ -6817,6 +7060,8 @@ async function relayBoundProviderResponse(input: {
     requestId: relayRequestId,
     reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
     externalConsent: input.externalConsent,
+    requesterUserId: input.requester.userId,
+    requesterModelApiTokenId: input.requester.modelApiTokenId,
     requestedProtocol: "openai",
     requestedSurface: "openai-responses",
     stream: input.stream,
@@ -6885,8 +7130,7 @@ async function relayBoundProviderResponse(input: {
       },
       signal: input.request.signal,
     });
-    if (admission.state !== "ADMITTED")
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+    if (admission.state !== "ADMITTED") return { dispatched: false, reason: "PROVIDER_SATURATED" };
     let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
     try {
       result = await dispatchPublicOverflow({
@@ -6910,6 +7154,7 @@ async function relayBoundProviderResponse(input: {
   } catch (error) {
     // Admission/dispatch threw before any provider terminal exists: finalize
     // the request here so it never lingers PENDING (and is counted once).
+    releaseCallerLease();
     await failRelayMetadata({
       relayRequestId,
       startedAt: boundStartedAt,
@@ -6918,17 +7163,23 @@ async function relayBoundProviderResponse(input: {
     throw error;
   }
   if (!result.dispatched) {
-    const failedAt = new Date();
-    await prisma
-      .$transaction((tx) =>
-        transitionRelayRequestTerminal(
-          tx,
-          relayRequestId,
-          { status: "FAILED", completedAt: failedAt, errorClass: "not_found" },
-          failedAt,
-        ),
-      )
-      .catch(metadataUpdateError);
+    releaseCallerLease();
+    const denied = boundDispatchDenial(result.reason, input.stickyRoute.visibleTarget);
+    const failure: RelayFailure = input.request.signal.aborted
+      ? "cancelled"
+      : denied
+        ? "access_denied"
+        : result.reason === "PROVIDER_SATURATED"
+          ? "rate_limited"
+          : "not_found";
+    await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
+      metadataUpdateError,
+    );
+    // Consent withdrawn at dispatch (switch, owner flags, token, grant): a
+    // permission error, never a success-shaped or "gone" response.
+    if (denied) return externalRouteErrorResponse("responses", denied);
+    if (failure === "rate_limited" || failure === "cancelled")
+      return openAiFailureJsonResponse(failure);
     return openAiFailureJsonResponse(
       "not_found",
       "The bound provider Responses target is no longer available.",
@@ -6949,12 +7200,14 @@ async function relayBoundProviderResponse(input: {
         providerAttemptId: result.attemptId,
         providerFencingToken: result.fencingToken,
         attemptCount: 1,
+        fallbackRoute: "pool-external",
       },
       select: { id: true },
     })
     .catch(metadataUpdateError);
   void result.terminal
     .then((terminal) => {
+      releaseCallerLease();
       const completedAt = new Date();
       const usage = usageFactsFromProviderUsage(terminal.usage);
       return prisma.$transaction((tx) =>
@@ -6984,12 +7237,12 @@ async function relayBoundProviderResponse(input: {
         ),
       );
     })
-    .catch(metadataUpdateError);
-  let response = result.response;
-  if (response.status < 200 || response.status >= 300) {
-    let sanitized: Uint8Array;
-    try {
-      sanitized = await readAdaptedNonstreamBody({
+    .catch(metadataUpdateError)
+    .finally(releaseCallerLease);
+  try {
+    let response = result.response;
+    if (response.status < 200 || response.status >= 300) {
+      const sanitized = await readAdaptedNonstreamBody({
         body: response.body,
         source: "openai-responses",
         target: "openai-responses",
@@ -6997,49 +7250,76 @@ async function relayBoundProviderResponse(input: {
         headers: response.headers,
         signal: input.request.signal,
       });
-    } catch (error) {
-      if (providerCapacityLease && input.capacityRuntime)
-        await releaseCapacityLeaseWithRetry({
-          store: input.capacityRuntime,
-          lease: providerCapacityLease,
-        });
-      throw error;
+      response = new Response(sanitized, {
+        status: response.status >= 400 && response.status <= 599 ? response.status : 502,
+        headers: adaptedProviderResponseHeaders(
+          "openai-responses",
+          "openai-responses",
+          response.headers,
+          false,
+        ),
+      });
     }
-    response = new Response(sanitized, {
-      status: response.status >= 400 && response.status <= 599 ? response.status : 502,
-      headers: adaptedProviderResponseHeaders(
-        "openai-responses",
-        "openai-responses",
-        response.headers,
-        false,
-      ),
+    if (input.captureReturnedResponse) {
+      response = captureProviderResponseBinding({
+        response,
+        streaming: input.stream,
+        requester: input.requester,
+        targetModelPoolId: input.stickyRoute.visibleTarget.id,
+        poolGrantId: input.stickyRoute.visibleTarget.accessGrantId,
+        target: result.target,
+        terminal: result.terminal,
+      });
+    }
+    const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
+    const held =
+      providerCapacityLease && input.capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            input.capacityRuntime,
+            committed,
+            providerCapacityLease,
+            input.request.signal,
+          )
+        : committed;
+    return withResponseHeaders(held, {
+      [ROUTE_HEADER]: "pool-external",
+      [SERVED_MODEL_HEADER]: result.target.upstreamModelId,
     });
+  } catch (error) {
+    // Precommit throw: nothing reaches the client, so neither lease may wait
+    // for a terminal that no reader will drive.
+    releaseCallerLease();
+    if (providerCapacityLease && input.capacityRuntime)
+      await releaseCapacityLeaseWithRetry({
+        store: input.capacityRuntime,
+        lease: providerCapacityLease,
+      });
+    throw error;
   }
-  if (input.captureReturnedResponse) {
-    response = captureProviderResponseBinding({
-      response,
-      streaming: input.stream,
-      requester: input.requester,
-      targetModelPoolId: input.stickyRoute.visibleTarget.id,
-      poolGrantId: input.stickyRoute.visibleTarget.accessGrantId,
-      target: result.target,
-      terminal: result.terminal,
-    });
-  }
-  const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
-  const held =
-    providerCapacityLease && input.capacityRuntime
-      ? await holdOrReleaseCapacityResponse(
-          input.capacityRuntime,
-          committed,
-          providerCapacityLease,
-          input.request.signal,
-        )
-      : committed;
-  return withResponseHeaders(held, {
-    [ROUTE_HEADER]: "pool-external",
-    [SERVED_MODEL_HEADER]: result.target.upstreamModelId,
-  });
+}
+
+/**
+ * Bound follow-up refusals that mean the caller's consent is gone at dispatch
+ * time (C3 / E0-TOCTOU). Null for availability failures.
+ */
+function boundDispatchDenial(
+  reason: PublicOverflowSkipReason,
+  pool: Pick<VisibleModelPoolTarget, "modelId">,
+): ExternalRouteError | null {
+  if (reason === "DEPLOYMENT_GATE_DISABLED")
+    return externalDenialError("DEPLOYMENT_DISABLED", pool);
+  if (
+    reason === "CALLER_CONSENT_MISSING" ||
+    reason === "CALLER_CONSENT_WITHDRAWN" ||
+    reason === "REQUESTER_NOT_VISIBLE" ||
+    reason === "POOL_PRIVATE" ||
+    reason === "GRANTEE_NOT_COVERED"
+  )
+    return {
+      code: "external_not_permitted",
+      message: `This response was served by an external provider, and external fallback for "${pool.modelId}" is no longer allowed for this caller.`,
+    };
+  return null;
 }
 
 function responseIdParam(responseId: string | undefined): string | Response {
@@ -7170,6 +7450,7 @@ export async function responsesCreateHandler({
       captureReturnedResponse: true,
       contextInput: prepared.payload ?? undefined,
       capacityRuntime,
+      limiter,
       externalConsent: consent,
     });
   }
@@ -7305,6 +7586,7 @@ async function responsesStickyHandler({
       stream: false,
       captureReturnedResponse: false,
       capacityRuntime,
+      limiter,
       externalConsent: consent,
     });
   }

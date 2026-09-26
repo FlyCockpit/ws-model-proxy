@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { readExternalConsentDenial } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
   type OpenAiCompatibleCapabilities,
   parseOpenAiCompatibleCapabilities,
@@ -64,6 +65,13 @@ export type PublicOverflowReason =
 export type PublicOverflowSkipReason =
   | "DEPLOYMENT_GATE_DISABLED"
   | "CALLER_CONSENT_MISSING"
+  /** The caller's token no longer allows `:external` for this pool (revoked,
+   * expired, `allowExternal` or `includeExternal` turned off). */
+  | "CALLER_CONSENT_WITHDRAWN"
+  /** A non-owner requester no longer holds a grant for the pool. */
+  | "REQUESTER_NOT_VISIBLE"
+  /** Durable provider admission did not admit within its wait budget. */
+  | "PROVIDER_SATURATED"
   | "POOL_PRIVATE"
   | "GRANTEE_NOT_COVERED"
   | "ADAPTATION_GATE_DISABLED"
@@ -86,9 +94,14 @@ export interface PublicOverflowRequest {
   /**
    * Caller consent minted by evaluateExternalEgress for exactly this pool.
    * Dispatch fails closed without an issued consent, and re-checks the
-   * deployment switch and the owner's pool flags against fresh state.
+   * deployment switch, the owner's pool flags, and the caller's token and
+   * grant against fresh state.
    */
   externalConsent: ExternalEgressConsent;
+  /** The request's requester; must equal the consent's requester. */
+  requesterUserId: string;
+  /** The request's API token (null for Chat Test); must equal the consent's token. */
+  requesterModelApiTokenId: string | null;
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
   stream: boolean;
@@ -1658,19 +1671,38 @@ export async function dispatchPublicOverflow(
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
   // Caller consent: only evaluateExternalEgress mints a consent, and only for
   // an explicit `owner/pool:external` request whose credential allows it.
+  // The consent is bound to the pool, its owner, and the exact requester and
+  // token of this request.
   const consent = request.externalConsent;
   if (
     !isIssuedExternalConsent(consent) ||
     consent.poolId !== request.poolId ||
-    consent.ownerUserId !== request.userId
+    consent.ownerUserId !== request.userId ||
+    consent.requesterUserId !== request.requesterUserId ||
+    consent.modelApiTokenId !== request.requesterModelApiTokenId ||
+    consent.requesterIsOwner !== (consent.requesterUserId === consent.ownerUserId)
   )
     return { dispatched: false, reason: "CALLER_CONSENT_MISSING" };
-  // Owner consent, re-read from the database at dispatch time: fallback on,
-  // and the owner pays for grantees when the requester is not the owner.
-  const listed = await listPublicOverflowTargets(request.userId, request.poolId);
+  // Owner and caller consent, re-read from the database at dispatch time
+  // (the consent was minted at authentication, possibly minutes ago): the
+  // owner's fallback flags, the caller's token consent, and the requester's
+  // grant. Nothing is decrypted or sent unless all of them still hold.
+  const [listed, callerDenial] = await Promise.all([
+    listPublicOverflowTargets(request.userId, request.poolId),
+    readExternalConsentDenial({
+      requesterUserId: consent.requesterUserId,
+      modelApiTokenId: consent.modelApiTokenId,
+      poolId: consent.poolId,
+      ownerUserId: consent.ownerUserId,
+    }),
+  ]);
   if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
   if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
     return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
+  if (callerDenial === "TOKEN_CONSENT_WITHDRAWN")
+    return { dispatched: false, reason: "CALLER_CONSENT_WITHDRAWN" };
+  if (callerDenial === "REQUESTER_NOT_VISIBLE")
+    return { dispatched: false, reason: "REQUESTER_NOT_VISIBLE" };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.

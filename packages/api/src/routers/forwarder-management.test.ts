@@ -2072,6 +2072,53 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
+  it("validates a new external wait against the budget set in the same save", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        fallbackEnabled: true,
+        capacityWaitBudgetMs: 60_000,
+        externalAfterWaitMs: 2_000,
+      }),
+    );
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        capacityWaitBudgetMs: 1_000,
+        externalAfterWaitMs: 5_000,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("never rejects a save that leaves a stored external wait above the budget unchanged", async () => {
+    // Stored default 2000 ms is above this pool's 1000 ms budget; the runtime
+    // uses min(budget, externalAfterWaitMs), so unrelated saves must succeed.
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        fallbackEnabled: true,
+        capacityWaitBudgetMs: 1_000,
+        externalAfterWaitMs: 2_000,
+      }),
+    );
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ fallbackEnabled: true, fallbackForGrantees: true }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", fallbackForGrantees: true }),
+    ).resolves.toMatchObject({ fallbackForGrantees: true });
+    // Re-sending the unchanged stored value is not a change either.
+    await expect(
+      client().updateModelPool({ id: "pool-id", externalAfterWaitMs: 2_000 }),
+    ).resolves.toBeDefined();
+    // Lowering only the budget below the stored wait is also allowed.
+    await expect(
+      client().updateModelPool({ id: "pool-id", capacityWaitBudgetMs: 500 }),
+    ).resolves.toBeDefined();
+    expect(db.modelPool.update).toHaveBeenCalledTimes(3);
+  });
+
   it.each([
     ["inactive", { mode: "LIMITED", limitValue: "2" }, null],
     ["LIMITED without a positive limit", { mode: "LIMITED", limitValue: null }, new Date()],

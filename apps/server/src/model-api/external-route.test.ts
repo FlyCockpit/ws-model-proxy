@@ -8,6 +8,20 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true },
 }));
 
+// Tests flip the mocked deployment switch; production reads only `env`.
+const { env: testEnv } = (await import("@ws-model-proxy/env/server")) as unknown as {
+  env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+};
+function withSwitch<T>(on: boolean, run: () => T): T {
+  const previous = testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
+  testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = on;
+  try {
+    return run();
+  } finally {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = previous;
+  }
+}
+
 const {
   evaluateExternalEgress,
   externalDenialError,
@@ -149,13 +163,14 @@ describe("egress gate", () => {
       requesterIsOwner,
       fallbackForGrantees,
     }) => {
-      const decision = evaluateExternalEgress({
-        requested,
-        requester: requesterIsOwner ? owner : grantee,
-        tokenPermitsPool: tokenPermits,
-        pool: { ...pool, fallbackEnabled, fallbackForGrantees },
-        deploymentSwitchEnabled: switchOn,
-      });
+      const decision = withSwitch(switchOn, () =>
+        evaluateExternalEgress({
+          requested,
+          requester: requesterIsOwner ? owner : grantee,
+          tokenPermitsPool: tokenPermits,
+          pool: { ...pool, fallbackEnabled, fallbackForGrantees },
+        }),
+      );
       const expected =
         switchOn &&
         requested &&
@@ -175,30 +190,28 @@ describe("egress gate", () => {
   );
 
   it("reports denials in gate order so the caller sees the right error", () => {
-    const deny = (overrides: Partial<Parameters<typeof evaluateExternalEgress>[0]>) => {
-      const decision = evaluateExternalEgress({
-        requested: true,
-        requester: grantee,
-        tokenPermitsPool: false,
-        pool: { ...pool, fallbackEnabled: false },
-        deploymentSwitchEnabled: false,
-        ...overrides,
-      });
+    const deny = (
+      switchOn: boolean,
+      overrides: Partial<Parameters<typeof evaluateExternalEgress>[0]> = {},
+    ) => {
+      const decision = withSwitch(switchOn, () =>
+        evaluateExternalEgress({
+          requested: true,
+          requester: grantee,
+          tokenPermitsPool: false,
+          pool: { ...pool, fallbackEnabled: false },
+          ...overrides,
+        }),
+      );
       return decision.granted ? "GRANTED" : decision.denial;
     };
-    expect(deny({ requested: false })).toBe("NOT_REQUESTED");
-    expect(deny({})).toBe("DEPLOYMENT_DISABLED");
-    expect(deny({ deploymentSwitchEnabled: true })).toBe("TOKEN_NOT_PERMITTED");
-    expect(deny({ deploymentSwitchEnabled: true, tokenPermitsPool: true })).toBe(
-      "POOL_FALLBACK_DISABLED",
+    expect(deny(false, { requested: false })).toBe("NOT_REQUESTED");
+    expect(deny(false)).toBe("DEPLOYMENT_DISABLED");
+    expect(deny(true)).toBe("TOKEN_NOT_PERMITTED");
+    expect(deny(true, { tokenPermitsPool: true })).toBe("POOL_FALLBACK_DISABLED");
+    expect(deny(true, { tokenPermitsPool: true, pool: { ...pool, fallbackEnabled: true } })).toBe(
+      "GRANTEE_NOT_COVERED",
     );
-    expect(
-      deny({
-        deploymentSwitchEnabled: true,
-        tokenPermitsPool: true,
-        pool: { ...pool, fallbackEnabled: true },
-      }),
-    ).toBe("GRANTEE_NOT_COVERED");
   });
 
   it("treats a signed-in Chat Test user as consenting and MCP as unsupported", () => {

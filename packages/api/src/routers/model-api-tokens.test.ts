@@ -201,6 +201,8 @@ function mockTokenCreate() {
       userId: createArgs.data.userId,
       name: createArgs.data.name,
       scopeMode: createArgs.data.scopeMode,
+      // Column default: new tokens are private only.
+      allowExternal: false,
       lookupPrefix: createArgs.data.lookupPrefix,
       lastUsedAt: null,
       revokedAt: null,
@@ -209,6 +211,7 @@ function mockTokenCreate() {
         target: entry.target,
         discoveredModelId: entry.discoveredModelId ?? null,
         modelPoolId: entry.modelPoolId ?? null,
+        includeExternal: false,
       })),
     });
   });
@@ -280,13 +283,20 @@ describe("modelApiTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        allowExternal: false,
         allowlist: {
           directModelCount: 1,
           modelPoolCount: 2,
           modelPoolIds: ["owned-pool-id", "granted-pool-id"],
+          externalModelPoolIds: [],
         },
       });
       expect(JSON.stringify(result.token)).not.toContain(result.secret);
+      // T1: external consent is human-only and never set at creation.
+      const createData = (db.modelApiToken.create.mock.calls[0]![0] as TokenCreateArgs).data;
+      expect(createData).not.toHaveProperty("allowExternal");
+      for (const entry of createData.AllowlistEntries.create)
+        expect(entry).not.toHaveProperty("includeExternal");
 
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
       expect(createCall.data.secretDigest).not.toBe(result.secret);
@@ -317,12 +327,15 @@ describe("modelApiTokensRouter", () => {
         scopeMode: "ALL_VISIBLE",
       });
 
+      expect(result.token.allowExternal).toBe(false);
       expect(result.token.allowlist).toEqual({
         directModelCount: 0,
         modelPoolCount: 0,
         modelPoolIds: [],
+        externalModelPoolIds: [],
       });
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
+      expect(createCall.data).not.toHaveProperty("allowExternal");
       expect(createCall.data.AllowlistEntries.create).toEqual([]);
     });
 

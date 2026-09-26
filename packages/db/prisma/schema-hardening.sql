@@ -1237,8 +1237,10 @@ ALTER TABLE response_stickiness_record
   DROP CONSTRAINT IF EXISTS response_stickiness_fallback_route_check;
 ALTER TABLE response_stickiness_record
   ADD CONSTRAINT response_stickiness_fallback_route_check CHECK (
+    -- NULL-safe: a CHECK that evaluates to NULL passes, so a v3 row with a
+    -- NULL route must compare FALSE here, not NULL.
     ("routingVersion" < 3 AND "fallbackRoute" IS NULL)
-    OR ("routingVersion" >= 3 AND "fallbackRoute" = 'pool-external')
+    OR ("routingVersion" >= 3 AND "fallbackRoute" IS NOT DISTINCT FROM 'pool-external')
   );
 
 ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_fallback_route_check;

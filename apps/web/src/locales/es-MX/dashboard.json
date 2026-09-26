@@ -528,10 +528,11 @@
       "enabled": "Usar respaldo externo para solicitudes :external",
       "forGrantees": "Pagar el respaldo externo que usen las personas con quienes comparto este pool",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
-      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Nunca supera el presupuesto de espera local.",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
-      "saved": "Ajustes de respaldo guardados"
+      "saved": "Ajustes de respaldo guardados",
+      "failed": "No se pudieron guardar los ajustes de respaldo. Inténtalo de nuevo."
     },
     "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
     "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
@@ -795,7 +796,7 @@
     "memberPolicyDetails": "Detalles de capacidad y enrutamiento",
     "memberTarget": "Destino de ejecución",
     "memberTier": "Nivel de enrutamiento",
-    "memberTierDisclosure": "Los proveedores principales participan en el enrutamiento normal y envían datos fuera de esta implementación. El desbordamiento público se intenta solo después de agotar todos los destinos principales.",
+    "memberTierDisclosure": "Los miembros principales siempre son locales y atienden el nombre simple del pool, que nunca sale de esta implementación. Los miembros de respaldo externo reciben datos solo en solicitudes que nombran propietario/pool:external, cuando el token de quien llama lo permite y los miembros locales están ocupados, no disponibles o son demasiado pequeños para la solicitud.",
     "moveOverflowEarlier": "Mover el proveedor de desbordamiento antes",
     "moveOverflowLater": "Mover el proveedor de desbordamiento después",
     "reorderFailed": "No se pudo reordenar los proveedores de desbordamiento",

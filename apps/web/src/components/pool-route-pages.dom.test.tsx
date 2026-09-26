@@ -17,6 +17,7 @@ const state = vi.hoisted(() => ({
   pools: [] as Array<Record<string, unknown>>,
   capacities: [] as Array<Record<string, unknown>>,
   nextReject: null as { name: string; error: unknown } | null,
+  mutationCalls: [] as Array<{ name: string; variables: unknown }>,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -105,7 +106,8 @@ vi.mock("@/utils/orpc", () => {
   });
   const mutation = (name = "") => ({
     mutationOptions: (options?: Record<string, unknown>) => ({
-      mutationFn: async () => {
+      mutationFn: async (variables: unknown) => {
+        state.mutationCalls.push({ name, variables });
         if (state.nextReject && state.nextReject.name === name) {
           const error = state.nextReject.error;
           state.nextReject = null;
@@ -171,6 +173,7 @@ afterEach(() => {
   state.pools = [];
   state.capacities = [];
   state.nextReject = null;
+  state.mutationCalls = [];
   vi.mocked(toast.error).mockClear();
 });
 
@@ -320,6 +323,101 @@ describe("dedicated pool pages", () => {
         ) as HTMLInputElement
       ).value,
     ).toBe("2000");
+  });
+
+  describe("fallback settings form", () => {
+    const fallbackPool = () => ({
+      id: "pool-1",
+      slug: "primary",
+      name: "Primary",
+      description: null,
+      canonicalModelId: "owner/pool/primary",
+      fallbackEnabled: false,
+      fallbackForGrantees: false,
+      externalAfterWaitMs: 2000,
+      members: [],
+      grants: [],
+      compatibility: { recommendedSurface: null },
+      transformer: { model: null },
+    });
+    const updateCalls = () => state.mutationCalls.filter((call) => call.name === "updateModelPool");
+    const submit = () =>
+      fireEvent.click(
+        screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }),
+      );
+
+    it("sends only the changed fields", async () => {
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      // Nothing changed: no request at all.
+      submit();
+      await waitFor(() => expect(screen.getByRole("button", { name: /fallbackSettings.save/ })));
+      expect(updateCalls()).toEqual([]);
+
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.forGrantees" }),
+      );
+      submit();
+      await waitFor(() => expect(updateCalls()).toHaveLength(1));
+      // The stored external wait is not re-sent, so it can never fail this save.
+      expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
+    });
+
+    it("asks for grantee privacy confirmation and retries with it", async () => {
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      state.nextReject = {
+        name: "updateModelPool",
+        error: {
+          code: "BAD_REQUEST",
+          data: {
+            reason: "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED",
+            poolName: "Primary",
+            grantees: [{ email: "grantee@example.test", name: "Grantee" }],
+          },
+        },
+      };
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+      );
+      submit();
+      await waitFor(() => expect(screen.getByText("grantee@example.test")).toBeTruthy());
+      expect(toast.error).not.toHaveBeenCalled();
+      fireEvent.click(
+        screen.getByRole("button", { name: "dashboard:pools.granteePrivacyConfirmAction" }),
+      );
+      await waitFor(() => expect(updateCalls()).toHaveLength(2));
+      expect(updateCalls()[1]?.variables).toEqual({
+        id: "pool-1",
+        fallbackEnabled: true,
+        confirmGranteePrivacyChange: true,
+      });
+    });
+
+    it("surfaces other save errors instead of swallowing them", async () => {
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      state.nextReject = {
+        name: "updateModelPool",
+        error: { code: "BAD_REQUEST", message: "boom" },
+      };
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.change(
+        screen.getByLabelText("dashboard:pools.fallbackSettings.externalAfterWaitMs"),
+        { target: { value: "500" } },
+      );
+      submit();
+      await waitFor(() => expect(toast.error).toHaveBeenCalled());
+      expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", externalAfterWaitMs: 500 });
+    });
   });
 
   it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {

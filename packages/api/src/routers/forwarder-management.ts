@@ -228,18 +228,27 @@ const poolFallbackFields = {
   externalAfterWaitMs: z.number().int().min(0).max(600_000).optional(),
 };
 
+/**
+ * A save that sets a NEW external-fallback wait must not exceed the pool's
+ * resulting local wait budget (the value after this save). A save that does
+ * not change the external wait is never rejected because of it: the stored
+ * value may exceed a budget lowered later, and the runtime always waits
+ * min(budget, externalAfterWaitMs), so an out-of-order pair is harmless.
+ */
 function assertExternalAfterWaitWithinBudget({
   externalAfterWaitMs,
+  currentExternalAfterWaitMs,
   capacityWaitBudgetMs,
 }: {
   externalAfterWaitMs: number | undefined;
+  /** Stored value, or null when creating a pool. */
+  currentExternalAfterWaitMs: number | null;
+  /** The pool's local wait budget after this save (null = unbounded). */
   capacityWaitBudgetMs: number | null;
 }): void {
-  if (
-    externalAfterWaitMs !== undefined &&
-    capacityWaitBudgetMs !== null &&
-    externalAfterWaitMs > capacityWaitBudgetMs
-  )
+  if (externalAfterWaitMs === undefined || externalAfterWaitMs === currentExternalAfterWaitMs)
+    return;
+  if (capacityWaitBudgetMs !== null && externalAfterWaitMs > capacityWaitBudgetMs)
     throw new ORPCError("BAD_REQUEST", {
       message: "The external fallback wait cannot exceed the pool's local wait budget.",
     });
@@ -2514,6 +2523,7 @@ export const forwarderManagementRouter = {
       if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
       assertExternalAfterWaitWithinBudget({
         externalAfterWaitMs: input.externalAfterWaitMs,
+        currentExternalAfterWaitMs: null,
         capacityWaitBudgetMs: input.capacityWaitBudgetMs ?? null,
       });
       assertLossyDeveloperRoleCollapseRequiresAdaptation({
@@ -2652,6 +2662,7 @@ export const forwarderManagementRouter = {
           transformerCacheMode: true,
           fallbackEnabled: true,
           capacityWaitBudgetMs: true,
+          externalAfterWaitMs: true,
           protocolAdaptationEnabled: true,
           allowLossyDeveloperRoleCollapse: true,
         },
@@ -2672,6 +2683,7 @@ export const forwarderManagementRouter = {
       if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
       assertExternalAfterWaitWithinBudget({
         externalAfterWaitMs: input.externalAfterWaitMs,
+        currentExternalAfterWaitMs: existing.externalAfterWaitMs,
         capacityWaitBudgetMs:
           input.capacityWaitBudgetMs !== undefined
             ? input.capacityWaitBudgetMs
