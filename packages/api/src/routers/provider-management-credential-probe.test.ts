@@ -28,6 +28,7 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
   "../lib/provider-credential-crypto"
 );
+const { providerHttpsRequest } = await import("../lib/provider-egress");
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
@@ -78,17 +79,48 @@ const server = createServer((request, response) => {
 });
 let baseUrl = "";
 
+// Endpoint-scoped gateway (reviewer's r2 counterexample): unknown keys get 401
+// everywhere; the inference key may call chat/messages but gets 403 on
+// `GET /v1/models`; the model-reader key may also list models.
+const inferenceKey = "fixture-inference-key";
+const modelReaderKey = "fixture-model-reader-key";
+const scopedServer = createServer((request, response) => {
+  const key =
+    request.headers["x-api-key"] ?? request.headers.authorization?.replace(/^Bearer /u, "") ?? "";
+  const known = key === inferenceKey || key === modelReaderKey;
+  if (request.url === "/") response.statusCode = 200;
+  else if (!known) response.statusCode = 401;
+  else if (request.url === "/v1/models") response.statusCode = key === modelReaderKey ? 200 : 403;
+  else if (
+    request.method === "POST" &&
+    (request.url === "/v1/chat/completions" || request.url === "/v1/messages")
+  )
+    response.statusCode = 200;
+  else response.statusCode = 404;
+  request.resume();
+  response.end("{}");
+});
+let scopedBaseUrl = "";
+
 beforeAll(async () => {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  await new Promise<void>((resolve) => scopedServer.listen(0, "127.0.0.1", resolve));
+  scopedBaseUrl = `http://127.0.0.1:${(scopedServer.address() as AddressInfo).port}`;
 });
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  await new Promise<void>((resolve) => scopedServer.close(() => resolve()));
 });
 
-function arrange(providerType: string, credentialType: "BEARER" | "API_KEY") {
+function arrange(
+  providerType: string,
+  credentialType: "BEARER" | "API_KEY",
+  key: string = secret,
+  accountBaseUrl: string = baseUrl,
+) {
   const encrypted = encryptProviderCredential(
-    secret,
+    key,
     {
       userId: "owner",
       providerAccountId: "acct",
@@ -104,7 +136,7 @@ function arrange(providerType: string, credentialType: "BEARER" | "API_KEY") {
     deletedAt: null,
     currentCredentialId: "credential",
     providerType,
-    baseUrl,
+    baseUrl: accountBaseUrl,
   });
   db.providerCredential.findFirst.mockResolvedValue({
     id: "credential",
@@ -190,4 +222,90 @@ describe("compatible-provider credential test against a public-root gateway", ()
     });
     expect(seen.map((request) => request.path)).toEqual(["/v1/models"]);
   });
+});
+
+describe("credential test against an endpoint-scoped gateway", () => {
+  const cases = [
+    ["openai-compatible", "openai", "BEARER", "/v1/chat/completions"],
+    ["anthropic-compatible", "anthropic", "API_KEY", "/v1/messages"],
+    ["openai", "openai", "BEARER", "/v1/chat/completions"],
+    ["anthropic", "anthropic", "API_KEY", "/v1/messages"],
+  ] as const;
+
+  async function inferenceStatus(
+    protocol: "openai" | "anthropic",
+    credentialType: "BEARER" | "API_KEY",
+    path: string,
+    key: string,
+  ) {
+    const response = await providerHttpsRequest(
+      `${scopedBaseUrl}${path}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: new TextEncoder().encode("{}"),
+      },
+      { allowPrivateNetworks: true, egressEnabled: true },
+      protocol,
+      credentialType === "BEARER"
+        ? { type: "BEARER", token: key }
+        : { type: "API_KEY", apiKey: key },
+    );
+    response.resume();
+    return response.statusCode;
+  }
+
+  it.each(cases)(
+    "%s: an inference-only key (403 on /v1/models) is inconclusive, not rejected",
+    async (providerType, protocol, credentialType, inferencePath) => {
+      // The fixture really accepts this key for inference and refuses a bogus one.
+      expect(await inferenceStatus(protocol, credentialType, inferencePath, inferenceKey)).toBe(
+        200,
+      );
+      expect(await inferenceStatus(protocol, credentialType, inferencePath, secret)).toBe(401);
+
+      arrange(providerType, credentialType, inferenceKey, scopedBaseUrl);
+      await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+        ok: false,
+        outcome: "INCONCLUSIVE",
+        reason: "INSUFFICIENT_PERMISSION",
+        statusCode: 403,
+      });
+      const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+      expect(audit.data.metadata).toEqual({
+        outcome: "INCONCLUSIVE",
+        statusCode: 403,
+        reason: "INSUFFICIENT_PERMISSION",
+      });
+      expect(JSON.stringify(audit)).not.toContain(inferenceKey);
+    },
+  );
+
+  it.each(cases)(
+    "%s: an unknown key (401) is not accepted",
+    async (providerType, _p, credentialType) => {
+      arrange(providerType, credentialType, secret, scopedBaseUrl);
+      await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+        ok: false,
+        outcome: "FAILURE",
+        reason: "INVALID_CREDENTIAL",
+        statusCode: 401,
+      });
+    },
+  );
+
+  it.each([
+    ["openai", "BEARER", { ok: true, outcome: "SUCCESS", reason: null }],
+    ["anthropic", "API_KEY", { ok: true, outcome: "SUCCESS", reason: null }],
+    ["openai-compatible", "BEARER", { ok: false, outcome: "INCONCLUSIVE", reason: "UNVERIFIED" }],
+  ] as const)(
+    "%s: a key allowed to list models",
+    async (providerType, credentialType, expected) => {
+      arrange(providerType, credentialType, modelReaderKey, scopedBaseUrl);
+      await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+        ...expected,
+        statusCode: 200,
+      });
+    },
+  );
 });

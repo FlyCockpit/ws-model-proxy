@@ -1122,6 +1122,7 @@
       "testFailed": "Provider credential test failed",
       "testRejected": "The provider rejected this credential",
       "testUnverified": "Could not confirm this credential: this provider type has no endpoint known to check keys",
+      "testForbidden": "Could not confirm this credential: it may lack permission for the test endpoint (listing models) but may still work for requests",
       "failed": "Provider change could not be saved",
       "pricingCreated": "Pricing draft saved",
       "pricingActivated": "Pricing version activated",

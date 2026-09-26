@@ -1023,7 +1023,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     classification: "cost",
     inputSchema: confirmedArgs("RUN"),
     descriptionNote:
-      "Result outcome SUCCESS means an endpoint known to require the key accepted it. FAILURE with reason INVALID_CREDENTIAL means the provider refused the key. INCONCLUSIVE means this provider type has no endpoint known to check keys: the key is neither confirmed nor refused.",
+      "Result outcome SUCCESS means an endpoint known to require the key accepted it. FAILURE with reason INVALID_CREDENTIAL means the provider answered 401: the key was not accepted. INCONCLUSIVE means the key is neither confirmed nor refused: reason INSUFFICIENT_PERMISSION (HTTP 403) means the key may lack permission to list models but may still work for inference; UNVERIFIED or UNEXPECTED_STATUS means this provider type has no endpoint known to check keys.",
     invokeProcedure: procedureInvoker((client) => client.providerManagement.testCredential),
   },
   {

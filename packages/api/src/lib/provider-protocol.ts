@@ -77,8 +77,11 @@ type CredentialProbe = {
  *   401 for a bad key.
  * - `-compatible` types probe their family's conventional `GET /v1/models`,
  *   but no endpoint is known to require a key on every implementation (many
- *   serve the model list publicly, some not at all). A 401/403 there still
- *   shows the key was refused; anything else is inconclusive, never a pass.
+ *   serve the model list publicly, some not at all). A 401 there still
+ *   shows the key was not accepted; anything else is inconclusive, never a
+ *   pass.
+ * On every type a 403 is inconclusive: the key may only lack permission to
+ * list models (see `classifyCredentialProbeStatus`).
  */
 const PROVIDER_CREDENTIAL_PROBE = {
   openrouter: { path: "/v1/key", verifiesCredential: true },
@@ -130,23 +133,31 @@ export function providerCredentialProbe(
 /**
  * Credential-test result from the probe's HTTP status.
  * - SUCCESS: 2xx from an endpoint known to require the key.
- * - FAILURE: 401/403 (`INVALID_CREDENTIAL`, the key was refused), or another
- *   status from an endpoint known to require the key (`UNEXPECTED_STATUS`).
- * - INCONCLUSIVE: the endpoint is not known to require a key, so a 2xx
- *   (`UNVERIFIED`) or another status (`UNEXPECTED_STATUS`) says nothing about
- *   the key either way.
+ * - FAILURE / INVALID_CREDENTIAL: 401, the key was not accepted.
+ * - FAILURE / UNEXPECTED_STATUS: another status from an endpoint known to
+ *   require the key.
+ * - INCONCLUSIVE / INSUFFICIENT_PERMISSION: 403, the request was recognised but
+ *   this key may not list models (an inference-only, restricted or project
+ *   key); it may still work for inference. Applies to every provider type.
+ * - INCONCLUSIVE / UNVERIFIED or UNEXPECTED_STATUS: the endpoint is not known
+ *   to require a key, so a 2xx or another status says nothing about the key.
  */
 export type CredentialProbeResult =
   | { ok: true; outcome: "SUCCESS"; reason: null }
   | { ok: false; outcome: "FAILURE"; reason: "INVALID_CREDENTIAL" | "UNEXPECTED_STATUS" }
-  | { ok: false; outcome: "INCONCLUSIVE"; reason: "UNVERIFIED" | "UNEXPECTED_STATUS" };
+  | {
+      ok: false;
+      outcome: "INCONCLUSIVE";
+      reason: "INSUFFICIENT_PERMISSION" | "UNVERIFIED" | "UNEXPECTED_STATUS";
+    };
 
 export function classifyCredentialProbeStatus(
   statusCode: number | null,
   verifiesCredential: boolean,
 ): CredentialProbeResult {
-  if (statusCode === 401 || statusCode === 403)
-    return { ok: false, outcome: "FAILURE", reason: "INVALID_CREDENTIAL" };
+  if (statusCode === 401) return { ok: false, outcome: "FAILURE", reason: "INVALID_CREDENTIAL" };
+  if (statusCode === 403)
+    return { ok: false, outcome: "INCONCLUSIVE", reason: "INSUFFICIENT_PERMISSION" };
   const success = statusCode !== null && statusCode >= 200 && statusCode < 300;
   if (verifiesCredential)
     return success

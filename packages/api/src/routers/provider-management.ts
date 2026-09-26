@@ -1813,8 +1813,9 @@ export const providerManagementRouter = {
         requestError = error;
       }
       // SUCCESS needs a 2xx from an endpoint known to require the key;
-      // 401/403 means the provider refused the key; a 2xx or other status from
-      // an endpoint not known to require one is INCONCLUSIVE, never a pass.
+      // 401 means the key was not accepted; 403 (the key may only lack
+      // permission for the probe endpoint) and a 2xx or other status from an
+      // endpoint not known to require a key are INCONCLUSIVE, never a pass.
       // A transport error, timeout or refused redirect is a FAILURE that says
       // nothing about the key. Reasons are fixed codes, never provider text.
       const classified = classifyCredentialProbeStatus(statusCode, probe.verifiesCredential);

@@ -300,24 +300,28 @@ describe("OpenAI and Anthropic credential tests", () => {
   });
 
   it.each([
-    [401, "INVALID_CREDENTIAL"],
-    [403, "INVALID_CREDENTIAL"],
-    [404, "UNEXPECTED_STATUS"],
-    [421, "UNEXPECTED_STATUS"],
-    [500, "UNEXPECTED_STATUS"],
-  ] as const)("classifies status %s as %s without leaking the key", async (status, reason) => {
-    await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
-    egressMock.request.mockResolvedValue({ statusCode: status, resume: vi.fn() });
-    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
-      ok: false,
-      outcome: "FAILURE",
-      statusCode: status,
-      reason,
-    });
-    const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
-    expect(audit.data.metadata).toEqual({ outcome: "FAILURE", statusCode: status, reason });
-    expect(JSON.stringify(audit)).not.toContain(secret);
-  });
+    [401, "FAILURE", "INVALID_CREDENTIAL"],
+    // A 403 may only mean the key cannot list models (restricted key).
+    [403, "INCONCLUSIVE", "INSUFFICIENT_PERMISSION"],
+    [404, "FAILURE", "UNEXPECTED_STATUS"],
+    [421, "FAILURE", "UNEXPECTED_STATUS"],
+    [500, "FAILURE", "UNEXPECTED_STATUS"],
+  ] as const)(
+    "classifies status %s as %s/%s without leaking the key",
+    async (status, outcome, reason) => {
+      await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
+      egressMock.request.mockResolvedValue({ statusCode: status, resume: vi.fn() });
+      await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+        ok: false,
+        outcome,
+        statusCode: status,
+        reason,
+      });
+      const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+      expect(audit.data.metadata).toEqual({ outcome, statusCode: status, reason });
+      expect(JSON.stringify(audit)).not.toContain(secret);
+    },
+  );
 
   it("reports a transport failure or timeout as a redacted BAD_GATEWAY", async () => {
     await arrange("openai", "https://api.openai.com", "BEARER");

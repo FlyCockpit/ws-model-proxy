@@ -202,12 +202,14 @@ describe("credential probe classification", () => {
   const failed = { ok: false, outcome: "FAILURE", reason: "UNEXPECTED_STATUS" };
   const unverified = { ok: false, outcome: "INCONCLUSIVE", reason: "UNVERIFIED" };
   const inconclusive = { ok: false, outcome: "INCONCLUSIVE", reason: "UNEXPECTED_STATUS" };
+  const forbidden = { ok: false, outcome: "INCONCLUSIVE", reason: "INSUFFICIENT_PERMISSION" };
 
   it.each([
     [200, success, unverified],
     [204, success, unverified],
     [401, refused, refused],
-    [403, refused, refused],
+    // A 403 may only mean the key cannot list models: never a refusal.
+    [403, forbidden, forbidden],
     [404, failed, inconclusive],
     [421, failed, inconclusive],
     [429, failed, inconclusive],

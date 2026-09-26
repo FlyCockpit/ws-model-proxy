@@ -502,10 +502,17 @@ export function ProviderOperationsSection() {
       onSuccess: (result) => {
         if (result.outcome === "SUCCESS")
           toast.success(t("dashboard:providers.feedback.testPassed"));
-        // Not a pass and not a refusal: this provider type has no endpoint
-        // known to require the key.
+        // Not a pass and not a refusal: the key may only lack permission to
+        // list models, or this provider type has no endpoint known to
+        // require the key.
         else if (result.outcome === "INCONCLUSIVE")
-          toast.warning(t("dashboard:providers.feedback.testUnverified"));
+          toast.warning(
+            t(
+              result.reason === "INSUFFICIENT_PERMISSION"
+                ? "dashboard:providers.feedback.testForbidden"
+                : "dashboard:providers.feedback.testUnverified",
+            ),
+          );
         else
           toast.error(
             t(

@@ -152,6 +152,12 @@ describe("ProviderOperationsSection mounted forms", () => {
     [{ ok: false, outcome: "FAILURE", reason: "UNEXPECTED_STATUS" }, "error", "testFailed"],
     // A compatible gateway cannot confirm a key: a warning, never "passed".
     [{ ok: false, outcome: "INCONCLUSIVE", reason: "UNVERIFIED" }, "warning", "testUnverified"],
+    // 403: the key may only lack permission to list models, not a rejection.
+    [
+      { ok: false, outcome: "INCONCLUSIVE", reason: "INSUFFICIENT_PERMISSION" },
+      "warning",
+      "testForbidden",
+    ],
     [
       { ok: false, outcome: "INCONCLUSIVE", reason: "UNEXPECTED_STATUS" },
       "warning",
