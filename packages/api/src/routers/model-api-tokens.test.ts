@@ -569,7 +569,7 @@ describe("modelApiTokensRouter", () => {
       // row is locked before any of its allowlist entries is written.
       const tokenLock = db.$queryRaw.mock.calls.findIndex(([strings]) =>
         String((strings as TemplateStringsArray).join("?")).includes(
-          "FROM model_api_token WHERE id = ? FOR NO KEY UPDATE",
+          'FROM model_api_token WHERE id = ? AND "userId" = ? FOR NO KEY UPDATE',
         ),
       );
       expect(tokenLock).toBeGreaterThanOrEqual(0);
@@ -611,13 +611,9 @@ describe("modelApiTokensRouter", () => {
     });
 
     it("hides tokens owned by another user", async () => {
-      db.modelApiToken.findUnique.mockResolvedValue({
-        id: "token-id",
-        userId: "other-user-id",
-        revokedAt: null,
-        scopeMode: "ALL_VISIBLE",
-        AllowlistEntries: [],
-      });
+      // Scoped to the caller, the lookup finds no row for another user's token.
+      db.modelApiToken.findUnique.mockResolvedValue(null);
+      db.$queryRaw.mockClear();
       const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
 
       await expect(
@@ -627,6 +623,19 @@ describe("modelApiTokensRouter", () => {
         return true;
       });
       expect(db.modelApiToken.update).not.toHaveBeenCalled();
+      // N2: the row lock itself is scoped to the caller's own token, so no
+      // caller can lock (and stall) another user's token row.
+      const lock = db.$queryRaw.mock.calls.find(([strings]) =>
+        String((strings as TemplateStringsArray).join("?")).includes("FROM model_api_token"),
+      );
+      if (!lock) throw new Error("expected a token row lock");
+      expect(String((lock[0] as TemplateStringsArray).join("?"))).toContain(
+        'WHERE id = ? AND "userId" = ? FOR NO KEY UPDATE',
+      );
+      expect(lock.slice(1)).toEqual(["token-id", "user-id"]);
+      expect(db.modelApiToken.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "token-id", userId: "user-id" } }),
+      );
     });
   });
 

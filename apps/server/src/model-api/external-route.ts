@@ -222,6 +222,13 @@ export type ExternalEgressConsent = {
   readonly requesterUserId: string;
   readonly requesterIsOwner: boolean;
   readonly modelApiTokenId: string | null;
+  /**
+   * The exact grant the request was resolved under (the visible pool target's
+   * `accessGrantId`, which for a stored-response operation equals the
+   * binding's grant): null for the pool owner. The send boundary requires this
+   * same grant row, so a replacement grant never revives the request.
+   */
+  readonly accessGrantId: string | null;
 };
 
 // Consents are minted only by evaluateExternalEgress. Provider dispatch
@@ -243,7 +250,7 @@ export type ExternalEgressRequester = {
 
 export type ExternalEgressPool = Pick<
   VisibleModelPoolTarget,
-  "id" | "ownerUserId" | "fallbackEnabled" | "fallbackForGrantees"
+  "id" | "ownerUserId" | "accessGrantId" | "fallbackEnabled" | "fallbackForGrantees"
 >;
 
 export type ExternalEgressDecision =
@@ -283,6 +290,7 @@ export function evaluateExternalEgress(input: {
     requesterUserId: input.requester.userId,
     requesterIsOwner,
     modelApiTokenId: input.requester.modelApiTokenId,
+    accessGrantId: requesterIsOwner ? null : input.pool.accessGrantId,
   });
   issuedConsents.add(consent);
   return { granted: true, consent };

@@ -15,6 +15,7 @@ import {
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import { env } from "@ws-model-proxy/env/server";
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
+import { PROVIDER_HALF_OPEN_LEASE_MS, providerHealthCoolingDown } from "./provider-health-state.js";
 import {
   claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
@@ -26,7 +27,6 @@ import {
   exactResponsesNativeSurface,
   matchesExactResponsesBinding,
   parseProviderUsage,
-  providerHealthCooldownElapsed,
   providerHealthOutcome,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
@@ -67,7 +67,13 @@ function issuedConsent(poolId = "pool"): ExternalEgressConsent {
       requested: true,
       requester: { userId: "owner", source: "API_TOKEN", modelApiTokenId: "token" },
       tokenPermitsPool: true,
-      pool: { id: poolId, ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: false },
+      pool: {
+        id: poolId,
+        ownerUserId: "owner",
+        accessGrantId: null,
+        fallbackEnabled: true,
+        fallbackForGrantees: false,
+      },
     });
     if (!decision.granted) throw new Error("expected an issued consent");
     return decision.consent;
@@ -106,20 +112,41 @@ it("fails closed without an issued caller consent for the exact pool", async () 
 
 describe("provider health cooldown", () => {
   const now = new Date("2026-08-25T12:00:00.000Z");
+  const at = (offsetMs: number) => new Date(now.getTime() + offsetMs);
 
-  it.each(["provider model", "provider account"])(
-    "excludes an unavailable %s until its database cooldown is due",
-    () => {
-      expect(
-        providerHealthCooldownElapsed("UNAVAILABLE", new Date("2026-08-25T12:00:01.000Z"), now),
-      ).toBe(false);
-      expect(providerHealthCooldownElapsed("UNAVAILABLE", null, now)).toBe(false);
-      expect(providerHealthCooldownElapsed("UNAVAILABLE", now, now)).toBe(true);
-      expect(
-        providerHealthCooldownElapsed("UNAVAILABLE", new Date("2026-08-25T11:59:59.000Z"), now),
-      ).toBe(true);
-    },
-  );
+  it("cools a provider account or model until its backoff is due", () => {
+    expect(
+      providerHealthCoolingDown({ healthNextRetryAt: at(1_000), healthHalfOpenAt: null }, now),
+    ).toBe(true);
+    expect(
+      providerHealthCoolingDown({ healthNextRetryAt: null, healthHalfOpenAt: null }, now),
+    ).toBe(false);
+    expect(providerHealthCoolingDown({ healthNextRetryAt: now, healthHalfOpenAt: null }, now)).toBe(
+      false,
+    );
+    expect(
+      providerHealthCoolingDown({ healthNextRetryAt: at(-1_000), healthHalfOpenAt: null }, now),
+    ).toBe(false);
+  });
+
+  // R3: the same rule claimProviderHealthTrial enforces, so listing never
+  // offers a target whose trial claim would answer COOLDOWN.
+  it("keeps cooling while another half-open trial's lease is live, and not after it lapses", () => {
+    const due = at(-1_000);
+    expect(
+      providerHealthCoolingDown({ healthNextRetryAt: due, healthHalfOpenAt: at(-5_000) }, now),
+    ).toBe(true);
+    expect(
+      providerHealthCoolingDown(
+        { healthNextRetryAt: due, healthHalfOpenAt: at(-PROVIDER_HALF_OPEN_LEASE_MS) },
+        now,
+      ),
+    ).toBe(false);
+    // A half-open stamp without a recorded failure is not a cooldown.
+    expect(
+      providerHealthCoolingDown({ healthNextRetryAt: null, healthHalfOpenAt: at(-5_000) }, now),
+    ).toBe(false);
+  });
 });
 
 const request = {
@@ -630,10 +657,14 @@ describe("public overflow compatibility", () => {
       "lock:model_api_token_allowlist_entry FOR SHARE",
       "read:pool",
       "read:consent",
+      "read:account",
       "read:consent",
       "read:consent",
       "lock:provider_account FOR UPDATE",
       "lock:provider_credential FOR UPDATE",
+      // Time and the (unlocked) account row, re-read after the last wait.
+      "read:consent",
+      "read:account",
       "durable-claim",
       "commit",
       "network-may-start",
@@ -652,6 +683,17 @@ describe("public overflow compatibility", () => {
       "GRANTEE_NOT_COVERED",
     ],
     ["the grant was deleted", { grant: null }, "REQUESTER_NOT_VISIBLE"],
+    [
+      "the grant was replaced by another grant",
+      { grant: { id: "replacement-grant" } },
+      "REQUESTER_NOT_VISIBLE",
+    ],
+    [
+      "the requester's account is marked for deletion",
+      { account: { deletionRequestedAt: new Date() } },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+    ["the requester is banned", { account: { banned: true } }, "REQUESTER_ACCESS_BLOCKED"],
     ["the token was revoked", { token: { revokedAt: new Date() } }, "CALLER_CONSENT_WITHDRAWN"],
     [
       "the token no longer allows external",
@@ -694,6 +736,88 @@ describe("public overflow compatibility", () => {
       expect(claim).toEqual({ claimed: false, reason });
       expect(order.filter((step) => step.startsWith("lock:provider"))).toEqual([]);
       expect(tx.providerCredential.update).not.toHaveBeenCalled();
+    },
+  );
+
+  // R1-B / R1-C: validity that lapses without a write to a locked row (time,
+  // and the requester's account row, which the claim does not lock) is
+  // re-evaluated after the provider account/credential lock waits, before
+  // the durable claim.
+  it.each([
+    [
+      "the token expired",
+      (tx: ReturnType<typeof consentTx>) => {
+        void tx;
+        vi.setSystemTime(new Date(CLAIM_START.getTime() + 2_000));
+      },
+      "CALLER_CONSENT_WITHDRAWN",
+    ],
+    [
+      "the requester's account was marked for deletion",
+      (tx: ReturnType<typeof consentTx>) => {
+        tx.user.findUnique.mockResolvedValue({
+          banned: false,
+          banExpires: null,
+          deletionRequestedAt: new Date(),
+        });
+      },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+    [
+      "the requester was banned",
+      (tx: ReturnType<typeof consentTx>) => {
+        tx.user.findUnique.mockResolvedValue({
+          banned: true,
+          banExpires: null,
+          deletionRequestedAt: null,
+        });
+      },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+  ] as const)(
+    "refuses the send claim when %s while it waited on the provider locks",
+    async (_label, lapse, reason) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(CLAIM_START);
+      try {
+        const order: string[] = [];
+        const consent = consentTx(order, {
+          token: { expiresAt: new Date(CLAIM_START.getTime() + 1_000) },
+        });
+        const tx = {
+          $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+            const table = lockedTable(strings);
+            order.push(`lock:${table}`);
+            // The change commits while the claim waits for the account lock.
+            if (table === "provider_account FOR UPDATE") lapse(consent);
+            return [];
+          }),
+          ...consent,
+          providerCredential: { findFirst: vi.fn(), update: vi.fn() },
+        };
+        db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
+          callback(tx),
+        );
+        const keyring = parseProviderCredentialKeyring(
+          `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+        );
+
+        const claim = await withEgressEnabled(() =>
+          claimPublicProviderCredentialForSend({
+            userId: "owner",
+            target: claimTarget(),
+            keyring,
+            consent: GRANTEE_TOKEN_CONSENT,
+          }),
+        );
+
+        expect(claim).toEqual({ claimed: false, reason });
+        expect(order).toContain("lock:provider_credential FOR UPDATE");
+        expect(tx.providerCredential.findFirst).not.toHaveBeenCalled();
+        expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     },
   );
 
@@ -1092,12 +1216,17 @@ describe("engine cache confirmation evidence", () => {
   });
 });
 
+const CLAIM_START = new Date("2026-09-26T12:00:00.000Z");
+
+type AccountRow = { banned: boolean; banExpires: Date | null; deletionRequestedAt: Date | null };
+
 /** A grantee's API-token request: every consent row kind is involved. */
 const GRANTEE_TOKEN_CONSENT = {
   requesterUserId: "grantee",
   modelApiTokenId: "token",
   poolId: "pool",
   ownerUserId: "owner",
+  accessGrantId: "grant",
 };
 
 function lockedTable(strings: TemplateStringsArray): string {
@@ -1123,9 +1252,10 @@ function consentTx(
   order: string[],
   change: {
     pool?: Record<string, unknown>;
-    grant?: null;
+    grant?: Record<string, unknown> | null;
     token?: Record<string, unknown>;
     entry?: Record<string, unknown>;
+    account?: Record<string, unknown>;
   } = {},
 ) {
   const read = <T>(label: string, value: T) =>
@@ -1142,7 +1272,18 @@ function consentTx(
       }),
     },
     poolGrant: {
-      findUnique: read("read:consent", "grant" in change ? null : { ownerUserId: "owner" }),
+      findUnique: read(
+        "read:consent",
+        change.grant === null ? null : { id: "grant", ownerUserId: "owner", ...change.grant },
+      ),
+    },
+    user: {
+      findUnique: read<AccountRow>("read:account", {
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+        ...change.account,
+      }),
     },
     modelApiToken: {
       findUnique: read("read:consent", {

@@ -1,7 +1,9 @@
 import { Readable } from "node:stream";
 import {
+  type ExternalSendConsentDenial,
   lockExternalSendConsent,
   readExternalConsentDenial,
+  recheckExternalSendRequesterValidity,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
   type OpenAiCompatibleCapabilities,
@@ -52,6 +54,7 @@ import {
   type RawProviderUsage,
   reconcileProviderBudget,
 } from "./provider-budget.js";
+import { providerHealthCoolingDown } from "./provider-health-state.js";
 import {
   calculatedCostForUsage,
   liabilityFromPricing,
@@ -71,8 +74,10 @@ export type PublicOverflowSkipReason =
   /** The caller's token no longer allows `:external` for this pool (revoked,
    * expired, `allowExternal` or `includeExternal` turned off). */
   | "CALLER_CONSENT_WITHDRAWN"
-  /** A non-owner requester no longer holds a grant for the pool. */
+  /** A non-owner requester no longer holds the exact grant the request was resolved under. */
   | "REQUESTER_NOT_VISIBLE"
+  /** The requester's account is banned or marked for deletion. */
+  | "REQUESTER_ACCESS_BLOCKED"
   /** Durable provider admission did not admit within its wait budget. */
   | "PROVIDER_SATURATED"
   | "POOL_PRIVATE"
@@ -82,7 +87,24 @@ export type PublicOverflowSkipReason =
   | "PROVIDER_UNHEALTHY"
   | "BUDGET_EXCEEDED"
   | "PROTECTION_POLICY_MISSING"
-  | "PROVIDER_UNAVAILABLE";
+  /**
+   * Transient: no provider attempt could be sent right now (fence allocation,
+   * transport failure before a response, and similar). Retrying may succeed.
+   */
+  | "PROVIDER_UNAVAILABLE"
+  /**
+   * Transient: the send-claim transaction failed before any provider I/O
+   * (lock or connection timeout, credential rotated or revoked meanwhile,
+   * decrypt failure). No provider health verdict is recorded for it.
+   */
+  | "SEND_CLAIM_FAILED"
+  /**
+   * Permanent: a stored-response binding (`exactResponsesBinding`) no longer
+   * matches any configured member (target gone, endpoint identity or version,
+   * upstream model, or native Responses support changed). Waiting never
+   * makes it servable again.
+   */
+  | "BOUND_TARGET_INVALID";
 
 /**
  * Skip reasons meaning the `:external` consent itself no longer holds (kill
@@ -95,6 +117,7 @@ export function isExternalConsentDenialReason(reason: PublicOverflowSkipReason):
     reason === "CALLER_CONSENT_MISSING" ||
     reason === "CALLER_CONSENT_WITHDRAWN" ||
     reason === "REQUESTER_NOT_VISIBLE" ||
+    reason === "REQUESTER_ACCESS_BLOCKED" ||
     reason === "POOL_PRIVATE" ||
     reason === "GRANTEE_NOT_COVERED"
   );
@@ -361,32 +384,48 @@ export type ExternalSendConsentIdentity = {
   modelApiTokenId: string | null;
   poolId: string;
   ownerUserId: string;
+  /** The exact grant the request or its stored-response binding was resolved under; null for the owner. */
+  accessGrantId: string | null;
 };
+
+type ExternalConsentSkipReason = Extract<
+  PublicOverflowSkipReason,
+  | "CALLER_CONSENT_WITHDRAWN"
+  | "REQUESTER_NOT_VISIBLE"
+  | "REQUESTER_ACCESS_BLOCKED"
+  | "POOL_PRIVATE"
+  | "GRANTEE_NOT_COVERED"
+>;
+
+function consentSkipReason(denial: ExternalSendConsentDenial): ExternalConsentSkipReason {
+  return denial === "TOKEN_CONSENT_WITHDRAWN" ? "CALLER_CONSENT_WITHDRAWN" : denial;
+}
 
 export type PublicProviderSendClaim =
   | { claimed: true; secret: string }
   | {
       claimed: false;
-      reason: Extract<
-        PublicOverflowSkipReason,
-        | "DEPLOYMENT_GATE_DISABLED"
-        | "CALLER_CONSENT_WITHDRAWN"
-        | "REQUESTER_NOT_VISIBLE"
-        | "POOL_PRIVATE"
-        | "GRANTEE_NOT_COVERED"
-      >;
+      reason: "DEPLOYMENT_GATE_DISABLED" | ExternalConsentSkipReason;
     };
 
 /**
  * The E0 send boundary: the last step before provider I/O. In one
  * transaction it (1) re-validates every `:external` consent condition while
- * holding the consent rows FOR SHARE (lockExternalSendConsent), then (2)
- * atomically claims the current credential. `lastUsedAt` is the durable
- * boundary: credential lifecycle changes serialize on the account/credential
- * rows, consent withdrawals on the consent rows, and the actual provider
- * request happens after commit. A withdrawal that commits before this
- * transaction is observed here; one that commits after it cannot cancel a
- * send that has already been claimed.
+ * holding the consent rows FOR SHARE (lockExternalSendConsent), (2) takes the
+ * provider account and credential locks, the last statements that can wait,
+ * (3) re-evaluates the time- and account-dependent validity of the requester
+ * (token expiry, ban, deletion mark) at a fresh `now`
+ * (recheckExternalSendRequesterValidity), then (4) atomically claims the
+ * current credential. `lastUsedAt` is the durable boundary: credential
+ * lifecycle changes serialize on the account/credential rows, consent
+ * withdrawals on the consent rows, and the actual provider request happens
+ * after commit. A withdrawal that commits before this transaction reaches
+ * the corresponding check is observed here; one that commits after it cannot
+ * cancel a send that has already been claimed.
+ *
+ * A throw from this function (lock or connection timeout, credential no
+ * longer current, decrypt failure) means nothing was sent; the dispatcher
+ * settles it without a provider health verdict.
  *
  * Lock order: model_pool -> pool_grant -> model_api_token ->
  * model_api_token_allowlist_entry (FOR SHARE), then provider_account ->
@@ -403,11 +442,13 @@ export async function claimPublicProviderCredentialForSend(input: {
   return prisma.$transaction(
     async (tx): Promise<PublicProviderSendClaim> => {
       const denial = await lockExternalSendConsent(tx, input.consent);
-      if (denial === "TOKEN_CONSENT_WITHDRAWN")
-        return { claimed: false, reason: "CALLER_CONSENT_WITHDRAWN" };
-      if (denial) return { claimed: false, reason: denial };
+      if (denial) return { claimed: false, reason: consentSkipReason(denial) };
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      // Nothing below waits on a lock: re-evaluate what time or an unlocked
+      // row (the requester's account) can have changed while we waited.
+      const lapsed = await recheckExternalSendRequesterValidity(tx, input.consent);
+      if (lapsed) return { claimed: false, reason: consentSkipReason(lapsed) };
       const current = await tx.providerCredential.findFirst({
         where: {
           id: input.target.credential.id,
@@ -721,6 +762,7 @@ export async function listPublicOverflowTargets(
                   nativeCapabilities: true,
                   healthStatus: true,
                   healthNextRetryAt: true,
+                  healthHalfOpenAt: true,
                   enabled: true,
                   deletedAt: true,
                   ProviderAccount: {
@@ -735,6 +777,7 @@ export async function listPublicOverflowTargets(
                       authType: true,
                       healthStatus: true,
                       healthNextRetryAt: true,
+                      healthHalfOpenAt: true,
                       enabled: true,
                       deletedAt: true,
                       CurrentCredential: {
@@ -800,9 +843,10 @@ export async function listPublicOverflowTargets(
       credential.status !== "ACTIVE"
     )
       return [];
+    // The same rule claimProviderHealthTrial applies under its locks: a
+    // pending backoff or a live half-open trial on the account or the model.
     const coolingDown =
-      !providerHealthCooldownElapsed(model.healthStatus, model.healthNextRetryAt, now) ||
-      !providerHealthCooldownElapsed(account.healthStatus, account.healthNextRetryAt, now);
+      providerHealthCoolingDown(model, now) || providerHealthCoolingDown(account, now);
     return [
       {
         coolingDown,
@@ -855,14 +899,6 @@ export async function listPublicOverflowTargets(
     targets: listed.flatMap((item) => (item.coolingDown ? [] : [item.target])),
     coolingDown: listed.flatMap((item) => (item.coolingDown ? [item.target] : [])),
   };
-}
-
-export function providerHealthCooldownElapsed(
-  status: string,
-  nextRetryAt: Date | null,
-  now: Date,
-): boolean {
-  return status !== "UNAVAILABLE" || (nextRetryAt !== null && nextRetryAt <= now);
 }
 
 function joinProviderPath(baseUrl: string, path: string): string {
@@ -1752,29 +1788,30 @@ export async function dispatchPublicOverflow(
     consent.ownerUserId !== request.userId ||
     consent.requesterUserId !== request.requesterUserId ||
     consent.modelApiTokenId !== request.requesterModelApiTokenId ||
-    consent.requesterIsOwner !== (consent.requesterUserId === consent.ownerUserId)
+    consent.requesterIsOwner !== (consent.requesterUserId === consent.ownerUserId) ||
+    consent.requesterIsOwner !== (consent.accessGrantId === null)
   )
     return { dispatched: false, reason: "CALLER_CONSENT_MISSING" };
+  const sendConsent: ExternalSendConsentIdentity = {
+    requesterUserId: consent.requesterUserId,
+    modelApiTokenId: consent.modelApiTokenId,
+    poolId: consent.poolId,
+    ownerUserId: consent.ownerUserId,
+    accessGrantId: consent.accessGrantId,
+  };
   // Owner and caller consent, re-read from the database at dispatch time
   // (the consent was minted at authentication, possibly minutes ago): the
   // owner's fallback flags, the caller's token consent, and the requester's
-  // grant. Nothing is decrypted or sent unless all of them still hold.
+  // exact grant, and the requester's account state. Nothing is decrypted or
+  // sent unless all of them still hold.
   const [listed, callerDenial] = await Promise.all([
     listPublicOverflowTargets(request.userId, request.poolId),
-    readExternalConsentDenial({
-      requesterUserId: consent.requesterUserId,
-      modelApiTokenId: consent.modelApiTokenId,
-      poolId: consent.poolId,
-      ownerUserId: consent.ownerUserId,
-    }),
+    readExternalConsentDenial(sendConsent),
   ]);
   if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
   if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
     return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
-  if (callerDenial === "TOKEN_CONSENT_WITHDRAWN")
-    return { dispatched: false, reason: "CALLER_CONSENT_WITHDRAWN" };
-  if (callerDenial === "REQUESTER_NOT_VISIBLE")
-    return { dispatched: false, reason: "REQUESTER_NOT_VISIBLE" };
+  if (callerDenial) return { dispatched: false, reason: consentSkipReason(callerDenial) };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
@@ -1816,6 +1853,10 @@ export async function dispatchPublicOverflow(
   // temporarily unavailable, not an incompatible request.
   if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
     return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
+  // A stored-response binding that matches no servable or cooling member is
+  // permanently invalid: no retry can make it match again.
+  if (compatible.length === 0 && binding)
+    return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
   if (compatible.length === 0) {
     await Promise.allSettled(
       listed.targets.map((target) =>
@@ -1858,6 +1899,13 @@ export async function dispatchPublicOverflow(
   if (!keyringValue) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
   const keyring = parseProviderCredentialKeyring(keyringValue);
   let lastAdmission: ProviderBudgetAdmission | undefined;
+  // The transient reason the last admitted attempt did not send, when it
+  // reached the health claim or beyond (see the final return).
+  let lastSendFailure:
+    | "PROVIDER_UNHEALTHY"
+    | "SEND_CLAIM_FAILED"
+    | "PROVIDER_UNAVAILABLE"
+    | undefined;
   let attemptCount = 0;
 
   const rankedTargets = orderChatTestProviderTargets(
@@ -2040,6 +2088,9 @@ export async function dispatchPublicOverflow(
       fencingToken,
     }).catch(() => "COOLDOWN" as const);
     if (healthClaim === "COOLDOWN") {
+      // Another trial is in flight or the cooldown started after listing:
+      // temporarily unavailable.
+      lastSendFailure = "PROVIDER_UNHEALTHY";
       await reconcileProviderBudget({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -2117,73 +2168,122 @@ export async function dispatchPublicOverflow(
       metadata: { healthClaim },
     }).catch(() => undefined);
 
+    // E0 send boundary, the last step before provider I/O. One transaction
+    // re-validates the caller's and owner's consent while holding the consent
+    // rows FOR SHARE, takes the same account-then-credential locks used by
+    // lifecycle mutations, re-evaluates the requester's time- and
+    // account-dependent validity after those waits, then claims the
+    // credential. A consent withdrawal, revoke or grant replacement that
+    // commits before this transaction is rejected here; one that commits
+    // afterwards cannot retroactively cancel a send that has already been
+    // claimed. Never hold database locks across provider I/O.
+    let claim: PublicProviderSendClaim | "FAILED";
     try {
-      // E0 send boundary, the last step before provider I/O. One transaction
-      // re-validates the caller's and owner's consent while holding the
-      // consent rows FOR SHARE, then claims the credential while holding the
-      // same account-then-credential locks used by lifecycle mutations. A
-      // consent withdrawal, revoke or replacement that commits before this
-      // transaction is rejected here; one that commits afterwards cannot
-      // retroactively cancel a send that has already been claimed. Never hold
-      // database locks across provider I/O.
-      const claim = await claimPublicProviderCredentialForSend({
+      claim = await claimPublicProviderCredentialForSend({
         userId: request.userId,
         target,
         keyring,
-        consent: {
-          requesterUserId: consent.requesterUserId,
-          modelApiTokenId: consent.modelApiTokenId,
-          poolId: consent.poolId,
-          ownerUserId: consent.ownerUserId,
-        },
+        consent: sendConsent,
       });
-      if (!claim.claimed) {
-        // Nothing was sent. Consent is caller/pool-wide, so no other target
-        // may be tried either: settle this attempt's reservations, hand back
-        // the half-open health trial without a health verdict, and return
-        // the same typed denial as the dispatch-entry check. Callers release
-        // the provider capacity lease and the caller lease on this result.
-        stopHeartbeat();
-        await releaseProviderHealthTrial({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          attemptId,
-          fencingToken,
-        }).catch(() => false);
-        await reconcileProviderBudget({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          credentialId: target.credential.id,
-          poolId: request.poolId,
-          requestId: request.requestId,
-          attemptId,
-          fencingToken,
-          reason: "CANCELLED",
-          revisionSequence: 1n,
-          revisionKind: "SNAPSHOT",
-        }).catch(() => undefined);
-        await recordProviderAttemptEvent({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          providerAttemptId,
-          requestId: request.requestId,
-          attemptId,
-          fencingToken,
-          eventType: "TERMINAL",
-          reason: claim.reason,
-          ...providerEventRouting({ request, target, nativeSurface }),
-          reservationId: admission.reservationIds[0],
-          reservationIds: admission.reservationIds,
-          waitDurationMs: providerWaitDurationMs,
-          terminalState: "CANCELLED",
-          contextTokens: renderedLiability.tokens,
-          streamCommitted: false,
-        }).catch(() => undefined);
-        return { dispatched: false, reason: claim.reason };
-      }
+    } catch {
+      // The claim failed before any provider I/O (lock or connection
+      // timeout, credential rotated or revoked meanwhile, decrypt failure).
+      // That is no evidence about the provider: hand the health trial back
+      // without a verdict and settle the attempt as never sent.
+      claim = "FAILED";
+    }
+    if (claim === "FAILED") {
+      stopHeartbeat();
+      lastSendFailure = "SEND_CLAIM_FAILED";
+      await releaseProviderHealthTrial({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        attemptId,
+        fencingToken,
+      }).catch(() => false);
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: request.signal.aborted ? "CANCELLED" : "SEND_CLAIM_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
+      if (!request.retrySafe) break;
+      continue;
+    }
+    if (!claim.claimed) {
+      // Nothing was sent. Consent is caller/pool-wide, so no other target
+      // may be tried either: settle this attempt's reservations, hand back
+      // the half-open health trial without a health verdict, and return
+      // the same typed denial as the dispatch-entry check. Callers release
+      // the provider capacity lease and the caller lease on this result.
+      stopHeartbeat();
+      await releaseProviderHealthTrial({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        attemptId,
+        fencingToken,
+      }).catch(() => false);
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: "CANCELLED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: claim.reason,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: "CANCELLED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
+      return { dispatched: false, reason: claim.reason };
+    }
+    try {
       const secret = claim.secret;
       const response = await providerHttpsRequest(
         target.baseUrl,
@@ -2651,6 +2751,7 @@ export async function dispatchPublicOverflow(
       };
     } catch {
       stopHeartbeat();
+      lastSendFailure = "PROVIDER_UNAVAILABLE";
       // A caller disappearing before provider response is not evidence that
       // the provider transport is unhealthy. Keep the existing health state;
       // cancellation still terminalizes and reconciles the durable attempt.
@@ -2708,6 +2809,9 @@ export async function dispatchPublicOverflow(
       if (!request.retrySafe) break;
     }
   }
+  // Every reason below is transient (retry later); none means the target
+  // or a stored-response binding is gone (BOUND_TARGET_INVALID is returned
+  // before any attempt).
   return {
     dispatched: false,
     reason:
@@ -2715,7 +2819,7 @@ export async function dispatchPublicOverflow(
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
           ? "PROTECTION_POLICY_MISSING"
           : "BUDGET_EXCEEDED"
-        : "PROVIDER_UNAVAILABLE",
+        : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }
 

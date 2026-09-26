@@ -10,6 +10,7 @@ import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
+import type { PublicProviderTarget } from "./public-overflow.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -590,7 +591,7 @@ function externalProviderTarget(poolMemberId = "primary-provider-member") {
     authType: "BEARER" as const,
     healthStatus: "HEALTHY" as const,
     nativeProtocols: ["openai" as const],
-    nativeSurfaces: ["openai-chat" as const],
+    nativeSurfaces: ["openai-chat"] as PublicProviderTarget["nativeSurfaces"],
     supportsStreaming: true,
     supportedFeatures: [],
     capabilityInventory: {
@@ -4634,6 +4635,44 @@ describe("model API routes", () => {
     };
   }
 
+  // R1-A: a grantee's consent carries the exact grant the request was
+  // resolved under, which the send claim requires to still exist.
+  it("binds a grantee's :external consent to the grant the request was resolved under", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [
+        {
+          ...externalPoolTarget,
+          ownerUserId: "pool-owner-id",
+          accessGrantId: "grant",
+          fallbackForGrantees: true,
+        },
+      ],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([provider], { fallbackForGrantees: true }),
+    );
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(provider));
+
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      affinityAccessGrantId: "grant",
+      externalConsent: expect.objectContaining({ requesterIsOwner: false, accessGrantId: "grant" }),
+    });
+  });
+
   it("serves an owner's :external request from external fallback with route headers", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -7346,7 +7385,14 @@ describe("model API routes", () => {
   );
 
   describe("bound provider operations (H1, E0-TOCTOU, C3)", () => {
-    const boundProvider = () => externalProviderTarget("provider");
+    // A member that matches consentedProviderBinding() in full: execution
+    // target, account, model, endpoint identity and version, upstream model,
+    // and native Responses support.
+    const boundProvider = () => ({
+      ...externalProviderTarget("provider"),
+      upstreamModelId: "gpt-response",
+      nativeSurfaces: ["openai-responses"] as PublicProviderTarget["nativeSurfaces"],
+    });
     const boundOperations = [
       ["follow-up create", "POST", "/responses", true],
       ["retrieve", "GET", "/responses/resp_provider", false],
@@ -7481,7 +7527,7 @@ describe("model API routes", () => {
         admittingCapacityRuntime(),
         limiter,
       ).request("/responses/resp_provider", boundRequest("GET", false));
-      expect(unavailable.status).toBe(404);
+      expect(unavailable.status).toBe(503);
       expect(callerRelease).toHaveBeenCalledTimes(1);
 
       publicOverflow.dispatch.mockRejectedValueOnce(new Error("provider dispatch disconnected"));
@@ -7530,6 +7576,123 @@ describe("model API routes", () => {
         expect(callerRelease).toHaveBeenCalledTimes(1);
       },
     );
+
+    // R1-A: a bound operation's consent carries the binding's own grant, so
+    // the send claim refuses it once that grant is replaced.
+    it("binds a grantee's bound operation consent to the binding's grant", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "binding-grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      db.responseStickinessRecord.findUnique.mockResolvedValue(
+        consentedProviderBinding({
+          poolGrantId: "binding-grant",
+          PoolGrant: {
+            id: "binding-grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce(boundDispatch());
+
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        externalConsent: expect.objectContaining({
+          requesterIsOwner: false,
+          accessGrantId: "binding-grant",
+        }),
+      });
+    });
+
+    // R4: the cooldown shortcut applies the full binding match. A cooling
+    // member whose endpoint version (or upstream model, or native Responses
+    // support) no longer matches the binding can never serve it again: 404.
+    it.each([
+      ["endpoint version", { endpointVersion: 99 }],
+      ["endpoint identity", { endpointIdentity: "https://other.example/v1" }],
+      ["upstream model", { upstreamModelId: "another-model" }],
+      [
+        "native Responses support",
+        { nativeSurfaces: ["openai-chat"] as PublicProviderTarget["nativeSurfaces"] },
+      ],
+    ] as const)(
+      "answers 404 for a cooling member whose %s no longer matches the binding",
+      async (_label, change) => {
+        publicOverflow.list.mockResolvedValue({
+          ...listedExternalTargets([]),
+          coolingDown: [{ ...boundProvider(), ...change }],
+        });
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          "/responses/resp_provider",
+          boundRequest("GET", false),
+        );
+
+        expect(response.status).toBe(404);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("answers 404 when a listed member no longer matches the binding's endpoint version", async () => {
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([{ ...boundProvider(), endpointVersion: 99 }]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(404);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(runtime.acquire).not.toHaveBeenCalled();
+    });
+
+    // R3: only a permanently invalid binding is "gone". Every transient
+    // dispatcher outcome after listing is 503 with both leases released.
+    it.each([
+      ["PROVIDER_UNHEALTHY", 503],
+      ["SEND_CLAIM_FAILED", 503],
+      ["PROVIDER_UNAVAILABLE", 503],
+      ["BUDGET_EXCEEDED", 503],
+      ["BOUND_TARGET_INVALID", 404],
+      ["REQUESTER_ACCESS_BLOCKED", 403],
+    ] as const)("maps a bound dispatch result %s to %i", async (reason, status) => {
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerRelease = vi.fn();
+      vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+      const runtime = admittingCapacityRuntime();
+
+      const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(status);
+      expect(runtime.release).toHaveBeenCalledTimes(1);
+      expect(callerRelease).toHaveBeenCalledTimes(1);
+    });
 
     it.each(boundOperations)(
       "E0-TOCTOU: %s answers 403 when consent is withdrawn between authentication and dispatch",

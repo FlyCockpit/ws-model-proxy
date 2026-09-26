@@ -11,6 +11,7 @@ const consentState = vi.hoisted(() => ({
   token: null as null | Record<string, unknown>,
   allowlistEntry: null as null | Record<string, unknown>,
   grant: null as null | Record<string, unknown>,
+  account: null as null | Record<string, unknown>,
 }));
 function resetConsentState() {
   consentState.token = {
@@ -22,11 +23,13 @@ function resetConsentState() {
   };
   consentState.allowlistEntry = null;
   consentState.grant = null;
+  consentState.account = { banned: false, banExpires: null, deletionRequestedAt: null };
 }
 const db = vi.hoisted(() => ({
   modelApiToken: { findUnique: vi.fn(async () => consentState.token) },
   modelApiTokenAllowlistEntry: { findUnique: vi.fn(async () => consentState.allowlistEntry) },
   poolGrant: { findUnique: vi.fn(async () => consentState.grant) },
+  user: { findUnique: vi.fn(async () => consentState.account) },
   modelPool: { findFirst: vi.fn() },
   providerAttempt: { groupBy: vi.fn().mockResolvedValue([]) },
   providerPricingVersion: { findFirst: vi.fn() },
@@ -104,6 +107,7 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 }));
 
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
+import { claimProviderHealthTrial } from "./provider-attempt-runtime.js";
 import { admitProviderBudget } from "./provider-budget.js";
 import {
   dispatchPublicOverflow,
@@ -127,6 +131,7 @@ function consentDelegates() {
     poolGrant: db.poolGrant,
     modelApiToken: db.modelApiToken,
     modelApiTokenAllowlistEntry: db.modelApiTokenAllowlistEntry,
+    user: db.user,
   };
 }
 
@@ -146,11 +151,21 @@ function ownerConsent(requesterUserId = "owner"): ExternalEgressConsent {
     requested: true,
     requester: { userId: requesterUserId, source: "API_TOKEN", modelApiTokenId: "token" },
     tokenPermitsPool: true,
-    pool: { id: "pool", ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: true },
+    pool: {
+      id: "pool",
+      ownerUserId: "owner",
+      accessGrantId: requesterUserId === "owner" ? null : GRANT_ID,
+      fallbackEnabled: true,
+      fallbackForGrantees: true,
+    },
   });
   if (!decision.granted) throw new Error("expected an issued consent");
   return decision.consent;
 }
+
+/** The grant a grantee's request (and its stored-response binding) was resolved under. */
+const GRANT_ID = "grant";
+const currentGrant = () => ({ id: GRANT_ID, ownerUserId: "owner" });
 
 describe("opaque native provider response headers", () => {
   it.each(["application/json", "text/event-stream"])(
@@ -501,7 +516,13 @@ describe("owner consent is re-read at dispatch", () => {
       requested: true,
       requester: { userId: "grantee", source: "CHAT_TEST", modelApiTokenId: null },
       tokenPermitsPool: false,
-      pool: { id: "pool", ownerUserId: "owner", fallbackEnabled: true, fallbackForGrantees: true },
+      pool: {
+        id: "pool",
+        ownerUserId: "owner",
+        accessGrantId: GRANT_ID,
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+      },
     });
     if (!decision.granted) throw new Error("expected an issued consent");
     consentState.grant = null;
@@ -509,7 +530,7 @@ describe("owner consent is re-read at dispatch", () => {
     // With the grant still in place the same Chat Test consent passes the
     // caller-side re-check (no token is read for a session).
     db.modelApiToken.findUnique.mockClear();
-    consentState.grant = { ownerUserId: "owner" };
+    consentState.grant = currentGrant();
     providerHttpsRequest.mockClear();
     db.modelPool.findFirst.mockResolvedValue({ ...dispatchPoolFixture(), fallbackEnabled: false });
     await expect(dispatchPublicOverflow(baseRequest(decision.consent))).resolves.toEqual({
@@ -557,6 +578,8 @@ describe("owner consent is re-read at dispatch", () => {
 describe("consent withdrawn between the dispatch-entry read and the send claim", () => {
   type Withdrawal = {
     requester: "owner" | "grantee";
+    /** A signed-in Chat Test session instead of an API token. */
+    chatTest?: boolean;
     allowlist?: boolean;
     withdraw: (fixture: { fallbackEnabled: boolean; fallbackForGrantees: boolean }) => void;
     reason: string;
@@ -623,7 +646,84 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
         reason: "REQUESTER_NOT_VISIBLE",
       },
     ],
+    // R1-A: revoking the grant the request was resolved under and re-granting
+    // creates a different grant row; the replacement is not the same consent.
+    [
+      "grant replacement",
+      {
+        requester: "grantee",
+        withdraw: () => {
+          consentState.grant = { id: "replacement-grant", ownerUserId: "owner" };
+        },
+        reason: "REQUESTER_NOT_VISIBLE",
+      },
+    ],
+    // R1-C: authentication refuses a deletion-marked or banned account; the
+    // send boundary must too (token and Chat Test session requesters).
+    [
+      "token owner deletion mark",
+      {
+        requester: "owner",
+        withdraw: () => {
+          consentState.account = {
+            banned: false,
+            banExpires: null,
+            deletionRequestedAt: new Date(),
+          };
+        },
+        reason: "REQUESTER_ACCESS_BLOCKED",
+      },
+    ],
+    [
+      "Chat Test session user deletion mark",
+      {
+        requester: "grantee",
+        chatTest: true,
+        withdraw: () => {
+          consentState.account = {
+            banned: false,
+            banExpires: null,
+            deletionRequestedAt: new Date(),
+          };
+        },
+        reason: "REQUESTER_ACCESS_BLOCKED",
+      },
+    ],
+    [
+      "Chat Test session user ban",
+      {
+        requester: "owner",
+        chatTest: true,
+        withdraw: () => {
+          consentState.account = { banned: true, banExpires: null, deletionRequestedAt: null };
+        },
+        reason: "REQUESTER_ACCESS_BLOCKED",
+      },
+    ],
   ];
+
+  /** Consent fields for the withdrawal's requester kind (API token or Chat Test session). */
+  function consentFieldsFor(withdrawal: Withdrawal) {
+    if (!withdrawal.chatTest) return ownerConsentFields(withdrawal.requester);
+    const decision = evaluateExternalEgress({
+      requested: true,
+      requester: { userId: withdrawal.requester, source: "CHAT_TEST", modelApiTokenId: null },
+      tokenPermitsPool: false,
+      pool: {
+        id: "pool",
+        ownerUserId: "owner",
+        accessGrantId: withdrawal.requester === "owner" ? null : GRANT_ID,
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+      },
+    });
+    if (!decision.granted) throw new Error("expected an issued consent");
+    return {
+      externalConsent: decision.consent,
+      requesterUserId: decision.consent.requesterUserId,
+      requesterModelApiTokenId: null,
+    };
+  }
 
   function arrange(withdrawal: Withdrawal, fixture: ReturnType<typeof dispatchPoolFixture>) {
     providerHttpsRequest.mockReset();
@@ -637,7 +737,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
       consentState.token = { ...consentState.token, scopeMode: "ALLOWLIST" };
       consentState.allowlistEntry = { target: "MODEL_POOL", includeExternal: true };
     }
-    if (withdrawal.requester === "grantee") consentState.grant = { ownerUserId: "owner" };
+    if (withdrawal.requester === "grantee") consentState.grant = currentGrant();
     const lockedSql: string[] = [];
     const credential =
       fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential;
@@ -694,7 +794,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
         poolId: "pool",
         requestId: "consent-race",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        ...ownerConsentFields(withdrawal.requester),
+        ...consentFieldsFor(withdrawal),
         requestedProtocol: "openai",
         requestedSurface: "openai-chat",
         stream: false,
@@ -716,7 +816,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
     },
   );
 
-  it.each([withdrawals[0]!, withdrawals[5]!])(
+  it.each([withdrawals[0]!, withdrawals[5]!, withdrawals[6]!, withdrawals[7]!])(
     "refuses a stored-response DELETE when %s is withdrawn during budget admission",
     async (_label, withdrawal) => {
       const fixture = dispatchPoolFixture("openai", "openai-responses");
@@ -730,7 +830,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
         poolId: "pool",
         requestId: "consent-race-delete",
         reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        ...ownerConsentFields(withdrawal.requester),
+        ...consentFieldsFor(withdrawal),
         requestedProtocol: "openai",
         requestedSurface: "openai-responses",
         stream: false,
@@ -759,6 +859,277 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
       expectDeniedAtSendBoundary(result, withdrawal.reason, arranged);
     },
   );
+});
+
+// R1-B / R1-C: validity that lapses while the send claim waits on the
+// provider account/credential locks (time, the unlocked account row) is
+// re-evaluated after those waits, before the durable claim.
+describe("requester validity lapsing during the send claim's provider-lock wait", () => {
+  const start = new Date("2026-09-26T12:00:00.000Z");
+
+  function arrangeLockWait(onAccountLock: () => void) {
+    providerHttpsRequest.mockReset();
+    reconcileProviderBudget.mockClear();
+    releaseProviderHealthTrial.mockClear();
+    recordProviderOutcome.mockClear();
+    const fixture = dispatchPoolFixture();
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    const credential =
+      fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential;
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        if (strings.join("?").includes("FROM provider_account")) onAccountLock();
+        return [];
+      }),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue(credential),
+        update: vi.fn().mockResolvedValue({ id: credential.id }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (value: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from('{"choices":[],"usage":{}}')]);
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+    return tx;
+  }
+
+  const chatRequest = () => ({
+    userId: "owner",
+    poolId: "pool",
+    requestId: "lock-wait",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+    ...ownerConsentFields(),
+    requestedProtocol: "openai" as const,
+    requestedSurface: "openai-chat" as const,
+    stream: false,
+    requiredFeatures: [],
+    path: "/v1/chat/completions",
+    headers: new Headers(),
+    body: new TextEncoder().encode(
+      '{"model":"pool","messages":[{"role":"user","content":"private data"}]}',
+    ),
+    signal: new AbortController().signal,
+    liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+    requestedOutputTokens: 1n,
+    releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+    adaptationEnabled: false,
+    retrySafe: true,
+  });
+
+  it.each([
+    ["no change (control)", (): void => undefined, null],
+    [
+      "the token expires",
+      (): void => {
+        vi.setSystemTime(new Date(start.getTime() + 2_000));
+      },
+      "CALLER_CONSENT_WITHDRAWN",
+    ],
+    [
+      "the account is marked for deletion",
+      (): void => {
+        consentState.account = { banned: false, banExpires: null, deletionRequestedAt: new Date() };
+      },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+  ] as const)("while the claim waits on provider locks: %s", async (_label, lapse, reason) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    try {
+      consentState.token = { ...consentState.token, expiresAt: new Date(start.getTime() + 1_000) };
+      const tx = arrangeLockWait(lapse);
+      const result = await dispatchPublicOverflow(chatRequest());
+      if (reason === null) {
+        expect(result.dispatched).toBe(true);
+        if (result.dispatched) {
+          await result.response.text();
+          await result.terminal;
+        }
+        expect(providerHttpsRequest).toHaveBeenCalledTimes(1);
+        return;
+      }
+      expect(result).toEqual({ dispatched: false, reason });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "CANCELLED" }),
+      );
+      expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// L1a: a send claim that throws before any provider I/O is no evidence about
+// the provider: no health verdict, the trial is handed back, and the result
+// is a typed transient reason.
+describe("send-claim failures before provider I/O", () => {
+  it.each([
+    ["a lock or connection timeout", "timeout"],
+    ["the credential is no longer current", "not-current"],
+  ] as const)("records no provider health verdict for %s", async (_label, failure) => {
+    providerHttpsRequest.mockReset();
+    reconcileProviderBudget.mockClear();
+    releaseProviderHealthTrial.mockClear();
+    recordProviderOutcome.mockClear();
+    const fixture = dispatchPoolFixture();
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        if (failure === "timeout" && strings.join("?").includes("FROM provider_account"))
+          throw new Error("canceling statement due to lock timeout");
+        return [];
+      }),
+      providerCredential: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() },
+    };
+    db.$transaction.mockImplementation(async (callback: (value: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "claim-throw",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(),
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new TextEncoder().encode('{"model":"pool","messages":[]}'),
+      signal: new AbortController().signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+
+    expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
+    expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
+    expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "FAILED" }),
+    );
+  });
+});
+
+// R3 + R4: a stored-response operation distinguishes "try again later" from
+// "this binding can never be served again".
+describe("bound (stored-response) dispatch classification", () => {
+  const binding = {
+    executionTargetId: "target-heartbeat",
+    providerAccountId: "account-heartbeat",
+    providerModelId: "model-heartbeat",
+    endpointIdentity: "https://provider.example",
+    endpointVersion: 1,
+    upstreamModelId: "upstream-model",
+  };
+
+  function boundFixture() {
+    const fixture = dispatchPoolFixture("openai", "openai-responses");
+    Object.assign(fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount, {
+      endpointIdentity: "https://provider.example",
+      endpointVersion: 1,
+    });
+    return fixture;
+  }
+
+  const boundRequest = () => ({
+    userId: "owner",
+    poolId: "pool",
+    requestId: "bound-classification",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+    ...ownerConsentFields(),
+    requestedProtocol: "openai" as const,
+    requestedSurface: "openai-responses" as const,
+    stream: false,
+    requiredFeatures: [],
+    method: "GET",
+    path: "/v1/responses/resp_bound",
+    headers: new Headers(),
+    body: new Uint8Array(),
+    signal: new AbortController().signal,
+    liability: { tokens: 0n, accountingVersion: "provider-billable-v1" },
+    requestedOutputTokens: 0n,
+    releaseLocalCapacity: async () => undefined,
+    adaptationEnabled: false,
+    retrySafe: false,
+    skipContextValidation: true,
+    forcedPoolMemberId: "member-heartbeat",
+    exactResponsesBinding: binding,
+  });
+
+  it("reports a binding that no longer matches its endpoint as permanently invalid", async () => {
+    providerHttpsRequest.mockReset();
+    const fixture = boundFixture();
+    fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.healthNextRetryAt =
+      new Date(Date.now() + 60_000);
+    Object.assign(fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount, {
+      endpointVersion: 99,
+    });
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    // Cooling or not, a stale endpoint version never matches the binding again.
+    await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+      dispatched: false,
+      reason: "BOUND_TARGET_INVALID",
+    });
+    fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.healthNextRetryAt =
+      new Date(0);
+    await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+      dispatched: false,
+      reason: "BOUND_TARGET_INVALID",
+    });
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+  });
+
+  it("reports a health-trial COOLDOWN at dispatch as unhealthy (transient)", async () => {
+    providerHttpsRequest.mockReset();
+    recordProviderOutcome.mockClear();
+    const fixture = boundFixture();
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    // Another request's half-open trial started after this request listed.
+    vi.mocked(claimProviderHealthTrial).mockResolvedValueOnce("COOLDOWN");
+    await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+      dispatched: false,
+      reason: "PROVIDER_UNHEALTHY",
+    });
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
+  });
+
+  it("classifies a member with a live half-open trial as cooling down at listing", async () => {
+    const fixture = boundFixture();
+    const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+    // Backoff elapsed, but another request holds the half-open trial.
+    Object.assign(model, { healthHalfOpenAt: new Date(Date.now() - 5_000) });
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    expect(listed.targets).toEqual([]);
+    expect(listed.coolingDown.map((target) => target.poolMemberId)).toEqual(["member-heartbeat"]);
+    await expect(dispatchPublicOverflow(boundRequest())).resolves.toEqual({
+      dispatched: false,
+      reason: "PROVIDER_UNHEALTHY",
+    });
+    // An expired trial lease no longer blocks the member.
+    Object.assign(model, { healthHalfOpenAt: new Date(Date.now() - 120_000) });
+    const recovered = await listPublicOverflowTargets("owner", "pool");
+    expect(recovered.targets.map((target) => target.poolMemberId)).toEqual(["member-heartbeat"]);
+  });
 });
 
 describe("public overflow terminal response dispatch", () => {

@@ -37,11 +37,14 @@ All of these must hold:
 All five are checked when the request arrives, and checked again against
 current database state immediately before any request data is sent (the
 switch, the owner's two settings, the token's consent and revocation or
-expiry, and, for someone other than the owner, their pool grant). That last
-check runs in the same database transaction that claims the provider
-credential for the send, and it holds those settings unchanged until the send
-is claimed. If any of them no longer holds, nothing is sent. A change saved
-after that point applies from the next send.
+expiry, the requester's account (not banned, no pending deletion), and, for
+someone other than the owner, the exact pool grant the request was resolved
+under; a revoked and re-created grant does not count). That last check runs
+in the same database transaction that claims the provider credential for the
+send, and it holds those settings unchanged until the send is claimed; token
+expiry and the account state are evaluated again after that transaction's
+last lock wait. If any of them no longer holds, nothing is sent. A change
+saved after that point applies from the next send.
 
 The request goes external only after local routing could not serve it:
 
@@ -106,7 +109,11 @@ listed, or deleted only with `owner/pool:external`-level consent that still
 holds (switch, token, grant, and owner settings), checked on arrival and again
 before sending. Without it the answer is `403 external_not_permitted` (or
 `403 external_providers_disabled` with the switch off). A plain-name follow-up
-gets `400 external_required`. A busy provider gives `429`. `:external`
+gets `400 external_required`. A busy provider gives `429`. A provider that is
+temporarily unavailable (health cooldown, a recovery probe already in flight,
+a failure before anything was sent) gives `503`; retry later. Only a binding
+that can never be served again (its member, endpoint identity or version,
+upstream model, or native Responses support changed) gives `404`. `:external`
 follow-ups to locally served responses stay on their local member.
 
 ## Breaking changes in this release

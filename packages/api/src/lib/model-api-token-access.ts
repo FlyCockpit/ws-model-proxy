@@ -357,7 +357,11 @@ export async function listVisibleModelTargetsWithExternalPermissionForToken(
 }
 
 /** Why a caller's `:external` consent no longer holds (see readExternalConsentDenial). */
-export type ExternalConsentStateDenial = "TOKEN_CONSENT_WITHDRAWN" | "REQUESTER_NOT_VISIBLE";
+export type ExternalConsentStateDenial =
+  | "TOKEN_CONSENT_WITHDRAWN"
+  | "REQUESTER_NOT_VISIBLE"
+  /** The requester's account is banned or marked for deletion. */
+  | "REQUESTER_ACCESS_BLOCKED";
 
 /** Why an `:external` send is refused at the send boundary (lockExternalSendConsent). */
 export type ExternalSendConsentDenial =
@@ -367,20 +371,30 @@ export type ExternalSendConsentDenial =
   /** A grantee's request, and the owner turned `fallbackForGrantees` off. */
   | "GRANTEE_NOT_COVERED";
 
-type ExternalConsentIdentity = {
+/**
+ * The identity an `:external` consent was minted for. `accessGrantId` is the
+ * exact grant the request (or the stored-response binding it continues) was
+ * resolved under: null for the pool owner, the grant row id for a grantee. A
+ * grantee is served only while that same grant row exists; a replacement
+ * grant (revoke G1, re-grant G2) is a different consent.
+ */
+export type ExternalConsentIdentity = {
   requesterUserId: string;
   modelApiTokenId: string | null;
   poolId: string;
   ownerUserId: string;
-  now?: Date;
+  accessGrantId: string | null;
 };
 
 type ConsentReadClient = Pick<
   Prisma.TransactionClient,
-  "modelApiToken" | "modelApiTokenAllowlistEntry" | "poolGrant"
+  "modelApiToken" | "modelApiTokenAllowlistEntry" | "poolGrant" | "user"
 >;
 
-async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConsentIdentity) {
+type RequesterValidityClient = Pick<Prisma.TransactionClient, "modelApiToken" | "user">;
+
+/** The token and account rows whose validity can lapse without a write (time) or is not locked. */
+function readRequesterValidityRows(db: RequesterValidityClient, input: ExternalConsentIdentity) {
   return Promise.all([
     input.modelApiTokenId
       ? db.modelApiToken.findUnique({
@@ -394,6 +408,16 @@ async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConse
           },
         })
       : null,
+    db.user.findUnique({
+      where: { id: input.requesterUserId },
+      select: { banned: true, banExpires: true, deletionRequestedAt: true },
+    }),
+  ]);
+}
+
+async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConsentIdentity) {
+  const [[token, requester], allowlistEntry, grant] = await Promise.all([
+    readRequesterValidityRows(db, input),
     input.modelApiTokenId
       ? db.modelApiTokenAllowlistEntry.findUnique({
           where: {
@@ -411,16 +435,27 @@ async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConse
           where: {
             poolId_granteeUserId: { poolId: input.poolId, granteeUserId: input.requesterUserId },
           },
-          select: { ownerUserId: true },
+          select: { id: true, ownerUserId: true },
         }),
   ]);
+  return { token, requester, allowlistEntry, grant };
 }
 
-function callerConsentDenial(
+type RequesterValidityRows = Awaited<ReturnType<typeof readRequesterValidityRows>>;
+
+/**
+ * The credential-validity part of authentication
+ * (authenticateModelApiTokenSecret for a token, Better Auth's session plus the
+ * account-access guard for Chat Test), evaluated at `now`: the token exists,
+ * belongs to the requester, is not revoked or expired and allows external;
+ * the requester's account exists, is not banned and has no deletion mark
+ * (`userCredentialAccessBlocked`).
+ */
+function requesterValidityDenial(
   input: ExternalConsentIdentity,
-  [token, allowlistEntry, grant]: Awaited<ReturnType<typeof readCallerConsentRows>>,
+  [token, requester]: RequesterValidityRows,
+  now: Date,
 ): ExternalConsentStateDenial | null {
-  const now = input.now ?? new Date();
   if (input.modelApiTokenId) {
     if (
       !token ||
@@ -430,13 +465,30 @@ function callerConsentDenial(
       token.allowExternal !== true
     )
       return "TOKEN_CONSENT_WITHDRAWN";
-    if (
-      String(token.scopeMode) === "ALLOWLIST" &&
-      (allowlistEntry?.target !== "MODEL_POOL" || allowlistEntry.includeExternal !== true)
-    )
-      return "TOKEN_CONSENT_WITHDRAWN";
   }
-  if (input.requesterUserId !== input.ownerUserId && grant?.ownerUserId !== input.ownerUserId)
+  if (!requester || userCredentialAccessBlocked(requester, now)) return "REQUESTER_ACCESS_BLOCKED";
+  return null;
+}
+
+function callerConsentDenial(
+  input: ExternalConsentIdentity,
+  rows: Awaited<ReturnType<typeof readCallerConsentRows>>,
+  now: Date,
+): ExternalConsentStateDenial | null {
+  const validity = requesterValidityDenial(input, [rows.token, rows.requester], now);
+  if (validity) return validity;
+  if (
+    input.modelApiTokenId &&
+    String(rows.token?.scopeMode) === "ALLOWLIST" &&
+    (rows.allowlistEntry?.target !== "MODEL_POOL" || rows.allowlistEntry.includeExternal !== true)
+  )
+    return "TOKEN_CONSENT_WITHDRAWN";
+  if (
+    input.requesterUserId !== input.ownerUserId &&
+    (input.accessGrantId === null ||
+      rows.grant?.id !== input.accessGrantId ||
+      rows.grant.ownerUserId !== input.ownerUserId)
+  )
     return "REQUESTER_NOT_VISIBLE";
   return null;
 }
@@ -448,35 +500,48 @@ function callerConsentDenial(
  *   - API token (`modelApiTokenId` non-null): the token still exists, belongs
  *     to the requester, is not revoked or expired, has `allowExternal`, and
  *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
+ *   - account (every requester, including Chat Test): the requester's user
+ *     row exists, is not banned and has no deletion mark;
  *   - visibility (any requester that is not the pool owner, including Chat
- *     Test): the requester still holds a grant for this pool from its owner,
- *     the same owner-or-grant rule `listVisibleModelTargetsForUser` applies.
+ *     Test): the requester still holds the exact grant (`accessGrantId`) the
+ *     request was resolved under, from this pool's owner.
  * Returns null when every condition still holds. The pool owner's own flags
  * (fallbackEnabled, fallbackForGrantees) are re-read by the dispatcher.
  *
  * This is an early, unlocked check. The authoritative check is
- * {@link lockExternalSendConsent}, inside the send-claim transaction.
+ * {@link lockExternalSendConsent} plus
+ * {@link recheckExternalSendRequesterValidity}, inside the send-claim
+ * transaction.
  */
 export async function readExternalConsentDenial(
   input: ExternalConsentIdentity,
 ): Promise<ExternalConsentStateDenial | null> {
-  return callerConsentDenial(input, await readCallerConsentRows(prisma, input));
+  const rows = await readCallerConsentRows(prisma, input);
+  return callerConsentDenial(input, rows, new Date());
 }
 
 /**
- * E0 send boundary: validates every consent condition of an `:external` send
- * (owner's `fallbackEnabled`, `fallbackForGrantees` for a grantee, the
- * requester's grant, and the token's `allowExternal`, revocation, expiry and
- * ALLOWLIST `includeExternal`) inside the caller's send-claim transaction,
- * holding the rows those conditions live on FOR SHARE until it commits.
+ * E0 send boundary, part 1: validates every consent condition of an
+ * `:external` send (owner's `fallbackEnabled`, `fallbackForGrantees` for a
+ * grantee, the requester's exact grant, the token's `allowExternal`,
+ * revocation, expiry and ALLOWLIST `includeExternal`, and the requester's
+ * account state) inside the caller's send-claim transaction, holding the
+ * pool, grant, token and allowlist rows FOR SHARE until it commits.
  *
- * Serialization: every consent withdrawal is an UPDATE or DELETE of one of
- * these rows (pool flag write, pool delete, grant delete and its pool/user
- * cascades, token revoke / `allowExternal` / `includeExternal` write, token
- * and allowlist cascades from a user delete). Each conflicts with FOR SHARE,
- * so a withdrawal either commits before the lock is granted (and the reads
- * below, later READ COMMITTED statements, see it) or waits until the send is
- * claimed. Nothing is sent after a withdrawal that committed first.
+ * Serialization: every consent withdrawal on those rows is an UPDATE or
+ * DELETE of one of them (pool flag write, pool delete, grant delete and its
+ * pool/user cascades, token revoke / `allowExternal` / `includeExternal`
+ * write, token and allowlist cascades from a user delete). Each conflicts
+ * with FOR SHARE, so a withdrawal either commits before the lock is granted
+ * (and the reads below, later READ COMMITTED statements, see it) or waits
+ * until the send is claimed. A grant replacement is a DELETE of the locked
+ * grant plus an INSERT of another id, so it is seen as the id mismatch.
+ *
+ * Two conditions are not frozen by these locks: time (token `expiresAt`, ban
+ * expiry) and the requester's user row (ban, deletion mark), which this
+ * transaction deliberately does not lock. Both are evaluated here as an early
+ * refusal and evaluated again by {@link recheckExternalSendRequesterValidity}
+ * after the last lock wait of the transaction.
  *
  * Lock order (documented in packages/db/src/capacity-lock-order.ts, "E0
  * send-claim transaction"): `model_pool` -> `pool_grant` -> `model_api_token`
@@ -502,7 +567,34 @@ export async function lockExternalSendConsent(
   });
   if (!pool?.fallbackEnabled) return "POOL_PRIVATE";
   if (!requesterIsOwner && !pool.fallbackForGrantees) return "GRANTEE_NOT_COVERED";
-  return callerConsentDenial(input, await readCallerConsentRows(tx, input));
+  const rows = await readCallerConsentRows(tx, input);
+  return callerConsentDenial(input, rows, new Date());
+}
+
+/**
+ * E0 send boundary, part 2: the caller runs this after the last statement of
+ * the send-claim transaction that can wait on a lock (the provider
+ * account/credential FOR UPDATE) and before the durable claim. It re-reads
+ * the token and the requester's account and evaluates their validity at a
+ * `now` taken after those reads, so a token that expired, or an account that
+ * was banned or marked for deletion, while the transaction waited on provider
+ * locks is refused before anything is claimed or sent.
+ *
+ * No user-row lock: every statement after this read (the credential re-read,
+ * the `lastUsedAt` write on a row this transaction already holds FOR UPDATE,
+ * and commit) is non-blocking, and none of them writes a row the ban or
+ * deletion-mark writers read. A mark or ban that commits after this read is
+ * therefore serializable after the claim, exactly the outcome a FOR SHARE
+ * lock would force (the writer waiting for this commit), without adding the
+ * `user` row to the E0 lock order. A mark that commits before this read is
+ * seen (a later READ COMMITTED statement).
+ */
+export async function recheckExternalSendRequesterValidity(
+  tx: RequesterValidityClient,
+  input: ExternalConsentIdentity,
+): Promise<ExternalConsentStateDenial | null> {
+  const rows = await readRequesterValidityRows(tx, input);
+  return requesterValidityDenial(input, rows, new Date());
 }
 
 export async function authenticateModelApiTokenSecret(

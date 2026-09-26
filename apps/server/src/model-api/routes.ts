@@ -171,6 +171,7 @@ import {
   isExternalConsentDenialReason,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
+  matchesExactResponsesBinding,
   orderChatTestProviderTargets,
   type PublicOverflowReason,
   type PublicOverflowRequest,
@@ -7121,17 +7122,20 @@ async function relayBoundProviderResponse(input: {
       input.stickyRoute.visibleTarget.ownerUserId,
       input.stickyRoute.visibleTarget.id,
     );
+    // The full immutable binding (execution target, account, model, endpoint
+    // identity and version, upstream model, native Responses support), the
+    // same predicate the dispatcher applies.
     const isBoundTarget = (target: (typeof listed.targets)[number]) =>
-      target.executionTargetId === input.stickyRoute.binding.executionTargetId &&
-      target.providerAccountId === input.stickyRoute.binding.providerAccountId &&
-      target.providerModelId === input.stickyRoute.binding.providerModelId;
+      matchesExactResponsesBinding(target, input.stickyRoute.binding);
     const exactTarget = listed.targets.find(isBoundTarget);
-    // The bound member still exists but is in a provider health cooldown:
-    // temporarily unavailable (503), not gone.
+    // The bound member still matches but is in a provider health cooldown or
+    // has a half-open trial in flight: temporarily unavailable (503), not gone.
     if (!exactTarget && listed.coolingDown.some(isBoundTarget))
       return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
+    // No member matches the binding (or it has no capacity to admit into):
+    // the binding can never be served again (404).
     if (!exactTarget?.inferenceCapacityId)
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+      return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
     const admission = await acquireCapacityWithTelemetry({
       runtime: input.capacityRuntime,
       relayRequestId,
@@ -7192,15 +7196,18 @@ async function relayBoundProviderResponse(input: {
   if (!result.dispatched) {
     releaseCallerLease();
     const denied = boundDispatchDenial(result.reason, input.stickyRoute.visibleTarget);
+    // Only a permanently invalid binding is "gone" (404). Every other
+    // non-consent reason (cooldown, half-open trial in flight, send-claim
+    // failure, transport failure, budget) is temporary (503).
     const failure: RelayFailure = input.request.signal.aborted
       ? "cancelled"
       : denied
         ? "access_denied"
         : result.reason === "PROVIDER_SATURATED"
           ? "rate_limited"
-          : result.reason === "PROVIDER_UNHEALTHY"
-            ? "disconnected"
-            : "not_found";
+          : result.reason === "BOUND_TARGET_INVALID"
+            ? "not_found"
+            : "disconnected";
     await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
       metadataUpdateError,
     );

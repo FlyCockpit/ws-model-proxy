@@ -95,6 +95,15 @@
  *   C5  `provider_account` FOR UPDATE, then `provider_credential` FOR UPDATE
  *       (the order every provider lifecycle writer uses).
  *
+ * After C5 (the last statement that can wait) it re-reads the requester's
+ * token and `user` row WITHOUT a lock and re-evaluates token expiry, ban and
+ * deletion mark at a fresh `now` (`recheckExternalSendRequesterValidity`).
+ * No `user` lock is needed: every statement after that read is non-blocking
+ * (the credential row is already held) and none writes a row the ban or
+ * deletion-mark writers read, so a mark committing after the read serializes
+ * after the claim, the same order a FOR SHARE would force, and the `user`
+ * row stays out of this order.
+ *
  * It takes no capacity lock and writes only the credential's `lastUsedAt`, so
  * no admitter ever waits on it (FOR SHARE does not conflict with the FOR KEY
  * SHARE of child inserts), and its C1 wait on an L1 holder closes no cycle.
@@ -103,8 +112,9 @@
  * (L1 first, then their grant/allowlist cascades), grant upserts (pool L1
  * first), grant revokes (single statement), user deletes (L1 on every owned
  * and granted pool before the L7 cascade into grants, tokens, entries and
- * provider rows), `updateExternalAccess` (token FOR NO KEY UPDATE before its
- * entries), token revoke (single statement). Provider writers that hold C5
+ * provider rows), `updateExternalAccess` (the caller's own token FOR NO KEY
+ * UPDATE, scoped by `userId`, before its entries), token revoke (single
+ * statement). Provider writers that hold C5
  * take no C1-C4 lock in a conflicting mode (their pool references are FK KEY
  * SHARE, which FOR SHARE admits).
  *

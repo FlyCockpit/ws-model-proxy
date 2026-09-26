@@ -1087,6 +1087,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     ["pool fallbackEnabled", "POOL_PRIVATE"],
     ["pool fallbackForGrantees", "GRANTEE_NOT_COVERED"],
     ["grant deletion", "REQUESTER_NOT_VISIBLE"],
+    // R1-A: revoke and re-grant in one transaction; the new grant row is not
+    // the grant the request was resolved under.
+    ["grant replacement", "REQUESTER_NOT_VISIBLE"],
   ] as const)(
     "serializes the send claim behind an uncommitted %s withdrawal",
     async (withdrawal, reason) => {
@@ -1135,6 +1138,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
             modelApiTokenId: token.id,
             poolId: result.pool.id,
             ownerUserId: result.user.id,
+            accessGrantId: result.grant!.id,
           },
         });
       // Control: with consent intact the claim succeeds.
@@ -1175,7 +1179,16 @@ integration("provider dispatch routes with real PostgreSQL", () => {
               where: { id: result.pool.id },
               data: { fallbackForGrantees: false },
             });
-          else await tx.poolGrant.delete({ where: { id: result.grant!.id } });
+          else if (withdrawal === "grant replacement") {
+            await tx.poolGrant.delete({ where: { id: result.grant!.id } });
+            await tx.poolGrant.create({
+              data: {
+                poolId: result.pool.id,
+                ownerUserId: result.user.id,
+                granteeUserId: result.requester.id,
+              },
+            });
+          } else await tx.poolGrant.delete({ where: { id: result.grant!.id } });
           writerLocked();
           await writerGate;
         },
