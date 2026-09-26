@@ -1175,6 +1175,78 @@
     "publicEgressWarning": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a un proveedor externo.",
     "publicEgressWarningNamed": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a {{providers}}."
   },
+  "providerCatalog": {
+    "presets": {
+      "label": "Ajustes predefinidos de proveedor",
+      "openrouter": "OpenRouter",
+      "openai": "OpenAI",
+      "anthropic": "Anthropic",
+      "custom": "Compatible con OpenAI personalizado",
+      "hint": "Los ajustes predefinidos completan el tipo, la URL base y la autenticación. OpenRouter atiende Chat Completions."
+    },
+    "picker": {
+      "label": "Buscar en el catálogo de OpenRouter",
+      "placeholder": "Busca modelos por nombre o id",
+      "toolsOnly": "Solo con llamadas a herramientas",
+      "empty": "Ningún modelo coincide.",
+      "loadMore": "Cargar más",
+      "loadFailed": "No se pudo cargar el catálogo.",
+      "disabled": "Los proveedores externos están desactivados en esta instalación.",
+      "unavailable": "El catálogo de OpenRouter no está disponible en este momento. Inténtalo más tarde.",
+      "stale": "Se muestra una copia en caché del catálogo.",
+      "context": "Contexto de {{value}}",
+      "contextUnknown": "Contexto desconocido",
+      "price": "${{input}} entrada / ${{output}} salida por 1M de tokens",
+      "priceUnknown": "Precio no indicado",
+      "priceVaries": "Precio variable",
+      "priceTiered": "Desde ${{input}} entrada / ${{output}} salida por 1M de tokens (por niveles)",
+      "free": "Gratis",
+      "tools": "Herramientas",
+      "reasoning": "Razonamiento",
+      "vision": "Imágenes"
+    },
+    "reasons": {
+      "NO_TEXT_OUTPUT": "No genera texto",
+      "NO_TOOLS": "Sin llamadas a herramientas, pero este pool las admite",
+      "SMALLER_CONTEXT": "Contexto menor que el de este pool",
+      "NO_IMAGE_INPUT": "No acepta imágenes, pero este pool sí",
+      "NO_REASONING": "Sin razonamiento, pero este pool lo admite",
+      "UNKNOWN_PRICE": "Precio desconocido o variable",
+      "FREE_MODEL": "Modelo gratuito: los prompts pueden registrarse o usarse para entrenamiento, y tiene sus propios límites de uso",
+      "EXPIRING": "Programado para retirarse",
+      "MODERATED": "Moderado: las respuestas pueden filtrarse"
+    },
+    "import": {
+      "title": "Importar del catálogo",
+      "description": "Elige un modelo de OpenRouter para agregarlo con su ventana de contexto, sus capacidades y su precio actual.",
+      "action": "Importar modelo",
+      "pending": "Importando…",
+      "success": "Modelo importado.",
+      "updated": "Modelo actualizado desde el catálogo.",
+      "failed": "No se pudo importar el modelo.",
+      "disabledHint": "Los modelos nuevos empiezan desactivados. Actívalos en la lista de modelos.",
+      "pricingUnknown": "El catálogo no tiene un precio fijo para este modelo, así que no hay precio definido. Las solicitudes con un límite de gasto se rechazan hasta que agregues un precio.",
+      "pricingCatalogRetired": "El catálogo ya no indica un precio fijo para este modelo, así que se retiró el precio anterior del catálogo. No hay precio definido; las solicitudes con un límite de gasto se rechazan hasta que agregues uno.",
+      "pricingUserKept": "Tu propio precio sigue activo, así que no se aplicó el precio del catálogo.",
+      "pricingUpdated": "El precio del catálogo cambió: se retiró el precio anterior del catálogo y el nuevo está activo.",
+      "pricingTiered": "Este modelo tiene precios por niveles. Se usó la tarifa más alta de cada tipo de token, así que el gasto nunca se subestima.",
+      "pricingScheduled": "Ya existe un precio programado, así que no se aplicó el precio del catálogo.",
+      "contextDrift": "El catálogo indica una ventana de contexto de {{catalog}} tokens; este modelo tiene {{current}}. Edita el modelo para cambiarla."
+    },
+    "equivalent": {
+      "title": "Modelo externo equivalente",
+      "description": "Al declarar un modelo de OpenRouter, las personas que pueden usar este pool pueden usar sus propias claves de proveedor con él (BYOK). Este modelo es la sugerencia predeterminada; cada persona elige su propio modelo. Quitarlo retira ese consentimiento.",
+      "current": "Actual: {{model}}",
+      "none": "No hay un equivalente declarado.",
+      "save": "Guardar equivalente",
+      "clear": "Quitar",
+      "saved": "Equivalente externo guardado.",
+      "cleared": "Equivalente externo quitado. Ya nadie puede usar sus propias claves con este pool.",
+      "failed": "No se pudo guardar el equivalente externo.",
+      "loadFailed": "No se pudo cargar el equivalente externo.",
+      "disabled": "Los proveedores externos están desactivados en esta instalación. Aún puedes quitar la declaración para retirar el consentimiento de claves propias."
+    }
+  },
   "welcomeBack": "Bienvenido de vuelta, {{name}}",
   "overview": {
     "title": "Resumen",

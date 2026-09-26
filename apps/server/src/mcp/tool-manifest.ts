@@ -1295,6 +1295,23 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Admin-only observability.",
   },
   {
+    target: "providerCatalog.search",
+    reason:
+      "Human-only catalog picker: an outbound OpenRouter catalog fetch that stays out of MCP.",
+  },
+  {
+    target: "providerCatalog.importModel",
+    reason: "Human-only catalog import; agents use the confirmed provider model tools.",
+  },
+  {
+    target: "providerCatalog.getPoolExternalEquivalent",
+    reason: "Human-only pool external-equivalent picker.",
+  },
+  {
+    target: "providerCatalog.setPoolExternalEquivalent",
+    reason: "Human-only pool external-equivalent picker (the owner's BYOK consent).",
+  },
+  {
     target: "mcpGrants.listMine",
     reason:
       "Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations.",

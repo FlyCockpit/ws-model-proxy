@@ -988,6 +988,14 @@ model ModelPool {
   affinityConversationWeight      Int                           @default(150)
   affinityConfirmedCacheWeight    Int                           @default(250)
   affinityLoadPenaltyWeight       Int                           @default(100)
+  /// Owner-declared external equivalent: a verbatim OpenRouter catalog id
+  /// (for example "qwen/qwen3-coder" or the floating alias "~vendor/x-latest"),
+  /// picked from the public catalog. Declaring it is the owner's consent that
+  /// people who can use this pool may route its requests through their own
+  /// provider keys (BYOK). It is also the default suggestion in their picker;
+  /// each user still picks their own model. Null = no consent: clearing it
+  /// withdraws BYOK for this pool.
+  externalEquivalentModel         String?
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]

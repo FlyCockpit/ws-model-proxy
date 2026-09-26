@@ -91,6 +91,10 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
+| `providerCatalog.getPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker. |
+| `providerCatalog.importModel` | — (excluded) | — | — | — | — | — | Human-only catalog import; agents use the confirmed provider model tools. |
+| `providerCatalog.search` | — (excluded) | — | — | — | — | — | Human-only catalog picker: an outbound OpenRouter catalog fetch that stays out of MCP. |
+| `providerCatalog.setPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker (the owner's BYOK consent). |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createAccount` | `provider_account_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createBudgetPolicy` | `provider_budget_policy_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
