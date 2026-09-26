@@ -466,7 +466,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.create.mockResolvedValue({ id: "pool-id" });
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
 
-    await client().createGuardedModelPool({
+    await httpClient().createGuardedModelPool({
+      ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
       slug: "default-context",
       name: "Default context",
       localModelIds: ["local-id"],
@@ -491,6 +492,9 @@ describe("forwarderManagementRouter", () => {
         }),
       }),
     );
+    expect(
+      JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
+    ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
   });
 
   it("defaults cache-affinity routing on for new guarded pools while honoring an explicit opt-out", async () => {
@@ -2343,7 +2347,8 @@ describe("forwarderManagementRouter", () => {
       db.poolMember.create.mockResolvedValue({ id: "external-provider-member" });
 
       await expect(
-        client().addProviderPoolMember({
+        httpClient().addProviderPoolMember({
+          ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
           poolId: "pool-id",
           providerModelId: "provider-model",
           tier: "PUBLIC_OVERFLOW",
@@ -2355,6 +2360,9 @@ describe("forwarderManagementRouter", () => {
       });
       expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
       expect(mailerState.sendEmail).not.toHaveBeenCalled();
+      expect(
+        JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
+      ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
     });
 
     it("never promotes a provider member to PRIMARY", async () => {
@@ -3287,7 +3295,8 @@ describe("forwarderManagementRouter", () => {
     });
 
     await expect(
-      client().updatePoolMember({
+      httpClient().updatePoolMember({
+        ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
         id: "provider-primary-member",
         capacityPriority: 24,
         capacityConcurrencyMode: "LIMITED",
@@ -3301,6 +3310,9 @@ describe("forwarderManagementRouter", () => {
         capacityContextMargin: 1_024,
       }),
     ).resolves.toMatchObject({ id: "provider-primary-member", tier: "PUBLIC_OVERFLOW" });
+    expect(JSON.stringify(db.poolMember.update.mock.calls)).not.toMatch(
+      /publicEgressAcknowledged|confirmGranteePrivacyChange/,
+    );
 
     expect(db.poolMember.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -5075,4 +5087,98 @@ describe("setCliDeviceFeatureGrants", () => {
       available: false,
     });
   });
+});
+
+function disclosurePool() {
+  return {
+    id: "disclosure-pool",
+    userId: "owner-private",
+    slug: "shared",
+    name: "Shared",
+    description: null,
+    fallbackEnabled: true,
+    fallbackForGrantees: true,
+    User: { slug: "owner" },
+    PoolGrants: [],
+    PoolMembers: [
+      {
+        id: "private-member",
+        tier: "PUBLIC_OVERFLOW",
+        healthStatus: "UNHEALTHY",
+        ExecutionTarget: {
+          id: "private-target",
+          providerModelId: "private-provider-model",
+          ProviderModel: {
+            id: "private-provider-model",
+            upstreamModelId: "private-upstream",
+            PricingVersions: [],
+            ProviderAccount: {
+              id: "private-account-id",
+              label: "Owner private billing label",
+              providerType: "openrouter",
+              baseUrl: "https://owner-private.example.test",
+              credentialMetadata: "private-credential",
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
+describe("provider disclosure at the serialized API boundary", () => {
+  it.each([
+    ["owner", true, true, true, true],
+    ["eligible grantee", false, true, true, true],
+    ["grantee coverage off", false, true, true, false],
+    ["deployment off", false, false, true, true],
+    ["fallback off", false, true, false, true],
+  ] as const)(
+    "visibleModels: %s",
+    async (_case, owner, enabled, fallbackEnabled, fallbackForGrantees) => {
+      const { env } = await import("@ws-model-proxy/env/server");
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+      const row = {
+        ...disclosurePool(),
+        fallbackEnabled,
+        fallbackForGrantees,
+        userId: owner ? "user-id" : "owner-private",
+      };
+      db.appSetting.findUnique.mockResolvedValue(null);
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockImplementation(async (args: { where?: { userId?: string } }) =>
+        args.where?.userId ? (owner ? [row] : []) : [row],
+      );
+      db.poolGrant.findMany.mockResolvedValue(owner ? [] : [{ id: "live-grant", ModelPool: row }]);
+      db.poolMember.findMany.mockResolvedValue([]);
+      try {
+        const result = await httpClient().visibleModels();
+        const wire = JSON.stringify(result);
+        const pool = result.modelPools[0];
+        const eligible = enabled && fallbackEnabled && (owner || fallbackForGrantees);
+        expect(pool?.providerAccountLabels).toEqual(
+          owner && fallbackEnabled ? ["Owner private billing label"] : [],
+        );
+        expect(pool).toHaveProperty("providerTypes", eligible ? ["openrouter"] : []);
+        if (!owner) {
+          expect(wire).not.toMatch(
+            /Owner private billing label|private-account-id|owner-private\.example|private-credential|private-provider-model|private-upstream|private-target|private-member/,
+          );
+          if (!eligible) expect(wire).not.toContain("openrouter");
+        }
+      } finally {
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+      }
+    },
+  );
+});
+
+it("omits a shared pool entirely after its grant is revoked", async () => {
+  db.appSetting.findUnique.mockResolvedValue(null);
+  db.discoveredModel.findMany.mockResolvedValue([]);
+  db.modelPool.findMany.mockResolvedValue([]);
+  db.poolGrant.findMany.mockResolvedValue([]);
+  const result = await httpClient().visibleModels();
+  expect(result.modelPools).toEqual([]);
+  expect(JSON.stringify(result)).not.toMatch(/openrouter|Owner private billing label/);
 });

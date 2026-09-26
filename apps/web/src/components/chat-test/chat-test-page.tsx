@@ -118,6 +118,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
         compatibility: pool.compatibility,
         effectiveProviderEgress: pool.effectiveProviderEgress,
         providerAccountLabels: pool.providerAccountLabels,
+        providerTypes: pool.providerTypes,
       };
       return pool.effectiveProviderEgress
         ? [option, { ...option, modelId: `${pool.modelId}:external` }]

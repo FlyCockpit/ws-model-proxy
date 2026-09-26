@@ -88,6 +88,7 @@ type PoolDetailContextValue = {
   capacities: PoolDetailCapacity[];
   capacityAvailability: ReturnType<typeof resolveCapacityAvailability>;
   providerEgressEnabled: boolean;
+  deploymentFlags: ReturnType<typeof useDeploymentFlags>["query"];
   openMember: (member: "create" | string | null) => void;
   openGrant: () => void;
   openDelete: () => void;
@@ -268,7 +269,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const { providerEgressEnabled } = useDeploymentFlags();
+  const { providerEgressEnabled, query: deploymentFlags } = useDeploymentFlags();
   const capacityAvailability = resolveCapacityAvailability();
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
@@ -343,6 +344,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
     capacities: capacities.data ?? [],
     capacityAvailability,
     providerEgressEnabled,
+    deploymentFlags,
     openMember: setMemberDialog,
     openGrant: () => setGrantOpen(true),
     openDelete: () => setDeletePoolOpen(true),
@@ -673,6 +675,21 @@ export function PoolDetailTab({
       </section>
     );
   }
+  if (detail.deploymentFlags.isPending)
+    return (
+      <div aria-busy="true" className="space-y-4">
+        <Skeleton className="h-6 w-48" />
+        <Skeleton className="h-5 w-full" />
+        <Skeleton className="h-80 w-full" />
+      </div>
+    );
+  if (detail.deploymentFlags.isError)
+    return (
+      <InlineRetry
+        message={t("dashboard:deploymentFeatures.loadFailed")}
+        onRetry={detail.deploymentFlags.refetch}
+      />
+    );
   const overflowMembers = pool.members
     .filter((member) => member.tier === "PUBLIC_OVERFLOW")
     .sort(
@@ -696,7 +713,11 @@ export function PoolDetailTab({
           {t("dashboard:pools.fallbackDisabledDeployment")}
         </p>
       ) : null}
-      <PoolFallbackSettings key={`${pool.id}-fallback`} pool={pool} />
+      <PoolFallbackSettings
+        key={`${pool.id}-fallback`}
+        pool={pool}
+        providerEgressEnabled={fallbackEnabled}
+      />
       {overflowMembers.length ? (
         <ol className="space-y-2">
           {overflowMembers.map((member, index) => (
@@ -739,7 +760,13 @@ export function PoolDetailTab({
  * Owner fallback settings. Callers opt in per request with
  * `owner/pool:external`; the plain name never leaves the deployment.
  */
-function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
+function PoolFallbackSettings({
+  pool,
+  providerEgressEnabled,
+}: {
+  pool: PoolDetailModel;
+  providerEgressEnabled: boolean;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const update = useMutation({
@@ -778,6 +805,12 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
       // Send only what changed, so an unrelated stored value can never make
       // this save fail. Enabling stays gated by the deployment switch
       // server-side; disabling is always allowed and keeps members configured.
+      if (
+        !providerEgressEnabled &&
+        (value.fallbackEnabled !== pool.fallbackEnabled ||
+          value.fallbackForGrantees !== pool.fallbackForGrantees)
+      )
+        return;
       const externalAfterWaitMs = Number(value.externalAfterWaitMs);
       const changes = {
         ...(value.fallbackEnabled !== pool.fallbackEnabled
@@ -816,6 +849,7 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
+              disabled={!providerEgressEnabled || update.isPending}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />
@@ -827,6 +861,7 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
+              disabled={!providerEgressEnabled || update.isPending}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />

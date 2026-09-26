@@ -710,3 +710,103 @@ describe("modelApiTokensRouter", () => {
     });
   });
 });
+
+function disclosurePool() {
+  return {
+    id: "disclosure-pool",
+    userId: "owner-private",
+    slug: "shared",
+    name: "Shared",
+    description: null,
+    fallbackEnabled: true,
+    fallbackForGrantees: true,
+    User: { slug: "owner" },
+    PoolGrants: [],
+    PoolMembers: [
+      {
+        id: "private-member",
+        tier: "PUBLIC_OVERFLOW",
+        healthStatus: "UNHEALTHY",
+        ExecutionTarget: {
+          id: "private-target",
+          providerModelId: "private-provider-model",
+          ProviderModel: {
+            id: "private-provider-model",
+            upstreamModelId: "private-upstream",
+            PricingVersions: [],
+            ProviderAccount: {
+              id: "private-account-id",
+              label: "Owner private billing label",
+              providerType: "openrouter",
+              baseUrl: "https://owner-private.example.test",
+              credentialMetadata: "private-credential",
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
+describe("provider disclosure at the serialized API boundary", () => {
+  for (const scopeMode of ["ALL_VISIBLE", "ALLOWLIST"] as const)
+    it.each([
+      ["owner", true, true, true, true],
+      ["eligible grantee", false, true, true, true],
+      ["grantee coverage off", false, true, true, false],
+      ["deployment off", false, false, true, true],
+      ["fallback off", false, true, false, true],
+    ] as const)(
+      "preview: %s",
+      async (_case, owner, enabled, fallbackEnabled, fallbackForGrantees) => {
+        const { env } = await import("@ws-model-proxy/env/server");
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+        const row = {
+          ...disclosurePool(),
+          fallbackEnabled,
+          fallbackForGrantees,
+          userId: owner ? "user-id" : "owner-private",
+        };
+        db.appSetting.findUnique.mockResolvedValue(null);
+        db.discoveredModel.findMany.mockResolvedValue([]);
+        db.modelPool.findMany.mockImplementation(async (args: { where?: { userId?: string } }) =>
+          args.where?.userId ? (owner ? [row] : []) : [row],
+        );
+        db.poolGrant.findMany.mockResolvedValue(
+          owner ? [] : [{ id: "live-grant", ModelPool: row }],
+        );
+
+        try {
+          const result = await httpClient().preview({
+            scopeMode,
+            modelIds: scopeMode === "ALLOWLIST" ? ["owner/shared"] : [],
+          });
+          const wire = JSON.stringify(result);
+          const pool = result.modelPools[0];
+          const eligible = enabled && fallbackEnabled && (owner || fallbackForGrantees);
+          expect(pool?.providerAccountLabels).toEqual(
+            owner && fallbackEnabled ? ["Owner private billing label"] : [],
+          );
+          expect(pool).toHaveProperty("providerTypes", eligible ? ["openrouter"] : []);
+          if (!owner) {
+            expect(wire).not.toMatch(
+              /Owner private billing label|private-account-id|owner-private\.example|private-credential|private-provider-model|private-upstream|private-target|private-member/,
+            );
+            if (!eligible) expect(wire).not.toContain("openrouter");
+          }
+        } finally {
+          env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+        }
+      },
+    );
+});
+
+it("omits a shared pool entirely after its grant is revoked", async () => {
+  db.appSetting.findUnique.mockResolvedValue(null);
+  db.discoveredModel.findMany.mockResolvedValue([]);
+  db.modelPool.findMany.mockResolvedValue([]);
+  db.poolGrant.findMany.mockResolvedValue([]);
+  const result = await httpClient().preview({ scopeMode: "ALL_VISIBLE" });
+  expect(result.modelPools).toEqual([]);
+  expect(JSON.stringify(result)).not.toMatch(/openrouter|Owner private billing label/);
+});

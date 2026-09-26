@@ -9,11 +9,7 @@ import {
 } from "@ws-model-proxy/db/forwarder-security";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
-import {
-  effectiveProviderEgress,
-  egressProviderAccountLabels,
-  externalFallbackMemberWhere,
-} from "./effective-provider-egress";
+import { externalFallbackMemberWhere, poolProviderDisclosure } from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
 
@@ -64,13 +60,15 @@ export type VisibleModelPoolTarget = {
   /** Configured external fallback (provider) members, regardless of health. */
   externalMemberCount: number;
   /**
-   * True when the pool can send `:external` traffic to a provider for some
-   * caller: fallback is on and at least one external member is configured.
+   * Static availability for this viewer: deployment switch, pool fallback,
+   * configured members, and owner or live grant with grantee coverage.
    * Plain pool names never leave the deployment.
    */
   effectiveProviderEgress: boolean;
-  /** Display names of provider accounts that can receive traffic. Never credentials. */
+  /** Owner-private account display names; always empty for grantees. */
   providerAccountLabels: string[];
+  /** Coarse provider types only while this viewer is eligible. */
+  providerTypes: string[];
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
@@ -128,7 +126,7 @@ const modelPoolSelect = {
       ExecutionTarget: {
         select: {
           ProviderModel: {
-            select: { ProviderAccount: { select: { label: true } } },
+            select: { ProviderAccount: { select: { label: true, providerType: true } } },
           },
         },
       },
@@ -164,6 +162,7 @@ function serializeDirectModel(row: DirectModelRow): VisibleDirectModelTarget {
 
 function serializeModelPool(
   row: ModelPoolRow,
+  viewerUserId: string,
   accessGrantId: string | null = null,
 ): VisibleModelPoolTarget {
   return {
@@ -182,18 +181,16 @@ function serializeModelPool(
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalMemberCount: (row.PoolMembers ?? []).length,
-    effectiveProviderEgress:
-      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
-      (accessGrantId === null || row.fallbackForGrantees) &&
-      effectiveProviderEgress({
-        fallbackEnabled: row.fallbackEnabled,
-        externalMemberCount: (row.PoolMembers ?? []).length,
-      }),
-    providerAccountLabels: egressProviderAccountLabels({
+    ...poolProviderDisclosure({
+      isOwner: row.userId === viewerUserId,
+      hasLiveGrant: Boolean(accessGrantId),
+      providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
       fallbackEnabled: row.fallbackEnabled,
+      fallbackForGrantees: row.fallbackForGrantees,
       members: (row.PoolMembers ?? []).map((member) => ({
         tier: member.tier,
-        accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
+        accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label,
+        providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
       })),
     }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
@@ -235,9 +232,9 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
   ]);
 
   const directModels = directModelRows.map(serializeDirectModel);
-  const ownedPools = ownedPoolRows.map((row) => serializeModelPool(row));
+  const ownedPools = ownedPoolRows.map((row) => serializeModelPool(row, userId));
   const grantedPools = grantedPoolRows.map((grant) =>
-    serializeModelPool(grant.ModelPool, grant.id),
+    serializeModelPool(grant.ModelPool, userId, grant.id),
   );
 
   return {

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   providerEgressEnabled: true,
+  flagsStatus: "ready" as "ready" | "pending" | "error",
   credentials: [] as Array<Record<string, unknown>>,
   calls: [] as string[],
   accounts: [] as Array<Record<string, unknown>>,
@@ -40,7 +41,18 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: () => unknown) => ({
-    queryOptions: () => ({ queryKey: [key], queryFn: async () => data(), initialData: data() }),
+    queryOptions: () => ({
+      queryKey: [key],
+      queryFn: async () => {
+        if (key === "deploymentFlags" && state.flagsStatus === "pending")
+          return new Promise<unknown>(() => {});
+        if (key === "deploymentFlags" && state.flagsStatus === "error")
+          throw new Error("flags failed");
+        return data();
+      },
+      initialData:
+        key === "deploymentFlags" && state.flagsStatus === "pending" ? undefined : data(),
+    }),
   });
   const mutation = (name: string) => ({
     mutationOptions: (options: Record<string, unknown>) => ({
@@ -139,6 +151,7 @@ afterEach(() => {
   state.credentials = [];
   state.calls = [];
   state.providerEgressEnabled = true;
+  state.flagsStatus = "ready";
   state.models = [];
   state.pricing = [];
   state.accountPayload = undefined;
@@ -489,4 +502,26 @@ describe("provider management with external providers disabled", () => {
     fireEvent.click(remove);
     await waitFor(() => expect(state.calls).toContain("deleteAccount"));
   });
+});
+
+it("shows a matching skeleton while flags load after accounts have loaded", () => {
+  state.flagsStatus = "pending";
+  mount();
+  expect(
+    screen.getByRole("region", { name: "dashboard:providers.title" }).getAttribute("aria-busy"),
+  ).toBe("true");
+  expect(document.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(1);
+  expect(screen.queryByText("dashboard:providers.disabledDeployment")).toBeNull();
+  expect(screen.queryByLabelText("dashboard:providers.fields.baseUrl")).toBeNull();
+});
+
+it("shows a flags error after a failed refetch and recovers through retry", async () => {
+  state.flagsStatus = "error";
+  mount();
+  expect(await screen.findByText("dashboard:deploymentFeatures.loadFailed")).toBeTruthy();
+  expect(screen.queryByText("dashboard:providers.disabledDeployment")).toBeNull();
+  expect(screen.queryByLabelText("dashboard:providers.fields.baseUrl")).toBeNull();
+  state.flagsStatus = "ready";
+  fireEvent.click(screen.getByRole("button", { name: "actions.tryAgain" }));
+  expect(await screen.findByLabelText("dashboard:providers.fields.baseUrl")).toBeTruthy();
 });

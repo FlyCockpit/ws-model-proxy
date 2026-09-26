@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   capacityEnabled: true,
   providerEgressEnabled: false,
+  flagsStatus: "ready" as "ready" | "pending" | "error",
   tab: "overview" as "overview" | "fallback" | "routing" | "capacity" | "media" | "access",
   detailTab: null as
     | null
@@ -99,7 +100,18 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: () => unknown) => ({
-    queryOptions: () => ({ queryKey: [key], queryFn: async () => data(), initialData: data() }),
+    queryOptions: () => ({
+      queryKey: [key],
+      queryFn: async () => {
+        if (key === "deploymentFlags" && state.flagsStatus === "pending")
+          return new Promise<unknown>(() => {});
+        if (key === "deploymentFlags" && state.flagsStatus === "error")
+          throw new Error("flags failed");
+        return data();
+      },
+      initialData:
+        key === "deploymentFlags" && state.flagsStatus === "pending" ? undefined : data(),
+    }),
   });
   const deferredQuery = (key: string, data: () => unknown) => ({
     queryOptions: () => ({ queryKey: [key], queryFn: async () => data() }),
@@ -168,6 +180,7 @@ function mount(children: ReactNode) {
 afterEach(() => {
   cleanup();
   state.capacityEnabled = true;
+  state.flagsStatus = "ready";
   state.providerEgressEnabled = false;
   state.tab = "overview";
   state.pools = [];
@@ -346,6 +359,23 @@ describe("dedicated pool pages", () => {
         screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }),
       );
 
+    it.each(["pending", "error"] as const)(
+      "does not describe %s flags as disabled",
+      async (status) => {
+        state.flagsStatus = status;
+        state.tab = "fallback";
+        state.pools = [fallbackPool()];
+        mount(<PoolDetailPage poolId="pool-1" />);
+        if (status === "pending") expect(document.querySelector('[aria-busy="true"]')).toBeTruthy();
+        else
+          expect(await screen.findByText("dashboard:deploymentFeatures.loadFailed")).toBeTruthy();
+        expect(screen.queryByText("dashboard:pools.fallbackDisabledDeployment")).toBeNull();
+        expect(
+          screen.queryByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+        ).toBeNull();
+      },
+    );
+
     it("sends only the changed fields", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";
@@ -420,6 +450,17 @@ describe("dedicated pool pages", () => {
     mount(<PoolDetailPage poolId="pool-1" />);
 
     expect(screen.getByText("dashboard:pools.fallbackDisabledDeployment")).toBeTruthy();
+    for (const name of [
+      "dashboard:pools.fallbackSettings.enabled",
+      "dashboard:pools.fallbackSettings.forGrantees",
+    ]) {
+      const control = screen.getByRole("checkbox", { name });
+      expect(
+        control.getAttribute("aria-disabled") === "true" || control.hasAttribute("disabled"),
+      ).toBe(true);
+      fireEvent.click(control);
+    }
+    expect(state.mutationCalls).toEqual([]);
   });
 
   it("shows stored member policy values and does not mark an override as inherited", () => {

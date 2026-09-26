@@ -163,8 +163,10 @@ grantee notice, or email is sent.
 
 Model API tokens start with external access off. During creation, or in the
 **External providers** editor afterward, a person can allow external providers.
-Enabling external access includes every allowlisted pool; uncheck individual
-pools to keep them local only. All-visible tokens allow all pools or none.
+During creation, external access includes every selected pool; uncheck individual
+pools to keep them local only. Later, turning external access off and back on
+preserves the saved per-pool choices, including an empty selection. All-visible
+tokens allow all pools or none.
 Enabling the permission lets prompts, attachments, tools, and generated output
 leave this deployment for third-party providers when the request uses
 `<pool>:external` and local members cannot serve it. If creation succeeds but
@@ -174,10 +176,16 @@ check the token’s permissions before using it.
 The **external** badge describes availability for the viewer, based on the
 deployment switch, pool settings, and configured provider members. It does not
 promise current provider health or imply that plain-name requests go external.
+Owners see their provider account labels. Eligible grantees see only coarse provider
+types, never the owner's account labels, identifiers, URLs or credential metadata;
+ineligible grantees receive neither labels nor types. Shared request history also
+withholds the owner's target, member, capacity and attempt identifiers.
 Chat Test lists a separate `:external` entry for eligible pools; selecting it
 provides the signed-in person’s consent for that test.
 
 Provider management remains on the Pools and Fallback pages when the deployment
 switch is off. Stored account and key details remain visible, with revoke and
 delete actions available. Creation, edits, imports, and credential tests are
-hidden or disabled. Secrets are never returned.
+hidden or disabled. Token consent and pool fallback switches are disabled too;
+saved choices remain intact. While deployment flags load, the UI shows skeletons;
+a failed fetch shows a retry state. Secrets are never returned.

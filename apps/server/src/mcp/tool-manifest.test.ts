@@ -767,3 +767,54 @@ it("has no dashboard pool-notice procedures or tool exclusions", () => {
     [...MCP_TOOL_MANIFEST, ...MCP_TOOL_EXCLUSIONS].map((entry) => entry.target).join("\n"),
   ).not.toMatch(/DashboardNotice/);
 });
+
+it.each([
+  [
+    "forwarder_guarded_pool_create",
+    "createGuardedModelPool",
+    {
+      slug: "legacy",
+      name: "Legacy",
+      localModelIds: ["local"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30000,
+      providerModels: [],
+    },
+  ],
+  ["forwarder_model_pool_update", "updateModelPool", { id: "pool", name: "Legacy" }],
+  [
+    "forwarder_provider_member_add",
+    "addProviderPoolMember",
+    { poolId: "pool", providerModelId: "provider", publicOrder: 0 },
+  ],
+  ["forwarder_pool_member_update", "updatePoolMember", { id: "member", publicOrder: 1 }],
+  [
+    "forwarder_pool_grant_create",
+    "grantPoolAccessByEmail",
+    { poolId: "pool", email: "grantee@example.test" },
+  ],
+] as const)(
+  "strips retired inputs through MCP %s and its real procedure schema",
+  async (toolName, procedureName, input) => {
+    const tool = MCP_TOOL_MANIFEST.find((item) => item.name === toolName)!;
+    const parsed = await tool.inputSchema["~standard"].validate({
+      ...input,
+      publicEgressAcknowledged: false,
+      confirmGranteePrivacyChange: false,
+      ...(tool.confirmation ? { confirm: tool.confirmation } : {}),
+    });
+    expect(parsed).not.toHaveProperty("issues");
+    if (!("value" in parsed)) throw new Error("MCP schema rejected legacy arguments");
+    const args = parsed.value;
+    const schema = appRouter.forwarderManagement[procedureName]["~orpc"].inputSchema!;
+    const result = await schema["~standard"].validate(args);
+    expect(result).not.toHaveProperty("issues");
+    expect(result).toHaveProperty("value", expect.objectContaining(input));
+    if ("value" in result) {
+      expect(result.value).not.toHaveProperty("publicEgressAcknowledged");
+      expect(result.value).not.toHaveProperty("confirmGranteePrivacyChange");
+    }
+  },
+);

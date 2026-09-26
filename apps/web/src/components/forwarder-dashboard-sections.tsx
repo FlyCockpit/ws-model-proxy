@@ -3443,7 +3443,11 @@ export function ModelApiTokensSection() {
       ) : null}
       <TokenEgressWarnings pools={visibleModelsData.modelPools} />
       <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
-      <TokenExternalAccess tokens={tokensData} pools={visibleModelsData.modelPools} />
+      <TokenExternalAccess
+        tokens={tokensData}
+        pools={visibleModelsData.modelPools}
+        providerEgressEnabled={visibleModelsData.providerEgressEnabled}
+      />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3475,7 +3479,10 @@ function ModelApiTokenCreateForm({
   const [secret, setSecret] = useState("");
   const [consentFailed, setConsentFailed] = useState(false);
   const create = useMutation(orpc.modelApiTokens.create.mutationOptions());
-  const update = useMutation(orpc.modelApiTokens.updateExternalAccess.mutationOptions());
+  const update = useMutation({
+    ...orpc.modelApiTokens.updateExternalAccess.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
   const form = useForm({
     defaultValues: {
       name: "",
@@ -3506,7 +3513,8 @@ function ModelApiTokenCreateForm({
         });
         // Retain the one-time secret even if the separate human consent save fails.
         setSecret(result.secret);
-        if (value.allowExternal) {
+        let consentSaved = true;
+        if (value.allowExternal && visibleModels.providerEgressEnabled) {
           try {
             await update.mutateAsync({
               id: result.token.id,
@@ -3524,11 +3532,12 @@ function ModelApiTokenCreateForm({
                 : {}),
             });
           } catch {
+            consentSaved = false;
             setConsentFailed(true);
           }
         }
         void queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
-        toast.success(t("dashboard:tokens.created"));
+        if (consentSaved) toast.success(t("dashboard:tokens.created"));
       } catch {
         // The standard mutation error toast reports creation failures.
       } finally {
@@ -3590,6 +3599,7 @@ function ModelApiTokenCreateForm({
               ) : null}
               <label className="flex min-h-11 items-center gap-3 text-sm">
                 <Checkbox
+                  disabled={!visibleModels.providerEgressEnabled}
                   checked={values.allowExternal}
                   onCheckedChange={(checked) =>
                     form.setFieldValue("allowExternal", checked === true)
@@ -3600,6 +3610,11 @@ function ModelApiTokenCreateForm({
               <p className="text-sm text-muted-foreground">
                 {t("dashboard:tokens.externalAccess.description")}
               </p>
+              {!visibleModels.providerEgressEnabled ? (
+                <p role="note" className="text-sm text-muted-foreground">
+                  {t("dashboard:tokens.externalAccess.disabledDeployment")}
+                </p>
+              ) : null}
               {values.allowExternal && values.scopeMode === "ALLOWLIST" ? (
                 <div className="space-y-1">
                   <p className="text-xs text-muted-foreground">
@@ -3610,6 +3625,7 @@ function ModelApiTokenCreateForm({
                     .map((pool) => (
                       <label key={pool.id} className="flex min-h-11 items-center gap-3 text-sm">
                         <Checkbox
+                          disabled={!visibleModels.providerEgressEnabled}
                           checked={!values.excludedPoolIds.includes(pool.id)}
                           onCheckedChange={(checked) =>
                             form.setFieldValue(
@@ -3684,7 +3700,9 @@ function TokenScopePreview({ scopeMode, modelIds }: { scopeMode: ScopeMode; mode
 function TokenExternalAccess({
   tokens,
   pools,
+  providerEgressEnabled,
 }: {
+  providerEgressEnabled: boolean;
   tokens: ModelApiToken[];
   pools: VisibleModels["modelPools"];
 }) {
@@ -3709,6 +3727,11 @@ function TokenExternalAccess({
           {t("dashboard:tokens.externalAccess.description")}
         </p>
       </div>
+      {!providerEgressEnabled ? (
+        <p role="note" className="text-sm text-muted-foreground">
+          {t("dashboard:tokens.externalAccess.disabledDeployment")}
+        </p>
+      ) : null}
       <ul className="divide-y">
         {activeTokens.map((token) => {
           const allowlistPoolIds =
@@ -3719,14 +3742,11 @@ function TokenExternalAccess({
               <label className="flex min-h-11 items-center gap-3 text-sm">
                 <Checkbox
                   checked={token.allowExternal}
-                  disabled={update.isPending}
+                  disabled={!providerEgressEnabled || update.isPending}
                   onCheckedChange={(checked) =>
                     update.mutate({
                       id: token.id,
                       allowExternal: checked === true,
-                      ...(checked === true && token.scopeMode === "ALLOWLIST"
-                        ? { externalModelPoolIds: allowlistPoolIds }
-                        : {}),
                     })
                   }
                 />
@@ -3737,13 +3757,13 @@ function TokenExternalAccess({
               {token.allowExternal && allowlistPoolIds.length > 0 ? (
                 <div className="space-y-1 pl-8">
                   <p className="text-xs text-muted-foreground">
-                    {t("dashboard:tokens.externalAccess.poolsHint")}
+                    {t("dashboard:tokens.externalAccess.savedPoolsHint")}
                   </p>
                   {allowlistPoolIds.map((poolId) => (
                     <label key={poolId} className="flex min-h-11 items-center gap-3 text-sm">
                       <Checkbox
                         checked={included.has(poolId)}
-                        disabled={update.isPending}
+                        disabled={!providerEgressEnabled || update.isPending}
                         onCheckedChange={(checked) => {
                           const next = new Set(included);
                           if (checked === true) next.add(poolId);
@@ -3853,7 +3873,9 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
           <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
             <PoolPrivacyBadge
               external={pool.effectiveProviderEgress === true}
-              providers={pool.providerAccountLabels}
+              providers={
+                pool.providerAccountLabels?.length ? pool.providerAccountLabels : pool.providerTypes
+              }
             />
             <code className="min-w-0 break-all font-mono text-xs text-muted-foreground">
               {pool.id}
@@ -3874,6 +3896,7 @@ function TokenEgressWarnings({
     name: string;
     effectiveProviderEgress?: boolean;
     providerAccountLabels?: readonly string[];
+    providerTypes?: readonly string[];
   }>;
   compact?: boolean;
 }) {

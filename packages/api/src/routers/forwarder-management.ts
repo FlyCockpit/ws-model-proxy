@@ -47,7 +47,6 @@ import {
 } from "../lib/discovered-inference-capacity";
 import {
   effectiveProviderEgress,
-  egressProviderAccountLabels,
   grantPoolAccessServerMessages,
 } from "../lib/effective-provider-egress";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
@@ -622,13 +621,8 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       fallbackEnabled: pool.fallbackEnabled,
       fallbackForGrantees: pool.fallbackForGrantees,
       effectiveProviderEgress: pool.effectiveProviderEgress,
-      providerAccountLabels: egressProviderAccountLabels({
-        fallbackEnabled: serializedPools.get(pool.id)?.fallbackEnabled ?? pool.fallbackEnabled,
-        members: (serializedPools.get(pool.id)?.members ?? []).map((member) => ({
-          tier: member.tier,
-          accountLabel: member.providerModel?.ProviderAccount.label ?? null,
-        })),
-      }),
+      providerAccountLabels: pool.providerAccountLabels,
+      providerTypes: pool.providerTypes,
       compatibility: serializedPools.get(pool.id)?.compatibility ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,

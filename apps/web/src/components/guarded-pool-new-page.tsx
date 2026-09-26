@@ -31,7 +31,7 @@ export function NewPoolPage() {
     refetchOnMount: "always",
   });
 
-  if (devices.isPending) {
+  if (devices.isPending || deploymentFlags.isPending) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-8 w-64" />
@@ -42,17 +42,17 @@ export function NewPoolPage() {
   if (devices.isError)
     return <InlineRetry message={t("pools.loadFailed")} onRetry={() => void devices.refetch()} />;
 
+  if (deploymentFlags.isError)
+    return (
+      <InlineRetry message={t("deploymentFeatures.loadFailed")} onRetry={deploymentFlags.refetch} />
+    );
+
   return (
     <GuardedPoolSetupWizard
-      // Remount on a SETTLED gate flip so form state re-initializes with the
-      // filtered defaults; without this, a true→false flip leaves checked but
-      // disabled provider checkboxes the user cannot clear (stuck on Next).
-      // Accepted trade-off: a pending→settled transition after first paint also
-      // remounts once, discarding input entered during that single refetch RTT.
-      // Residual window: a submit during the background refetch RTT with a
-      // stale-true snapshot is rejected server-side with
-      // PROVIDER_EGRESS_DISABLED and surfaced via the inline create-failure copy.
-      key={deploymentFlags.isPending ? "pending" : String(providerEgressEnabled)}
+      // A settled gate change resets provider selections. Loading and failed
+      // flags are rendered above, so they never masquerade as a disabled flag.
+      // The server remains authoritative during a cached background refetch.
+      key={String(providerEgressEnabled)}
       open
       page
       onOpenChange={() => undefined}

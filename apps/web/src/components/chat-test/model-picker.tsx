@@ -92,7 +92,11 @@ export function ModelPicker({
           {selected?.kind === "MODEL_POOL" ? (
             <PoolPrivacyBadge
               external={selected.effectiveProviderEgress === true}
-              providers={selected.providerAccountLabels}
+              providers={
+                selected.providerAccountLabels?.length
+                  ? selected.providerAccountLabels
+                  : selected.providerTypes
+              }
             />
           ) : null}
         </span>
@@ -136,7 +140,11 @@ export function ModelPicker({
                       {option.kind === "MODEL_POOL" ? (
                         <PoolPrivacyBadge
                           external={option.effectiveProviderEgress === true}
-                          providers={option.providerAccountLabels}
+                          providers={
+                            option.providerAccountLabels?.length
+                              ? option.providerAccountLabels
+                              : option.providerTypes
+                          }
                         />
                       ) : null}
                       <span className="rounded-full border bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">

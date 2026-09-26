@@ -18,6 +18,7 @@ export type ModelOption = {
   /** Static external availability for this viewer; plain names remain local. */
   effectiveProviderEgress?: boolean;
   providerAccountLabels?: readonly string[];
+  providerTypes?: readonly string[];
 };
 
 export type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";

@@ -211,7 +211,8 @@
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
     "privateNetworkAdmin": "Las URL privadas y de loopback se rechazan. Define `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
-    "privateNetworkUser": "Las URL privadas y de loopback se rechazan."
+    "privateNetworkUser": "Las URL privadas y de loopback se rechazan.",
+    "loadFailed": "No se pudo cargar la configuración de la implementación. Inténtalo de nuevo."
   },
   "endpoints": {
     "empty": "No hay endpoints registrados para este CLI.",
@@ -1137,10 +1138,12 @@
       "title": "Proveedores externos",
       "description": "Desactivado de forma predeterminada. Habilitarlo permite enviar prompts, adjuntos, herramientas y resultados fuera de esta implementación a proveedores externos. Las solicitudes deben usar <pool>:external, el propietario debe permitir el respaldo y los miembros locales no deben poder atender la solicitud. Los nombres simples permanecen locales.",
       "allow": "Permitir proveedores externos para {{name}}",
-      "poolsHint": "Al habilitar el acceso externo se incluye cada pool de la lista permitida. Desmarca cualquier pool para mantenerlo solo local.",
+      "poolsHint": "Los tokens nuevos incluyen cada grupo seleccionado. Desmarca cualquier grupo para mantenerlo solo local.",
       "saved": "Acceso a proveedores externos actualizado",
       "createAllow": "Permitir proveedores externos",
-      "createFailed": "Se creó el token, pero no se pudo confirmar la actualización de acceso externo. Copia el secreto ahora y revisa sus permisos abajo antes de usarlo."
+      "createFailed": "Se creó el token, pero no se pudo confirmar la actualización de acceso externo. Copia el secreto ahora y revisa sus permisos abajo antes de usarlo.",
+      "disabledDeployment": "Los proveedores externos están desactivados en esta implementación. Se conservan tus permisos guardados; no puedes cambiarlos mientras los proveedores estén desactivados.",
+      "savedPoolsHint": "Elige qué grupos pueden usar proveedores externos. Al desactivar y reactivar el acceso externo se conservan estas opciones."
     },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",

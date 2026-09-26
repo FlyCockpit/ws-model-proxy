@@ -281,7 +281,7 @@ describe("modelApiTokenAccess", () => {
                 ExecutionTarget: {
                   select: {
                     ProviderModel: {
-                      select: { ProviderAccount: { select: { label: true } } },
+                      select: { ProviderAccount: { select: { label: true, providerType: true } } },
                     },
                   },
                 },
@@ -708,4 +708,32 @@ describe("static external availability for each viewer", () => {
       }
     },
   );
+});
+
+it("discloses only recognized coarse types, deduplicated, and never grantee account labels", async () => {
+  const { poolProviderDisclosure } = await import("./effective-provider-egress");
+  const input = {
+    isOwner: false,
+    hasLiveGrant: true,
+    providerEgressEnabled: true,
+    fallbackEnabled: true,
+    fallbackForGrantees: true,
+    members: ["openrouter", "openai", "openrouter", "owner-private-custom-type"].map(
+      (providerType) => ({
+        tier: "PUBLIC_OVERFLOW",
+        providerType,
+        accountLabel: "Private owner label",
+      }),
+    ),
+  };
+  expect(poolProviderDisclosure(input)).toEqual({
+    effectiveProviderEgress: true,
+    providerAccountLabels: [],
+    providerTypes: ["openai", "openrouter"],
+  });
+  expect(poolProviderDisclosure({ ...input, hasLiveGrant: false })).toEqual({
+    effectiveProviderEgress: false,
+    providerAccountLabels: [],
+    providerTypes: [],
+  });
 });

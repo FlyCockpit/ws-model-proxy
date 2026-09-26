@@ -311,8 +311,11 @@ export function ProviderOperationsSection() {
   const showDate = (value: Date | string | null | undefined) =>
     value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
-  const { privateNetworksAllowed: allowPrivateNetworks, providerEgressEnabled } =
-    useDeploymentFlags();
+  const {
+    privateNetworksAllowed: allowPrivateNetworks,
+    providerEgressEnabled,
+    query: deploymentFlags,
+  } = useDeploymentFlags();
   const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
   const privateNetworkMessage = isDeploymentAdmin
     ? t("dashboard:deploymentFeatures.privateNetworkAdmin")
@@ -744,7 +747,28 @@ export function ProviderOperationsSection() {
     },
   });
 
-  if (accounts.isPending) return <Skeleton className="mt-8 h-80 w-full" />;
+  if (accounts.isPending || deploymentFlags.isPending)
+    return (
+      <section
+        aria-label={t("dashboard:providers.title")}
+        aria-busy="true"
+        className="mt-10 min-w-0 space-y-4 border-t pt-8"
+      >
+        <Skeleton className="h-7 w-48" />
+        <Skeleton className="h-5 w-full max-w-3xl" />
+        <div className="grid gap-4 md:grid-cols-2">
+          <Skeleton className="h-64 w-full" />
+          <Skeleton className="h-64 w-full" />
+        </div>
+      </section>
+    );
+  if (deploymentFlags.isError)
+    return (
+      <InlineRetry
+        message={t("dashboard:deploymentFeatures.loadFailed")}
+        onRetry={deploymentFlags.refetch}
+      />
+    );
   if (accounts.isError)
     return <InlineRetry message={t("dashboard:providers.loadFailed")} onRetry={accounts.refetch} />;
 

@@ -423,6 +423,7 @@ function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth
 
 type TrafficRow = {
   external?: boolean;
+  providers?: readonly string[];
   key: string;
   title: string;
   subtitle: string | null;
@@ -462,6 +463,7 @@ function SharedPoolsTable({ metrics, t }: { metrics: OverviewMetrics; t: Dashboa
       rows={metrics.sharedPools.map((row) => ({
         key: row.poolId,
         external: row.effectiveProviderEgress,
+        providers: row.providerTypes,
         title: row.available && row.name ? row.name : t("overview.shared.unavailable"),
         subtitle: row.ownerSlug ? t("overview.shared.owner", { owner: row.ownerSlug }) : null,
         stats: row.current,
@@ -526,7 +528,7 @@ function TrafficTable({
                 <td className="max-w-64 py-2 pr-3">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="truncate font-medium">{row.title}</span>
-                    {row.external ? <PoolPrivacyBadge external /> : null}
+                    {row.external ? <PoolPrivacyBadge external providers={row.providers} /> : null}
                   </div>
                   {row.subtitle ? (
                     <div className="truncate text-xs text-muted-foreground">{row.subtitle}</div>

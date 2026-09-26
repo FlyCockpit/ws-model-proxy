@@ -211,7 +211,8 @@
   "deploymentFeatures": {
     "unavailable": "Not available on this deployment.",
     "privateNetworkAdmin": "Private and loopback URLs are rejected. Set `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
-    "privateNetworkUser": "Private and loopback URLs are rejected."
+    "privateNetworkUser": "Private and loopback URLs are rejected.",
+    "loadFailed": "Could not load deployment settings. Try again."
   },
   "endpoints": {
     "empty": "No endpoints have registered for this CLI.",
@@ -890,10 +891,12 @@
       "title": "External providers",
       "description": "Off by default. Enabling this lets prompts, attachments, tools, and output leave this deployment for third-party providers. Requests must use <pool>:external, the pool owner must allow fallback, and local members must be unable to serve the request. Plain pool names stay local.",
       "allow": "Allow external providers for {{name}}",
-      "poolsHint": "External access includes each allowlisted pool when enabled. Uncheck any pool to keep it local only.",
+      "poolsHint": "New tokens include each selected pool. Uncheck any pool to keep it local only.",
       "saved": "External provider access updated",
       "createAllow": "Allow external providers",
-      "createFailed": "Token created, but its external-access update could not be confirmed. Copy the secret now and check its permissions below before using it."
+      "createFailed": "Token created, but its external-access update could not be confirmed. Copy the secret now and check its permissions below before using it.",
+      "disabledDeployment": "External providers are disabled on this deployment. Your saved permissions are kept; changes are unavailable while providers are disabled.",
+      "savedPoolsHint": "Choose which pools may use external providers. Turning external access off and on preserves these choices."
     },
     "allVisible": "All visible",
     "allowlist": "Allowlist",

@@ -511,21 +511,13 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
   });
 
-  it("fails the egress gate closed while the cold appConfig fetch is pending", async () => {
-    const user = userEvent.setup();
-    state.devices = devicesWithModels;
-    // Cold observer: no initialData and a fetch that never settles, so the
-    // page stays isPending with undefined data for the whole test.
+  it("shows a skeleton while the cold deployment flags fetch is pending", () => {
     state.appConfigInitialData = false;
     state.appConfigPromise = new Promise(() => {});
     mountPage();
-
-    const provider = await drivePageToProviderStep(user);
-    expect(provider.getAttribute("aria-disabled")).toBe("true");
-    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
-    await user.click(provider);
-    expect(provider.getAttribute("aria-checked")).toBe("false");
-    expect(screen.queryByText("dashboard:pools.wizard.egressWarning")).toBeNull();
+    expect(document.querySelector('[data-slot="skeleton"]')).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.wizard.providerEgressDisabled")).toBeNull();
+    expect(screen.queryByLabelText("dashboard:pools.slug")).toBeNull();
   });
 
   it("fails the egress gate closed after a failed appConfig refetch retains a stale-true snapshot", async () => {
@@ -549,16 +541,17 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     // retaining the stale providerEgressEnabled:true data.
     rejectAppConfig(new Error("appConfig unavailable"));
 
-    // Gate flips to closed and the settled key change remounts the wizard,
-    // clearing the live provider selection and all entered form state.
-    await waitFor(() =>
-      expect((screen.getByLabelText("dashboard:pools.slug") as HTMLInputElement).value).toBe(""),
+    expect(await screen.findByText("deploymentFeatures.loadFailed")).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.wizard.providerEgressDisabled")).toBeNull();
+    expect(screen.queryByLabelText("dashboard:pools.slug")).toBeNull();
+    state.appConfigPromise = Promise.resolve(state.appConfig);
+    await user.click(screen.getByRole("button", { name: "actions.tryAgain" }));
+    expect(((await screen.findByLabelText("dashboard:pools.slug")) as HTMLInputElement).value).toBe(
+      "",
     );
-
     const after = await drivePageToProviderStep(user);
     expect(after.getAttribute("aria-checked")).toBe("false");
-    expect(after.getAttribute("aria-disabled")).toBe("true");
-    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
+    expect(after.getAttribute("aria-disabled")).toBeNull();
   });
 
   it("registers the page's deploymentFlags observer with refetchOnMount always", () => {

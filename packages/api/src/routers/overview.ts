@@ -29,6 +29,7 @@ import { protectedProcedure } from "../index";
 import {
   effectiveProviderEgress,
   externalFallbackMemberWhere,
+  poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
 import {
   type Accumulator,
@@ -408,7 +409,19 @@ export const overviewRouter = {
                   slug: true,
                   fallbackEnabled: true,
                   fallbackForGrantees: true,
-                  _count: { select: { PoolMembers: { where: externalFallbackMemberWhere } } },
+                  PoolMembers: {
+                    where: externalFallbackMemberWhere,
+                    select: {
+                      tier: true,
+                      ExecutionTarget: {
+                        select: {
+                          ProviderModel: {
+                            select: { ProviderAccount: { select: { providerType: true } } },
+                          },
+                        },
+                      },
+                    },
+                  },
                 },
               },
               Owner: { select: { slug: true } },
@@ -425,14 +438,17 @@ export const overviewRouter = {
           poolId,
           // Labelled only while the pool is still shared with you.
           available: grant !== undefined,
-          effectiveProviderEgress: Boolean(
-            env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
-              grant?.ModelPool.fallbackForGrantees &&
-              effectiveProviderEgress({
-                fallbackEnabled: grant.ModelPool.fallbackEnabled,
-                externalMemberCount: grant.ModelPool._count.PoolMembers,
-              }),
-          ),
+          ...poolProviderDisclosure({
+            isOwner: false,
+            hasLiveGrant: grant !== undefined,
+            providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+            fallbackEnabled: grant?.ModelPool.fallbackEnabled ?? false,
+            fallbackForGrantees: grant?.ModelPool.fallbackForGrantees ?? false,
+            members: (grant?.ModelPool.PoolMembers ?? []).map((member) => ({
+              tier: member.tier,
+              providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
+            })),
+          }),
           name: grant?.ModelPool.name ?? null,
           slug: grant?.ModelPool.slug ?? null,
           ownerSlug: grant?.Owner.slug ?? null,

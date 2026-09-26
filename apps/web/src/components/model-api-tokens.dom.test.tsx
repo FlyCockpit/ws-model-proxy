@@ -7,6 +7,7 @@ const state = vi.hoisted(() => ({
   tokens: [] as Array<Record<string, unknown>>,
   calls: [] as Array<{ name: string; input: Record<string, unknown> }>,
   failConsent: false,
+  providerEgressEnabled: true,
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
@@ -31,6 +32,23 @@ vi.mock("@/utils/orpc", () => {
         if (name === "update" && state.failConsent) throw new Error("save failed");
         if (name === "create")
           return { token: { id: "new-token" }, secret: "test-one-time-secret" };
+        if (name === "update")
+          state.tokens = state.tokens.map((token) =>
+            token.id === input.id
+              ? {
+                  ...token,
+                  allowExternal: input.allowExternal,
+                  ...(input.externalModelPoolIds
+                    ? {
+                        allowlist: {
+                          ...(token.allowlist as Record<string, unknown>),
+                          externalModelPoolIds: input.externalModelPoolIds,
+                        },
+                      }
+                    : {}),
+                }
+              : token,
+          );
         return {};
       },
     }),
@@ -40,18 +58,28 @@ vi.mock("@/utils/orpc", () => {
       modelApiTokens: {
         key: () => ["tokens"],
         list: query("tokens", () => state.tokens),
-        preview: query("preview", () => ({ directModels: [], modelPools: pools })),
+        preview: query("preview", () => ({
+          providerEgressEnabled: state.providerEgressEnabled,
+          directModels: [],
+          modelPools: pools,
+        })),
         create: mutation("create"),
         updateExternalAccess: mutation("update"),
         revoke: mutation("revoke"),
       },
       forwarderManagement: {
-        visibleModels: query("visible", () => ({ directModels: [], modelPools: pools })),
+        visibleModels: query("visible", () => ({
+          providerEgressEnabled: state.providerEgressEnabled,
+          directModels: [],
+          modelPools: pools,
+        })),
       },
     },
   };
 });
 
+import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import { ModelApiTokensSection } from "./forwarder-dashboard-sections";
 
 function mount() {
@@ -59,6 +87,7 @@ function mount() {
     <QueryClientProvider
       client={
         new QueryClient({
+          mutationCache: createAppMutationCache((key) => key),
           defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
         })
       }
@@ -81,6 +110,8 @@ afterEach(() => {
   state.tokens = [];
   state.calls = [];
   state.failConsent = false;
+  state.providerEgressEnabled = true;
+  vi.clearAllMocks();
 });
 
 describe("human token external access", () => {
@@ -152,9 +183,11 @@ describe("human token external access", () => {
       screen.getByRole("button", { name: "dashboard:tokens.create" }).hasAttribute("disabled"),
     ).toBe(true);
     expect(state.calls.filter((call) => call.name === "create")).toHaveLength(1);
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
-  it("enables existing allowlist entries together", async () => {
+  it("preserves stored empty external choices when enabling an existing token", async () => {
     state.tokens = [
       {
         id: "existing",
@@ -178,7 +211,6 @@ describe("human token external access", () => {
     expect(state.calls[0]?.input).toEqual({
       id: "existing",
       allowExternal: true,
-      externalModelPoolIds: ["one", "two"],
     });
   });
 });
@@ -245,4 +277,75 @@ it("does not expose edits for revoked tokens", () => {
   expect(
     screen.queryByRole("checkbox", { name: "dashboard:tokens.externalAccess.allow" }),
   ).toBeNull();
+});
+
+function existingToken() {
+  return {
+    id: "existing",
+    name: "Existing",
+    allowExternal: true,
+    scopeMode: "ALLOWLIST",
+    createdAt: new Date(0),
+    allowlist: {
+      directModelCount: 0,
+      modelPoolCount: 2,
+      modelPoolIds: ["one", "two"],
+      externalModelPoolIds: ["one", "two"],
+    },
+  };
+}
+
+it("restores per-pool opt-outs across disable, re-enable and reopening", async () => {
+  state.tokens = [existingToken()];
+  const view = mount();
+  fireEvent.click(screen.getByRole("checkbox", { name: "two" }));
+  await waitFor(() =>
+    expect(screen.getByRole("checkbox", { name: "two" }).getAttribute("aria-checked")).toBe(
+      "false",
+    ),
+  );
+  fireEvent.click(screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.allow" }));
+  await waitFor(() => expect(screen.queryByRole("checkbox", { name: "two" })).toBeNull());
+  view.unmount();
+  mount();
+  fireEvent.click(screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.allow" }));
+  await waitFor(() =>
+    expect(screen.getByRole("checkbox", { name: "two" }).getAttribute("aria-checked")).toBe(
+      "false",
+    ),
+  );
+  expect(screen.getByRole("checkbox", { name: "one" }).getAttribute("aria-checked")).toBe("true");
+  expect(state.calls.map((call) => call.input)).toEqual([
+    { id: "existing", allowExternal: true, externalModelPoolIds: ["one"] },
+    { id: "existing", allowExternal: false },
+    { id: "existing", allowExternal: true },
+  ]);
+});
+
+it("disables create, existing-token and per-pool external consent when providers are off", async () => {
+  state.providerEgressEnabled = false;
+  state.tokens = [existingToken()];
+  mount();
+  for (const name of ["dashboard:tokens.externalAccess.allow", "one", "two"]) {
+    const control = screen.getByRole("checkbox", { name });
+    expect(
+      control.getAttribute("aria-disabled") === "true" || control.hasAttribute("disabled"),
+    ).toBe(true);
+    fireEvent.click(control);
+  }
+  expect(state.calls).toEqual([]);
+  openCreate();
+  const consent = screen.getByRole("checkbox", {
+    name: "dashboard:tokens.externalAccess.createAllow",
+  });
+  expect(consent.getAttribute("aria-disabled") === "true" || consent.hasAttribute("disabled")).toBe(
+    true,
+  );
+  fireEvent.click(consent);
+  expect(
+    screen.getAllByText("dashboard:tokens.externalAccess.disabledDeployment").length,
+  ).toBeGreaterThan(0);
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]?.name).toBe("create");
 });
