@@ -1313,7 +1313,11 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         ? 401
         : invalidation === "external consent" || invalidation === "owner fallback"
           ? 403
-          : 404,
+          : // A revoked credential on a disabled, undeleted account is restorable
+            // (a new credential serves the same binding): transient, not gone.
+            invalidation === "credential"
+            ? 503
+            : 404,
     );
     expect(upstreamObservations).toHaveLength(observationCount);
   });
