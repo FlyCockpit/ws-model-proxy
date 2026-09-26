@@ -18,7 +18,10 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
-import { providerProtocolForType } from "@ws-model-proxy/api/lib/provider-protocol";
+import {
+  providerProtocolForType,
+  providerRequestPathname,
+} from "@ws-model-proxy/api/lib/provider-protocol";
 import {
   resolveExecutionPath,
   surfaceAvailabilityMatrix,
@@ -912,14 +915,15 @@ export async function listPublicOverflowTargets(
   };
 }
 
-function joinProviderPath(baseUrl: string, path: string): string {
+/**
+ * Request path on the provider for `path` (e.g. `/v1/chat/completions`). A
+ * base URL stored with a trailing `/v1` (as providers document it) does not
+ * produce `/v1/v1/...`; see `providerRequestPathname`.
+ */
+export function joinProviderPath(baseUrl: string, path: string): string {
   const base = new URL(baseUrl);
   const requested = new URL(path, "http://provider-path.invalid");
-  const cleanBase = base.pathname.replace(/\/$/u, "");
-  const cleanPath = requested.pathname.startsWith("/")
-    ? requested.pathname
-    : `/${requested.pathname}`;
-  return `${cleanBase}${cleanPath}${requested.search}`;
+  return `${providerRequestPathname(base.pathname, requested.pathname)}${requested.search}`;
 }
 
 const SAFE_CONTENT_ENCODINGS = new Set(["br", "deflate", "gzip", "identity", "zstd"]);

@@ -1120,6 +1120,7 @@
       "modelCreated": "Provider model created disabled",
       "testPassed": "Provider credential test passed",
       "testFailed": "Provider credential test failed",
+      "testRejected": "The provider rejected this credential",
       "failed": "Provider change could not be saved",
       "pricingCreated": "Pricing draft saved",
       "pricingActivated": "Pricing version activated",

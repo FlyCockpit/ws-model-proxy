@@ -1503,6 +1503,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
       ok: true,
       statusCode: 204,
+      reason: null,
     });
     const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
     expect(audit.data).toMatchObject({
@@ -1512,17 +1513,40 @@ describe("providerManagementRouter security boundary", () => {
     });
     expect(JSON.stringify(audit)).not.toContain("super-secret-value");
     expect(JSON.stringify(audit)).not.toContain("provider.example");
+    // An OpenAI account stored with the old `/v1` default probes `/v1/models`
+    // once, not `/v1/v1/models` or the API root.
     expect(egressMock.request).toHaveBeenLastCalledWith(
-      "https://provider.example/v1",
+      "https://provider.example/v1/models",
       { method: "GET", headers: { accept: "application/json" } },
       expect.objectContaining({ egressEnabled: true }),
       "openai",
       { type: "BEARER", token: "super-secret-value" },
     );
 
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "anthropic",
+      baseUrl: "https://provider.example",
+    });
+    await expect(client.testCredential({ providerAccountId: "account" })).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(egressMock.request).toHaveBeenLastCalledWith(
+      "https://provider.example/v1/models",
+      {
+        method: "GET",
+        headers: { accept: "application/json", "anthropic-version": "2023-06-01" },
+      },
+      expect.objectContaining({ egressEnabled: true }),
+      "anthropic",
+      { type: "BEARER", token: "super-secret-value" },
+    );
+
     for (const [providerType, protocol] of [
       ["openai-compatible", "openai"],
-      ["anthropic", "anthropic"],
       ["anthropic-compatible", "anthropic"],
     ] as const) {
       db.providerAccount.findFirst.mockResolvedValue({
@@ -1573,7 +1597,11 @@ describe("providerManagementRouter security boundary", () => {
       message: "Provider request failed",
     });
     const failedAudit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
-    expect(failedAudit.data.metadata).toEqual({ outcome: "FAILURE", statusCode: null });
+    expect(failedAudit.data.metadata).toEqual({
+      outcome: "FAILURE",
+      statusCode: null,
+      reason: "REQUEST_FAILED",
+    });
     expect(JSON.stringify(failedAudit)).not.toContain("super-secret-value");
     expect(JSON.stringify(failedAudit)).not.toContain("provider.example");
   });
@@ -1620,6 +1648,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
       ok: true,
       statusCode: 204,
+      reason: null,
     });
 
     expect(db.$queryRaw).toHaveBeenCalledTimes(2);

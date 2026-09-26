@@ -32,8 +32,9 @@ import {
   validateProviderBaseUrl,
 } from "../lib/provider-egress";
 import {
+  classifyCredentialProbeStatus,
   inventoryProtocolForProviderType,
-  providerCredentialProbeUrl,
+  providerCredentialProbe,
   providerInventorySurfacesAllowed,
   providerProtocolForType,
 } from "../lib/provider-protocol";
@@ -1798,9 +1799,10 @@ export const providerManagementRouter = {
           row.credentialType === "BEARER"
             ? ({ type: "BEARER", token: secret } as const)
             : ({ type: "API_KEY", apiKey: secret } as const);
+        const probe = providerCredentialProbe(account.providerType, account.baseUrl);
         const response = await providerHttpsRequest(
-          providerCredentialProbeUrl(account.providerType, account.baseUrl),
-          { method: "GET", headers: { accept: "application/json" } },
+          probe.url,
+          { method: "GET", headers: probe.headers },
           policy(),
           protocol,
           providerAuth,
@@ -1810,7 +1812,13 @@ export const providerManagementRouter = {
       } catch (error) {
         requestError = error;
       }
-      const ok = requestError === undefined && (statusCode ?? 500) < 400;
+      // 2xx passes; 401/403 means the provider rejected the key; any other
+      // status (or a transport error, timeout, refused redirect) is a failure
+      // that says nothing about the key. Reasons are fixed codes, never text
+      // from the provider.
+      const classified = classifyCredentialProbeStatus(statusCode);
+      const ok = requestError === undefined && classified.ok;
+      const reason = requestError !== undefined ? ("REQUEST_FAILED" as const) : classified.reason;
       // G1: a caller that aborted while the HTTPS probe was in flight must
       // not trigger the audit write transaction either (the MCP per-request
       // abort fence would reject it anyway — this check keeps the intent
@@ -1832,13 +1840,17 @@ export const providerManagementRouter = {
             providerAccountId: account.id,
             action: "CREDENTIAL_TESTED",
             subjectId: row.id,
-            metadata: { outcome: ok ? "SUCCESS" : "FAILURE", statusCode },
+            metadata: ok
+              ? { outcome: "SUCCESS", statusCode }
+              : { outcome: "FAILURE", statusCode, reason },
           },
         });
       }, providerWriteTransaction);
       if (requestError !== undefined)
         throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(requestError) });
-      return { ok, statusCode };
+      return classified.ok
+        ? { ok: true as const, statusCode, reason: null }
+        : { ok: false as const, statusCode, reason: classified.reason };
     }),
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     readRevokeOrDeleteAllowed();

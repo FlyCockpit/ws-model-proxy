@@ -176,6 +176,7 @@ describe("OpenRouter credential test", () => {
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: true,
       statusCode: 200,
+      reason: null,
     });
     expect(egressMock.request).toHaveBeenCalledWith(
       "https://openrouter.ai/api/v1/key",
@@ -190,14 +191,143 @@ describe("OpenRouter credential test", () => {
     });
   });
 
-  it("reports an invalid key as a failed test", async () => {
+  it("reports an invalid key as a rejected credential", async () => {
     egressMock.request.mockResolvedValue({ statusCode: 401, resume: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: false,
       statusCode: 401,
+      reason: "INVALID_CREDENTIAL",
     });
     expect(db.providerAuditEvent.create.mock.calls.at(-1)?.[0].data).toMatchObject({
-      metadata: { outcome: "FAILURE", statusCode: 401 },
+      metadata: { outcome: "FAILURE", statusCode: 401, reason: "INVALID_CREDENTIAL" },
     });
+  });
+});
+
+// OpenAI's API root answers 421 and Anthropic's 404 with or without a key, so
+// probing the base URL reported valid keys as failures.
+describe("OpenAI and Anthropic credential tests", () => {
+  const secret = "sk-direct-secret";
+
+  async function arrange(
+    providerType: "openai" | "anthropic",
+    baseUrl: string,
+    credentialType: "BEARER" | "API_KEY",
+  ) {
+    const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
+      "../lib/provider-credential-crypto"
+    );
+    const encrypted = encryptProviderCredential(
+      secret,
+      {
+        userId: "owner",
+        providerAccountId: "acct",
+        credentialId: "credential",
+        credentialType,
+        aadVersion: 1,
+      },
+      parseProviderCredentialKeyring("v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "acct",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType,
+      baseUrl,
+    });
+    db.providerCredential.findFirst.mockResolvedValue({
+      id: "credential",
+      providerAccountId: "acct",
+      credentialType,
+      aadVersion: 1,
+      status: "ACTIVE",
+      ...encrypted,
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.providerCredential.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+  });
+
+  it.each(["https://api.openai.com", "https://api.openai.com/v1"])(
+    "probes OpenAI's Bearer-authenticated model list for base %s",
+    async (baseUrl) => {
+      await arrange("openai", baseUrl, "BEARER");
+      egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+      await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+        ok: true,
+        statusCode: 200,
+        reason: null,
+      });
+      expect(egressMock.request).toHaveBeenCalledWith(
+        "https://api.openai.com/v1/models",
+        { method: "GET", headers: { accept: "application/json" } },
+        expect.objectContaining({ egressEnabled: true }),
+        "openai",
+        { type: "BEARER", token: secret },
+      );
+      expect(db.providerAuditEvent.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+        metadata: { outcome: "SUCCESS", statusCode: 200 },
+      });
+    },
+  );
+
+  it("probes Anthropic's model list with x-api-key and anthropic-version", async () => {
+    await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
+    egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(egressMock.request).toHaveBeenCalledWith(
+      "https://api.anthropic.com/v1/models",
+      {
+        method: "GET",
+        headers: { accept: "application/json", "anthropic-version": "2023-06-01" },
+      },
+      expect.objectContaining({ egressEnabled: true }),
+      "anthropic",
+      { type: "API_KEY", apiKey: secret },
+    );
+  });
+
+  it.each([
+    [401, "INVALID_CREDENTIAL"],
+    [403, "INVALID_CREDENTIAL"],
+    [404, "UNEXPECTED_STATUS"],
+    [421, "UNEXPECTED_STATUS"],
+    [500, "UNEXPECTED_STATUS"],
+  ] as const)("classifies status %s as %s without leaking the key", async (status, reason) => {
+    await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
+    egressMock.request.mockResolvedValue({ statusCode: status, resume: vi.fn() });
+    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+      ok: false,
+      statusCode: status,
+      reason,
+    });
+    const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+    expect(audit.data.metadata).toEqual({ outcome: "FAILURE", statusCode: status, reason });
+    expect(JSON.stringify(audit)).not.toContain(secret);
+  });
+
+  it("reports a transport failure or timeout as a redacted BAD_GATEWAY", async () => {
+    await arrange("openai", "https://api.openai.com", "BEARER");
+    egressMock.request.mockRejectedValueOnce(new Error(`timeout ${secret}`));
+    await expect(client().testCredential({ providerAccountId: "acct" })).rejects.toMatchObject({
+      code: "BAD_GATEWAY",
+      message: "Provider request failed",
+    });
+    const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+    expect(audit.data.metadata).toEqual({
+      outcome: "FAILURE",
+      statusCode: null,
+      reason: "REQUEST_FAILED",
+    });
+    expect(JSON.stringify(audit)).not.toContain(secret);
   });
 });

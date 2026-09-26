@@ -141,6 +141,13 @@ afterEach(() => {
 });
 
 describe("ProviderOperationsSection mounted forms", () => {
+  // Request paths carry `/v1`; a `/v1` default produced `/v1/v1/...` upstream.
+  it("defaults the new account to the unversioned OpenAI API root", () => {
+    mount();
+    const baseUrl = screen.getByLabelText("dashboard:providers.fields.baseUrl");
+    expect((baseUrl as HTMLInputElement).value).toBe("https://api.openai.com");
+  });
+
   it("says private and loopback URLs are rejected before submit when that flag is off", () => {
     state.allowPrivateNetworks = false;
     mount();

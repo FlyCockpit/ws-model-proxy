@@ -25,6 +25,7 @@ import {
   parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { ANTHROPIC_DEFAULT_API_VERSION } from "@ws-model-proxy/api/lib/provider-protocol";
 import {
   resolveExecutionPath,
   type SurfaceRequestRequirements,
@@ -3899,7 +3900,10 @@ async function relayPool({
             });
             const headers = new Headers({ "content-type": "application/json" });
             if (providerTarget.protocol === "anthropic")
-              headers.set("anthropic-version", providerTarget.providerVersion ?? "2023-06-01");
+              headers.set(
+                "anthropic-version",
+                providerTarget.providerVersion ?? ANTHROPIC_DEFAULT_API_VERSION,
+              );
             return {
               protocol: providerTarget.protocol,
               path:
