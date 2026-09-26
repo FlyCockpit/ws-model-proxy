@@ -346,7 +346,7 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
           }
           expect(blocked).toBe(true);
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${user.id}:${imported.model.id}`}, 0))`;
-          await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${imported.model.id} AND "userId" = ${user.id} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${imported.model.id} AND "userId" = ${user.id} FOR NO KEY UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_pricing_version WHERE "providerModelId" = ${imported.model.id} AND "userId" = ${user.id} FOR UPDATE`;
         },
         { timeout: 8_000 },

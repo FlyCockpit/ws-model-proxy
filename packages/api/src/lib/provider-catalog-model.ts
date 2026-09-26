@@ -27,6 +27,27 @@ export const catalogModelIdSchema = z
 
 // USD per token as a decimal string. "-1" means variable (router models).
 const PRICE_PATTERN = /^(?:-1|\d{1,12}(?:\.\d{1,30})?)$/u;
+
+function isMalformedListedPrice(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "string") return true;
+  return !PRICE_PATTERN.test(value);
+}
+
+/** Present but unparseable base price strings (fail closed, same as `-1`). */
+function hasMalformedBasePrice(source: unknown): boolean {
+  if (source === undefined || source === null) return false;
+  if (typeof source !== "object") return true;
+  const record = source as Record<string, unknown>;
+  return (
+    isMalformedListedPrice(record.prompt) ||
+    isMalformedListedPrice(record.completion) ||
+    isMalformedListedPrice(record.input_cache_read) ||
+    isMalformedListedPrice(record.input_cache_write) ||
+    isMalformedListedPrice(record.internal_reasoning)
+  );
+}
+
 const priceSchema = z.string().regex(PRICE_PATTERN).nullable().optional().catch(null);
 
 /**
@@ -180,8 +201,10 @@ function isVariable(raw: RawPriceTier | null | undefined): boolean {
 
 function catalogPricing(
   raw: (RawPriceTier & { overrides?: unknown }) | null | undefined,
+  pricingSource?: unknown,
 ): CatalogPricing {
   const base = priceTier(raw);
+  if (hasMalformedBasePrice(pricingSource ?? raw)) return { ...base, variable: true, tiers: [] };
   if (raw?.overrides === undefined || raw.overrides === null)
     return { ...base, variable: isVariable(raw), tiers: [] };
   const tiers = priceTiersSchema.safeParse(raw.overrides);
@@ -207,12 +230,16 @@ export function parseCatalog(json: unknown): CatalogModel[] {
     seen.add(entry.id);
     const parameters = new Set(entry.supported_parameters ?? []);
     const pricing = entry.pricing ?? null;
+    const pricingSource =
+      raw && typeof raw === "object" && "pricing" in raw
+        ? (raw as { pricing?: unknown }).pricing
+        : undefined;
     models.push({
       id: entry.id,
       name: entry.name ?? entry.id,
       contextLength: entry.context_length ?? entry.top_provider?.context_length ?? null,
       maxCompletionTokens: entry.top_provider?.max_completion_tokens ?? null,
-      pricing: catalogPricing(pricing),
+      pricing: catalogPricing(pricing, pricingSource),
       inputModalities: [...new Set(entry.architecture?.input_modalities ?? [])],
       outputModalities: [...new Set(entry.architecture?.output_modalities ?? [])],
       supportsTools: parameters.has("tools"),

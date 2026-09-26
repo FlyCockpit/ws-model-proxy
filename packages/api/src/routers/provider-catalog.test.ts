@@ -322,7 +322,11 @@ describe("providerCatalog.importModel", () => {
     );
     db.$queryRaw.mockImplementation(async (strings: TemplateStringsArray, ...values: unknown[]) => {
       const text = sql(strings, values);
-      locks.push(text.includes("provider_account") ? "provider_account" : "provider_model");
+      if (text.includes("provider_account")) locks.push("provider_account");
+      else if (text.includes("provider_model")) {
+        expect(text).toContain("FOR NO KEY UPDATE");
+        locks.push("provider_model");
+      }
       return [];
     });
     db.providerAccount.findFirst.mockResolvedValue(account);
@@ -494,7 +498,12 @@ describe("providerCatalog.importModel", () => {
     ];
     catalogAuthored = new Set(["price-1"]);
     const again = await importQwen();
-    expect(again).toMatchObject({ created: false, restored: false, pricing: "unchanged" });
+    expect(again).toMatchObject({
+      created: false,
+      restored: false,
+      pricing: "unchanged",
+      priceTiered: false,
+    });
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.executionTarget.create).not.toHaveBeenCalled();
@@ -559,7 +568,7 @@ describe("providerCatalog.importModel", () => {
     stored = storedModel();
     active = [activeRow({ id: "mine", version: "my-price" })];
     const result = await importQwen();
-    expect(result.pricing).toBe("userPricingKept");
+    expect(result).toMatchObject({ pricing: "userPricingKept", priceTiered: false });
     expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
     expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
     expect(db.providerModel.updateMany).not.toHaveBeenCalled();
@@ -615,7 +624,7 @@ describe("providerCatalog.importModel", () => {
   it("never overrides a future-dated ACTIVE price the user scheduled", async () => {
     active = [activeRow({ id: "future", effectiveAt: new Date(Date.now() + 86_400_000) })];
     const result = await importQwen();
-    expect(result.pricing).toBe("scheduledPricingExists");
+    expect(result).toMatchObject({ pricing: "scheduledPricingExists", priceTiered: false });
     expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
     expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
   });

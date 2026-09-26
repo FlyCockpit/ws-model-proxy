@@ -82,7 +82,7 @@ describe("parseCatalog", () => {
       name: "qwen/qwen3-coder",
       contextLength: null,
       maxCompletionTokens: null,
-      pricing: { prompt: null, completion: "0.000001", variable: false },
+      pricing: { prompt: null, completion: "0.000001", variable: true },
       supportsTools: false,
       expirationDate: null,
     });
@@ -215,6 +215,29 @@ describe("tiered pricing that cannot be bounded", () => {
         }),
       ],
     })[0];
+
+  it.each(["input_cache_read", "input_cache_write", "internal_reasoning"] as const)(
+    "treats a malformed base %s as unknown price (fail closed)",
+    (category) => {
+      for (const value of ["abc", "1.25e-6"]) {
+        const [model] = parseCatalog({
+          data: [
+            catalogEntry({
+              pricing: {
+                prompt: "0.000001",
+                completion: "0.000002",
+                [category]: value,
+              },
+            }),
+          ],
+        });
+        if (!model) throw new Error("fixture");
+        expect(model.pricing.variable).toBe(true);
+        expect(catalogRatesPerMillion(model)).toBeNull();
+        expect(catalogCompatibility(model, null).warn).toContain("UNKNOWN_PRICE");
+      }
+    },
+  );
 
   it.each([
     ["a variable tier", [{ min_prompt_tokens: 1000, prompt: "-1" }]],

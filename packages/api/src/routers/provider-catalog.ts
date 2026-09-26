@@ -457,7 +457,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
           } else {
             modelId = known.id;
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${modelId}`}, 0))`;
-            await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
+            await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${modelId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
             const current = await tx.providerModel.findFirst({
               where: { id: modelId, userId, providerAccountId: account.id },
               select: {
@@ -527,10 +527,13 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
           if (!row) throw missing();
           return { model: row, created, restored, pricing, contextWindowDrift };
         });
+        const catalogPricingWritten =
+          outcome.pricing === "created" || outcome.pricing === "updated";
         return {
           ...outcome,
-          // The imported rates are the upper bound across these tiers.
-          priceTiered: rates !== null && model.pricing.tiers.length > 0,
+          // Only when this import wrote/refreshed catalog pricing (not kept,
+          // scheduled, unchanged, or unknown).
+          priceTiered: catalogPricingWritten && rates !== null && model.pricing.tiers.length > 0,
           compatibility: catalogCompatibility(model, null),
         };
       }),

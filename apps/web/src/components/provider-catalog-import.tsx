@@ -50,6 +50,7 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
         const next: string[] = [];
         const pricingNote = pricingNoteKey[result.pricing];
         if (pricingNote) next.push(t(pricingNote));
+        // `priceTiered` is only true when this import wrote catalog pricing.
         if (result.priceTiered) next.push(t("dashboard:providerCatalog.import.pricingTiered"));
         if (result.contextWindowDrift)
           next.push(

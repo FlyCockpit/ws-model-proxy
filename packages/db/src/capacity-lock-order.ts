@@ -64,9 +64,10 @@
  * A freshly inserted model's id is transaction-private and needs no L0 fence;
  * its pricing advisory cannot contend. Catalog import re-enters its advisory
  * after locking the existing model. Pricing-only writers need no L0 fence.
- * Pricing writers take the model FOR NO KEY UPDATE (pricing fields are not
- * keys), compatible with target-insert FK KEY SHARE during pool setup. They
- * never wait on pool/target/capacity locks. Import and updateModel share the
+ * Pricing writers and catalog import (existing model) take the model FOR NO
+ * KEY UPDATE (pricing and metadata fields are not keys), compatible with
+ * target-insert FK KEY SHARE during pool setup. They never wait on
+ * pool/target/capacity locks. Import and updateModel share the
  * L0 fence with provider attach before taking the account/model rows; none
  * requests a pool row or another identity fence afterwards. The static
  * inventory and pricing writer sequence tests include implicit FK locks.
