@@ -1,4 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Download } from "lucide-react";
@@ -11,6 +12,21 @@ import {
   ProviderCatalogRowSummary,
 } from "@/components/provider-catalog-picker";
 import { orpc } from "@/utils/orpc";
+
+type CatalogPricingOutcome = Awaited<
+  ReturnType<AppRouterClient["providerCatalog"]["importModel"]>
+>["pricing"];
+
+/** What the import did to the price; `created` and `unchanged` need no note. */
+const pricingNoteKey = {
+  created: null,
+  unchanged: null,
+  updated: "dashboard:providerCatalog.import.pricingUpdated",
+  unknown: "dashboard:providerCatalog.import.pricingUnknown",
+  catalogPricingRetired: "dashboard:providerCatalog.import.pricingCatalogRetired",
+  userPricingKept: "dashboard:providerCatalog.import.pricingUserKept",
+  scheduledPricingExists: "dashboard:providerCatalog.import.pricingScheduled",
+} as const satisfies Record<CatalogPricingOutcome, string | null>;
 
 /**
  * "Import from catalog" for the caller's own OpenRouter account: picks a
@@ -32,10 +48,9 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
             : t("dashboard:providerCatalog.import.updated"),
         );
         const next: string[] = [];
-        if (result.pricing === "unknown")
-          next.push(t("dashboard:providerCatalog.import.pricingUnknown"));
-        if (result.pricing === "scheduledPricingExists")
-          next.push(t("dashboard:providerCatalog.import.pricingScheduled"));
+        const pricingNote = pricingNoteKey[result.pricing];
+        if (pricingNote) next.push(t(pricingNote));
+        if (result.priceTiered) next.push(t("dashboard:providerCatalog.import.pricingTiered"));
         if (result.contextWindowDrift)
           next.push(
             t("dashboard:providerCatalog.import.contextDrift", {

@@ -4,6 +4,11 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
+const egressMock = vi.hoisted(() => ({ request: vi.fn() }));
+vi.mock("../lib/provider-egress", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/provider-egress")>()),
+  providerHttpsRequest: egressMock.request,
+}));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
@@ -25,6 +30,8 @@ const db = prisma as unknown as {
   $transaction: MockInstance;
   providerAccount: { create: MockInstance; findFirst: MockInstance };
   providerModel: { create: MockInstance };
+  providerCredential: { findFirst: MockInstance; updateMany: MockInstance };
+  providerAuditEvent: { create: MockInstance };
 };
 
 const context: Context = {
@@ -119,5 +126,78 @@ describe("OpenRouter provider type in provider management", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.providerModel.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("OpenRouter credential test", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
+      "../lib/provider-credential-crypto"
+    );
+    const encrypted = encryptProviderCredential(
+      "sk-or-secret",
+      {
+        userId: "owner",
+        providerAccountId: "acct",
+        credentialId: "credential",
+        credentialType: "BEARER",
+        aadVersion: 1,
+      },
+      parseProviderCredentialKeyring("v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "acct",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "openrouter",
+      baseUrl: "https://openrouter.ai/api",
+    });
+    db.providerCredential.findFirst.mockResolvedValue({
+      id: "credential",
+      providerAccountId: "acct",
+      credentialType: "BEARER",
+      aadVersion: 1,
+      status: "ACTIVE",
+      ...encrypted,
+    });
+    db.providerCredential.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+  });
+
+  // The API root answers 404 with or without a key, so probing it could never
+  // succeed; /v1/key answers 401 for a bad key.
+  it("probes the authenticated key endpoint on the account's base URL", async () => {
+    egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+      ok: true,
+      statusCode: 200,
+    });
+    expect(egressMock.request).toHaveBeenCalledWith(
+      "https://openrouter.ai/api/v1/key",
+      { method: "GET", headers: { accept: "application/json" } },
+      expect.objectContaining({ egressEnabled: true }),
+      "openai",
+      { type: "BEARER", token: "sk-or-secret" },
+    );
+    expect(db.providerAuditEvent.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      action: "CREDENTIAL_TESTED",
+      metadata: { outcome: "SUCCESS", statusCode: 200 },
+    });
+  });
+
+  it("reports an invalid key as a failed test", async () => {
+    egressMock.request.mockResolvedValue({ statusCode: 401, resume: vi.fn() });
+    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
+      ok: false,
+      statusCode: 401,
+    });
+    expect(db.providerAuditEvent.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      metadata: { outcome: "FAILURE", statusCode: 401 },
+    });
   });
 });

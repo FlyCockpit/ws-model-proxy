@@ -3,7 +3,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
-import { catalogEntry } from "../lib/fixtures/openrouter-catalog";
+import { catalogEntry, liveShapedCatalogEntries } from "../lib/fixtures/openrouter-catalog";
 
 const envMock = vi.hoisted(() => ({ enabled: true }));
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -16,11 +16,13 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep(), Prisma: {} };
+  return { default: mockDeep(), Prisma: { JsonNull: "JsonNull" } };
 });
 
 const { createProviderCatalogRouter } = await import("./provider-catalog");
-const { parseCatalog } = await import("../lib/provider-catalog-model");
+const { CATALOG_CHARGE_RULES, catalogNativeCapabilities, parseCatalog } = await import(
+  "../lib/provider-catalog-model"
+);
 const { default: prisma } = await import("@ws-model-proxy/db");
 type ProviderCatalogResult = Awaited<
   ReturnType<import("../lib/provider-catalog").ProviderCatalog["get"]>
@@ -31,13 +33,18 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
   providerAccount: { findFirst: MockInstance };
-  providerModel: { findFirst: MockInstance; create: MockInstance; update: MockInstance };
+  providerModel: {
+    findFirst: MockInstance;
+    create: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+  };
   providerPricingVersion: {
     findMany: MockInstance;
     updateMany: MockInstance;
     create: MockInstance;
   };
-  providerAuditEvent: { create: MockInstance };
+  providerAuditEvent: { create: MockInstance; findMany: MockInstance };
   executionTarget: { create: MockInstance; findUnique: MockInstance };
   modelPool: { findFirst: MockInstance; updateMany: MockInstance };
 };
@@ -145,6 +152,7 @@ describe("providerCatalog.search", () => {
         cacheRead: "0.00000002",
         cacheWrite: null,
         variable: false,
+        tiered: false,
       },
       supportsTools: true,
       supportsReasoning: true,
@@ -241,24 +249,115 @@ describe("providerCatalog.search", () => {
 
 describe("providerCatalog.importModel", () => {
   const account = { id: "acct-1", providerType: "openrouter" };
+  const qwenCapabilities = () => {
+    const qwen = models.find((model) => model.id === "qwen/qwen3-coder");
+    if (!qwen) throw new Error("fixture");
+    return catalogNativeCapabilities(qwen);
+  };
+  const catalogRates = {
+    input: "0.2",
+    output: "0.8",
+    cacheRead: "0.02",
+    cacheWrite: "0.2",
+    reasoning: "0.8",
+  };
+  type ActiveRow = {
+    id: string;
+    version: string;
+    currency: string;
+    accountingVersion: string;
+    pricing: unknown;
+    chargeRules: unknown;
+    effectiveAt: Date;
+  };
+  type Stored = {
+    deletedAt: Date | null;
+    displayName: string | null;
+    nativeCapabilities: unknown;
+    contextWindow: number | null;
+    maxOutputTokens: number | null;
+  };
+  // In-memory view of what the transaction reads, plus an ordered lock log.
+  let stored: Stored | null;
+  let hasTarget: boolean;
+  let active: ActiveRow[];
+  let catalogAuthored: Set<string>;
+  let locks: string[];
+
+  const activeRow = (overrides: Partial<ActiveRow> = {}): ActiveRow => ({
+    id: "price-0",
+    version: "v0",
+    currency: "USD",
+    accountingVersion: "provider-billable-v1",
+    pricing: { ratesPerMillion: { input: "1", output: "2" } },
+    chargeRules: {},
+    effectiveAt: new Date(Date.now() - 60_000),
+    ...overrides,
+  });
+  const storedModel = (overrides: Partial<Stored> = {}): Stored => ({
+    deletedAt: null,
+    displayName: "Qwen: Qwen3 Coder",
+    nativeCapabilities: qwenCapabilities(),
+    contextWindow: 262_144,
+    maxOutputTokens: 65_536,
+    ...overrides,
+  });
+  const sql = (strings: TemplateStringsArray, values: unknown[]) =>
+    strings.reduce(
+      (text, part, index) => `${text}${part}${index < values.length ? `$${index}` : ""}`,
+      "",
+    );
+
   beforeEach(() => {
+    stored = null;
+    hasTarget = true;
+    active = [];
+    catalogAuthored = new Set();
+    locks = [];
+    db.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        locks.push(`advisory ${String(values[0])}`);
+        return sql(strings, values) && 1;
+      },
+    );
+    db.$queryRaw.mockImplementation(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const text = sql(strings, values);
+      locks.push(text.includes("provider_account") ? "provider_account" : "provider_model");
+      return [];
+    });
     db.providerAccount.findFirst.mockResolvedValue(account);
-    db.providerModel.findFirst.mockImplementation(async (args: { select?: object }) =>
-      args.select && "upstreamModelId" in args.select
-        ? {
+    db.providerModel.findFirst.mockImplementation(
+      async (args: { where: Record<string, unknown>; select?: Record<string, unknown> }) => {
+        if (!stored) return null;
+        if (args.select && "deletedAt" in args.select) return stored;
+        if (args.select && "upstreamModelId" in args.select)
+          return {
             id: "pm-1",
             providerAccountId: "acct-1",
             upstreamModelId: "qwen/qwen3-coder",
-            displayName: "Qwen: Qwen3 Coder",
-            contextWindow: 262_144,
-            maxOutputTokens: 65_536,
-            pricingVersion: "v",
+            displayName: stored.displayName,
+            contextWindow: stored.contextWindow,
+            maxOutputTokens: stored.maxOutputTokens,
+            pricingVersion: null,
             enabled: false,
-          }
-        : null,
+          };
+        return { id: "pm-1" };
+      },
     );
-    db.providerModel.create.mockResolvedValue({ id: "pm-1" });
-    db.providerPricingVersion.findMany.mockResolvedValue([]);
+    db.providerModel.create.mockImplementation(async (args: { data: Stored }) => {
+      stored = { ...args.data, deletedAt: null };
+      return { id: "pm-1" };
+    });
+    db.executionTarget.findUnique.mockImplementation(async () =>
+      hasTarget ? { id: "et-1" } : null,
+    );
+    db.providerPricingVersion.findMany.mockImplementation(async () => active);
+    db.providerAuditEvent.findMany.mockImplementation(
+      async (args: { where: { subjectId: { in: string[] } } }) =>
+        args.where.subjectId.in
+          .filter((subjectId) => catalogAuthored.has(subjectId))
+          .map((subjectId) => ({ subjectId })),
+    );
     db.providerPricingVersion.create.mockImplementation(
       async (args: { data: { version: string } }) => ({
         id: "price-1",
@@ -267,11 +366,20 @@ describe("providerCatalog.importModel", () => {
     );
   });
 
+  const importQwen = (modelId = "qwen/qwen3-coder") =>
+    client().importModel({ providerAccountId: "acct-1", modelId });
+  const auditActions = () =>
+    db.providerAuditEvent.create.mock.calls.map(
+      ([args]: [{ data: { action: string; subjectId: string; metadata: unknown } }]) => [
+        args.data.action,
+        args.data.subjectId,
+        args.data.metadata,
+      ],
+    );
+
   it("is hidden when the switch is off", async () => {
     envMock.enabled = false;
-    await expect(
-      client().importModel({ providerAccountId: "acct-1", modelId: "qwen/qwen3-coder" }),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(importQwen()).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(catalog.get).not.toHaveBeenCalled();
   });
 
@@ -291,18 +399,17 @@ describe("providerCatalog.importModel", () => {
   });
 
   it("creates the model, its execution target, audit events and an ACTIVE catalog price", async () => {
-    const result = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
-    });
+    const result = await importQwen();
     expect(result).toMatchObject({
       created: true,
       restored: false,
       pricing: "created",
+      priceTiered: false,
       contextWindowDrift: null,
       compatibility: { verdict: "ok" },
     });
-    expect(db.$queryRaw).toHaveBeenCalled();
+    // A new model's id is not visible to others: no identity fence needed.
+    expect(locks[0]).toBe("provider_account");
     expect(db.providerModel.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         userId: "owner",
@@ -330,15 +437,7 @@ describe("providerCatalog.importModel", () => {
         currency: "USD",
         status: "ACTIVE",
         confidence: "ESTIMATED",
-        pricing: {
-          ratesPerMillion: {
-            input: "0.2",
-            output: "0.8",
-            cacheRead: "0.02",
-            cacheWrite: "0.2",
-            reasoning: "0.8",
-          },
-        },
+        pricing: { ratesPerMillion: catalogRates },
         chargeRules: expect.objectContaining({ unknownCategories: "FAIL_CLOSED" }),
       }),
       select: { id: true, version: true },
@@ -349,16 +448,15 @@ describe("providerCatalog.importModel", () => {
         data: expect.objectContaining({ pricingVersion: expect.stringMatching(/^openrouter-/u) }),
       }),
     );
-    const actions = db.providerAuditEvent.create.mock.calls.map(
-      ([args]: [{ data: { action: string; metadata: unknown } }]) => [
-        args.data.action,
-        args.data.metadata,
+    expect(auditActions()).toEqual([
+      [
+        "MODEL_CREATED",
+        "pm-1",
+        { source: "OPENROUTER_CATALOG", catalogModelId: "qwen/qwen3-coder" },
       ],
-    );
-    expect(actions).toEqual([
-      ["MODEL_CREATED", { source: "OPENROUTER_CATALOG", catalogModelId: "qwen/qwen3-coder" }],
       [
         "PRICING_ACTIVATED",
+        "price-1",
         expect.objectContaining({
           source: "OPENROUTER_CATALOG",
           catalogModelId: "qwen/qwen3-coder",
@@ -367,49 +465,35 @@ describe("providerCatalog.importModel", () => {
     ]);
   });
 
-  it("is idempotent: re-importing identical catalog data writes nothing", async () => {
-    const first = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
+  it("takes the provider-model identity fence before the account row when the model exists", async () => {
+    stored = storedModel();
+    hasTarget = false;
+    await importQwen();
+    expect(locks.slice(0, 2)).toEqual([
+      "advisory execution-target:provider-model:pm-1",
+      "provider_account",
+    ]);
+    // ...and only then the pricing lock and the model row.
+    expect(locks.slice(2, 4)).toEqual(["advisory provider-pricing:owner:pm-1", "provider_model"]);
+    expect(db.executionTarget.create).toHaveBeenCalledWith({
+      data: { userId: "owner", kind: "PROVIDER_MODEL", providerModelId: "pm-1" },
     });
-    expect(first.created).toBe(true);
-    const createdModel = db.providerModel.create.mock.calls[0]?.[0].data;
-    const createdPrice = db.providerPricingVersion.create.mock.calls[0]?.[0].data;
-    vi.clearAllMocks();
-    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
-      callback(db),
-    );
-    db.providerAccount.findFirst.mockResolvedValue(account);
+  });
+
+  it("is idempotent: re-importing identical catalog data writes nothing", async () => {
     // Postgres jsonb reorders keys; the comparison must not depend on order.
     const reversed = (value: object) =>
       JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(value).reverse())));
-    db.providerModel.findFirst.mockImplementation(async (args: { select?: object }) => {
-      if (args.select && "deletedAt" in args.select)
-        return {
-          deletedAt: null,
-          displayName: createdModel.displayName,
-          nativeCapabilities: reversed(createdModel.nativeCapabilities),
-          contextWindow: createdModel.contextWindow,
-          maxOutputTokens: createdModel.maxOutputTokens,
-        };
-      if (args.select && "upstreamModelId" in args.select) return { id: "pm-1" };
-      return { id: "pm-1" };
-    });
-    db.executionTarget.findUnique.mockResolvedValue({ id: "et-1" });
-    db.providerPricingVersion.findMany.mockResolvedValue([
-      {
+    stored = storedModel({ nativeCapabilities: reversed(qwenCapabilities()) });
+    active = [
+      activeRow({
         id: "price-1",
-        currency: "USD",
-        accountingVersion: "provider-billable-v1",
-        pricing: { ratesPerMillion: reversed(createdPrice.pricing.ratesPerMillion) },
-        chargeRules: reversed(createdPrice.chargeRules),
-        effectiveAt: new Date(Date.now() - 1_000),
-      },
-    ]);
-    const again = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
-    });
+        pricing: { ratesPerMillion: reversed(catalogRates) },
+        chargeRules: reversed(CATALOG_CHARGE_RULES),
+      }),
+    ];
+    catalogAuthored = new Set(["price-1"]);
+    const again = await importQwen();
     expect(again).toMatchObject({ created: false, restored: false, pricing: "unchanged" });
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.providerModel.update).not.toHaveBeenCalled();
@@ -419,46 +503,50 @@ describe("providerCatalog.importModel", () => {
     expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
   });
 
-  it("retires the old ACTIVE version when the catalog price changed", async () => {
-    db.providerModel.findFirst.mockImplementation(async (args: { select?: object }) =>
-      args.select && "deletedAt" in args.select
-        ? {
-            deletedAt: null,
-            displayName: "Qwen: Qwen3 Coder",
-            nativeCapabilities: null,
-            contextWindow: 131_072,
-            maxOutputTokens: 65_536,
-          }
-        : { id: "pm-1" },
-    );
-    db.executionTarget.findUnique.mockResolvedValue(null);
-    db.providerPricingVersion.findMany.mockResolvedValue([
-      {
-        id: "price-0",
-        currency: "USD",
-        accountingVersion: "provider-billable-v1",
-        pricing: { ratesPerMillion: { input: "1", output: "2" } },
-        chargeRules: {},
-        effectiveAt: new Date(Date.now() - 60_000),
-      },
-    ]);
-    const result = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
-    });
+  it("replaces a catalog-authored ACTIVE price when the catalog price changed", async () => {
+    stored = storedModel({ contextWindow: 131_072 });
+    hasTarget = false;
+    active = [activeRow()];
+    catalogAuthored = new Set(["price-0"]);
+    const result = await importQwen();
     expect(result).toMatchObject({
       created: false,
-      pricing: "created",
+      pricing: "updated",
       // Context feeds capacity policy: reported, never silently rewritten.
       contextWindowDrift: { current: 131_072, catalog: 262_144 },
     });
+    expect(db.providerAuditEvent.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: "owner",
+        action: "PRICING_ACTIVATED",
+        subjectId: { in: ["price-0"] },
+        metadata: { path: ["source"], equals: "OPENROUTER_CATALOG" },
+      },
+      select: { subjectId: true },
+    });
     expect(db.providerPricingVersion.updateMany).toHaveBeenCalledWith({
-      where: { userId: "owner", providerModelId: "pm-1", status: "ACTIVE" },
+      where: {
+        userId: "owner",
+        providerModelId: "pm-1",
+        status: "ACTIVE",
+        id: { in: ["price-0"] },
+      },
       data: { status: "RETIRED", retiredAt: expect.any(Date) },
     });
+    expect(db.providerPricingVersion.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ pricing: { ratesPerMillion: catalogRates } }),
+      }),
+    );
+    expect(auditActions().map(([action, subject]) => [action, subject])).toEqual([
+      ["PRICING_RETIRED", "price-0"],
+      ["PRICING_ACTIVATED", "price-1"],
+    ]);
+    // Nothing else about the model changed, so it is not rewritten.
+    expect(db.providerModel.update).toHaveBeenCalledTimes(1);
     expect(db.providerModel.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.not.objectContaining({ contextWindow: expect.anything() }),
+        data: expect.objectContaining({ pricingVersion: expect.any(String) }),
       }),
     );
     // A missing execution target (and so capacity) is created for the runtime.
@@ -467,78 +555,170 @@ describe("providerCatalog.importModel", () => {
     });
   });
 
-  it("never overrides a future-dated ACTIVE price the user scheduled", async () => {
-    db.providerModel.findFirst.mockImplementation(async (args: { select?: object }) =>
-      args.select && "deletedAt" in args.select ? null : { id: "pm-1" },
-    );
-    db.providerModel.findFirst.mockResolvedValueOnce(null);
-    db.providerPricingVersion.findMany.mockResolvedValue([
+  it("keeps a user-authored ACTIVE price and says so", async () => {
+    stored = storedModel();
+    active = [activeRow({ id: "mine", version: "my-price" })];
+    const result = await importQwen();
+    expect(result.pricing).toBe("userPricingKept");
+    expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
+    expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
+    expect(db.providerModel.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps a user-authored price even when the catalog price becomes unknown", async () => {
+    stored = storedModel();
+    active = [activeRow({ id: "mine" })];
+    const result = await importQwen("openrouter/auto");
+    expect(result.pricing).toBe("userPricingKept");
+    expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("retires a catalog-authored price when the catalog price becomes unknown", async () => {
+    stored = storedModel();
+    active = [activeRow({ id: "price-0", version: "openrouter-old" })];
+    catalogAuthored = new Set(["price-0"]);
+    const result = await importQwen("openrouter/auto");
+    expect(result.pricing).toBe("catalogPricingRetired");
+    expect(db.providerPricingVersion.updateMany).toHaveBeenCalledWith({
+      where: {
+        userId: "owner",
+        providerModelId: "pm-1",
+        status: "ACTIVE",
+        id: { in: ["price-0"] },
+      },
+      data: { status: "RETIRED", retiredAt: expect.any(Date) },
+    });
+    // The model points at no price, so SPEND rules fail closed.
+    expect(db.providerModel.updateMany).toHaveBeenCalledWith({
+      where: { id: "pm-1", userId: "owner", pricingVersion: { in: ["openrouter-old"] } },
+      data: { pricingVersion: null, pricingMetadata: "JsonNull" },
+    });
+    expect(auditActions()).toContainEqual([
+      "PRICING_RETIRED",
+      "price-0",
       {
-        id: "future",
-        currency: "USD",
-        accountingVersion: "provider-billable-v1",
-        pricing: {},
-        chargeRules: {},
-        effectiveAt: new Date(Date.now() + 86_400_000),
+        version: "openrouter-old",
+        source: "OPENROUTER_CATALOG",
+        catalogModelId: "openrouter/auto",
       },
     ]);
-    const result = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
-    });
+    expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
+  });
+
+  it("reports unknown only when no ACTIVE price exists", async () => {
+    const result = await importQwen("openrouter/auto");
+    expect(result.pricing).toBe("unknown");
+    expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
+    expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never overrides a future-dated ACTIVE price the user scheduled", async () => {
+    active = [activeRow({ id: "future", effectiveAt: new Date(Date.now() + 86_400_000) })];
+    const result = await importQwen();
     expect(result.pricing).toBe("scheduledPricingExists");
     expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
     expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
   });
 
-  it("restores a soft-deleted model disabled", async () => {
-    db.providerModel.findFirst.mockImplementation(async (args: { select?: object }) =>
-      args.select && "deletedAt" in args.select
-        ? {
-            deletedAt: new Date(),
-            displayName: "Qwen: Qwen3 Coder",
-            nativeCapabilities: null,
-            contextWindow: 262_144,
-            maxOutputTokens: 65_536,
-          }
-        : { id: "pm-1" },
-    );
-    db.executionTarget.findUnique.mockResolvedValue({ id: "et-1" });
-    const result = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "qwen/qwen3-coder",
+  it("keeps the owner's display name and does not clear max output when the catalog has none", async () => {
+    stored = storedModel({
+      displayName: "My renamed Qwen",
+      maxOutputTokens: 4_096,
+      nativeCapabilities: null,
     });
+    catalogResult = {
+      status: "ok",
+      models: parseCatalog({
+        data: [catalogEntry({ top_provider: { context_length: 262_144 } })],
+      }),
+      fetchedAt,
+      stale: false,
+    };
+    await importQwen();
+    // Only the catalog-owned capability inventory is rewritten.
+    expect(db.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "pm-1" },
+      data: { nativeCapabilities: expect.objectContaining({ version: 4 }) },
+    });
+    const updates = db.providerModel.update.mock.calls.map(
+      ([args]: [{ data: object }]) => args.data,
+    );
+    for (const data of updates) {
+      expect(data).not.toHaveProperty("displayName");
+      expect(data).not.toHaveProperty("maxOutputTokens");
+    }
+  });
+
+  it("refreshes max output and capabilities from the catalog", async () => {
+    stored = storedModel({ displayName: "Mine", maxOutputTokens: 4_096, nativeCapabilities: null });
+    active = [
+      activeRow({
+        id: "price-1",
+        pricing: { ratesPerMillion: catalogRates },
+        chargeRules: CATALOG_CHARGE_RULES,
+      }),
+    ];
+    catalogAuthored = new Set(["price-1"]);
+    await importQwen();
+    expect(db.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "pm-1" },
+      data: { nativeCapabilities: qwenCapabilities(), maxOutputTokens: 65_536 },
+    });
+  });
+
+  it("restores a soft-deleted model disabled, keeping its name", async () => {
+    stored = storedModel({ deletedAt: new Date(), displayName: "Mine" });
+    const result = await importQwen();
     expect(result.restored).toBe(true);
-    expect(db.providerModel.update).toHaveBeenCalledWith(
+    expect(locks[0]).toBe("advisory execution-target:provider-model:pm-1");
+    expect(db.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "pm-1" },
+      data: { deletedAt: null, enabled: false },
+    });
+  });
+
+  it("imports a floating `~` alias with its tier upper bound", async () => {
+    catalogResult = {
+      status: "ok",
+      models: parseCatalog({ data: liveShapedCatalogEntries() }),
+      fetchedAt,
+      stale: false,
+    };
+    const result = await importQwen("~openai/gpt-luna-latest");
+    expect(result).toMatchObject({ created: true, pricing: "created", priceTiered: true });
+    expect(db.providerModel.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ deletedAt: null, enabled: false }),
+        data: expect.objectContaining({ upstreamModelId: "~openai/gpt-luna-latest" }),
+      }),
+    );
+    expect(db.providerPricingVersion.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          pricing: {
+            ratesPerMillion: {
+              input: "0.2",
+              output: "0.75",
+              cacheRead: "0.02",
+              cacheWrite: "0.25",
+              reasoning: "0.75",
+            },
+          },
+        }),
       }),
     );
   });
 
-  it("skips pricing for a variable-price model", async () => {
-    const result = await client().importModel({
-      providerAccountId: "acct-1",
-      modelId: "openrouter/auto",
-    });
-    expect(result.pricing).toBe("unknown");
-    expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
-  });
-
   it("rejects a blocked model, an unknown model, and a non-OpenRouter account", async () => {
-    await expect(
-      client().importModel({ providerAccountId: "acct-1", modelId: "vendor/image-only" }),
-    ).rejects.toMatchObject({
+    await expect(importQwen("vendor/image-only")).rejects.toMatchObject({
       code: "BAD_REQUEST",
       data: { reason: "CATALOG_MODEL_INCOMPATIBLE" },
     });
-    await expect(
-      client().importModel({ providerAccountId: "acct-1", modelId: "vendor/missing" }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "CATALOG_MODEL_NOT_FOUND" } });
+    await expect(importQwen("vendor/missing")).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CATALOG_MODEL_NOT_FOUND" },
+    });
     db.providerAccount.findFirst.mockResolvedValue({ id: "acct-1", providerType: "openai" });
-    await expect(
-      client().importModel({ providerAccountId: "acct-1", modelId: "qwen/qwen3-coder" }),
-    ).rejects.toMatchObject({
+    await expect(importQwen()).rejects.toMatchObject({
       code: "BAD_REQUEST",
       data: { reason: "CATALOG_ACCOUNT_NOT_OPENROUTER" },
     });
@@ -547,9 +727,7 @@ describe("providerCatalog.importModel", () => {
 
   it("fails with SERVICE_UNAVAILABLE when the catalog cannot be fetched", async () => {
     catalogResult = { status: "unavailable", reason: "CATALOG_UNAVAILABLE" };
-    await expect(
-      client().importModel({ providerAccountId: "acct-1", modelId: "qwen/qwen3-coder" }),
-    ).rejects.toMatchObject({
+    await expect(importQwen()).rejects.toMatchObject({
       code: "SERVICE_UNAVAILABLE",
       data: { reason: "CATALOG_UNAVAILABLE" },
     });
@@ -599,6 +777,26 @@ describe("providerCatalog pool external equivalent", () => {
     expect(db.modelPool.updateMany).toHaveBeenCalledWith({
       where: { id: "p", userId: "owner" },
       data: { externalEquivalentModel: "vendor/no-tools" },
+    });
+  });
+
+  it("accepts a floating `~` alias as the equivalent", async () => {
+    catalogResult = {
+      status: "ok",
+      models: parseCatalog({ data: liveShapedCatalogEntries() }),
+      fetchedAt,
+      stale: false,
+    };
+    db.modelPool.findFirst
+      .mockResolvedValueOnce({ id: "p" })
+      .mockResolvedValueOnce({ capacityContextCeiling: null, PoolMembers: [] });
+    db.modelPool.updateMany.mockResolvedValue({ count: 1 });
+    await expect(
+      client().setPoolExternalEquivalent({ poolId: "p", modelId: "~openai/gpt-luna-latest" }),
+    ).resolves.toMatchObject({ externalEquivalentModel: "~openai/gpt-luna-latest" });
+    expect(db.modelPool.updateMany).toHaveBeenCalledWith({
+      where: { id: "p", userId: "owner" },
+      data: { externalEquivalentModel: "~openai/gpt-luna-latest" },
     });
   });
 

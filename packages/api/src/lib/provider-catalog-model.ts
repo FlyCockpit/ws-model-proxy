@@ -12,21 +12,37 @@ import {
 export const CATALOG_MAX_MODELS = 10_000;
 export const CATALOG_SEARCH_MAX_LIMIT = 50;
 
-/** Catalog ids are stored verbatim (they may contain `:`, e.g. `…:free`). */
+/**
+ * Catalog ids are stored verbatim (they may contain `:`, e.g. `…:free`). One
+ * leading `~` marks OpenRouter's floating family aliases such as
+ * `~vendor/model-latest` ("always the latest model in the family"); they are
+ * ordinary priced chat models and accepted wherever a catalog id is.
+ */
 export const catalogModelIdSchema = z
   .string()
   .trim()
   .min(3)
   .max(255)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._~-]*\/[A-Za-z0-9._~:@+-]+$/u);
+  .regex(/^~?[A-Za-z0-9][A-Za-z0-9._~-]*\/[A-Za-z0-9._~:@+-]+$/u);
 
 // USD per token as a decimal string. "-1" means variable (router models).
-const priceSchema = z
-  .string()
-  .regex(/^(?:-1|\d{1,12}(?:\.\d{1,30})?)$/u)
-  .nullable()
-  .optional()
-  .catch(null);
+const PRICE_PATTERN = /^(?:-1|\d{1,12}(?:\.\d{1,30})?)$/u;
+const priceSchema = z.string().regex(PRICE_PATTERN).nullable().optional().catch(null);
+
+/**
+ * One `pricing.overrides` tier (prompt-length or time-of-day rates). Parsed
+ * strictly: a malformed tier makes the whole price unknown instead of being
+ * dropped, because dropping a higher tier would undercount spend.
+ */
+const strictPrice = z.string().regex(PRICE_PATTERN).nullable().optional();
+const priceTierSchema = z.object({
+  prompt: strictPrice,
+  completion: strictPrice,
+  input_cache_read: strictPrice,
+  input_cache_write: strictPrice,
+  internal_reasoning: strictPrice,
+});
+const priceTiersSchema = z.array(priceTierSchema).max(32);
 const positiveInt = z
   .number()
   .int()
@@ -58,6 +74,7 @@ const catalogEntrySchema = z.object({
       input_cache_read: priceSchema,
       input_cache_write: priceSchema,
       internal_reasoning: priceSchema,
+      overrides: z.unknown().optional(),
     })
     .nullable()
     .optional()
@@ -84,15 +101,26 @@ const catalogEnvelopeSchema = z.object({
   data: z.array(z.unknown()).max(CATALOG_MAX_MODELS),
 });
 
-export interface CatalogPricing {
-  /** USD per token, decimal strings; null when the catalog does not list it. */
+/** USD per token, decimal strings; null when the catalog does not list it. */
+export interface CatalogPriceTier {
   prompt: string | null;
   completion: string | null;
   cacheRead: string | null;
   cacheWrite: string | null;
   reasoning: string | null;
-  /** True when the catalog reports variable pricing (`-1`). */
+}
+
+export interface CatalogPricing extends CatalogPriceTier {
+  /**
+   * True when the price cannot be bounded: the catalog reports variable
+   * pricing (`-1`, base or any tier) or lists malformed `overrides` tiers.
+   */
   variable: boolean;
+  /**
+   * Higher-rate tiers from `pricing.overrides` (for example from 272k prompt
+   * tokens, or by time of day). The base fields above are the lowest tier.
+   */
+  tiers: CatalogPriceTier[];
 }
 
 export interface CatalogModel {
@@ -122,6 +150,51 @@ function price(value: string | null | undefined): string | null {
   return value === undefined || value === null || value === "-1" ? null : value;
 }
 
+type RawPriceTier = {
+  prompt?: string | null;
+  completion?: string | null;
+  input_cache_read?: string | null;
+  input_cache_write?: string | null;
+  internal_reasoning?: string | null;
+};
+
+function priceTier(raw: RawPriceTier | null | undefined): CatalogPriceTier {
+  return {
+    prompt: price(raw?.prompt),
+    completion: price(raw?.completion),
+    cacheRead: price(raw?.input_cache_read),
+    cacheWrite: price(raw?.input_cache_write),
+    reasoning: price(raw?.internal_reasoning),
+  };
+}
+
+function isVariable(raw: RawPriceTier | null | undefined): boolean {
+  return [
+    raw?.prompt,
+    raw?.completion,
+    raw?.input_cache_read,
+    raw?.input_cache_write,
+    raw?.internal_reasoning,
+  ].includes("-1");
+}
+
+function catalogPricing(
+  raw: (RawPriceTier & { overrides?: unknown }) | null | undefined,
+): CatalogPricing {
+  const base = priceTier(raw);
+  if (raw?.overrides === undefined || raw.overrides === null)
+    return { ...base, variable: raw?.prompt === "-1" || raw?.completion === "-1", tiers: [] };
+  const tiers = priceTiersSchema.safeParse(raw.overrides);
+  // Unparseable tiers cannot be bounded: the price is unknown (fail closed).
+  if (!tiers.success) return { ...base, variable: true, tiers: [] };
+  return {
+    ...base,
+    variable:
+      raw.prompt === "-1" || raw.completion === "-1" || tiers.data.some((tier) => isVariable(tier)),
+    tiers: tiers.data.map(priceTier),
+  };
+}
+
 /** Parse and trim the catalog. Invalid entries are dropped, duplicates keep the first. */
 export function parseCatalog(json: unknown): CatalogModel[] {
   const envelope = catalogEnvelopeSchema.safeParse(json);
@@ -140,14 +213,7 @@ export function parseCatalog(json: unknown): CatalogModel[] {
       name: entry.name ?? entry.id,
       contextLength: entry.context_length ?? entry.top_provider?.context_length ?? null,
       maxCompletionTokens: entry.top_provider?.max_completion_tokens ?? null,
-      pricing: {
-        prompt: price(pricing?.prompt),
-        completion: price(pricing?.completion),
-        cacheRead: price(pricing?.input_cache_read),
-        cacheWrite: price(pricing?.input_cache_write),
-        reasoning: price(pricing?.internal_reasoning),
-        variable: pricing?.prompt === "-1" || pricing?.completion === "-1",
-      },
+      pricing: catalogPricing(pricing),
       inputModalities: [...new Set(entry.architecture?.input_modalities ?? [])],
       outputModalities: [...new Set(entry.architecture?.output_modalities ?? [])],
       supportsTools: parameters.has("tools"),
@@ -269,8 +335,7 @@ export function catalogCompatibility(
     if (profile.imageInput && !model.inputModalities.includes("image")) warn.push("NO_IMAGE_INPUT");
     if (profile.reasoning && !model.supportsReasoning) warn.push("NO_REASONING");
   }
-  if (model.pricing.variable || model.pricing.prompt === null || model.pricing.completion === null)
-    warn.push("UNKNOWN_PRICE");
+  if (catalogRatesPerMillion(model) === null) warn.push("UNKNOWN_PRICE");
   if (model.free) warn.push("FREE_MODEL");
   if (model.expirationDate !== null) warn.push("EXPIRING");
   if (model.moderated) warn.push("MODERATED");
@@ -279,11 +344,8 @@ export function catalogCompatibility(
 
 const MONEY_SCALE = 9;
 
-/**
- * USD per token → USD per million tokens, rounded UP to 9 decimals so a
- * budget estimate never undercounts. Exact decimal arithmetic (no floats).
- */
-export function perTokenToPerMillion(value: string): string | null {
+/** USD per token → units of 1e-9 USD per million tokens, rounded up. */
+function perTokenToUnits(value: string): bigint | null {
   const match = /^(\d{1,12})(?:\.(\d{1,30}))?$/u.exec(value);
   if (!match) return null;
   const whole = match[1] ?? "0";
@@ -291,16 +353,29 @@ export function perTokenToPerMillion(value: string): string | null {
   const digits = BigInt(`${whole}${fraction}`);
   // units of 1e-9 USD per million = value * 1e6 * 1e9 = digits * 10^(15 - scale)
   const exponent = 6 + MONEY_SCALE - fraction.length;
-  const units =
-    exponent >= 0
-      ? digits * 10n ** BigInt(exponent)
-      : (digits + 10n ** BigInt(-exponent) - 1n) / 10n ** BigInt(-exponent);
+  return exponent >= 0
+    ? digits * 10n ** BigInt(exponent)
+    : (digits + 10n ** BigInt(-exponent) - 1n) / 10n ** BigInt(-exponent);
+}
+
+function unitsToDecimal(units: bigint): string {
   const integer = units / 10n ** BigInt(MONEY_SCALE);
   const remainder = (units % 10n ** BigInt(MONEY_SCALE))
     .toString()
     .padStart(MONEY_SCALE, "0")
     .replace(/0+$/u, "");
   return remainder ? `${integer}.${remainder}` : integer.toString();
+}
+
+/**
+ * USD per token → USD per million tokens with exact decimal arithmetic (no
+ * floats), rounded UP to the 9 decimals a stored rate allows. Rounding only
+ * ever raises one listed per-token rate; it does not make an imported price
+ * an upper bound by itself (see `catalogRatesPerMillion` for tiers).
+ */
+export function perTokenToPerMillion(value: string): string | null {
+  const units = perTokenToUnits(value);
+  return units === null ? null : unitsToDecimal(units);
 }
 
 export type CatalogRatesPerMillion = {
@@ -331,27 +406,58 @@ export function stableJson(value: unknown): string {
   return JSON.stringify(normalize(value)) ?? "null";
 }
 
+function maxUnits(values: readonly bigint[]): bigint {
+  return values.reduce((highest, value) => (value > highest ? value : highest));
+}
+
 /**
  * Pricing schedule rates for an imported model, or null when the price is
- * unknown or variable (the budget then uses its conservative fallback). The
- * usage parser reports cache reads and reasoning separately from input and
- * output, so each category gets an explicit rate; a category the catalog does
- * not price falls back to the base rate OpenRouter bills it at.
+ * unknown or variable (no ACTIVE price is then written, so SPEND rules fail
+ * closed with PRICING_UNAVAILABLE).
+ *
+ * The schedule has one rate per token category, but OpenRouter bills some
+ * models in tiers (`pricing.overrides`, e.g. 2x input from 272k prompt tokens,
+ * or by time of day). Each category's rate is therefore the upper bound across
+ * the base price and every tier, so the calculated cost of any token-priced
+ * request is never below what OpenRouter charges for those tokens. It does not
+ * cover non-token charges (web search, images, audio, per-request fees); the
+ * FAIL_CLOSED rule covers usage categories the schedule does not price.
+ *
+ * The usage parser reports cache reads/writes and reasoning separately from
+ * input and output, so each gets an explicit rate. A tier that does not price
+ * one of them is bounded by the input (cache) or output (reasoning) upper
+ * bound, the rate OpenRouter otherwise bills those tokens at.
  */
 export function catalogRatesPerMillion(model: CatalogModel): CatalogRatesPerMillion | null {
-  if (model.pricing.variable) return null;
-  const input = model.pricing.prompt === null ? null : perTokenToPerMillion(model.pricing.prompt);
-  const output =
-    model.pricing.completion === null ? null : perTokenToPerMillion(model.pricing.completion);
+  const pricing = model.pricing;
+  if (pricing.variable || pricing.prompt === null || pricing.completion === null) return null;
+  const tiers: CatalogPriceTier[] = [pricing, ...pricing.tiers];
+  const units = (value: string | null) => (value === null ? null : perTokenToUnits(value));
+  const bound = (key: keyof CatalogPriceTier, fallback: bigint | null): bigint | null => {
+    const values: bigint[] = [];
+    for (const tier of tiers) {
+      const value = units(tier[key]);
+      if (value !== null) values.push(value);
+      else if (tier[key] !== null) return null;
+      else if (fallback !== null) values.push(fallback);
+    }
+    return values.length > 0 ? maxUnits(values) : null;
+  };
+  // Prompt and completion always exist on the base tier; a tier that omits
+  // them inherits the base rate, which is already in the bound.
+  const input = bound("prompt", null);
+  const output = bound("completion", null);
   if (input === null || output === null) return null;
-  const rate = (value: string | null, fallback: string) =>
-    (value === null ? null : perTokenToPerMillion(value)) ?? fallback;
+  const cacheRead = bound("cacheRead", input);
+  const cacheWrite = bound("cacheWrite", input);
+  const reasoning = bound("reasoning", output);
+  if (cacheRead === null || cacheWrite === null || reasoning === null) return null;
   return {
-    input,
-    output,
-    cacheRead: rate(model.pricing.cacheRead, input),
-    cacheWrite: rate(model.pricing.cacheWrite, input),
-    reasoning: rate(model.pricing.reasoning, output),
+    input: unitsToDecimal(input),
+    output: unitsToDecimal(output),
+    cacheRead: unitsToDecimal(cacheRead),
+    cacheWrite: unitsToDecimal(cacheWrite),
+    reasoning: unitsToDecimal(reasoning),
   };
 }
 
