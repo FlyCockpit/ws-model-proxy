@@ -7,7 +7,13 @@ import {
   runProcessShutdown,
   runWithDeadline,
 } from "./graceful-shutdown";
-import { PROCESS_SHUTDOWN_DEADLINE_MS, SHARED_DISCONNECT_TIMEOUT_MS } from "./shutdown-timeouts";
+import {
+  CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+  PERIODIC_JOBS_STOP_TIMEOUT_MS,
+  PROCESS_SHUTDOWN_DEADLINE_MS,
+  RELAY_CLOSE_TIMEOUT_MS,
+  SHARED_DISCONNECT_TIMEOUT_MS,
+} from "./shutdown-timeouts";
 
 /**
  * Graceful-shutdown ORDERING tests (Phase 4 item 4): the MCP
@@ -23,6 +29,7 @@ describe("runGracefulShutdownSequence", () => {
         | "closeBrowserSockets"
         | "drainHttp"
         | "closeRelaySessions"
+        | "closeCapacityRuntimes"
         | "closeMcpHandler"
         | "disconnectPrisma",
         Error | undefined
@@ -42,6 +49,7 @@ describe("runGracefulShutdownSequence", () => {
         closeBrowserSockets: step("closeBrowserSockets"),
         drainHttp: step("drainHttp"),
         closeRelaySessions: step("closeRelaySessions"),
+        closeCapacityRuntimes: step("closeCapacityRuntimes"),
         closeMcpHandler: step("closeMcpHandler"),
         disconnectPrisma: step("disconnectPrisma"),
         log: () => {},
@@ -50,7 +58,7 @@ describe("runGracefulShutdownSequence", () => {
     };
   }
 
-  it("runs stopPeriodicJobs → closeBrowserSockets → drainHttp → closeRelaySessions → closeMcpHandler → disconnectPrisma, in order", async () => {
+  it("runs stopPeriodicJobs → closeBrowserSockets → drainHttp → closeRelaySessions → closeCapacityRuntimes → closeMcpHandler → disconnectPrisma, in order", async () => {
     const { order, deps } = recorder();
     await runGracefulShutdownSequence(deps);
     expect(order).toEqual([
@@ -58,6 +66,7 @@ describe("runGracefulShutdownSequence", () => {
       "closeBrowserSockets",
       "drainHttp",
       "closeRelaySessions",
+      "closeCapacityRuntimes",
       "closeMcpHandler",
       "disconnectPrisma",
     ]);
@@ -80,11 +89,40 @@ describe("runGracefulShutdownSequence", () => {
     expect(order.indexOf("closeMcpHandler")).toBeLessThan(order.indexOf("disconnectPrisma"));
   });
 
+  it("awaits owner teardown after drain and before the MCP DB fence or Prisma disconnect", async () => {
+    const { order, deps } = recorder();
+    let finishClose!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      finishClose = resolve;
+    });
+    const teardownStarted = new Promise<void>((resolve) => {
+      const close = deps.closeCapacityRuntimes;
+      deps.closeCapacityRuntimes = async () => {
+        await close();
+        resolve();
+        await closing;
+      };
+    });
+    const shutdown = runGracefulShutdownSequence(deps);
+    await teardownStarted;
+    expect(order).toEqual([
+      "stopPeriodicJobs",
+      "closeBrowserSockets",
+      "drainHttp",
+      "closeRelaySessions",
+      "closeCapacityRuntimes",
+    ]);
+    finishClose();
+    await shutdown;
+    expect(order.slice(-2)).toEqual(["closeMcpHandler", "disconnectPrisma"]);
+  });
+
   it.each([
     "stopPeriodicJobs",
     "closeBrowserSockets",
     "drainHttp",
     "closeRelaySessions",
+    "closeCapacityRuntimes",
     "closeMcpHandler",
   ] as const)("a failing %s does not prevent the remaining steps", async (failingStep) => {
     const { order, deps } = recorder({ [failingStep]: new Error("boom") } as Parameters<
@@ -96,6 +134,7 @@ describe("runGracefulShutdownSequence", () => {
       "closeBrowserSockets",
       "drainHttp",
       "closeRelaySessions",
+      "closeCapacityRuntimes",
       "closeMcpHandler",
       "disconnectPrisma",
     ]);
@@ -118,6 +157,7 @@ describe("runGracefulShutdownSequence — default-logger sanitization (L19, F3)"
     "closeBrowserSockets",
     "drainHttp",
     "closeRelaySessions",
+    "closeCapacityRuntimes",
     "closeMcpHandler",
     "disconnectPrisma",
   ] as const;
@@ -170,6 +210,10 @@ describe("runGracefulShutdownSequence — default-logger sanitization (L19, F3)"
           order.push("closeRelaySessions");
           if (step === "closeRelaySessions") throw rejection.value;
         },
+        closeCapacityRuntimes: async () => {
+          order.push("closeCapacityRuntimes");
+          if (step === "closeCapacityRuntimes") throw rejection.value;
+        },
         closeMcpHandler: async () => {
           order.push("closeMcpHandler");
           if (step === "closeMcpHandler") throw rejection.value;
@@ -187,6 +231,7 @@ describe("runGracefulShutdownSequence — default-logger sanitization (L19, F3)"
         "closeBrowserSockets",
         "drainHttp",
         "closeRelaySessions",
+        "closeCapacityRuntimes",
         "closeMcpHandler",
         "disconnectPrisma",
       ]);
@@ -206,6 +251,7 @@ describe("runGracefulShutdownSequence — default-logger sanitization (L19, F3)"
       closeBrowserSockets: () => {},
       drainHttp: async () => {},
       closeRelaySessions: () => {},
+      closeCapacityRuntimes: async () => {},
       closeMcpHandler: async () => {},
       disconnectPrisma: async () => {},
     });
@@ -333,6 +379,111 @@ describe("runWithDeadline", () => {
     expect(warnings).toEqual(["[server] relay session close did not finish before its deadline."]);
   });
 
+  it("continues shutdown when periodic job stop hangs on listener close", async () => {
+    const order: string[] = [];
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: async () => {
+        order.push("stopPeriodicJobs");
+        await hang();
+      },
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {
+        order.push("drainHttp");
+      },
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: async () => {},
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {
+        order.push("disconnectPrisma");
+      },
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(PERIODIC_JOBS_STOP_TIMEOUT_MS);
+    await sequence;
+    expect(order.indexOf("drainHttp")).toBeGreaterThan(order.indexOf("stopPeriodicJobs"));
+    expect(order.at(-1)).toBe("disconnectPrisma");
+  });
+
+  it("continues shutdown when capacity runtime close hangs on a stalled release", async () => {
+    const order: string[] = [];
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: async () => {
+        order.push("closeCapacityRuntimes");
+        await hang();
+      },
+      closeMcpHandler: async () => {
+        order.push("closeMcpHandler");
+      },
+      disconnectPrisma: async () => {
+        order.push("disconnectPrisma");
+      },
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS);
+    await sequence;
+    expect(order).toEqual(["closeCapacityRuntimes", "closeMcpHandler", "disconnectPrisma"]);
+  });
+
+  it("does not log capacity runtimes closed when close hits its deadline", async () => {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message) => {
+      warnings.push(String(message));
+    });
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: () => hang(),
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {},
+      log: (message) => logs.push(message),
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS);
+    await sequence;
+    warnSpy.mockRestore();
+    expect(warnings).toContain(
+      "[server] capacity runtime close did not finish before its deadline.",
+    );
+    expect(logs.some((line) => line.includes("Capacity runtimes closed."))).toBe(false);
+  });
+
+  it("does not log relay sessions closed when relay close hits its deadline", async () => {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message) => {
+      warnings.push(String(message));
+    });
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: () => hang(),
+      closeCapacityRuntimes: async () => {},
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {},
+      log: (message) => logs.push(message),
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(RELAY_CLOSE_TIMEOUT_MS);
+    await sequence;
+    warnSpy.mockRestore();
+    expect(warnings).toContain("[server] relay session close did not finish before its deadline.");
+    expect(logs.some((line) => line.includes("Relay sessions closed."))).toBe(false);
+  });
+
   it("lets a whole shutdown sequence finish while relay persistence hangs", async () => {
     const order: string[] = [];
     const hang = () => new Promise<void>(() => {});
@@ -353,8 +504,9 @@ describe("runWithDeadline", () => {
           warn: () => {},
         }),
       closeRelaySessions: async () => {
-        await runWithDeadline(hang, 5_000, "relay session close", { warn: () => {} });
+        order.push("closeRelaySessions");
       },
+      closeCapacityRuntimes: async () => {},
       closeMcpHandler: async () => {},
       disconnectPrisma: async () => {
         order.push("disconnectPrisma");
@@ -364,7 +516,12 @@ describe("runWithDeadline", () => {
     });
     await vi.advanceTimersByTimeAsync(15_000);
     await sequence;
-    expect(order).toEqual(["stopAdmission", "closeIdleRelaySessions", "disconnectPrisma"]);
+    expect(order).toEqual([
+      "stopAdmission",
+      "closeIdleRelaySessions",
+      "closeRelaySessions",
+      "disconnectPrisma",
+    ]);
   });
 
   it("returns as soon as the work finishes", async () => {
@@ -490,6 +647,7 @@ describe("runProcessShutdown", () => {
           closeBrowserSockets: () => {},
           drainHttp: async () => {},
           closeRelaySessions: () => {},
+          closeCapacityRuntimes: async () => {},
           // A future step without a bound.
           closeMcpHandler: () => new Promise<void>(() => {}),
           disconnectPrisma: async () => {},

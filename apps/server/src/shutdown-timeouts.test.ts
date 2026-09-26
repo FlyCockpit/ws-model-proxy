@@ -1,8 +1,10 @@
 import { PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS } from "@ws-model-proxy/db/parent-deletion";
 import { describe, expect, it } from "vitest";
 import {
+  CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
   HTTP_DRAIN_TIMEOUT_MS,
   MCP_CLOSE_SHADOW_AWAIT_MS,
+  PERIODIC_JOBS_STOP_TIMEOUT_MS,
   PROCESS_SHUTDOWN_DEADLINE_MS,
   RELAY_CLOSE_TIMEOUT_MS,
   SHARED_DISCONNECT_TIMEOUT_MS,
@@ -89,14 +91,16 @@ describe("shutdown timing arithmetic", () => {
 
   it("pins the process deadline: the sum of the step bounds plus a margin", () => {
     const steps =
+      PERIODIC_JOBS_STOP_TIMEOUT_MS +
       HTTP_DRAIN_TIMEOUT_MS +
       RELAY_CLOSE_TIMEOUT_MS +
+      CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS +
       MCP_CLOSE_SHADOW_AWAIT_MS +
       USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
       USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS +
       SHARED_DISCONNECT_TIMEOUT_MS;
-    expect(steps).toBe(35_500);
-    expect(PROCESS_SHUTDOWN_DEADLINE_MS).toBe(40_000);
+    expect(steps).toBe(42_500);
+    expect(PROCESS_SHUTDOWN_DEADLINE_MS).toBe(47_000);
     const margin = PROCESS_SHUTDOWN_DEADLINE_MS - steps;
     expect(margin).toBeGreaterThanOrEqual(4_000);
     // Not padded far past the steps.

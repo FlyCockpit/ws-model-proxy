@@ -29,6 +29,8 @@ export type AdmissionAttempt = {
 };
 
 export type CapacityLeaseHandle = {
+  /** Runtime-owned lifetime: aborts on client cancellation, loss, release or shutdown. */
+  signal?: AbortSignal;
   leaseId: string;
   attemptId: string;
   capacityId: string;

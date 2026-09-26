@@ -40,6 +40,12 @@
  *       request deletes never wait on L6/L7 rows at all
  *       ({@link deleteTerminalRelayRequestsWithoutWaiting}).
  *
+ * Physical lease heartbeat is a single-row conditional UPDATE at L7, holding
+ * no other locks and acquiring none afterwards: it adds no lock-order edges.
+ * The runtime owns renewal from admission through dispatch and body release;
+ * response wrapping adopts that owner (apps/server/src/model-api/capacity/README.md).
+ * Expiry reclaim UPDATEs recheck expiry because heartbeat takes no L3-L5 lock.
+ *
  * Implicit locks count as locks at their level. A child INSERT (and an
  * UPDATE that changes a foreign key) takes FOR KEY SHARE on each parent row.
  * An UPDATE, and an INSERT ... ON CONFLICT DO UPDATE, takes FOR NO KEY

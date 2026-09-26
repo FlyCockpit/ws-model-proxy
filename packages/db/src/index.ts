@@ -1,7 +1,6 @@
-import { PrismaPg } from "@prisma/adapter-pg";
 import { env } from "@ws-model-proxy/env/shared";
 
-import { PrismaClient } from "../prisma/generated/client";
+import { createPrismaClient } from "./client-factory";
 import { withDbShutdownFence } from "./shutdown-fence";
 
 export { Prisma } from "../prisma/generated/client";
@@ -14,7 +13,6 @@ export { Prisma } from "../prisma/generated/client";
 // (apps/server/src/app.ts wires armDbShutdownFence into the gate's
 // onClosed), any NEW database operation started by any continuation of any
 // consumer rejects immediately. See ./shutdown-fence.ts for the rationale.
-const adapter = new PrismaPg({ connectionString: env.DATABASE_URL });
-const prisma = withDbShutdownFence(new PrismaClient({ adapter }));
+const prisma = withDbShutdownFence(createPrismaClient(env.DATABASE_URL));
 
 export default prisma;

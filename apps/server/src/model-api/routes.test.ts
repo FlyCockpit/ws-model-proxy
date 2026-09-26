@@ -7,7 +7,11 @@ import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-secu
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
 import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
-import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
+import {
+  type CapacityAdmissionRuntime,
+  StoreCapacityAdmissionRuntime,
+} from "./capacity/runtime.js";
+import type { CapacityAdmissionStore } from "./capacity/types.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 import type { PublicProviderTarget } from "./public-overflow.js";
@@ -4924,6 +4928,143 @@ describe("model API routes", () => {
     expect(capacityRuntime.release).toHaveBeenCalledTimes(1);
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["direct", "pool", "external", "local sticky", "external sticky"])(
+    "F2-CAP-1: aborts %s dispatch on physical lease loss before response headers",
+    async (route) => {
+      vi.useFakeTimers();
+      const store: CapacityAdmissionStore = {
+        acquire: admittingCapacityRuntime().acquire,
+        heartbeat: vi.fn().mockResolvedValue(true),
+        release: vi.fn().mockResolvedValue(true),
+        terminalizeAttempt: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
+        reclaimExpired: vi.fn().mockResolvedValue(0),
+      };
+      const runtime = new StoreCapacityAdmissionRuntime(store);
+      const manager = new FakeRelayManager();
+      const external = route === "external" || route === "external sticky";
+      const sticky = route === "local sticky" || route === "external sticky";
+      let providerSignal: AbortSignal | undefined;
+      const providerCancelled = vi.fn();
+      if (route === "pool" || route === "local sticky") {
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "local-member",
+            discoveredModelId: "local-model",
+            upstreamModelId: "local-upstream",
+            cliDeviceId: "cli-device-id",
+          }),
+        ]);
+      }
+      if (route === "local sticky") {
+        db.responseStickinessRecord.findUnique.mockResolvedValue({
+          routingVersion: 2,
+          userId: "user-id",
+          modelApiTokenId: "token-id",
+          targetDiscoveredModelId: null,
+          targetModelPoolId: "pool-id",
+          selectedDiscoveredModelId: "local-model",
+          TargetExecutionTarget: null,
+          SelectedExecutionTarget: { discoveredModelId: "local-model" },
+          expiresAt: new Date(Date.now() + 60_000),
+        });
+        db.discoveredModel.findUnique.mockResolvedValue(
+          directRow({
+            id: "local-model",
+            upstreamModelId: "local-upstream",
+            cliDeviceId: "cli-device-id",
+          }),
+        );
+      }
+      if (external) {
+        mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+          directModels: [],
+          modelPools: [externalPoolTarget],
+        });
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const providerTarget =
+          route === "external sticky"
+            ? {
+                ...externalProviderTarget("provider"),
+                upstreamModelId: "gpt-response",
+                nativeSurfaces: ["openai-responses"] as PublicProviderTarget["nativeSurfaces"],
+              }
+            : externalProviderTarget();
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([providerTarget]));
+        if (route === "external sticky")
+          db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+        publicOverflow.dispatch.mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+          providerSignal = signal;
+          return new Promise((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                providerCancelled();
+                resolve({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
+              },
+              { once: true },
+            );
+          });
+        });
+      }
+      try {
+        const pending = appWith(manager, runtime).request(
+          sticky ? "/responses/resp_provider" : "/chat/completions",
+          {
+            method: sticky ? "GET" : "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            ...(sticky
+              ? {}
+              : {
+                  body: requestBody(
+                    external
+                      ? EXTERNAL_MODEL_ID
+                      : route === "pool"
+                        ? poolTarget.modelId
+                        : directTarget.modelId,
+                  ),
+                }),
+          },
+        );
+        await vi.waitFor(() => {
+          if (external) expect(providerSignal).toBeDefined();
+          else expect(manager.sent).toHaveLength(1);
+        });
+        // Healthy dispatch can outlive the original TTL without freeing the slot.
+        await vi.advanceTimersByTimeAsync(31_000);
+        expect(store.heartbeat).toHaveBeenCalledTimes(4);
+        expect(store.release).not.toHaveBeenCalled();
+        vi.mocked(store.heartbeat).mockResolvedValueOnce(false);
+        await vi.advanceTimersByTimeAsync(10_000);
+        const response = await pending;
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        if (external) {
+          expect(providerSignal?.aborted).toBe(true);
+          expect(providerCancelled).toHaveBeenCalledOnce();
+        } else {
+          expect(manager.cancelled).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                requestId: requireSent(manager).requestId,
+                reason: "cancelled",
+              }),
+            ]),
+          );
+        }
+        expect(store.release).toHaveBeenCalledOnce();
+        const count = vi.mocked(store.heartbeat).mock.calls.length;
+        await vi.advanceTimersByTimeAsync(31_000);
+        expect(store.heartbeat).toHaveBeenCalledTimes(count);
+      } finally {
+        await runtime.close();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("ends the external phase on a send-boundary consent denial without trying other members", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({

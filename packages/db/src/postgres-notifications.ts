@@ -1,5 +1,14 @@
 import { Client } from "pg";
 
+/** When `Client.end()` waits on a stalled peer, destroy the socket after this bound. */
+export const POSTGRES_NOTIFICATION_LISTENER_CLOSE_TIMEOUT_MS = 2_000;
+
+function destroyPgClientSocket(client: Client): void {
+  const stream = (client as unknown as { connection?: { stream?: { destroy?: () => void } } })
+    .connection?.stream;
+  stream?.destroy?.();
+}
+
 export class PostgresNotificationListener {
   readonly #client: Client;
   readonly #channel: string;
@@ -38,7 +47,23 @@ export class PostgresNotificationListener {
     });
   }
 
-  async close() {
-    await this.#client.end();
+  async close(
+    closeTimeoutMs: number = POSTGRES_NOTIFICATION_LISTENER_CLOSE_TIMEOUT_MS,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const endSettled = this.#client.end().catch(() => undefined);
+    try {
+      const result = await Promise.race([
+        endSettled.then(() => "done" as const),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), closeTimeoutMs);
+          timer.unref();
+        }),
+      ]);
+      if (result === "timeout") destroyPgClientSocket(this.#client);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    void endSettled;
   }
 }

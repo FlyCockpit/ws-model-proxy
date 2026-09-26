@@ -93,13 +93,20 @@ export interface DiagnosticCoreDependencies {
  * Admission is always on: both transports share this runtime, and there is
  * no in-memory limiter fallback when it is absent.
  */
-let sharedDiagnosticsCapacityRuntime: CapacityAdmissionRuntime | undefined;
+let sharedDiagnosticsCapacityRuntime: StoreCapacityAdmissionRuntime | undefined;
+let diagnosticsClosed = false;
 
 export function diagnosticsCapacityRuntime(): CapacityAdmissionRuntime {
+  if (diagnosticsClosed) throw new Error("Diagnostics capacity runtime closed.");
   sharedDiagnosticsCapacityRuntime ??= new StoreCapacityAdmissionRuntime(
     new PostgresCapacityAdmissionStore(),
   );
   return sharedDiagnosticsCapacityRuntime;
+}
+
+export async function closeDiagnosticsCapacityRuntime(): Promise<void> {
+  diagnosticsClosed = true;
+  await sharedDiagnosticsCapacityRuntime?.close();
 }
 
 // ---------------------------------------------------------------------------

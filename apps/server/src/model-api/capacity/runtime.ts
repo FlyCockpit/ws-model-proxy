@@ -1,3 +1,4 @@
+import { CapacityLeaseOwner } from "./lease-owner.js";
 import { type CapacityWakeSource, waitWithCapacityPolling } from "./postgres-store.js";
 import { holdCapacityLeaseForResponse } from "./response-lease.js";
 import type {
@@ -32,6 +33,38 @@ function waitForPollDelay(milliseconds: number, signal?: AbortSignal): Promise<v
 
 export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   private lastMaintenanceAt = 0;
+  private closed = false;
+  private readonly shutdown = new AbortController();
+  private readonly owners = new Map<string, CapacityLeaseOwner>();
+  private readonly handles = new WeakMap<CapacityLeaseHandle, CapacityLeaseOwner>();
+
+  private leaseKey(lease: CapacityLeaseHandle) {
+    return `${lease.leaseId}:${lease.fencingToken}`;
+  }
+
+  private async adopt(
+    lease: CapacityLeaseHandle,
+    signal?: AbortSignal,
+  ): Promise<CapacityLeaseHandle> {
+    const key = this.leaseKey(lease);
+    let owner = this.owners.get(key);
+    if (!owner) {
+      owner = new CapacityLeaseOwner(this.store, lease, signal, 10_000, 30_000, true);
+      this.owners.set(key, owner);
+      const owned = owner;
+      const forgetReleased = () => {
+        void owned.release().then(() => {
+          if (this.owners.get(key) === owned) this.owners.delete(key);
+        });
+      };
+      owned.signal.addEventListener("abort", forgetReleased, { once: true });
+      if (owned.signal.aborted) forgetReleased();
+    }
+    await owner.ready;
+    const handle = { ...lease, signal: owner.signal };
+    this.handles.set(handle, owner);
+    return handle;
+  }
   constructor(
     private readonly store: CapacityAdmissionStore & {
       sweepAbandoned?: (input: {
@@ -61,9 +94,18 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
     // INSIDE the failure boundary — any throw there (fence rejection,
     // connection loss) terminalizes an already-persisted attempt exactly
     // like a poll failure.
+    if (this.closed) return { state: "CANCELLED" };
+    signal = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
     try {
       await this.maintain();
-      return await this.#acquireUntilTerminal(attempt, signal);
+      const result = await this.#acquireUntilTerminal(attempt, signal);
+      if (result.state !== "ADMITTED") return result;
+      const lease = await this.adopt(result.lease, signal);
+      if (this.closed || lease.signal?.aborted) {
+        await this.release(lease);
+        return { state: "CANCELLED" };
+      }
+      return { state: "ADMITTED", lease };
     } catch (error) {
       // G2n exception/cleanup boundary (pass 4): a poll or acquisition
       // failure (a DB abort/shutdown fence rejection, connection loss, or
@@ -193,10 +235,23 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   }
 
   release(lease: CapacityLeaseHandle) {
-    return this.store.release(lease);
+    const owner = this.handles.get(lease) ?? this.owners.get(this.leaseKey(lease));
+    return owner ? owner.release() : this.store.release(lease);
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    this.shutdown.abort(new Error("Capacity runtime closed."));
+    await Promise.all(
+      [...this.owners.values()].map((owner) =>
+        owner.release(new Error("Capacity runtime closed.")),
+      ),
+    );
   }
 
   hold(response: Response, lease: CapacityLeaseHandle, signal?: AbortSignal) {
-    return holdCapacityLeaseForResponse({ response, store: this.store, lease, signal });
+    const owner = this.handles.get(lease) ?? this.owners.get(this.leaseKey(lease));
+    if (!owner) throw new Error("Capacity response requires an admitted lease owner.");
+    return holdCapacityLeaseForResponse({ response, store: this.store, lease, signal, owner });
   }
 }

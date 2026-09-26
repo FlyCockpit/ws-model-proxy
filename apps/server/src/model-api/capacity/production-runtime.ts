@@ -20,11 +20,17 @@ export function createProductionCapacityRuntime() {
     void runtime.maintain();
   }, 5_000);
   maintenanceTimer.unref?.();
+  const stopMaintenance = async () => {
+    clearInterval(maintenanceTimer);
+    await wakeSource.close();
+  };
   return {
     runtime,
+    // Stop background work before HTTP drain, retaining admissions and owners.
+    stopMaintenance,
     async close() {
-      clearInterval(maintenanceTimer);
-      await wakeSource.close();
+      await stopMaintenance();
+      await runtime.close();
     },
   };
 }

@@ -225,14 +225,26 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             result: { state: "ADMITTED", lease: leaseHandle(currentLease) } as const,
             notify: [],
           };
-        await tx.capacityLease.updateMany({
+        const reclaimed = await tx.capacityLease.updateMany({
           where: {
             id: existing.Lease.id,
             fencingToken: existing.Lease.fencingToken,
             state: "ACTIVE",
+            expiresAt: { lte: lockedNow },
           },
           data: { state: "RECLAIMED", releasedAt: lockedNow, releaseReason: "expired" },
         });
+        // Heartbeat takes only the lease row; it may renew after our read.
+        if (!reclaimed.count) {
+          const renewed = await tx.capacityLease.findUniqueOrThrow({
+            where: { id: existing.Lease.id },
+          });
+          if (renewed.state === "ACTIVE")
+            return {
+              result: { state: "ADMITTED", lease: leaseHandle(renewed) } as const,
+              notify: [],
+            };
+        }
         await tx.admissionRequest.update({
           where: { id: existing.id },
           data: { state: "TERMINAL", terminalAt: lockedNow, terminalReason: "lease_expired" },
@@ -789,22 +801,19 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     if (!Number.isFinite(extensionMs) || extensionMs <= 0)
       throw new RangeError("Capacity lease extension must be a positive duration.");
     const boundedExtensionMs = Math.min(extensionMs, 5 * 60_000);
-    return this.#serializable(async (tx) => {
-      await this.#lockAdmissionResources(tx, [lease.capacityId]);
-      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-      const now = clockRows[0]?.now;
-      if (!now) throw new Error("Database clock unavailable.");
-      const result = await tx.capacityLease.updateMany({
-        where: {
-          id: lease.leaseId,
-          fencingToken: lease.fencingToken,
-          state: "ACTIVE",
-          expiresAt: { gt: now },
-        },
-        data: { heartbeatAt: now, expiresAt: new Date(now.getTime() + boundedExtensionMs) },
-      });
-      return result.count === 1;
-    });
+    // Single-row L7 UPDATE, with no other locks and no lock-order edges.
+    // PostgreSQL rechecks the predicate after a concurrent release/reclaim.
+    // Use its clock at execution, never the caller's process clock.
+    const count = await this.db.$executeRaw`
+      UPDATE capacity_lease
+      SET ("heartbeatAt", "expiresAt") = (
+        SELECT now, now + (${boundedExtensionMs} * interval '1 millisecond')
+        FROM (SELECT clock_timestamp() AS now) AS heartbeat_clock
+      )
+      WHERE id = ${lease.leaseId} AND "fencingToken" = ${lease.fencingToken}
+        AND state = 'ACTIVE' AND "expiresAt" > clock_timestamp()
+    `;
+    return count === 1;
   }
 
   async release(lease: CapacityLeaseHandle): Promise<boolean> {

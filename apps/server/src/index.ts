@@ -15,11 +15,11 @@ import {
   drainHttpWithDeadline,
   runGracefulShutdownSequence,
   runProcessShutdown,
-  runWithDeadline,
 } from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
+import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
 import {
   providerAttemptExpiryEnabled,
   startProviderAttemptExpiry,
@@ -34,7 +34,7 @@ import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
-import { HTTP_DRAIN_TIMEOUT_MS, RELAY_CLOSE_TIMEOUT_MS } from "./shutdown-timeouts.js";
+import { HTTP_DRAIN_TIMEOUT_MS } from "./shutdown-timeouts.js";
 import {
   createUserDeletionSweepClient,
   shutDownUserDeletionSweep,
@@ -270,17 +270,13 @@ async function runShutdownSequence() {
       stopCliCommandSweep();
       stopTerminalSessionRecheck();
       relaySessionManager.dispose();
-      await capacityLifecycle?.close();
+      await capacityLifecycle?.stopMaintenance();
     },
     closeBrowserSockets: () => {
       terminalBrowserHub.closeAll();
     },
     closeRelaySessions: async () => {
-      await runWithDeadline(
-        () => relaySessionManager.closeRelaySessions(),
-        RELAY_CLOSE_TIMEOUT_MS,
-        "relay session close",
-      );
+      await relaySessionManager.closeRelaySessions();
     },
     // 1. Stop accepting new connections and drain in-flight requests.
     //    ORDER: admission stops first (relay drain flag makes terminal and
@@ -332,6 +328,11 @@ async function runShutdownSequence() {
           nodeServer.closeIdleConnections?.();
         },
       }),
+    // After HTTP drain, before the MCP gate arms the database fence. Owners
+    // must keep renewing and admitting requests throughout the drain window.
+    closeCapacityRuntimes: async () => {
+      await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()]);
+    },
     // 2. Close the admission gate AND the module-lifetime MCP handler —
     //    AFTER the HTTP drain (normal-drain requests finished; nothing
     //    admitted loses its exchange prematurely) and BEFORE the Prisma

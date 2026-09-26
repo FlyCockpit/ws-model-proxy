@@ -3801,6 +3801,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         closeBrowserSockets: () => undefined,
         drainHttp: async () => undefined,
         closeRelaySessions: () => undefined,
+        closeCapacityRuntimes: async () => undefined,
         closeMcpHandler: async () => {
           fence.armDbShutdownFence();
         },

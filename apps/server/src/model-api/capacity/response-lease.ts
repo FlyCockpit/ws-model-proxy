@@ -1,31 +1,10 @@
+import {
+  CapacityLeaseOwner,
+  reportCapacityCleanupFailure as reportCleanupFailure,
+} from "./lease-owner.js";
 import type { CapacityAdmissionStore, CapacityLeaseHandle } from "./types.js";
 
-const reportCleanupFailure = (operation: "cancel" | "release", error: unknown) => {
-  console.warn("[capacity] response lease cleanup failed", {
-    operation,
-    errorClass: error instanceof Error ? error.name : "UnknownError",
-  });
-};
-
-export async function releaseCapacityLeaseWithRetry({
-  store,
-  lease,
-}: {
-  store: Pick<CapacityAdmissionStore, "release">;
-  lease: CapacityLeaseHandle;
-}): Promise<void> {
-  let lastError: unknown;
-  for (const retryDelayMs of [0, 25, 100, 250]) {
-    if (retryDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
-    try {
-      if (await store.release(lease)) return;
-      lastError = new Error("Capacity release was not acknowledged.");
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  reportCleanupFailure("release", lastError);
-}
+export { releaseCapacityLeaseWithRetry } from "./lease-owner.js";
 
 export function holdCapacityLeaseForResponse({
   response,
@@ -34,6 +13,7 @@ export function holdCapacityLeaseForResponse({
   signal,
   heartbeatIntervalMs = 10_000,
   leaseExtensionMs = 30_000,
+  owner,
 }: {
   response: Response;
   store: Pick<CapacityAdmissionStore, "heartbeat" | "release">;
@@ -41,32 +21,21 @@ export function holdCapacityLeaseForResponse({
   signal?: AbortSignal;
   heartbeatIntervalMs?: number;
   leaseExtensionMs?: number;
+  owner?: CapacityLeaseOwner;
 }): Response {
   if (!response.body)
     throw new Error("Bodyless capacity responses must release before returning to the client.");
+  const lifetime =
+    owner ?? new CapacityLeaseOwner(store, lease, signal, heartbeatIntervalMs, leaseExtensionMs);
+  const lifetimeSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
   let finished = false;
-  let heartbeatRunning = false;
-  let timer: ReturnType<typeof setInterval> | undefined;
   let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
   let terminalError: unknown;
   const finish = async () => {
     if (finished) return;
     finished = true;
-    if (timer) clearInterval(timer);
-    signal?.removeEventListener("abort", abort);
-    await releaseCapacityLeaseWithRetry({ store, lease });
-  };
-  const heartbeat = async () => {
-    if (finished || heartbeatRunning) return;
-    heartbeatRunning = true;
-    try {
-      const retained = await store.heartbeat(lease, leaseExtensionMs);
-      if (!retained) await loseLease(new Error("Capacity lease was lost while streaming."));
-    } catch (error) {
-      await loseLease(error);
-    } finally {
-      heartbeatRunning = false;
-    }
+    lifetimeSignal.removeEventListener("abort", abort);
+    await lifetime.release();
   };
   const reader = response.body.getReader();
   const loseLease = async (reason: unknown) => {
@@ -84,15 +53,14 @@ export function holdCapacityLeaseForResponse({
     await finish();
   };
   const abort = () => {
-    void loseLease(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    void loseLease(lifetimeSignal.reason ?? new DOMException("Aborted", "AbortError"));
   };
-  signal?.addEventListener("abort", abort, { once: true });
-  if (heartbeatIntervalMs > 0) timer = setInterval(() => void heartbeat(), heartbeatIntervalMs);
+  lifetimeSignal.addEventListener("abort", abort, { once: true });
 
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       downstream = controller;
-      if (signal?.aborted) abort();
+      if (lifetimeSignal.aborted) abort();
     },
     async pull(controller) {
       try {
