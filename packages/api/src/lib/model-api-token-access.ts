@@ -359,30 +359,31 @@ export async function listVisibleModelTargetsWithExternalPermissionForToken(
 /** Why a caller's `:external` consent no longer holds (see readExternalConsentDenial). */
 export type ExternalConsentStateDenial = "TOKEN_CONSENT_WITHDRAWN" | "REQUESTER_NOT_VISIBLE";
 
-/**
- * Re-reads, from current database state, the caller-side conditions that an
- * `:external` consent was minted from at authentication, so provider dispatch
- * never relies on a snapshot that may be minutes old:
- *   - API token (`modelApiTokenId` non-null): the token still exists, belongs
- *     to the requester, is not revoked or expired, has `allowExternal`, and
- *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
- *   - visibility (any requester that is not the pool owner, including Chat
- *     Test): the requester still holds a grant for this pool from its owner,
- *     the same owner-or-grant rule `listVisibleModelTargetsForUser` applies.
- * Returns null when every condition still holds. The pool owner's own flags
- * (fallbackEnabled, fallbackForGrantees) are re-read by the dispatcher.
- */
-export async function readExternalConsentDenial(input: {
+/** Why an `:external` send is refused at the send boundary (lockExternalSendConsent). */
+export type ExternalSendConsentDenial =
+  | ExternalConsentStateDenial
+  /** The pool is gone or its owner turned `fallbackEnabled` off. */
+  | "POOL_PRIVATE"
+  /** A grantee's request, and the owner turned `fallbackForGrantees` off. */
+  | "GRANTEE_NOT_COVERED";
+
+type ExternalConsentIdentity = {
   requesterUserId: string;
   modelApiTokenId: string | null;
   poolId: string;
   ownerUserId: string;
   now?: Date;
-}): Promise<ExternalConsentStateDenial | null> {
-  const now = input.now ?? new Date();
-  const [token, allowlistEntry, grant] = await Promise.all([
+};
+
+type ConsentReadClient = Pick<
+  Prisma.TransactionClient,
+  "modelApiToken" | "modelApiTokenAllowlistEntry" | "poolGrant"
+>;
+
+async function readCallerConsentRows(db: ConsentReadClient, input: ExternalConsentIdentity) {
+  return Promise.all([
     input.modelApiTokenId
-      ? prisma.modelApiToken.findUnique({
+      ? db.modelApiToken.findUnique({
           where: { id: input.modelApiTokenId },
           select: {
             userId: true,
@@ -394,7 +395,7 @@ export async function readExternalConsentDenial(input: {
         })
       : null,
     input.modelApiTokenId
-      ? prisma.modelApiTokenAllowlistEntry.findUnique({
+      ? db.modelApiTokenAllowlistEntry.findUnique({
           where: {
             modelApiTokenId_modelPoolId: {
               modelApiTokenId: input.modelApiTokenId,
@@ -406,13 +407,20 @@ export async function readExternalConsentDenial(input: {
       : null,
     input.requesterUserId === input.ownerUserId
       ? null
-      : prisma.poolGrant.findUnique({
+      : db.poolGrant.findUnique({
           where: {
             poolId_granteeUserId: { poolId: input.poolId, granteeUserId: input.requesterUserId },
           },
           select: { ownerUserId: true },
         }),
   ]);
+}
+
+function callerConsentDenial(
+  input: ExternalConsentIdentity,
+  [token, allowlistEntry, grant]: Awaited<ReturnType<typeof readCallerConsentRows>>,
+): ExternalConsentStateDenial | null {
+  const now = input.now ?? new Date();
   if (input.modelApiTokenId) {
     if (
       !token ||
@@ -431,6 +439,70 @@ export async function readExternalConsentDenial(input: {
   if (input.requesterUserId !== input.ownerUserId && grant?.ownerUserId !== input.ownerUserId)
     return "REQUESTER_NOT_VISIBLE";
   return null;
+}
+
+/**
+ * Re-reads, from current database state, the caller-side conditions that an
+ * `:external` consent was minted from at authentication, so provider dispatch
+ * never relies on a snapshot that may be minutes old:
+ *   - API token (`modelApiTokenId` non-null): the token still exists, belongs
+ *     to the requester, is not revoked or expired, has `allowExternal`, and
+ *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
+ *   - visibility (any requester that is not the pool owner, including Chat
+ *     Test): the requester still holds a grant for this pool from its owner,
+ *     the same owner-or-grant rule `listVisibleModelTargetsForUser` applies.
+ * Returns null when every condition still holds. The pool owner's own flags
+ * (fallbackEnabled, fallbackForGrantees) are re-read by the dispatcher.
+ *
+ * This is an early, unlocked check. The authoritative check is
+ * {@link lockExternalSendConsent}, inside the send-claim transaction.
+ */
+export async function readExternalConsentDenial(
+  input: ExternalConsentIdentity,
+): Promise<ExternalConsentStateDenial | null> {
+  return callerConsentDenial(input, await readCallerConsentRows(prisma, input));
+}
+
+/**
+ * E0 send boundary: validates every consent condition of an `:external` send
+ * (owner's `fallbackEnabled`, `fallbackForGrantees` for a grantee, the
+ * requester's grant, and the token's `allowExternal`, revocation, expiry and
+ * ALLOWLIST `includeExternal`) inside the caller's send-claim transaction,
+ * holding the rows those conditions live on FOR SHARE until it commits.
+ *
+ * Serialization: every consent withdrawal is an UPDATE or DELETE of one of
+ * these rows (pool flag write, pool delete, grant delete and its pool/user
+ * cascades, token revoke / `allowExternal` / `includeExternal` write, token
+ * and allowlist cascades from a user delete). Each conflicts with FOR SHARE,
+ * so a withdrawal either commits before the lock is granted (and the reads
+ * below, later READ COMMITTED statements, see it) or waits until the send is
+ * claimed. Nothing is sent after a withdrawal that committed first.
+ *
+ * Lock order (documented in packages/db/src/capacity-lock-order.ts, "E0
+ * send-claim transaction"): `model_pool` -> `pool_grant` -> `model_api_token`
+ * -> `model_api_token_allowlist_entry`, all FOR SHARE, and then the caller's
+ * `provider_account` -> `provider_credential` FOR UPDATE. The transaction
+ * holds no lock before this call and takes no capacity lock at all.
+ */
+export async function lockExternalSendConsent(
+  tx: Prisma.TransactionClient,
+  input: ExternalConsentIdentity,
+): Promise<ExternalSendConsentDenial | null> {
+  const requesterIsOwner = input.requesterUserId === input.ownerUserId;
+  await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${input.ownerUserId} FOR SHARE`;
+  if (!requesterIsOwner)
+    await tx.$queryRaw`SELECT id FROM pool_grant WHERE "poolId" = ${input.poolId} AND "granteeUserId" = ${input.requesterUserId} FOR SHARE`;
+  if (input.modelApiTokenId) {
+    await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.modelApiTokenId} FOR SHARE`;
+    await tx.$queryRaw`SELECT id FROM model_api_token_allowlist_entry WHERE "modelApiTokenId" = ${input.modelApiTokenId} AND "modelPoolId" = ${input.poolId} FOR SHARE`;
+  }
+  const pool = await tx.modelPool.findFirst({
+    where: { id: input.poolId, userId: input.ownerUserId },
+    select: { fallbackEnabled: true, fallbackForGrantees: true },
+  });
+  if (!pool?.fallbackEnabled) return "POOL_PRIVATE";
+  if (!requesterIsOwner && !pool.fallbackForGrantees) return "GRANTEE_NOT_COVERED";
+  return callerConsentDenial(input, await readCallerConsentRows(tx, input));
 }
 
 export async function authenticateModelApiTokenSecret(

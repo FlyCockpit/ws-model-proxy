@@ -307,6 +307,7 @@ function listedExternalTargets(
       loadPenaltyWeight: 100,
     },
     targets,
+    coolingDown: [],
   };
 }
 
@@ -752,6 +753,7 @@ describe("model API routes", () => {
         loadPenaltyWeight: 100,
       },
       targets: [],
+      coolingDown: [],
     });
     publicOverflow.buildAffinityTargets.mockImplementation(async ({ targets }) =>
       targets.map((target: { poolMemberId: string; executionTargetId: string }) => ({
@@ -4882,6 +4884,74 @@ describe("model API routes", () => {
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
 
+  it("ends the external phase on a send-boundary consent denial without trying other members", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    // The dispatcher's send-claim transaction found the token's consent gone.
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: false,
+      reason: "CALLER_CONSENT_WITHDRAWN",
+    });
+    const release = vi.fn(async () => true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release,
+      hold: vi.fn((response) => response),
+    };
+    const limiter = new ModelApiConcurrencyLimiter();
+    const callerReleases = vi.fn();
+    const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+    vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+      const lease = acquireGlobal(identity);
+      return {
+        release: () => {
+          callerReleases();
+          lease.release();
+        },
+      };
+    });
+
+    const response = await appWith(new FakeRelayManager(), capacityRuntime, limiter).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "external_unavailable" },
+    });
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(expect.objectContaining({ poolMemberId: "overflow-a" }));
+    expect(callerReleases).toHaveBeenCalledTimes(1);
+  });
+
   it("releases an admitted external lease and the caller lease when dispatch rejects", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -5171,7 +5241,8 @@ describe("model API routes", () => {
       expect(response.headers.get("x-wsmp-route")).toBe("local");
       expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
       expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
-      // At most one external attempt per request.
+      // One external phase per request; precommit failover across external
+      // members follows the existing retry rules.
       expect(publicOverflow.list).toHaveBeenCalledTimes(1);
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
       expect(manager.sent).toHaveLength(0);
@@ -5202,7 +5273,15 @@ describe("model API routes", () => {
 
     it("answers 400 with the header on a provider-only pool with no compatible external target", async () => {
       db.poolMember.findMany.mockResolvedValue([]);
-      publicOverflow.list.mockResolvedValue(listedExternalTargets([]));
+      // A configured, healthy external member that cannot serve this request
+      // (no chat surface): incompatible, not temporarily unavailable. Uses
+      // the real listing so health and compatibility are both evaluated.
+      const realOverflow =
+        await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+      db.modelPool.findFirst.mockResolvedValue(
+        cooldownPoolFixture(externalPoolTarget.ownerUserId, "openai-responses"),
+      );
+      publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
       const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
 
       const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
@@ -5214,6 +5293,86 @@ describe("model API routes", () => {
       expect(response.status).toBe(400);
       expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
       expect(response.headers.get("x-wsmp-route")).toBeNull();
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "unsupported_capability" },
+      });
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["provider model", "model"],
+      ["provider account", "account"],
+    ] as const)(
+      "answers 503 (not 400) on a provider-only pool whose compatible %s is in health cooldown",
+      async (_label, cooling) => {
+        db.poolMember.findMany.mockResolvedValue([]);
+        const realOverflow =
+          await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+        const fixture = cooldownPoolFixture(externalPoolTarget.ownerUserId);
+        const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+        db.modelPool.findFirst.mockResolvedValue(fixture);
+        // Control: the same member is listed while its cooldown has elapsed.
+        expect(
+          (
+            await realOverflow.listPublicOverflowTargets(
+              externalPoolTarget.ownerUserId,
+              externalPoolTarget.id,
+            )
+          ).targets,
+        ).toHaveLength(1);
+        const coolingUntil = new Date(Date.now() + 60_000);
+        if (cooling === "model") model.healthNextRetryAt = coolingUntil;
+        else model.ProviderAccount.healthNextRetryAt = coolingUntil;
+        const listed = await realOverflow.listPublicOverflowTargets(
+          externalPoolTarget.ownerUserId,
+          externalPoolTarget.id,
+        );
+        expect(listed.targets).toHaveLength(0);
+        expect(listed.coolingDown).toHaveLength(1);
+        publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
+        const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+        const response = await appWith(new FakeRelayManager(), runtime).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+
+        expect(response.status).toBe(503);
+        expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        await expect(response.json()).resolves.toMatchObject({
+          error: { code: "external_unavailable" },
+        });
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+    );
+
+    it("answers 400 when the only cooling-down external member is incompatible anyway", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      const realOverflow =
+        await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+      const fixture = cooldownPoolFixture(externalPoolTarget.ownerUserId, "openai-responses");
+      fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.healthNextRetryAt = new Date(
+        Date.now() + 60_000,
+      );
+      db.modelPool.findFirst.mockResolvedValue(fixture);
+      publicOverflow.list.mockImplementation(realOverflow.listPublicOverflowTargets);
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(400);
       await expect(response.json()).resolves.toMatchObject({
         error: { code: "unsupported_capability" },
       });
@@ -6589,6 +6748,7 @@ describe("model API routes", () => {
         loadPenaltyWeight: 100,
       },
       targets: [providerTarget],
+      coolingDown: [],
     });
     const capacityRuntime = admittingCapacityRuntime();
     publicOverflow.dispatch.mockResolvedValueOnce({
@@ -7346,6 +7506,30 @@ describe("model API routes", () => {
       expect(busy.status).toBe(429);
       expect(callerRelease).toHaveBeenCalledTimes(3);
     });
+
+    it.each(boundOperations)(
+      "%s answers 503 (not 404) while the bound provider is in health cooldown",
+      async (_label, method, path, create) => {
+        publicOverflow.list.mockResolvedValue({
+          ...listedExternalTargets([]),
+          coolingDown: [boundProvider()],
+        });
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          path,
+          boundRequest(method, create),
+        );
+
+        expect(response.status).toBe(503);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
 
     it.each(boundOperations)(
       "E0-TOCTOU: %s answers 403 when consent is withdrawn between authentication and dispatch",
@@ -8124,3 +8308,68 @@ describe("model API routes", () => {
     });
   });
 });
+
+/**
+ * A pool with one external member as `listPublicOverflowTargets` reads it
+ * from the database, with every health cooldown elapsed (UNAVAILABLE status,
+ * next retry in the past: a half-open candidate).
+ */
+function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
+  return {
+    fallbackEnabled: true,
+    fallbackForGrantees: false,
+    PoolMembers: [
+      {
+        id: "member-cooldown",
+        publicOrder: 0,
+        ExecutionTarget: {
+          id: "target-cooldown",
+          inferenceCapacityId: "capacity-cooldown",
+          ProviderModel: {
+            id: "model-cooldown",
+            userId: ownerUserId,
+            upstreamModelId: "upstream-model",
+            contextWindow: 10_000,
+            maxOutputTokens: 1_000,
+            concurrencyLimit: null,
+            nativeCapabilities: {
+              protocols: ["openai"],
+              surfaces: [surface],
+              streaming: true,
+              features: [],
+            },
+            healthStatus: "UNAVAILABLE",
+            healthNextRetryAt: new Date(0),
+            enabled: true,
+            deletedAt: null,
+            ProviderAccount: {
+              id: "account-cooldown",
+              userId: ownerUserId,
+              providerType: "openai",
+              providerVersion: null,
+              baseUrl: "https://provider.example",
+              endpointIdentity: "https://provider.example",
+              endpointVersion: 1,
+              authType: "BEARER",
+              healthStatus: "UNAVAILABLE",
+              healthNextRetryAt: new Date(0),
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: {
+                id: "credential-cooldown",
+                credentialType: "BEARER",
+                aadVersion: 1,
+                algorithm: "AES-256-GCM",
+                keyVersion: "v1",
+                ciphertext: new Uint8Array(),
+                nonce: new Uint8Array(),
+                authTag: new Uint8Array(),
+                status: "ACTIVE",
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+}

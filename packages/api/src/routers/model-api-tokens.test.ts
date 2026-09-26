@@ -565,6 +565,17 @@ describe("modelApiTokensRouter", () => {
         { where: { id: "entry-a" }, data: { includeExternal: false } },
         { where: { id: "entry-b" }, data: { includeExternal: true } },
       ]);
+      // Canonical consent-row order shared with the E0 send claim: the token
+      // row is locked before any of its allowlist entries is written.
+      const tokenLock = db.$queryRaw.mock.calls.findIndex(([strings]) =>
+        String((strings as TemplateStringsArray).join("?")).includes(
+          "FROM model_api_token WHERE id = ? FOR NO KEY UPDATE",
+        ),
+      );
+      expect(tokenLock).toBeGreaterThanOrEqual(0);
+      expect(db.$queryRaw.mock.invocationCallOrder[tokenLock]).toBeLessThan(
+        Math.min(...db.modelApiTokenAllowlistEntry.update.mock.invocationCallOrder),
+      );
     });
 
     it.each([

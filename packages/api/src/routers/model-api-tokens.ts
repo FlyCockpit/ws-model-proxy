@@ -227,6 +227,11 @@ export const modelApiTokensRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        // Canonical consent-row order (see lockExternalSendConsent): the token
+        // row before its allowlist entries. The E0 send-claim transaction holds
+        // token then entry FOR SHARE; taking the entries first here would let
+        // the two wait on each other.
+        await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.id} FOR NO KEY UPDATE`;
         const existing = await tx.modelApiToken.findUnique({
           where: { id: input.id },
           select: {

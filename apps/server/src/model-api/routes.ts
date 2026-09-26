@@ -168,6 +168,7 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
+  isExternalConsentDenialReason,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   orderChatTestProviderTargets,
@@ -3923,8 +3924,8 @@ async function relayPool({
       // provider request must fail closed even if legacy configuration exists.
       if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
       const listed = await listPublicOverflowTargets(target.ownerUserId, target.id);
-      const compatible = orderChatTestProviderTargets(
-        listed.targets.flatMap((providerTarget) => {
+      const compatibleTargets = (providerTargets: typeof listed.targets) =>
+        providerTargets.flatMap((providerTarget) => {
           if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
           const resolvedExecution = resolvePublicProviderExecution(providerTarget, providerRequest);
           const resolvedTarget = { ...providerTarget, resolvedExecution };
@@ -3932,10 +3933,16 @@ async function relayPool({
             matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
             ? [resolvedTarget]
             : [];
-        }),
+        });
+      const compatible = orderChatTestProviderTargets(
+        compatibleTargets(listed.targets),
         requestedSurface,
         testRoutingMode,
       );
+      // Compatible members exist but every one is in a provider health
+      // cooldown: a transient 503-class condition, never 400.
+      if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
+        return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
       // An external member is a physical execution target too. Missing
       // capacity identity is a configuration error, never permission to bypass
       // durable concurrency and fencing.
@@ -4003,6 +4010,9 @@ async function relayPool({
         }
         await capacityRuntime.release(admission.lease);
         lastResult = result;
+        // Consent is request-wide: a denial (at dispatch entry or at the send
+        // boundary) ends the external phase for every member.
+        if (isExternalConsentDenialReason(result.reason)) return result;
         // A provider attempt that did not commit is retryable only under the
         // operation's existing exact retry policy. Never re-admit the same
         // physical member during this tier traversal.
@@ -4637,8 +4647,10 @@ async function relayPool({
     external.consent && target.externalMemberCount > 0
       ? (eligibleMembers[0]?.ModelPool?.externalAfterWaitMs ?? null)
       : null;
-  // Local wait per admission (X1): "shortened" waits min(B, E) and then tries
-  // external once; after an external attempt that did not dispatch, the same
+  // Local wait per admission (X1): "shortened" waits min(B, E) and then runs
+  // the external phase once (one external phase per request; precommit
+  // failover across external members follows the existing retry rules);
+  // after an external phase that did not dispatch, the same
   // candidates wait the rest, B - min(B, E) ("remaining"), so `:external`
   // never gets less local service than the plain name; every later admission
   // waits the full budget ("full"). Without an external plan it is "full".
@@ -6530,10 +6542,13 @@ const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, 
 /**
  * Why a consented `:external` request needed an external dispatch but none
  * happened. Drives the provider-only pool status (D5 / X1):
- *   NO_COMPATIBLE -> 400 unsupported_capability (no external target fits);
+ *   NO_COMPATIBLE -> 400 unsupported_capability (no configured external
+ *                    target fits the request, cooling down or not);
  *   SATURATED     -> 429 rate_limited (provider admission did not admit);
- *   UNAVAILABLE   -> 503 external_unavailable (unhealthy, precommit failure,
- *                    owner or caller consent withdrawn at dispatch, ...);
+ *   UNAVAILABLE   -> 503 external_unavailable (every compatible target in a
+ *                    provider health cooldown, precommit failure, owner or
+ *                    caller consent withdrawn at dispatch or at the send
+ *                    boundary, ...);
  *   CANCELLED     -> the client went away; stays a cancel.
  */
 type ExternalUnavailableReason = "NO_COMPATIBLE" | "SATURATED" | "UNAVAILABLE" | "CANCELLED";
@@ -7106,12 +7121,15 @@ async function relayBoundProviderResponse(input: {
       input.stickyRoute.visibleTarget.ownerUserId,
       input.stickyRoute.visibleTarget.id,
     );
-    const exactTarget = listed.targets.find(
-      (target) =>
-        target.executionTargetId === input.stickyRoute.binding.executionTargetId &&
-        target.providerAccountId === input.stickyRoute.binding.providerAccountId &&
-        target.providerModelId === input.stickyRoute.binding.providerModelId,
-    );
+    const isBoundTarget = (target: (typeof listed.targets)[number]) =>
+      target.executionTargetId === input.stickyRoute.binding.executionTargetId &&
+      target.providerAccountId === input.stickyRoute.binding.providerAccountId &&
+      target.providerModelId === input.stickyRoute.binding.providerModelId;
+    const exactTarget = listed.targets.find(isBoundTarget);
+    // The bound member still exists but is in a provider health cooldown:
+    // temporarily unavailable (503), not gone.
+    if (!exactTarget && listed.coolingDown.some(isBoundTarget))
+      return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
     if (!exactTarget?.inferenceCapacityId)
       return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const admission = await acquireCapacityWithTelemetry({
@@ -7180,7 +7198,9 @@ async function relayBoundProviderResponse(input: {
         ? "access_denied"
         : result.reason === "PROVIDER_SATURATED"
           ? "rate_limited"
-          : "not_found";
+          : result.reason === "PROVIDER_UNHEALTHY"
+            ? "disconnected"
+            : "not_found";
     await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
       metadataUpdateError,
     );
@@ -7189,6 +7209,11 @@ async function relayBoundProviderResponse(input: {
     if (denied) return externalRouteErrorResponse("responses", denied);
     if (failure === "rate_limited" || failure === "cancelled")
       return openAiFailureJsonResponse(failure);
+    if (failure === "disconnected")
+      return openAiFailureJsonResponse(
+        failure,
+        "The bound provider Responses target is temporarily unavailable. Try again later.",
+      );
     return openAiFailureJsonResponse(
       "not_found",
       "The bound provider Responses target is no longer available.",
@@ -7317,13 +7342,7 @@ function boundDispatchDenial(
 ): ExternalRouteError | null {
   if (reason === "DEPLOYMENT_GATE_DISABLED")
     return externalDenialError("DEPLOYMENT_DISABLED", pool);
-  if (
-    reason === "CALLER_CONSENT_MISSING" ||
-    reason === "CALLER_CONSENT_WITHDRAWN" ||
-    reason === "REQUESTER_NOT_VISIBLE" ||
-    reason === "POOL_PRIVATE" ||
-    reason === "GRANTEE_NOT_COVERED"
-  )
+  if (isExternalConsentDenialReason(reason))
     return {
       code: "external_not_permitted",
       message: `This response was served by an external provider, and external fallback for "${pool.modelId}" is no longer allowed for this caller.`,

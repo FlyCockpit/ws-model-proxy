@@ -553,10 +553,11 @@ describe("public overflow compatibility", () => {
     const envelope = encryptProviderCredential("provider-secret", identity, keyring);
     const order: string[] = [];
     const tx = {
-      $queryRaw: vi.fn(async () => {
-        order.push("lock");
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        order.push(`lock:${lockedTable(strings)}`);
         return [];
       }),
+      ...consentTx(order),
       providerCredential: {
         findFirst: vi.fn(async () => ({
           id: identity.credentialId,
@@ -608,24 +609,112 @@ describe("public overflow compatibility", () => {
       },
     };
 
-    const secret = await claimPublicProviderCredentialForSend({
-      userId: identity.userId,
-      target,
-      keyring,
-    });
+    const claim = await withEgressEnabled(() =>
+      claimPublicProviderCredentialForSend({
+        userId: identity.userId,
+        target,
+        keyring,
+        consent: GRANTEE_TOKEN_CONSENT,
+      }),
+    );
     order.push("network-may-start");
 
-    expect(secret).toBe("provider-secret");
-    expect(order).toEqual(["lock", "lock", "durable-claim", "commit", "network-may-start"]);
+    expect(claim).toEqual({ claimed: true, secret: "provider-secret" });
+    // E0 send boundary: consent rows FOR SHARE in the canonical order, read
+    // under those locks, then the provider account/credential lifecycle locks,
+    // the durable claim, and commit, all before any network I/O.
+    expect(order).toEqual([
+      "lock:model_pool FOR SHARE",
+      "lock:pool_grant FOR SHARE",
+      "lock:model_api_token FOR SHARE",
+      "lock:model_api_token_allowlist_entry FOR SHARE",
+      "read:pool",
+      "read:consent",
+      "read:consent",
+      "read:consent",
+      "lock:provider_account FOR UPDATE",
+      "lock:provider_credential FOR UPDATE",
+      "durable-claim",
+      "commit",
+      "network-may-start",
+    ]);
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
       maxWait: 5_000,
       timeout: 10_000,
     });
   });
 
+  it.each([
+    ["the owner turned fallback off", { pool: { fallbackEnabled: false } }, "POOL_PRIVATE"],
+    [
+      "the owner stopped covering grantees",
+      { pool: { fallbackEnabled: true, fallbackForGrantees: false } },
+      "GRANTEE_NOT_COVERED",
+    ],
+    ["the grant was deleted", { grant: null }, "REQUESTER_NOT_VISIBLE"],
+    ["the token was revoked", { token: { revokedAt: new Date() } }, "CALLER_CONSENT_WITHDRAWN"],
+    [
+      "the token no longer allows external",
+      { token: { allowExternal: false } },
+      "CALLER_CONSENT_WITHDRAWN",
+    ],
+    [
+      "the allowlist entry no longer includes external",
+      { entry: { includeExternal: false } },
+      "CALLER_CONSENT_WITHDRAWN",
+    ],
+  ] as const)(
+    "refuses the send claim when %s, before any credential lock",
+    async (_label, change, reason) => {
+      const order: string[] = [];
+      const tx = {
+        $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+          order.push(`lock:${lockedTable(strings)}`);
+          return [];
+        }),
+        ...consentTx(order, change),
+        providerCredential: { findFirst: vi.fn(), update: vi.fn() },
+      };
+      db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const keyring = parseProviderCredentialKeyring(
+        `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+      );
+
+      const claim = await withEgressEnabled(() =>
+        claimPublicProviderCredentialForSend({
+          userId: "owner",
+          target: claimTarget(),
+          keyring,
+          consent: GRANTEE_TOKEN_CONSENT,
+        }),
+      );
+
+      expect(claim).toEqual({ claimed: false, reason });
+      expect(order.filter((step) => step.startsWith("lock:provider"))).toEqual([]);
+      expect(tx.providerCredential.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses the send claim with the deployment switch off without opening a transaction", async () => {
+    db.$transaction.mockClear();
+    const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
+    await expect(
+      claimPublicProviderCredentialForSend({
+        userId: "owner",
+        target: claimTarget(),
+        keyring,
+        consent: GRANTEE_TOKEN_CONSENT,
+      }),
+    ).resolves.toEqual({ claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
   it("fails a send-start claim when revocation won the lifecycle lock", async () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([]),
+      ...consentTx([]),
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(null),
         update: vi.fn(),
@@ -637,42 +726,45 @@ describe("public overflow compatibility", () => {
     const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
 
     await expect(
-      claimPublicProviderCredentialForSend({
-        userId: "owner",
-        target: {
-          poolMemberId: "member",
-          executionTargetId: "target",
-          publicOrder: 0,
-          providerModelId: "model",
-          upstreamModelId: "upstream",
-          contextWindow: 1_000,
-          maxOutputTokens: 100,
-          protocol: "openai",
-          providerAccountId: "account",
-          endpointIdentity: "provider-endpoint",
-          endpointVersion: 1,
-          concurrencyLimit: null,
-          providerVersion: null,
-          baseUrl: "https://provider.example",
-          authType: "BEARER",
-          healthStatus: "HEALTHY",
-          nativeProtocols: ["openai"],
-          nativeSurfaces: ["openai-chat"],
-          supportsStreaming: true,
-          supportedFeatures: [],
-          credential: {
-            id: "credential",
-            credentialType: "BEARER",
-            keyVersion: "v1",
-            aadVersion: 1,
-            algorithm: "AES-256-GCM",
-            ciphertext: new Uint8Array(),
-            nonce: new Uint8Array(),
-            authTag: new Uint8Array(),
+      withEgressEnabled(() =>
+        claimPublicProviderCredentialForSend({
+          userId: "owner",
+          consent: GRANTEE_TOKEN_CONSENT,
+          target: {
+            poolMemberId: "member",
+            executionTargetId: "target",
+            publicOrder: 0,
+            providerModelId: "model",
+            upstreamModelId: "upstream",
+            contextWindow: 1_000,
+            maxOutputTokens: 100,
+            protocol: "openai",
+            providerAccountId: "account",
+            endpointIdentity: "provider-endpoint",
+            endpointVersion: 1,
+            concurrencyLimit: null,
+            providerVersion: null,
+            baseUrl: "https://provider.example",
+            authType: "BEARER",
+            healthStatus: "HEALTHY",
+            nativeProtocols: ["openai"],
+            nativeSurfaces: ["openai-chat"],
+            supportsStreaming: true,
+            supportedFeatures: [],
+            credential: {
+              id: "credential",
+              credentialType: "BEARER",
+              keyVersion: "v1",
+              aadVersion: 1,
+              algorithm: "AES-256-GCM",
+              ciphertext: new Uint8Array(),
+              nonce: new Uint8Array(),
+              authTag: new Uint8Array(),
+            },
           },
-        },
-        keyring,
-      }),
+          keyring,
+        }),
+      ),
     ).rejects.toThrow("no longer current");
     expect(tx.providerCredential.update).not.toHaveBeenCalled();
   });
@@ -999,3 +1091,110 @@ describe("engine cache confirmation evidence", () => {
     expect(engineCacheConfirmedFromRetainedResponse(hitPrefix, zeroTail, 128, 64)).toBe(false);
   });
 });
+
+/** A grantee's API-token request: every consent row kind is involved. */
+const GRANTEE_TOKEN_CONSENT = {
+  requesterUserId: "grantee",
+  modelApiTokenId: "token",
+  poolId: "pool",
+  ownerUserId: "owner",
+};
+
+function lockedTable(strings: TemplateStringsArray): string {
+  const sql = strings.join("?").replace(/\s+/g, " ");
+  const table = sql.match(/FROM (\w+)/)?.[1] ?? "?";
+  const mode = sql.match(/FOR (SHARE|UPDATE|NO KEY UPDATE)/)?.[0] ?? "";
+  return `${table} ${mode}`.trim();
+}
+
+async function withEgressEnabled<T>(work: () => Promise<T>): Promise<T> {
+  const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+  const previous = mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
+  mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+  try {
+    return await work();
+  } finally {
+    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = previous;
+  }
+}
+
+/** Consent rows as the send-claim transaction reads them, all granting by default. */
+function consentTx(
+  order: string[],
+  change: {
+    pool?: Record<string, unknown>;
+    grant?: null;
+    token?: Record<string, unknown>;
+    entry?: Record<string, unknown>;
+  } = {},
+) {
+  const read = <T>(label: string, value: T) =>
+    vi.fn(async () => {
+      order.push(label);
+      return value;
+    });
+  return {
+    modelPool: {
+      findFirst: read("read:pool", {
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        ...change.pool,
+      }),
+    },
+    poolGrant: {
+      findUnique: read("read:consent", "grant" in change ? null : { ownerUserId: "owner" }),
+    },
+    modelApiToken: {
+      findUnique: read("read:consent", {
+        userId: "grantee",
+        scopeMode: "ALLOWLIST",
+        allowExternal: true,
+        revokedAt: null,
+        expiresAt: null,
+        ...change.token,
+      }),
+    },
+    modelApiTokenAllowlistEntry: {
+      findUnique: read("read:consent", {
+        target: "MODEL_POOL",
+        includeExternal: true,
+        ...change.entry,
+      }),
+    },
+  };
+}
+
+function claimTarget() {
+  return {
+    poolMemberId: "member",
+    executionTargetId: "target",
+    publicOrder: 0,
+    providerModelId: "model",
+    upstreamModelId: "upstream",
+    contextWindow: 1_000,
+    maxOutputTokens: 100,
+    protocol: "openai" as const,
+    providerAccountId: "account",
+    endpointIdentity: "provider-endpoint",
+    endpointVersion: 1,
+    concurrencyLimit: null,
+    providerVersion: null,
+    baseUrl: "https://provider.example",
+    authType: "BEARER" as const,
+    healthStatus: "HEALTHY" as const,
+    nativeProtocols: ["openai" as const],
+    nativeSurfaces: ["openai-chat" as const],
+    supportsStreaming: true,
+    supportedFeatures: [],
+    credential: {
+      id: "credential",
+      credentialType: "BEARER" as const,
+      keyVersion: "v1",
+      aadVersion: 1,
+      algorithm: "AES-256-GCM" as const,
+      ciphertext: new Uint8Array(),
+      nonce: new Uint8Array(),
+      authTag: new Uint8Array(),
+    },
+  };
+}

@@ -1076,6 +1076,136 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expect(afterReplacement.status).toBe(404);
   }, 15_000);
 
+  // E0 send boundary on real PostgreSQL: the send-claim transaction holds the
+  // consent rows FOR SHARE, so a withdrawal that is still uncommitted when the
+  // claim starts makes the claim wait, and the claim then sees the committed
+  // withdrawal and refuses. Nothing is claimed or sent after it.
+  it.each([
+    ["token allowExternal", "CALLER_CONSENT_WITHDRAWN"],
+    ["token revocation", "CALLER_CONSENT_WITHDRAWN"],
+    ["allowlist includeExternal", "CALLER_CONSENT_WITHDRAWN"],
+    ["pool fallbackEnabled", "POOL_PRIVATE"],
+    ["pool fallbackForGrantees", "GRANTEE_NOT_COVERED"],
+    ["grant deletion", "REQUESTER_NOT_VISIBLE"],
+  ] as const)(
+    "serializes the send claim behind an uncommitted %s withdrawal",
+    async (withdrawal, reason) => {
+      if (!modules || !db) throw new Error("modules unavailable");
+      const publicOverflow = await import("./public-overflow.js");
+      const result = await runCase({
+        requested: "openai-chat",
+        native: "openai-chat",
+        behavior: "json",
+        grantee: true,
+      });
+      if (!result.grant) throw new Error("grant unavailable");
+      const token = await modules.prisma.modelApiToken.findFirstOrThrow({
+        where: { userId: result.requester.id, name: "Provider route token" },
+      });
+      const entry =
+        withdrawal === "allowlist includeExternal"
+          ? await modules.prisma.$transaction(async (tx) => {
+              await tx.modelApiToken.update({
+                where: { id: token.id },
+                data: { scopeMode: "ALLOWLIST" },
+              });
+              return tx.modelApiTokenAllowlistEntry.create({
+                data: {
+                  modelApiTokenId: token.id,
+                  target: "MODEL_POOL",
+                  modelPoolId: result.pool.id,
+                  includeExternal: true,
+                },
+              });
+            })
+          : undefined;
+      const [target] = (
+        await publicOverflow.listPublicOverflowTargets(result.user.id, result.pool.id)
+      ).targets;
+      if (!target) throw new Error("provider target unavailable");
+      const claim = () =>
+        publicOverflow.claimPublicProviderCredentialForSend({
+          userId: result.user.id,
+          target,
+          keyring: modules!.credentials.parseProviderCredentialKeyring(
+            process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS!,
+          ),
+          consent: {
+            requesterUserId: result.requester.id,
+            modelApiTokenId: token.id,
+            poolId: result.pool.id,
+            ownerUserId: result.user.id,
+          },
+        });
+      // Control: with consent intact the claim succeeds.
+      await expect(claim()).resolves.toMatchObject({ claimed: true });
+
+      let releaseWriter!: () => void;
+      const writerGate = new Promise<void>((resolve) => {
+        releaseWriter = resolve;
+      });
+      let writerLocked!: () => void;
+      const writerHoldsRow = new Promise<void>((resolve) => {
+        writerLocked = resolve;
+      });
+      const writer = db.$transaction(
+        async (tx) => {
+          if (withdrawal === "token allowExternal")
+            await tx.modelApiToken.update({
+              where: { id: token.id },
+              data: { allowExternal: false },
+            });
+          else if (withdrawal === "token revocation")
+            await tx.modelApiToken.update({
+              where: { id: token.id },
+              data: { revokedAt: new Date() },
+            });
+          else if (withdrawal === "allowlist includeExternal")
+            await tx.modelApiTokenAllowlistEntry.update({
+              where: { id: entry!.id },
+              data: { includeExternal: false },
+            });
+          else if (withdrawal === "pool fallbackEnabled")
+            await tx.modelPool.update({
+              where: { id: result.pool.id },
+              data: { fallbackEnabled: false },
+            });
+          else if (withdrawal === "pool fallbackForGrantees")
+            await tx.modelPool.update({
+              where: { id: result.pool.id },
+              data: { fallbackForGrantees: false },
+            });
+          else await tx.poolGrant.delete({ where: { id: result.grant!.id } });
+          writerLocked();
+          await writerGate;
+        },
+        { maxWait: 10_000, timeout: 30_000 },
+      );
+      await writerHoldsRow;
+      const credentialBefore = await modules.prisma.providerCredential.findUniqueOrThrow({
+        where: { id: result.credentialId },
+        select: { lastUsedAt: true },
+      });
+      const pending = claim();
+      const early = await Promise.race([
+        pending.then(() => "settled" as const),
+        new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 500)),
+      ]);
+      // The claim is blocked on the withdrawal's row lock, not racing past it.
+      expect(early).toBe("waiting");
+      releaseWriter();
+      await writer;
+      await expect(pending).resolves.toEqual({ claimed: false, reason });
+      // No credential claim was recorded for the refused send.
+      await expect(
+        modules.prisma.providerCredential.findUniqueOrThrow({
+          where: { id: result.credentialId },
+          select: { lastUsedAt: true },
+        }),
+      ).resolves.toEqual(credentialBefore);
+    },
+  );
+
   it.each([
     "expiry",
     "endpoint",

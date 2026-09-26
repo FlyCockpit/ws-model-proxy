@@ -37,8 +37,11 @@ All of these must hold:
 All five are checked when the request arrives, and checked again against
 current database state immediately before any request data is sent (the
 switch, the owner's two settings, the token's consent and revocation or
-expiry, and, for someone other than the owner, their pool grant). If any of
-them no longer holds, nothing is sent.
+expiry, and, for someone other than the owner, their pool grant). That last
+check runs in the same database transaction that claims the provider
+credential for the send, and it holds those settings unchanged until the send
+is claimed. If any of them no longer holds, nothing is sent. A change saved
+after that point applies from the next send.
 
 The request goes external only after local routing could not serve it:
 
@@ -55,7 +58,8 @@ Hitting your own concurrency caps (per token, per user) is never a reason to go
 external: you get `429` as before, and external requests (including stored
 Responses operations on externally served responses) count against those caps.
 
-A request makes at most one external attempt.
+A request has at most one external phase; precommit failover across external
+members follows the existing retry rules.
 
 ### When the external attempt does not happen
 
@@ -68,6 +72,7 @@ gets worse local service than the plain name:
 | Local wait expired, pool has local members | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
 | No compatible or healthy local member, context too large, or local failures after every member was tried | The same error the plain name gets. |
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
+| Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
 | Pool has only external members, anything else (unhealthy, failure before the first byte, fallback or consent withdrawn) | `503 external_unavailable` |
 
