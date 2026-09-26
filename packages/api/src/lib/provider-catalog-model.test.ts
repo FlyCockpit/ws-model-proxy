@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { catalogEntry } from "./fixtures/openrouter-catalog";
+import { catalogEntry, liveShapedCatalogEntries } from "./fixtures/openrouter-catalog";
 import { parseOpenAiCompatibleCapabilities } from "./openai-compatible-capabilities";
 import {
   CATALOG_CHARGE_RULES,
@@ -38,6 +38,7 @@ describe("parseCatalog", () => {
         cacheWrite: null,
         reasoning: null,
         variable: false,
+        tiers: [],
       },
       inputModalities: ["text"],
       outputModalities: ["text"],
@@ -110,15 +111,141 @@ describe("parseCatalog", () => {
   });
 });
 
+describe("live-shaped catalog entries", () => {
+  // Regression for the first parser: it dropped every `~` alias and ignored
+  // `pricing.overrides`, importing the lowest tier as the ACTIVE price.
+  const models = parseCatalog({ data: liveShapedCatalogEntries() });
+  const byId = new Map(models.map((model) => [model.id, model]));
+
+  it("keeps floating `~` aliases, tiered and extra-price-key entries", () => {
+    expect(models.map((model) => model.id)).toEqual([
+      "~openai/gpt-luna-latest",
+      "tencent/hy3",
+      "anthropic/claude-sonnet-5",
+    ]);
+    expect(byId.get("~openai/gpt-luna-latest")).toMatchObject({
+      name: "OpenAI: GPT Luna Latest",
+      contextLength: 1_050_000,
+      pricing: {
+        prompt: "0.0000001",
+        variable: false,
+        tiers: [
+          {
+            prompt: "0.0000002",
+            completion: "0.00000075",
+            cacheRead: "0.00000002",
+            cacheWrite: "0.00000025",
+            reasoning: null,
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(models)).not.toContain("min_prompt_tokens");
+    expect(JSON.stringify(models)).not.toContain("alias_target");
+  });
+
+  it("imports the upper bound across the base price and every tier", () => {
+    const alias = byId.get("~openai/gpt-luna-latest");
+    const timeOfDay = byId.get("tencent/hy3");
+    const flat = byId.get("anthropic/claude-sonnet-5");
+    if (!alias || !timeOfDay || !flat) throw new Error("fixture");
+    // Long-prompt tier: 2x input, 1.5x output, 2x cache.
+    expect(catalogRatesPerMillion(alias)).toEqual({
+      input: "0.2",
+      output: "0.75",
+      cacheRead: "0.02",
+      cacheWrite: "0.25",
+      reasoning: "0.75",
+    });
+    // Time-of-day tier; cache writes are unpriced, so bounded by input.
+    expect(catalogRatesPerMillion(timeOfDay)).toEqual({
+      input: "0.132",
+      output: "0.528",
+      cacheRead: "0.033",
+      cacheWrite: "0.132",
+      reasoning: "0.528",
+    });
+    // Non-token keys (web_search, audio, 1h cache write) are not token rates.
+    expect(catalogRatesPerMillion(flat)).toEqual({
+      input: "3",
+      output: "15",
+      cacheRead: "0.3",
+      cacheWrite: "3.75",
+      reasoning: "15",
+    });
+  });
+
+  it("warns nothing about price for a boundable tiered alias", () => {
+    const alias = byId.get("~openai/gpt-luna-latest");
+    if (!alias) throw new Error("fixture");
+    expect(catalogCompatibility(alias, null).warn).toEqual(["MODERATED"]);
+  });
+});
+
+describe("tiered pricing that cannot be bounded", () => {
+  const tiered = (overrides: unknown) =>
+    parseCatalog({
+      data: [
+        catalogEntry({
+          pricing: { prompt: "0.000001", completion: "0.000002", overrides },
+        }),
+      ],
+    })[0];
+
+  it.each([
+    ["a variable tier", [{ min_prompt_tokens: 1000, prompt: "-1" }]],
+    ["a malformed tier price", [{ min_prompt_tokens: 1000, prompt: "lots" }]],
+    ["a non-array overrides value", { prompt: "0.000009" }],
+    ["a non-object tier", ["0.000009"]],
+  ])("treats %s as unknown price (fail closed)", (_label, overrides) => {
+    const model = tiered(overrides);
+    if (!model) throw new Error("fixture");
+    expect(model.pricing.variable).toBe(true);
+    expect(catalogRatesPerMillion(model)).toBeNull();
+    expect(catalogCompatibility(model, null).warn).toContain("UNKNOWN_PRICE");
+  });
+
+  it("ignores an empty or null overrides list", () => {
+    for (const overrides of [[], null]) {
+      const model = tiered(overrides);
+      if (!model) throw new Error("fixture");
+      expect(catalogRatesPerMillion(model)).toMatchObject({ input: "1", output: "2" });
+    }
+  });
+
+  it("bounds a tier that omits a category by the base rate and the fallback", () => {
+    const model = tiered([{ min_prompt_tokens: 1000, completion: "0.000004" }]);
+    if (!model) throw new Error("fixture");
+    expect(catalogRatesPerMillion(model)).toEqual({
+      input: "1",
+      output: "4",
+      cacheRead: "1",
+      cacheWrite: "1",
+      reasoning: "4",
+    });
+  });
+});
+
 describe("catalogModelIdSchema", () => {
-  it.each(["qwen/qwen3-coder", "meta/llama-4:free", "openai/gpt-6-luna-pro:batch", "a/b.c_d~e"])(
-    "accepts %s verbatim",
-    (value) => expect(catalogModelIdSchema.parse(value)).toBe(value),
-  );
-  it.each(["qwen", "/qwen", "qwen/", "a b/c", "qwen/qwen coder", "x".repeat(256)])(
-    "rejects %s",
-    (value) => expect(catalogModelIdSchema.safeParse(value).success).toBe(false),
-  );
+  it.each([
+    "qwen/qwen3-coder",
+    "meta/llama-4:free",
+    "openai/gpt-6-luna-pro:batch",
+    "a/b.c_d~e",
+    "~openai/gpt-luna-latest",
+    "~z-ai/glm-latest",
+  ])("accepts %s verbatim", (value) => expect(catalogModelIdSchema.parse(value)).toBe(value));
+  it.each([
+    "qwen",
+    "/qwen",
+    "qwen/",
+    "a b/c",
+    "qwen/qwen coder",
+    "x".repeat(256),
+    "~~openai/x",
+    "~/x",
+    "~",
+  ])("rejects %s", (value) => expect(catalogModelIdSchema.safeParse(value).success).toBe(false));
 });
 
 describe("searchCatalog", () => {

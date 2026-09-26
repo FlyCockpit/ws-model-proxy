@@ -67,9 +67,13 @@ export function ProviderCatalogRowSummary({ row }: { row: ProviderCatalogRow }) 
               })}
         </Badge>
         <Badge>
-          {input === null || output === null
-            ? t("dashboard:providerCatalog.picker.priceUnknown")
-            : t("dashboard:providerCatalog.picker.price", { input, output })}
+          {row.pricing.variable
+            ? t("dashboard:providerCatalog.picker.priceVaries")
+            : input === null || output === null
+              ? t("dashboard:providerCatalog.picker.priceUnknown")
+              : row.pricing.tiered
+                ? t("dashboard:providerCatalog.picker.priceTiered", { input, output })
+                : t("dashboard:providerCatalog.picker.price", { input, output })}
         </Badge>
         {row.supportsTools ? (
           <Badge>
@@ -146,6 +150,8 @@ export function ProviderCatalogPicker({
   const search = useProviderCatalogSearch({ query, poolId, toolsOnly, enabled: !disabled });
 
   const body = (() => {
+    // A disabled picker never runs its query, so it would otherwise stay pending.
+    if (disabled) return null;
     if (search.isPending) return <PickerSkeleton />;
     if (search.isError)
       return (

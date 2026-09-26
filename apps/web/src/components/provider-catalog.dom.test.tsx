@@ -91,6 +91,7 @@ function row(id: string, overrides: Partial<Row> = {}): Row {
       cacheRead: null,
       cacheWrite: null,
       variable: false,
+      tiered: false,
     },
     supportsTools: true,
     supportsReasoning: false,
@@ -172,6 +173,41 @@ describe("ProviderCatalogPicker", () => {
     expect(list?.className).toContain("overscroll-contain");
     const item = container.querySelector("[data-slot='command-item']");
     expect(item?.className).toContain("min-h-11");
+  });
+
+  it("tells a variable price, a missing price and tiered prices apart", async () => {
+    const base = {
+      prompt: "0.000003",
+      completion: "0.000015",
+      cacheRead: null,
+      cacheWrite: null,
+      variable: false,
+      tiered: false,
+    };
+    state.respond = () => ({
+      status: "ok",
+      items: [
+        row("x/varies", {
+          pricing: { ...base, prompt: null, completion: null, variable: true },
+        }),
+        row("x/missing", { pricing: { ...base, completion: null } }),
+        row("x/tiered", { pricing: { ...base, tiered: true } }),
+      ],
+      nextCursor: null,
+    });
+    wrap(<ProviderCatalogPicker onSelect={vi.fn()} />);
+    await screen.findByText("Name x/tiered");
+    expect(screen.getByText("dashboard:providerCatalog.picker.priceVaries")).toBeTruthy();
+    expect(screen.getByText("dashboard:providerCatalog.picker.priceUnknown")).toBeTruthy();
+    expect(
+      screen.getByText('dashboard:providerCatalog.picker.priceTiered|{"input":"3","output":"15"}'),
+    ).toBeTruthy();
+  });
+
+  it("shows no endless skeleton when disabled", () => {
+    const { container } = wrap(<ProviderCatalogPicker onSelect={vi.fn()} disabled />);
+    expect(container.querySelector("[data-slot='skeleton']")).toBeNull();
+    expect(state.searchCalls).toEqual([]);
   });
 
   it("debounces the query and sends the pool id and tool filter", async () => {
@@ -259,6 +295,34 @@ describe("ProviderCatalogImport", () => {
         'dashboard:providerCatalog.import.contextDrift|{"catalog":131072,"current":8000}',
       ),
     ).toBeTruthy();
+  });
+
+  it.each([
+    ["userPricingKept", "dashboard:providerCatalog.import.pricingUserKept"],
+    ["catalogPricingRetired", "dashboard:providerCatalog.import.pricingCatalogRetired"],
+    ["updated", "dashboard:providerCatalog.import.pricingUpdated"],
+    ["scheduledPricingExists", "dashboard:providerCatalog.import.pricingScheduled"],
+  ])("reports the %s pricing outcome truthfully", async (pricing, note) => {
+    state.respond = () => ({ status: "ok", items: [row("vendor/pick")], nextCursor: null });
+    state.importResult = {
+      created: false,
+      restored: false,
+      pricing,
+      priceTiered: pricing === "updated",
+      contextWindowDrift: null,
+      model: {},
+      compatibility: { verdict: "ok", block: [], warn: [] },
+    };
+    wrap(<ProviderCatalogImport providerAccountId="acct-1" />);
+    fireEvent.click(await screen.findByText("Name vendor/pick"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "dashboard:providerCatalog.import.action" }),
+    );
+    await screen.findByText(note);
+    expect(screen.queryByText("dashboard:providerCatalog.import.pricingUnknown")).toBeNull();
+    expect(Boolean(screen.queryByText("dashboard:providerCatalog.import.pricingTiered"))).toBe(
+      pricing === "updated",
+    );
   });
 });
 

@@ -15,8 +15,10 @@ import { orpc } from "@/utils/orpc";
 
 /**
  * Owner-side declaration of the pool's external equivalent (an OpenRouter
- * catalog id). It is a default suggestion and the owner's consent for callers'
- * own keys; it routes nothing by itself. Clearing works with the switch off.
+ * catalog id). Declaring it is the owner's consent that people who can use
+ * this pool may bring their own provider keys (BYOK); it is also the default
+ * suggestion while each user picks their own model. Clearing withdraws that
+ * consent and works with the switch off.
  */
 export function PoolExternalEquivalentSection({ poolId }: { poolId: string }) {
   const { t } = useTranslation(["dashboard"]);
