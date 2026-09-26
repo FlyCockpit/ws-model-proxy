@@ -143,6 +143,13 @@ export const USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS = 1_000;
  */
 export const SHARED_DISCONNECT_TIMEOUT_MS = 2_000;
 
+/**
+ * Bound on step 1's awaited work in `stopPeriodicJobs` (index.ts): capacity
+ * maintenance stop closes the LISTEN client's socket via `Client.end()`, which
+ * otherwise waits indefinitely for the peer to close the connection.
+ */
+export const PERIODIC_JOBS_STOP_TIMEOUT_MS = 2_000;
+
 /** HTTP drain deadline (`drainHttpWithDeadline`, index.ts `drainHttp`). */
 export const HTTP_DRAIN_TIMEOUT_MS = 10_000;
 
@@ -171,10 +178,10 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * pending. It is the sum of the step bounds plus a margin, so it never fires
  * before a bounded step finishes:
  *
- *   HTTP drain 10 s + relay close 5 s + capacity runtime close 5 s
- *   + MCP close 10 s + sweep join 7.5 s + sweep disconnect 1 s
- *   + shared disconnect 2 s = 40.5 s, plus a 4.5 s margin (periodic-job
- *   stop, browser socket close, JavaScript continuations) = 45 s.
+ *   periodic-job stop 2 s + HTTP drain 10 s + relay close 5 s
+ *   + capacity runtime close 5 s + MCP close 10 s + sweep join 7.5 s
+ *   + sweep disconnect 1 s + shared disconnect 2 s = 42.5 s, plus a 4.5 s
+ *   margin (browser socket close, JavaScript continuations) = 47 s.
  *
  * Any future step that waits without a bound still ends here. The timer is
  * unref'd, so it never keeps an otherwise finished process alive, and it uses
@@ -187,7 +194,7 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * can land anywhere in the sequence (for the sweep, the same uncertain-outcome
  * case as a quarantine; the durable marker and generation make it
  * recoverable). A deployment that wants every step to finish sets its
- * platform's stop grace to at least this deadline plus a margin, 50 s
- * (`docker stop -t 50`, compose `stop_grace_period: 50s`).
+ * platform's stop grace to at least this deadline plus a margin, 52 s
+ * (`docker stop -t 52`, compose `stop_grace_period: 52s`).
  */
-export const PROCESS_SHUTDOWN_DEADLINE_MS = 45_000;
+export const PROCESS_SHUTDOWN_DEADLINE_MS = 47_000;

@@ -15,7 +15,6 @@ import {
   drainHttpWithDeadline,
   runGracefulShutdownSequence,
   runProcessShutdown,
-  runWithDeadline,
 } from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
@@ -35,7 +34,7 @@ import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
-import { HTTP_DRAIN_TIMEOUT_MS, RELAY_CLOSE_TIMEOUT_MS } from "./shutdown-timeouts.js";
+import { HTTP_DRAIN_TIMEOUT_MS } from "./shutdown-timeouts.js";
 import {
   createUserDeletionSweepClient,
   shutDownUserDeletionSweep,
@@ -277,11 +276,7 @@ async function runShutdownSequence() {
       terminalBrowserHub.closeAll();
     },
     closeRelaySessions: async () => {
-      await runWithDeadline(
-        () => relaySessionManager.closeRelaySessions(),
-        RELAY_CLOSE_TIMEOUT_MS,
-        "relay session close",
-      );
+      await relaySessionManager.closeRelaySessions();
     },
     // 1. Stop accepting new connections and drain in-flight requests.
     //    ORDER: admission stops first (relay drain flag makes terminal and

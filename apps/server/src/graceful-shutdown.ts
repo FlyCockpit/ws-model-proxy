@@ -3,7 +3,8 @@
  *
  * The load-bearing ORDER (unit-tested here):
  *
- *   1. stop periodic jobs (timers must not fire mid-shutdown);
+ *   1. stop periodic jobs (timers must not fire mid-shutdown). The capacity
+ *      maintenance stop closes the LISTEN client (`runWithDeadline`);
  *   2. close browser terminal sockets so they do not hold the HTTP drain;
  *   3. drain HTTP (`drainHttpWithDeadline`). Admission stops FIRST (relay
  *      drain flag + server.close), then the drain deadline starts, then idle
@@ -35,7 +36,9 @@
 
 import {
   CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+  PERIODIC_JOBS_STOP_TIMEOUT_MS,
   PROCESS_SHUTDOWN_DEADLINE_MS,
+  RELAY_CLOSE_TIMEOUT_MS,
   SHARED_DISCONNECT_TIMEOUT_MS,
 } from "./shutdown-timeouts.js";
 
@@ -75,7 +78,12 @@ export async function runGracefulShutdownSequence(deps: ShutdownSequenceDeps): P
     });
 
   try {
-    await deps.stopPeriodicJobs();
+    await runWithDeadline(
+      () => deps.stopPeriodicJobs(),
+      PERIODIC_JOBS_STOP_TIMEOUT_MS,
+      "periodic job stop",
+      { logError },
+    );
   } catch (error) {
     logError("[server] Error stopping periodic jobs during shutdown:", error);
   }
@@ -95,21 +103,26 @@ export async function runGracefulShutdownSequence(deps: ShutdownSequenceDeps): P
   }
 
   try {
-    await deps.closeRelaySessions();
-    log("[server] Relay sessions closed.");
+    const relayClose = await runWithDeadline(
+      () => deps.closeRelaySessions(),
+      RELAY_CLOSE_TIMEOUT_MS,
+      "relay session close",
+      { logError },
+    );
+    if (relayClose === "done") log("[server] Relay sessions closed.");
   } catch (error) {
     logError("[server] Error closing relay sessions:", error);
   }
 
   // Keep owners live until drain ends; their cleanup precedes the DB fence.
   try {
-    await runWithDeadline(
+    const capacityClose = await runWithDeadline(
       () => deps.closeCapacityRuntimes(),
       CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
       "capacity runtime close",
       { logError },
     );
-    log("[server] Capacity runtimes closed.");
+    if (capacityClose === "done") log("[server] Capacity runtimes closed.");
   } catch (error) {
     logError("[server] Error closing capacity runtimes:", error);
   }

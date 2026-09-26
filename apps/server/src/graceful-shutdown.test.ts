@@ -9,7 +9,9 @@ import {
 } from "./graceful-shutdown";
 import {
   CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS,
+  PERIODIC_JOBS_STOP_TIMEOUT_MS,
   PROCESS_SHUTDOWN_DEADLINE_MS,
+  RELAY_CLOSE_TIMEOUT_MS,
   SHARED_DISCONNECT_TIMEOUT_MS,
 } from "./shutdown-timeouts";
 
@@ -377,6 +379,33 @@ describe("runWithDeadline", () => {
     expect(warnings).toEqual(["[server] relay session close did not finish before its deadline."]);
   });
 
+  it("continues shutdown when periodic job stop hangs on listener close", async () => {
+    const order: string[] = [];
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: async () => {
+        order.push("stopPeriodicJobs");
+        await hang();
+      },
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {
+        order.push("drainHttp");
+      },
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: async () => {},
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {
+        order.push("disconnectPrisma");
+      },
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(PERIODIC_JOBS_STOP_TIMEOUT_MS);
+    await sequence;
+    expect(order.indexOf("drainHttp")).toBeGreaterThan(order.indexOf("stopPeriodicJobs"));
+    expect(order.at(-1)).toBe("disconnectPrisma");
+  });
+
   it("continues shutdown when capacity runtime close hangs on a stalled release", async () => {
     const order: string[] = [];
     const hang = () => new Promise<void>(() => {});
@@ -403,6 +432,58 @@ describe("runWithDeadline", () => {
     expect(order).toEqual(["closeCapacityRuntimes", "closeMcpHandler", "disconnectPrisma"]);
   });
 
+  it("does not log capacity runtimes closed when close hits its deadline", async () => {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message) => {
+      warnings.push(String(message));
+    });
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: async () => {},
+      closeCapacityRuntimes: () => hang(),
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {},
+      log: (message) => logs.push(message),
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS);
+    await sequence;
+    warnSpy.mockRestore();
+    expect(warnings).toContain(
+      "[server] capacity runtime close did not finish before its deadline.",
+    );
+    expect(logs.some((line) => line.includes("Capacity runtimes closed."))).toBe(false);
+  });
+
+  it("does not log relay sessions closed when relay close hits its deadline", async () => {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message) => {
+      warnings.push(String(message));
+    });
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: async () => {},
+      closeRelaySessions: () => hang(),
+      closeCapacityRuntimes: async () => {},
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {},
+      log: (message) => logs.push(message),
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(RELAY_CLOSE_TIMEOUT_MS);
+    await sequence;
+    warnSpy.mockRestore();
+    expect(warnings).toContain("[server] relay session close did not finish before its deadline.");
+    expect(logs.some((line) => line.includes("Relay sessions closed."))).toBe(false);
+  });
+
   it("lets a whole shutdown sequence finish while relay persistence hangs", async () => {
     const order: string[] = [];
     const hang = () => new Promise<void>(() => {});
@@ -423,7 +504,7 @@ describe("runWithDeadline", () => {
           warn: () => {},
         }),
       closeRelaySessions: async () => {
-        await runWithDeadline(hang, 5_000, "relay session close", { warn: () => {} });
+        order.push("closeRelaySessions");
       },
       closeCapacityRuntimes: async () => {},
       closeMcpHandler: async () => {},
@@ -435,7 +516,12 @@ describe("runWithDeadline", () => {
     });
     await vi.advanceTimersByTimeAsync(15_000);
     await sequence;
-    expect(order).toEqual(["stopAdmission", "closeIdleRelaySessions", "disconnectPrisma"]);
+    expect(order).toEqual([
+      "stopAdmission",
+      "closeIdleRelaySessions",
+      "closeRelaySessions",
+      "disconnectPrisma",
+    ]);
   });
 
   it("returns as soon as the work finishes", async () => {
