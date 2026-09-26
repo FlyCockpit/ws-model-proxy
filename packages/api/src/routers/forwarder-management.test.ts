@@ -7,6 +7,10 @@ import {
   parseDirectModelId,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
+import {
+  ParentDeletionDrainPendingError,
+  RetainedHistoryError,
+} from "@ws-model-proxy/db/parent-deletion";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
@@ -23,6 +27,25 @@ const mailerState = vi.hoisted(() => ({
     subject: "Pool may send requests to an external provider",
     html: "<p>external provider</p>",
   })),
+}));
+
+// The ordered-delete locking runs against real PostgreSQL
+// (capacity-lock-order.postgres.integration.test.ts); here it is observed.
+const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
+  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+}));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
+  lockCapacityGraphForDelete,
+}));
+// The history drain before an ordered delete runs against real PostgreSQL
+// (parent-deletion.postgres.integration.test.ts); here it is observed.
+const { prepareParentDeletion } = vi.hoisted(() => ({
+  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
+}));
+vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
+  prepareParentDeletion,
 }));
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -89,8 +112,11 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
     delete: MockInstance;
   };
+  cliDeviceCredential: { findMany: MockInstance };
+  cliToken: { findMany: MockInstance; updateMany: MockInstance };
   endpoint: {
     findUnique: MockInstance;
     delete: MockInstance;
@@ -279,6 +305,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolMember.findUnique.mockResolvedValue(null);
     db.providerModel.findFirst.mockResolvedValue(null);
+    // A foreign CLI device matches no owner-scoped row.
+    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
     const captures: Array<{ status: number; body: string }> = [];
     const rpc = httpClient(captures);
     const attempts = [
@@ -1782,7 +1810,8 @@ describe("forwarderManagementRouter", () => {
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: null,
+        reportedHostname: "desk-01.local",
         status: "CONNECTED",
         lastConnectedAt: new Date("2026-01-01T00:00:00Z"),
         lastDisconnectedAt: null,
@@ -1839,6 +1868,13 @@ describe("forwarderManagementRouter", () => {
       "renamed-owner/desk/local/llama",
     );
     expect(result[0]?.endpoints[0]?.models[0]?.executionTarget).toBeNull();
+    // No user-set name: the reported hostname is the display name.
+    expect(result[0]).toMatchObject({
+      slug: "desk",
+      name: null,
+      reportedHostname: "desk-01.local",
+      displayName: "desk-01.local",
+    });
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("127.0.0.1");
     expect(serialized).not.toContain("endpoint-secret");
@@ -1870,7 +1906,8 @@ describe("forwarderManagementRouter", () => {
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: "Desk",
+        reportedHostname: null,
         status: "CONNECTED",
         lastConnectedAt: new Date("2026-01-01T00:00:00Z"),
         lastDisconnectedAt: null,
@@ -1924,12 +1961,10 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("removes metadata only when the row belongs to the current user", async () => {
-    db.cliDevice.findUnique.mockResolvedValue({
-      id: "cli-id",
-      userId: "other-user-id",
-      status: "STALE",
-      lastHeartbeatAt: new Date("2026-01-01"),
-    });
+    // The owner-scoped precheck finds nothing for another user's device, so
+    // nothing is drained and no lock is taken.
+    db.cliDevice.findFirst.mockResolvedValue(null);
+    prepareParentDeletion.mockClear();
 
     await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toSatisfy(
       (error: ORPCError) => {
@@ -1937,7 +1972,55 @@ describe("forwarderManagementRouter", () => {
         return true;
       },
     );
+    expect(db.cliDevice.findFirst).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id" },
+      select: { lastHeartbeatAt: true },
+    });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("deletes a device with its credentials and closes their live relay sessions", async () => {
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+    prepareParentDeletion.mockClear();
+    db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    db.cliDevice.delete.mockResolvedValue({ id: "cli-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "device-credential-1" }]);
+    db.cliToken.findMany.mockResolvedValue([{ id: "cli-token-1" }]);
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
+    const onCliCredentialsRevoked = vi.fn();
+    const rpc = createRouterClient(forwarderManagementRouter, {
+      context: { ...buildContext(), services: { onCliCredentialsRevoked } },
+    });
+
+    await expect(rpc.removeCliDeviceMetadata({ id: "cli-id" })).resolves.toEqual({
+      deleted: true,
+    });
+
+    expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["cli-token-1"] }, revokedAt: null },
+      data: { revokedAt: expect.any(Date) },
+    });
+    expect(db.cliDevice.delete).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      select: { id: true },
+    });
+    expect(onCliCredentialsRevoked.mock.calls).toEqual([
+      [{ kind: "deviceCredential", ids: ["device-credential-1"] }],
+      [{ kind: "cliToken", ids: ["cli-token-1"] }],
+    ]);
+    // The request history is drained before the ordered delete.
+    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user-id",
+      cliDeviceIds: ["cli-id"],
+    });
+    expect(prepareParentDeletion.mock.invocationCallOrder[0]).toBeLessThan(
+      db.cliDevice.delete.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    // Sessions are closed only after the delete transaction committed.
+    const deleteOrder = db.cliDevice.delete.mock.invocationCallOrder[0] ?? Number.NaN;
+    expect(onCliCredentialsRevoked.mock.invocationCallOrder[0]).toBeGreaterThan(deleteOrder);
   });
 
   it("creates and updates owned model pools without touching grant ids", async () => {
@@ -3185,6 +3268,55 @@ describe("forwarderManagementRouter", () => {
       where: { id: "capacity-id", userId: "user-id", physicalMaxContext: null },
       data: { physicalMaxContext: 128_000 },
     });
+  });
+
+  it("locks the target (L2) and the adopted capacity row (L5) before filling or linking it", async () => {
+    // DL-1 L5-before-L2: a target without a capacity adopts its auto capacity
+    // and fills a null AUTO limit. Both writes follow the target's policy
+    // lock and the sorted capacity-row lock.
+    const raw = prisma as unknown as { $queryRaw: MockInstance; $executeRaw: MockInstance };
+    const extra = prisma as unknown as {
+      inferenceCapacity: { findUnique: MockInstance };
+      executionTarget: { updateMany: MockInstance };
+    };
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+      capacityContextCeiling: null,
+      capacityContextMargin: 0,
+    });
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "model-id",
+      userId: "user-id",
+      upstreamModelId: "model",
+    });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "target-id",
+      inferenceCapacityId: null,
+      InferenceCapacity: null,
+    });
+    db.inferenceCapacity.findMany.mockResolvedValue([{ id: "auto-capacity" }]);
+    extra.inferenceCapacity.findUnique.mockResolvedValue({ id: "auto-capacity" });
+    db.inferenceCapacity.updateMany.mockResolvedValue({ count: 1 });
+    extra.executionTarget.updateMany.mockResolvedValue({ count: 1 });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" });
+
+    const rawOrder = (fragment: string) => {
+      const index = raw.$queryRaw.mock.calls.findIndex(([strings]) =>
+        (strings as TemplateStringsArray).join("?").includes(fragment),
+      );
+      return raw.$queryRaw.mock.invocationCallOrder[index] ?? Number.NaN;
+    };
+    const targetLock = rawOrder("FROM execution_target WHERE id = ? FOR NO KEY UPDATE");
+    const capacityLock = rawOrder("FROM inference_capacity WHERE id IN (");
+    const fill = db.inferenceCapacity.updateMany.mock.invocationCallOrder[0] ?? Number.NaN;
+    const link = extra.executionTarget.updateMany.mock.invocationCallOrder[0] ?? Number.NaN;
+    expect(targetLock).toBeLessThan(capacityLock);
+    expect(capacityLock).toBeLessThan(fill);
+    expect(capacityLock).toBeLessThan(link);
   });
 
   it("maps duplicate local pool members to CONFLICT without swallowing other errors", async () => {
@@ -4649,6 +4781,14 @@ describe("forwarderManagementRouter", () => {
       expect(db.poolMember.delete).toHaveBeenCalledWith({
         where: { id: "member-a" },
       });
+      // Capacity lock order: the member's delete locks precede the DELETE.
+      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+        userId: "user-id",
+        poolMemberIds: ["member-a"],
+      });
+      expect(lockCapacityGraphForDelete.mock.invocationCallOrder.at(-1)).toBeLessThan(
+        db.poolMember.delete.mock.invocationCallOrder.at(-1) ?? 0,
+      );
       expect(db.poolMember.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { poolId: "pool-id", id: { not: "member-a" } } }),
       );
@@ -4835,13 +4975,36 @@ describe("forwarderManagementRouter", () => {
       expect(result.impactedPools).toEqual([]);
     });
 
+    it("removeEndpointMetadata passes endpointIds in the capacity lock scope", async () => {
+      db.endpoint.findUnique.mockResolvedValue({
+        id: "endpoint-id",
+        userId: "user-id",
+        cliDeviceId: "cli-device-id",
+        lastSeenAt: null,
+      });
+      db.executionTarget.findMany.mockResolvedValue([{ id: "target-id" }]);
+      db.endpoint.delete.mockResolvedValue({ id: "endpoint-id" });
+
+      await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).resolves.toEqual({
+        deleted: true,
+      });
+      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+        userId: "user-id",
+        lockedCliDeviceIds: ["cli-device-id"],
+        executionTargetIds: ["target-id"],
+        endpointIds: ["endpoint-id"],
+      });
+    });
+
     it("removeDiscoveredModelMetadata computes the post-deletion surface after capturing affected pools", async () => {
       db.discoveredModel.findUnique.mockResolvedValue({
         id: "model-id",
         userId: "user-id",
         lastSeenAt: null,
+        Endpoint: { cliDeviceId: "cli-device-id" },
       });
       db.discoveredModel.delete.mockResolvedValue({ id: "model-id" });
+      db.executionTarget.findMany.mockResolvedValueOnce([{ id: "target-id" }]);
       // The responses-native member cascades away with the deleted model, so
       // the post-deletion primary set of pool-a is chat-only under a stored
       // responses override: unservable.
@@ -4856,7 +5019,218 @@ describe("forwarderManagementRouter", () => {
         impactedPools: [{ id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" }],
       });
       expect(db.discoveredModel.delete).toHaveBeenCalledWith({ where: { id: "model-id" } });
+      // Capacity lock order: the owning device (L0) and the model's target
+      // cascade are locked before the DELETE.
+      // The model is named for the in-transaction residual recount.
+      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+        userId: "user-id",
+        lockedCliDeviceIds: ["cli-device-id"],
+        executionTargetIds: ["target-id"],
+        discoveredModelIds: ["model-id"],
+      });
     });
+
+    describe("deletion CONFLICT reasons", () => {
+      const recent = new Date("2026-06-01T00:00:00Z");
+      const staleBefore = new Date("2026-05-31T00:00:00Z");
+
+      it("endpoint: a recent precheck heartbeat is not_stale", async () => {
+        db.endpoint.findUnique.mockResolvedValue({ userId: "user-id", lastSeenAt: recent });
+        await expect(
+          client().removeEndpointMetadata({ id: "endpoint-id", staleBefore }),
+        ).rejects.toMatchObject({
+          code: "CONFLICT",
+          message: "Endpoint is not stale.",
+          data: { reason: "not_stale" },
+        });
+        expect(prepareParentDeletion).not.toHaveBeenCalled();
+      });
+
+      it("endpoint: a heartbeat under the locks is not_stale", async () => {
+        db.endpoint.findUnique
+          .mockResolvedValueOnce({ userId: "user-id", lastSeenAt: null })
+          .mockResolvedValueOnce({ id: "endpoint-id", userId: "user-id", cliDeviceId: "cli" })
+          .mockResolvedValueOnce({ lastSeenAt: recent });
+        db.executionTarget.findMany.mockResolvedValue([]);
+        await expect(
+          client().removeEndpointMetadata({ id: "endpoint-id", staleBefore }),
+        ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
+        expect(db.endpoint.delete).not.toHaveBeenCalled();
+      });
+
+      it("discovered model: precheck and under-lock heartbeats are not_stale", async () => {
+        db.discoveredModel.findUnique.mockResolvedValueOnce({
+          userId: "user-id",
+          lastSeenAt: recent,
+        });
+        await expect(
+          client().removeDiscoveredModelMetadata({ id: "model-id", staleBefore }),
+        ).rejects.toMatchObject({
+          code: "CONFLICT",
+          message: "Discovered model is not stale.",
+          data: { reason: "not_stale" },
+        });
+        db.discoveredModel.findUnique
+          .mockResolvedValueOnce({ userId: "user-id", lastSeenAt: null })
+          .mockResolvedValueOnce({
+            id: "model-id",
+            userId: "user-id",
+            Endpoint: { cliDeviceId: "cli" },
+          })
+          .mockResolvedValueOnce({ lastSeenAt: recent });
+        db.executionTarget.findMany.mockResolvedValue([]);
+        await expect(
+          client().removeDiscoveredModelMetadata({ id: "model-id", staleBefore }),
+        ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
+        expect(db.discoveredModel.delete).not.toHaveBeenCalled();
+      });
+
+      it("endpoint: retained history and an undrained residual carry their reasons", async () => {
+        db.endpoint.findUnique.mockResolvedValue({ userId: "user-id", lastSeenAt: null });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
+        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "delete_pending" },
+        });
+        expect(db.endpoint.delete).not.toHaveBeenCalled();
+      });
+
+      it("pool: retained history and an undrained residual carry their reasons", async () => {
+        db.modelPool.findUnique.mockResolvedValue({
+          id: "pool-id",
+          userId: "user-id",
+          publicEgressEnabled: false,
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
+        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "delete_pending" },
+        });
+        expect(db.modelPool.delete).not.toHaveBeenCalled();
+      });
+
+      it("pool member: retained history carries its reason", async () => {
+        db.poolMember.findUnique.mockResolvedValue({
+          id: "member-a",
+          poolId: "pool-id",
+          tier: "PUBLIC_OVERFLOW",
+          ModelPool: {
+            userId: "user-id",
+            recommendedSurfaceOverride: null,
+            protocolAdaptationEnabled: false,
+          },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removePoolMember({ id: "member-a" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        expect(db.poolMember.delete).not.toHaveBeenCalled();
+      });
+
+      it("CLI device: retained history carries its reason", async () => {
+        db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+      });
+    });
+  });
+});
+
+describe("renameCliDevice", () => {
+  function renameClient(userId = "user-id") {
+    return createRouterClient(forwarderManagementRouter, {
+      context: buildContext({ user: { id: userId } }),
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("sets a trimmed name on an owned device and returns its display name", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      slug: "desk",
+      name: "Work laptop",
+      reportedHostname: "desk-01.local",
+    });
+
+    const result = await renameClient().renameCliDevice({
+      cliDeviceId: "cli-id",
+      name: "  Work laptop  ",
+    });
+
+    expect(db.cliDevice.update).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      data: { name: "Work laptop" },
+      select: { id: true, slug: true, name: true, reportedHostname: true },
+    });
+    expect(result).toEqual({
+      cliDeviceId: "cli-id",
+      name: "Work laptop",
+      displayName: "Work laptop",
+    });
+  });
+
+  it("clears the name with null so the hostname shows again", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      slug: "desk",
+      name: null,
+      reportedHostname: "desk-01.local",
+    });
+
+    const result = await renameClient().renameCliDevice({ cliDeviceId: "cli-id", name: null });
+
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { name: null } }),
+    );
+    expect(result.displayName).toBe("desk-01.local");
+  });
+
+  it("rejects blank, over-long, and invisible-character names before touching the database", async () => {
+    for (const name of ["   ", "x".repeat(121), "desk\u0000", "desk\u202Epot", "desk\u200Bpot"]) {
+      const error = await renameClient()
+        .renameCliDevice({ cliDeviceId: "cli-id", name })
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ORPCError);
+      if (error instanceof ORPCError) expect(error.code).toBe("BAD_REQUEST");
+    }
+    expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("uses the same not-found error for an unknown device and another user's device", async () => {
+    db.cliDevice.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "cli-id", userId: "other-user" });
+    const unknown = await renameClient()
+      .renameCliDevice({ cliDeviceId: "missing", name: "Desk" })
+      .catch((error: unknown) => error);
+    const foreign = await renameClient()
+      .renameCliDevice({ cliDeviceId: "cli-id", name: "Desk" })
+      .catch((error: unknown) => error);
+    for (const error of [unknown, foreign]) {
+      expect(error).toBeInstanceOf(ORPCError);
+      if (error instanceof ORPCError) expect(error.code).toBe("NOT_FOUND");
+    }
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
   });
 });
 
@@ -4875,7 +5249,7 @@ describe("setCliDeviceFeatureGrants", () => {
       id: "cli-id",
       userId: "user-id",
       reportedHumanTerminal: true,
-      reportedMcpCommands: true,
+      reportedMcpCommandMode: "UNSUPERVISED",
       reportedTerminalSupported: true,
       ...overrides,
     };
@@ -4886,7 +5260,7 @@ describe("setCliDeviceFeatureGrants", () => {
     db.cliDevice.update.mockResolvedValue({
       id: "cli-id",
       allowHumanTerminal: true,
-      allowMcpCommands: false,
+      mcpCommandMode: "OFF",
     });
   });
 
@@ -4923,16 +5297,73 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(db.cliDevice.update).not.toHaveBeenCalled();
   });
 
-  it.each([false, null])(
-    "rejects enabling MCP commands when the CLI reports %s",
-    async (reported) => {
-      db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommands: reported }));
-      await expect(
-        grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", mcpCommands: true }),
-      ).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
-      expect(db.cliDevice.update).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    ["supervised", null],
+    ["supervised", "OFF"],
+    ["unsupervised", null],
+    ["unsupervised", "OFF"],
+    ["unsupervised", "SUPERVISED"],
+  ] as const)("rejects mode %s when the CLI reports %s", async (mode, reported) => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommandMode: reported }));
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", mcpCommandMode: mode }),
+    ).rejects.toSatisfy(
+      (error: ORPCError) => error.code === "BAD_REQUEST" && error.message.includes(mode),
+    );
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects the removed boolean mcpCommands input", async () => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        // @ts-expect-error the boolean grant was replaced by mcpCommandMode
+        mcpCommands: true,
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("sets a mode at or below the reported one and always allows off", async () => {
+    const hook = vi.fn();
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommandMode: "SUPERVISED" }));
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "SUPERVISED",
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        mcpCommandMode: "supervised",
+      }),
+    ).resolves.toEqual({
+      cliDeviceId: "cli-id",
+      humanTerminal: false,
+      mcpCommandMode: "supervised",
+    });
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { mcpCommandMode: "SUPERVISED" } }),
+    );
+
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommandMode: null }));
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        mcpCommandMode: "off",
+      }),
+    ).resolves.toMatchObject({ mcpCommandMode: "off" });
+    expect(db.cliDevice.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ data: { mcpCommandMode: "OFF" } }),
+    );
+    expect(hook).toHaveBeenCalledTimes(2);
+  });
 
   it("enables a reported terminal, allows disabling without a report, and fires the hook", async () => {
     const hook = vi.fn();
@@ -4940,23 +5371,23 @@ describe("setCliDeviceFeatureGrants", () => {
     db.cliDevice.update.mockResolvedValue({
       id: "cli-id",
       allowHumanTerminal: true,
-      allowMcpCommands: false,
+      mcpCommandMode: "OFF",
     });
     await expect(
       grantsClient("user-id", hook).setCliDeviceFeatureGrants({
         cliDeviceId: "cli-id",
         humanTerminal: true,
-        mcpCommands: false,
+        mcpCommandMode: "off",
       }),
     ).resolves.toEqual({
       cliDeviceId: "cli-id",
       humanTerminal: true,
-      mcpCommands: false,
+      mcpCommandMode: "off",
     });
     expect(db.cliDevice.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "cli-id" },
-        data: { allowHumanTerminal: true, allowMcpCommands: false },
+        data: { allowHumanTerminal: true, mcpCommandMode: "OFF" },
       }),
     );
     expect(hook).toHaveBeenCalledWith("cli-id");
@@ -4964,14 +5395,14 @@ describe("setCliDeviceFeatureGrants", () => {
     db.cliDevice.findUnique.mockResolvedValue(
       deviceRow({
         reportedHumanTerminal: null,
-        reportedMcpCommands: null,
+        reportedMcpCommandMode: null,
         reportedTerminalSupported: null,
       }),
     );
     db.cliDevice.update.mockResolvedValue({
       id: "cli-id",
       allowHumanTerminal: false,
-      allowMcpCommands: false,
+      mcpCommandMode: "OFF",
     });
     await expect(
       grantsClient("user-id", hook).setCliDeviceFeatureGrants({
@@ -4984,31 +5415,33 @@ describe("setCliDeviceFeatureGrants", () => {
 
   it("does not fire the hook when enabling is rejected", async () => {
     const hook = vi.fn();
-    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommands: null }));
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommandMode: null }));
     await expect(
       grantsClient("user-id", hook).setCliDeviceFeatureGrants({
         cliDeviceId: "cli-id",
-        mcpCommands: true,
+        mcpCommandMode: "supervised",
       }),
     ).rejects.toBeInstanceOf(ORPCError);
     expect(hook).not.toHaveBeenCalled();
   });
 
-  it("reports live terminal availability from the session snapshot and stored columns when offline", async () => {
+  it("reports terminal and command features from the live snapshot and stored columns", async () => {
     db.cliDevice.findMany.mockResolvedValue([
       {
         id: "cli-id",
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: "Desk",
+        reportedHostname: "desk-01.local",
         status: "DISCONNECTED",
         allowHumanTerminal: true,
-        allowMcpCommands: false,
-        cliVersion: "1.2.0",
-        relayProtocolVersion: "2.4",
+        mcpCommandMode: "UNSUPERVISED",
+        cliVersion: "0.4.0",
+        relayProtocolVersion: "2.6",
         reportedHumanTerminal: true,
-        reportedMcpCommands: false,
+        reportedMcpCommandMode: "SUPERVISED",
+        reportedTerminalApproval: false,
         reportedTerminalSupported: true,
         User: { slug: "owner" },
         Endpoints: [],
@@ -5023,41 +5456,58 @@ describe("setCliDeviceFeatureGrants", () => {
         deviceAllows: true,
         supported: true,
         live: false,
+        approvalRequired: false,
         available: false,
       },
       commands: {
-        granted: false,
-        deviceAllows: false,
+        mode: "unsupervised",
+        deviceMode: "supervised",
+        supported: true,
         live: false,
+        effectiveMode: "off",
         available: false,
       },
     });
-    expect(offline[0]?.cliVersion).toBe("1.2.0");
-    expect(offline[0]?.relayProtocolVersion).toBe("2.4");
+    expect(offline[0]?.displayName).toBe("Desk");
+    expect(offline[0]?.cliVersion).toBe("0.4.0");
 
-    const live = await createRouterClient(forwarderManagementRouter, {
-      context: {
-        ...buildContext(),
-        services: {
-          getLiveCliFeatures: () =>
-            new Map([
-              [
-                "cli-id",
-                {
-                  protocolVersion: "2.4",
-                  cliVersion: "1.2.0",
-                  humanTerminal: true,
-                  mcpCommands: false,
-                  terminalSupported: true,
-                  terminalApproval: false,
-                  terminalPublicKey: "key",
-                },
-              ],
-            ]),
+    const liveClient = (mcpCommandMode: "off" | "supervised" | "unsupervised") =>
+      createRouterClient(forwarderManagementRouter, {
+        context: {
+          ...buildContext(),
+          services: {
+            getLiveCliFeatures: () =>
+              new Map([
+                [
+                  "cli-id",
+                  {
+                    protocolVersion: "2.6",
+                    cliVersion: "0.4.0",
+                    humanTerminal: true,
+                    mcpCommandMode,
+                    supervisedCommands: true,
+                    terminalSupported: true,
+                    terminalApproval: false,
+                    terminalPublicKey: "key",
+                  },
+                ],
+              ]),
+          },
         },
-      },
-    }).listCliDevices();
+      });
+    const live = await liveClient("supervised").listCliDevices();
     expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
-    expect(live[0]?.features.commands).toMatchObject({ live: false, available: false });
+    // Grant unsupervised, live CLI supervised: the lower one applies.
+    expect(live[0]?.features.commands).toMatchObject({
+      live: true,
+      effectiveMode: "supervised",
+      available: true,
+    });
+    const liveOff = await liveClient("off").listCliDevices();
+    expect(liveOff[0]?.features.commands).toMatchObject({
+      live: true,
+      effectiveMode: "off",
+      available: false,
+    });
   });
 });

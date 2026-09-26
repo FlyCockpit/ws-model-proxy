@@ -127,10 +127,19 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   # invokes `prisma db push`. When the heredoc closes, the session exits and
   # the lock is released.
   #
-  # We call the prisma CLI by its copied path (node_modules/.bin/prisma)
-  # rather than `npx prisma`: the binary is COPY'd into the image explicitly
-  # by both Dockerfiles, and the global npm/npx is stripped from the runtime
-  # image (it is never used at runtime and its vendored deps drag in CVEs).
+  # scripts/push-schema.mjs calls the prisma CLI by its copied path
+  # (node_modules/.bin/prisma) rather than `npx prisma`: the binary is COPY'd
+  # into the image explicitly, and the global npm/npx is stripped from the
+  # runtime image (it is never used at runtime and its vendored deps drag in
+  # CVEs).
+  #
+  # Lock order against the live application (DL-1): schema hardening locks
+  # every table it touches up front with NOWAIT and retries, so it never waits
+  # while holding a lock (apply-schema-hardening.mjs; it also skips entirely
+  # when the SQL and catalog are unchanged since its last apply). Prisma's
+  # push cannot lock up front, so it is the one deploy-only exception:
+  # push-schema.mjs gives every push statement a short lock_timeout and
+  # re-runs the whole (declarative) push on a lock timeout or deadlock.
   #
   # Connect psql via discrete libpq PG* env vars rather than passing
   # DATABASE_URL as a CLI argument. A CLI argument is visible in
@@ -185,7 +194,7 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   ' schema-launch "$SCHEMA_LAUNCH_GATE" psql -v ON_ERROR_STOP=1 <<EOF &
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
-\! cd "$DB_PACKAGE_DIR" && node_modules/.bin/prisma db push $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
+\! cd "$DB_PACKAGE_DIR" && node scripts/push-schema.mjs $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
   # Executable tests use this narrow hook to deliver a signal in the otherwise

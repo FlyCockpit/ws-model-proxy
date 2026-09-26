@@ -1,7 +1,9 @@
 import { Link, useParams } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 
+import { AgentRequestsBadge } from "@/components/agent-requests-badge";
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
 
@@ -14,6 +16,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
   const { state } = useAuthSession();
   const session = state.session;
   const { t } = useTranslation("nav");
+  const agentRequests = usePendingAgentRequests();
   const items = getNavItems({
     placement: "mobile",
     isAuthenticated: Boolean(session),
@@ -40,7 +43,15 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
                 "flex flex-col items-center justify-center gap-0.5 px-3 py-1.5 text-primary transition-colors min-w-[64px] min-h-[44px]",
             }}
           >
-            <item.icon className="size-5" />
+            <span className="relative">
+              <item.icon className="size-5" />
+              {item.id === "dashboard" ? (
+                <AgentRequestsBadge
+                  count={agentRequests.count}
+                  className="absolute -top-1.5 -end-2.5"
+                />
+              ) : null}
+            </span>
             <span className="text-[10px] font-medium leading-tight">{t(item.labelKey)}</span>
           </Link>
         ))}

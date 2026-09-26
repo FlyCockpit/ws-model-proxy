@@ -13,8 +13,14 @@ import responsesConformanceFixture from "./protocols/fixtures/generated-conforma
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  // The real Prisma namespace (Sql builder, error classes) is needed by the
+  // usage-rollup writer; the client itself stays a deep mock.
+  const actual = await vi.importActual<typeof import("@ws-model-proxy/db")>("@ws-model-proxy/db");
+  return { default: mockDeep(), Prisma: actual.Prisma };
 });
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: { DATABASE_URL: "postgresql://routes-test", NODE_ENV: "test" },
+}));
 
 const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
@@ -85,6 +91,7 @@ type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
+  $executeRaw: MockInstance;
   executionTarget: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -1379,8 +1386,8 @@ describe("model API routes", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           status: "SUCCEEDED",
-          completedAt: new Date("2026-08-26T00:00:00.000Z"),
-          durationMs: 0,
+          completedAt: expect.any(Date),
+          durationMs: expect.any(Number),
         }),
       }),
     );
@@ -2647,6 +2654,453 @@ describe("model API routes", () => {
     );
   });
 
+  describe("usage rollups (exactly once per terminal transition)", () => {
+    function rollupRow(data: Record<string, unknown>) {
+      return {
+        id: "relay-request-id",
+        userId: token.userId,
+        status: data.status,
+        source: "API_TOKEN",
+        startedAt: new Date("2026-08-26T00:00:00.000Z"),
+        completedAt: data.completedAt ?? new Date("2026-08-26T00:00:01.000Z"),
+        durationMs: data.durationMs ?? 1000,
+        firstClientByteAt: null,
+        requestedModelPoolId: null,
+        selectedPoolMemberId: null,
+        requestedExecutionTargetId: "execution-target-id",
+        selectedExecutionTargetId: "execution-target-id",
+        attemptCount: 1,
+        promptTokens: data.promptTokens ?? null,
+        completionTokens: data.completionTokens ?? null,
+        cacheReadTokens: data.cacheReadTokens ?? null,
+        cacheWriteTokens: data.cacheWriteTokens ?? null,
+        usageKnown: data.usageKnown ?? false,
+      };
+    }
+
+    function rollupStatements() {
+      return db.$executeRaw.mock.calls.filter(([sql]) =>
+        String((sql as { sql?: string }).sql ?? "").includes("usage_rollup_minute"),
+      );
+    }
+
+    async function relayDirectSuccess(manager: FakeRelayManager, body: unknown) {
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(sent.requestId, JSON.stringify(body));
+      manager.complete(sent.requestId);
+      await response.arrayBuffer();
+      return response;
+    }
+
+    it("parses usage server-side and writes one rollup increment in the terminal transaction", async () => {
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) =>
+          args.where.status === "PENDING" ? rollupRow(args.data) : { id: "relay-request-id" },
+      );
+      const manager = new FakeRelayManager();
+      const response = await relayDirectSuccess(manager, {
+        id: "chatcmpl",
+        choices: [],
+        usage: {
+          prompt_tokens: 120,
+          completion_tokens: 7,
+          total_tokens: 127,
+          prompt_tokens_details: { cached_tokens: 100 },
+        },
+      });
+      expect(response.status).toBe(200);
+      await vi.waitFor(() => expect(rollupStatements()).toHaveLength(1));
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: expect.objectContaining({
+            status: "SUCCEEDED",
+            promptTokens: 120,
+            completionTokens: 7,
+            cacheReadTokens: 100,
+            usageKnown: true,
+          }),
+        }),
+      );
+      expect(db.relayRequest.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ source: "API_TOKEN" }) }),
+      );
+      // The increment and the transition share one transaction.
+      const transitionTx = db.$transaction.mock.calls.length;
+      expect(transitionTx).toBeGreaterThan(0);
+    });
+
+    it("writes no increment when another finalizer already moved the request out of PENDING", async () => {
+      const { Prisma } = await import("@ws-model-proxy/db");
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(async (args: { where: { status?: string } }) => {
+        if (args.where.status === "PENDING")
+          throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+            code: "P2025",
+            clientVersion: "test",
+          });
+        return { id: "relay-request-id" };
+      });
+      const manager = new FakeRelayManager();
+      const response = await relayDirectSuccess(manager, { id: "chatcmpl", choices: [] });
+      expect(response.status).toBe(200);
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({ where: { id: "relay-request-id", status: "PENDING" } }),
+        ),
+      );
+      expect(rollupStatements()).toHaveLength(0);
+    });
+
+    it("finalizes a pool request whose member attempt ends non-retryably (client abort before headers) exactly once as CANCELED", async () => {
+      // Stateful attempt rows: the ACTIVE -> terminal claim succeeds once per
+      // attempt, like the real guarded updateMany.
+      const attemptStates = new Map<string, string>();
+      db.relayExecutionAttempt.create.mockImplementation(
+        async (args: { data: { attemptId: string } }) => {
+          attemptStates.set(args.data.attemptId, "ACTIVE");
+          return { attemptId: args.data.attemptId };
+        },
+      );
+      db.relayExecutionAttempt.updateMany.mockImplementation(
+        async (args: {
+          where: { attemptId?: string | { in: string[] }; state?: string };
+          data: { state?: string };
+        }) => {
+          const attemptId = args.where.attemptId;
+          if (typeof attemptId !== "string") return { count: 0 };
+          if (attemptStates.get(attemptId) !== args.where.state) return { count: 0 };
+          if (args.data.state) attemptStates.set(attemptId, args.data.state);
+          return { count: 1 };
+        },
+      );
+      let requestStatus = "PENDING";
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) => {
+          if (args.where.status !== "PENDING") return { id: "relay-request-id" };
+          if (requestStatus !== "PENDING") {
+            const { Prisma } = await import("@ws-model-proxy/db");
+            throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+              code: "P2025",
+              clientVersion: "test",
+            });
+          }
+          requestStatus = String(args.data.status);
+          return {
+            ...rollupRow(args.data),
+            requestedModelPoolId: "pool-id",
+            selectedPoolMemberId: "member-a",
+          };
+        },
+      );
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const controller = new AbortController();
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      controller.abort();
+      await Promise.resolve(responsePromise).catch(() => undefined);
+
+      await vi.waitFor(() => expect(requestStatus).toBe("CANCELED"));
+      await vi.waitFor(() => expect(rollupStatements()).toHaveLength(1));
+      const [statement] = rollupStatements()[0] as [{ sql: string; values: unknown[] }];
+      // VALUES order: bucketStart, ownerUserId, requesterUserId, poolId,
+      // poolMemberId, executionTargetId, source, requests, successes, errors,
+      // cancels, ...
+      const values = statement.values;
+      expect(values.slice(3, 5)).toEqual(["pool-id", "member-a"]);
+      expect(values.slice(7, 11)).toEqual([1, 0, 0, 1]);
+      // One attempt row, claimed once, with its TERMINAL event.
+      expect([...attemptStates.values()]).toEqual(["CANCELED"]);
+      expect(db.relayExecutionEvent.createMany).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * Stateful finalization mocks: the attempt claim (ACTIVE -> terminal)
+     * succeeds once per attempt row and the request transition once per
+     * request, like the real guarded writes. Every claim/transition attempt
+     * is recorded so tests can count claimants.
+     */
+    function statefulFinalization({ poolId }: { poolId?: string } = {}) {
+      const attemptStates = new Map<string, string>();
+      const attemptClaims: string[] = [];
+      const transitions: Array<Record<string, unknown>> = [];
+      let requestStatus = "PENDING";
+      db.relayExecutionAttempt.create.mockImplementation(
+        async (args: { data: { attemptId: string } }) => {
+          attemptStates.set(args.data.attemptId, "ACTIVE");
+          return { attemptId: args.data.attemptId };
+        },
+      );
+      db.relayExecutionAttempt.updateMany.mockImplementation(
+        async (args: {
+          where: { attemptId?: string | { in: string[] }; state?: string };
+          data: { state?: string };
+        }) => {
+          const attemptId = args.where.attemptId;
+          if (typeof attemptId !== "string") return { count: 0 };
+          // Terminal claims only (they set a terminal state); first-byte
+          // stamps and heartbeats are not claimants.
+          if (args.data.state && args.data.state !== "ACTIVE") attemptClaims.push(attemptId);
+          if (attemptStates.get(attemptId) !== args.where.state) return { count: 0 };
+          if (args.data.state) attemptStates.set(attemptId, args.data.state);
+          return { count: 1 };
+        },
+      );
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) => {
+          if (args.where.status !== "PENDING") return { id: "relay-request-id" };
+          transitions.push(args.data);
+          if (requestStatus !== "PENDING") {
+            const { Prisma } = await import("@ws-model-proxy/db");
+            throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+              code: "P2025",
+              clientVersion: "test",
+            });
+          }
+          requestStatus = String(args.data.status);
+          return {
+            ...rollupRow(args.data),
+            ...(poolId
+              ? {
+                  requestedModelPoolId: poolId,
+                  selectedPoolMemberId: args.data.selectedPoolMemberId ?? null,
+                }
+              : {}),
+          };
+        },
+      );
+      return { attemptStates, attemptClaims, transitions, status: () => requestStatus };
+    }
+
+    it("records the original completion time when finalization only commits on a registry retry", async () => {
+      const recovery = await import("./relay-telemetry-recovery.js");
+      recovery.resetLocalRelayAttemptRegistryForTests();
+      const t0 = new Date("2026-09-24T10:00:30.000Z");
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(t0);
+      try {
+        // The DB clock follows the (fake) wall clock, so a finalizer that read
+        // it at retry time would record the late time.
+        db.$queryRaw.mockImplementation(async () => [{ now: new Date() }]);
+        const { transitions } = statefulFinalization();
+        const pendingUpdate = db.relayRequest.update.getMockImplementation()!;
+        let failFirst = true;
+        db.relayRequest.update.mockImplementation(
+          async (args: { where: { status?: string }; data: Record<string, unknown> }) => {
+            if (args.where.status === "PENDING" && failFirst) {
+              failFirst = false;
+              transitions.push(args.data);
+              throw new Error("database unavailable");
+            }
+            return pendingUpdate(args);
+          },
+        );
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const manager = new FakeRelayManager();
+        const response = await relayDirectSuccess(manager, {
+          id: "chatcmpl",
+          choices: [],
+          usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 },
+        });
+        expect(response.status).toBe(200);
+        await vi.waitFor(() => expect(transitions).toHaveLength(1));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(transitions).toHaveLength(1);
+
+        // Ten minutes later (within the in-flight deadline) the registry
+        // retry commits.
+        const retryAt = new Date(t0.getTime() + 10 * 60 * 1000);
+        vi.setSystemTime(retryAt);
+        await expect(
+          recovery.retryDeferredLocalAttemptFinalizations(retryAt.getTime()),
+        ).resolves.toBe(1);
+
+        expect(transitions).toHaveLength(2);
+        const [first, committed] = transitions as [
+          Record<string, unknown>,
+          Record<string, unknown>,
+        ];
+        expect(committed.status).toBe("SUCCEEDED");
+        expect(committed.completedAt).toEqual(first.completedAt);
+        expect((committed.completedAt as Date).getTime()).toBeLessThan(t0.getTime() + 60_000);
+        expect(committed.durationMs).toBe(first.durationMs);
+        expect(committed.durationMs as number).toBeLessThan(60_000);
+        expect(committed).toMatchObject({
+          promptTokens: 12,
+          completionTokens: 3,
+          usageKnown: true,
+        });
+        // The rollup lands in the original minute bucket, not the retry's.
+        const [statement] = rollupStatements().at(-1) as [{ values: unknown[] }];
+        expect((statement.values[0] as Date).toISOString()).toBe("2026-09-24T10:00:00.000Z");
+      } finally {
+        vi.useRealTimers();
+        recovery.resetLocalRelayAttemptRegistryForTests();
+      }
+    });
+
+    it("keeps one claimant and records the served error when holding the direct response throws", async () => {
+      const { attemptClaims, transitions } = statefulFinalization();
+      const capacityRuntime = admittingCapacityRuntime();
+      capacityRuntime.hold = vi.fn(() => {
+        throw new Error("capacity hold failed");
+      });
+      const manager = new FakeRelayManager();
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(sent.requestId);
+      const response = await responsePromise;
+
+      expect(response.status).toBeGreaterThanOrEqual(500);
+      expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(transitions).toHaveLength(1));
+      // Let any (incorrectly) scheduled finalizer run before counting.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(transitions).toHaveLength(1);
+      expect(transitions[0]).toMatchObject({ status: "FAILED" });
+      expect(attemptClaims.filter((id) => id === sent.requestId)).toHaveLength(1);
+      expect(rollupStatements()).toHaveLength(1);
+    });
+
+    it("records the attempt that served the client when holding a pool member's response throws and the pool retries", async () => {
+      const { attemptStates, attemptClaims, transitions } = statefulFinalization({
+        poolId: "pool-id",
+      });
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+        poolMemberRow({
+          id: "member-b",
+          discoveredModelId: "model-b",
+          upstreamModelId: "upstream-b",
+          cliDeviceId: "cli-b",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const capacityRuntime = admittingCapacityRuntime();
+      let holds = 0;
+      capacityRuntime.hold = vi.fn((heldResponse: Response) => {
+        holds += 1;
+        if (holds > 1) return heldResponse;
+        // The first member's transport fails (a retryable member failure)
+        // and holding its response throws: the pool must move on.
+        manager.error(manager.sent[0]!.requestId, "transport");
+        throw new Error("capacity hold failed");
+      });
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const first = manager.sent[0]!;
+      manager.headers(first.requestId, 200, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      const second = manager.sent[1]!;
+      manager.headers(second.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(second.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(second.requestId);
+      await response.arrayBuffer();
+
+      expect(response.status).toBe(200);
+      await vi.waitFor(() => expect(transitions).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // One request transition, by the attempt that served the client.
+      expect(transitions).toHaveLength(1);
+      expect(transitions[0]).toMatchObject({
+        status: "SUCCEEDED",
+        selectedDiscoveredModelId: second.cliDeviceId === "cli-b" ? "model-b" : "model-a",
+        attemptCount: 2,
+      });
+      expect(second.cliDeviceId).not.toBe(first.cliDeviceId);
+      // Each attempt row claimed exactly once: the first as FAILED only.
+      expect(attemptClaims.filter((id) => id === first.requestId)).toHaveLength(1);
+      expect(attemptClaims.filter((id) => id === second.requestId)).toHaveLength(1);
+      expect(attemptStates.get(first.requestId)).toBe("FAILED");
+      expect(attemptStates.get(second.requestId)).toBe("SUCCEEDED");
+      expect(rollupStatements()).toHaveLength(1);
+    });
+
+    it("finalizes early failures through the same guarded transition", async () => {
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) =>
+          args.where.status === "PENDING" ? rollupRow(args.data) : { id: "relay-request-id" },
+      );
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [directTarget],
+        modelPools: [],
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(null);
+      const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(),
+      });
+      expect(response.status).toBe(404);
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: expect.objectContaining({ status: "FAILED", errorClass: "not_found" }),
+        }),
+      );
+      expect(rollupStatements()).toHaveLength(1);
+    });
+  });
+
   it("strips every inbound provider credential alias before endpoint authentication", async () => {
     const manager = new FakeRelayManager();
     const pending = appWith(manager).request("/chat/completions", {
@@ -3864,7 +4318,11 @@ describe("model API routes", () => {
       fencingToken: 1n,
       nativeSurface: "openai-chat",
       attemptCount: 1,
-      terminal: Promise.resolve({ ok: true, responseBytes: 17 }),
+      terminal: Promise.resolve({
+        ok: true,
+        responseBytes: 17,
+        usage: { inputTokens: 5n, outputTokens: 3n, cacheReadTokens: 15n },
+      }),
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
@@ -3893,6 +4351,22 @@ describe("model API routes", () => {
           selectedPoolMemberTier: "PUBLIC_OVERFLOW",
         }),
       }),
+    );
+    // Provider terminal: the same status-guarded transition, with the usage
+    // that settled billing mapped to prompt-free facts.
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: expect.objectContaining({
+            status: "SUCCEEDED",
+            promptTokens: 20,
+            completionTokens: 3,
+            cacheReadTokens: 15,
+            usageKnown: true,
+          }),
+        }),
+      ),
     );
   });
 
@@ -5363,6 +5837,7 @@ describe("model API routes", () => {
       streaming: false,
       requester: {
         userId: "user-id",
+        source: "API_TOKEN",
         modelApiTokenId: "token-id",
         modelApiTokenLookupPrefix: "wsmp_model_lookup",
         limitKey: "token-id",

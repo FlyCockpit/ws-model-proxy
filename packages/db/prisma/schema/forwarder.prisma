@@ -5,6 +5,15 @@ enum CliConnectionStatus {
   REVOKED
 }
 
+/// Which MCP commands may run on a CLI device. SUPERVISED: only commands a
+/// person confirms in a supervised terminal (Enter on the CLI-rendered confirm
+/// screen). UNSUPERVISED: headless exec as well (it also permits supervised).
+enum McpCommandMode {
+  OFF
+  SUPERVISED
+  UNSUPERVISED
+}
+
 enum EndpointKind {
   OPENAI_COMPATIBLE
   ANTHROPIC_COMPATIBLE
@@ -201,6 +210,16 @@ enum RelayRequestStatus {
   CANCELED
 }
 
+/// Which entry point originated a relay request. Dashboard/overview metrics
+/// exclude CHAT_TEST and MCP (diagnostic) traffic by default and never count
+/// TRANSFORMER hops, which are internal sub-requests of a pool request.
+enum RelayRequestSource {
+  API_TOKEN
+  CHAT_TEST
+  MCP
+  TRANSFORMER
+}
+
 enum CapacityCountStrategy {
   TOKENIZER
   TEMPLATE_AWARE
@@ -261,8 +280,12 @@ model CliDevice {
   createdAt                 DateTime              @default(now())
   updatedAt                 DateTime              @default(now()) @updatedAt
   userId                    String
+  /// Chosen at `wsmp login`; used in model ids and signed by the terminal
+  /// identity statement.
   slug                      String
-  label                     String
+  /// Set by the user in the dashboard; null until they name the device.
+  /// Hello must not overwrite it. Display name: name ?? reportedHostname ?? slug.
+  name                      String?
   status                    CliConnectionStatus   @default(DISCONNECTED)
   lastConnectedAt           DateTime?
   lastDisconnectedAt        DateTime?
@@ -280,14 +303,16 @@ model CliDevice {
   endpointTargeting         Boolean               @default(false)
   /// Server grants. Hello must not overwrite these; the dashboard does.
   allowHumanTerminal        Boolean               @default(false)
-  allowMcpCommands          Boolean               @default(false)
+  mcpCommandMode            McpCommandMode        @default(OFF)
   cliVersion                String?
   relayProtocolVersion      String?
   /// Null until a 2.4 hello reports the CLI's own config. False is a report.
   reportedHumanTerminal     Boolean?
-  reportedMcpCommands       Boolean?
+  reportedMcpCommandMode    McpCommandMode?
   reportedTerminalApproval  Boolean?
   reportedTerminalSupported Boolean?
+  /// The machine's hostname from the latest hello. Null when not reported.
+  reportedHostname          String?
   featuresReportedAt        DateTime?
   User                      User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliTokens                 CliToken[]
@@ -323,19 +348,20 @@ model CliToken {
   @@map("cli_token")
 }
 
+/// Minted by `wsmp login` for exactly one device and never rebound: the device
+/// is required and deleting it deletes its credentials.
 model CliDeviceCredential {
-  id           String     @id @default(cuid(2))
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @default(now()) @updatedAt
+  id           String    @id @default(cuid(2))
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @default(now()) @updatedAt
   userId       String
-  cliDeviceId  String?
-  name         String
+  cliDeviceId  String
   lookupPrefix String
   secretDigest String
   lastUsedAt   DateTime?
   revokedAt    DateTime?
-  User         User       @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliDevice    CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  User         User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice    CliDevice @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -667,6 +693,8 @@ model ProviderAttempt {
   @@unique([attemptId, fencingToken])
   @@index([userId, expiresAt])
   @@index([state, heartbeatAt, expiresAt])
+  /// Abandoned-request reaper: NOT EXISTS (ACTIVE attempt for this request).
+  @@index([requestId, state])
   @@map("provider_attempt")
 }
 
@@ -774,6 +802,9 @@ model ProviderUsageLedger {
   Reservation                  ProviderBudgetReservation?     @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([attemptId, fencingToken, sourceVersion])
+  // Created by schema-hardening.sql before Prisma knew it; declared here so
+  // `prisma db push` no longer drops it on every deploy.
+  @@unique([attemptId, fencingToken, revisionSequence], map: "provider_usage_ledger_attempt_revision_unique")
   @@index([userId, createdAt])
   @@index([providerAccountId, createdAt])
   @@map("provider_usage_ledger")
@@ -833,6 +864,9 @@ model ProviderBudgetSettlement {
   Reservation                  ProviderBudgetReservation      @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([reservationId, attemptId, fencingToken, sourceVersion])
+  // Created by schema-hardening.sql before Prisma knew it; declared here so
+  // `prisma db push` no longer drops it on every deploy.
+  @@unique([reservationId, attemptId, fencingToken, revisionSequence], map: "provider_budget_settlement_reservation_revision_unique")
   @@index([userId, createdAt])
   @@map("provider_budget_settlement")
 }
@@ -985,20 +1019,22 @@ model CacheAffinityRecord {
   expiresAt            DateTime
   userId               String
   /// Requester tenant; may differ from userId for an explicitly granted pool.
-  tenantUserId         String?
+  // NOT NULL since cache-affinity v3 (schema-hardening.sql deletes older rows
+  // first). Declared here so `prisma db push` stops dropping the constraint.
+  tenantUserId         String
   poolId               String
   executionTargetId    String
   targetIdentity       String
   digestVersion        Int             @default(4)
   /// Stable execution/security binding, separate from request content and conversation identity.
-  bindingDigest        String?
+  bindingDigest        String
   prefixDigest         String?
   conversationDigest   String?
   prefixDepth          Int
   estimatedTokens      Int?
   engineCacheConfirmed Boolean         @default(false)
   User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TenantUser           User?           @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TenantUser           User            @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
@@ -1129,6 +1165,10 @@ model AdmissionRequest {
   @@index([state, heartbeatAt])
   @@index([basePriority, enqueueSequence, id])
   @@index([relayRequestId])
+  // Parent-deletion history drains (packages/db/src/parent-deletion.ts) and
+  // the ON DELETE CASCADE from model_pool / execution_target.
+  @@index([poolId])
+  @@index([directExecutionTargetId])
   @@map("admission_request")
 }
 
@@ -1168,6 +1208,10 @@ model CapacityWaiter {
   @@index([capacityId, state, deadlineAt, candidateOrder])
   @@index([admissionRequestId, state])
   @@index([poolMemberId, state])
+  // Parent-deletion history drains and the ON DELETE CASCADE from
+  // execution_target / model_pool.
+  @@index([executionTargetId])
+  @@index([poolId])
   @@map("capacity_waiter")
 }
 
@@ -1204,6 +1248,10 @@ model CapacityLease {
   @@index([capacityId, state, expiresAt])
   @@index([ownerServerInstance, state, heartbeatAt])
   @@index([poolMemberId, state])
+  // Retained-history preflight of parent deletes (RESTRICT from
+  // execution_target / model_pool).
+  @@index([executionTargetId])
+  @@index([poolId])
   @@map("capacity_lease")
 }
 
@@ -1361,12 +1409,21 @@ model RelayRequest {
   requestedExecutionTargetId String?
   selectedExecutionTargetId  String?
   status                     RelayRequestStatus      @default(PENDING)
+  source                     RelayRequestSource      @default(API_TOKEN)
   startedAt                  DateTime                @default(now())
   completedAt                DateTime?
   durationMs                 Int?
+  /// Total prompt tokens (uncached + cache reads + cache writes) as parsed
+  /// server-side from the upstream response usage. Counts only, never content.
   promptTokens               Int?
   completionTokens           Int?
   totalTokens                Int?
+  /// Prompt tokens served from the engine prompt cache. Null = not reported.
+  cacheReadTokens            Int?
+  /// Prompt tokens written to the engine prompt cache. Null = not reported.
+  cacheWriteTokens           Int?
+  /// True when the upstream response reported token usage for this request.
+  usageKnown                 Boolean                 @default(false)
   httpStatusCode             Int?
   upstreamStatusCode         Int?
   errorClass                 String?
@@ -1445,7 +1502,101 @@ model RelayRequest {
   @@index([requestedExecutionTargetId, createdAt])
   @@index([selectedExecutionTargetId])
   @@index([status, createdAt])
+  @@index([createdAt])
   @@map("relay_request")
+}
+
+/// Prompt-free per-minute usage aggregates for dashboard metrics. Exactly one
+/// increment per relay request, written in the same transaction as the
+/// request's PENDING -> terminal transition. Optional identities use the ''
+/// sentinel (never NULL) so the composite primary key is a real conflict
+/// target: PostgreSQL treats NULLs as distinct in unique indexes, which would
+/// make ON CONFLICT never merge.
+/// Users: `ownerUserId` is the RESOURCE owner (requested pool's owner, else
+/// the execution target's owner, else the requester when nothing resolved);
+/// owners see all traffic on what they own and deleting the owner cascades.
+/// `requesterUserId` is the RelayRequest owner and is deliberately NOT a
+/// foreign key: deleting a requester must not erase the owner's history, so
+/// the `usage_rollup_detach_requester` trigger (schema-hardening.sql) merges
+/// the deleted requester's rows into the '' sentinel requester. Grantees read
+/// only rows where they are the requester and not the owner.
+/// Latency histograms use the fixed log-scale bounds in
+/// `@ws-model-proxy/config/usage-metrics`. Kept 30 days, then compacted into
+/// UsageRollupHour.
+model UsageRollupMinute {
+  bucketStart           DateTime
+  ownerUserId           String
+  /// '' once the requester was deleted (merged by trigger); never NULL.
+  requesterUserId       String
+  poolId                String             @default("")
+  poolMemberId          String             @default("")
+  executionTargetId     String             @default("")
+  source                RelayRequestSource
+  updatedAt             DateTime           @default(now())
+  requests              Int                @default(0)
+  successes             Int                @default(0)
+  errors                Int                @default(0)
+  cancels               Int                @default(0)
+  retries               Int                @default(0)
+  usageKnownRequests    Int                @default(0)
+  inputTokens           BigInt             @default(0)
+  outputTokens          BigInt             @default(0)
+  cacheReadTokens       BigInt             @default(0)
+  cacheWriteTokens      BigInt             @default(0)
+  /// Requests whose upstream reported cache usage, and their prompt tokens:
+  /// the denominator of the token-weighted prompt-cache hit rate.
+  cacheKnownRequests    Int                @default(0)
+  cacheKnownInputTokens BigInt             @default(0)
+  durationCount         Int                @default(0)
+  durationSumMs         BigInt             @default(0)
+  latencyHistogram      Int[]              @default([])
+  ttftCount             Int                @default(0)
+  ttftSumMs             BigInt             @default(0)
+  ttftHistogram         Int[]              @default([])
+  Owner                 User               @relation("UsageRollupMinuteOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
+  @@index([ownerUserId, bucketStart])
+  @@index([requesterUserId, bucketStart])
+  @@map("usage_rollup_minute")
+}
+
+/// Hourly compaction of UsageRollupMinute (same key and counters), kept 13
+/// months. Rows are only written by the retention compaction job.
+model UsageRollupHour {
+  bucketStart           DateTime
+  ownerUserId           String
+  /// '' once the requester was deleted (merged by trigger); never NULL.
+  requesterUserId       String
+  poolId                String             @default("")
+  poolMemberId          String             @default("")
+  executionTargetId     String             @default("")
+  source                RelayRequestSource
+  updatedAt             DateTime           @default(now())
+  requests              Int                @default(0)
+  successes             Int                @default(0)
+  errors                Int                @default(0)
+  cancels               Int                @default(0)
+  retries               Int                @default(0)
+  usageKnownRequests    Int                @default(0)
+  inputTokens           BigInt             @default(0)
+  outputTokens          BigInt             @default(0)
+  cacheReadTokens       BigInt             @default(0)
+  cacheWriteTokens      BigInt             @default(0)
+  cacheKnownRequests    Int                @default(0)
+  cacheKnownInputTokens BigInt             @default(0)
+  durationCount         Int                @default(0)
+  durationSumMs         BigInt             @default(0)
+  latencyHistogram      Int[]              @default([])
+  ttftCount             Int                @default(0)
+  ttftSumMs             BigInt             @default(0)
+  ttftHistogram         Int[]              @default([])
+  Owner                 User               @relation("UsageRollupHourOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
+  @@index([ownerUserId, bucketStart])
+  @@index([requesterUserId, bucketStart])
+  @@map("usage_rollup_hour")
 }
 
 /// Append-only, prompt-free facts for each local CLI relay attempt. A separate
@@ -1522,6 +1673,10 @@ model RelayExecutionAttempt {
   @@index([state, expiresAt])
   @@index([ownerEpoch, state])
   @@index([relayRequestId, createdAt])
+  // The user-delete cascade (ON DELETE CASCADE on userId) and the final-phase
+  // residual recount under the capacity locks look attempts up by owner
+  // (DL1-TXBOUND); without this index both scanned the whole table.
+  @@index([userId])
   @@map("relay_execution_attempt")
 }
 

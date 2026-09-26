@@ -3,8 +3,52 @@ const TERMINAL_FRAME_METADATA_MAX_BYTES = 64 * 1024;
 
 export type TerminalWriterLabel = "you" | "other" | "none";
 
+export type SupervisedStatus =
+  | "awaiting_user"
+  | "running"
+  | "awaiting_output_review"
+  | "exited"
+  | "declined"
+  | "expired"
+  | "cancelled"
+  | "rejected";
+
+const SUPERVISED_STATUSES: ReadonlySet<string> = new Set<SupervisedStatus>([
+  "awaiting_user",
+  "running",
+  "awaiting_output_review",
+  "exited",
+  "declined",
+  "expired",
+  "cancelled",
+  "rejected",
+]);
+
+/** A command an MCP agent asked to run in a supervised terminal. Server-asserted. */
+export type SupervisedInfo = {
+  commandId: string;
+  status: SupervisedStatus;
+  /** The MCP token name. */
+  requester: string;
+  /** Agent-written; shown as the agent's words. */
+  reason: string | null;
+  command: string;
+  cwd: string | null;
+  shareOutput: boolean;
+  createdAt: string | null;
+  expiresAt: string | null;
+  exitCode: number | null;
+  signal: string | null;
+};
+
+export type TerminalOrigin = "user" | "agent";
+
 export type ListedTerminal = {
   terminalId: string;
+  /** `agent`: a supervised command request. It is never attached automatically. */
+  origin: TerminalOrigin;
+  /** Present on agent terminals. */
+  supervised: SupervisedInfo | null;
   cliDeviceId: string;
   cols: number;
   rows: number;
@@ -36,6 +80,8 @@ export type TerminalClientMessage =
   | { type: "list" }
   | {
       type: "open";
+      /** Echoed by the `opening` answer and by any refusal of this frame. */
+      requestId: string;
       cliDeviceId: string;
       cols: number;
       rows: number;
@@ -51,12 +97,27 @@ export type TerminalClientMessage =
       identity?: { publicKey: string };
     }
   | { type: "auth"; terminalId: string; signature: string }
-  | { type: "close"; terminalId: string }
+  /**
+   * End session. `requestId` is echoed by the relay's direct answer: `closed`
+   * once it ended the terminal, or an error.
+   */
+  | { type: "close"; terminalId: string; requestId: string }
+  /**
+   * Agent requests only. Never ends a command whose Enter came first.
+   * `requestId` is echoed by every direct answer to this Decline.
+   */
+  | { type: "decline"; terminalId: string; requestId: string }
   | { type: "detach"; terminalId: string };
 
 export type TerminalServerMessage =
-  | { type: "terminals"; terminals: ListedTerminal[]; clis: ListedCli[] }
-  | { type: "opening"; terminalId: string; viewerId: string | null }
+  | {
+      type: "terminals";
+      terminals: ListedTerminal[];
+      clis: ListedCli[];
+      /** Sent by the relay unasked, as a full snapshot, when agent terminals change. */
+      pushed?: boolean;
+    }
+  | { type: "opening"; terminalId: string; viewerId: string | null; requestId?: string | null }
   | { type: "attaching"; terminalId: string; viewerId: string }
   | { type: "viewers"; terminalId: string; count: number; writer: TerminalWriterLabel }
   | {
@@ -74,10 +135,32 @@ export type TerminalServerMessage =
       reason: string;
       approvalCode: string | null;
     }
-  | { type: "exit"; terminalId: string; exitCode: number | null; signal: string | null }
+  | {
+      type: "exit";
+      terminalId: string;
+      exitCode: number | null;
+      signal: string | null;
+      /** An agent terminal: its command's status once the terminal ended. */
+      supervisedStatus?: SupervisedStatus | null;
+    }
+  /**
+   * A Decline lost to an Enter: the command started and keeps running.
+   * `requestId` is set on the direct answer to one Decline, and null on the
+   * later event sent to every tab whose Decline was out.
+   */
+  | { type: "decline"; terminalId: string; outcome: "started"; requestId?: string | null }
+  /** The relay ended this terminal for this socket's `close` (named by `requestId`). */
+  | { type: "closed"; terminalId: string; requestId: string | null }
   /** `self`: this tab stopped viewing. `slow`: this tab fell behind. None: 2.4 steal. */
   | { type: "detached"; terminalId: string; reason: "self" | "slow" | null }
-  | { type: "error"; message: string; code: string | null; terminalId: string | null };
+  /** `requestId`: the frame this error answers, when that frame carried one. */
+  | {
+      type: "error";
+      message: string;
+      code: string | null;
+      terminalId: string | null;
+      requestId?: string | null;
+    };
 
 export type SealedTerminalFrame = {
   terminalId: string;
@@ -110,14 +193,48 @@ function readWriter(value: unknown): TerminalWriterLabel | null {
   return value === "you" || value === "other" || value === "none" ? value : null;
 }
 
+function readNullableString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" ? value : null;
+}
+
+export function readSupervisedInfo(value: unknown): SupervisedInfo | null {
+  if (!isRecord(value)) return null;
+  const commandId = readString(value, "commandId");
+  const status = readString(value, "status");
+  const command = readNullableString(value, "command");
+  if (!commandId || !status || !SUPERVISED_STATUSES.has(status) || command === null) return null;
+  return {
+    commandId,
+    status: status as SupervisedStatus,
+    requester: readNullableString(value, "requester") ?? "",
+    reason: readString(value, "reason"),
+    command,
+    cwd: readString(value, "cwd"),
+    shareOutput: value.shareOutput === true,
+    createdAt: readString(value, "createdAt"),
+    expiresAt: readString(value, "expiresAt"),
+    exitCode:
+      typeof value.exitCode === "number" && Number.isInteger(value.exitCode)
+        ? value.exitCode
+        : null,
+    signal: readString(value, "signal"),
+  };
+}
+
 function readListedTerminal(value: unknown): ListedTerminal | null {
   if (!isRecord(value)) return null;
   const terminalId = readString(value, "terminalId");
   const cliDeviceId = readString(value, "cliDeviceId") ?? readString(value, "id");
   if (!terminalId || !cliDeviceId) return null;
   const viewerAttached = value.viewerAttached === true;
+  // An agent terminal without readable request details is still an agent
+  // terminal: never treat it as the user's own shell (that would auto-attach).
+  const origin: TerminalOrigin = value.origin === "agent" ? "agent" : "user";
   return {
     terminalId,
+    origin,
+    supervised: origin === "agent" ? readSupervisedInfo(value.supervised) : null,
     cliDeviceId,
     cols: readDimension(value.cols, 80),
     rows: readDimension(value.rows, 24),
@@ -169,12 +286,17 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
             return cli ? [cli] : [];
           })
         : [];
-      return { type: "terminals", terminals, clis };
+      return { type: "terminals", terminals, clis, pushed: value.pushed === true };
     }
     case "opening": {
       const terminalId = readString(value, "terminalId");
       if (!terminalId) return null;
-      return { type: "opening", terminalId, viewerId: readString(value, "viewerId") };
+      return {
+        type: "opening",
+        terminalId,
+        viewerId: readString(value, "viewerId"),
+        requestId: readString(value, "requestId"),
+      };
     }
     case "attaching": {
       const terminalId = readString(value, "terminalId");
@@ -222,7 +344,27 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
         terminalId,
         exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
         signal: typeof value.signal === "string" ? value.signal : null,
+        supervisedStatus:
+          typeof value.supervisedStatus === "string" &&
+          SUPERVISED_STATUSES.has(value.supervisedStatus)
+            ? (value.supervisedStatus as SupervisedStatus)
+            : null,
       };
+    }
+    case "decline": {
+      const terminalId = readString(value, "terminalId");
+      if (!terminalId || value.outcome !== "started") return null;
+      return {
+        type: "decline",
+        terminalId,
+        outcome: "started",
+        requestId: readString(value, "requestId"),
+      };
+    }
+    case "closed": {
+      const terminalId = readString(value, "terminalId");
+      if (!terminalId) return null;
+      return { type: "closed", terminalId, requestId: readString(value, "requestId") };
     }
     case "detached": {
       const terminalId = readString(value, "terminalId");
@@ -238,6 +380,7 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
         message: message ?? "error",
         code: readString(value, "code"),
         terminalId: readString(value, "terminalId"),
+        requestId: readString(value, "requestId"),
       };
     }
     default:

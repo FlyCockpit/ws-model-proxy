@@ -60,6 +60,7 @@ type UserRow = {
   emailVerified: boolean;
   banned: boolean | null;
   banReason: string | null;
+  deletionRequestedAt: Date | string | null;
   createdAt: Date | string;
 };
 
@@ -137,22 +138,26 @@ function AdminUsers() {
         trigger("error");
       },
     }),
-    meta: { errorFallbackKey: "admin:users.restoreFailed" },
+    meta: { errorFallbackKey: "admin:users.restoreFailed", deletionEntity: "user" },
   });
 
   const remove = useMutation({
     ...orpc.users.remove.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.users.key() });
         trigger("success");
-        toast.success(t("admin:users.userDeleted"));
+        if (data.pending) {
+          toast.success(t("admin:users.userDeletePending"));
+        } else {
+          toast.success(t("admin:users.userDeleted"));
+        }
         setDeleteId(null);
       },
       onError: () => {
         trigger("error");
       },
     }),
-    meta: { errorFallbackKey: "admin:users.deleteFailed" },
+    meta: { errorFallbackKey: "admin:users.deleteFailed", deletionEntity: "user" },
   });
 
   const allUsers = (list.data?.users ?? []) as UserRow[];
@@ -247,6 +252,7 @@ function AdminUsers() {
                 const isSelf = user.id === session.user.id;
                 const isAdmin = hasRole(user.role, "admin");
                 const isArchived = !!user.banned;
+                const isDeleting = Boolean(user.deletionRequestedAt);
                 return (
                   <li
                     key={user.id}
@@ -261,7 +267,8 @@ function AdminUsers() {
                           </span>
                         )}
                         <RolePill isAdmin={isAdmin} />
-                        {isArchived && <ArchivedPill />}
+                        {isDeleting && <DeletingPill />}
+                        {isArchived && !isDeleting && <ArchivedPill />}
                         {!user.emailVerified && <UnverifiedPill />}
                       </p>
                       <p className="mt-0.5 truncate text-xs text-muted-foreground">
@@ -422,6 +429,15 @@ function ArchivedPill() {
   return (
     <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase text-amber-700 dark:text-amber-400">
       {t("users.archivedBadge")}
+    </span>
+  );
+}
+
+function DeletingPill() {
+  const { t } = useTranslation("admin");
+  return (
+    <span className="inline-flex items-center rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase text-red-700 dark:text-red-400">
+      {t("users.deletingBadge")}
     </span>
   );
 }

@@ -181,6 +181,15 @@ export const ENV_GROUPS: EnvGroup[] = [
     comment: ["Anonymous SSR HTML cache for public locale pages."],
   },
   {
+    id: "retention",
+    title: "Metrics retention",
+    tuning: true,
+    comment: [
+      "Raw per-request relay metadata retention. Aggregated usage rollups are kept",
+      "separately (per-minute for 30 days, hourly for 13 months).",
+    ],
+  },
+  {
     id: "web",
     title: "Web app (build-time, public)",
     file: "web",
@@ -741,6 +750,15 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "60",
     comment: ["Anonymous SSR HTML cache TTL for public pages. 0 disables."],
+  },
+  {
+    key: "RELAY_REQUEST_RETENTION_DAYS",
+    group: "retention",
+    source: "default",
+    default: "14",
+    comment: [
+      "Days to keep raw RelayRequest rows (and their execution events) before the hourly sweep deletes them.",
+    ],
   },
 
   // --- web -----------------------------------------------------------------

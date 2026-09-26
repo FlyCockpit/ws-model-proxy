@@ -20,7 +20,7 @@
     "inventoryAcknowledged": "Inventory #{{sequence}} acknowledged: {{value}}",
     "inventoryUnconfirmed": "Inventory has not been acknowledged",
     "loadFailed": "Failed to load CLI metadata.",
-    "searchLabel": "Search endpoints and models",
+    "searchLabel": "Search CLIs, endpoints, and models",
     "healthFilterLabel": "Endpoint health filter",
     "filters": {
       "all": "All",
@@ -28,7 +28,7 @@
       "offline": "Offline",
       "stale": "Stale"
     },
-    "searchPlaceholder": "Search model ID, upstream ID, endpoint, or label",
+    "searchPlaceholder": "Search CLI name, model ID, upstream ID, or endpoint",
     "noSearchResults": "No endpoints or models match that search.",
     "title": "CLIs, Endpoints, and Models",
     "features": {
@@ -38,7 +38,41 @@
       "saveFailed": "Couldn't update CLI feature access. Try again.",
       "windows": "Not supported on Windows yet",
       "configDisabled": "Disabled in this CLI's wsmp config — edit and restart wsmp",
-      "updateWsmp": "Update wsmp to use this"
+      "updateWsmp": "Update wsmp to use this",
+      "commandModes": {
+        "off": "Off",
+        "supervised": "Supervised",
+        "unsupervised": "Unsupervised"
+      },
+      "commandModeHelp": {
+        "off": "MCP agents cannot run commands on this CLI.",
+        "supervised": "An agent can ask to run a command; it runs only after someone presses Enter on the CLI's confirm screen.",
+        "unsupervised": "Dangerous: any agent holding an MCP token for this account can run any command on this machine, as the CLI's OS user, with no one confirming it. Prefer Supervised."
+      },
+      "commandModeRecommended": "Recommended",
+      "unsupervisedConfirm": {
+        "title": "Allow unsupervised commands on {{name}}?",
+        "description": "Any agent holding an MCP token for this account will be able to run any command on {{name}}, as the operating-system user the CLI runs as, without anyone confirming it. A leaked or misused token means full control of that account on this machine. Supervised mode keeps a person in the loop and is recommended.",
+        "cancel": "Keep current mode",
+        "confirm": "Allow unsupervised"
+      },
+      "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:"
+    },
+    "rename": {
+      "action": "Rename",
+      "actionLabel": "Rename {{name}}",
+      "title": "Rename CLI",
+      "description": "The name shows only in this dashboard. Model IDs keep using the slug {{slug}}.",
+      "field": "Name",
+      "hint": "Leave blank to show {{fallback}}.",
+      "tooLong": "Use at most {{max}} characters.",
+      "invalidCharacters": "Remove control or invisible formatting characters.",
+      "save": "Save name",
+      "saving": "Saving…",
+      "cancel": "Cancel",
+      "saved": "CLI renamed",
+      "cleared": "CLI name cleared",
+      "saveFailed": "Couldn't rename this CLI. Try again."
     }
   },
   "chatTest": {
@@ -179,7 +213,6 @@
     "privateNetworkAdmin": "Private and loopback URLs are rejected. Set `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
     "privateNetworkUser": "Private and loopback URLs are rejected."
   },
-  "description": "Operate connected CLIs, model pools, credentials, and relay metadata.",
   "endpoints": {
     "empty": "No endpoints have registered for this CLI.",
     "failureReason": "Last probe failure: {{reason}}",
@@ -188,6 +221,7 @@
   "loadFailed": "Failed to load dashboard.",
   "metadata": {
     "delete": "Delete metadata",
+    "deleteCliDescription": "This deletes the CLI device and signs it out: its device login is deleted, CLI tokens bound to it are revoked, and its relay is disconnected. Run `wsmp login` on that machine to add it again. Local CLI configuration is not changed.",
     "deleteDescription": "This deletes only metadata owned by your account. It does not edit local CLI endpoint configuration.",
     "deleteModel": "Delete discovered model metadata",
     "deleteTitle": "Delete metadata",
@@ -237,6 +271,8 @@
     "add": "New terminal",
     "close": "Stop viewing this terminal",
     "cliList": "Choose a CLI",
+    "cliSearch": "Search CLIs",
+    "cliSearchEmpty": "No CLIs match your search.",
     "reconnecting": "Reconnecting to the terminal service…",
     "exited": "The shell exited.",
     "gone": "This terminal ended while you were disconnected.",
@@ -250,6 +286,8 @@
     "endSession": "End session",
     "endSessionTitle": "End this terminal session?",
     "endSessionDescription": "The shell stops for everyone viewing it. Unsaved work in it is lost.",
+    "ending": "Ending this session…",
+    "endFailed": "This session could not be ended. It may still be running; try End session again.",
     "status": {
       "youTyping": "You're typing",
       "otherTyping": "Someone else is typing",
@@ -285,6 +323,7 @@
       "cli_too_old": "Update wsmp to use terminals",
       "offline": "CLI is offline",
       "invalid": "That terminal request was invalid",
+      "rate_limited": "Too many terminal messages at once; try again shortly",
       "viewer_limit": "Too many tabs are already viewing this terminal",
       "bad_frame": "The CLI dropped this tab after a bad frame",
       "identity_changed": "This CLI's identity key changed",
@@ -318,7 +357,8 @@
       "opening": "Connecting",
       "live": "Connected",
       "rejected": "Rejected",
-      "exited": "Ended"
+      "exited": "Ended",
+      "waiting": "Not viewing"
     }
   },
   "nav": {
@@ -847,7 +887,6 @@
   "publication": {
     "unpublished": "Unpublished"
   },
-  "title": "Dashboard",
   "tokens": {
     "allVisible": "All visible",
     "allowlist": "Allowlist",
@@ -1136,5 +1175,209 @@
       "confidence": "Confidence"
     }
   },
-  "welcomeBack": "Welcome back, {{name}}"
+  "welcomeBack": "Welcome back, {{name}}",
+  "overview": {
+    "title": "Overview",
+    "description": "Traffic, prompt-cache efficiency, and health across the pools and models you own.",
+    "rangeLabel": "Time range",
+    "ranges": {
+      "1h": "1h",
+      "24h": "24h",
+      "7d": "7d"
+    },
+    "loadFailed": "Couldn't load overview metrics.",
+    "healthLoadFailed": "Couldn't load health status.",
+    "updatedAt": "Updated {{time}}",
+    "notReported": "Not reported",
+    "noValue": "—",
+    "kpi": {
+      "sectionLabel": "Key metrics",
+      "requests": "Requests",
+      "errorRate": "Error rate",
+      "cacheHitRate": "Prompt cache hit rate",
+      "cacheHitRateHint": "Token-weighted, over requests whose upstream reports cached tokens.",
+      "p95Latency": "p95 latency",
+      "p95Ttft": "p95 time to first token",
+      "tokens": "Tokens in / out",
+      "tokensValue": "{{input}} / {{output}}",
+      "deltaUp": "Up {{value}} vs previous period",
+      "deltaDown": "Down {{value}} vs previous period",
+      "deltaPoints": "{{value}} pp",
+      "deltaFlat": "No change vs previous period",
+      "deltaNone": "No previous data"
+    },
+    "health": {
+      "sectionLabel": "Health",
+      "clis": "CLIs online",
+      "endpoints": "Endpoints healthy",
+      "members": "Pool members",
+      "ratio": "{{value}} / {{total}}",
+      "membersValue": "{{degraded}} degraded · {{open}} circuit open",
+      "allHealthy": "All healthy",
+      "noneConfigured": "None yet",
+      "review": "Review",
+      "reviewClis": "Review CLIs",
+      "reviewEndpoints": "Review endpoints",
+      "reviewMember": "Open {{pool}}"
+    },
+    "pools": {
+      "title": "Pools",
+      "summary": "{{requests}} requests · {{errors}} errors · cache {{cache}}",
+      "chartLabel": "Requests per minute by member for {{name}}",
+      "perMinute": "req/min",
+      "noTraffic": "No traffic for this pool in the selected range.",
+      "open": "Open pool",
+      "other": "Other members",
+      "unrouted": "Not routed",
+      "removedMember": "Removed member",
+      "columns": {
+        "member": "Member",
+        "share": "Share",
+        "cache": "Cache hit",
+        "p50": "p50",
+        "p95": "p95",
+        "errors": "Errors",
+        "status": "Status"
+      },
+      "tier": {
+        "PRIMARY": "Primary",
+        "PUBLIC_OVERFLOW": "Overflow"
+      },
+      "health": {
+        "UNKNOWN": "Unknown",
+        "HEALTHY": "Healthy",
+        "HALF_OPEN": "Recovering",
+        "DEGRADED": "Degraded",
+        "UNHEALTHY": "Circuit open"
+      },
+      "routing": {
+        "ACTIVE": "Active",
+        "DRAINING": "Draining",
+        "DISABLED": "Disabled"
+      }
+    },
+    "direct": {
+      "title": "Direct model traffic",
+      "description": "Requests addressed to a single model rather than a pool.",
+      "unresolved": "Unresolved model",
+      "columns": {
+        "model": "Model",
+        "requests": "Requests",
+        "errors": "Errors",
+        "cache": "Cache hit",
+        "p95": "p95",
+        "tokens": "Tokens in / out"
+      }
+    },
+    "shared": {
+      "title": "Your usage of shared pools",
+      "description": "Your own requests to pools other users share with you. Other people's traffic on these pools is not shown.",
+      "unavailable": "Pool no longer shared with you",
+      "owner": "Shared by {{owner}}",
+      "columns": {
+        "pool": "Pool",
+        "requests": "Requests",
+        "errors": "Errors",
+        "cache": "Cache hit",
+        "p95": "p95",
+        "tokens": "Tokens in / out"
+      }
+    },
+    "empty": {
+      "title": "No traffic in this range",
+      "description": "Requests through your pools and models will appear here within a minute."
+    },
+    "setup": {
+      "title": "Get started",
+      "description": "Finish these steps to route your first request and see metrics here.",
+      "done": "Done",
+      "todo": "To do",
+      "steps": {
+        "connectCli": {
+          "title": "Connect a CLI",
+          "description": "Run wsmp login on the machine that hosts your models.",
+          "action": "Open CLIs"
+        },
+        "addEndpoint": {
+          "title": "Add an endpoint",
+          "description": "Point the CLI at a local OpenAI- or Anthropic-compatible server.",
+          "action": "Open CLIs"
+        },
+        "createPool": {
+          "title": "Create a pool",
+          "description": "Group models so requests fail over and share load.",
+          "action": "Create pool"
+        },
+        "createToken": {
+          "title": "Create an API token",
+          "description": "Clients use it to call the OpenAI-compatible API.",
+          "action": "Create token"
+        },
+        "tryChat": {
+          "title": "Try the chat test",
+          "description": "Send a message through a pool from the browser.",
+          "action": "Open chat test"
+        }
+      }
+    }
+  },
+  "agentRequests": {
+    "badge_one": "{{count}} agent request waiting",
+    "badge_other": "{{count}} agent requests waiting",
+    "noticeTitle_one": "An agent is waiting for you",
+    "noticeTitle_other": "{{count}} agent requests are waiting for you",
+    "noticeBody": "{{requester}} asked to run a command on one of your CLIs. Nothing runs until you press Enter on the CLI's confirm screen.",
+    "open": "Open Terminals",
+    "title": "Agent request",
+    "tabLabel": "Agent request · {{cli}}",
+    "requestedBy": "Requested by {{requester}}",
+    "reason": "Agent's reason:",
+    "command": "Command",
+    "commandIn": "Command, in {{cwd}}",
+    "commandSize_one": "{{count}} line, {{bytes}} bytes",
+    "commandSize_other": "{{count}} lines, {{bytes}} bytes",
+    "outputShared": "Output will be shared with the requesting agent.",
+    "outputPrivate": "Output stays in this terminal.",
+    "view": "Show the confirm screen",
+    "reviewOutput": "Review output before sending",
+    "finished": "Command finished (exit {{code}})",
+    "finishedSignal": "Command finished (signal {{signal}})",
+    "ended": "Agent request ended",
+    "cancelled": "Agent request cancelled",
+    "notRun": {
+      "declined": "Declined. The command did not run.",
+      "expired": "Expired. The command did not run.",
+      "rejected": "The CLI refused this request. The command did not run."
+    },
+    "decline": "Decline",
+    "declineTitle": "Decline this request?",
+    "declineDescription": "If nobody has pressed Enter on the confirm screen yet, the command never runs and the agent is told you declined. If someone already pressed Enter, the command keeps running and this tab says so; End session stops it.",
+    "declineSent": "Decline sent. Waiting for the CLI: if someone pressed Enter first, the command runs.",
+    "startedBeforeDecline": "Someone pressed Enter before your Decline reached the CLI, so the command started and keeps running. Use End session to stop it.",
+    "declineUnsent": "Not connected: your Decline has not reached the relay yet. It is sent again as soon as the connection is back, or press Decline to try now.",
+    "declineFailed": "Your Decline could not be delivered (the CLI may be offline, or too many messages were sent at once). Nothing was declined; press Decline to try again.",
+    "status": {
+      "awaiting_user": "Waiting for you",
+      "running": "Running",
+      "awaiting_output_review": "Output waiting for review",
+      "exited": "Finished",
+      "declined": "Declined",
+      "expired": "Expired",
+      "cancelled": "Cancelled",
+      "rejected": "Rejected"
+    },
+    "review": {
+      "title": "Review output before sending",
+      "description": "This is exactly what {{requester}} would receive. Edit it, send it, or redact all of it. Closing this redacts all output.",
+      "label": "Output",
+      "redact": "Redact all output",
+      "undo": "Undo changes",
+      "submit": "Submit",
+      "sent": "Reviewed output sent to the agent",
+      "redacted": "Output redacted",
+      "alreadyAnswered": "This output was already reviewed",
+      "failed": "Couldn't send the review. Try again.",
+      "truncated": "The command printed {{bytes}} bytes; only the start and the end are kept."
+    }
+  }
 }

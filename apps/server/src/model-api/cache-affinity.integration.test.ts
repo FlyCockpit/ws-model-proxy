@@ -38,7 +38,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       data: { name: "Other tenant", email: `affinity-other-${suffix}@example.test` },
     });
     const device = await db.cliDevice.create({
-      data: { userId: owner.id, slug: `device-${suffix}`, label: "Device" },
+      data: { userId: owner.id, slug: `device-${suffix}` },
     });
     const endpoint = await db.endpoint.create({
       data: {

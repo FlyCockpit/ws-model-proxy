@@ -13,6 +13,12 @@
     "./forwarder-identifiers": {
       "default": "./src/forwarder-identifiers.ts"
     },
+    "./cli-device-name": {
+      "default": "./src/cli-device-name.ts"
+    },
+    "./cli-device-login": {
+      "default": "./src/cli-device-login.ts"
+    },
     "./theme-init": {
       "default": "./src/theme-init.ts"
     },
@@ -21,6 +27,21 @@
     },
     "./rpc-policy": {
       "default": "./src/rpc-policy.ts"
+    },
+    "./usage-metrics": {
+      "default": "./src/usage-metrics.ts"
+    },
+    "./cli-command-output": {
+      "default": "./src/cli-command-output.ts"
+    },
+    "./display-escape": {
+      "default": "./src/display-escape.ts"
+    },
+    "./terminal-socket-policy": {
+      "default": "./src/terminal-socket-policy.ts"
+    },
+    "./deletion-conflict": {
+      "default": "./src/deletion-conflict.ts"
     }
   },
   "files": [

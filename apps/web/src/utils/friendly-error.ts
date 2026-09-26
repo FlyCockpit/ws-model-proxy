@@ -1,3 +1,8 @@
+import {
+  type DeletionConflictReason,
+  isDeletionConflictReason,
+} from "@ws-model-proxy/config/deletion-conflict";
+
 /**
  * Map an unknown error (oRPC ORPCError, fetch error, thrown Error) to safe
  * user-facing copy. Never returns `error.message` — that may contain raw
@@ -60,6 +65,61 @@ export function isConflict(error: unknown): boolean {
   const e = asErrorShape(error);
   if (!e) return false;
   return e.status === 409 || e.code === "CONFLICT";
+}
+
+/**
+ * The structured reason (`data.reason`) the API attaches to a
+ * deletion-related CONFLICT, or null for any other error — including a
+ * CONFLICT without a known reason. Reads only the code, never the message.
+ */
+export function deletionConflictReason(error: unknown): DeletionConflictReason | null {
+  if (!isConflict(error)) return null;
+  const data = asErrorShape(error)?.data;
+  if (!data || typeof data !== "object" || !("reason" in data)) return null;
+  const reason = (data as { reason?: unknown }).reason;
+  return isDeletionConflictReason(reason) ? reason : null;
+}
+
+/** What a delete mutation removes; picks the "do this instead" copy. */
+export type DeletionEntity =
+  | "user"
+  | "cliDevice"
+  | "endpoint"
+  | "discoveredModel"
+  | "pool"
+  | "poolMember"
+  | "capacity";
+
+/**
+ * i18n key (errors namespace) for a deletion-related CONFLICT on `entity`, or
+ * null when the error carries no known deletion reason (callers then fall
+ * back to the generic `friendly()` copy). Retained history names the
+ * entity's real off switch; the other reasons share entity-neutral copy.
+ */
+export function deletionConflictMessageKey(error: unknown, entity: DeletionEntity): string | null {
+  const reason = deletionConflictReason(error);
+  if (!reason) return null;
+  switch (reason) {
+    case "retained_history":
+      return `errors:deletionConflict.retainedHistory.${entity}`;
+    case "delete_pending":
+      return "errors:deletionConflict.deletePending";
+    case "delete_contended":
+      return "errors:deletionConflict.deleteContended";
+    case "still_attached":
+      return "errors:deletionConflict.stillAttached";
+    case "not_stale":
+      return "errors:deletionConflict.notStale";
+    case "deletion_in_progress":
+      return "errors:deletionConflict.deletionInProgress";
+  }
+}
+
+/** True if the error looks like a 404 / NOT_FOUND response from oRPC. */
+export function isNotFound(error: unknown): boolean {
+  const e = asErrorShape(error);
+  if (!e) return false;
+  return e.status === 404 || e.code === "NOT_FOUND";
 }
 
 /**

@@ -44,6 +44,10 @@ vi.mock("@/utils/orpc", () => {
           return { impactedPools: state.capabilityImpact };
         if (name === "setDiscoveredModelCapabilityProfile")
           return { impactedPools: state.capabilityImpact };
+        if (name === "renameCliDevice") {
+          const renamed = (input as { name: string | null }).name;
+          return { cliDeviceId: "cli-1", name: renamed, displayName: renamed ?? "desk-01.local" };
+        }
         if (name === "removeDiscoveredModelMetadata")
           return { deleted: true, impactedPools: state.capabilityImpact };
         return { id: "pool-1" };
@@ -74,10 +78,12 @@ vi.mock("@/utils/orpc", () => {
         setDiscoveredModelCapabilityProfile: mutation("setDiscoveredModelCapabilityProfile"),
         updateDiscoveredModelAttachmentLimit: mutation("updateDiscoveredModelAttachmentLimit"),
         setCliDeviceFeatureGrants: mutation("setCliDeviceFeatureGrants"),
+        renameCliDevice: mutation("renameCliDevice"),
         cacheAffinityStats: query("affinity", { activeRecords: 0, targets: [] }),
         clearCacheAffinity: mutation("clearCacheAffinity"),
         grantPoolAccessByEmail: mutation("grantPoolAccessByEmail"),
       },
+      adminObservability: { key: () => ["adminObservability"] },
       capacityManagement: {
         key: () => ["capacityManagement"],
         list: query("capacities", []),
@@ -90,6 +96,7 @@ vi.mock("@/utils/orpc", () => {
 
 import { grantPoolAccessServerMessages } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import {
   CliEndpointsModelsSection,
   GrantPoolDialog,
@@ -100,7 +107,9 @@ import {
 const cliDeviceWithModel = {
   id: "cli-1",
   slug: "desk",
-  label: "Desk",
+  name: null,
+  reportedHostname: "desk-01.local",
+  displayName: "desk-01.local",
   status: "ONLINE",
   isStale: false,
   inventoryConfirmed: true,
@@ -722,6 +731,174 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
       expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
     );
     expect(toast.warning).not.toHaveBeenCalled();
+  });
+});
+
+describe("CliEndpointsModelsSection delete conflicts", () => {
+  function mountWithAppToasts() {
+    return render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+            mutationCache: createAppMutationCache((key) => key),
+          })
+        }
+      >
+        <CliEndpointsModelsSection />
+      </QueryClientProvider>,
+    );
+  }
+
+  async function confirmDelete(token: string) {
+    fireEvent.change(await screen.findByPlaceholderText(token), { target: { value: token } });
+    fireEvent.click(screen.getByRole("button", { name: "actions.delete" }));
+  }
+
+  it.each([
+    ["removeCliDeviceMetadata", 0, "desk", "retained_history", "retainedHistory.cliDevice"],
+    ["removeEndpointMetadata", 1, "desk/local", "delete_pending", "deletePending"],
+    [
+      "removeDiscoveredModelMetadata",
+      -1,
+      "owner/desk/local/example",
+      "retained_history",
+      "retainedHistory.discoveredModel",
+    ],
+  ])(
+    "%s: a structured CONFLICT shows its specific copy, not the generic one",
+    async (name, buttonIndex, token, reason, key) => {
+      state.cliDevices = [cliDeviceWithModel];
+      state.nextReject = {
+        name,
+        error: { status: 409, code: "CONFLICT", message: "raw", data: { reason } },
+      };
+      mountWithAppToasts();
+
+      if (buttonIndex < 0) {
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:metadata.deleteModel" }));
+      } else {
+        fireEvent.click(
+          screen.getAllByRole("button", { name: "dashboard:metadata.delete" })[buttonIndex],
+        );
+      }
+      await confirmDelete(token);
+
+      await waitFor(() => expect(state.mutationCalls).toEqual([name]));
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith(`errors:deletionConflict.${key}`),
+      );
+      expect(toast.error).not.toHaveBeenCalledWith("That conflicts with an existing record.");
+    },
+  );
+});
+
+describe("CliEndpointsModelsSection device names", () => {
+  function mountDevices() {
+    return render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <CliEndpointsModelsSection />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("shows the display name with the slug as secondary text", () => {
+    state.cliDevices = [cliDeviceWithModel];
+    mountDevices();
+
+    expect(screen.getByRole("heading", { name: "desk-01.local" })).toBeTruthy();
+    expect(screen.getByText("desk")).toBeTruthy();
+    // SectionHeader is the page h1 now that the shared dashboard header is gone.
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
+  it("finds a device by display name, hostname, or slug", () => {
+    state.cliDevices = [
+      cliDeviceWithModel,
+      {
+        ...cliDeviceWithModel,
+        id: "cli-2",
+        slug: "tower",
+        name: "Work laptop",
+        reportedHostname: "tower.lan",
+        displayName: "Work laptop",
+        endpoints: [],
+      },
+    ];
+    mountDevices();
+    const search = screen.getByLabelText("dashboard:clis.searchLabel");
+
+    for (const query of ["work lap", "tower.lan", "tower"]) {
+      fireEvent.change(search, { target: { value: query } });
+      expect(screen.getByRole("heading", { name: "Work laptop" })).toBeTruthy();
+      expect(screen.queryByRole("heading", { name: "desk-01.local" })).toBeNull();
+    }
+  });
+
+  it("renames a device with a trimmed name", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    mountDevices();
+
+    fireEvent.click(screen.getByRole("button", { name: /dashboard:clis\.rename\.actionLabel/ }));
+    fireEvent.change(screen.getByLabelText("dashboard:clis.rename.field"), {
+      target: { value: "  Work laptop  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:clis.rename.save" }));
+
+    await waitFor(() =>
+      expect(state.mutationPayloads).toEqual([
+        { name: "renameCliDevice", input: { cliDeviceId: "cli-1", name: "Work laptop" } },
+      ]),
+    );
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("dashboard:clis.rename.saved"));
+  });
+
+  it("rejects invisible formatting characters without saving", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    mountDevices();
+
+    fireEvent.click(screen.getByRole("button", { name: /dashboard:clis\.rename\.actionLabel/ }));
+    fireEvent.change(screen.getByLabelText("dashboard:clis.rename.field"), {
+      target: { value: "Work\u202Elaptop" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:clis.rename.save" }));
+
+    expect(await screen.findByText("dashboard:clis.rename.invalidCharacters")).toBeTruthy();
+    expect(state.mutationPayloads).toEqual([]);
+  });
+
+  it("hints the name the device falls back to when cleared", () => {
+    state.cliDevices = [
+      { ...cliDeviceWithModel, name: "Old", reportedHostname: null, displayName: "Old" },
+    ];
+    mountDevices();
+
+    fireEvent.click(screen.getByRole("button", { name: /dashboard:clis\.rename\.actionLabel/ }));
+    expect(
+      screen.getByText('dashboard:clis.rename.hint|{"fallback":"desk"}', { exact: true }),
+    ).toBeTruthy();
+  });
+
+  it("clears the name when saved blank", async () => {
+    state.cliDevices = [{ ...cliDeviceWithModel, name: "Old", displayName: "Old" }];
+    mountDevices();
+
+    fireEvent.click(screen.getByRole("button", { name: /dashboard:clis\.rename\.actionLabel/ }));
+    fireEvent.change(screen.getByLabelText("dashboard:clis.rename.field"), {
+      target: { value: "   " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:clis.rename.save" }));
+
+    await waitFor(() =>
+      expect(state.mutationPayloads).toEqual([
+        { name: "renameCliDevice", input: { cliDeviceId: "cli-1", name: null } },
+      ]),
+    );
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:clis.rename.cleared"),
+    );
   });
 });
 

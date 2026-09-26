@@ -140,6 +140,35 @@ pub fn resolve_cwd(cwd: Option<&str>, home: &Path) -> Result<PathBuf, &'static s
     Ok(path)
 }
 
+/// Why a working directory cannot be shown on the supervised confirm screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmCwdError {
+    /// The physical path could not be resolved (gone, or unreadable).
+    Unresolvable,
+    /// The physical path is not valid UTF-8, so no text can show it exactly.
+    NotUtf8,
+}
+
+/// The working directory exactly as the supervised confirm screen shows it.
+///
+/// The confirm child `chdir`s into `path` and draws `getcwd()`, which is the
+/// physical path (symlinks resolved). This returns that same physical path,
+/// which the caller must also spawn in, as text. A path that is not valid
+/// UTF-8 is refused: a lossy rendering (U+FFFD) would let two different
+/// directories look the same, so the person could approve one and run in
+/// another. This covers the `$HOME` default, `~/` expansion and symlinks.
+pub fn confirm_screen_cwd(path: &Path) -> Result<(PathBuf, String), ConfirmCwdError> {
+    let physical = std::fs::canonicalize(path).map_err(|_| ConfirmCwdError::Unresolvable)?;
+    if !std::fs::metadata(&physical).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(ConfirmCwdError::Unresolvable);
+    }
+    let text = physical
+        .to_str()
+        .ok_or(ConfirmCwdError::NotUtf8)?
+        .to_string();
+    Ok((physical, text))
+}
+
 fn expand_cwd(raw: &str, home: &Path) -> Result<PathBuf, &'static str> {
     if raw.as_bytes().contains(&0) {
         return Err("working directory contains NUL");
@@ -326,5 +355,48 @@ mod tests {
         assert!(resolve_cwd(Some("~/missing"), &home).is_err());
         assert!(resolve_cwd(Some(file.to_str().expect("utf8")), &home).is_err());
         assert!(resolve_cwd(Some("~/has\0nul"), &home).is_err());
+    }
+
+    #[test]
+    fn confirm_screen_cwd_is_the_exact_physical_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let physical_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let dir = physical_root.join("work dir é");
+        std::fs::create_dir(&dir).expect("dir");
+        let (path, text) = confirm_screen_cwd(&dir).expect("utf8 dir");
+        assert_eq!(path, dir);
+        assert_eq!(text, dir.to_str().expect("utf8"));
+        assert_eq!(
+            confirm_screen_cwd(&physical_root.join("missing")),
+            Err(ConfirmCwdError::Unresolvable)
+        );
+        let file = physical_root.join("file");
+        std::fs::write(&file, b"x").expect("file");
+        assert_eq!(
+            confirm_screen_cwd(&file),
+            Err(ConfirmCwdError::Unresolvable)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirm_screen_cwd_refuses_non_utf8_directories_and_symlinks_to_them() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let bad = root.path().join(OsStr::from_bytes(b"a\xff"));
+        std::fs::create_dir(&bad).expect("non-utf8 dir");
+        assert_eq!(confirm_screen_cwd(&bad), Err(ConfirmCwdError::NotUtf8));
+        // A UTF-8 path whose physical target is not UTF-8 (what getcwd shows).
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&bad, &link).expect("symlink");
+        assert!(link.to_str().is_some());
+        assert_eq!(confirm_screen_cwd(&link), Err(ConfirmCwdError::NotUtf8));
+        // A valid directory literally named with U+FFFD is shown exactly.
+        let replacement = root.path().join("a\u{FFFD}");
+        std::fs::create_dir(&replacement).expect("fffd dir");
+        let (_, text) = confirm_screen_cwd(&replacement).expect("fffd is valid utf8");
+        assert!(text.ends_with("a\u{FFFD}"));
     }
 }

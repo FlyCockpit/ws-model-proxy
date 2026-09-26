@@ -114,13 +114,49 @@ impl ConfigLock {
     }
 }
 
+/// What MCP agents may run on this CLI. Read once when the relay starts.
+///
+/// `supervised` only allows commands a person confirms in a browser terminal
+/// (Enter on a confirm screen); `unsupervised` also allows headless exec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpCommandMode {
+    #[default]
+    Off,
+    Supervised,
+    Unsupervised,
+}
+
+impl McpCommandMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Supervised => "supervised",
+            Self::Unsupervised => "unsupervised",
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Headless `exec.start` is allowed.
+    pub fn allows_exec(self) -> bool {
+        matches!(self, Self::Unsupervised)
+    }
+
+    /// Supervised terminals (`term.spawn`) are allowed.
+    pub fn allows_supervised(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", from = "ConfigWire")]
 pub struct Config {
     pub version: u8,
     pub server_url: Option<String>,
     pub cli_slug: Option<String>,
-    pub cli_label: Option<String>,
     pub cli_token_env: Option<String>,
     pub endpoints: Vec<EndpointConfig>,
     /// Extra HTTP(S) origins whose signed `/media/{id}` URLs the relay may fetch
@@ -131,12 +167,70 @@ pub struct Config {
     /// Browser terminal master switch. Read once when the relay starts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_human_terminal: bool,
-    /// MCP command master switch. Read once when the relay starts.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_mcp_commands: bool,
+    /// MCP command policy. Read once when the relay starts.
+    #[serde(default, skip_serializing_if = "McpCommandMode::is_off")]
+    pub mcp_command_mode: McpCommandMode,
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
+}
+
+/// The on-disk shape, including the legacy `allowMcpCommands` switch that
+/// older wsmp releases wrote. `true` there loads as `unsupervised`; the key is
+/// never written back.
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ConfigWire {
+    version: u8,
+    server_url: Option<String>,
+    cli_slug: Option<String>,
+    cli_token_env: Option<String>,
+    endpoints: Vec<EndpointConfig>,
+    media_trusted_origins: Vec<String>,
+    allow_human_terminal: bool,
+    mcp_command_mode: Option<McpCommandMode>,
+    allow_mcp_commands: Option<bool>,
+    require_terminal_approval: bool,
+}
+
+impl Default for ConfigWire {
+    fn default() -> Self {
+        let config = Config::default();
+        Self {
+            version: config.version,
+            server_url: None,
+            cli_slug: None,
+            cli_token_env: None,
+            endpoints: Vec::new(),
+            media_trusted_origins: Vec::new(),
+            allow_human_terminal: false,
+            mcp_command_mode: None,
+            allow_mcp_commands: None,
+            require_terminal_approval: false,
+        }
+    }
+}
+
+impl From<ConfigWire> for Config {
+    fn from(wire: ConfigWire) -> Self {
+        let mcp_command_mode = wire
+            .mcp_command_mode
+            .unwrap_or(match wire.allow_mcp_commands {
+                Some(true) => McpCommandMode::Unsupervised,
+                _ => McpCommandMode::Off,
+            });
+        Self {
+            version: wire.version,
+            server_url: wire.server_url,
+            cli_slug: wire.cli_slug,
+            cli_token_env: wire.cli_token_env,
+            endpoints: wire.endpoints,
+            media_trusted_origins: wire.media_trusted_origins,
+            allow_human_terminal: wire.allow_human_terminal,
+            mcp_command_mode,
+            require_terminal_approval: wire.require_terminal_approval,
+        }
+    }
 }
 
 impl Default for Config {
@@ -145,12 +239,11 @@ impl Default for Config {
             version: CONFIG_VERSION,
             server_url: None,
             cli_slug: None,
-            cli_label: None,
             cli_token_env: None,
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
-            allow_mcp_commands: false,
+            mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
         }
     }
@@ -1648,6 +1741,36 @@ mod tests {
         };
         let serialized = serde_json::to_value(legacy).expect("serialize legacy inventory");
         assert!(serialized.get("surfaces").is_none());
+    }
+
+    #[test]
+    fn legacy_allow_mcp_commands_loads_as_a_mode_and_is_not_written_back() {
+        let on: Config =
+            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": true }))
+                .expect("legacy on");
+        assert_eq!(on.mcp_command_mode, McpCommandMode::Unsupervised);
+        let written = serde_json::to_value(&on).expect("serialize");
+        assert!(written.get("allowMcpCommands").is_none());
+        assert_eq!(written["mcpCommandMode"], "unsupervised");
+        let off: Config =
+            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": false }))
+                .expect("legacy off");
+        assert_eq!(off.mcp_command_mode, McpCommandMode::Off);
+        assert!(
+            serde_json::to_value(&off)
+                .expect("serialize")
+                .get("mcpCommandMode")
+                .is_none()
+        );
+        let explicit: Config = serde_json::from_value(serde_json::json!({
+            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "supervised"
+        }))
+        .expect("explicit wins");
+        assert_eq!(explicit.mcp_command_mode, McpCommandMode::Supervised);
+        assert!(
+            serde_json::from_value::<Config>(serde_json::json!({ "mcpCommandMode": "sometimes" }))
+                .is_err()
+        );
     }
 
     #[test]

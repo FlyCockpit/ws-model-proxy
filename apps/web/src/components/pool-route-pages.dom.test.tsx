@@ -16,6 +16,7 @@ const state = vi.hoisted(() => ({
       }) => ReactNode),
   pools: [] as Array<Record<string, unknown>>,
   capacities: [] as Array<Record<string, unknown>>,
+  nextReject: null as { name: string; error: unknown } | null,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -69,7 +70,30 @@ vi.mock("@/components/provider-operations-section", () => ({
 }));
 
 vi.mock("@/components/confirm-delete-dialog", () => ({
-  ConfirmDeleteDialog: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  ConfirmDeleteDialog: ({
+    children,
+    open,
+    title,
+    onConfirm,
+  }: {
+    children?: ReactNode;
+    open: boolean;
+    title: string;
+    onConfirm: (value: string) => void;
+  }) => (
+    <>
+      {children}
+      {open ? (
+        <button type="button" onClick={() => onConfirm("")}>
+          {`confirm ${title}`}
+        </button>
+      ) : null}
+    </>
+  ),
+}));
+
+vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
 vi.mock("@/utils/orpc", () => {
@@ -79,9 +103,16 @@ vi.mock("@/utils/orpc", () => {
   const deferredQuery = (key: string, data: () => unknown) => ({
     queryOptions: () => ({ queryKey: [key], queryFn: async () => data() }),
   });
-  const mutation = () => ({
+  const mutation = (name = "") => ({
     mutationOptions: (options?: Record<string, unknown>) => ({
-      mutationFn: async () => undefined,
+      mutationFn: async () => {
+        if (state.nextReject && state.nextReject.name === name) {
+          const error = state.nextReject.error;
+          state.nextReject = null;
+          throw error;
+        }
+        return undefined;
+      },
       ...options,
     }),
   });
@@ -93,22 +124,25 @@ vi.mock("@/utils/orpc", () => {
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
         listCliDevices: query("devices", () => []),
-        deleteModelPool: mutation(),
+        key: () => ["forwarderManagement"],
+        deleteModelPool: mutation("deleteModelPool"),
         addPoolMember: mutation(),
         updatePoolMember: mutation(),
-        removePoolMember: mutation(),
+        removePoolMember: mutation("removePoolMember"),
         grantPoolAccessByEmail: mutation(),
         revokePoolAccessByEmail: mutation(),
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
         list: deferredQuery("capacities", () => state.capacities),
-        remove: mutation(),
+        remove: mutation("capacityRemove"),
       },
     },
   };
 });
 
+import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import {
   InferenceCapacityPage,
   PoolDetailPage,
@@ -135,6 +169,8 @@ afterEach(() => {
   state.tab = "overview";
   state.pools = [];
   state.capacities = [];
+  state.nextReject = null;
+  vi.mocked(toast.error).mockClear();
 });
 
 describe("dedicated pool pages", () => {
@@ -348,5 +384,136 @@ describe("dedicated pool pages", () => {
 
     await waitFor(() => expect(screen.getByText("dashboard:pools.capacity.empty")).toBeTruthy());
     expect(screen.queryByText("dashboard:pools.capacity.disabledReason")).toBeNull();
+  });
+});
+
+describe("delete conflicts on pool pages", () => {
+  function mountWithAppToasts(children: ReactNode) {
+    return render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+            mutationCache: createAppMutationCache((key) => key),
+          })
+        }
+      >
+        {children}
+      </QueryClientProvider>,
+    );
+  }
+
+  function conflict(reason: string) {
+    return { status: 409, code: "CONFLICT", message: "raw", data: { reason } };
+  }
+
+  const pool = {
+    id: "pool-1",
+    slug: "primary",
+    name: "Primary",
+    description: null,
+    canonicalModelId: "owner/pool/primary",
+    members: [
+      {
+        id: "member-1",
+        discoveredModelId: "model-1",
+        model: { canonicalModelId: "owner/desk/local/example" },
+        routingStatus: "ACTIVE",
+        tier: "PRIMARY",
+        weight: 1,
+        capacityPriority: null,
+        capacityConcurrencyMode: "INHERIT",
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: null,
+        capacityBorrowPolicy: null,
+        capacityWaitBudgetMode: "INHERIT",
+        capacityWaitBudgetMs: null,
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextCeiling: null,
+        capacityContextMargin: null,
+      },
+    ],
+    grants: [],
+    compatibility: { recommendedSurface: null },
+    transformer: { model: null },
+  };
+
+  it("shows the in-flight copy when a pool delete is still draining", async () => {
+    state.pools = [pool];
+    state.nextReject = { name: "deleteModelPool", error: conflict("delete_pending") };
+    mountWithAppToasts(<PoolDetailPage poolId="pool-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "confirm dashboard:pools.deleteTitle" }));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("errors:deletionConflict.deletePending"),
+    );
+  });
+
+  it("suggests disabling a pool member that has retained history", async () => {
+    state.pools = [pool];
+    state.nextReject = { name: "removePoolMember", error: conflict("retained_history") };
+    mountWithAppToasts(<PoolDetailPage poolId="pool-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.removeMember" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "confirm dashboard:pools.removeMemberTitle" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "errors:deletionConflict.retainedHistory.poolMember",
+      ),
+    );
+  });
+
+  it("shows the capacity retained-history copy on a capacity delete", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 2,
+        _count: { CapacityLeases: 0 },
+      },
+    ];
+    state.nextReject = { name: "capacityRemove", error: conflict("retained_history") };
+    mountWithAppToasts(<InferenceCapacityPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "common:actions.delete" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "confirm dashboard:pools.capacity.deleteTitle" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("errors:deletionConflict.retainedHistory.capacity"),
+    );
+  });
+
+  it("keeps the generic copy for a capacity CONFLICT without a reason", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 2,
+        _count: { CapacityLeases: 0 },
+      },
+    ];
+    state.nextReject = {
+      name: "capacityRemove",
+      error: { status: 409, code: "CONFLICT", message: "raw" },
+    };
+    mountWithAppToasts(<InferenceCapacityPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "common:actions.delete" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "confirm dashboard:pools.capacity.deleteTitle" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("That conflicts with an existing record."),
+    );
   });
 });

@@ -34,6 +34,12 @@
     },
     "./mcp-grant": {
       "default": "./src/mcp-grant.ts"
+    },
+    "./user-deletion-listeners": {
+      "default": "./src/user-deletion-listeners.ts"
+    },
+    "./user-deletion-access-guard": {
+      "default": "./src/user-deletion-access-guard.ts"
     }
   },
   "scripts": {

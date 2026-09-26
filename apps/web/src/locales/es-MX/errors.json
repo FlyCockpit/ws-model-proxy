@@ -2,5 +2,21 @@
   "appUpdateAvailable": "Una nueva versión está disponible. Recargando…",
   "couldNotCopy": "No se pudo copiar — por favor selecciona y copia manualmente.",
   "pageDescription": "{{appName}} es una aplicación web",
-  "rootError": "Esta página no cargó. Intenta de nuevo o recarga."
+  "rootError": "Esta página no cargó. Intenta de nuevo o recarga.",
+  "deletionConflict": {
+    "deletePending": "Esto todavía tiene solicitudes en curso, así que no se eliminó nada. Intenta de nuevo en un momento.",
+    "deleteContended": "Esto estaba ocupado con tráfico activo, así que no se eliminó nada. Intenta de nuevo en un momento.",
+    "stillAttached": "Esta capacidad todavía está asignada a un miembro de pool. Desasígnala primero.",
+    "notStale": "Se reportó hace poco, así que no se eliminó por inactividad.",
+    "deletionInProgress": "Esta cuenta se está eliminando y no se puede restaurar.",
+    "retainedHistory": {
+      "user": "Este usuario tiene historial retenido y no se puede eliminar. Archívalo en su lugar.",
+      "cliDevice": "Este CLI tiene historial de capacidad o de proveedor retenido y no se puede eliminar. Deshabilítalo en su lugar: cambia el enrutamiento de sus miembros de pool a Deshabilitado.",
+      "endpoint": "Este endpoint tiene historial de capacidad o de proveedor retenido y no se puede eliminar. Deshabilítalo en su lugar: cambia el enrutamiento de sus miembros de pool a Deshabilitado.",
+      "discoveredModel": "Este modelo tiene historial de capacidad o de proveedor retenido y no se puede eliminar. Deshabilítalo en su lugar: cambia el enrutamiento de sus miembros de pool a Deshabilitado.",
+      "pool": "Este pool tiene historial de capacidad o de proveedor retenido y no se puede eliminar. Deshabilítalo en su lugar: cambia el enrutamiento de sus miembros a Deshabilitado.",
+      "poolMember": "Este miembro tiene historial de capacidad o de proveedor retenido y no se puede quitar. Cambia su enrutamiento a Deshabilitado en su lugar.",
+      "capacity": "Esta capacidad tiene historial retenido y no se puede eliminar. Déjala desasignada en su lugar; ya no atiende solicitudes."
+    }
+  }
 }

@@ -44,6 +44,7 @@
     "react": "catalog:",
     "react-dom": "catalog:",
     "react-i18next": "catalog:",
+    "recharts": "catalog:",
     "react-markdown": "catalog:",
     "rehype-highlight": "catalog:",
     "remark-gfm": "catalog:",

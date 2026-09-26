@@ -236,7 +236,44 @@ fn login_rejects_invalid_slug_before_device_authorization_request() {
 }
 
 #[test]
-fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
+fn login_rejects_the_removed_name_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "http://127.0.0.1:9"
+        }),
+    );
+
+    cli(&config, &state)
+        .args(["login", "--name", "Desk", "--slug", "desk-01"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--name"));
+}
+
+#[test]
+fn non_interactive_login_defaults_the_slug_from_the_hostname() {
+    let Some(expected) = wsmp::hostname::hostname_slug() else {
+        // No usable hostname here: login must ask for `--slug` instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.json");
+        let state = tmp.path().join("state");
+        write_config(
+            &config,
+            json!({ "version": 1, "serverUrl": "http://127.0.0.1:9" }),
+        );
+        cli(&config, &state)
+            .arg("login")
+            .write_stdin("")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("pass `--slug <slug>`"));
+        return;
+    };
     let server = TestServer::start(vec![
         (
             "/api/auth/device/code",
@@ -251,13 +288,62 @@ fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
         ),
         (
             "/rpc/cliCredentials/exchangeDeviceCode",
-            409,
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-1",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_secret_for_test"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+
+    // assert_cmd gives the child a non-terminal stdin.
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains("POST /api/auth/device/code"));
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(&format!(r#""cliSlug":"{expected}""#)));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], expected.as_str());
+    server.join();
+}
+
+#[test]
+fn login_rejection_does_not_overwrite_local_slug_or_save_credential() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            400,
             json!({
                 "json": {
                     "defined": false,
-                    "code": "CONFLICT",
-                    "status": 409,
-                    "message": "CLI slug `desk-01` is already in use for your account; choose a different slug."
+                    "code": "BAD_REQUEST",
+                    "status": 400,
+                    "message": "Device authorization was requested for a different CLI slug."
                 }
             }),
         ),
@@ -278,15 +364,178 @@ fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
         .args(["login", "--slug", "desk-01"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("choose a different slug"));
+        .stderr(predicate::str::contains("different CLI slug"));
 
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains("POST /api/auth/device/code"));
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains("POST /api/auth/device/code"));
     let exchange_request = server.requests.recv().unwrap();
     assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["cliSlug"], "existing-cli");
     assert!(!state.join("device-auth.json").exists());
+    server.join();
+}
+
+#[test]
+fn login_untagged_error_fails_fast_even_when_the_message_says_pending() {
+    // Only one exchange response is served. Classifying by message text (it
+    // says "pending") instead of `data.deviceFlowError` would poll again, hit
+    // a closed server, and fail with a transport error instead of this error.
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            400,
+            json!({
+                "json": {
+                    "defined": false,
+                    "code": "BAD_REQUEST",
+                    "status": 400,
+                    "message": "Device authorization is pending, but for a different CLI slug."
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+
+    let started = std::time::Instant::now();
+    cli(&config, &state)
+        .args(["login", "--slug", "pending-ci"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("for a different CLI slug"));
+    // One poll interval (1s), not a poll loop until the 30s expiry.
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert!(!state.join("device-auth.json").exists());
+    server.join();
+}
+
+#[test]
+fn relogin_with_the_saved_slug_overwrites_the_device_credential() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-2",
+                "user_code": "WXYZ-2345",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-2",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_new_secret"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "desk-01" }),
+    );
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("device-auth.json"),
+        serde_json::to_string(&json!({
+            "credentialId": "credential-1",
+            "userId": "user-1",
+            "secret": "wsmp_device_old_secret"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+
+    // The approval request names the saved slug, so the approver sees which
+    // device this login replaces.
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
+    let credential_text = fs::read_to_string(state.join("device-auth.json")).unwrap();
+    assert!(credential_text.contains("wsmp_device_new_secret"));
+    assert!(!credential_text.contains("wsmp_device_old_secret"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], "desk-01");
+    server.join();
+}
+
+#[test]
+fn non_interactive_login_defaults_to_the_saved_slug() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-1",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_secret_for_test"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "saved-cli" }),
+    );
+
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+    let _start_request = server.requests.recv().unwrap();
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(r#""cliSlug":"saved-cli""#));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], "saved-cli");
     server.join();
 }
 
@@ -312,7 +561,8 @@ fn login_writes_device_credential_to_state_dir() {
                     "defined": false,
                     "code": "BAD_REQUEST",
                     "status": 400,
-                    "message": "Device authorization is pending."
+                    "message": "Device authorization is pending.",
+                    "data": { "deviceFlowError": "authorization_pending" }
                 }
             }),
         ),
@@ -340,14 +590,17 @@ fn login_writes_device_credential_to_state_dir() {
     );
 
     cli(&config, &state)
-        .args(["login", "--name", "Test CLI", "--slug", "desk-01"])
+        .args(["login", "--slug", "desk-01"])
         .assert()
         .success()
         .stdout(predicate::str::contains("device login complete"));
     let start_request = server.requests.recv().unwrap();
     assert!(start_request.contains("POST /api/auth/device/code"));
+    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
     let pending_request = server.requests.recv().unwrap();
     assert!(pending_request.contains(r#""cliSlug":"desk-01""#));
+    // The device's name is dashboard-owned; login sends none.
+    assert!(!pending_request.contains(r#""name""#));
     let success_request = server.requests.recv().unwrap();
     assert!(success_request.contains(r#""cliSlug":"desk-01""#));
 
@@ -644,20 +897,81 @@ fn config_terminal_flags_persist_and_ask_for_a_restart() {
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
     cli(&config, &state)
-        .args(["config", "--json", "set-mcp-commands", "on"])
+        .args(["config", "--json", "set-mcp-commands", "supervised"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("allowMcpCommands"));
+        .stdout(predicate::str::contains(r#""key":"mcpCommandMode""#))
+        .stdout(predicate::str::contains(r#""value":"supervised""#));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["allowHumanTerminal"], true);
-    assert_eq!(cfg["allowMcpCommands"], true);
+    assert_eq!(cfg["mcpCommandMode"], "supervised");
+    assert!(cfg.get("allowMcpCommands").is_none());
     assert!(cfg.get("requireTerminalApproval").is_none());
+    cli(&config, &state)
+        .args(["config", "set-mcp-commands", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("mcpCommandMode").is_none());
+    cli(&config, &state)
+        .args(["config", "set-mcp-commands", "on"])
+        .assert()
+        .failure();
+
+    // A config from an older wsmp keeps its MCP commands switch, as a mode.
+    fs::write(&config, r#"{"version":1,"allowMcpCommands":true}"#).unwrap();
+    cli(&config, &state)
+        .args(["config", "set-terminal-approval", "on"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["mcpCommandMode"], "unsupervised");
+    assert!(cfg.get("allowMcpCommands").is_none());
 
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "off"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
+}
+
+#[cfg(unix)]
+#[test]
+fn supervised_run_without_the_daemon_env_fails_and_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let witness = tmp.path().join("ran");
+    // Only a command: the rest of the daemon-provided env is missing.
+    cli(&config, &state)
+        .args(["terminal", "supervised-run"])
+        .env(
+            "WSMP_SUPERVISED_COMMAND",
+            format!("touch {}", witness.display()),
+        )
+        .env_remove("WSMP_SUPERVISED_REASON")
+        .env_remove("WSMP_SUPERVISED_REQUESTER")
+        .env_remove("WSMP_SUPERVISED_SHARE")
+        .env_remove("WSMP_SUPERVISED_MARKER")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("started by the relay daemon"));
+    // Every variable set, but stdin is not a terminal: still nothing runs.
+    cli(&config, &state)
+        .args(["terminal", "supervised-run"])
+        .env(
+            "WSMP_SUPERVISED_COMMAND",
+            format!("touch {}", witness.display()),
+        )
+        .env("WSMP_SUPERVISED_REASON", "")
+        .env("WSMP_SUPERVISED_REQUESTER", "agent")
+        .env("WSMP_SUPERVISED_SHARE", "0")
+        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .write_stdin("\n")
+        .assert()
+        .failure();
+    assert!(!witness.exists());
 }
 
 #[test]
@@ -1348,4 +1662,321 @@ mod signal_shutdown {
             "control socket removed"
         );
     }
+
+    /// JSON may escape an unpaired UTF-16 surrogate, which no Rust string can
+    /// hold. Such a frame fails only the request it names; the daemon (model
+    /// serving, every other terminal and command) keeps running.
+    #[test]
+    fn a_frame_with_a_lone_surrogate_fails_only_its_own_request() {
+        let mut setup = start_relay(&["connect"]);
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        write_text(
+            &mut socket,
+            r#"{"type":"exec.start","commandId":"bad-1","command":"echo \ud800"}"#,
+        );
+        let rejected = setup.relay.next_text("exec.rejected");
+        assert_eq!(rejected["commandId"], "bad-1");
+        assert_eq!(rejected["reason"], "bad_command");
+        write_text(
+            &mut socket,
+            r#"{"type":"term.spawn","terminalId":"AAAAAAAAAAAAAAAAAAAAAA","commandId":"bad-2","command":"true","reason":"x\udc00","requester":"agent","shareOutput":false}"#,
+        );
+        let rejected = setup.relay.next_text("supervised.rejected");
+        assert_eq!(rejected["commandId"], "bad-2");
+        // A cancel for an unknown command names nothing live: nothing happens.
+        write_text(
+            &mut socket,
+            r#"{"type":"supervised.cancel","commandId":"\udbff"}"#,
+        );
+        // Still serving: a well-formed command runs.
+        write_text(
+            &mut socket,
+            &json!({ "type": "exec.start", "commandId": "good-1", "command": "echo ok" })
+                .to_string(),
+        );
+        assert_eq!(setup.relay.next_text("exec.started")["commandId"], "good-1");
+        assert_eq!(setup.relay.next_text("exec.done")["commandId"], "good-1");
+        assert!(
+            setup.child.try_wait().expect("poll relay").is_none(),
+            "the daemon exited on a malformed frame"
+        );
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
+}
+
+/// Runs the real confirm child in a PTY, as the relay daemon does.
+#[cfg(unix)]
+struct ConfirmChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    output: mpsc::Receiver<Vec<u8>>,
+    seen: Vec<u8>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+#[cfg(unix)]
+impl ConfirmChild {
+    const MARKER: &'static str = "00112233445566778899aabbccddeeff";
+
+    fn spawn(command: &str, share: bool, cwd: &Path) -> Self {
+        let system = portable_pty::native_pty_system();
+        let pair = system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open a pty");
+        let mut builder = portable_pty::CommandBuilder::new(assert_cmd::cargo::cargo_bin("wsmp"));
+        builder.args(["terminal", "supervised-run"]);
+        builder.cwd(cwd);
+        builder.env("WSMP_SUPERVISED_COMMAND", command);
+        builder.env("WSMP_SUPERVISED_REASON", "because\u{202e}txt.exe");
+        builder.env("WSMP_SUPERVISED_REQUESTER", "test agent");
+        builder.env("WSMP_SUPERVISED_SHARE", if share { "1" } else { "0" });
+        builder.env("WSMP_SUPERVISED_MARKER", Self::MARKER);
+        builder.env_remove("WSMP_LOG");
+        builder.env_remove("RUST_LOG");
+        let child = pair.slave.spawn_command(builder).expect("spawn wsmp");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let writer = pair.master.take_writer().expect("pty writer");
+        let (tx, output) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = [0_u8; 4096];
+            while let Ok(count) = reader.read(&mut buf) {
+                if count == 0 || tx.send(buf[..count].to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            child,
+            writer,
+            output,
+            seen: Vec::new(),
+            master: pair.master,
+        }
+    }
+
+    fn marker(kind: &str) -> Vec<u8> {
+        format!("\x1b]7717;wsmp-supervised;{kind};{}\x07", Self::MARKER).into_bytes()
+    }
+
+    fn wait_for(&mut self, needle: &[u8]) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if self
+                .seen
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                return true;
+            }
+            if let Ok(bytes) = self
+                .output
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                self.seen.extend(bytes);
+            }
+        }
+        false
+    }
+
+    fn pump(&mut self, wait: std::time::Duration) {
+        if let Ok(bytes) = self.output.recv_timeout(wait) {
+            self.seen.extend(bytes);
+        }
+    }
+
+    fn type_keys(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).expect("type keys");
+        self.writer.flush().expect("flush keys");
+    }
+
+    /// The relay daemon's go-ahead after it took `accepted`.
+    fn release(&mut self) {
+        let go = Self::marker("go");
+        self.type_keys(&go);
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
+    }
+
+    /// How many paints (each starts with home + clear) were seen so far.
+    fn paints(&self) -> usize {
+        self.seen
+            .windows(Self::CLEAR.len())
+            .filter(|window| *window == Self::CLEAR)
+            .count()
+    }
+
+    /// Waits for a paint that started after the first `after` paints and was
+    /// written in full (its last row ends the prompt, which is always drawn
+    /// last), and returns its rows. A paint still arriving in pieces never
+    /// qualifies, whatever its length so far.
+    fn wait_for_paint(&mut self, after: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if self.paints() > after {
+                let paint = self.last_paint();
+                if paint.last().is_some_and(|row| row.ends_with("decline")) {
+                    return paint;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no complete repaint after paint {after}: {:?}",
+                String::from_utf8_lossy(&self.seen)
+            );
+            self.pump(std::time::Duration::from_millis(50));
+        }
+    }
+
+    const CLEAR: &[u8] = b"\x1b[H\x1b[2J";
+
+    /// The rows of the most recent paint of the confirm screen, as far as it
+    /// arrived (use `wait_for_paint` to know it is complete).
+    fn last_paint(&self) -> Vec<String> {
+        let text = String::from_utf8_lossy(&self.seen).to_string();
+        let start = text.rfind("\x1b[H\x1b[2J").expect("a paint") + "\x1b[H\x1b[2J".len();
+        let paint = &text[start..];
+        let end = paint.find('\x1b').unwrap_or(paint.len());
+        paint[..end]
+            .split('\n')
+            .map(|row| row.trim_end_matches('\r').to_string())
+            .collect()
+    }
+
+    fn exit_code(&mut self) -> u32 {
+        self.child.wait().expect("wait for wsmp").exit_code()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn confirm_screen_ignores_type_ahead_and_runs_only_after_enter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let witness = tmp.path().join("ran");
+    let command = format!(
+        "touch {} && printf 'hello-%s\\n' supervised",
+        witness.display()
+    );
+    let mut child = ConfirmChild::spawn(&command, true, tmp.path());
+    // Enter typed before the screen is drawn must not run the command.
+    child.type_keys(b"\r\r\r");
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    assert!(!witness.exists());
+    let screen = String::from_utf8_lossy(&child.seen).to_string();
+    assert!(screen.contains("Requested by: test agent"), "{screen}");
+    assert!(screen.contains("because\\u{202e}txt.exe"), "{screen}");
+    assert!(screen.contains("Output will be shared with the requesting agent."));
+    assert!(screen.contains(&witness.display().to_string()));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!witness.exists(), "type-ahead ran the command");
+    child.type_keys(b"x \x1b[A\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    // Enter alone does not start it: the daemon's go does.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!witness.exists(), "the command ran before the go");
+    child.type_keys(b"\r\r");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !witness.exists(),
+        "keys other than the go started the command"
+    );
+    child.release();
+    assert!(child.wait_for(b"hello-supervised"));
+    assert_eq!(child.exit_code(), 0);
+    assert!(witness.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn confirm_screen_declines_on_q_and_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let witness = tmp.path().join("ran");
+    let mut child = ConfirmChild::spawn(&format!("touch {}", witness.display()), false, tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    assert!(String::from_utf8_lossy(&child.seen).contains("Output stays in this terminal."));
+    child.type_keys(b"q");
+    assert!(child.wait_for(b"Declined."));
+    assert_eq!(child.exit_code(), 0);
+    assert!(!child.seen.windows(8).any(|window| window == b"accepted"));
+    assert!(!witness.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_confirmed_command_without_the_go_never_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let witness = tmp.path().join("ran");
+    let mut child = ConfirmChild::spawn(&format!("touch {}", witness.display()), false, tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    child.type_keys(b"\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    // A wrong go (another request's marker) is not the go.
+    child.type_keys(b"\x1b]7717;wsmp-supervised;go;ffffffffffffffffffffffffffffffff\x07");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!witness.exists());
+    // The daemon ends it instead (a server expiry won the race).
+    child.child.kill().expect("kill the confirm child");
+    let _ = child.child.wait();
+    assert!(!witness.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tall_command_fits_the_screen_and_follows_a_resize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = (0..300)
+        .map(|n| format!("echo line-{n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut child = ConfirmChild::spawn(&command, false, tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    let first = child.last_paint();
+    assert!(first.len() <= 24, "{first:?}");
+    let joined = first.join("\n");
+    assert!(joined.contains("Requested by: test agent"), "{joined}");
+    assert!(joined.contains("echo line-0"), "{joined}");
+    assert!(joined.contains("the rest is not shown"), "{joined}");
+    assert!(joined.contains("300 lines"), "{joined}");
+    assert!(joined.ends_with("Enter to run · Ctrl-C, Ctrl-D or q to decline"));
+
+    // A narrower, shorter terminal gets a new layout that still fits.
+    let before = child.paints();
+    child.resize(40, 12);
+    let narrow = child.wait_for_paint(before);
+    assert!(narrow.len() <= 12, "{narrow:?}");
+    assert!(
+        narrow.iter().all(|row| row.chars().count() < 40),
+        "{narrow:?}"
+    );
+    assert!(narrow.join(" ").contains("not shown"), "{narrow:?}");
+
+    // Scrolling to the end shows the output notice; `q` still declines.
+    let before = child.paints();
+    child.type_keys(b"G");
+    let end = child.wait_for_paint(before).join(" ");
+    assert!(end.contains("Output stays in this terminal."), "{end}");
+    assert!(end.contains("echo line-299"), "{end}");
+    child.type_keys(b"q");
+    assert!(child.wait_for(b"Declined."));
+    assert_eq!(child.exit_code(), 0);
 }

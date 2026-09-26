@@ -96,6 +96,8 @@ catalog:
   zod: ^4.6.5
   "@types/node": ^26.5.1
   "@types/ws": ^8.18.1
+  # Types for pg (packages/db); keep on the pg 8.x line of packages/db.
+  "@types/pg": ^8.23.1
   hono: ^4.13.7
   "@orpc/server": ^1.15.0
   "@orpc/openapi": ^1.15.0
@@ -114,6 +116,10 @@ catalog:
   next-themes: ^0.4.6
   react: ^19.3.0
   react-dom: ^19.3.0
+  # Required recharts peer; keep aligned with react.
+  react-is: ^19.3.0
+  # shadcn chart component (packages/ui/src/components/chart.tsx).
+  recharts: ^3.8.1
   react-markdown: 10.1.0
   rehype-highlight: 7.0.2
   highlight.js: 11.12.0

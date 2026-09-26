@@ -35,7 +35,7 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
-  cliToken: { update: MockInstance };
+  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -46,6 +46,7 @@ const db = prisma as unknown as {
   poolMember: { updateMany: MockInstance };
   executionTarget: { findMany: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
+  mcpPersonalToken: { findFirst: MockInstance };
 };
 
 const identity: CliWebsocketIdentity = {
@@ -77,27 +78,30 @@ class FakeSocket {
   }
 }
 
+/** The live PAT row the start path re-reads: unrevoked, CLI commands, mcp:write. */
+function liveToken(name = "MCP agent", expiresAt: Date | null = null) {
+  return { name, scopes: ["mcp:read", "mcp:write"], allowCliCommands: true, expiresAt };
+}
+
 function uncompressedKey(): string {
   const bytes = Buffer.alloc(65, 9);
   bytes[0] = 0x04;
   return bytes.toString("base64url");
 }
 
-function hello(
-  slug: string,
-  features: { mcpCommands: boolean },
-  protocolVersion: "2.4" | "2.5" = "2.4",
-) {
+type Mode = "off" | "supervised" | "unsupervised";
+
+function hello(slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion,
+    protocolVersion: "2.6",
     cli: {
       slug,
-      label: slug,
+      hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion,
+        protocolVersion: "2.6",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -112,12 +116,13 @@ function hello(
         exec: true,
         features: {
           humanTerminal: false,
-          mcpCommands: features.mcpCommands,
+          mcpCommandMode: features.mcpCommandMode,
           terminalApproval: false,
           terminalSupported: false,
         },
         terminalPublicKey: uncompressedKey(),
-        ...(protocolVersion === "2.5" ? { terminalViewers: true } : {}),
+        terminalViewers: true,
+        supervisedCommands: true,
       },
     },
     endpoints: [],
@@ -126,12 +131,11 @@ function hello(
 
 async function connect(
   slug = "desktop",
-  features = { mcpCommands: true },
-  protocolVersion: "2.4" | "2.5" = "2.4",
+  features: { mcpCommandMode: Mode } = { mcpCommandMode: "unsupervised" },
 ) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, features, protocolVersion), now);
+  await relaySessionManager.handleTextFrame(socket, hello(slug, features), now);
   return socket;
 }
 
@@ -142,13 +146,20 @@ describe("cli commands", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    // An unbound CLI token: every hello's conditional bind claims it.
+    db.cliToken.findUnique.mockResolvedValue({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
     db.cliDevice.upsert.mockImplementation(async (args: { create: { slug: string } }) => ({
       id: args.create.slug,
       userId: "user-id",
       slug: args.create.slug,
       allowHumanTerminal: false,
-      allowMcpCommands: true,
+      mcpCommandMode: "UNSUPERVISED",
       inventorySeq: 0,
       inventoryDigest: null,
       inventoryAcknowledgedAt: null,
@@ -162,9 +173,10 @@ describe("cli commands", () => {
     db.cliDevice.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
       if (args.where.id === "missing") return null;
       if (args.where.id === "foreign")
-        return { id: "foreign", userId: "other-user", allowMcpCommands: true };
-      return { id: args.where.id, userId: "user-id", allowMcpCommands: true };
+        return { id: "foreign", userId: "other-user", mcpCommandMode: "UNSUPERVISED" };
+      return { id: args.where.id, userId: "user-id", mcpCommandMode: "UNSUPERVISED" };
     });
+    db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken());
     db.endpoint.findUnique.mockResolvedValue(null);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
@@ -174,6 +186,153 @@ describe("cli commands", () => {
   afterEach(async () => {
     await relaySessionManager.closeRelaySessions();
     sweepExpiredTokenCommands(Date.now() + 16 * 60 * 1000);
+  });
+
+  it("refuses commands for a user marked for deletion", async () => {
+    db.user.findUnique.mockResolvedValue({
+      banned: true,
+      deletionRequestedAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    db.cliDevice.findUnique.mockResolvedValue({
+      id: "desktop",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    const socket = await connect("desktop");
+    socket.sends.length = 0;
+    const started = await startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    expect(started).toEqual({ ok: false, error: "token_inactive" });
+  });
+
+  /** Pauses only the owner-state read (the select carrying the deletion marker). */
+  function pauseOwnerRead() {
+    let release!: (row: { banned: boolean; banExpires: null; deletionRequestedAt: null }) => void;
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const fallback = db.user.findUnique.getMockImplementation();
+    db.user.findUnique.mockImplementation(
+      (args: { select?: { deletionRequestedAt?: boolean } }) => {
+        if (!args.select?.deletionRequestedAt) return fallback?.(args) ?? { slug: "owner" };
+        return new Promise((resolve) => {
+          release = resolve;
+          entered();
+        });
+      },
+    );
+    return {
+      reached,
+      release: () => release({ banned: false, banExpires: null, deletionRequestedAt: null }),
+    };
+  }
+
+  function execStarts(socket: FakeSocket) {
+    return socket.sends.filter((send) => typeof send === "string" && send.includes("exec.start"));
+  }
+
+  it("refuses a start whose token is revoked while the owner read is pending", async () => {
+    const socket = await connect("desktop");
+    socket.sends.length = 0;
+    const owner = pauseOwnerRead();
+    const start = startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    await owner.reached;
+    cancelCommandsForToken("token");
+    owner.release();
+    await expect(start).resolves.toEqual({ ok: false, error: "token_inactive" });
+    expect(execStarts(socket)).toEqual([]);
+  });
+
+  it("refuses an owner whose temporary ban is active and admits one whose ban expired", async () => {
+    const socket = await connect("desktop");
+    socket.sends.length = 0;
+    db.user.findUnique.mockResolvedValue({
+      banned: true,
+      banExpires: new Date(Date.now() + 60_000),
+      deletionRequestedAt: null,
+    });
+    await expect(
+      startCliCommand({
+        userId: "user-id",
+        tokenId: "token",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "pwd",
+      }),
+    ).resolves.toEqual({ ok: false, error: "token_inactive" });
+    db.user.findUnique.mockResolvedValue({
+      banned: true,
+      banExpires: new Date(Date.now() - 60_000),
+      deletionRequestedAt: null,
+    });
+    const started = await startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    expect(started.ok).toBe(true);
+  });
+
+  it("a deletion mark committed after the owner read closes the device before dispatch", async () => {
+    const socket = await connect("desktop");
+    socket.sends.length = 0;
+    // The owner read resolves unmarked; the token read is still pending.
+    let releaseToken!: (row: ReturnType<typeof liveToken>) => void;
+    let tokenEntered!: () => void;
+    const tokenReached = new Promise<void>((resolve) => {
+      tokenEntered = resolve;
+    });
+    db.mcpPersonalToken.findFirst.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseToken = resolve;
+          tokenEntered();
+        }),
+    );
+    const start = startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    await tokenReached;
+    // What `onUserDeletionMarked` runs in-process after the marker commits.
+    const closing = relaySessionManager.closeSessionsForUser("user-id");
+    expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    releaseToken(liveToken());
+    await expect(start).resolves.toEqual({ ok: false, error: "offline" });
+    await closing;
+    expect(execStarts(socket)).toEqual([]);
+  });
+
+  it("a deletion mark committed after dispatch ends the registered command", async () => {
+    const socket = await connect("desktop");
+    socket.sends.length = 0;
+    const started = await startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    if (!started.ok) throw new Error("start refused");
+    await relaySessionManager.closeSessionsForUser("user-id");
+    expect(snapshotCliCommand(started.commandId, "user-id", "token")?.status).not.toBe("running");
   });
 
   it("uses the same not-found result for an unknown device and another user's device", async () => {
@@ -195,8 +354,8 @@ describe("cli commands", () => {
     expect(foreign).toEqual(unknown);
   });
 
-  it("starts commands on a 2.5 CLI through the version check", async () => {
-    const socket = await connect("desktop", { mcpCommands: true }, "2.5");
+  it("starts commands on a 2.6 CLI through the version check", async () => {
+    const socket = await connect("desktop");
     socket.sends.length = 0;
     const started = await startCliCommand({
       userId: "user-id",
@@ -217,7 +376,7 @@ describe("cli commands", () => {
     db.cliDevice.findUnique.mockResolvedValue({
       id: "desktop",
       userId: "user-id",
-      allowMcpCommands: false,
+      mcpCommandMode: "OFF",
     });
     const socket = await connect();
     socket.sends.length = 0;
@@ -235,7 +394,7 @@ describe("cli commands", () => {
     db.cliDevice.findUnique.mockResolvedValue({
       id: "desktop",
       userId: "user-id",
-      allowMcpCommands: true,
+      mcpCommandMode: "UNSUPERVISED",
     });
     await relaySessionManager.closeRelaySessions();
     await expect(
@@ -258,7 +417,7 @@ describe("cli commands", () => {
         protocolVersion: "2.1",
         cli: {
           slug: "desktop",
-          label: "desktop",
+          hostname: "desktop.local",
           capabilities: {
             protocolVersion: "2.1",
             inventoryAck: true,
@@ -290,7 +449,7 @@ describe("cli commands", () => {
     );
 
     await relaySessionManager.closeRelaySessions();
-    const disabled = await connect("desktop", { mcpCommands: false });
+    const disabled = await connect("desktop", { mcpCommandMode: "off" });
     disabled.sends.length = 0;
     await expect(
       startCliCommand({
@@ -365,10 +524,12 @@ describe("cli commands", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const socket = await connect();
     const marker = "super-secret-command-marker";
+    const expiry = new Date(Date.now() + 60_000);
+    db.mcpPersonalToken.findFirst.mockResolvedValueOnce(liveToken("MCP agent", expiry));
     const started = await startCliCommand({
       userId: "user-id",
       tokenId: "token-b",
-      expiresAt: new Date(Date.now() - 1000),
+      expiresAt: expiry,
       cliDeviceId: "desktop",
       command: marker,
     });
@@ -517,17 +678,96 @@ describe("cli commands", () => {
     ).resolves.toEqual({ ok: false, error: "limit" });
   });
 
+  it("refuses a command or cwd with an unpaired surrogate before sending anything", async () => {
+    const socket = await connect();
+    socket.sends.length = 0;
+    const base = {
+      userId: "user-id",
+      tokenId: "token-u",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+    };
+    for (const input of [
+      { command: "echo \ud800" },
+      { command: "echo \udc00" },
+      { command: "pwd", cwd: "/tmp/\ud83d" },
+    ]) {
+      await expect(startCliCommand({ ...base, ...input })).resolves.toEqual({
+        ok: false,
+        error: "invalid_command",
+      });
+    }
+    expect(socket.sends).toEqual([]);
+    const ok = await startCliCommand({ ...base, command: "echo 😀", cwd: "/tmp/😀" });
+    expect(ok.ok).toBe(true);
+    const raw = socket.sends.find(
+      (send): send is string => typeof send === "string" && send.includes("exec.start"),
+    );
+    expect(raw?.isWellFormed()).toBe(true);
+  });
+
+  it("never runs a command whose token is revoked or narrowed while it looks things up", async () => {
+    const socket = await connect();
+    socket.sends.length = 0;
+    for (const race of ["token", "device"] as const) {
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      if (race === "token") {
+        db.mcpPersonalToken.findFirst.mockImplementationOnce(async () => {
+          await gate;
+          return liveToken();
+        });
+      } else {
+        const device = db.cliDevice.findUnique.getMockImplementation();
+        db.cliDevice.findUnique.mockImplementationOnce(async (args: { where: { id: string } }) => {
+          await gate;
+          return device?.(args);
+        });
+      }
+      const pending = startCliCommand({
+        userId: "user-id",
+        tokenId: "token-r",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "touch /tmp/ran",
+      });
+      await Promise.resolve();
+      cancelCommandsForToken("token-r");
+      release();
+      await expect(pending).resolves.toEqual({ ok: false, error: "token_inactive" });
+    }
+    // A token row that is no longer live (revoked in the database, or narrowed).
+    for (const row of [null, { ...liveToken(), allowCliCommands: false }]) {
+      db.mcpPersonalToken.findFirst.mockResolvedValueOnce(row);
+      await expect(
+        startCliCommand({
+          userId: "user-id",
+          tokenId: "token-r",
+          expiresAt: null,
+          cliDeviceId: "desktop",
+          command: "touch /tmp/ran",
+        }),
+      ).resolves.toEqual({ ok: false, error: "token_inactive" });
+    }
+    expect(socket.sends).toEqual([]);
+  });
+
   it("cancels a running command whose token expiry has passed", async () => {
     const socket = await connect();
+    const expiry = new Date(Date.now() + 1_000);
+    db.mcpPersonalToken.findFirst.mockResolvedValueOnce(liveToken("MCP agent", expiry));
     const started = await startCliCommand({
       userId: "user-id",
       tokenId: "token-c",
-      expiresAt: new Date(1_000),
+      expiresAt: expiry,
       cliDeviceId: "desktop",
       command: "pwd",
     });
     if (!started.ok) throw new Error("expected start");
-    expect(sweepExpiredTokenCommands(1_000)).toBe(1);
+    expect(sweepExpiredTokenCommands(expiry.getTime() - 1)).toBe(0);
+    expect(sweepExpiredTokenCommands(expiry.getTime())).toBe(1);
     expect(snapshotCliCommand(started.commandId, "user-id", "token-c")?.status).toBe("running");
     expect(
       socket.sends.some(

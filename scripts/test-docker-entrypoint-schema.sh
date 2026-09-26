@@ -48,8 +48,25 @@ mkdir -p "$TEST_ROOT/usr/local/bin" "$TEST_ROOT/app/packages/db/node_modules/.bi
   "$TEST_ROOT/app/packages/db/scripts" "$TEST_ROOT/bin"
 cp "$REPO_ROOT/scripts/docker-entrypoint.sh" "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh"
 
+# The real push wrapper runs (with the real node) against the stub prisma
+# below, so its flag pass-through, lock_timeout URL option and retry loop are
+# exercised exactly as the image runs them. The scripts staged here are the
+# ones the Dockerfile's runner stage copies, derived from its COPY lines (not
+# a hand list), so a module the image lacks fails this test at import too.
+sed -n 's#^COPY --from=builder /app/\(packages/db/scripts/[A-Za-z0-9_.-]*\.mjs\) \./\1$#\1#p' \
+  "$REPO_ROOT/Dockerfile" > "$TEST_ROOT/image-scripts"
+grep -qx 'packages/db/scripts/push-schema.mjs' "$TEST_ROOT/image-scripts" || {
+  echo "Dockerfile runner stage does not copy packages/db/scripts/push-schema.mjs" >&2
+  exit 1
+}
+while IFS= read -r image_script; do
+  cp "$REPO_ROOT/$image_script" "$TEST_ROOT/app/$image_script"
+done < "$TEST_ROOT/image-scripts"
 cat > "$TEST_ROOT/bin/node" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = "scripts/push-schema.mjs" ]; then
+  exec "$ENTRYPOINT_TEST_REAL_NODE" "$@"
+fi
 if [ "${1:-}" = "-e" ]; then
   case "${2:-}" in
     *ENTRYPOINT_SIGNAL_RESET_LAUNCHER*) exec "$ENTRYPOINT_TEST_REAL_NODE" "$@" ;;
@@ -66,6 +83,18 @@ EOF
 cat > "$TEST_ROOT/app/packages/db/node_modules/.bin/prisma" <<'EOF'
 #!/bin/sh
 echo "push${*:+ $*}" >> "$ENTRYPOINT_TEST_EVENTS"
+case "$DATABASE_URL" in
+  *"options=-c%20lock_timeout%3D5000ms"*) ;;
+  *) echo "push-without-lock-timeout" >> "$ENTRYPOINT_TEST_EVENTS" ;;
+esac
+if [ -n "${PUSH_LOCK_FAILURES_FILE:-}" ] && [ -s "$PUSH_LOCK_FAILURES_FILE" ]; then
+  remaining=$(cat "$PUSH_LOCK_FAILURES_FILE")
+  if [ "$remaining" -gt 0 ]; then
+    echo $((remaining - 1)) > "$PUSH_LOCK_FAILURES_FILE"
+    echo "Error: ERROR: canceling statement due to lock timeout" >&2
+    exit 1
+  fi
+fi
 exit "${PUSH_EXIT_STATUS:-0}"
 EOF
 cat > "$TEST_ROOT/bin/psql" <<'EOF'
@@ -251,6 +280,39 @@ push db push --accept-data-loss
 harden
 unlock
 exec'
+
+# Safe mode never passes Prisma's data-loss flag through the push wrapper.
+export APPLY_SCHEMA=safe
+run_entrypoint
+assert_status 0
+assert_events 'psql
+lock
+push db push
+harden
+unlock
+exec'
+if grep -q 'accept-data-loss' "$EVENTS"; then
+  echo "Safe mode passed --accept-data-loss to prisma" >&2
+  exit 1
+fi
+
+# A push that hits its lock_timeout is retried as a whole (deploy-only
+# exception to the DL-1 lock order: bounded wait + retry), then hardening runs.
+PUSH_LOCK_FAILURES_FILE="$TEST_ROOT/push-lock-failures"
+echo 2 > "$PUSH_LOCK_FAILURES_FILE"
+export PUSH_LOCK_FAILURES_FILE
+run_entrypoint
+assert_status 0
+assert_events 'psql
+lock
+push db push
+push db push
+push db push
+harden
+unlock
+exec'
+grep -q 'Schema push lock conflict; retrying attempt 2/' "$OUTPUT"
+unset PUSH_LOCK_FAILURES_FILE
 
 # Off bypasses every schema tool and directly execs the application.
 export APPLY_SCHEMA=off

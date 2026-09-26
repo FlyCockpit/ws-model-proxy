@@ -47,6 +47,8 @@ const cliRuntime = vi.hoisted(() => ({
   startCliCommand: vi.fn(),
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
+  startSupervisedCommand: vi.fn(),
+  snapshotSupervisedCommand: vi.fn((): unknown => null),
 }));
 
 vi.mock("../relay/cli-commands.js", () => cliRuntime);
@@ -190,6 +192,7 @@ function bindRequest(
 
 const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
+  "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
 ]);
 
@@ -1116,6 +1119,9 @@ describe("CLI command tools", () => {
     cliRuntime.startCliCommand.mockReset();
     cliRuntime.waitCliCommand.mockReset();
     cliRuntime.snapshotCliCommand.mockReset();
+    cliRuntime.startSupervisedCommand.mockReset();
+    cliRuntime.snapshotSupervisedCommand.mockReset();
+    cliRuntime.snapshotSupervisedCommand.mockReturnValue(null);
   });
 
   async function listedNames(
@@ -1139,6 +1145,7 @@ describe("CLI command tools", () => {
     const flagged = await listedNames(PAT_WITH_CLI, ["mcp:write"]);
     expect(flagged).toEqual(catalogNames(true));
     expect(flagged).toContain("forwarder_cli_command_run");
+    expect(flagged).toContain("forwarder_cli_supervised_command_start");
     expect(flagged).toContain("forwarder_cli_command_result");
   });
 
@@ -1237,7 +1244,14 @@ describe("CLI command tools", () => {
     ["offline", "CLI is offline or does not support this protocol"],
     ["feature_disabled", "CLI has MCP commands disabled in wsmp config"],
     ["limit", "too many commands"],
-    ["invalid_command", "command must be 1..=4096 bytes and contain no NUL"],
+    [
+      "invalid_command",
+      "command and cwd must be well-formed Unicode text (no unpaired surrogates), 1..=4096 UTF-8 bytes, and contain no NUL",
+    ],
+    [
+      "token_inactive",
+      "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
+    ],
   ] as const)("maps start error %s to a stable message", async (code, message) => {
     cliRuntime.startCliCommand.mockResolvedValue({ ok: false, error: code });
     const run = requireDescriptor("forwarder_cli_command_run");
@@ -1471,5 +1485,170 @@ describe("CLI command tools", () => {
     expect(result.structuredContent).not.toMatchObject({ error: { code: "OUTPUT_TOO_LARGE" } });
     const bytes = new TextEncoder().encode(JSON.stringify(result)).length;
     expect(bytes).toBeLessThanOrEqual(CLI_COMMAND_WRAPPED_OUTPUT_BUDGET);
+  });
+
+  describe("supervised command tool", () => {
+    beforeEach(() => {
+      cliRuntime.startSupervisedCommand.mockReset();
+      cliRuntime.snapshotSupervisedCommand.mockReset();
+      cliRuntime.snapshotSupervisedCommand.mockReturnValue(null);
+      cliRuntime.snapshotCliCommand.mockReset();
+    });
+
+    const startArgs = {
+      cliDeviceId: "cli-1",
+      command: "sudo apt install build-essential",
+      reason: "needs your sudo password",
+      shareOutput: true,
+      confirm: "RUN",
+    };
+
+    it("is destructive, needs RUN, and explains what the agent can learn", async () => {
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-list", PAT_WITH_CLI);
+      const handler = createMcpTransport();
+      const response = await handler.fetch(toolsListRequest(9), { authInfo });
+      const body = (await response.json()) as {
+        result?: {
+          tools?: {
+            name: string;
+            description?: string;
+            annotations?: { destructiveHint?: boolean };
+          }[];
+        };
+      };
+      const tool = body.result?.tools?.find(
+        (entry) => entry.name === "forwarder_cli_supervised_command_start",
+      );
+      expect(tool?.annotations?.destructiveHint).toBe(true);
+      expect(tool?.description).toContain('confirm: "RUN"');
+      expect(tool?.description).toContain("press Enter");
+      expect(tool?.description).toContain("forwarder_cli_command_result");
+    });
+
+    it("fails closed for OAuth and a PAT without the flag", async () => {
+      const start = requireDescriptor("forwarder_cli_supervised_command_start");
+      for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+        const result = await runManifestTool(start, {
+          dispatch: cliDispatch(credential),
+          scopes: ["mcp:write"],
+          client: undefined,
+          args: startArgs,
+        });
+        expect(result.isError).toBe(true);
+        expect(resultText(result)).toBe("Tool forwarder_cli_supervised_command_start not found");
+      }
+      expect(cliRuntime.startSupervisedCommand).not.toHaveBeenCalled();
+    });
+
+    it("requires confirm RUN and the mcp:write scope", async () => {
+      const start = requireDescriptor("forwarder_cli_supervised_command_start");
+      const { confirm: _confirm, ...withoutConfirm } = startArgs;
+      const missing = await runManifestTool(start, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: withoutConfirm,
+      });
+      expect(missing.isError).toBe(true);
+      expect(resultText(missing)).toContain('confirm="RUN"');
+      const readOnly = await runManifestTool(start, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:read"],
+        client: undefined,
+        args: startArgs,
+      });
+      expect(readOnly.isError).toBe(true);
+      expect(resultText(readOnly)).toContain("mcp:write");
+      expect(cliRuntime.startSupervisedCommand).not.toHaveBeenCalled();
+    });
+
+    it("starts with the token id and returns the request id without waiting", async () => {
+      cliRuntime.startSupervisedCommand.mockResolvedValue({
+        ok: true,
+        commandId: "sup-1",
+        terminalId: "term-1",
+        expiresAt: "2026-01-01T00:15:00.000Z",
+      });
+      const start = requireDescriptor("forwarder_cli_supervised_command_start");
+      const result = await runManifestTool(start, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: startArgs,
+      });
+      expect(cliRuntime.startSupervisedCommand).toHaveBeenCalledWith({
+        userId: USER.id,
+        tokenId: "token-pat-1",
+        expiresAt: PAT_EXPIRES,
+        cliDeviceId: "cli-1",
+        command: startArgs.command,
+        reason: startArgs.reason,
+        shareOutput: true,
+      });
+      expect(parsedTool(result)).toMatchObject({
+        commandId: "sup-1",
+        kind: "supervised",
+        status: "awaiting_user",
+        shareOutput: true,
+      });
+      expect(cliRuntime.waitCliCommand).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["supervised_only", "use forwarder_cli_supervised_command_start"],
+      ["unsupported", "terminal support"],
+      ["invalid_reason", "of at most 500 characters (Unicode code points)"],
+    ] as const)("maps %s to a stable message", async (code, fragment) => {
+      cliRuntime.startSupervisedCommand.mockResolvedValue({ ok: false, error: code });
+      const start = requireDescriptor("forwarder_cli_supervised_command_start");
+      const result = await runManifestTool(start, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: startArgs,
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain(fragment);
+    });
+
+    it("the result tool reads supervised records with the caller's token and never shows held output", async () => {
+      const resultTool = requireDescriptor("forwarder_cli_command_result");
+      cliRuntime.snapshotSupervisedCommand.mockReturnValue({
+        kind: "supervised",
+        commandId: "sup-1",
+        userId: USER.id,
+        tokenId: "token-pat-1",
+        cliDeviceId: "cli-1",
+        status: "awaiting_output_review",
+        exitCode: 0,
+        signal: null,
+        rejectionReason: null,
+        waitDeadline: Date.parse("2026-01-01T00:15:00.000Z"),
+        output: null,
+        shared: null,
+        reviewedText: null,
+      });
+      const held = parsedTool(
+        await runManifestTool(resultTool, {
+          dispatch: cliDispatch(PAT_WITH_CLI),
+          scopes: ["mcp:write"],
+          client: undefined,
+          args: { commandId: "sup-1" },
+        }),
+      );
+      expect(cliRuntime.snapshotSupervisedCommand).toHaveBeenCalledWith(
+        "sup-1",
+        USER.id,
+        "token-pat-1",
+      );
+      expect(held).toEqual({
+        commandId: "sup-1",
+        kind: "supervised",
+        status: "awaiting_output_review",
+        waitingUntil: "2026-01-01T00:15:00.000Z",
+      });
+      expect(cliRuntime.snapshotCliCommand).not.toHaveBeenCalled();
+    });
   });
 });

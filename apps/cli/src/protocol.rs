@@ -6,13 +6,12 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    CapabilityOverrideMode, EndpointConfig, EndpointKind, OpenAiCompatibleCapabilities,
+    CapabilityOverrideMode, EndpointConfig, EndpointKind, McpCommandMode,
+    OpenAiCompatibleCapabilities,
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.5";
-/// Spoken after an old server rejects the first 2.5 hello. Single-viewer terminals.
-pub const RELAY_LEGACY_PROTOCOL_VERSION: &str = "2.4";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.6";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -22,61 +21,18 @@ pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 /// credit (`relay.request.body.ack`) to the server for each chunk its upstream
 /// request consumes. Mirrors `RELAY_REQUEST_BODY_WINDOW_CHUNKS` on the server.
 pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
+/// What a pre-2.6 server answers when its strict hello schema rejects a 2.6 hello.
+pub const OLDER_SERVER_HELLO_REJECTION: &str = "Malformed relay protocol message.";
 
-/// The relay protocol this process speaks. 2.5 adds multi-viewer terminals;
-/// 2.4 is the sticky fallback for servers that do not know 2.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelayProtocolMode {
-    V25,
-    Legacy24,
-}
-
-impl RelayProtocolMode {
-    pub fn version(self) -> &'static str {
-        match self {
-            Self::V25 => RELAY_PROTOCOL_VERSION,
-            Self::Legacy24 => RELAY_LEGACY_PROTOCOL_VERSION,
-        }
-    }
-
-    pub fn terminal_viewers(self) -> bool {
-        matches!(self, Self::V25)
-    }
-}
-
-/// The 2.5 -> 2.4 fallback. The first hello that gets `protocol.error` before
-/// `hello.ok` downgrades once; the downgrade is sticky for the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProtocolNegotiation {
-    mode: RelayProtocolMode,
-}
-
-impl Default for ProtocolNegotiation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ProtocolNegotiation {
-    pub fn new() -> Self {
-        Self {
-            mode: RelayProtocolMode::V25,
-        }
-    }
-
-    pub fn mode(self) -> RelayProtocolMode {
-        self.mode
-    }
-
-    /// `true` when this `protocol.error` should trigger the one reconnect with
-    /// a 2.4 hello. An access denial is not a version mismatch, so it never
-    /// downgrades.
-    pub fn downgrade_on_protocol_error(&mut self, registered: bool, message: &str) -> bool {
-        if registered || self.mode != RelayProtocolMode::V25 || message == "access_denied" {
-            return false;
-        }
-        self.mode = RelayProtocolMode::Legacy24;
-        true
+/// The fatal error for a `protocol.error` that arrives before `hello.ok`.
+/// A pre-2.6 server rejects the 2.6 hello as malformed; say so plainly.
+pub fn hello_rejection_message(message: &str) -> String {
+    if message == OLDER_SERVER_HELLO_REJECTION {
+        format!(
+            "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
+        )
+    } else {
+        format!("relay protocol error: {message}")
     }
 }
 
@@ -192,6 +148,34 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+    /// A supervised terminal's confirm screen is running (no viewers yet).
+    #[serde(rename = "term.spawned")]
+    TermSpawned {
+        terminal_id: String,
+        command_id: String,
+    },
+    /// `term.spawn` was refused; nothing ran.
+    #[serde(rename = "supervised.rejected")]
+    SupervisedRejected { command_id: String, reason: String },
+    /// Enter was pressed on the drawn confirm screen; the command was exec'd.
+    #[serde(rename = "supervised.accepted")]
+    SupervisedAccepted { command_id: String },
+    /// Declined on the confirm screen, or the confirm child ended without accepting.
+    #[serde(rename = "supervised.declined")]
+    SupervisedDeclined { command_id: String },
+    /// The accepted command exited. `review`: output was withheld for review.
+    /// `output_bytes` only when `supervised.output` frames were sent.
+    #[serde(rename = "supervised.done")]
+    SupervisedDone {
+        command_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+        review: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_bytes: Option<u64>,
+    },
     #[serde(rename = "exec.started")]
     ExecStarted { command_id: String },
     #[serde(rename = "exec.rejected")]
@@ -248,7 +232,9 @@ pub enum RelayMetricTokenizer {
 #[serde(rename_all = "camelCase")]
 pub struct CliInventory {
     pub slug: String,
-    pub label: String,
+    /// This machine's hostname, a reported fact. Omitted when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: CliCapabilities,
@@ -261,12 +247,12 @@ pub struct CliInventory {
 #[derive(Debug, Clone)]
 pub struct TerminalFeatureSnapshot {
     pub allow_human_terminal: bool,
-    pub allow_mcp_commands: bool,
+    pub mcp_command_mode: McpCommandMode,
     pub require_terminal_approval: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
-    /// 2.5 only: the persistent identity key and its signature over the ECDH
-    /// key above. `None` when the identity file could not be loaded.
+    /// The persistent identity key and its signature over the ECDH key above.
+    /// `None` when the identity file could not be loaded.
     pub terminal_identity: Option<TerminalIdentityProof>,
 }
 
@@ -274,7 +260,7 @@ pub struct TerminalFeatureSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CliReportedFeatures {
     pub human_terminal: bool,
-    pub mcp_commands: bool,
+    pub mcp_command_mode: McpCommandMode,
     pub terminal_approval: bool,
     pub terminal_supported: bool,
 }
@@ -297,19 +283,19 @@ pub struct CliCapabilities {
     pub exec: bool,
     pub features: CliReportedFeatures,
     pub terminal_public_key: String,
-    /// 2.5 only; the 2.4 schema is strict and must not see this key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_viewers: Option<bool>,
-    /// 2.5 only. The browser pins this key and checks the signature before any
+    pub terminal_viewers: bool,
+    /// 2.6: this CLI implements supervised terminals (`term.spawn`).
+    pub supervised_commands: bool,
+    /// The browser pins this key and checks the signature before any
     /// terminal handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_identity: Option<TerminalIdentityProof>,
 }
 
 impl CliCapabilities {
-    pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot, mode: RelayProtocolMode) -> Self {
+    pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot) -> Self {
         Self {
-            protocol_version: mode.version().to_string(),
+            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
             inventory_ack: true,
             inventory_replace: true,
             endpoint_targeting: true,
@@ -324,17 +310,14 @@ impl CliCapabilities {
             exec: true,
             features: CliReportedFeatures {
                 human_terminal: snapshot.allow_human_terminal,
-                mcp_commands: snapshot.allow_mcp_commands,
+                mcp_command_mode: snapshot.mcp_command_mode,
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
-            terminal_viewers: mode.terminal_viewers().then_some(true),
-            terminal_identity: if mode.terminal_viewers() {
-                snapshot.terminal_identity.clone()
-            } else {
-                None
-            },
+            terminal_viewers: true,
+            supervised_commands: true,
+            terminal_identity: snapshot.terminal_identity.clone(),
         }
     }
 }
@@ -493,6 +476,36 @@ enum KnownServerControlMessage {
     },
     #[serde(rename = "exec.cancel")]
     ExecCancel { command_id: String },
+    #[serde(rename = "term.spawn")]
+    TermSpawn {
+        terminal_id: String,
+        command_id: String,
+        command: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+        requester: String,
+        share_output: bool,
+    },
+    #[serde(rename = "supervised.cancel")]
+    SupervisedCancel {
+        command_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// A supervised command request, as `term.spawn` carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisedSpawn {
+    pub terminal_id: String,
+    pub command_id: String,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub reason: Option<String>,
+    pub requester: String,
+    pub share_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +584,15 @@ pub enum ServerControlMessage {
     ExecCancel {
         command_id: String,
     },
+    TermSpawn(SupervisedSpawn),
+    SupervisedCancel {
+        command_id: String,
+        /// `true` for the server's confirm deadline (`reason: "expire"`) or a
+        /// browser decline (`reason: "decline"`): a request the CLI decides
+        /// against an Enter it may already have taken. Without a reason (or
+        /// with another one) the terminal simply ends.
+        if_waiting: bool,
+    },
     Unknown {
         type_name: String,
     },
@@ -628,6 +650,21 @@ pub enum RelayBinaryFrameMetadata {
     ExecStdout { command_id: String, seq: u64 },
     #[serde(rename = "exec.stderr")]
     ExecStderr { command_id: String, seq: u64 },
+    /// Shared supervised output (never while under review): the first bytes
+    /// (`head`) or the last bytes (`tail`) after the accept marker.
+    #[serde(rename = "supervised.output")]
+    SupervisedOutput {
+        command_id: String,
+        part: SupervisedOutputPart,
+        seq: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SupervisedOutputPart {
+    Head,
+    Tail,
 }
 
 impl RelayBinaryFrameMetadata {
@@ -637,7 +674,9 @@ impl RelayBinaryFrameMetadata {
                 request_id
             }
             Self::TermSealed { terminal_id, .. } => terminal_id,
-            Self::ExecStdout { command_id, .. } | Self::ExecStderr { command_id, .. } => command_id,
+            Self::ExecStdout { command_id, .. }
+            | Self::ExecStderr { command_id, .. }
+            | Self::SupervisedOutput { command_id, .. } => command_id,
         }
     }
 }
@@ -801,6 +840,8 @@ fn known_server_frame(type_name: &str) -> bool {
             | "term.auth"
             | "exec.start"
             | "exec.cancel"
+            | "term.spawn"
+            | "supervised.cancel"
     )
 }
 
@@ -921,6 +962,29 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 cwd,
             },
             KnownServerControlMessage::ExecCancel { command_id } => Self::ExecCancel { command_id },
+            KnownServerControlMessage::TermSpawn {
+                terminal_id,
+                command_id,
+                command,
+                cwd,
+                reason,
+                requester,
+                share_output,
+            } => Self::TermSpawn(SupervisedSpawn {
+                terminal_id,
+                command_id,
+                command,
+                cwd,
+                reason,
+                requester,
+                share_output,
+            }),
+            KnownServerControlMessage::SupervisedCancel { command_id, reason } => {
+                Self::SupervisedCancel {
+                    command_id,
+                    if_waiting: matches!(reason.as_deref(), Some("expire" | "decline")),
+                }
+            }
         }
     }
 }
@@ -1023,6 +1087,19 @@ pub enum FrameFault {
     CloseCommand {
         command_id: String,
     },
+    /// A malformed `term.spawn` that names a command: refuse it, spawn nothing.
+    RejectSupervised {
+        command_id: String,
+    },
+    /// A malformed `exec.start` that names a command: refuse it, run nothing
+    /// (a command already running under that id is left alone).
+    RejectExec {
+        command_id: String,
+    },
+    /// A malformed `supervised.*` that names a command: end that command.
+    CancelSupervised {
+        command_id: String,
+    },
 }
 
 pub fn control_frame_fault(text: &str) -> FrameFault {
@@ -1039,10 +1116,89 @@ pub fn control_frame_fault(text: &str) -> FrameFault {
         }
         return FrameFault::Ignore;
     }
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
+    // Not JSON at all (and not a frame whose strings only hold an escaped
+    // lone surrogate): nothing in it can be attributed, and a server that
+    // sends it is broken, so the session ends.
+    let Some(value) = parse_for_fault(text) else {
         return FrameFault::Fatal;
     };
     interactive_fault(&value, true)
+}
+
+/// Parses a frame that failed its normal parse, only to learn what it names.
+/// JSON allows a `\u` escape of an unpaired UTF-16 surrogate (RFC 8259
+/// section 8.2), which no Rust string can hold, so serde_json refuses the
+/// whole frame. Such escapes are read as U+FFFD here; nothing in a faulty
+/// frame is ever acted on beyond the ids that name its request.
+fn parse_for_fault(text: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        return Some(value);
+    }
+    let repaired = replace_lone_surrogate_escapes(text)?;
+    serde_json::from_str::<Value>(&repaired).ok()
+}
+
+fn hex_unit(bytes: &[u8], at: usize) -> Option<u16> {
+    let digits = std::str::from_utf8(bytes.get(at..at + 4)?).ok()?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(digits, 16).ok()
+}
+
+/// `text` with every string escape of an unpaired surrogate replaced by
+/// `\ufffd`, or `None` when it has none. Escaped pairs stay as they are.
+fn replace_lone_surrogate_escapes(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut repaired = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut in_string = false;
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if !in_string {
+            in_string = byte == b'"';
+            at += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = false;
+            at += 1;
+            continue;
+        }
+        if byte != b'\\' {
+            at += 1;
+            continue;
+        }
+        let unit = (bytes.get(at + 1) == Some(&b'u'))
+            .then(|| hex_unit(bytes, at + 2))
+            .flatten();
+        let Some(unit) = unit else {
+            // Any other escape: skip the escaped character.
+            at += 2;
+            continue;
+        };
+        let paired = (0xD800..=0xDBFF).contains(&unit)
+            && bytes.get(at + 6) == Some(&b'\\')
+            && bytes.get(at + 7) == Some(&b'u')
+            && hex_unit(bytes, at + 8).is_some_and(|low| (0xDC00..=0xDFFF).contains(&low));
+        if paired {
+            at += 12;
+        } else if (0xD800..=0xDFFF).contains(&unit) {
+            // Every cut is at an ASCII byte, so it is a char boundary.
+            repaired.push_str(&text[copied..at]);
+            repaired.push_str("\\ufffd");
+            at += 6;
+            copied = at;
+        } else {
+            at += 6;
+        }
+    }
+    if copied == 0 {
+        return None;
+    }
+    repaired.push_str(&text[copied..]);
+    Some(repaired)
 }
 
 pub fn binary_frame_fault(frame: &[u8]) -> Result<(RelayBinaryFrameMetadata, Vec<u8>), FrameFault> {
@@ -1065,7 +1221,7 @@ fn classify_binary_metadata(frame: &[u8]) -> FrameFault {
         return FrameFault::Ignore;
     }
     let metadata = &frame[4..4 + length];
-    let Ok(value) = serde_json::from_slice::<Value>(metadata) else {
+    let Some(value) = std::str::from_utf8(metadata).ok().and_then(parse_for_fault) else {
         if bytes_contain(metadata, b"relay.request.body") {
             return FrameFault::Fatal;
         }
@@ -1089,6 +1245,7 @@ fn known_binary_type(type_name: &str) -> bool {
             | "term.sealed"
             | "exec.stdout"
             | "exec.stderr"
+            | "supervised.output"
     )
 }
 
@@ -1096,6 +1253,17 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
     if type_name == "relay.request" || type_name == "relay.request.body" {
         return FrameFault::Fatal;
+    }
+    if type_name == "term.spawn"
+        && let Some(command_id) = string_field(value, "commandId")
+    {
+        return FrameFault::RejectSupervised { command_id };
+    }
+    if type_name.starts_with("supervised.") {
+        return match string_field(value, "commandId") {
+            Some(command_id) => FrameFault::CancelSupervised { command_id },
+            None => FrameFault::Ignore,
+        };
     }
     if type_name.starts_with("term.") {
         let Some(terminal_id) = string_field(value, "terminalId") else {
@@ -1110,6 +1278,11 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
             };
         }
         return FrameFault::CloseTerminal { terminal_id };
+    }
+    if type_name == "exec.start"
+        && let Some(command_id) = string_field(value, "commandId")
+    {
+        return FrameFault::RejectExec { command_id };
     }
     if type_name.starts_with("exec.") {
         return match string_field(value, "commandId") {
@@ -1227,27 +1400,43 @@ mod tests {
     }
 
     #[test]
+    fn hello_omits_an_unavailable_hostname() {
+        let inventory = CliInventory {
+            slug: "desktop".to_string(),
+            hostname: None,
+            version: None,
+            capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
+                allow_human_terminal: false,
+                mcp_command_mode: McpCommandMode::Off,
+                require_terminal_approval: false,
+                terminal_public_key_b64url: "AQID".to_string(),
+                terminal_identity: None,
+            }),
+        };
+        let encoded = serde_json::to_string(&inventory).expect("encode");
+        assert!(!encoded.contains("hostname"));
+        assert!(!encoded.contains("label"));
+    }
+
+    #[test]
     fn control_frames_use_server_field_casing() {
         let message = ClientControlMessage::Hello {
             id: "hello-1".to_string(),
             protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
             cli: CliInventory {
                 slug: "desktop".to_string(),
-                label: "Desktop".to_string(),
+                hostname: Some("desk-01.local".to_string()),
                 version: None,
-                capabilities: CliCapabilities::from_snapshot(
-                    &TerminalFeatureSnapshot {
-                        allow_human_terminal: false,
-                        allow_mcp_commands: true,
-                        require_terminal_approval: false,
-                        terminal_public_key_b64url: "AQID".to_string(),
-                        terminal_identity: Some(TerminalIdentityProof {
-                            public_key: "BAQE".to_string(),
-                            signature: "Sig".to_string(),
-                        }),
-                    },
-                    RelayProtocolMode::V25,
-                ),
+                capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
+                    allow_human_terminal: false,
+                    mcp_command_mode: McpCommandMode::Supervised,
+                    require_terminal_approval: false,
+                    terminal_public_key_b64url: "AQID".to_string(),
+                    terminal_identity: Some(TerminalIdentityProof {
+                        public_key: "BAQE".to_string(),
+                        signature: "Sig".to_string(),
+                    }),
+                }),
             },
             endpoints: vec![EndpointInventory {
                 slug: "local".to_string(),
@@ -1262,7 +1451,10 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.5""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.6""#));
+        assert!(encoded.contains(r#""supervisedCommands":true"#));
+        assert!(encoded.contains(r#""hostname":"desk-01.local""#));
+        assert!(!encoded.contains(r#""label":"Desktop""#));
         assert!(encoded.contains(r#""terminalViewers":true"#));
         assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
         assert!(encoded.contains(r#""sharedTokenizerTps":true"#));
@@ -1270,7 +1462,8 @@ mod tests {
         assert!(encoded.contains(r#""terminal":true"#));
         assert!(encoded.contains(r#""exec":true"#));
         assert!(encoded.contains(r#""terminalPublicKey":"AQID""#));
-        assert!(encoded.contains(r#""mcpCommands":true"#));
+        assert!(encoded.contains(r#""mcpCommandMode":"supervised""#));
+        assert!(!encoded.contains(r#""mcpCommands""#));
         assert!(encoded.contains(r#""humanTerminal":false"#));
         assert!(encoded.contains(r#""maxBinaryChunkBytes":1048576"#));
         assert!(encoded.contains(r#""requestBodyStreaming":true"#));
@@ -1352,6 +1545,16 @@ mod tests {
         );
         assert_eq!(
             control_frame_fault(r#"{"type":"exec.start","commandId":"cmd-1"}"#),
+            FrameFault::RejectExec {
+                command_id: "cmd-1".to_string(),
+            }
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"exec.cancel","commandId":7}"#),
+            FrameFault::Ignore
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"exec.cancel","commandId":"cmd-1","x":{}}"#),
             FrameFault::CloseCommand {
                 command_id: "cmd-1".to_string(),
             }
@@ -1392,6 +1595,81 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_surrogate_fails_only_the_request_that_carries_it() {
+        // serde_json cannot hold an unpaired surrogate, so the normal parse fails.
+        let spawn = r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"echo \ud800","requester":"a","shareOutput":false}"#;
+        assert!(parse_server_control(spawn).is_err());
+        assert_eq!(
+            control_frame_fault(spawn),
+            FrameFault::RejectSupervised {
+                command_id: "c".to_string()
+            }
+        );
+        assert_eq!(
+            control_frame_fault(
+                r#"{"type":"exec.start","commandId":"e","command":"ls","cwd":"\udc00"}"#
+            ),
+            FrameFault::RejectExec {
+                command_id: "e".to_string()
+            }
+        );
+        // The id itself may be the bad string: it is still named, as U+FFFD.
+        assert_eq!(
+            control_frame_fault(r#"{"type":"supervised.cancel","commandId":"\udbff"}"#),
+            FrameFault::CancelSupervised {
+                command_id: "\u{fffd}".to_string()
+            }
+        );
+        assert_eq!(
+            control_frame_fault(
+                r#"{"type":"term.attach","terminalId":"t","viewerId":"v","browserPublicKey":"\ud83d"}"#
+            ),
+            FrameFault::DropViewer {
+                terminal_id: "t".to_string(),
+                viewer_id: "v".to_string()
+            }
+        );
+        // Model relay frames and frames naming nothing stay fatal.
+        assert_eq!(
+            control_frame_fault(r#"{"type":"relay.request","path":"\ud800"}"#),
+            FrameFault::Fatal
+        );
+        assert_eq!(control_frame_fault("not json \\ud800"), FrameFault::Fatal);
+        // Binary metadata gets the same treatment.
+        let meta = br#"{"type":"term.sealed","terminalId":"t9","x":"\udfff"}"#;
+        let mut frame = (meta.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(meta);
+        assert_eq!(
+            binary_frame_fault(&frame).expect_err("malformed sealed"),
+            FrameFault::CloseTerminal {
+                terminal_id: "t9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn only_unpaired_surrogate_escapes_are_replaced() {
+        assert_eq!(
+            replace_lone_surrogate_escapes(r#"{"a":"plain \u0041"}"#),
+            None
+        );
+        // A valid escaped pair is left alone.
+        assert_eq!(
+            replace_lone_surrogate_escapes(r#"{"a":"\ud83d\ude00"}"#),
+            None
+        );
+        // An escaped backslash followed by text that looks like an escape.
+        assert_eq!(replace_lone_surrogate_escapes(r#"{"a":"\\ud800"}"#), None);
+        assert_eq!(
+            replace_lone_surrogate_escapes(r#"{"a":"x\ud800y","b":"\udc00","c":"\ud800\u0041"}"#)
+                .as_deref(),
+            Some(r#"{"a":"x\ufffdy","b":"\ufffd","c":"\ufffd\u0041"}"#)
+        );
+        // Outside strings nothing is touched (and the JSON stays invalid).
+        assert_eq!(replace_lone_surrogate_escapes(r#"{\ud800}"#), None);
+    }
+
+    #[test]
     fn oversized_multibyte_control_frame_is_ignored_without_panic() {
         // `你` is E4 BD A0. 256 % 3 == 1, so byte 256 is inside a character.
         // The frame must also exceed the 64 KiB control limit.
@@ -1412,67 +1690,146 @@ mod tests {
         assert_eq!(control_frame_fault(&fatal), FrameFault::Fatal);
     }
     #[test]
-    fn legacy_capabilities_match_the_strict_2_4_schema() {
-        let snapshot = TerminalFeatureSnapshot {
-            allow_human_terminal: true,
-            allow_mcp_commands: true,
-            require_terminal_approval: false,
-            terminal_public_key_b64url: "AQID".to_string(),
-            terminal_identity: Some(TerminalIdentityProof {
-                public_key: "BAQE".to_string(),
-                signature: "Sig".to_string(),
-            }),
-        };
-        let legacy = serde_json::to_value(CliCapabilities::from_snapshot(
-            &snapshot,
-            RelayProtocolMode::Legacy24,
-        ))
-        .expect("encode");
-        assert_eq!(legacy["protocolVersion"], "2.4");
-        assert!(legacy.get("terminalViewers").is_none());
-        assert!(legacy.get("terminalIdentity").is_none());
-        let current = serde_json::to_value(CliCapabilities::from_snapshot(
-            &snapshot,
-            RelayProtocolMode::V25,
-        ))
-        .expect("encode");
-        assert_eq!(current["protocolVersion"], "2.5");
-        assert_eq!(current["terminalViewers"], true);
-        assert_eq!(current["terminalIdentity"]["publicKey"], "BAQE");
-        let mut legacy_keys = legacy
-            .as_object()
-            .expect("object")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        legacy_keys.push("terminalViewers".to_string());
-        legacy_keys.push("terminalIdentity".to_string());
-        legacy_keys.sort();
-        let mut current_keys = current
-            .as_object()
-            .expect("object")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        current_keys.sort();
-        assert_eq!(legacy_keys, current_keys);
+    fn a_pre_2_6_server_rejection_says_to_upgrade_the_server() {
+        let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
+        assert!(message.contains("rejected relay protocol 2.6"), "{message}");
+        assert!(
+            message.contains("upgrade the WS Model Proxy server"),
+            "{message}"
+        );
+        assert_eq!(
+            hello_rejection_message("access_denied"),
+            "relay protocol error: access_denied"
+        );
     }
 
     #[test]
-    fn protocol_fallback_happens_once() {
-        let mut negotiation = ProtocolNegotiation::new();
-        assert_eq!(negotiation.mode(), RelayProtocolMode::V25);
-        // After `hello.ok`, a protocol error is not a version mismatch.
-        assert!(!negotiation.downgrade_on_protocol_error(true, "protocol_error"));
-        assert!(!negotiation.downgrade_on_protocol_error(false, "access_denied"));
-        assert_eq!(negotiation.mode(), RelayProtocolMode::V25);
-        assert!(negotiation.downgrade_on_protocol_error(false, "protocol_error"));
-        assert_eq!(negotiation.mode(), RelayProtocolMode::Legacy24);
-        assert_eq!(negotiation.mode().version(), "2.4");
-        assert!(!negotiation.mode().terminal_viewers());
-        // Sticky, and never a second downgrade.
-        assert!(!negotiation.downgrade_on_protocol_error(false, "protocol_error"));
-        assert_eq!(negotiation.mode(), RelayProtocolMode::Legacy24);
+    fn supervised_messages_use_server_field_casing() {
+        let spawn = parse_server_control(
+            r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls -l","cwd":"~/x","reason":"why","requester":"agent","shareOutput":true}"#,
+        )
+        .expect("spawn");
+        match spawn {
+            ServerControlMessage::TermSpawn(spawn) => {
+                assert_eq!(spawn.command, "ls -l");
+                assert_eq!(spawn.cwd.as_deref(), Some("~/x"));
+                assert_eq!(spawn.reason.as_deref(), Some("why"));
+                assert_eq!(spawn.requester, "agent");
+                assert!(spawn.share_output);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        let minimal = parse_server_control(
+            r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls","requester":"a","shareOutput":false}"#,
+        )
+        .expect("minimal spawn");
+        assert!(
+            matches!(minimal, ServerControlMessage::TermSpawn(ref s) if s.cwd.is_none() && s.reason.is_none())
+        );
+        let cancel = parse_server_control(r#"{"type":"supervised.cancel","commandId":"c"}"#)
+            .expect("cancel");
+        assert!(
+            matches!(cancel, ServerControlMessage::SupervisedCancel { command_id, if_waiting: false } if command_id == "c")
+        );
+        let expire = parse_server_control(
+            r#"{"type":"supervised.cancel","commandId":"c","reason":"expire"}"#,
+        )
+        .expect("expire");
+        assert!(matches!(
+            expire,
+            ServerControlMessage::SupervisedCancel {
+                if_waiting: true,
+                ..
+            }
+        ));
+        let decline = parse_server_control(
+            r#"{"type":"supervised.cancel","commandId":"c","reason":"decline"}"#,
+        )
+        .expect("decline");
+        assert!(matches!(
+            decline,
+            ServerControlMessage::SupervisedCancel {
+                if_waiting: true,
+                ..
+            }
+        ));
+        // Any other reason ends the terminal.
+        let other = parse_server_control(
+            r#"{"type":"supervised.cancel","commandId":"c","reason":"later"}"#,
+        )
+        .expect("other");
+        assert!(matches!(
+            other,
+            ServerControlMessage::SupervisedCancel {
+                if_waiting: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            encode_control(&ClientControlMessage::TermSpawned {
+                terminal_id: "t".to_string(),
+                command_id: "c".to_string(),
+            })
+            .expect("spawned"),
+            r#"{"type":"term.spawned","terminalId":"t","commandId":"c"}"#
+        );
+        assert_eq!(
+            encode_control(&ClientControlMessage::SupervisedDone {
+                command_id: "c".to_string(),
+                exit_code: Some(0),
+                signal: None,
+                review: false,
+                output_bytes: Some(12),
+            })
+            .expect("done"),
+            r#"{"type":"supervised.done","commandId":"c","exitCode":0,"review":false,"outputBytes":12}"#
+        );
+        assert_eq!(
+            encode_control(&ClientControlMessage::SupervisedDone {
+                command_id: "c".to_string(),
+                exit_code: None,
+                signal: Some("9".to_string()),
+                review: true,
+                output_bytes: None,
+            })
+            .expect("done review"),
+            r#"{"type":"supervised.done","commandId":"c","signal":"9","review":true}"#
+        );
+        assert_eq!(
+            encode_control(&ClientControlMessage::SupervisedRejected {
+                command_id: "c".to_string(),
+                reason: "disabled".to_string(),
+            })
+            .expect("rejected"),
+            r#"{"type":"supervised.rejected","commandId":"c","reason":"disabled"}"#
+        );
+        let output = RelayBinaryFrameMetadata::SupervisedOutput {
+            command_id: "c".to_string(),
+            part: SupervisedOutputPart::Tail,
+            seq: 2,
+        };
+        let encoded = encode_binary_frame(&output, b"x").expect("output");
+        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
+        assert_eq!(
+            text,
+            r#"{"type":"supervised.output","commandId":"c","part":"tail","seq":2}"#
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"term.spawn","terminalId":"t","commandId":"c"}"#),
+            FrameFault::RejectSupervised {
+                command_id: "c".to_string()
+            }
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"supervised.cancel","commandId":7}"#),
+            FrameFault::Ignore
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"supervised.cancel","commandId":"c","x":{}}"#),
+            FrameFault::CancelSupervised {
+                command_id: "c".to_string()
+            }
+        );
     }
 
     #[test]

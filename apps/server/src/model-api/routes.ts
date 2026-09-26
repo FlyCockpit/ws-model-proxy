@@ -151,7 +151,6 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
-  engineCacheConfirmedFromRetainedResponse,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   orderChatTestProviderTargets,
@@ -160,15 +159,21 @@ import {
   type PublicProviderTarget,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
-  retainProviderUsagePrefix,
-  retainProviderUsageTail,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
   LOCAL_RELAY_PROCESS_EPOCH,
+  runLocalAttemptFinalization,
+  trackLocalRelayAttempt,
 } from "./relay-telemetry-recovery.js";
+import {
+  engineCacheConfirmedFromUsageFacts,
+  type RelayUsageFacts,
+  usageFactsFromProviderUsage,
+  usageFactsFromRelayTerminal,
+} from "./relay-usage-facts.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
 import {
@@ -178,6 +183,7 @@ import {
   transcriptionCapabilityCompatible,
   transcriptionRequestProfileFromParts,
 } from "./transcription-request.js";
+import { type RelayRequestSourceValue, transitionRelayRequestTerminal } from "./usage-rollup.js";
 
 type ModelApiRouteDependencies = {
   manager?: Pick<
@@ -735,6 +741,7 @@ type PoolMemberRelayRow = Omit<PoolMemberRelayQueryRow, "discoveredModelId" | "D
 
 type RelayMetadataCreate = {
   userId: string;
+  source: RelayRequestSourceValue;
   modelApiTokenId?: string | null;
   modelApiTokenLookupPrefix?: string | null;
   requestedDiscoveredModelId?: string;
@@ -771,10 +778,17 @@ type RelayMetadataUpdate = {
   localExecution?: LocalExecutionTelemetry;
   userId?: string;
   localTerminal?: RelayAttemptTerminal;
+  /**
+   * Usage facts the caller already parsed from `terminal` (the pool path needs
+   * them for affinity evidence too); parsed here when absent. Never both.
+   */
+  usage?: RelayUsageFacts;
 };
 
 type RelayRequester = {
   userId: string;
+  /** Entry point, persisted on the RelayRequest and keyed in usage rollups. */
+  source: RelayRequestSourceValue;
   limitKey: string;
   modelApiTokenId: string | null;
   modelApiTokenLookupPrefix: string | null;
@@ -1884,6 +1898,7 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
   const row = await prisma.relayRequest.create({
     data: {
       userId: input.userId,
+      source: input.source,
       modelApiTokenId: input.modelApiTokenId ?? null,
       modelApiTokenLookupPrefix: input.modelApiTokenLookupPrefix ?? null,
       requestedDiscoveredModelId: input.requestedDiscoveredModelId ?? null,
@@ -1911,15 +1926,20 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
 function requesterFromToken(token: ModelApiTokenIdentity): RelayRequester {
   return {
     userId: token.userId,
+    source: "API_TOKEN",
     limitKey: token.id,
     modelApiTokenId: token.id,
     modelApiTokenLookupPrefix: token.lookupPrefix,
   };
 }
 
-function requesterFromChatTestUser(userId: string): RelayRequester {
+function requesterFromChatTestUser(
+  userId: string,
+  source: "CHAT_TEST" | "MCP" = "CHAT_TEST",
+): RelayRequester {
   return {
     userId,
+    source,
     limitKey: `chat-test:${userId}`,
     modelApiTokenId: null,
     modelApiTokenLookupPrefix: null,
@@ -1928,6 +1948,11 @@ function requesterFromChatTestUser(userId: string): RelayRequester {
 }
 
 async function updateRelayMetadata(relayRequestId: string, update: RelayMetadataUpdate) {
+  // The request's completion facts are captured ONCE, here, when its outcome
+  // is known: completion time, duration, and the parsed usage counts. A local
+  // finalization that only commits on a later registry retry reuses them, so
+  // a retry never moves the completion time, inflates the latency, or shifts
+  // the rollup bucket, and the retained closure holds only compact facts.
   const completedAt = new Date();
   const failure = update.terminal.failure ?? update.fallbackFailure ?? null;
   const selectedExecutionTarget = update.selectedDiscoveredModelId
@@ -1936,15 +1961,22 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
         select: { id: true },
       })
     : null;
+  // Usage is parsed once from the executor's retained response windows
+  // (falling back to CLI-normalized usage): here, or by a caller that also
+  // needs it and passes the facts in. Counts only.
+  const usage = update.usage ?? usageFactsFromRelayTerminal(update.terminal);
   const relayData = {
     selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
     selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
     status: update.status,
     completedAt,
     durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
-    promptTokens: update.terminal.usage?.promptTokens ?? null,
-    completionTokens: update.terminal.usage?.completionTokens ?? null,
-    totalTokens: update.terminal.usage?.totalTokens ?? null,
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    totalTokens: usage.totalTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    usageKnown: usage.usageKnown,
     httpStatusCode:
       update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
     upstreamStatusCode: update.terminal.upstreamStatusCode,
@@ -1984,48 +2016,134 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       : {}),
   };
   if (update.localExecution && update.userId) {
-    const localExecution = update.localExecution;
-    const updateUserId = update.userId;
     const localTerminal = update.localTerminal ?? update.terminal;
-    await prisma.$transaction(async (tx) => {
-      const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-      if (!clock) throw new Error("Database clock query returned no row");
+    // Two independent claims, each with exactly one guard:
+    //  - the ATTEMPT row claim (ACTIVE -> terminal, own epoch) gates only the
+    //    attempt's TERMINAL event, so the event is written at most once;
+    //  - the REQUEST transition is claimed solely by its own status guard
+    //    (`transitionRelayRequestTerminal`, PENDING -> terminal + rollup).
+    // The request transition is deliberately NOT gated on winning the attempt
+    // claim: losing it means another writer (an earlier `recordLocalTerminal`
+    // of this attempt, or crash repair) already finalized the ATTEMPT, which
+    // says nothing about the REQUEST. Crash repair transitions the request
+    // itself, so the guarded transition is then a no-op; otherwise this call
+    // is the request's only finalizer and must not skip it.
+    await runLocalAttemptFinalization(
+      update.localExecution.localAttemptId,
+      localFinalization({
+        attempt: localAttemptTerminalFacts(
+          relayRequestId,
+          update.userId,
+          update.localExecution,
+          localTerminal,
+          completedAt,
+        ),
+        request: { relayRequestId, data: relayData, completedAt },
+      }),
+    );
+    return;
+  }
+  await prisma.$transaction((tx) =>
+    transitionRelayRequestTerminal(tx, relayRequestId, relayData, completedAt),
+  );
+}
+
+/**
+ * Compact, buffer-free facts of one local attempt's terminal, computed once
+ * when the terminal is known. Finalization closures (which the in-flight
+ * registry may retain for retries) capture only these, never the terminal
+ * itself, whose `usageSample` holds up to ~1 MiB of response windows.
+ */
+type LocalAttemptTerminalFacts = {
+  attemptId: string;
+  state: "SUCCEEDED" | "FAILED" | "CANCELED";
+  terminalAt: Date;
+  requestBytes: bigint;
+  responseBytes: bigint;
+  event: ReturnType<typeof localTerminalEventData>;
+};
+
+function localAttemptTerminalFacts(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+  terminal: RelayAttemptTerminal,
+  terminalAt: Date,
+): LocalAttemptTerminalFacts {
+  return {
+    attemptId: execution.localAttemptId,
+    state: terminalStatus(terminal),
+    terminalAt,
+    requestBytes: BigInt(terminal.requestBytes),
+    responseBytes: BigInt(terminal.responseBytes),
+    event: localTerminalEventData(relayRequestId, userId, execution, terminal),
+  };
+}
+
+type LocalRequestTransition = {
+  relayRequestId: string;
+  data: Parameters<typeof transitionRelayRequestTerminal>[2];
+  completedAt: Date;
+};
+
+/**
+ * Builds a local attempt's finalization transaction from precomputed facts:
+ * claims the attempt row (own epoch, ACTIVE -> terminal) and writes its
+ * TERMINAL event only on winning that claim; with `request`, also performs
+ * the request's guarded PENDING -> terminal transition + rollup, and with
+ * `contextCountAttempt`, adds the side attempt's bytes to the request.
+ * Re-running the returned closure is idempotent and reuses the same facts.
+ */
+function localFinalization({
+  attempt,
+  request,
+  contextCountAttempt = false,
+  relayRequestId = request?.relayRequestId,
+}: {
+  attempt: LocalAttemptTerminalFacts;
+  request?: LocalRequestTransition;
+  contextCountAttempt?: boolean;
+  relayRequestId?: string;
+}) {
+  return () =>
+    prisma.$transaction(async (tx) => {
       const claimed = await tx.relayExecutionAttempt.updateMany({
         where: {
-          attemptId: localExecution.localAttemptId,
+          attemptId: attempt.attemptId,
           ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
           state: "ACTIVE",
         },
         data: {
-          state: terminalStatus(localTerminal),
-          terminalAt: clock.now,
-          terminalState: terminalStatus(localTerminal),
-          requestBytes: BigInt(localTerminal.requestBytes),
-          responseBytes: BigInt(localTerminal.responseBytes),
+          state: attempt.state,
+          terminalAt: attempt.terminalAt,
+          terminalState: attempt.state,
+          requestBytes: attempt.requestBytes,
+          responseBytes: attempt.responseBytes,
         },
       });
-      if (claimed.count === 0) return;
-      await tx.relayExecutionEvent.createMany({
-        data: [localTerminalEventData(relayRequestId, updateUserId, localExecution, localTerminal)],
-        skipDuplicates: true,
-      });
-      await tx.relayRequest.update({
-        where: { id: relayRequestId },
-        data: {
-          ...relayData,
-          completedAt: clock.now,
-          durationMs: Math.max(0, clock.now.getTime() - update.startedAt.getTime()),
-        },
-        select: { id: true },
-      });
+      if (claimed.count > 0) {
+        await tx.relayExecutionEvent.createMany({
+          data: [attempt.event],
+          skipDuplicates: true,
+        });
+        if (contextCountAttempt && relayRequestId)
+          await tx.relayRequest.update({
+            where: { id: relayRequestId },
+            data: {
+              auxiliaryAttemptCount: { increment: 1 },
+              auxiliaryRequestBytes: { increment: attempt.requestBytes },
+              auxiliaryResponseBytes: { increment: attempt.responseBytes },
+            },
+          });
+      }
+      if (request)
+        await transitionRelayRequestTerminal(
+          tx,
+          request.relayRequestId,
+          request.data,
+          request.completedAt,
+        );
     });
-    return;
-  }
-  await prisma.relayRequest.update({
-    where: { id: relayRequestId },
-    data: relayData,
-    select: { id: true },
-  });
 }
 
 async function updateContextCountMetadata(
@@ -2063,6 +2181,9 @@ async function startLocalExecutionTelemetry(
   userId: string,
   execution: LocalExecutionTelemetry,
 ) {
+  // Held (heartbeated) from before its row exists until its finalization
+  // commits; see the liveness predicate in relay-telemetry-recovery.ts.
+  trackLocalRelayAttempt(execution.localAttemptId, relayRequestId);
   await prisma.$transaction(async (tx) => {
     const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
     if (!clock) throw new Error("Database clock query returned no row");
@@ -2134,39 +2255,21 @@ async function recordLocalTerminal(
   execution: LocalExecutionTelemetry,
   terminal: RelayAttemptTerminal,
 ) {
-  await prisma.$transaction(async (tx) => {
-    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-    if (!clock) throw new Error("Database clock query returned no row");
-    const claimed = await tx.relayExecutionAttempt.updateMany({
-      where: {
-        attemptId: execution.localAttemptId,
-        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
-        state: "ACTIVE",
-      },
-      data: {
-        state: terminalStatus(terminal),
-        terminalAt: clock.now,
-        terminalState: terminalStatus(terminal),
-        requestBytes: BigInt(terminal.requestBytes),
-        responseBytes: BigInt(terminal.responseBytes),
-      },
-    });
-    if (claimed.count === 0) return;
-    await tx.relayExecutionEvent.createMany({
-      data: [localTerminalEventData(relayRequestId, userId, execution, terminal)],
-      skipDuplicates: true,
-    });
-    if (claimed.count > 0 && execution.attemptKind === "CONTEXT_COUNT") {
-      await tx.relayRequest.update({
-        where: { id: relayRequestId },
-        data: {
-          auxiliaryAttemptCount: { increment: 1 },
-          auxiliaryRequestBytes: { increment: BigInt(terminal.requestBytes) },
-          auxiliaryResponseBytes: { increment: BigInt(terminal.responseBytes) },
-        },
-      });
-    }
-  });
+  // Attempt-only finalization: never transitions the RelayRequest. Callers
+  // use it for attempts that are NOT the request's last word (a retried pool
+  // member, a context-count side attempt, or an attempt followed by a
+  // separate non-local request finalizer). When the attempt IS the request's
+  // outcome, call `updateRelayMetadata` with `localExecution` instead, which
+  // claims the attempt and transitions the request together; calling both
+  // for one attempt would make two claimants of one attempt row.
+  await runLocalAttemptFinalization(
+    execution.localAttemptId,
+    localFinalization({
+      attempt: localAttemptTerminalFacts(relayRequestId, userId, execution, terminal, new Date()),
+      contextCountAttempt: execution.attemptKind === "CONTEXT_COUNT",
+      relayRequestId,
+    }),
+  );
 }
 
 function localTerminalEventData(
@@ -2331,6 +2434,15 @@ async function acquireCapacityWithTelemetry({
 function terminalStatus(terminal: RelayAttemptTerminal): "SUCCEEDED" | "FAILED" | "CANCELED" {
   if (terminal.failure === "cancelled") return "CANCELED";
   return terminal.ok ? "SUCCEEDED" : "FAILED";
+}
+
+/**
+ * Request status when the client is served an ERROR response for this
+ * attempt. The attempt itself may have succeeded upstream (e.g. a body-less
+ * response whose capacity release then failed); the request did not.
+ */
+function servedFailureStatus(terminal: RelayAttemptTerminal): "FAILED" | "CANCELED" {
+  return terminal.failure === "cancelled" ? "CANCELED" : "FAILED";
 }
 
 async function failRelayMetadata({
@@ -3158,6 +3270,7 @@ async function relayDirect({
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
+    source: requester.source,
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId: target.id,
@@ -3412,12 +3525,17 @@ async function relayDirect({
       () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       () => operation.dispose?.(),
     ]);
+    // The attempt row may already exist (telemetry committed, dispatch
+    // threw): finalize it together with the request, one claimant.
     await failRelayMetadata({
       relayRequestId,
       startedAt,
       failure: "unknown",
       selectedDiscoveredModelId: selected.id,
       attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
+      localTerminal: rejectedRelayTerminal(),
     });
     return operationFailureResponse(operation, "unknown");
   }
@@ -3425,6 +3543,31 @@ async function relayDirect({
 
   try {
     const started = await attempt.started;
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
+    );
+    const served =
+      capacityLease?.state === "ADMITTED" && capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            response,
+            capacityLease.lease,
+            request.signal,
+          )
+        : response;
+    // Only now is this attempt definitively the request's outcome (the
+    // response goes to the client), so only now is its finalizer scheduled.
+    // Anything above that throws lands in the catch below, which is then the
+    // attempt's single claimant and records what the client actually got.
     const finalize = attempt.terminal
       .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
@@ -3458,27 +3601,12 @@ async function relayDirect({
       })
       .catch(metadataUpdateError);
     void finalize;
-    const response = responseWithFirstClientByte(
-      new Response(
-        responseBodyForOperation({
-          body: started.body,
-          headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
-        }),
-        { status: started.status, headers: started.headers },
-      ),
-      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
-    );
-    return capacityLease?.state === "ADMITTED" && capacityRuntime
-      ? await holdOrReleaseCapacityResponse(
-          capacityRuntime,
-          response,
-          capacityLease.lease,
-          request.signal,
-        )
-      : response;
+    return served;
   } catch {
+    // No finalizer was scheduled (see above). Settle an attempt that may
+    // still be streaming (no-op once its terminal is known), then claim it
+    // together with the request as the error the client receives.
+    attempt.cancel("unknown");
     const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
     const cleanup = await Promise.allSettled([
       Promise.resolve().then(() => cliLease.release()),
@@ -3492,9 +3620,10 @@ async function relayDirect({
     reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
-      status: terminalStatus(terminal),
+      status: servedFailureStatus(terminal),
       startedAt,
       terminal,
+      fallbackFailure: "unknown",
       attemptCount: 1,
       localExecution,
       userId: requester.userId,
@@ -3535,6 +3664,7 @@ async function relayPool({
   const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
+    source: requester.source,
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: target.id,
@@ -3862,23 +3992,33 @@ async function relayPool({
     void result.terminal
       .then(async (terminal) => {
         const completedAt = new Date();
+        const usage = usageFactsFromProviderUsage(terminal.usage);
         await Promise.allSettled([
-          prisma.relayRequest.update({
-            where: { id: relayRequestId },
-            data: {
-              selectedExecutionTargetId: result.target.executionTargetId,
-              status: terminal.ok ? "SUCCEEDED" : request.signal.aborted ? "CANCELED" : "FAILED",
+          prisma.$transaction((tx) =>
+            transitionRelayRequestTerminal(
+              tx,
+              relayRequestId,
+              {
+                selectedExecutionTargetId: result.target.executionTargetId,
+                status: terminal.ok ? "SUCCEEDED" : request.signal.aborted ? "CANCELED" : "FAILED",
+                completedAt,
+                durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+                httpStatusCode: result.response.status,
+                upstreamStatusCode: result.response.status,
+                requestBytes: BigInt(publicRequestBytes),
+                responseBytes: BigInt(terminal.responseBytes),
+                attemptCount: result.attemptCount,
+                errorClass: terminal.ok ? null : request.signal.aborted ? "cancelled" : "unknown",
+                promptTokens: usage.promptTokens,
+                completionTokens: usage.completionTokens,
+                totalTokens: usage.totalTokens,
+                cacheReadTokens: usage.cacheReadTokens,
+                cacheWriteTokens: usage.cacheWriteTokens,
+                usageKnown: usage.usageKnown,
+              },
               completedAt,
-              durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
-              httpStatusCode: result.response.status,
-              upstreamStatusCode: result.response.status,
-              requestBytes: BigInt(publicRequestBytes),
-              responseBytes: BigInt(terminal.responseBytes),
-              attemptCount: result.attemptCount,
-              errorClass: terminal.ok ? null : request.signal.aborted ? "cancelled" : "unknown",
-            },
-            select: { id: true },
-          }),
+            ),
+          ),
           operation.dispose?.() ?? Promise.resolve(),
         ]);
       })
@@ -4844,16 +4984,6 @@ async function relayPool({
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
         : null;
-    // Retain both the bounded response prefix and tail so cache-affinity
-    // evidence survives early usage events (Anthropic message_start) on
-    // streams larger than the tail window. Buffers are per-attempt: they are
-    // declared inside the candidate loop so retries cannot contaminate each
-    // other's evidence.
-    const usagePrefixChunks: Uint8Array[] = [];
-    let usagePrefixBytes = 0;
-    const usageTailChunks: Uint8Array[] = [];
-    let usageTailBytes = 0;
-    let usageResponseBytes = 0;
     const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
       await settleRelayCleanup([
@@ -4900,14 +5030,19 @@ async function relayPool({
         timeoutMs: attemptTimeoutMs,
         abortSignal: request.signal,
         onResponseBodyChunk: (chunk) => {
-          usageResponseBytes += chunk.byteLength;
-          usagePrefixBytes = retainProviderUsagePrefix(usagePrefixChunks, usagePrefixBytes, chunk);
-          usageTailBytes = retainProviderUsageTail(usageTailChunks, usageTailBytes, chunk);
           responseIdCapture?.push(chunk, operation.stream);
         },
       });
     } catch {
       attempt?.cancel("unknown");
+      // Attempt-only finalization (the request moves on to the next member
+      // or the post-loop finalizer); a no-op claim if no row was written.
+      await recordLocalTerminal(
+        relayRequestId,
+        requester.userId,
+        localExecution,
+        rejectedRelayTerminal(),
+      ).catch(metadataUpdateError);
       await settleRelayCleanup([
         () => cliLease.release(),
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
@@ -5041,6 +5176,9 @@ async function relayPool({
           adaptationCompletion = primed.completion.then((outcome) =>
             protocolFailureObserved && outcome === "ok" ? "protocol_error" : outcome,
           );
+          // Observed by the finalizer once the response is served; until then
+          // (or if serving throws) keep a rejection from going unhandled.
+          adaptationCompletion.catch(() => undefined);
         } catch {
           attempt.cancel("protocol_error");
           const terminal = await attempt.terminal;
@@ -5067,118 +5205,6 @@ async function relayPool({
         }
       }
 
-      const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
-        .then(async ([terminalResult, adaptationResult]) => {
-          const upstreamTerminal =
-            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
-          const adaptationOutcome =
-            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
-          const terminal: RelayAttemptTerminal =
-            adaptationOutcome !== "ok" && upstreamTerminal.ok
-              ? {
-                  ...upstreamTerminal,
-                  ok: false,
-                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
-                }
-              : upstreamTerminal;
-          const cumulativeTerminal = {
-            ...terminal,
-            requestBytes: cumulativeRequestBytes + terminal.requestBytes,
-            responseBytes: cumulativeResponseBytes + terminal.responseBytes,
-          };
-          const cleanup = await Promise.allSettled([
-            Promise.resolve().then(() => cliLease.release()),
-            Promise.resolve().then(() => globalLease?.release()),
-            builtRequest.body instanceof Uint8Array
-              ? Promise.resolve()
-              : builtRequest.body.dispose(),
-            operation.dispose?.() ?? Promise.resolve(),
-          ]);
-          reportCleanupFailures(cleanup);
-          const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-          const engineCacheConfirmed = engineCacheConfirmedFromRetainedResponse(
-            usagePrefixChunks,
-            usageTailChunks,
-            usageResponseBytes,
-          );
-          const affinityTarget = requestedSurface
-            ? affinityTargetForMember(
-                member,
-                requestedSurface,
-                executionByMember.get(member.id),
-                candidate.healthStatus,
-              )
-            : null;
-          const selectedAffinityScore = affinityTarget
-            ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)
-            : 0;
-          const selectedAffinityPrefixDepth = affinityTarget
-            ? (affinityDecision?.prefixDepths[affinityTarget.executionTargetId] ?? 0)
-            : 0;
-          const selectedConversationMatch = affinityTarget
-            ? (affinityDecision?.conversationMatches[affinityTarget.executionTargetId] ?? false)
-            : false;
-          const selectedAffinityReason = affinityTarget
-            ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
-            : "identity_unavailable";
-          const terminalWrites = await Promise.allSettled([
-            terminal.ok
-              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
-              : adaptationOutcome === "protocol_error"
-                ? recordPoolMemberRelayFailure({
-                    poolMemberId: candidate.poolMemberId,
-                    failure: "protocol_error",
-                  })
-                : Promise.resolve(),
-            updateRelayMetadata(relayRequestId, {
-              selectedDiscoveredModelId: member.discoveredModelId,
-              status: terminalStatus(terminal),
-              startedAt,
-              terminal: cumulativeTerminal,
-              attemptCount,
-              localExecution,
-              userId: requester.userId,
-              localTerminal: terminal,
-              affinity: {
-                outcome:
-                  affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
-                    ? "PREDICTED_MATCH"
-                    : affinityPolicy.enabled
-                      ? "NO_MATCH"
-                      : "DISABLED",
-                score: selectedAffinityScore,
-                prefixDepth: selectedAffinityPrefixDepth,
-                reason: selectedAffinityReason,
-              },
-            }).catch(metadataUpdateError),
-            terminal.ok && responseId && operation.responseStickiness
-              ? writeResponseStickiness({
-                  ...operation.responseStickiness,
-                  responseId,
-                  targetModelPoolId: target.id,
-                  selectedDiscoveredModelId: member.discoveredModelId,
-                }).catch(stickinessWriteError)
-              : Promise.resolve(),
-            terminal.ok && requestedSurface && affinityPayload && affinityTarget
-              ? rememberAffinity({
-                  ownerId: requester.userId,
-                  resourceOwnerId: member.DiscoveredModel.userId,
-                  poolId: target.id,
-                  securityScope: requester.limitKey,
-                  accessGrantId: target.accessGrantId,
-                  policy: affinityPolicy,
-                  surface: requestedSurface,
-                  payload: affinityPayload,
-                  target: affinityTarget,
-                  engineCacheConfirmed,
-                  estimatedTokens: operation.contextCount?.tokens,
-                })
-              : Promise.resolve(),
-          ]);
-          reportCleanupFailures(terminalWrites);
-        })
-        .catch(metadataUpdateError);
-      void finalize;
       let responseHeaders = new Headers(started.headers);
       const adaptedRequestLimitations = operation.adaptation
         ? (() => {
@@ -5296,29 +5322,167 @@ async function relayPool({
         }),
         () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
       );
-      return capacityLease?.state === "ADMITTED" && capacityRuntime
-        ? await holdOrReleaseCapacityResponse(
-            capacityRuntime,
-            response,
-            capacityLease.lease,
-            request.signal,
-          )
-        : response;
+      const served =
+        capacityLease?.state === "ADMITTED" && capacityRuntime
+          ? await holdOrReleaseCapacityResponse(
+              capacityRuntime,
+              response,
+              capacityLease.lease,
+              request.signal,
+            )
+          : response;
+      // Only now is this attempt definitively the request's outcome (its
+      // response goes to the client), so only now is its finalizer scheduled.
+      // Anything above that throws lands in the catch below, which is then the
+      // attempt's single claimant: it either records the error the client
+      // receives or finalizes only the attempt and moves on to the next
+      // member, whose attempt then decides the request's outcome.
+      const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
+        .then(async ([terminalResult, adaptationResult]) => {
+          const upstreamTerminal =
+            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
+          const adaptationOutcome =
+            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
+          const terminal: RelayAttemptTerminal =
+            adaptationOutcome !== "ok" && upstreamTerminal.ok
+              ? {
+                  ...upstreamTerminal,
+                  ok: false,
+                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
+                }
+              : upstreamTerminal;
+          const cumulativeTerminal = {
+            ...terminal,
+            requestBytes: cumulativeRequestBytes + terminal.requestBytes,
+            responseBytes: cumulativeResponseBytes + terminal.responseBytes,
+          };
+          const cleanup = await Promise.allSettled([
+            Promise.resolve().then(() => cliLease.release()),
+            Promise.resolve().then(() => globalLease?.release()),
+            builtRequest.body instanceof Uint8Array
+              ? Promise.resolve()
+              : builtRequest.body.dispose(),
+            operation.dispose?.() ?? Promise.resolve(),
+          ]);
+          reportCleanupFailures(cleanup);
+          const responseId = responseIdCapture?.finish(operation.stream) ?? null;
+          // The relay executor retains the bounded prefix and tail windows of
+          // THIS attempt's response (per-attempt, so retries cannot
+          // contaminate each other's evidence); the prefix keeps early usage
+          // events (Anthropic message_start) on streams beyond the tail window.
+          // Parsed once: the same facts feed the request's usage columns and
+          // rollup (via updateRelayMetadata) and the engine-cache evidence.
+          const usage = usageFactsFromRelayTerminal(upstreamTerminal);
+          const engineCacheConfirmed = engineCacheConfirmedFromUsageFacts(usage);
+          const affinityTarget = requestedSurface
+            ? affinityTargetForMember(
+                member,
+                requestedSurface,
+                executionByMember.get(member.id),
+                candidate.healthStatus,
+              )
+            : null;
+          const selectedAffinityScore = affinityTarget
+            ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedAffinityPrefixDepth = affinityTarget
+            ? (affinityDecision?.prefixDepths[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedConversationMatch = affinityTarget
+            ? (affinityDecision?.conversationMatches[affinityTarget.executionTargetId] ?? false)
+            : false;
+          const selectedAffinityReason = affinityTarget
+            ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
+            : "identity_unavailable";
+          const terminalWrites = await Promise.allSettled([
+            terminal.ok
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              : adaptationOutcome === "protocol_error"
+                ? recordPoolMemberRelayFailure({
+                    poolMemberId: candidate.poolMemberId,
+                    failure: "protocol_error",
+                  })
+                : Promise.resolve(),
+            updateRelayMetadata(relayRequestId, {
+              selectedDiscoveredModelId: member.discoveredModelId,
+              status: terminalStatus(terminal),
+              startedAt,
+              terminal: cumulativeTerminal,
+              usage,
+              attemptCount,
+              localExecution,
+              userId: requester.userId,
+              localTerminal: terminal,
+              affinity: {
+                outcome:
+                  affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
+                    ? "PREDICTED_MATCH"
+                    : affinityPolicy.enabled
+                      ? "NO_MATCH"
+                      : "DISABLED",
+                score: selectedAffinityScore,
+                prefixDepth: selectedAffinityPrefixDepth,
+                reason: selectedAffinityReason,
+              },
+            }).catch(metadataUpdateError),
+            terminal.ok && responseId && operation.responseStickiness
+              ? writeResponseStickiness({
+                  ...operation.responseStickiness,
+                  responseId,
+                  targetModelPoolId: target.id,
+                  selectedDiscoveredModelId: member.discoveredModelId,
+                }).catch(stickinessWriteError)
+              : Promise.resolve(),
+            terminal.ok && requestedSurface && affinityPayload && affinityTarget
+              ? rememberAffinity({
+                  ownerId: requester.userId,
+                  resourceOwnerId: member.DiscoveredModel.userId,
+                  poolId: target.id,
+                  securityScope: requester.limitKey,
+                  accessGrantId: target.accessGrantId,
+                  policy: affinityPolicy,
+                  surface: requestedSurface,
+                  payload: affinityPayload,
+                  target: affinityTarget,
+                  engineCacheConfirmed,
+                  estimatedTokens: operation.contextCount?.tokens,
+                })
+              : Promise.resolve(),
+          ]);
+          reportCleanupFailures(terminalWrites);
+        })
+        .catch(metadataUpdateError);
+      void finalize;
+      return served;
     } catch {
+      // No finalizer was scheduled for this attempt (see above). Settle it if
+      // it may still be streaming (a no-op once its terminal is known).
+      attempt.cancel("unknown");
       const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
-      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
-        metadataUpdateError,
-      );
+      const failure = terminal.failure ?? "unknown";
+      const operationRetryable = shouldRetryRelayOperation(operation, "precommit_transport");
+      const memberRetryable =
+        isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure);
+      // Single claimant per attempt row: when this attempt is the request's
+      // outcome (operation retryable, member failure not retryable), the
+      // attempt is claimed by `updateRelayMetadata` below together with the
+      // request transition. Every other outcome hands the request to a later
+      // finalizer (next member, or the post-loop overflow/failRelayMetadata),
+      // so only the attempt is finalized here.
+      const attemptIsRequestOutcome = operationRetryable && !memberRetryable;
+      if (!attemptIsRequestOutcome)
+        await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
+          metadataUpdateError,
+        );
       cumulativeRequestBytes += terminal.requestBytes;
       cumulativeResponseBytes += terminal.responseBytes;
       await settleRelayCleanup([
         () => cliLease.release(),
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
-      const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
-      if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
-      if (isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure)) {
+      if (!operationRetryable) break;
+      if (memberRetryable && isPoolRelayFailureClass(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
           failure,
@@ -5336,13 +5500,14 @@ async function relayPool({
       ]);
       await updateRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
-        status: terminalStatus(terminal),
+        status: servedFailureStatus(terminal),
         startedAt,
         terminal: {
           ...terminal,
           requestBytes: cumulativeRequestBytes,
           responseBytes: cumulativeResponseBytes,
         },
+        fallbackFailure: failure,
         attemptCount,
         localExecution,
         userId: requester.userId,
@@ -5415,6 +5580,7 @@ async function relaySelectedModelNoFailover({
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
+    source: requester.source,
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId,
@@ -5574,7 +5740,26 @@ async function relaySelectedModelNoFailover({
           }
         : undefined,
   };
-  await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+  try {
+    await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+  } catch {
+    cliLease.release();
+    globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
+    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+    await operation.dispose?.();
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+      attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
+      localTerminal: rejectedRelayTerminal(),
+    });
+    return operationFailureResponse(operation, "unknown");
+  }
   const attempt = startRelayAttempt({
     requestId: localExecution.localAttemptId,
     manager,
@@ -5594,6 +5779,31 @@ async function relaySelectedModelNoFailover({
 
   try {
     const started = await attempt.started;
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
+    );
+    const served =
+      capacityLease?.state === "ADMITTED" && capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            response,
+            capacityLease.lease,
+            request.signal,
+          )
+        : response;
+    // Only now is this attempt definitively the request's outcome (the
+    // response goes to the client), so only now is its finalizer scheduled.
+    // Anything above that throws lands in the catch below, which is then the
+    // attempt's single claimant and records what the client actually got.
     const finalize = attempt.terminal
       .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
@@ -5626,27 +5836,10 @@ async function relaySelectedModelNoFailover({
       })
       .catch(metadataUpdateError);
     void finalize;
-    const response = responseWithFirstClientByte(
-      new Response(
-        responseBodyForOperation({
-          body: started.body,
-          headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
-        }),
-        { status: started.status, headers: started.headers },
-      ),
-      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
-    );
-    return capacityLease?.state === "ADMITTED" && capacityRuntime
-      ? await holdOrReleaseCapacityResponse(
-          capacityRuntime,
-          response,
-          capacityLease.lease,
-          request.signal,
-        )
-      : response;
+    return served;
   } catch {
+    // No finalizer was scheduled (see above): this catch is the attempt's
+    // single claimant and records the error the client receives.
     attempt.cancel("unknown");
     const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
     const cleanup = await Promise.allSettled([
@@ -5661,9 +5854,10 @@ async function relaySelectedModelNoFailover({
     reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
-      status: terminalStatus(terminal),
+      status: servedFailureStatus(terminal),
       startedAt,
       terminal,
+      fallbackFailure: "unknown",
       attemptCount: 1,
       localExecution,
       userId: requester.userId,
@@ -5921,6 +6115,9 @@ async function maybeApplyPoolMediaTransformer({
     try {
       transformRelayRequestId = await createRelayMetadata({
         userId: requester.userId,
+        // Internal media-transformer hop of a pool request: never counted as
+        // a separate client request in usage rollups.
+        source: "TRANSFORMER",
         modelApiTokenId: requester.modelApiTokenId,
         modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
         requestedDiscoveredModelId: transformer.id,
@@ -5942,7 +6139,23 @@ async function maybeApplyPoolMediaTransformer({
       localAttemptId: crypto.randomUUID(),
       poolId,
     };
-    await startLocalExecutionTelemetry(transformRelayRequestId, requester.userId, localExecution);
+    try {
+      await startLocalExecutionTelemetry(transformRelayRequestId, requester.userId, localExecution);
+    } catch (error) {
+      cliLease.release();
+      globalLease.release();
+      await failRelayMetadata({
+        relayRequestId: transformRelayRequestId,
+        startedAt: hopStartedAt,
+        failure: "unknown",
+        selectedDiscoveredModelId: transformer.id,
+        transformerErrorClass: "unknown",
+        localExecution,
+        userId: requester.userId,
+        localTerminal: rejectedRelayTerminal(),
+      }).catch(metadataUpdateError);
+      throw error;
+    }
     const attempt = startRelayAttempt({
       requestId: localExecution.localAttemptId,
       manager,
@@ -6466,17 +6679,20 @@ export async function chatTestCompletionsHandler({
   manager,
   limiter,
   capacityRuntime,
+  source = "CHAT_TEST",
 }: {
   request: Request;
   userId: string;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
+  /** MCP diagnostics reuse this core; tag their traffic separately. */
+  source?: "CHAT_TEST" | "MCP";
 }) {
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
 
-  const requester = requesterFromChatTestUser(userId);
+  const requester = requesterFromChatTestUser(userId, source);
   const targets = await listVisibleModelTargetsForUser(userId);
   return relayPreparedModeledRequest({
     request,
@@ -6525,8 +6741,10 @@ async function relayBoundProviderResponse(input: {
   contextCount?: ContextCountTelemetry;
   capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
+  const boundStartedAt = new Date();
   const relayRequestId = await createRelayMetadata({
     userId: input.requester.userId,
+    source: input.requester.source,
     modelApiTokenId: input.requester.modelApiTokenId,
     modelApiTokenLookupPrefix: input.requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: input.stickyRoute.visibleTarget.id,
@@ -6641,18 +6859,34 @@ async function relayBoundProviderResponse(input: {
     return result;
   };
   let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
-  let result = await dispatchBoundTier("PRIMARY");
-  if (!result.dispatched) {
-    selectedTier = "PUBLIC_OVERFLOW";
-    result = await dispatchBoundTier("PUBLIC_OVERFLOW");
+  let result: Awaited<ReturnType<typeof dispatchBoundTier>>;
+  try {
+    result = await dispatchBoundTier("PRIMARY");
+    if (!result.dispatched) {
+      selectedTier = "PUBLIC_OVERFLOW";
+      result = await dispatchBoundTier("PUBLIC_OVERFLOW");
+    }
+  } catch (error) {
+    // Admission/dispatch threw before any provider terminal exists: finalize
+    // the request here so it never lingers PENDING (and is counted once).
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt: boundStartedAt,
+      failure: input.request.signal.aborted ? "cancelled" : "unknown",
+    }).catch(metadataUpdateError);
+    throw error;
   }
   if (!result.dispatched) {
-    await prisma.relayRequest
-      .update({
-        where: { id: relayRequestId },
-        data: { status: "FAILED", completedAt: new Date(), errorClass: "not_found" },
-        select: { id: true },
-      })
+    const failedAt = new Date();
+    await prisma
+      .$transaction((tx) =>
+        transitionRelayRequestTerminal(
+          tx,
+          relayRequestId,
+          { status: "FAILED", completedAt: failedAt, errorClass: "not_found" },
+          failedAt,
+        ),
+      )
       .catch(metadataUpdateError);
     return openAiFailureJsonResponse(
       "not_found",
@@ -6679,20 +6913,36 @@ async function relayBoundProviderResponse(input: {
     })
     .catch(metadataUpdateError);
   void result.terminal
-    .then((terminal) =>
-      prisma.relayRequest.update({
-        where: { id: relayRequestId },
-        data: {
-          status: terminal.ok ? "SUCCEEDED" : input.request.signal.aborted ? "CANCELED" : "FAILED",
-          completedAt: new Date(),
-          httpStatusCode: result.response.status,
-          upstreamStatusCode: result.response.status,
-          responseBytes: BigInt(terminal.responseBytes),
-          errorClass: terminal.ok ? null : input.request.signal.aborted ? "cancelled" : "unknown",
-        },
-        select: { id: true },
-      }),
-    )
+    .then((terminal) => {
+      const completedAt = new Date();
+      const usage = usageFactsFromProviderUsage(terminal.usage);
+      return prisma.$transaction((tx) =>
+        transitionRelayRequestTerminal(
+          tx,
+          relayRequestId,
+          {
+            status: terminal.ok
+              ? "SUCCEEDED"
+              : input.request.signal.aborted
+                ? "CANCELED"
+                : "FAILED",
+            completedAt,
+            durationMs: Math.max(0, completedAt.getTime() - boundStartedAt.getTime()),
+            httpStatusCode: result.response.status,
+            upstreamStatusCode: result.response.status,
+            responseBytes: BigInt(terminal.responseBytes),
+            errorClass: terminal.ok ? null : input.request.signal.aborted ? "cancelled" : "unknown",
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            totalTokens: usage.totalTokens,
+            cacheReadTokens: usage.cacheReadTokens,
+            cacheWriteTokens: usage.cacheWriteTokens,
+            usageKnown: usage.usageKnown,
+          },
+          completedAt,
+        ),
+      );
+    })
     .catch(metadataUpdateError);
   let response = result.response;
   if (response.status < 200 || response.status >= 300) {

@@ -20,6 +20,23 @@ model User {
   banned                     Boolean?
   banReason                  String?
   banExpires                 DateTime?
+  /// Durable intent of an accepted account deletion (users.remove or Better
+  /// Auth admin remove-user). Set, with a ban, before any history is drained;
+  /// the user-deletion sweeper finishes every marked user. See
+  /// packages/db/src/parent-deletion.ts.
+  deletionRequestedAt        DateTime?
+  /// Identity of the current deletion generation: set with
+  /// deletionRequestedAt, cleared with it. Every marker transition
+  /// (completion, abandon, sweep backoff) is predicated on the generation the
+  /// worker selected, so a stale worker cannot act on a newer deletion. A
+  /// random id, not a timestamp compare, so no column precision is involved.
+  deletionGeneration         String?
+  /// Transient sweeper failures of the current generation (exponential backoff).
+  deletionSweepAttempts      Int                          @default(0)
+  /// Last user-deletion sweeper attempt (fairness / backoff).
+  deletionSweepLastAttemptAt DateTime?
+  /// Do not select for sweeping before this instant (transient failures).
+  deletionSweepNextAttemptAt DateTime?
   twoFactorEnabled           Boolean?
   operationalAlerts          Boolean                      @default(true)
   sessions                   Session[]
@@ -46,6 +63,8 @@ model User {
   responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
   relayRequests              RelayRequest[]               @relation("RelayRequestOwner")
   relayExecutionEvents       RelayExecutionEvent[]        @relation("RelayExecutionEventOwner")
+  usageRollupMinutes         UsageRollupMinute[]          @relation("UsageRollupMinuteOwner")
+  usageRollupHours           UsageRollupHour[]            @relation("UsageRollupHourOwner")
   relayExecutionAttempts     RelayExecutionAttempt[]      @relation("RelayExecutionAttemptOwner")
   mediaAssets                MediaAsset[]                 @relation("MediaAssetOwner")
   providerAccounts           ProviderAccount[]            @relation("ProviderAccountOwner")
@@ -66,6 +85,8 @@ model User {
   @@unique([email])
   @@index([slug])
   @@index([role])
+  @@index([deletionRequestedAt])
+  @@index([deletionSweepNextAttemptAt, deletionRequestedAt])
   @@map("user")
 }
 

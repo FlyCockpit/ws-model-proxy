@@ -1,4 +1,4 @@
-import { Link, Outlet, useMatchRoute, useNavigate } from "@tanstack/react-router";
+import { Link, Outlet, useMatches, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
@@ -17,8 +17,11 @@ import {
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { AgentRequestsBadge } from "@/components/agent-requests-badge";
+import { AgentRequestsNotice } from "@/components/agent-requests-notice";
 import { DashboardNotices } from "@/components/dashboard-notices";
 import { TerminalStatusDot } from "@/components/terminal-status-dot";
+import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { TerminalWorkspaceProvider, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
@@ -89,17 +92,44 @@ const TerminalWorkspaceView = lazy(() =>
 
 type Section = (typeof dashboardSections)[number];
 
+export type DashboardLayoutMode = "padded" | "fill";
+
+/**
+ * The deepest matched route that declares `staticData.dashboardLayout` wins.
+ * Routes without the flag render inside the padded, centered container.
+ */
+export function resolveDashboardLayout(
+  matches: readonly { staticData?: { dashboardLayout?: DashboardLayoutMode } }[],
+): DashboardLayoutMode {
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const layout = matches[index]?.staticData?.dashboardLayout;
+    if (layout) return layout;
+  }
+  return "padded";
+}
+
 export function DashboardFrame({ lang }: { lang: string }) {
   const matchRoute = useMatchRoute();
+  const layout = useMatches({ select: resolveDashboardLayout });
+  // Terminal-specific behavior only (keep-alive workspace, provider activation);
+  // the page geometry comes from the route's declared layout.
   const onTerminals = Boolean(matchRoute({ to: "/$lang/dashboard/terminals", params: { lang } }));
   return (
     <TerminalWorkspaceProvider active={onTerminals}>
-      <DashboardLayout lang={lang} onTerminals={onTerminals} />
+      <DashboardLayout lang={lang} layout={layout} onTerminals={onTerminals} />
     </TerminalWorkspaceProvider>
   );
 }
 
-function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boolean }) {
+function DashboardLayout({
+  lang,
+  layout,
+  onTerminals,
+}: {
+  lang: string;
+  layout: DashboardLayoutMode;
+  onTerminals: boolean;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   const sidebarCollapsed = useUiPreferences((state) => state.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((state) => state.toggleSidebar);
@@ -158,19 +188,32 @@ function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boo
       </aside>
 
       <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        {onTerminals ? (
-          <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
+        {layout === "fill" ? (
+          <>
+            <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
+            {/* empty:hidden drops the padding when there are no notices. */}
+            <div data-dashboard-notices="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
+              {onTerminals ? null : <AgentRequestsNotice lang={lang} />}
+              <DashboardNotices />
+            </div>
+            {/* The terminals route renders nothing; the workspace below fills instead. */}
+            <div
+              data-dashboard-layout="fill"
+              className={cn("flex min-h-0 min-w-0 flex-col", !onTerminals && "flex-1")}
+            >
+              <Outlet />
+            </div>
+          </>
         ) : (
-          <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col md:overflow-x-clip md:overflow-y-auto">
-            <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-8">
-              <div className="mb-5 hidden shrink-0 md:block">
-                <h1 className="text-xl font-semibold md:text-2xl">{t("dashboard:title")}</h1>
-                <p className="mt-1 text-sm text-muted-foreground">{t("dashboard:description")}</p>
-              </div>
-
+          <div
+            data-dashboard-layout="padded"
+            className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col md:overflow-x-clip md:overflow-y-auto"
+          >
+            <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
               <MobileNavStrip lang={lang} className="mb-4" />
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
+                <AgentRequestsNotice lang={lang} />
                 <DashboardNotices />
                 <Outlet />
               </div>
@@ -185,8 +228,6 @@ function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boo
             </Suspense>
           </div>
         ) : null}
-        {/* The terminals route renders nothing; it keeps the router's match. */}
-        {onTerminals ? <Outlet /> : null}
       </div>
     </div>
   );
@@ -197,11 +238,14 @@ function SidebarLink({
   lang,
   collapsed,
   className,
+  badge = 0,
 }: {
   item: Section;
   lang: string;
   collapsed: boolean;
   className?: string;
+  /** Agent requests waiting (Terminals only). */
+  badge?: number;
 }) {
   const { t } = useTranslation(["dashboard"]);
   return (
@@ -228,7 +272,10 @@ function SidebarLink({
       {collapsed ? (
         <span className="sr-only">{t(item.labelKey)}</span>
       ) : (
-        <span className="min-w-0 truncate">{t(item.labelKey)}</span>
+        <>
+          <span className="min-w-0 truncate">{t(item.labelKey)}</span>
+          <AgentRequestsBadge count={badge} className="ms-auto" />
+        </>
       )}
     </Link>
   );
@@ -251,11 +298,16 @@ function TerminalsNavItem({
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(true);
   const tabs = workspace.tabs;
+  const agentRequests = usePendingAgentRequests();
 
   if (collapsed) {
     return (
       <div className="relative flex justify-center">
         <SidebarLink item={item} lang={lang} collapsed />
+        <AgentRequestsBadge
+          count={agentRequests.count}
+          className="pointer-events-none absolute bottom-1 end-1"
+        />
         {tabs.length > 0 ? (
           <span
             aria-hidden="true"
@@ -271,7 +323,13 @@ function TerminalsNavItem({
   return (
     <div className="flex min-w-0 flex-col">
       <div className="flex min-w-0 items-center">
-        <SidebarLink item={item} lang={lang} collapsed={false} className="min-w-0 flex-1" />
+        <SidebarLink
+          item={item}
+          lang={lang}
+          collapsed={false}
+          className="min-w-0 flex-1"
+          badge={agentRequests.count}
+        />
         {tabs.length > 0 ? (
           <Button
             type="button"
@@ -333,6 +391,7 @@ function TerminalsNavItem({
 /** Below md: a horizontal strip of section links in place of the sidebar. */
 function MobileNavStrip({ lang, className }: { lang: string; className?: string }) {
   const { t } = useTranslation(["dashboard"]);
+  const agentRequests = usePendingAgentRequests();
   return (
     // Horizontal-only: overflow-y-hidden clips accidental vertical overflow;
     // overscroll-x-contain keeps horizontal swipes from chaining. Avoid
@@ -361,6 +420,9 @@ function MobileNavStrip({ lang, className }: { lang: string; className?: string 
           >
             <item.icon aria-hidden="true" className="size-4" />
             {t(item.labelKey)}
+            {item.to === "/$lang/dashboard/terminals" ? (
+              <AgentRequestsBadge count={agentRequests.count} />
+            ) : null}
           </Link>
         ))}
       </nav>

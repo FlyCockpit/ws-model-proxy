@@ -19,6 +19,8 @@ import {
   encodeTerminalData,
   encodeTerminalOutputKey,
   encodeTerminalResize,
+  encodeTerminalReviewCapture,
+  encodeTerminalReviewToggle,
   hexToBytes,
   importEcdhPrivateJwk,
   importEcdhPublicRaw,
@@ -502,5 +504,74 @@ describe("terminal CLI identity vectors", () => {
 
   it("formats the fingerprint as base32 groups of 4", async () => {
     await expect(cliIdentityFingerprint(identityRaw)).resolves.toBe(CLI_ID_FINGERPRINT);
+  });
+});
+
+describe("supervised command review plaintexts", () => {
+  it("encodes the review toggle as [0x04, on]", () => {
+    expect(bytesToHex(encodeTerminalReviewToggle(true))).toBe("0401");
+    expect(bytesToHex(encodeTerminalReviewToggle(false))).toBe("0400");
+  });
+
+  it("decodes the CLI's review state [0x06, on] and rejects other flag bytes", () => {
+    expect(decodeTerminalPlaintextV2(hexToBytes("0601"))).toEqual({
+      kind: "reviewState",
+      on: true,
+    });
+    expect(decodeTerminalPlaintextV2(hexToBytes("0600"))).toEqual({
+      kind: "reviewState",
+      on: false,
+    });
+    expect(() => decodeTerminalPlaintextV2(hexToBytes("0602"))).toThrow();
+    expect(() => decodeTerminalPlaintextV2(hexToBytes("060100"))).toThrow();
+  });
+
+  it("decodes a capture laid out as [0x05, be64 total, be32 headLen, head, tail]", () => {
+    // total = 70000, headLen = 2, head = "hi", tail = "yo".
+    const bytes = hexToBytes(`05${"0000000000011170"}${"00000002"}6869796f`);
+    expect(decodeTerminalPlaintextV2(bytes)).toEqual({
+      kind: "reviewCapture",
+      totalBytes: 70000,
+      head: new TextEncoder().encode("hi"),
+      tail: new TextEncoder().encode("yo"),
+    });
+    const round = encodeTerminalReviewCapture({
+      head: new TextEncoder().encode("hi"),
+      tail: new TextEncoder().encode("yo"),
+      totalBytes: 70000,
+    });
+    expect(bytesToHex(round)).toBe(bytesToHex(bytes));
+  });
+
+  it("rejects captures with a bad head length, an oversized part, or a short header", () => {
+    expect(() => decodeTerminalPlaintextV2(hexToBytes("05000000"))).toThrow();
+    // headLen 5 but only 2 bytes follow.
+    expect(() =>
+      decodeTerminalPlaintextV2(hexToBytes(`05${"0000000000000005"}${"00000005"}6869`)),
+    ).toThrow();
+    const bigTail = encodeTerminalReviewCapture({
+      head: new Uint8Array(),
+      tail: new Uint8Array(40961),
+      totalBytes: 50000,
+    });
+    expect(() => decodeTerminalPlaintextV2(bigTail)).toThrow(/tail/);
+    const bigHead = encodeTerminalReviewCapture({
+      head: new Uint8Array(8193),
+      tail: new Uint8Array(),
+      totalBytes: 8193,
+    });
+    expect(() => decodeTerminalPlaintextV2(bigHead)).toThrow(/head/);
+    // A total smaller than the head it claims to contain.
+    const lying = encodeTerminalReviewCapture({
+      head: new Uint8Array(4),
+      tail: new Uint8Array(),
+      totalBytes: 3,
+    });
+    expect(() => decodeTerminalPlaintextV2(lying)).toThrow(/total/);
+  });
+
+  it("keeps the v1 decoder rejecting the supervised tags", () => {
+    expect(() => decodeTerminalPlaintext(hexToBytes("0401"))).toThrow();
+    expect(() => decodeTerminalPlaintext(hexToBytes("0601"))).toThrow();
   });
 });

@@ -24,7 +24,7 @@ All require an active session, enforced by the `_auth` layout.
 
 | Path | Description |
 |------|-------------|
-| `/{lang}/dashboard` | Main dashboard landing page. |
+| `/{lang}/dashboard` | Overview: owner-scoped traffic, prompt-cache, latency, and error metrics per pool and direct model (1h / 24h / 7d), a health strip for CLIs, endpoints, and pool members, and a setup checklist for new users. |
 | `/{lang}/dashboard/chat-test` | Authenticated model chat test surface. |
 | `/{lang}/dashboard/clis` | Own CLI devices and discovered endpoint/model metadata. |
 | `/{lang}/dashboard/terminals` | Browser terminals on the user's own CLIs. |

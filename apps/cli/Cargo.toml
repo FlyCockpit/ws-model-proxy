@@ -8,7 +8,7 @@
 
 [package]
 name = "wsmp"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 publish = false
 # Minimum Supported Rust Version. Edition 2024 requires >= 1.85; tiktoken-rs
@@ -94,14 +94,20 @@ p256 = { version = "0.14", features = ["ecdh"] }
 # Maintained Unix API wrapper used only for authenticated local-control peer
 # credentials and for killing terminal/exec process groups. `socket` exposes
 # SO_PEERCRED/LOCAL_PEERCRED and `user` exposes the current effective UID
-# without unsafe FFI. `signal` covers process-group SIGKILL.
-nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user", "signal", "process", "poll"] }
+# without unsafe FFI. `signal` covers process-group SIGKILL. `hostname` is
+# reported in hello and suggests the login slug. `term` puts the supervised
+# command confirm screen in raw mode and flushes typed-ahead input.
+nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "socket", "user", "signal", "process", "poll", "term"] }
 # Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
 # here). Windows v1 reports terminals unsupported and does not link this crate.
 portable-pty = "0.9"
 # `dup(2)` of the PTY master. Opening `/proc/self/fd/N` follows the ptmx
 # symlink and allocates a new pty, so the reader cannot poll that path.
 filedescriptor = "0.8"
+# Reads the PTY size for the supervised confirm screen with a safe ioctl
+# wrapper, so no `stty` process runs before the person presses a key.
+# Already in the tree through clap's `wrap_help`.
+terminal_size = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same

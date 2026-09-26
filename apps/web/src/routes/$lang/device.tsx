@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
@@ -14,6 +14,10 @@ import { ShieldCheck, ShieldX } from "lucide-react";
 import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 
+import {
+  DeviceLoginRequestDetails,
+  DeviceLoginRequestSkeleton,
+} from "@/components/device-login-request";
 import { authClient } from "@/lib/auth-client";
 import { decideDeviceRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
@@ -81,9 +85,38 @@ function DevicePage() {
   const queryClient = useQueryClient();
   const { t } = useTranslation("auth");
 
+  // Claim the code for this account (Better Auth `GET /device`), then read
+  // what approving it authorizes. Approve stays disabled until that is shown.
+  //
+  // The claim happens on page load, not on Approve/Deny: the summary is
+  // owner-scoped (`deviceLoginRequest` only answers the account that claimed
+  // the code), so it cannot be shown before the claim. Better Auth binds a
+  // pending code to the first signed-in account that opens this link; anyone
+  // else who opens it later gets "not found". This page is for signed-in users
+  // approving their own `wsmp login`, so the opener is expected to be the
+  // approver; a link opened by the wrong account needs a fresh `wsmp login`.
+  const claimQuery = useQuery({
+    queryKey: ["device-login-claim", userCode],
+    queryFn: async () => {
+      await claimDeviceCode(userCode, t("device.request.loadError"));
+      return true;
+    },
+    enabled: userCode.length > 0,
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+    meta: { skipGlobalErrorToast: true },
+  });
+  const requestQuery = useQuery({
+    ...orpc.cliCredentials.deviceLoginRequest.queryOptions({ input: { userCode } }),
+    enabled: claimQuery.isSuccess,
+    retry: false,
+    meta: { skipGlobalErrorToast: true },
+  });
+  const requestError = claimQuery.error ?? requestQuery.error;
+
   const approveMutation = useMutation({
     mutationFn: async () => {
-      await claimDeviceCode(userCode, t("device.approveError"));
       const result = await authClient.device.approve({ userCode });
       if (result.error) {
         throw new Error(result.error.error_description ?? "Failed to approve");
@@ -92,6 +125,7 @@ function DevicePage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: orpc.devices.key() });
+      queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
       setDecision("approved");
       toast.success(t("device.approveSuccess"));
     },
@@ -181,12 +215,21 @@ function DevicePage() {
         <div className="rounded-md border bg-muted/40 px-3 py-2 font-mono text-sm">
           {t("device.userCodeLabel")} <strong>{userCode}</strong>
         </div>
+        {requestQuery.data ? (
+          <DeviceLoginRequestDetails request={requestQuery.data} />
+        ) : requestError ? (
+          <p role="alert" className="text-sm text-destructive">
+            {friendly(requestError, t("device.request.loadError"))}
+          </p>
+        ) : (
+          <DeviceLoginRequestSkeleton />
+        )}
         <div className="flex gap-2">
           <Button
             type="button"
             className="min-h-[44px]"
             onClick={() => approveMutation.mutate()}
-            disabled={approveMutation.isPending || denyMutation.isPending}
+            disabled={!requestQuery.data || approveMutation.isPending || denyMutation.isPending}
           >
             {approveMutation.isPending ? t("device.approving") : t("device.approve")}
           </Button>

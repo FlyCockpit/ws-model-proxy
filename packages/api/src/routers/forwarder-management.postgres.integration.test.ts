@@ -49,7 +49,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
       },
     });
     const cli = await modules.prisma.cliDevice.create({
-      data: { userId: user.id, slug: `cli-${suffix}`, label: "CLI" },
+      data: { userId: user.id, slug: `cli-${suffix}` },
     });
     const endpoint = await modules.prisma.endpoint.create({
       data: {

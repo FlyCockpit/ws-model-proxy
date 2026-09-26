@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import { lockExecutionTargetPolicies } from "@ws-model-proxy/api/lib/capacity-policy-safety";
-import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  type CliWebsocketIdentity,
+  checkCliCredentialForDevice,
+} from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   type ContextWindowSeedDependent,
   declaredContextWindow,
@@ -8,10 +10,16 @@ import {
 } from "@ws-model-proxy/api/lib/declared-context-window";
 import {
   ensureDiscoveredInferenceCapacity,
+  existingDiscoveredCapacityCandidates,
   fillNullAutoDiscoveredCapacityLimit,
   isInferenceCapacityWriteRetryable,
   linkExecutionTargetCapacity,
 } from "@ws-model-proxy/api/lib/discovered-inference-capacity";
+import {
+  type McpCommandModeDb,
+  type McpCommandModeName,
+  mcpCommandModeFromDb,
+} from "@ws-model-proxy/api/lib/mcp-command-mode";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   coarseCapabilitiesFromOpenAi,
@@ -19,6 +27,11 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import {
+  lockCapacityRowsForPolicyWrite,
+  lockExecutionTargetPolicies,
+} from "@ws-model-proxy/db/capacity-lock-order";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
 
 type JsonValue = string | number | boolean | { [key: string]: JsonValue } | JsonValue[];
@@ -110,9 +123,11 @@ export type ReportedRelayFeatures = {
   cliVersion: string | null;
   relayProtocolVersion: string;
   reportedHumanTerminal: boolean | null;
-  reportedMcpCommands: boolean | null;
+  reportedMcpCommandMode: McpCommandModeDb | null;
   reportedTerminalApproval: boolean | null;
   reportedTerminalSupported: boolean | null;
+  /** Already normalized (see `normalizeReportedHostname`); null when not reported. */
+  reportedHostname: string | null;
   featuresReportedAt: Date | null;
 };
 
@@ -127,7 +142,7 @@ export async function persistRelayRegistration({
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
-  cli: { slug: string; label: string };
+  cli: { slug: string };
   endpoints: EndpointInventory[];
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
@@ -139,7 +154,7 @@ export async function persistRelayRegistration({
   cliDeviceId: string;
   userId: string;
   allowHumanTerminal: boolean;
-  allowMcpCommands: boolean;
+  mcpCommandMode: McpCommandModeName;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -149,7 +164,7 @@ export async function persistRelayRegistration({
   }
 
   const inventoryDigest = inventoryDigestFor(endpoints);
-  // Grants (allowHumanTerminal / allowMcpCommands) are server-owned and are
+  // Grants (allowHumanTerminal / mcpCommandMode) are server-owned and are
   // never written here. Reported columns are hello-only.
   const reportedData =
     connection && reported
@@ -157,9 +172,10 @@ export async function persistRelayRegistration({
           cliVersion: reported.cliVersion,
           relayProtocolVersion: reported.relayProtocolVersion,
           reportedHumanTerminal: reported.reportedHumanTerminal,
-          reportedMcpCommands: reported.reportedMcpCommands,
+          reportedMcpCommandMode: reported.reportedMcpCommandMode,
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
+          reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
         }
       : {};
@@ -170,16 +186,25 @@ export async function persistRelayRegistration({
         async (tx) => {
           const user = await tx.user.findUnique({
             where: { id: identity.userId },
-            select: { id: true, slug: true },
+            select: {
+              id: true,
+              slug: true,
+              banned: true,
+              banExpires: true,
+              deletionRequestedAt: true,
+            },
           });
           if (!user) {
             throw new RelayRegistrationError("Credential owner no longer exists.", "access_denied");
           }
+          if (userCredentialAccessBlocked(user, new Date())) {
+            throw new RelayRegistrationError("Credential owner is not active.", "access_denied");
+          }
 
           const cliDevice = await tx.cliDevice.upsert({
             where: { userId_slug: { userId: identity.userId, slug: cliSlug } },
+            // `name` is user-owned (dashboard); registration never writes it.
             update: {
-              label: cli.label,
               inventoryConfirmed,
               endpointTargeting,
               ...(connection
@@ -195,7 +220,6 @@ export async function persistRelayRegistration({
             create: {
               userId: identity.userId,
               slug: cliSlug,
-              label: cli.label,
               inventoryConfirmed,
               endpointTargeting,
               status: "CONNECTED",
@@ -213,31 +237,29 @@ export async function persistRelayRegistration({
               inventoryAcknowledgedAt: true,
               inventoryConfirmed: true,
               allowHumanTerminal: true,
-              allowMcpCommands: true,
+              mcpCommandMode: true,
             },
           });
 
-          if (identity.cliDeviceId && identity.cliDeviceId !== cliDevice.id) {
+          // After the device upsert, which holds the device row lock that a
+          // re-login's revoking transaction and a device delete also take. A
+          // device credential only ever registers as its minted device; an
+          // unbound CLI token is bound here. Any refusal rolls back the
+          // upsert, including a device row it just created.
+          const credentialCheck = await checkCliCredentialForDevice(
+            tx,
+            identity,
+            cliDevice.id,
+            now,
+          );
+          if (credentialCheck === "revoked") {
+            throw new RelayRegistrationError("Credential was revoked.", "access_denied");
+          }
+          if (credentialCheck === "otherDevice") {
             throw new RelayRegistrationError(
               "Credential is bound to a different CLI device.",
               "access_denied",
             );
-          }
-
-          if (!identity.cliDeviceId) {
-            if (identity.kind === "cliToken") {
-              await tx.cliToken.update({
-                where: { id: identity.id },
-                data: { cliDeviceId: cliDevice.id },
-                select: { id: true },
-              });
-            } else {
-              await tx.cliDeviceCredential.update({
-                where: { id: identity.id },
-                data: { cliDeviceId: cliDevice.id },
-                select: { id: true },
-              });
-            }
           }
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;
@@ -245,6 +267,51 @@ export async function persistRelayRegistration({
           const declaredContextByCapacityId = new Map<string, number>();
           const upsertedTargetIds = new Set<string>();
           const publishedEndpointSlugs = endpoints.map((endpoint) => endpoint.slug);
+          const capacityWork: Array<{
+            targetId: string;
+            inferenceCapacityId: string | null;
+            discoveredModelId: string;
+            upstreamModelId: string;
+            reportedConcurrency: number | undefined;
+            declaredContext: number | null;
+          }> = [];
+
+          // Capacity lock order (@ws-model-proxy/db/capacity-lock-order):
+          // the device row above is L0. Every existing execution target this
+          // inventory touches is locked here (L2, sorted) before any endpoint,
+          // model, target or capacity write, and every capacity row is locked
+          // (L5, sorted) before the first capacity write below. Targets created
+          // in this transaction are invisible to every other transaction until
+          // commit, so their L2 locks cannot be contended.
+          const inventoryModelFilters = endpoints.flatMap((endpoint) =>
+            endpoint.models.length > 0
+              ? [
+                  {
+                    Endpoint: { slug: endpoint.slug },
+                    upstreamModelId: { in: endpoint.models.map((model) => model.upstreamModelId) },
+                  },
+                ]
+              : [],
+          );
+          const existingInventoryTargets =
+            inventoryModelFilters.length > 0
+              ? await tx.executionTarget.findMany({
+                  where: {
+                    userId: identity.userId,
+                    DiscoveredModel: {
+                      is: {
+                        Endpoint: { cliDeviceId: cliDevice.id },
+                        OR: inventoryModelFilters,
+                      },
+                    },
+                  },
+                  select: { id: true },
+                })
+              : [];
+          const policyLockedTargetIds = new Set(
+            existingInventoryTargets.map((target) => target.id),
+          );
+          await lockExecutionTargetPolicies(tx, [...policyLockedTargetIds]);
 
           for (const endpoint of endpoints) {
             const coarseCapabilities = endpoint.defaultCapabilities
@@ -393,65 +460,54 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true },
               });
-              const target = await tx.executionTarget.upsert({
+              // Execution-target identity (userId, kind, source model) is
+              // immutable (schema hardening), so an existing target is only
+              // read. A native upsert whose SET names the key column "userId"
+              // would take FOR UPDATE on the row even for an unchanged value
+              // and block admission's FK FOR KEY SHARE checks (DL-1).
+              let target = await tx.executionTarget.findUnique({
                 where: { discoveredModelId: discoveredModel.id },
-                update: { userId: identity.userId, kind: "DISCOVERED_MODEL" },
-                create: {
-                  userId: identity.userId,
-                  kind: "DISCOVERED_MODEL",
-                  discoveredModelId: discoveredModel.id,
-                },
                 select: { id: true, inferenceCapacityId: true },
               });
-              // Keep a capacity that is already attached. Otherwise create one
-              // and set the foreign key before this transaction commits.
-              // A null limit on this target's auto key is the schema-hardening
-              // trigger, which cannot see the CLI report. Fill only that null.
-              let inferenceCapacityId = target.inferenceCapacityId;
-              if (inferenceCapacityId === null) {
-                inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
-                  userId: identity.userId,
-                  discoveredModelId: discoveredModel.id,
-                  upstreamModelId: model.upstreamModelId,
-                  executionTargetId: target.id,
-                  reportedConcurrency: model.concurrencyLimit,
+              if (!target) {
+                target = await tx.executionTarget.create({
+                  data: {
+                    userId: identity.userId,
+                    kind: "DISCOVERED_MODEL",
+                    discoveredModelId: discoveredModel.id,
+                  },
+                  select: { id: true, inferenceCapacityId: true },
                 });
-                await linkExecutionTargetCapacity(tx, {
-                  executionTargetId: target.id,
-                  userId: identity.userId,
-                  inferenceCapacityId,
-                });
-              } else {
-                await fillNullAutoDiscoveredCapacityLimit(tx, {
-                  userId: identity.userId,
-                  capacityId: inferenceCapacityId,
-                  discoveredModelId: discoveredModel.id,
-                  executionTargetId: target.id,
-                  reportedConcurrency: model.concurrencyLimit,
-                });
+              }
+              if (!policyLockedTargetIds.has(target.id)) {
+                // Not in the snapshot the L2 set was read from, so this
+                // transaction created it: an uncontended lock on a new row.
+                await lockExecutionTargetPolicies(tx, [target.id]);
+                policyLockedTargetIds.add(target.id);
               }
               upsertedTargetIds.add(target.id);
-              const declared = declaredContextWindow(
-                resolveEffectiveCapabilityMetadata({
-                  capabilityOverrideMode: keepDashboardOverride
-                    ? (existingModel?.capabilityOverrideMode ?? "INHERIT_ENDPOINT_DEFAULTS")
-                    : incomingOverride
-                      ? "OVERRIDE"
-                      : "INHERIT_ENDPOINT_DEFAULTS",
-                  capabilityOverrideMetadata: keepDashboardOverride
-                    ? existingModel?.capabilityOverrideMetadata
-                    : incomingOverride
-                      ? model.capabilities
-                      : null,
-                  endpointCapabilityMetadata: endpoint.defaultCapabilities,
-                }),
-              );
-              if (declared != null && inferenceCapacityId) {
-                declaredContextByCapacityId.set(
-                  inferenceCapacityId,
-                  Math.max(declaredContextByCapacityId.get(inferenceCapacityId) ?? 0, declared),
-                );
-              }
+              capacityWork.push({
+                targetId: target.id,
+                inferenceCapacityId: target.inferenceCapacityId,
+                discoveredModelId: discoveredModel.id,
+                upstreamModelId: model.upstreamModelId,
+                reportedConcurrency: model.concurrencyLimit,
+                declaredContext: declaredContextWindow(
+                  resolveEffectiveCapabilityMetadata({
+                    capabilityOverrideMode: keepDashboardOverride
+                      ? (existingModel?.capabilityOverrideMode ?? "INHERIT_ENDPOINT_DEFAULTS")
+                      : incomingOverride
+                        ? "OVERRIDE"
+                        : "INHERIT_ENDPOINT_DEFAULTS",
+                    capabilityOverrideMetadata: keepDashboardOverride
+                      ? existingModel?.capabilityOverrideMetadata
+                      : incomingOverride
+                        ? model.capabilities
+                        : null,
+                    endpointCapabilityMetadata: endpoint.defaultCapabilities,
+                  }),
+                ),
+              });
               refreshedDiscoveredModelIds.push(discoveredModel.id);
             }
 
@@ -464,12 +520,65 @@ export async function persistRelayRegistration({
             });
           }
 
+          // L5: every existing capacity row the loop below may write (the
+          // attached capacity, or the auto capacity it would adopt), sorted,
+          // before the first write. A capacity created below is a new row.
+          const candidateCapacityIds = new Set<string>();
+          for (const work of capacityWork) {
+            if (work.inferenceCapacityId) candidateCapacityIds.add(work.inferenceCapacityId);
+            else
+              for (const id of await existingDiscoveredCapacityCandidates(tx, {
+                userId: identity.userId,
+                discoveredModelId: work.discoveredModelId,
+                executionTargetId: work.targetId,
+              }))
+                candidateCapacityIds.add(id);
+          }
+          await lockCapacityRowsForPolicyWrite(tx, identity.userId, [...candidateCapacityIds]);
+          for (const work of capacityWork) {
+            // Keep a capacity that is already attached. Otherwise create one
+            // and set the foreign key before this transaction commits.
+            // A null limit on this target's auto key is the schema-hardening
+            // trigger, which cannot see the CLI report. Fill only that null.
+            let inferenceCapacityId = work.inferenceCapacityId;
+            if (inferenceCapacityId === null) {
+              inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
+                userId: identity.userId,
+                discoveredModelId: work.discoveredModelId,
+                upstreamModelId: work.upstreamModelId,
+                executionTargetId: work.targetId,
+                reportedConcurrency: work.reportedConcurrency,
+              });
+              await linkExecutionTargetCapacity(tx, {
+                executionTargetId: work.targetId,
+                userId: identity.userId,
+                inferenceCapacityId,
+              });
+            } else {
+              await fillNullAutoDiscoveredCapacityLimit(tx, {
+                userId: identity.userId,
+                capacityId: inferenceCapacityId,
+                discoveredModelId: work.discoveredModelId,
+                executionTargetId: work.targetId,
+                reportedConcurrency: work.reportedConcurrency,
+              });
+            }
+            if (work.declaredContext != null && inferenceCapacityId) {
+              declaredContextByCapacityId.set(
+                inferenceCapacityId,
+                Math.max(
+                  declaredContextByCapacityId.get(inferenceCapacityId) ?? 0,
+                  work.declaredContext,
+                ),
+              );
+            }
+          }
+
           if (declaredContextByCapacityId.size > 0) {
-            // The target upserts above already hold their row locks. The policy
-            // fence deliberately equals that upserted set: registration never
+            // Every inventory target already holds its L2 policy lock (above).
+            // The seed fence deliberately equals that set: registration never
             // locks targets belonging to a different device or endpoint.
             const lockedExecutionTargetIds = new Set(upsertedTargetIds);
-            await lockExecutionTargetPolicies(tx, [...lockedExecutionTargetIds]);
             const capacityIds = [...declaredContextByCapacityId.keys()];
             const capacities = await tx.inferenceCapacity.findMany({
               where: { userId: identity.userId, id: { in: capacityIds } },
@@ -595,7 +704,7 @@ export async function persistRelayRegistration({
             cliDeviceId: cliDevice.id,
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
-            allowMcpCommands: cliDevice.allowMcpCommands === true,
+            mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,

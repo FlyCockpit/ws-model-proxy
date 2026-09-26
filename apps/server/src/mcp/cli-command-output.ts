@@ -1,15 +1,18 @@
-import { PRODUCT_CREDENTIAL_PREFIXES } from "@ws-model-proxy/db/forwarder-security";
+import {
+  CLI_OUTPUT_ELLIPSIS,
+  type CliStreamText,
+  formatBoundedStream,
+  type BoundedByteView as SharedBoundedByteView,
+} from "@ws-model-proxy/config/cli-command-output";
 
-/**
- * Per-stream view the model sees. `totalBytes` is the full stream count.
- * `text` is lossy UTF-8 of the retained head and tail, with credential
- * substrings removed. Other secrets are not redacted.
- */
-export type CliStreamText = {
-  text: string;
-  truncated: boolean;
-  totalBytes: number;
-};
+export {
+  CLI_OUTPUT_CREDENTIAL_PREFIXES,
+  CLI_OUTPUT_ELLIPSIS,
+  CLI_STREAM_HEAD_MAX_BYTES,
+  CLI_STREAM_TAIL_MAX_BYTES,
+  formatBoundedStream,
+  redactCredentialSubstrings,
+} from "@ws-model-proxy/config/cli-command-output";
 
 export type ParsedCliCommandSnapshot = {
   commandId: string;
@@ -22,25 +25,7 @@ export type ParsedCliCommandSnapshot = {
   stderr: BoundedByteView;
 };
 
-type BoundedByteView = {
-  head: Uint8Array;
-  tail: Uint8Array;
-  totalBytes: number;
-};
-
-/** First bytes retained per stream (the runtime cap). */
-export const CLI_STREAM_HEAD_MAX_BYTES = 8192;
-/** Last bytes retained per stream once the stream is truncated (the runtime cap). */
-export const CLI_STREAM_TAIL_MAX_BYTES = 40960;
-
-/**
- * Marker between the retained head and tail when bytes in the middle were
- * dropped. Kept short so the wrapped tool result stays inside the MCP cap.
- */
-export const CLI_OUTPUT_ELLIPSIS = "\n…\n";
-
-/** Same marker the key/prefix redactor uses, so the two layers read alike. */
-const REDACTED = "[redacted]";
+type BoundedByteView = SharedBoundedByteView;
 
 /**
  * Byte budget of the envelope `runManifestTool` actually emits
@@ -48,15 +33,6 @@ const REDACTED = "[redacted]";
  * the wrapped result under this even when lossy UTF-8 expands the bytes.
  */
 export const CLI_COMMAND_WRAPPED_OUTPUT_BUDGET = 256 * 1024 - 1024;
-
-const CREDENTIAL_SUBSTRING = new RegExp(
-  `(?:${Object.values(PRODUCT_CREDENTIAL_PREFIXES).map(escapeRegex).join("|")})[A-Za-z0-9_-]+`,
-  "g",
-);
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
@@ -81,124 +57,6 @@ function readBounded(value: unknown): BoundedByteView {
       ? Math.max(0, Math.trunc(total))
       : head.length + tail.length;
   return { head, tail, totalBytes };
-}
-
-/** Replace credential substrings anywhere in the text, not only whole values. */
-export function redactCredentialSubstrings(text: string): string {
-  const replaced = text.replace(CREDENTIAL_SUBSTRING, REDACTED);
-  return neutralizeLeadingPrefixes(replaced);
-}
-
-/**
- * A leftover prefix with no credential body does not match the substring
- * regex, but the downstream whole-value redactor would blank the entire
- * field if the text still starts with one. Peel those leading prefixes so
- * the rest of the output survives.
- */
-function neutralizeLeadingPrefixes(text: string): string {
-  const prefixes = Object.values(PRODUCT_CREDENTIAL_PREFIXES);
-  let next = text;
-  for (let guard = 0; guard < prefixes.length; guard += 1) {
-    const prefix = prefixes.find((candidate) => next.startsWith(candidate));
-    if (prefix === undefined) return next;
-    next = `${REDACTED}${next.slice(prefix.length)}`;
-  }
-  return next;
-}
-
-function decodeLossy(bytes: Uint8Array): string {
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-}
-
-/** Drop C0/C1 controls except tab, LF, and CR. */
-function stripDisallowedControls(text: string): string {
-  let out = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code === 0x09 || code === 0x0a || code === 0x0d) {
-      out += text[index] ?? "";
-      continue;
-    }
-    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) continue;
-    out += text[index] ?? "";
-  }
-  return out;
-}
-
-function stripTerminalSequences(text: string): string {
-  let out = "";
-  for (let index = 0; index < text.length; index += 1) {
-    if (text.charCodeAt(index) !== 0x1b) {
-      out += text[index] ?? "";
-      continue;
-    }
-    const next = text[index + 1];
-    if (next === "[") {
-      index += 2;
-      while (index < text.length && (text.charCodeAt(index) ?? 0) < 0x40) index += 1;
-      continue;
-    }
-    if (next === "]") {
-      index += 2;
-      while (index < text.length) {
-        const code = text.charCodeAt(index) ?? 0;
-        if (code === 0x07) break;
-        if (code === 0x1b && text[index + 1] === "\\") {
-          index += 1;
-          break;
-        }
-        index += 1;
-      }
-      continue;
-    }
-    if (next) index += 1;
-  }
-  return out;
-}
-
-function dropLeadingTokenRun(text: string): string {
-  return text.replace(/^[A-Za-z0-9_-]+/, "");
-}
-
-function cleanDecoded(bytes: Uint8Array, options?: { dropLeadingToken?: boolean }): string {
-  let text = stripDisallowedControls(stripTerminalSequences(decodeLossy(bytes)));
-  if (options?.dropLeadingToken) text = dropLeadingTokenRun(text);
-  return redactCredentialSubstrings(text);
-}
-
-function concatBytes(head: Uint8Array, tail: Uint8Array): Uint8Array {
-  if (tail.length === 0) return head;
-  if (head.length === 0) return tail;
-  const out = new Uint8Array(head.length + tail.length);
-  out.set(head, 0);
-  out.set(tail, head.length);
-  return out;
-}
-
-/**
- * Head is the first retained bytes and tail the last. The runtime keeps a
- * tail that still overlaps the head until the stream is longer than both
- * caps, so a covered stream (`totalBytes <= head + tail`) is head plus the
- * non-overlapping suffix of tail — not a blind concatenation. A longer
- * stream has a gap: lossy-utf8(head) + ellipsis + lossy-utf8(tail).
- */
-export function formatBoundedStream(stream: BoundedByteView): CliStreamText {
-  const truncated = stream.totalBytes > stream.head.length + stream.tail.length;
-  if (truncated) {
-    return {
-      text: `${cleanDecoded(stream.head)}${CLI_OUTPUT_ELLIPSIS}${cleanDecoded(stream.tail, { dropLeadingToken: true })}`,
-      truncated: true,
-      totalBytes: stream.totalBytes,
-    };
-  }
-  const overlap = Math.max(0, stream.head.length + stream.tail.length - stream.totalBytes);
-  const tailSuffix =
-    overlap >= stream.tail.length ? new Uint8Array() : stream.tail.subarray(overlap);
-  return {
-    text: cleanDecoded(concatBytes(stream.head, tailSuffix)),
-    truncated: false,
-    totalBytes: stream.totalBytes,
-  };
 }
 
 export function parseCliCommandSnapshot(
@@ -339,4 +197,72 @@ export function presentCliCommand(
     stdout,
     stderr,
   });
+}
+
+/** The supervised-command snapshot fields the presenter reads. */
+export type PresentableSupervisedSnapshot = {
+  commandId: string;
+  status: string;
+  exitCode: number | null;
+  signal: string | null;
+  rejectionReason: string | null;
+  waitDeadline: number | null;
+  started: boolean | null;
+  output: { mode: "shared" | "reviewed" | "redacted" | "private"; edited: boolean } | null;
+  shared: BoundedByteView | null;
+  reviewedText: string | null;
+};
+
+/**
+ * Model-facing record of a supervised command. While a person still has to
+ * act it carries only the status (and the deadline of that wait). Once the
+ * command exited it carries the exit status and `output.mode`: `shared` (the
+ * capture as the CLI sent it), `reviewed` (text a person approved, possibly
+ * edited — not a raw transcript), `redacted` (withheld), or `private`
+ * (output was never requested). Unreviewed output never appears here. A
+ * request that ended without exiting says whether its command had `started`
+ * (`null`: not known yet, or never, if the CLI disconnected first).
+ */
+export function presentSupervisedCommand(snapshot: PresentableSupervisedSnapshot): unknown {
+  const base = {
+    commandId: snapshot.commandId,
+    kind: "supervised" as const,
+    status: snapshot.status,
+  };
+  if (
+    snapshot.status === "awaiting_user" ||
+    snapshot.status === "running" ||
+    snapshot.status === "awaiting_output_review"
+  ) {
+    return {
+      ...base,
+      ...(snapshot.waitDeadline !== null
+        ? { waitingUntil: new Date(snapshot.waitDeadline).toISOString() }
+        : {}),
+    };
+  }
+  if (snapshot.status !== "exited" || snapshot.output === null) {
+    return {
+      ...base,
+      started: snapshot.started,
+      ...(snapshot.rejectionReason ? { rejectionReason: snapshot.rejectionReason } : {}),
+    };
+  }
+  const output = { mode: snapshot.output.mode, edited: snapshot.output.edited };
+  let stdout: CliStreamText | undefined;
+  if (snapshot.output.mode === "shared" && snapshot.shared !== null) {
+    stdout = formatBoundedStream(snapshot.shared);
+  } else if (snapshot.output.mode === "reviewed") {
+    const text = snapshot.reviewedText ?? "";
+    stdout = { text, truncated: false, totalBytes: new TextEncoder().encode(text).byteLength };
+  }
+  const record = {
+    ...base,
+    exitCode: snapshot.exitCode,
+    processSignal: snapshot.signal,
+    timedOut: false,
+    output,
+    ...(stdout !== undefined ? { stdout } : {}),
+  };
+  return stdout === undefined ? record : { ...record, ...fitWrappedOutput(record) };
 }

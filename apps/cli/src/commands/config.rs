@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, McpCommandMode};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -33,8 +33,10 @@ enum Sub {
     SetSlug { slug: String },
     /// Allow browser terminals. Takes effect the next time wsmp starts.
     SetHumanTerminal { state: Switch },
-    /// Allow MCP commands. Takes effect the next time wsmp starts.
-    SetMcpCommands { state: Switch },
+    /// Choose what MCP agents may run: `off`, `supervised` (a person confirms
+    /// each command in a browser terminal), or `unsupervised` (headless exec
+    /// too). Takes effect the next time wsmp starts.
+    SetMcpCommands { mode: McpMode },
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
 }
@@ -43,6 +45,23 @@ enum Sub {
 enum Switch {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum McpMode {
+    Off,
+    Supervised,
+    Unsupervised,
+}
+
+impl McpMode {
+    fn mode(self) -> McpCommandMode {
+        match self {
+            Self::Off => McpCommandMode::Off,
+            Self::Supervised => McpCommandMode::Supervised,
+            Self::Unsupervised => McpCommandMode::Unsupervised,
+        }
+    }
 }
 
 impl Switch {
@@ -118,10 +137,26 @@ pub fn run(args: &Args) -> Result<()> {
                 cfg.allow_human_terminal = state.enabled();
             })?;
         }
-        Sub::SetMcpCommands { state } => {
-            set_flag(args.json, "allowMcpCommands", state.enabled(), |cfg| {
-                cfg.allow_mcp_commands = state.enabled();
+        Sub::SetMcpCommands { mode } => {
+            let mode = mode.mode();
+            Config::update(false, |cfg| {
+                cfg.mcp_command_mode = mode;
+                Ok(())
             })?;
+            if args.json {
+                output::json(&SetValue {
+                    key: "mcpCommandMode",
+                    value: mode.as_str(),
+                })?;
+            } else {
+                output::line(format!("set `mcpCommandMode` to `{}`", mode.as_str()))?;
+                if mode == McpCommandMode::Supervised {
+                    output::line(
+                        "Tip: `wsmp config set-terminal-approval on` makes browsers prove an approved identity before they can confirm a command.",
+                    )?;
+                }
+                output::line("Restart wsmp to apply.")?;
+            }
         }
         Sub::SetTerminalApproval { state } => {
             set_flag(

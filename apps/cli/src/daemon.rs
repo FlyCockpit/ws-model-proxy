@@ -94,10 +94,10 @@ use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::protocol::parse_binary_frame;
 use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    ProtocolNegotiation, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-    RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage,
-    binary_frame_fault, control_frame_fault, encode_binary_frame, encode_control,
-    endpoint_inventory, parse_server_control,
+    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL,
+    RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage, binary_frame_fault,
+    control_frame_fault, encode_binary_frame, encode_control, endpoint_inventory,
+    hello_rejection_message, parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
@@ -400,8 +400,6 @@ enum RelaySessionError {
         reset_backoff: bool,
     },
     Fatal(anyhow::Error),
-    /// The server rejected the first 2.5 hello; reconnect now with 2.4.
-    ProtocolDowngrade,
     /// A shutdown signal arrived; the session has already cleaned up.
     Shutdown(i32),
 }
@@ -453,8 +451,6 @@ pub fn connect_foreground() -> Result<()> {
     // inventory on reconnect.
     let mut acknowledged_config_modified_at = None;
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
-    // Sticky for the process: at most one 2.5 -> 2.4 downgrade.
-    let mut negotiation = ProtocolNegotiation::new();
     loop {
         check_shutdown()?;
         // Reuse only a locally unchanged snapshot that the server has already
@@ -507,15 +503,7 @@ pub fn connect_foreground() -> Result<()> {
             endpoints,
             &mut control,
             &mut last_inventory_revision,
-            &mut negotiation,
         ) {
-            Err(RelaySessionError::ProtocolDowngrade) => {
-                tracing::warn!(
-                    protocol_version = negotiation.mode().version(),
-                    "relay server does not accept protocol 2.5; reconnecting with the single-viewer protocol"
-                );
-                continue;
-            }
             Ok(()) => {
                 tracing::warn!(
                     retry_delay_secs = reconnect_delay.as_secs(),
@@ -722,9 +710,7 @@ fn run_relay_session(
     endpoints: Vec<EndpointInventory>,
     _control: &mut ControlServer,
     last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
-    negotiation: &mut ProtocolNegotiation,
 ) -> RelaySessionResult<()> {
-    let mode = negotiation.mode();
     let mut request = ws_url
         .as_str()
         .into_client_request()
@@ -753,20 +739,17 @@ fn run_relay_session(
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-    let mut terminals = TerminalRegistry::new(worker_tx.clone(), mode.terminal_viewers());
+    let mut terminals = TerminalRegistry::new(worker_tx.clone(), true);
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
 
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
-        protocol_version: mode.version().to_string(),
+        protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
-            label: config
-                .cli_label
-                .clone()
-                .unwrap_or_else(|| "CLI device".to_string()),
+            hostname: crate::hostname::reported_hostname(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            capabilities: startup::hello_capabilities(startup, config, mode, cli_slug),
+            capabilities: startup::hello_capabilities(startup, config, cli_slug),
         },
         endpoints,
     };
@@ -905,7 +888,6 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
-                negotiation,
                 &mut registered,
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
@@ -1439,7 +1421,6 @@ fn handle_text<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
-    negotiation: &mut ProtocolNegotiation,
     registered: &mut bool,
 ) -> RelaySessionResult<()>
 where
@@ -1574,12 +1555,13 @@ where
             }
         }
         ServerControlMessage::ProtocolError { message, .. } => {
-            if negotiation.downgrade_on_protocol_error(*registered, &message) {
-                return Err(RelaySessionError::ProtocolDowngrade);
-            }
-            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                "relay protocol error: {message}"
-            )));
+            // Before `hello.ok`, a pre-2.6 server rejects the hello itself.
+            let text = if *registered {
+                format!("relay protocol error: {message}")
+            } else {
+                hello_rejection_message(&message)
+            };
+            return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
         }
         ServerControlMessage::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
@@ -1718,6 +1700,15 @@ where
         }
         ServerControlMessage::ExecCancel { command_id } => {
             send_outbound_frames(socket, execs.cancel(&command_id))?;
+        }
+        ServerControlMessage::TermSpawn(spawn) => {
+            send_outbound_frames(socket, terminals.spawn_supervised(startup, config, &spawn))?;
+        }
+        ServerControlMessage::SupervisedCancel {
+            command_id,
+            if_waiting,
+        } => {
+            send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
         }
     }
     Ok(())
@@ -1872,6 +1863,31 @@ where
             tracing::warn!(command_id, "closing a command after a malformed frame");
             send_outbound_frames(socket, execs.cancel(&command_id))
         }
+        FrameFault::RejectExec { command_id } => {
+            tracing::warn!(command_id, "refusing a malformed exec command request");
+            send_outbound_frames(socket, execs.reject_malformed(&command_id))
+        }
+        FrameFault::RejectSupervised { command_id } => {
+            tracing::warn!(
+                command_id,
+                "refusing a malformed supervised command request"
+            );
+            send_control(
+                socket,
+                &ClientControlMessage::SupervisedRejected {
+                    command_id,
+                    reason: "bad_command".to_string(),
+                },
+                "sending a supervised command rejection",
+            )
+        }
+        FrameFault::CancelSupervised { command_id } => {
+            tracing::warn!(
+                command_id,
+                "ending a supervised command after a malformed frame"
+            );
+            send_outbound_frames(socket, terminals.cancel_supervised(&command_id, false))
+        }
     }
 }
 
@@ -1928,6 +1944,10 @@ where
             }
             RelayBinaryFrameMetadata::ResponseBody { .. } => {
                 tracing::warn!("ignoring an unexpected relay response body");
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::SupervisedOutput { .. } => {
+                tracing::warn!("ignoring an unexpected supervised output frame");
                 Ok(())
             }
             RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
@@ -2538,6 +2558,11 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::TermWriter { .. }
         | ClientControlMessage::TermInputDropped { .. }
         | ClientControlMessage::TermExit { .. }
+        | ClientControlMessage::TermSpawned { .. }
+        | ClientControlMessage::SupervisedRejected { .. }
+        | ClientControlMessage::SupervisedAccepted { .. }
+        | ClientControlMessage::SupervisedDeclined { .. }
+        | ClientControlMessage::SupervisedDone { .. }
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }
         | ClientControlMessage::ExecDone { .. } => {

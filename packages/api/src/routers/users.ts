@@ -1,13 +1,24 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { auth } from "@ws-model-proxy/auth";
+import {
+  notifyUserDeleted,
+  notifyUserDeletionMarked,
+} from "@ws-model-proxy/auth/user-deletion-listeners";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import {
+  type DurableUserDeletionResult,
+  deleteUserDurably,
+  isPermanentParentDeletionFailure,
+  RetainedHistoryError,
+} from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
 import { renderInviteUser, sendEmail } from "@ws-model-proxy/mailer";
 import { z } from "zod";
 
 import { adminOr404Procedure } from "../index";
+import { deletionConflict } from "../lib/deletion-conflict";
 
 // Roles surfaced in the admin UI. Better-auth itself stores `role` as a free-
 // form string (and supports comma-separated lists), but the admin dashboard
@@ -43,6 +54,7 @@ const USER_SELECT = {
   banned: true,
   banReason: true,
   banExpires: true,
+  deletionRequestedAt: true,
   twoFactorEnabled: true,
   image: true,
   createdAt: true,
@@ -243,17 +255,24 @@ export const usersRouter = {
     }),
 
   unarchive: adminOr404Procedure.input(userIdInput).handler(async ({ input }) => {
+    // One conditional statement, so a deletion marked between a read and the
+    // write cannot be un-banned: the write only matches an unmarked row.
+    // (Access is refused on the marker alone anyway; see
+    // @ws-model-proxy/auth/user-deletion-access-guard.)
+    const restored = await prisma.user.updateMany({
+      where: { id: input.userId, deletionRequestedAt: null },
+      data: { banned: false, banReason: null, banExpires: null },
+    });
+    if (restored.count === 1) return { success: true };
     const target = await prisma.user.findUnique({
       where: { id: input.userId },
       select: { id: true },
     });
     if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
-
-    await prisma.user.update({
-      where: { id: input.userId },
-      data: { banned: false, banReason: null, banExpires: null },
-    });
-    return { success: true };
+    throw deletionConflict(
+      "deletion_in_progress",
+      "This account is being deleted and cannot be restored. Wait for deletion to finish or contact support.",
+    );
   }),
 
   remove: adminOr404Procedure.input(userIdInput).handler(async ({ input, context }) => {
@@ -269,27 +288,63 @@ export const usersRouter = {
     if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
 
     // Sessions, accounts, two-factors, api keys, device codes and push subs
-    // cascade. Posts (`onDelete: Restrict`) do not — if the user has authored
-    // posts the delete will fail with a Prisma constraint error and we
-    // surface a friendly message suggesting "archive" instead.
+    // cascade, and so do the user's CLI devices and CLI credentials. Retained
+    // history (`onDelete: Restrict`: capacity leases, provider accounting)
+    // does not: the delete is refused up front with a friendly message
+    // suggesting "archive" instead.
+    //
+    // The delete is durable and bounded (packages/db/src/parent-deletion.ts):
+    // a preflight refuses retained history before anything changes, then the
+    // user is marked for deletion (and banned, sessions revoked), the request
+    // history is drained in short batches, and only the capacity graph is
+    // deleted under the capacity locks (L0-L6, then the user row). If that
+    // last step fails transiently the marker stays and the user-deletion
+    // sweeper finishes it, so the response reports `pending`.
+    const label = (err: unknown) =>
+      // Constructor name only — Prisma rejections embed SQL + params.
+      err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+    let result: DurableUserDeletionResult;
     try {
-      await prisma.user.delete({ where: { id: input.userId } });
+      result = await deleteUserDurably(prisma, input.userId, {
+        onMarked: notifyUserDeletionMarked,
+        onTransientFailure: (err) =>
+          console.error(
+            `[users.remove] delete incomplete, the deletion sweeper will finish it: ${label(err)}`,
+          ),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to delete user";
-      if (/foreign key|constraint|restrict/i.test(message)) {
-        throw new ORPCError("CONFLICT", {
-          message:
-            "This user has authored content and cannot be deleted. Archive them instead, or reassign their content first.",
-        });
+      if (
+        err instanceof RetainedHistoryError ||
+        isPermanentParentDeletionFailure(err) ||
+        /foreign key|constraint|restrict/i.test(message)
+      ) {
+        throw deletionConflict(
+          "retained_history",
+          "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+        );
       }
-      // Constructor name only — Prisma rejections embed SQL + params.
-      const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
-      console.error(`[users.remove] prisma delete failed: ${errLabel}`);
+      console.error(`[users.remove] prisma delete failed: ${label(err)}`);
       throw new ORPCError("INTERNAL_SERVER_ERROR", {
         message:
           "Couldn't delete that account. Try again, or contact an admin if it keeps happening.",
       });
     }
-    return { success: true };
+    if (result === "missing") throw new ORPCError("NOT_FOUND", { message: "User not found" });
+    if (result === "pending") return { success: true, pending: true };
+    if (result === "abandoned") {
+      // A permanent refusal archived the user before this call finished.
+      throw deletionConflict(
+        "retained_history",
+        "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+      );
+    }
+    // Close the deleted user's live relay sessions, matched by the
+    // authenticated identity's userId (not a credential-id snapshot, so a
+    // credential minted just before the delete is covered). Same post-commit
+    // notification Better Auth's admin remove-user fires; in-process only
+    // (see @ws-model-proxy/auth/user-deletion-listeners).
+    await notifyUserDeleted(input.userId);
+    return { success: true, pending: false };
   }),
 };

@@ -23,7 +23,8 @@ vi.mock("@/utils/orpc", () => ({
   },
 }));
 
-import { TerminalWorkspaceProvider } from "./use-terminal-workspace";
+import type { TerminalTab } from "./use-terminal-sessions";
+import { TerminalWorkspaceProvider, terminalTabLabel } from "./use-terminal-workspace";
 
 afterEach(() => {
   cleanup();
@@ -61,5 +62,65 @@ describe("TerminalWorkspaceProvider", () => {
     // Leaving Terminals keeps the connection so open terminals survive.
     rerender(false);
     expect(sessions.enabledCalls.at(-1)).toBe(true);
+  });
+});
+
+function tab(localId: string, cliDeviceId: string): TerminalTab {
+  return {
+    localId,
+    terminalId: null,
+    cliDeviceId,
+    cols: 80,
+    rows: 24,
+    phase: "live",
+    approvalCode: null,
+    rejectionReason: null,
+    error: null,
+    multiViewer: true,
+    viewerId: null,
+    writer: "none",
+    viewerCount: 1,
+    ptyCols: null,
+    ptyRows: null,
+    opener: false,
+    origin: "user",
+    supervised: null,
+    reviewOutput: null,
+    reviewCapture: null,
+    exitCode: null,
+    exitSignal: null,
+    decline: null,
+    ending: null,
+  };
+}
+
+describe("terminalTabLabel", () => {
+  const names: Record<string, string> = { a: "desk", b: "desk", c: "laptop" };
+  const slugs: Record<string, string> = { a: "desk-a", b: "desk-b", c: "laptop" };
+  const name = (id: string) => names[id] ?? id;
+  const slug = (id: string) => slugs[id] ?? null;
+
+  it("shows just the display name when it is unique", () => {
+    const tabs = [tab("1", "a"), tab("2", "c")];
+    expect(terminalTabLabel(tabs[0] as TerminalTab, tabs, name, slug)).toBe("desk");
+    expect(terminalTabLabel(tabs[1] as TerminalTab, tabs, name, slug)).toBe("laptop");
+  });
+
+  it("appends the slug when two open CLIs share a display name", () => {
+    const tabs = [tab("1", "a"), tab("2", "b")];
+    expect(terminalTabLabel(tabs[0] as TerminalTab, tabs, name, slug)).toBe("desk · desk-a");
+    expect(terminalTabLabel(tabs[1] as TerminalTab, tabs, name, slug)).toBe("desk · desk-b");
+  });
+
+  it("numbers several tabs on one CLI without adding the slug", () => {
+    const tabs = [tab("1", "a"), tab("2", "a")];
+    expect(terminalTabLabel(tabs[0] as TerminalTab, tabs, name, slug)).toBe("desk (1)");
+    expect(terminalTabLabel(tabs[1] as TerminalTab, tabs, name, slug)).toBe("desk (2)");
+  });
+
+  it("combines the slug and numbering", () => {
+    const tabs = [tab("1", "a"), tab("2", "a"), tab("3", "b")];
+    expect(terminalTabLabel(tabs[1] as TerminalTab, tabs, name, slug)).toBe("desk · desk-a (2)");
+    expect(terminalTabLabel(tabs[2] as TerminalTab, tabs, name, slug)).toBe("desk · desk-b");
   });
 });

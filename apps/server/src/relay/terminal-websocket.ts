@@ -3,10 +3,16 @@ import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
 import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import {
+  TERMINAL_BROWSER_JSON_LIMIT,
+  TERMINAL_BROWSER_JSON_WINDOW_MS,
+  TERMINAL_BROWSER_TEXT_PENDING_LIMIT,
+} from "@ws-model-proxy/config/terminal-socket-policy";
 import prisma from "@ws-model-proxy/db";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, MiddlewareHandler } from "hono";
-import type { WSContext } from "hono/ws";
+import type { WSContext, WSEvents } from "hono/ws";
 import { z } from "zod";
 import { resolveClientIp } from "../client-ip.js";
 import { createRateLimiterMiddleware, rpcLimiter } from "../rate-limit.js";
@@ -30,14 +36,16 @@ import { settleSocketHandler } from "./socket-handler.js";
 
 const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
 const BROWSER_JSON_MAX_BYTES = 64 * 1024;
-const BROWSER_JSON_LIMIT = 20;
-const BROWSER_JSON_WINDOW_MS = 10_000;
+const BROWSER_JSON_LIMIT = TERMINAL_BROWSER_JSON_LIMIT;
+const BROWSER_JSON_WINDOW_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
 /**
  * Accepted text frames a browser may have waiting or running at once. A slow
- * database lookup must not let one socket pile up work; past this the socket
- * is closed with 1008.
+ * database lookup must not let one socket pile up work; a frame past this is
+ * answered `rate_limited` unread and the accepted ones run on. Not below the
+ * browser's per-window budget, so a conforming burst always fits
+ * (TERMINAL_BROWSER_TEXT_PENDING_LIMIT).
  */
-const BROWSER_TEXT_QUEUE_LIMIT = 8;
+const BROWSER_TEXT_QUEUE_LIMIT = TERMINAL_BROWSER_TEXT_PENDING_LIMIT;
 /** Per terminal tab. Key repeat runs at about 30 frames per second. */
 const BROWSER_BINARY_LIMIT = 300;
 /** Per terminal, across every viewer, so many tabs cannot multiply the CLI's input load. */
@@ -45,6 +53,24 @@ const TERMINAL_BINARY_LIMIT = 600;
 const BROWSER_BINARY_WINDOW_MS = 10_000;
 /** Limiter bucket for frames that do not name a terminal. */
 const INVALID_BINARY_KEY = "";
+/**
+ * A refused text frame this small is read for its `requestId` and
+ * `terminalId`, so the refusal answers that frame. Every schema-valid frame
+ * fits (the largest, an `open` with a browser identity, is under 1.5 KiB);
+ * reading it costs about as much as the error frame sent back.
+ */
+const BROWSER_JSON_ECHO_MAX_BYTES = 4096;
+
+/**
+ * Client-chosen, echoed by every answer the relay gives that frame directly
+ * (`terminals` to a list, `opening`, `attaching`, `closed`, `detached` self,
+ * a Decline's immediate `started`, and every error, including a rate-limit
+ * or validation refusal), so the browser can tell which of its frames an
+ * answer is for. Later events about a terminal (`pending`, `opened`,
+ * `attached`, `rejected`, `exit`, pushes) are not answers to one frame and
+ * carry none.
+ */
+const browserRequestIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 
 const browserIdentitySchema = z
   .object({
@@ -56,11 +82,14 @@ const browserIdentitySchema = z
   })
   .strict();
 
+const requestIdField = { requestId: browserRequestIdSchema.optional() };
+
 const browserClientMessageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("list") }).strict(),
+  z.object({ type: z.literal("list"), ...requestIdField }).strict(),
   z
     .object({
       type: z.literal("open"),
+      ...requestIdField,
       cliDeviceId: z.string().trim().min(1).max(128),
       cols: z.number().int().min(1).max(1000),
       rows: z.number().int().min(1).max(1000),
@@ -72,6 +101,7 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("auth"),
+      ...requestIdField,
       terminalId: base64Url16ByteSchema,
       signature: z.string().regex(/^[A-Za-z0-9_-]{1,512}$/),
     })
@@ -79,15 +109,48 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("attach"),
+      ...requestIdField,
       terminalId: base64Url16ByteSchema,
       publicKey: uncompressedP256PublicKeySchema,
       nonce: base64Url16ByteSchema,
       identity: browserIdentitySchema.optional(),
     })
     .strict(),
-  z.object({ type: z.literal("close"), terminalId: base64Url16ByteSchema }).strict(),
-  z.object({ type: z.literal("detach"), terminalId: base64Url16ByteSchema }).strict(),
+  z
+    .object({ type: z.literal("close"), ...requestIdField, terminalId: base64Url16ByteSchema })
+    .strict(),
+  z
+    .object({ type: z.literal("decline"), ...requestIdField, terminalId: base64Url16ByteSchema })
+    .strict(),
+  z
+    .object({ type: z.literal("detach"), ...requestIdField, terminalId: base64Url16ByteSchema })
+    .strict(),
 ]);
+
+/** What an answer to one browser frame names, so the browser can match it. */
+type FrameRef = { terminalId?: string; requestId?: string };
+
+/** The well-formed `terminalId` and `requestId` of a parsed frame, if any. */
+function frameRefOf(parsed: unknown): FrameRef {
+  if (typeof parsed !== "object" || parsed === null) return {};
+  const record = parsed as Record<string, unknown>;
+  const terminalId = base64Url16ByteSchema.safeParse(record.terminalId);
+  const requestId = browserRequestIdSchema.safeParse(record.requestId);
+  return {
+    ...(terminalId.success ? { terminalId: terminalId.data } : {}),
+    ...(requestId.success ? { requestId: requestId.data } : {}),
+  };
+}
+
+/** `frameRefOf` for a raw frame refused before parsing; bounded in size. */
+function rawFrameRef(frame: string): FrameRef {
+  if (frame.length > BROWSER_JSON_ECHO_MAX_BYTES) return {};
+  try {
+    return frameRefOf(JSON.parse(frame));
+  } catch {
+    return {};
+  }
+}
 
 export type TerminalAvailabilityReason =
   | "ok"
@@ -102,6 +165,7 @@ type TerminalErrorCode =
   | "not_found"
   | "limit"
   | "invalid"
+  | "rate_limited"
   | "input_dropped";
 
 type BrowserConn = {
@@ -109,13 +173,41 @@ type BrowserConn = {
   socket: RelaySocket;
   userId: string;
   sessionId: string;
+  /**
+   * The admin acting through an impersonation session (Better Auth
+   * `session.impersonatedBy`), or null. Revoking that admin closes this
+   * connection too.
+   */
+  impersonatedBy: string | null;
+  /**
+   * False from registration until the admission read passed
+   * ({@link admitBrowserConnection}). A pending connection is revocable like
+   * an admitted one, but no frame of it runs and nothing is pushed to it.
+   */
+  admitted: boolean;
+  /** Settles once admission ends (admitted, refused or forgotten). */
+  admission: { promise: Promise<void>; settle: () => void };
   /** Accepted text frames not yet finished. Bounded by BROWSER_TEXT_QUEUE_LIMIT. */
   pendingText: number;
 };
 
+type BrowserConnInput = {
+  socket: RelaySocket;
+  userId: string;
+  sessionId: string;
+  impersonatedBy?: string | null;
+};
+
+function admissionGate(): BrowserConn["admission"] {
+  let settle: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    settle = () => resolve();
+  });
+  return { promise, settle };
+}
+
 type CliListRow = {
   id: string;
-  label: string;
   slug: string;
   status: string;
   allowHumanTerminal: boolean;
@@ -126,7 +218,6 @@ type CliListRow = {
 
 const cliListSelect = {
   id: true,
-  label: true,
   slug: true,
   status: true,
   allowHumanTerminal: true,
@@ -207,6 +298,7 @@ function errorMessage(code: TerminalErrorCode): string {
   if (code === "offline") return "CLI is offline.";
   if (code === "limit") return "Terminal limit reached.";
   if (code === "input_dropped") return "Terminal input was dropped.";
+  if (code === "rate_limited") return "Too many terminal messages; try again shortly.";
   return "Invalid terminal message.";
 }
 
@@ -239,11 +331,93 @@ export class TerminalBrowserHub {
   private textChain = new Map<RelaySocket, Promise<void>>();
   /** `${connId}\0${terminalId}` while input is being dropped, so the browser hears about it once. */
   private dropNotified = new Set<string>();
+  /** Users whose pushed terminal list is already queued for this tick. */
+  private pushQueued = new Set<string>();
 
-  accept(input: { socket: RelaySocket; userId: string; sessionId: string }) {
-    const conn: BrowserConn = { id: randomUUID(), pendingText: 0, ...input };
+  /**
+   * Closes every browser terminal socket, pending or admitted, that acts as
+   * the user: its own sessions and sessions an admin impersonates through.
+   * Called from the deletion listeners after the mark (or delete) committed.
+   *
+   * No in-process revocation state is kept. A handshake that authenticated
+   * before the mark is either registered already (pending, so this closes
+   * it) or registers later, and then its admission read, issued after
+   * registration and so after this listener ran after the commit, sees the
+   * marker or the missing session ({@link admitBrowserConnection}).
+   */
+  revokeTerminalAccessForUser(userId: string) {
+    for (const conn of [...this.bySocket.values()]) {
+      if (conn.userId !== userId && conn.impersonatedBy !== userId) continue;
+      this.detachAll(conn);
+      if (conn.socket.readyState === 1) conn.socket.close(4401, "user_deletion_pending");
+      this.forgetConn(conn);
+    }
+  }
+
+  /**
+   * Registers a socket in the pending admission state. Synchronous, before any
+   * database read, so a revocation that runs from here on finds it. Text
+   * frames received while pending queue behind admission (same rate, size and
+   * queue limits) and run in order once admitted.
+   */
+  register(input: BrowserConnInput): BrowserConn {
+    const conn: BrowserConn = {
+      id: randomUUID(),
+      socket: input.socket,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      impersonatedBy: input.impersonatedBy ?? null,
+      admitted: false,
+      admission: admissionGate(),
+      pendingText: 0,
+    };
+    const previous = this.bySocket.get(input.socket);
+    if (previous) this.forgetConn(previous);
     this.bySocket.set(input.socket, conn);
     this.byId.set(conn.id, conn);
+    this.textChain.set(input.socket, conn.admission.promise);
+    return conn;
+  }
+
+  /**
+   * Promotes a pending connection. Only the same registration (object
+   * identity: not revoked, closed or replaced meanwhile) of a still-open
+   * socket is admitted; otherwise the connection is forgotten and false is
+   * returned.
+   */
+  admit(conn: BrowserConn): boolean {
+    if (this.bySocket.get(conn.socket) !== conn) {
+      conn.admission.settle();
+      return false;
+    }
+    if (conn.socket.readyState !== 1) {
+      this.forgetConn(conn);
+      return false;
+    }
+    conn.admitted = true;
+    conn.admission.settle();
+    return true;
+  }
+
+  /** Ends a pending (or admitted) connection: closes the socket and forgets it. */
+  refuse(conn: BrowserConn, code: number, reason: string) {
+    const current = this.bySocket.get(conn.socket);
+    if (current === conn) {
+      this.detachAll(conn);
+      this.forgetConn(conn);
+    }
+    conn.admission.settle();
+    // A newer registration of the same socket is not this refusal's to close.
+    if (current !== undefined && current !== conn) return;
+    if (conn.socket.readyState === 1) conn.socket.close(code, reason);
+  }
+
+  /**
+   * Registers an already-admitted connection without an admission read. For
+   * tests; production sockets go through {@link admitBrowserConnection}.
+   */
+  accept(input: BrowserConnInput) {
+    this.admit(this.register(input));
   }
 
   /**
@@ -252,19 +426,26 @@ export class TerminalBrowserHub {
    */
   handleText(socket: RelaySocket, frame: string): Promise<void> {
     const conn = this.bySocket.get(socket);
+    // Registered synchronously on open and forgotten on close, so an unknown
+    // socket is one that already closed.
     if (!conn) return Promise.resolve();
+    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
+      // Refused unread, like a rate-limited frame, and answered so the
+      // browser can send it again. The frames already accepted keep running;
+      // the socket stays open. Checked before the rate window so a refused
+      // frame does not use up a slot.
+      this.sendError(conn, "rate_limited", rawFrameRef(frame));
+      return Promise.resolve();
+    }
     if (!this.allowJson(conn)) {
-      this.sendError(conn, "invalid");
+      // Answer the refused frame itself: a Decline refused here must reach a
+      // state the person can retry, and an open must not shift the browser's
+      // matching of later `opening` answers.
+      this.sendError(conn, "rate_limited", rawFrameRef(frame));
       return Promise.resolve();
     }
     if (utf8ByteLengthExceeds(frame, BROWSER_JSON_MAX_BYTES)) {
       this.sendError(conn, "invalid");
-      return Promise.resolve();
-    }
-    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
-      this.detachAll(conn);
-      if (conn.socket.readyState === 1) conn.socket.close(1008, "too_many_pending");
-      this.forgetConn(conn);
       return Promise.resolve();
     }
     conn.pendingText += 1;
@@ -335,15 +516,21 @@ export class TerminalBrowserHub {
     for (const key of this.dropNotified) {
       if (key.startsWith(`${conn.id}\0`)) this.dropNotified.delete(key);
     }
-    this.textChain.delete(conn.socket);
-    this.bySocket.delete(conn.socket);
+    // A socket-keyed entry may already belong to a newer registration.
+    if (this.bySocket.get(conn.socket) === conn) {
+      this.bySocket.delete(conn.socket);
+      this.textChain.delete(conn.socket);
+    }
     this.byId.delete(conn.id);
+    // Frames queued behind a pending admission run now and no-op.
+    conn.admission.settle();
   }
 
   /** Frames already passed the rate and size checks in `handleText`. */
   private async handleTextExclusive(conn: BrowserConn, frame: string) {
-    // The socket may have closed while this frame waited its turn.
-    if (this.bySocket.get(conn.socket) !== conn) return;
+    // The socket may have closed, or been refused admission, while this frame
+    // waited its turn.
+    if (this.bySocket.get(conn.socket) !== conn || !conn.admitted) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(frame);
@@ -353,46 +540,114 @@ export class TerminalBrowserHub {
     }
     const message = browserClientMessageSchema.safeParse(parsed);
     if (!message.success) {
-      this.sendError(conn, "invalid");
+      this.sendError(conn, "invalid", frameRefOf(parsed));
       return;
     }
-    if (message.data.type === "list") {
-      await this.sendTerminalList(conn);
+    const ref: FrameRef = {
+      ...("terminalId" in message.data ? { terminalId: message.data.terminalId } : {}),
+      ...(message.data.requestId ? { requestId: message.data.requestId } : {}),
+    };
+    try {
+      await this.dispatchText(conn, message.data, ref);
+    } catch (error) {
+      // Every parsed frame gets an answer, also when handling it failed.
+      this.sendError(conn, "invalid", ref);
+      throw error;
+    }
+  }
+
+  private async dispatchText(
+    conn: BrowserConn,
+    data: z.infer<typeof browserClientMessageSchema>,
+    ref: FrameRef,
+  ) {
+    if (data.type === "list") {
+      await this.sendTerminalList(conn, false, ref.requestId);
       return;
     }
-    if (message.data.type === "open") {
+    if (data.type === "open") {
       const terminalId = this.allocateTerminalId();
       // A new terminal has no viewers yet, so a fresh id cannot collide.
       const viewerId = randomBytes(16).toString("base64url");
-      this.send(conn, { type: "opening", terminalId, viewerId });
-      await this.openTerminal(conn, message.data, terminalId, viewerId);
+      // From here on the terminal id names this open too.
+      ref.terminalId = terminalId;
+      this.send(conn, {
+        type: "opening",
+        terminalId,
+        viewerId,
+        ...(ref.requestId ? { requestId: ref.requestId } : {}),
+      });
+      await this.openTerminal(conn, data, terminalId, viewerId, ref);
       return;
     }
-    if (message.data.type === "auth") {
-      this.forwardAuth(conn, message.data.terminalId, message.data.signature);
+    if (data.type === "auth") {
+      this.forwardAuth(conn, data.terminalId, data.signature, ref);
       return;
     }
-    if (message.data.type === "attach") {
-      this.attachTerminal(conn, message.data);
+    if (data.type === "attach") {
+      this.attachTerminal(conn, data, ref);
       return;
     }
-    if (message.data.type === "close") {
-      if (!relaySessionManager.closeTerminalFromBrowser(message.data.terminalId, conn.userId)) {
-        this.sendError(conn, "not_found", message.data.terminalId);
+    if (data.type === "close") {
+      // End session: ends the terminal for everyone, whatever runs in it.
+      if (!relaySessionManager.closeTerminalFromBrowser(data.terminalId, conn.userId)) {
+        this.sendError(conn, "not_found", ref);
+        return;
+      }
+      // The terminal is gone from the relay now (a later list omits it), so
+      // the browser can stop re-sending this close.
+      this.send(conn, {
+        type: "closed",
+        terminalId: data.terminalId,
+        ...(ref.requestId ? { requestId: ref.requestId } : {}),
+      });
+      return;
+    }
+    if (data.type === "decline") {
+      // Decline an agent request: never ends a command whose Enter came first.
+      const terminalId = data.terminalId;
+      const answer = relaySessionManager.declineTerminalFromBrowser(
+        terminalId,
+        conn.userId,
+        conn.id,
+      );
+      // Every answer names this Decline (`requestId`). `requested` is
+      // answered later, to every socket whose Decline is out: the exit, or a
+      // `decline` event saying the command started.
+      if (answer === "started") {
+        this.send(conn, {
+          type: "decline",
+          terminalId,
+          outcome: "started",
+          ...(ref.requestId ? { requestId: ref.requestId } : {}),
+        });
+      } else if (answer !== "requested") {
+        this.sendError(conn, answer, ref);
       }
       return;
     }
     // Stop viewing (X button). `close` above ends the session for everyone.
-    if (!relaySessionManager.detachTerminalViewer(message.data.terminalId, conn.userId, conn.id)) {
-      this.sendError(conn, "not_found", message.data.terminalId);
+    if (!relaySessionManager.detachTerminalViewer(data.terminalId, conn.userId, conn.id)) {
+      this.sendError(conn, "not_found", ref);
       return;
     }
-    this.send(conn, { type: "detached", terminalId: message.data.terminalId, reason: "self" });
+    this.send(conn, {
+      type: "detached",
+      terminalId: data.terminalId,
+      reason: "self",
+      ...(ref.requestId ? { requestId: ref.requestId } : {}),
+    });
   }
 
   handleBinary(socket: RelaySocket, frame: ArrayBuffer) {
     const conn = this.bySocket.get(socket);
     if (!conn) return;
+    if (!conn.admitted) {
+      // Terminal input needs an attached terminal, which needs an admitted
+      // socket. Refused loudly, never dropped silently.
+      this.refuse(conn, 1008, "not_admitted");
+      return;
+    }
     let parsed: ReturnType<typeof parseRelayBinaryFrame>;
     try {
       parsed = parseRelayBinaryFrame(frame);
@@ -479,12 +734,28 @@ export class TerminalBrowserHub {
       let row: {
         expiresAt: Date;
         userId: string;
-        user: { twoFactorEnabled: boolean | null } | null;
+        user: {
+          twoFactorEnabled: boolean | null;
+          deletionRequestedAt: Date | null;
+          banned: boolean | null;
+          banExpires: Date | null;
+        } | null;
       } | null = null;
       try {
         row = await prisma.session.findUnique({
           where: { id: conn.sessionId },
-          select: { expiresAt: true, userId: true, user: { select: { twoFactorEnabled: true } } },
+          select: {
+            expiresAt: true,
+            userId: true,
+            user: {
+              select: {
+                twoFactorEnabled: true,
+                deletionRequestedAt: true,
+                banned: true,
+                banExpires: true,
+              },
+            },
+          },
         });
       } catch (error) {
         console.error("[terminal] session recheck failed", errorKind(error));
@@ -492,6 +763,10 @@ export class TerminalBrowserHub {
       }
       if (!row || row.userId !== conn.userId || row.expiresAt.getTime() <= now) {
         this.expire(conn);
+        continue;
+      }
+      if (row.user && userCredentialAccessBlocked(row.user, new Date(now))) {
+        this.expire(conn, "user_deletion_pending");
         continue;
       }
       if (twoFactorRequired === true && !row.user?.twoFactorEnabled) {
@@ -505,6 +780,10 @@ export class TerminalBrowserHub {
       this.forwardSealedToViewers(event);
       return;
     }
+    if (event.type === "list_changed") {
+      this.pushTerminalLists(event.userId);
+      return;
+    }
     if (event.type === "exit") {
       this.terminalBinaryAt.delete(event.terminalId);
       for (const connId of event.connIds) {
@@ -515,7 +794,18 @@ export class TerminalBrowserHub {
           terminalId: event.terminalId,
           ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
           ...(event.signal !== undefined ? { signal: event.signal } : {}),
+          ...(event.supervisedStatus !== undefined
+            ? { supervisedStatus: event.supervisedStatus }
+            : {}),
         });
+      }
+      return;
+    }
+    if (event.type === "decline") {
+      for (const connId of event.connIds) {
+        const conn = this.byId.get(connId);
+        if (!conn) continue;
+        this.send(conn, { type: "decline", terminalId: event.terminalId, outcome: event.outcome });
       }
       return;
     }
@@ -599,20 +889,40 @@ export class TerminalBrowserHub {
     }
   }
 
-  private async sendTerminalList(conn: BrowserConn) {
+  /**
+   * Supervised requests appear, change, and end without a browser asking.
+   * Every open socket of that user gets a fresh list, marked `pushed`. The
+   * list is a full snapshot as of its arrival.
+   */
+  private pushTerminalLists(userId: string) {
+    // Several changes in one tick (accept, then list) make one push.
+    if (this.pushQueued.has(userId)) return;
+    this.pushQueued.add(userId);
+    queueMicrotask(() => {
+      this.pushQueued.delete(userId);
+      for (const conn of [...this.bySocket.values()]) {
+        if (conn.userId !== userId || !this.isLive(conn)) continue;
+        settleSocketHandler("terminal list push", this.sendTerminalList(conn, true));
+      }
+    });
+  }
+
+  private async sendTerminalList(conn: BrowserConn, pushed = false, requestId?: string) {
     const rows = await prisma.cliDevice.findMany({
       where: { userId: conn.userId },
       orderBy: { createdAt: "asc" },
       select: cliListSelect,
     });
+    if (pushed && !this.isLive(conn)) return;
     const live = relaySessionManager.getLiveCliFeatures(rows.map((row) => row.id));
     this.send(conn, {
       type: "terminals",
+      ...(pushed ? { pushed: true } : {}),
+      ...(requestId ? { requestId } : {}),
       clis: rows.map((row) => {
         const availability = availabilityFor(row, live.get(row.id) ?? null);
         return {
           cliDeviceId: row.id,
-          label: row.label,
           slug: row.slug,
           available: availability.available,
           publicKey: availability.publicKey,
@@ -636,14 +946,14 @@ export class TerminalBrowserHub {
     return randomBytes(16).toString("base64url");
   }
 
-  private forwardAuth(conn: BrowserConn, terminalId: string, signature: string) {
+  private forwardAuth(conn: BrowserConn, terminalId: string, signature: string, ref: FrameRef) {
     const result = relaySessionManager.forwardTerminalAuth(
       terminalId,
       conn.userId,
       conn.id,
       signature,
     );
-    if (result === "not_found") this.sendError(conn, "not_found", terminalId);
+    if (result === "not_found") this.sendError(conn, "not_found", ref);
   }
 
   private async openTerminal(
@@ -651,19 +961,21 @@ export class TerminalBrowserHub {
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
     terminalId: string,
     viewerId: string,
+    /** Names the frame and, since `opening`, the terminal made for it. */
+    ref: FrameRef,
   ) {
     const row = await this.ownedDevice(conn.userId, message.cliDeviceId);
     // The browser may have gone while the lookup ran. Starting now would leave
     // a shell with a phantom viewer holding a terminal slot.
     if (!this.isLive(conn)) return;
     if (!row) {
-      this.sendError(conn, "not_found", terminalId);
+      this.sendError(conn, "not_found", ref);
       return;
     }
     const live = relaySessionManager.getLiveCliFeatures([row.id]).get(row.id) ?? null;
     const availability = availabilityFor(row, live);
     if (!availability.available) {
-      this.sendError(conn, availability.reason, terminalId);
+      this.sendError(conn, availability.reason, ref);
       return;
     }
     const approvalRequired = live?.terminalApproval === true;
@@ -672,14 +984,13 @@ export class TerminalBrowserHub {
       !approvalRequired &&
       (counts.user >= TERMINAL_USER_LIMIT || counts.cli >= TERMINAL_CLI_LIMIT)
     ) {
-      this.sendError(conn, "limit", terminalId);
+      this.sendError(conn, "limit", ref);
       return;
     }
     const started = relaySessionManager.startTerminal({
       terminalId,
       userId: conn.userId,
       cliDeviceId: row.id,
-      label: row.label,
       cols: message.cols,
       rows: message.rows,
       browserPublicKey: message.publicKey,
@@ -688,12 +999,13 @@ export class TerminalBrowserHub {
       connId: conn.id,
       viewerId,
     });
-    if (!started) this.sendError(conn, "offline", terminalId);
+    if (!started) this.sendError(conn, "offline", ref);
   }
 
   private attachTerminal(
     conn: BrowserConn,
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "attach" }>,
+    ref: FrameRef,
   ) {
     if (!this.isLive(conn)) return;
     const result = relaySessionManager.attachTerminal({
@@ -705,13 +1017,14 @@ export class TerminalBrowserHub {
       ...(message.identity ? { identity: message.identity } : {}),
     });
     if (!result.ok) {
-      this.sendError(conn, result.error === "limit" ? "limit" : "not_found", message.terminalId);
+      this.sendError(conn, result.error === "limit" ? "limit" : "not_found", ref);
       return;
     }
     this.send(conn, {
       type: "attaching",
       terminalId: message.terminalId,
       viewerId: result.viewerId,
+      ...(ref.requestId ? { requestId: ref.requestId } : {}),
     });
   }
 
@@ -726,26 +1039,28 @@ export class TerminalBrowserHub {
     relaySessionManager.releaseBrowserViewer(conn.userId, conn.id);
   }
 
-  /** Still registered and open, so terminal work on its behalf may proceed. */
+  /** Admitted, still registered and open, so terminal work on its behalf may proceed. */
   private isLive(conn: BrowserConn): boolean {
-    return this.bySocket.get(conn.socket) === conn && conn.socket.readyState === 1;
+    return conn.admitted && this.bySocket.get(conn.socket) === conn && conn.socket.readyState === 1;
   }
 
   private expire(
     conn: BrowserConn,
-    reason: "session_expired" | "two_factor_required" = "session_expired",
+    reason: "session_expired" | "two_factor_required" | "user_deletion_pending" = "session_expired",
   ) {
     this.detachAll(conn);
     if (conn.socket.readyState === 1) conn.socket.close(4401, reason);
     this.forgetConn(conn);
   }
 
-  private sendError(conn: BrowserConn, code: TerminalErrorCode, terminalId?: string) {
+  private sendError(conn: BrowserConn, code: TerminalErrorCode, target?: string | FrameRef) {
+    const ref = typeof target === "string" ? { terminalId: target } : (target ?? {});
     this.send(conn, {
       type: "error",
       code,
       message: errorMessage(code),
-      ...(terminalId ? { terminalId } : {}),
+      ...(ref.terminalId ? { terminalId: ref.terminalId } : {}),
+      ...(ref.requestId ? { requestId: ref.requestId } : {}),
     });
   }
 
@@ -761,6 +1076,56 @@ registerTerminalBridge({
     terminalBrowserHub.onTerminalEvent(event);
   },
 });
+
+/**
+ * Registers a browser terminal socket, then admits it after one read of its
+ * session and owner.
+ *
+ * Order (DEL-STATE): `register` runs synchronously, before the read. The
+ * deletion mark deletes the user's sessions (and the sessions it impersonates
+ * through) in the transaction that sets the marker, and its listener runs
+ * after that commit. So either the read's snapshot includes the mark (the
+ * session is gone or the owner is marked: refused here), or the mark committed
+ * after the read began, hence after registration, and the listener finds and
+ * closes the pending connection. No in-process revocation state is needed.
+ *
+ * Fails closed: a missing or foreign or expired session, a missing user row, a
+ * deletion marker or an active ban close the socket (4401), and a read error
+ * closes it (1011) before rethrowing for the caller's log. A socket that
+ * closed or was revoked during the read is never registered.
+ */
+export async function admitBrowserConnection(input: BrowserConnInput): Promise<void> {
+  const conn = terminalBrowserHub.register(input);
+  let row: {
+    userId: string;
+    expiresAt: Date;
+    user: { deletionRequestedAt: Date | null; banned: boolean | null; banExpires: Date | null };
+  } | null;
+  try {
+    row = await prisma.session.findUnique({
+      where: { id: input.sessionId },
+      select: {
+        userId: true,
+        expiresAt: true,
+        user: { select: { deletionRequestedAt: true, banned: true, banExpires: true } },
+      },
+    });
+  } catch (error) {
+    terminalBrowserHub.refuse(conn, 1011, "admission_failed");
+    throw error;
+  }
+  const now = new Date();
+  if (!row || row.userId !== input.userId || row.expiresAt.getTime() <= now.getTime()) {
+    terminalBrowserHub.refuse(conn, 4401, "session_expired");
+    return;
+  }
+  // `user` is a required relation; a vanished row still refuses.
+  if (!row.user || userCredentialAccessBlocked(row.user, now)) {
+    terminalBrowserHub.refuse(conn, 4401, "user_deletion_pending");
+    return;
+  }
+  terminalBrowserHub.admit(conn);
+}
 
 type TerminalWsContext = WSContext<WebSocketLike>;
 const browserSockets = new WeakMap<TerminalWsContext, RelaySocket>();
@@ -835,41 +1200,55 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
   };
 }
 
-export function terminalUpgradeHandler() {
-  return upgradeWebSocket((c: Context<{ Variables: TerminalVariables }>) => {
-    const session = c.get("session");
-    return {
-      onOpen(_event, ws) {
-        if (!session?.user?.id || !session.session?.id) {
-          ws.close(4401, "session_expired");
-          return;
-        }
-        terminalBrowserHub.accept({
-          socket: browserSocketFor(ws),
+/**
+ * The socket events of one upgraded browser terminal connection, for the
+ * session the middleware authenticated. Exported for the wiring tests.
+ */
+export function terminalSocketEvents(session: Session | null): WSEvents<WebSocketLike> {
+  return {
+    onOpen(_event, ws) {
+      if (!session?.user?.id || !session.session?.id) {
+        ws.close(4401, "session_expired");
+        return;
+      }
+      const socket = browserSocketFor(ws);
+      // Registers synchronously (pending), before this handler returns and
+      // before any frame of the socket is handled.
+      settleSocketHandler(
+        "browser admit",
+        admitBrowserConnection({
+          socket,
           userId: session.user.id,
           sessionId: session.session.id,
-        });
-      },
-      onMessage(event, ws) {
-        const socket = browserSocketFor(ws);
-        if (typeof event.data === "string") {
-          settleSocketHandler("browser text", terminalBrowserHub.handleText(socket, event.data));
-          return;
-        }
-        if (event.data instanceof ArrayBuffer) {
-          terminalBrowserHub.handleBinary(socket, event.data);
-        }
-      },
-      onClose(_event, ws) {
-        const socket = browserSocketFor(ws);
-        terminalBrowserHub.handleClose(socket);
-        browserSockets.delete(ws);
-      },
-      onError(_event, ws) {
-        const socket = browserSocketFor(ws);
-        terminalBrowserHub.handleClose(socket);
-        browserSockets.delete(ws);
-      },
-    };
-  });
+          impersonatedBy: session.session.impersonatedBy ?? null,
+        }),
+      );
+    },
+    onMessage(event, ws) {
+      const socket = browserSocketFor(ws);
+      if (typeof event.data === "string") {
+        settleSocketHandler("browser text", terminalBrowserHub.handleText(socket, event.data));
+        return;
+      }
+      if (event.data instanceof ArrayBuffer) {
+        terminalBrowserHub.handleBinary(socket, event.data);
+      }
+    },
+    onClose(_event, ws) {
+      const socket = browserSocketFor(ws);
+      terminalBrowserHub.handleClose(socket);
+      browserSockets.delete(ws);
+    },
+    onError(_event, ws) {
+      const socket = browserSocketFor(ws);
+      terminalBrowserHub.handleClose(socket);
+      browserSockets.delete(ws);
+    },
+  };
+}
+
+export function terminalUpgradeHandler() {
+  return upgradeWebSocket((c: Context<{ Variables: TerminalVariables }>) =>
+    terminalSocketEvents(c.get("session")),
+  );
 }

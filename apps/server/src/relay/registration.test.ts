@@ -2,6 +2,10 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { BETTER_AUTH_SECRET: "test-better-auth-secret" },
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
@@ -18,7 +22,7 @@ const db = prisma as unknown as {
   $executeRaw: MockInstance;
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance };
-  cliToken: { update: MockInstance };
+  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -27,7 +31,12 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   poolMember: { updateMany: MockInstance };
-  executionTarget: { findMany: MockInstance; upsert: MockInstance; updateMany: MockInstance };
+  executionTarget: {
+    findMany: MockInstance;
+    findUnique: MockInstance;
+    create: MockInstance;
+    updateMany: MockInstance;
+  };
   inferenceCapacity: {
     findMany: MockInstance;
     findUnique: MockInstance;
@@ -130,6 +139,13 @@ describe("capability override origin", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    // An unbound CLI token: every hello's conditional bind claims it.
+    db.cliToken.findUnique.mockResolvedValue({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ id: "user-id", slug: "owner" });
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",
@@ -150,7 +166,7 @@ describe("capability override origin", () => {
     db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
     db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: "capacity-id",
     });
@@ -160,6 +176,149 @@ describe("capability override origin", () => {
     db.inferenceCapacity.findUnique.mockResolvedValue(null);
     db.inferenceCapacity.updateMany.mockResolvedValue({ count: 0 });
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "ensured-capacity" });
+  });
+
+  it("stores the hello's reported hostname and never writes the user-owned name", async () => {
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: [],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      connection: true,
+      reported: {
+        cliVersion: "1.0.0",
+        relayProtocolVersion: "2.6",
+        reportedHumanTerminal: null,
+        reportedMcpCommandMode: null,
+        reportedTerminalApproval: null,
+        reportedTerminalSupported: null,
+        reportedHostname: "desk-01.local",
+        featuresReportedAt: null,
+      },
+      now,
+    });
+
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as {
+      update: Record<string, unknown>;
+      create: Record<string, unknown>;
+    };
+    expect(call.update.reportedHostname).toBe("desk-01.local");
+    expect(call.create.reportedHostname).toBe("desk-01.local");
+    for (const data of [call.update, call.create]) {
+      expect(data).not.toHaveProperty("name");
+      expect(data).not.toHaveProperty("label");
+    }
+  });
+
+  it("refuses registration while the credential owner is marked for deletion", async () => {
+    db.user.findUnique.mockResolvedValue({
+      id: "user-id",
+      slug: "owner",
+      banned: true,
+      deletionRequestedAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    await expect(
+      persistRelayRegistration({
+        identity,
+        cli: { slug: "desktop" },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        now,
+      }),
+    ).rejects.toMatchObject({ code: "access_denied" });
+  });
+
+  it("refuses to register a revoked or expired credential", async () => {
+    const register = () =>
+      persistRelayRegistration({
+        identity,
+        cli: { slug: "desktop" },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        now,
+      });
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: now,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    await expect(register()).rejects.toMatchObject({
+      name: "RelayRegistrationError",
+      code: "access_denied",
+    });
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: now,
+      cliDeviceId: null,
+    });
+    await expect(register()).rejects.toMatchObject({ code: "access_denied" });
+    // Checked inside the registration transaction, after the device upsert.
+    expect(db.cliToken.findUnique).toHaveBeenCalledWith({
+      where: { id: "token-id" },
+      select: { revokedAt: true, expiresAt: true, cliDeviceId: true },
+    });
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("registers a device credential only as the device it was minted for", async () => {
+    const credentials = prisma as unknown as {
+      cliDeviceCredential: { findUnique: MockInstance; update: MockInstance };
+    };
+    const deviceIdentity: CliWebsocketIdentity = {
+      kind: "deviceCredential",
+      id: "credential-id",
+      userId: "user-id",
+      cliDeviceId: "minted-device-id",
+      lookupPrefix: "wsmp_device_prefix",
+    };
+    const register = (slug: string) =>
+      persistRelayRegistration({
+        identity: deviceIdentity,
+        cli: { slug },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        connection: true,
+        now,
+      });
+
+    // The hello names another slug (or the minted device was deleted and the
+    // upsert recreated a row): the device ids differ, so it is refused and the
+    // transaction (with the upserted row) rolls back.
+    credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "minted-device-id",
+    });
+    await expect(register("someone-else")).rejects.toMatchObject({
+      code: "access_denied",
+      message: "Credential is bound to a different CLI device.",
+    });
+    // Deleted together with its device.
+    credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce(null);
+    await expect(register("desktop")).rejects.toMatchObject({
+      code: "access_denied",
+      message: "Credential was revoked.",
+    });
+    // Never rebound to whatever device the hello names.
+    expect(credentials.cliDeviceCredential.update).not.toHaveBeenCalled();
+  });
+
+  it("leaves the reported hostname alone on inventory updates", async () => {
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: [],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as { update: Record<string, unknown> };
+    expect(call.update).not.toHaveProperty("reportedHostname");
+    expect(call.update).not.toHaveProperty("name");
   });
 
   it("treats only dashboard origin as protected", () => {
@@ -185,7 +344,7 @@ describe("capability override origin", () => {
     ]);
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -219,6 +378,53 @@ describe("capability override origin", () => {
     });
   });
 
+  it("locks existing inventory targets (L2) before inventory writes and capacity rows (L5) before capacity writes", async () => {
+    // DL-1 capacity lock order: the device row (L0), then every existing
+    // target of this inventory, sorted, before any endpoint/model/target
+    // write; then the capacity rows it may write, sorted, before the first
+    // capacity write. No capacity write precedes a target lock.
+    db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: "capacity-id",
+    });
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints({ modelOverride: false }),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const sql = (index: number) =>
+      ((db.$queryRaw.mock.calls[index]?.[0] as TemplateStringsArray | undefined) ?? []).join("?");
+    const order = (fragment: string) => {
+      const index = db.$queryRaw.mock.calls.findIndex((_, call) => sql(call).includes(fragment));
+      return db.$queryRaw.mock.invocationCallOrder[index] ?? Number.NaN;
+    };
+    const targetLock = order("FROM execution_target WHERE id = ? FOR NO KEY UPDATE");
+    const capacityLock = order("FROM inference_capacity WHERE id IN (");
+    const firstOf = (mock: MockInstance) => mock.mock.invocationCallOrder[0] ?? Number.NaN;
+    expect(firstOf(db.cliDevice.upsert)).toBeLessThan(targetLock);
+    expect(targetLock).toBeLessThan(firstOf(db.endpoint.upsert));
+    expect(targetLock).toBeLessThan(firstOf(db.discoveredModel.upsert));
+    expect(capacityLock).toBeGreaterThan(firstOf(db.discoveredModel.upsert));
+    expect(capacityLock).toBeLessThan(firstOf(db.inferenceCapacity.updateMany));
+    // The L2 set is the inventory's existing targets on this device only.
+    expect(db.executionTarget.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: "user-id",
+        DiscoveredModel: {
+          is: {
+            Endpoint: { cliDeviceId: "cli-device-id" },
+            OR: [{ Endpoint: { slug: "local-openai" }, upstreamModelId: { in: ["llava/local"] } }],
+          },
+        },
+      },
+      select: { id: true },
+    });
+  });
+
   it("retries a raw policy-lock deadlock and then persists the registration", async () => {
     db.$queryRaw.mockRejectedValueOnce({ code: "P2010", meta: { code: "40P01" } });
     const [endpoint] = inventoryEndpoints({ modelOverride: false });
@@ -227,7 +433,7 @@ describe("capability override origin", () => {
     await expect(
       persistRelayRegistration({
         identity,
-        cli: { slug: "desktop", label: "Desktop" },
+        cli: { slug: "desktop" },
         endpoints: [
           {
             ...endpoint,
@@ -265,7 +471,7 @@ describe("capability override origin", () => {
     ]);
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -324,7 +530,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -366,7 +572,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -383,16 +589,13 @@ describe("capability override origin", () => {
         }),
       }),
     );
-    expect(db.executionTarget.upsert).toHaveBeenCalledWith({
+    // Target identity is immutable: an existing target is read, never
+    // upserted with a SET of the key column "userId" (DL-1).
+    expect(db.executionTarget.findUnique).toHaveBeenCalledWith({
       where: { discoveredModelId: "model-id" },
-      update: { userId: "user-id", kind: "DISCOVERED_MODEL" },
-      create: {
-        userId: "user-id",
-        kind: "DISCOVERED_MODEL",
-        discoveredModelId: "model-id",
-      },
       select: { id: true, inferenceCapacityId: true },
     });
+    expect(db.executionTarget.create).not.toHaveBeenCalled();
   });
 
   it("preserves a dashboard-authored override when the CLI inherits", async () => {
@@ -402,7 +605,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: false }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -426,7 +629,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: false }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -449,7 +652,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: true }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -480,7 +683,7 @@ describe("capability override origin", () => {
     ]);
     const result = await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -491,7 +694,7 @@ describe("capability override origin", () => {
   });
 
   it("creates one discovered capacity, stores its id, and seeds declared context", async () => {
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: null,
     });
@@ -513,7 +716,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -572,7 +775,7 @@ describe("capability override origin", () => {
   });
 
   it("stores the CLI-reported concurrency when the registration payload has one", async () => {
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: null,
     });
@@ -580,7 +783,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -614,14 +817,14 @@ describe("capability override origin", () => {
   });
 
   it("does not create another capacity when the same model registers again", async () => {
-    db.executionTarget.upsert
+    db.executionTarget.findUnique
       .mockResolvedValueOnce({ id: "execution-target-id", inferenceCapacityId: null })
       .mockResolvedValueOnce({ id: "execution-target-id", inferenceCapacityId: "new-capacity" });
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "new-capacity" });
 
     const registration = {
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -635,7 +838,7 @@ describe("capability override origin", () => {
   });
 
   it("keeps an execution target capacity that is already attached", async () => {
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: "kept-capacity",
     });
@@ -656,7 +859,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -695,7 +898,7 @@ describe("capability override origin", () => {
   function preAttachedRegistration(concurrencyLimit?: number) {
     return {
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -731,7 +934,7 @@ describe("capability override origin", () => {
       runtimeIdentityKey: "execution-target:execution-target-id",
       hardConcurrencyLimit: null as number | null,
     };
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: row.id,
     });
@@ -766,7 +969,7 @@ describe("capability override origin", () => {
       runtimeIdentityKey: "discovered-model:model-id",
       hardConcurrencyLimit: null as number | null,
     };
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: row.id,
     });
@@ -787,7 +990,7 @@ describe("capability override origin", () => {
       runtimeIdentityKey: "execution-target:execution-target-id",
       hardConcurrencyLimit: 4,
     };
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: row.id,
     });
@@ -819,7 +1022,7 @@ describe("capability override origin", () => {
         hardConcurrencyLimit: userLimit as number | null,
         hardConcurrencyLimitSource: "USER" as "AUTO" | "USER",
       };
-      db.executionTarget.upsert.mockResolvedValue({
+      db.executionTarget.findUnique.mockResolvedValue({
         id: "execution-target-id",
         inferenceCapacityId: row.id,
       });
@@ -842,7 +1045,7 @@ describe("capability override origin", () => {
       runtimeIdentityKey: "execution-target:other-target",
       hardConcurrencyLimit: null as number | null,
     };
-    db.executionTarget.upsert.mockResolvedValue({
+    db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: row.id,
     });

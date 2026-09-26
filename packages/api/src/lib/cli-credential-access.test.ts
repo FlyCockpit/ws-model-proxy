@@ -16,32 +16,67 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// The ordered-delete locking itself runs against real PostgreSQL
+// (capacity-lock-order.postgres.integration.test.ts); here it is observed.
+const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
+  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+}));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
+  lockCapacityGraphForDelete,
+}));
+// The history drain before an ordered delete runs against real PostgreSQL
+// (parent-deletion.postgres.integration.test.ts); here it is observed.
+const { prepareParentDeletion } = vi.hoisted(() => ({
+  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
+}));
+vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
+  prepareParentDeletion,
+}));
+
 const {
   authenticateCliWebsocketSecret,
   digestCliDeviceCredentialSecret,
   digestCliTokenSecret,
+  checkCliCredentialForDevice,
+  deleteCliDeviceAndCredentials,
   mintCliDeviceCredentialFromApprovedDeviceCode,
 } = await import("./cli-credential-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
+const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
+  "@ws-model-proxy/db/parent-deletion"
+);
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
+  $queryRaw: MockInstance;
   cliToken: {
     findUnique: MockInstance;
+    findMany: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
   };
   cliDevice: {
+    upsert: MockInstance;
+    updateMany: MockInstance;
     findUnique: MockInstance;
-    create: MockInstance;
+    delete: MockInstance;
   };
   cliDeviceCredential: {
     findUnique: MockInstance;
+    findMany: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
     create: MockInstance;
   };
   deviceCode: {
     findUnique: MockInstance;
     update: MockInstance;
-    delete: MockInstance;
+    deleteMany: MockInstance;
+  };
+  user: {
+    findUnique: MockInstance;
   };
 };
 
@@ -50,8 +85,19 @@ const now = new Date("2026-01-01T00:00:00.000Z");
 describe("cliCredentialAccess", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    db.cliDevice.findUnique.mockResolvedValue(null);
-    db.cliDevice.create.mockResolvedValue({ id: "cli-device-id" });
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.deviceCode.deleteMany.mockResolvedValue({ count: 1 });
+    db.cliDevice.upsert.mockResolvedValue({ id: "cli-device-id" });
+    // The FOR SHARE read of the approving owner: active, no deletion pending.
+    db.$queryRaw.mockResolvedValue([
+      { banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
+    db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-id", userId: "user-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([]);
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
+    db.user.findUnique.mockResolvedValue({ banned: false, deletionRequestedAt: null });
   });
 
   it("verifies active wsmp_cli_ tokens with the CLI-token HMAC context", async () => {
@@ -66,7 +112,7 @@ describe("cliCredentialAccess", () => {
       revokedAt: null,
       expiresAt: null,
     });
-    db.cliToken.update.mockResolvedValue({ id: "token-id" });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(authenticateCliWebsocketSecret(rawSecret, now)).resolves.toEqual({
       kind: "cliToken",
@@ -75,10 +121,9 @@ describe("cliCredentialAccess", () => {
       cliDeviceId: "cli-device-id",
       lookupPrefix,
     });
-    expect(db.cliToken.update).toHaveBeenCalledWith({
+    expect(db.cliToken.updateMany).toHaveBeenCalledWith({
       where: { id: "token-id" },
       data: { lastUsedAt: now },
-      select: { id: true },
     });
   });
 
@@ -88,20 +133,35 @@ describe("cliCredentialAccess", () => {
     db.cliDeviceCredential.findUnique.mockResolvedValue({
       id: "credential-id",
       userId: "user-id",
-      cliDeviceId: null,
+      cliDeviceId: "cli-device-id",
       lookupPrefix,
       secretDigest: digestCliDeviceCredentialSecret(rawSecret),
       revokedAt: null,
     });
-    db.cliDeviceCredential.update.mockResolvedValue({ id: "credential-id" });
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(authenticateCliWebsocketSecret(rawSecret, now)).resolves.toEqual({
       kind: "deviceCredential",
       id: "credential-id",
       userId: "user-id",
-      cliDeviceId: null,
+      cliDeviceId: "cli-device-id",
       lookupPrefix,
     });
+  });
+
+  it("refuses a device credential deleted (with its device) since it was read", async () => {
+    const rawSecret = `${PRODUCT_CREDENTIAL_PREFIXES.deviceCredential}${"d".repeat(43)}`;
+    db.cliDeviceCredential.findUnique.mockResolvedValue({
+      id: "credential-id",
+      userId: "user-id",
+      cliDeviceId: "cli-device-id",
+      lookupPrefix: credentialLookupPrefix(rawSecret),
+      secretDigest: digestCliDeviceCredentialSecret(rawSecret),
+      revokedAt: null,
+    });
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(authenticateCliWebsocketSecret(rawSecret, now)).resolves.toBeNull();
   });
 
   it("rejects revoked, expired, and wrong-purpose credentials", async () => {
@@ -143,78 +203,584 @@ describe("cliCredentialAccess", () => {
     await expect(authenticateCliWebsocketSecret(rawSecret, now)).resolves.toBeNull();
   });
 
-  it("does not mint a durable device credential from an expired device code", async () => {
-    db.deviceCode.findUnique.mockResolvedValue({
-      id: "device-code-row-id",
-      userId: "user-id",
-      expiresAt: new Date("2025-12-31T23:59:59.000Z"),
-      status: "approved",
-      lastPolledAt: null,
-      pollingInterval: 5,
+  it("registers a device credential only as the device it was minted for", async () => {
+    const check = () =>
+      checkCliCredentialForDevice(
+        prisma,
+        { kind: "deviceCredential", id: "credential-id" },
+        "cli-device-id",
+        now,
+      );
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+    });
+    await expect(check()).resolves.toBe("ok");
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "another-device-id",
+    });
+    await expect(check()).resolves.toBe("otherDevice");
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: now,
+      cliDeviceId: "cli-device-id",
+    });
+    await expect(check()).resolves.toBe("revoked");
+    // Deleted with its device.
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce(null);
+    await expect(check()).resolves.toBe("revoked");
+    // A device credential is never (re)bound.
+    expect(db.cliDeviceCredential.update).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("binds an unbound CLI token on its first hello with a conditional write", async () => {
+    const check = () =>
+      checkCliCredentialForDevice(
+        prisma,
+        { kind: "cliToken", id: "token-id" },
+        "cli-device-id",
+        now,
+      );
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValueOnce({ count: 1 });
+    await expect(check()).resolves.toBe("ok");
+    expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+      where: { id: "token-id", cliDeviceId: null, revokedAt: null },
+      data: { cliDeviceId: "cli-device-id" },
     });
 
-    await expect(
-      mintCliDeviceCredentialFromApprovedDeviceCode({
-        deviceCode: "short-lived-device-code",
-        name: "Laptop",
-        cliSlug: "desk-01",
+    // Another hello bound it to a different device between the read and the write.
+    db.cliToken.findUnique
+      .mockResolvedValueOnce({ revokedAt: null, expiresAt: null, cliDeviceId: null })
+      .mockResolvedValueOnce({ revokedAt: null, cliDeviceId: "another-device-id" });
+    db.cliToken.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(check()).resolves.toBe("otherDevice");
+  });
+
+  it("refuses bound-elsewhere, revoked, and expired CLI tokens", async () => {
+    const check = () =>
+      checkCliCredentialForDevice(
+        prisma,
+        { kind: "cliToken", id: "token-id" },
+        "cli-device-id",
         now,
-      }),
-    ).rejects.toSatisfy((error: ORPCError) => {
+      );
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: "cli-device-id",
+    });
+    await expect(check()).resolves.toBe("ok");
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: "another-device-id",
+    });
+    await expect(check()).resolves.toBe("otherDevice");
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: now,
+      expiresAt: null,
+      cliDeviceId: "cli-device-id",
+    });
+    await expect(check()).resolves.toBe("revoked");
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: now,
+      cliDeviceId: "cli-device-id",
+    });
+    await expect(check()).resolves.toBe("revoked");
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+function approvedRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "device-code-row-id",
+    userId: "user-id",
+    expiresAt: new Date("2026-01-01T00:10:00.000Z"),
+    status: "approved",
+    lastPolledAt: null,
+    // The value Better Auth 1.7 stores for `interval: "5s"`: milliseconds.
+    pollingInterval: 5000,
+    scope: "cli-slug:desk-01",
+    ...overrides,
+  };
+}
+
+describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.deviceCode.deleteMany.mockResolvedValue({ count: 1 });
+    db.cliDevice.upsert.mockResolvedValue({ id: "cli-device-id" });
+    // The FOR SHARE read of the approving owner: active, no deletion pending.
+    db.$queryRaw.mockResolvedValue([
+      { banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
+    db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-id", userId: "user-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([]);
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  function mint(cliSlug = "desk-01") {
+    return mintCliDeviceCredentialFromApprovedDeviceCode({
+      deviceCode: "short-lived-device-code",
+      cliSlug,
+      now,
+    });
+  }
+
+  function expectNothingMinted() {
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.cliDevice.upsert).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  }
+
+  it("does not mint a durable device credential from an expired device code", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(
+      approvedRow({ expiresAt: new Date("2025-12-31T23:59:59.000Z") }),
+    );
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
       expect(error).toBeInstanceOf(ORPCError);
       expect(error.code).toBe("BAD_REQUEST");
       return true;
     });
-    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
-    expect(db.deviceCode.delete).toHaveBeenCalledWith({ where: { id: "device-code-row-id" } });
+    expectNothingMinted();
+    expect(db.deviceCode.deleteMany).toHaveBeenCalledWith({
+      where: { id: "device-code-row-id" },
+    });
   });
 
-  it("mints a durable device credential after approval and deletes the short-lived code", async () => {
-    db.deviceCode.findUnique.mockResolvedValue({
-      id: "device-code-row-id",
-      userId: "user-id",
-      expiresAt: new Date("2026-01-01T00:10:00.000Z"),
-      status: "approved",
-      lastPolledAt: null,
-      pollingInterval: 5,
-    });
-    db.cliDeviceCredential.create.mockResolvedValue({
-      id: "credential-id",
-      userId: "user-id",
-    });
+  it("creates the device on a first login and revokes nothing", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
 
-    const result = await mintCliDeviceCredentialFromApprovedDeviceCode({
-      deviceCode: "short-lived-device-code",
-      name: "Laptop",
-      cliSlug: "desk-01",
-      now,
-    });
+    const result = await mint();
 
-    expect(result.credentialId).toBe("credential-id");
-    expect(result.userId).toBe("user-id");
+    expect(result).toMatchObject({
+      credentialId: "credential-id",
+      userId: "user-id",
+      cliDeviceId: "cli-device-id",
+      revoked: { kind: "deviceCredential", ids: [] },
+    });
     expect(result.secret.startsWith(PRODUCT_CREDENTIAL_PREFIXES.deviceCredential)).toBe(true);
-    expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith({
       where: { userId_slug: { userId: "user-id", slug: "desk-01" } },
-      select: { id: true },
-    });
-    expect(db.cliDevice.create).toHaveBeenCalledWith({
-      data: {
-        userId: "user-id",
-        slug: "desk-01",
-        label: "Laptop",
-      },
+      create: { userId: "user-id", slug: "desk-01" },
+      update: { updatedAt: now },
       select: { id: true },
     });
     expect(db.cliDeviceCredential.create).toHaveBeenCalledWith({
       data: {
         userId: "user-id",
         cliDeviceId: "cli-device-id",
-        name: "Laptop",
         lookupPrefix: expect.stringMatching(/^wsmp_device_/),
         secretDigest: expect.any(String),
       },
       select: { id: true, userId: true },
     });
-    expect(db.deviceCode.delete).toHaveBeenCalledWith({ where: { id: "device-code-row-id" } });
+    expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("reattaches a re-login to the existing device and revokes its other credentials", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.cliDevice.upsert.mockResolvedValue({ id: "existing-device-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "old-1" }, { id: "old-2" }]);
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 2 });
+
+    const result = await mint();
+
+    // The device keeps its id; the upsert's update touches nothing user-owned.
+    expect(result.cliDeviceId).toBe("existing-device-id");
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).toEqual({ updatedAt: now });
+    expect(db.cliDeviceCredential.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ cliDeviceId: "existing-device-id" }),
+      }),
+    );
+    expect(db.cliDeviceCredential.findMany).toHaveBeenCalledWith({
+      where: { cliDeviceId: "existing-device-id", revokedAt: null, id: { not: "credential-id" } },
+      select: { id: true },
+    });
+    expect(db.cliDeviceCredential.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["old-1", "old-2"] }, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    expect(result.revoked).toEqual({ kind: "deviceCredential", ids: ["old-1", "old-2"] });
+  });
+
+  it("takes the device, then the owner row, then consumes the code, inside one transaction", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "old-1" }]);
+
+    await mint();
+
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.deviceCode.deleteMany).toHaveBeenCalledWith({
+      where: {
+        id: "device-code-row-id",
+        status: "approved",
+        userId: "user-id",
+        expiresAt: { gt: now },
+      },
+    });
+    // The ordered user delete's order: device (L0), user (L7), then the
+    // cascade into device_code and credentials.
+    const ordered = [
+      db.cliDevice.upsert,
+      db.$queryRaw,
+      db.deviceCode.deleteMany,
+      db.cliDeviceCredential.create,
+      db.cliDeviceCredential.updateMany,
+    ];
+    // Every call must exist before comparing indices: an absent call maps to
+    // Number.NaN and would silently satisfy (or silently break) the sort check.
+    for (const mock of ordered) expect(mock).toHaveBeenCalledTimes(1);
+    const order = ordered.map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    const ownerRead = db.$queryRaw.mock.calls[0]?.[0] as TemplateStringsArray;
+    expect(ownerRead.join("?")).toMatch(/FROM "user"[\s\S]*FOR SHARE/);
+  });
+
+  it("mints nothing when a concurrent exchange consumed the code first", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.deviceCode.deleteMany.mockResolvedValue({ count: 0 });
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("NOT_FOUND");
+      expect(error.data).toBeUndefined();
+      return true;
+    });
+    // The device upsert ran first and rolls back with the transaction.
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a deletion is pending", [{ banned: true, banExpires: null, deletionRequestedAt: now }]],
+    [
+      "an unbanned row still carries the marker",
+      [{ banned: false, banExpires: null, deletionRequestedAt: now }],
+    ],
+    [
+      "an indefinite ban is active",
+      [{ banned: true, banExpires: null, deletionRequestedAt: null }],
+    ],
+    ["the owner row is gone", []],
+  ])("refuses with access_denied when %s, before consuming the code", async (_label, rows) => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.$queryRaw.mockResolvedValue(rows);
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ deviceFlowError: "access_denied" });
+      return true;
+    });
+    expect(db.deviceCode.deleteMany).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses with access_denied when the owner was deleted before the device upsert", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.$transaction.mockRejectedValue(
+      Object.assign(new Error("Foreign key constraint violated"), { code: "P2003" }),
+    );
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ deviceFlowError: "access_denied" });
+      return true;
+    });
+  });
+
+  it("rejects an exchange for a slug other than the approved one", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow({ scope: "cli-slug:victim-box" }));
+
+    await expect(mint("desk-01")).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      // Not a device-flow state: the CLI stops.
+      expect(error.data).toBeUndefined();
+      return true;
+    });
+    expectNothingMinted();
+    expect(db.deviceCode.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects a device code whose request named no CLI slug", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow({ scope: null }));
+
+    await expect(mint()).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      expect(error.data).toBeUndefined();
+      return true;
+    });
+    expectNothingMinted();
+  });
+
+  it("lets a concurrent first login reattach instead of failing (last approved login wins)", async () => {
+    // On Postgres the upsert is one `INSERT … ON CONFLICT DO UPDATE`: the second
+    // first-login of a new slug waits, then takes the update branch on the
+    // device the first one created, and revokes that login's credential.
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    db.cliDevice.upsert.mockResolvedValue({ id: "device-created-by-the-other-login" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "other-login-credential" }]);
+    db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await mint();
+
+    expect(result.cliDeviceId).toBe("device-created-by-the-other-login");
+    expect(result.revoked).toEqual({ kind: "deviceCredential", ids: ["other-login-credential"] });
+  });
+
+  it("does not map an unexpected unique violation to a retryable conflict", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(approvedRow());
+    const unique = Object.assign(new Error("unique"), { code: "P2002" });
+    db.$transaction.mockRejectedValue(unique);
+
+    await expect(mint()).rejects.toBe(unique);
+  });
+});
+
+describe("device-flow polling against the stored interval (milliseconds)", () => {
+  const pending = (lastPolledAt: Date | null) =>
+    approvedRow({ status: "pending", userId: null, lastPolledAt, pollingInterval: 5000 });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.deviceCode.update.mockResolvedValue({ id: "device-code-row-id" });
+  });
+
+  async function pollError(lastPolledAt: Date | null) {
+    db.deviceCode.findUnique.mockResolvedValue(pending(lastPolledAt));
+    return mintCliDeviceCredentialFromApprovedDeviceCode({
+      deviceCode: "short-lived-device-code",
+      cliSlug: "desk-01",
+      now,
+    }).catch((error: unknown) => error);
+  }
+
+  it("answers the first poll with authorization_pending and records it", async () => {
+    const error = await pollError(null);
+    expect(error).toBeInstanceOf(ORPCError);
+    expect((error as ORPCError<string, unknown>).data).toEqual({
+      deviceFlowError: "authorization_pending",
+    });
+    expect(db.deviceCode.update).toHaveBeenCalledWith({
+      where: { id: "device-code-row-id" },
+      data: { lastPolledAt: now },
+      select: { id: true },
+    });
+  });
+
+  it("answers a poll 1s after the last one with slow_down and does not record it", async () => {
+    const error = await pollError(new Date(now.getTime() - 1_000));
+    expect((error as ORPCError<string, unknown>).data).toEqual({ deviceFlowError: "slow_down" });
+    expect(db.deviceCode.update).not.toHaveBeenCalled();
+  });
+
+  it.each([5_000, 6_000, 60_000])(
+    "answers a poll %ims after the last one with authorization_pending",
+    async (elapsedMs) => {
+      const error = await pollError(new Date(now.getTime() - elapsedMs));
+      expect((error as ORPCError<string, unknown>).data).toEqual({
+        deviceFlowError: "authorization_pending",
+      });
+      expect(db.deviceCode.update).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("falls back to 5s when the row has no interval", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(
+      approvedRow({
+        status: "pending",
+        userId: null,
+        lastPolledAt: new Date(now.getTime() - 4_000),
+        pollingInterval: null,
+      }),
+    );
+    const error = await mintCliDeviceCredentialFromApprovedDeviceCode({
+      deviceCode: "short-lived-device-code",
+      cliSlug: "desk-01",
+      now,
+    }).catch((caught: unknown) => caught);
+    expect((error as ORPCError<string, unknown>).data).toEqual({ deviceFlowError: "slow_down" });
+  });
+});
+
+describe("deleteCliDeviceAndCredentials", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+    db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: null });
+    db.cliDevice.delete.mockResolvedValue({ id: "cli-device-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "device-credential-1" }]);
+    db.cliToken.findMany.mockResolvedValue([{ id: "cli-token-1" }]);
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("locks the device, revokes its CLI tokens, deletes it, and reports every credential", async () => {
+    const result = await deleteCliDeviceAndCredentials({
+      cliDeviceId: "cli-device-id",
+      userId: "user-id",
+      now,
+    });
+
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id", userId: "user-id" },
+      data: { updatedAt: now },
+    });
+    expect(db.cliDeviceCredential.findMany).toHaveBeenCalledWith({
+      where: { cliDeviceId: "cli-device-id", revokedAt: null },
+      select: { id: true },
+    });
+    expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["cli-token-1"] }, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    expect(db.cliDevice.delete).toHaveBeenCalledWith({
+      where: { id: "cli-device-id" },
+      select: { id: true },
+    });
+    // Capacity lock order: the device row (L0) first, then every lock the
+    // cascade can reach, then the DELETE.
+    expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(db, {
+      userId: "user-id",
+      cliDeviceIds: ["cli-device-id"],
+    });
+    // The request history is drained first, outside the ordered transaction.
+    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user-id",
+      cliDeviceIds: ["cli-device-id"],
+    });
+    const orderedMocks = [
+      prepareParentDeletion,
+      db.cliDevice.updateMany,
+      db.cliDeviceCredential.findMany,
+      db.cliToken.updateMany,
+      lockCapacityGraphForDelete,
+      db.cliDevice.delete,
+    ];
+    // Every call must exist before comparing indices: an absent call maps to
+    // Number.NaN and would silently satisfy (or silently break) the sort check.
+    for (const mock of orderedMocks) expect(mock).toHaveBeenCalledTimes(1);
+    const order = orderedMocks.map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(result.revoked).toEqual([
+      { kind: "deviceCredential", ids: ["device-credential-1"] },
+      { kind: "cliToken", ids: ["cli-token-1"] },
+    ]);
+  });
+
+  it("is NOT_FOUND for another user's (or a missing) device and deletes nothing", async () => {
+    db.cliDevice.findFirst.mockResolvedValue(null);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "intruder", now }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("is NOT_FOUND when the device disappears after the precheck", async () => {
+    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("refuses to prune a device that heartbeated since staleBefore", async () => {
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: now });
+    db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: now });
+
+    await expect(
+      deleteCliDeviceAndCredentials({
+        cliDeviceId: "cli-device-id",
+        userId: "user-id",
+        staleBefore: new Date(now.getTime() - 60_000),
+        now,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("refuses under the device lock when a heartbeat lands after the precheck", async () => {
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+    db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: now });
+
+    await expect(
+      deleteCliDeviceAndCredentials({
+        cliDeviceId: "cli-device-id",
+        userId: "user-id",
+        staleBefore: new Date(now.getTime() - 60_000),
+        now,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: "CLI device is not stale.",
+      data: { reason: "not_stale" },
+    });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("answers delete_pending when the in-transaction recount is above the bound", async () => {
+    db.$transaction.mockRejectedValueOnce(new ParentDeletionDrainPendingError("recount"));
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "delete_pending" } });
+  });
+
+  it("answers retained_history before draining when history must be kept", async () => {
+    prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "retained_history" } });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("answers delete_contended when ordered delete retries are exhausted", async () => {
+    const deadlock = Object.assign(new Error("deadlock detected"), { code: "40P01" });
+    db.$transaction.mockRejectedValue(deadlock);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "delete_contended" } });
+    expect(db.$transaction).toHaveBeenCalledTimes(5);
+  });
+
+  it("rethrows a non-retryable transaction error unchanged", async () => {
+    const boom = new Error("boom");
+    db.$transaction.mockRejectedValue(boom);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toBe(boom);
+  });
+
+  it("rethrows NOT_FOUND from inside the ordered transaction unchanged", async () => {
+    const notFound = new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+    db.$transaction.mockRejectedValue(notFound);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toBe(notFound);
   });
 });

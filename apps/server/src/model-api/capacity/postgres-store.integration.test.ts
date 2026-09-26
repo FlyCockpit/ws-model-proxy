@@ -1,3 +1,7 @@
+import {
+  lockAndValidateModelPoolCapacityPolicy,
+  lockExecutionTargetPolicies,
+} from "@ws-model-proxy/api/lib/capacity-policy-safety";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { PostgresNotificationListener } from "@ws-model-proxy/db/postgres-notifications";
 import { describe, expect, it, vi } from "vitest";
@@ -348,15 +352,13 @@ integration("PostgreSQL capacity admission primitives", () => {
         const backend = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
         writerPid = backend[0]?.pid;
         if (writerPid === undefined) throw new Error("Policy writer backend unavailable.");
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR UPDATE`;
-        for (const targetId of candidates
-          .map(({ executionTargetId }) => executionTargetId)
-          .sort()) {
-          await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${targetId} FOR UPDATE`;
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${
-            "capacity-policy:" + targetId
-          }, 0))`;
-        }
+        // The production writer lock sequence: pool row (L1), then sorted
+        // target rows plus their capacity-policy fences (L2).
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR NO KEY UPDATE`;
+        await lockExecutionTargetPolicies(
+          tx,
+          candidates.map(({ executionTargetId }) => executionTargetId),
+        );
         await tx.modelPool.update({
           where: { id: pool.id },
           data: { capacityConcurrencyLimit: 1 },
@@ -418,6 +420,198 @@ integration("PostgreSQL capacity admission primitives", () => {
       ]);
     }
   }, 15_000);
+
+  it("inserts an admitted lease while a policy writer holding pool/target locks waits on that capacity (no 40P01)", async () => {
+    // DL-1 regression. Side A is a policy writer (or admission poll): it holds
+    // the model_pool row and the execution_target row + capacity-policy fence
+    // through the production helpers, then requests the capacity advisory lock.
+    // Side B is the admitter (release/reclaim/acquire via #admitOne): it holds
+    // the capacity advisory lock and inference_capacity row, then inserts a
+    // capacity_lease whose FK checks take FOR KEY SHARE on the pool and target
+    // rows. With FOR UPDATE parent locks this is a guaranteed deadlock that
+    // PostgreSQL resolves by aborting one side with 40P01.
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const namedUrl = (name: string) =>
+      `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(name)}`;
+    const writer = createPrismaClient(namedUrl(`dl1-policy-${suffix}`));
+    const admitter = createPrismaClient(namedUrl(`dl1-admitter-${suffix}`));
+    const inspector = createPrismaClient(databaseUrl);
+    const user = await writer.user.create({
+      data: { name: "Lock order proof", email: `dl1-lock-order-${suffix}@example.test` },
+    });
+    let allowPolicyCapacityLock!: () => void;
+    const policyMayRequestCapacity = new Promise<void>((resolve) => {
+      allowPolicyCapacityLock = resolve;
+    });
+    let policySide: Promise<void> | undefined;
+    let admitterSide: Promise<void> | undefined;
+    try {
+      const pool = await writer.modelPool.create({
+        data: {
+          userId: user.id,
+          slug: `dl1-lock-order-${suffix}`,
+          name: "Lock order proof",
+          capacityConcurrencyLimit: null,
+          publicEgressAcknowledged: true,
+        },
+      });
+      const capacity = await writer.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `dl1-lock-order-${suffix}`,
+          runtimeIdentityKey: `dl1-lock-order-${suffix}`,
+          runtimeModel: "dl1-lock-order",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const account = await writer.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: `dl1-lock-order-${suffix}`,
+          baseUrl: "https://example.test",
+          endpointIdentity: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const model = await writer.providerModel.create({
+        data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+      });
+      const target = await writer.executionTarget.create({
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      const member = await writer.poolMember.create({
+        data: {
+          poolId: pool.id,
+          executionTargetId: target.id,
+          tier: "PRIMARY",
+          capacityConcurrencyMode: "INHERIT",
+        },
+      });
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(admitter, `dl1-${suffix}`);
+      const attempt = (name: string) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "POOL" as const,
+        poolId: pool.id,
+        basePriority: 16,
+        connectionOwner: name,
+        deadlineAt: new Date(Date.now() + 60_000),
+        candidates: [
+          {
+            capacityId: capacity.id,
+            executionTargetId: target.id,
+            poolMemberId: member.id,
+            candidateOrder: 0,
+          },
+        ],
+      });
+      const holder = await store.acquire(attempt("dl1-holder"));
+      if (holder.state !== "ADMITTED") throw new Error("Expected the first capacity lease.");
+      await expect(store.acquire(attempt("dl1-waiter"))).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      const waiting = await inspector.admissionRequest.findUniqueOrThrow({
+        where: { attemptId: `dl1-waiter-${suffix}` },
+      });
+
+      let policyPid: number | undefined;
+      let policyLocked!: () => void;
+      const policyHasLocks = new Promise<void>((resolve) => {
+        policyLocked = resolve;
+      });
+      policySide = writer.$transaction(
+        async (tx) => {
+          const backend = await tx.$queryRaw<
+            Array<{ pid: number }>
+          >`SELECT pg_backend_pid() AS pid`;
+          policyPid = backend[0]?.pid;
+          await lockAndValidateModelPoolCapacityPolicy(tx, {
+            modelPoolId: pool.id,
+            userId: user.id,
+            policy: {},
+            notFound: () => {
+              throw new Error("Pool not found.");
+            },
+          });
+          policyLocked();
+          await policyMayRequestCapacity;
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+        },
+        { timeout: 20_000 },
+      );
+      await policyHasLocks;
+      if (policyPid === undefined) throw new Error("Policy backend unavailable.");
+
+      admitterSide = admitter.$transaction(
+        async (tx) => {
+          const backend = await tx.$queryRaw<
+            Array<{ pid: number }>
+          >`SELECT pg_backend_pid() AS pid`;
+          const admitterPid = backend[0]?.pid;
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+          await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
+          allowPolicyCapacityLock();
+          // Wait until side A is provably queued behind this transaction's
+          // capacity advisory lock, then take the FK FOR KEY SHARE locks.
+          let queued = false;
+          for (let poll = 0; poll < 200 && !queued; poll++) {
+            const rows = await inspector.$queryRaw<Array<{ queued: boolean }>>`
+              SELECT ${admitterPid}::int = ANY(pg_blocking_pids(${policyPid}::int)) AS queued`;
+            queued = rows[0]?.queued ?? false;
+            if (!queued) await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          expect(queued).toBe(true);
+          await tx.capacityLease.create({
+            data: {
+              userId: user.id,
+              requestId: waiting.requestId,
+              attemptId: waiting.attemptId,
+              admissionRequestId: waiting.id,
+              capacityId: capacity.id,
+              executionTargetId: target.id,
+              poolId: pool.id,
+              poolMemberId: member.id,
+              priority: 16,
+              reservationClass: 16,
+              fencingToken: 1_000_000n,
+              ownerServerInstance: `dl1-${suffix}`,
+              heartbeatAt: new Date(),
+              expiresAt: new Date(Date.now() + 30_000),
+            },
+          });
+        },
+        { timeout: 20_000 },
+      );
+
+      // Neither side may be chosen as a deadlock victim: both must commit.
+      const outcomes = await Promise.allSettled([admitterSide, policySide]);
+      expect(
+        outcomes.map((outcome) =>
+          outcome.status === "fulfilled" ? "committed" : String(outcome.reason),
+        ),
+      ).toEqual(["committed", "committed"]);
+      expect(
+        await inspector.capacityLease.count({
+          where: { capacityId: capacity.id, state: "ACTIVE" },
+        }),
+      ).toBe(2);
+      await store.release(holder.lease);
+    } finally {
+      allowPolicyCapacityLock();
+      await Promise.allSettled([policySide, admitterSide]);
+      await cleanupCapacityFixture(writer, user.id);
+      await Promise.all([writer.$disconnect(), admitter.$disconnect(), inspector.$disconnect()]);
+    }
+  }, 30_000);
 
   it("uses the database clock across managers for deadlines, heartbeats, and lease expiry", async () => {
     if (!databaseUrl) return;
@@ -800,7 +994,6 @@ integration("PostgreSQL capacity admission primitives", () => {
         data: {
           userId: user.id,
           slug: `device-${suffix}`,
-          label: "Capacity device",
         },
       });
       const endpoint = await db.endpoint.create({
@@ -1302,7 +1495,6 @@ integration("PostgreSQL capacity admission primitives", () => {
         data: {
           userId: user.id,
           slug: `device-${suffix}`,
-          label: "Reservation device",
         },
       });
       const endpoint = await db.endpoint.create({
@@ -1827,7 +2019,6 @@ integration("model API routes with real PostgreSQL capacity", () => {
       data: {
         userId: user.id,
         slug: `cli-${suffix}`,
-        label: "Capacity route CLI",
         status: "CONNECTED",
         inventoryConfirmed: true,
         endpointTargeting: true,

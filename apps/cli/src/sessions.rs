@@ -52,8 +52,11 @@ use std::time::{Duration, Instant};
 use crate::approvals::{approved_public_key, record_pending};
 use crate::child_env::{self, scrub_parent_env};
 use crate::config::Config;
+#[cfg(unix)]
+use crate::protocol::SupervisedOutputPart;
 use crate::protocol::{
-    ClientControlMessage, RelayBinaryFrameMetadata, TerminalIdentity, terminal_supported,
+    ClientControlMessage, RelayBinaryFrameMetadata, SupervisedSpawn, TerminalIdentity,
+    terminal_supported,
 };
 use crate::relay_bus::FromWorker;
 use crate::startup::TerminalStartup;
@@ -112,6 +115,36 @@ const REASON_SPAWN_FAILED: &str = "spawn_failed";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
 const REASON_BAD_FRAME: &str = "bad_frame";
 const REASON_EXPIRED: &str = "expired";
+const REASON_SUPERVISED_ONLY: &str = "supervised_only";
+/// The supervised working directory is not valid UTF-8, so the confirm
+/// screen could not show it exactly. Passed through to the agent as the
+/// rejection reason.
+const REASON_CWD_NOT_UTF8: &str = "cwd_not_utf8";
+
+/// Supervised terminals waiting for Enter (starting or on the confirm screen).
+const MAX_SUPERVISED_AWAITING: usize = 1;
+/// Supervised terminals with a live PTY (awaiting Enter or running). With
+/// one awaiting slot this is "1 awaiting + 1 running", enforced at spawn: an
+/// Enter on a drawn screen is never refused. Finished review-pending
+/// terminals (no PTY) do not count.
+const MAX_SUPERVISED_LIVE: usize = 2;
+/// Safety net for a confirm screen nobody answered. The server expires the
+/// request at 15 minutes and normally cancels it first.
+const SUPERVISED_CONFIRM_TTL: Duration = Duration::from_secs(16 * 60);
+/// How long a finished command's output capture waits for review.
+const SUPERVISED_REVIEW_TTL: Duration = Duration::from_secs(15 * 60);
+const SUPERVISED_REASON_MAX_CHARS: usize = 500;
+const SUPERVISED_REQUESTER_MAX_CHARS: usize = 100;
+
+#[cfg(unix)]
+mod supervised_pty;
+#[cfg(unix)]
+use supervised_pty::{MarkerEvent, Piece};
+#[cfg(unix)]
+pub(crate) use supervised_pty::{
+    SUPERVISED_ENV_COMMAND, SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_REASON,
+    SUPERVISED_ENV_REQUESTER, SUPERVISED_ENV_SHARE, supervised_marker,
+};
 
 pub(crate) enum OutboundFrame {
     Control(ClientControlMessage),
@@ -142,6 +175,8 @@ enum Incoming {
     Close,
     /// 2.5: an authenticated frame with a bad payload removes only its viewer.
     DropViewer,
+    /// A supervised command's "review output before sending" checkbox.
+    ReviewToggle(bool),
 }
 
 fn terminal_block_reason(supported: bool, allowed: bool, open: usize) -> Option<&'static str> {
@@ -878,6 +913,20 @@ impl InputQueue {
         Ok(true)
     }
 
+    /// The daemon's own bytes (the supervised `go` token): queued behind
+    /// what is already there, never dropped for a full queue.
+    fn push_control(&self, bytes: Vec<u8>) -> std::io::Result<()> {
+        let mut state = self.lock();
+        if state.failed || state.closed {
+            return Err(std::io::Error::other("terminal input is closed"));
+        }
+        state.pending += bytes.len();
+        state.chunks.push_back(bytes);
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
     /// The next chunk for the writer, or `None` once the terminal closes.
     fn next(&self, stop: &AtomicBool) -> Option<Vec<u8>> {
         let mut state = self.lock();
@@ -1028,6 +1077,13 @@ fn wipe(bytes: &mut [u8]) {
     std::hint::black_box(&*bytes);
 }
 
+fn wipe_capture_message(message: &mut TermPlaintextV2) {
+    if let TermPlaintextV2::ReviewCapture { head, tail, .. } = message {
+        wipe(head);
+        wipe(tail);
+    }
+}
+
 /// One browser tab. On a 2.4 terminal the single implicit viewer uses v1 keys.
 struct Viewer {
     keys: DirectionKeys,
@@ -1111,6 +1167,93 @@ impl Drop for OutputKey {
     }
 }
 
+/// The bytes a command printed after Enter, bounded like the server's exec
+/// buffers: the first [`terminal_crypto::CAPTURE_HEAD_MAX`] bytes and a
+/// rolling last [`terminal_crypto::CAPTURE_TAIL_MAX`] bytes of the stream.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: u64,
+}
+
+impl Capture {
+    /// The server's view: the tail only once the stream is past the head.
+    fn parts(&self) -> (Vec<u8>, Vec<u8>) {
+        let tail = if self.total > terminal_crypto::CAPTURE_HEAD_MAX as u64 {
+            self.tail.iter().copied().collect()
+        } else {
+            Vec::new()
+        };
+        (self.head.clone(), tail)
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        wipe(&mut self.head);
+        self.tail.iter_mut().for_each(|byte| *byte = 0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "only the Unix PTY path (`supervised_pty`) creates a supervised terminal; \
+                  elsewhere the shared checks below only ever see `None`"
+    )
+)]
+enum SupervisedPhase {
+    /// The confirm child is starting; its screen is not drawn yet.
+    Starting,
+    /// The confirm screen is drawn and waits for Enter.
+    Confirm,
+    /// Enter was pressed; the command runs in the PTY.
+    Running,
+    /// The command exited and its capture waits for review. No PTY.
+    Finished,
+}
+
+/// An agent-requested terminal: a confirm screen, then exactly one command.
+struct Supervised {
+    command_id: String,
+    share_output: bool,
+    /// Terminal-wide "review output before sending".
+    review: bool,
+    phase: SupervisedPhase,
+    /// The confirm child's markers, the `go` token and PTY EOF.
+    #[cfg(unix)]
+    child: supervised_pty::ChildLink,
+    capture: Capture,
+    spawned_at: Instant,
+    finished_at: Option<Instant>,
+    /// Kept for the `term.exit` of a finished session.
+    exit_status: (Option<i32>, Option<i32>),
+    /// A person pressed Enter but `go` could not be written (the PTY is
+    /// going away): the command never started, and this is not a decline.
+    start_failed: bool,
+}
+
+impl Supervised {
+    fn awaiting(&self) -> bool {
+        matches!(
+            self.phase,
+            SupervisedPhase::Starting | SupervisedPhase::Confirm
+        )
+    }
+
+    fn capture_message(&self) -> TermPlaintextV2 {
+        let (head, tail) = self.capture.parts();
+        TermPlaintextV2::ReviewCapture {
+            total: self.capture.total,
+            head,
+            tail,
+        }
+    }
+}
+
 struct TerminalSession {
     /// Protocol 2.5: v2 crypto, broadcast output, and writer tracking.
     multi: bool,
@@ -1125,9 +1268,114 @@ struct TerminalSession {
     scrollback: VecDeque<u8>,
     #[cfg(unix)]
     pty: Option<PtyRuntime>,
+    /// Set on an agent-requested (supervised) terminal.
+    supervised: Option<Supervised>,
 }
 
 impl TerminalSession {
+    /// Whether viewer keystrokes may reach the PTY now. A supervised terminal
+    /// takes input only once its confirm screen is drawn and while the
+    /// command has not exited; everything else is dropped, never queued.
+    fn accepts_input(&self) -> bool {
+        #[cfg(unix)]
+        if self.pty.as_ref().is_none_or(|pty| pty.exited.is_some()) {
+            return false;
+        }
+        match &self.supervised {
+            None => true,
+            Some(supervised) => matches!(
+                supervised.phase,
+                SupervisedPhase::Confirm | SupervisedPhase::Running
+            ),
+        }
+    }
+
+    /// Supervised PTY output: markers become phase changes and never reach
+    /// viewers; bytes after Enter also go to the capture.
+    #[cfg(unix)]
+    fn supervised_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
+        let mut frames = Vec::new();
+        let mut display = Vec::new();
+        {
+            let Some(supervised) = self.supervised.as_mut() else {
+                return frames;
+            };
+            if supervised.phase == SupervisedPhase::Finished {
+                return frames;
+            }
+            for piece in supervised.child.scanner.feed(bytes) {
+                match piece {
+                    Piece::Bytes(bytes) => {
+                        if supervised.phase == SupervisedPhase::Running {
+                            supervised.capture.push(&bytes);
+                        }
+                        display.extend(bytes);
+                    }
+                    Piece::Event(MarkerEvent::Ready) => {
+                        if supervised.phase == SupervisedPhase::Starting {
+                            supervised.phase = SupervisedPhase::Confirm;
+                        }
+                    }
+                    Piece::Event(MarkerEvent::Accepted) => {
+                        // The decision point: only a request still waiting
+                        // here starts; the child execs only on `go`.
+                        if supervised.phase != SupervisedPhase::Confirm {
+                            continue;
+                        }
+                        let released = self
+                            .pty
+                            .as_ref()
+                            .map(|pty| pty.input.push_control(supervised.child.go.clone()));
+                        if let Some(Ok(())) = released {
+                            supervised.phase = SupervisedPhase::Running;
+                            frames.push(OutboundFrame::Control(
+                                ClientControlMessage::SupervisedAccepted {
+                                    command_id: supervised.command_id.clone(),
+                                },
+                            ));
+                        } else {
+                            // The PTY is going away; the child exits without
+                            // running anything. Only `term.exit` reports it:
+                            // a person pressed Enter, so it is no decline.
+                            supervised.start_failed = true;
+                            tracing::warn!(terminal_id, "could not start a confirmed command");
+                        }
+                    }
+                }
+            }
+        }
+        if !display.is_empty() {
+            push_scrollback(&mut self.scrollback, &display);
+            frames.extend(self.broadcast_data(terminal_id, &display));
+        }
+        frames
+    }
+
+    /// Unicast to a joining viewer: the review flag, and the capture when a
+    /// finished command waits for review.
+    fn supervised_join_frames(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
+        let Some(supervised) = self.supervised.as_ref() else {
+            return Vec::new();
+        };
+        if !supervised.share_output {
+            return Vec::new();
+        }
+        let review = supervised.review;
+        let capture = (supervised.phase == SupervisedPhase::Finished && review)
+            .then(|| supervised.capture_message());
+        let mut frames = Vec::new();
+        frames.extend(self.seal_unicast(
+            terminal_id,
+            viewer_id,
+            &TermPlaintextV2::ReviewState(review),
+        ));
+        if let Some(mut message) = capture {
+            frames.extend(self.seal_unicast(terminal_id, viewer_id, &message));
+            wipe_capture_message(&mut message);
+        }
+        frames
+    }
+
     /// v1 output for the single 2.4 viewer. Nothing when it is detached.
     fn seal_legacy_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
         let Some(viewer) = self.viewers.get_mut(LEGACY_VIEWER) else {
@@ -1334,8 +1582,14 @@ impl TerminalSession {
         match terminal_crypto::decode_plaintext_v2(&plaintext) {
             Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
             Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
-            // A browser never sends an output key.
-            Ok(TermPlaintextV2::OutputKey { .. }) | Err(_) => Incoming::DropViewer,
+            Ok(TermPlaintextV2::ReviewToggle(on)) => Incoming::ReviewToggle(on),
+            // A browser never sends an output key, a capture, or a review state.
+            Ok(
+                TermPlaintextV2::OutputKey { .. }
+                | TermPlaintextV2::ReviewCapture { .. }
+                | TermPlaintextV2::ReviewState(_),
+            )
+            | Err(_) => Incoming::DropViewer,
         }
     }
 }
@@ -1379,6 +1633,26 @@ pub(crate) struct TerminalRegistry {
     shut_down: bool,
     #[cfg(unix)]
     shell: Option<(String, Vec<String>)>,
+    /// The confirm child program. `None`: this binary, `terminal supervised-run`.
+    #[cfg(unix)]
+    supervised_program: Option<(String, Vec<String>)>,
+    confirm_ttl: Duration,
+    review_ttl: Duration,
+}
+
+fn supervised_rejected(command_id: &str, reason: &str) -> OutboundFrame {
+    OutboundFrame::Control(ClientControlMessage::SupervisedRejected {
+        command_id: command_id.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+fn term_exit(terminal_id: &str, status: (Option<i32>, Option<i32>)) -> OutboundFrame {
+    OutboundFrame::Control(ClientControlMessage::TermExit {
+        terminal_id: terminal_id.to_string(),
+        exit_code: status.0,
+        signal: signal_token(status.1),
+    })
 }
 
 impl TerminalRegistry {
@@ -1398,7 +1672,380 @@ impl TerminalRegistry {
             shut_down: false,
             #[cfg(unix)]
             shell: None,
+            #[cfg(unix)]
+            supervised_program: None,
+            confirm_ttl: SUPERVISED_CONFIRM_TTL,
+            review_ttl: SUPERVISED_REVIEW_TTL,
         }
+    }
+
+    /// Human (browser-opened) terminals. Supervised terminals have their own slots.
+    fn human_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.supervised.is_none())
+            .count()
+    }
+
+    fn supervised_counts(&self) -> (usize, usize) {
+        let mut awaiting = 0;
+        let mut running = 0;
+        for supervised in self
+            .sessions
+            .values()
+            .filter_map(|session| session.supervised.as_ref())
+        {
+            if supervised.awaiting() {
+                awaiting += 1;
+            } else if supervised.phase == SupervisedPhase::Running {
+                running += 1;
+            }
+        }
+        (awaiting, running)
+    }
+
+    /// `term.spawn`: a viewer-less terminal whose PTY child shows the confirm
+    /// screen for exactly this command. Nothing runs until a viewer presses
+    /// Enter on that screen.
+    pub(crate) fn spawn_supervised(
+        &mut self,
+        startup: &TerminalStartup,
+        config: &Config,
+        spawn: &SupervisedSpawn,
+    ) -> Vec<OutboundFrame> {
+        let command_id = spawn.command_id.as_str();
+        if !valid_id(command_id) || !valid_id(&spawn.terminal_id) {
+            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
+        }
+        if !terminal_supported() || !self.multi {
+            return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
+        }
+        if !startup.mcp_command_mode().allows_supervised() {
+            return vec![supervised_rejected(command_id, REASON_DISABLED)];
+        }
+        if self.sessions.contains_key(&spawn.terminal_id)
+            || self.sessions.values().any(|session| {
+                session
+                    .supervised
+                    .as_ref()
+                    .is_some_and(|supervised| supervised.command_id == command_id)
+            })
+        {
+            return vec![supervised_rejected(command_id, REASON_ALREADY_OPEN)];
+        }
+        let (awaiting, running) = self.supervised_counts();
+        if awaiting >= MAX_SUPERVISED_AWAITING || awaiting + running >= MAX_SUPERVISED_LIVE {
+            return vec![supervised_rejected(command_id, REASON_LIMIT)];
+        }
+        if spawn.command.is_empty() || child_env::validate_command(&spawn.command).is_err() {
+            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
+        }
+        let reason = spawn.reason.as_deref().unwrap_or("");
+        if reason.contains('\0')
+            || reason.chars().count() > SUPERVISED_REASON_MAX_CHARS
+            || spawn.requester.is_empty()
+            || spawn.requester.contains('\0')
+            || spawn.requester.chars().count() > SUPERVISED_REQUESTER_MAX_CHARS
+        {
+            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
+        }
+        let home = match user_home() {
+            Ok(path) => path,
+            Err(_) => return vec![supervised_rejected(command_id, REASON_BAD_CWD)],
+        };
+        let cwd = match child_env::resolve_cwd(spawn.cwd.as_deref(), &home) {
+            Ok(path) => path,
+            Err(reason) => {
+                tracing::warn!(
+                    command_id,
+                    reason,
+                    "rejecting a supervised working directory"
+                );
+                return vec![supervised_rejected(command_id, REASON_BAD_CWD)];
+            }
+        };
+        // I1: the confirm screen shows `getcwd()` (the physical path). Refuse
+        // before any PTY or child exists when that path cannot be shown
+        // exactly, and spawn in the checked physical path.
+        let cwd = match child_env::confirm_screen_cwd(&cwd) {
+            Ok((physical, _)) => physical,
+            Err(child_env::ConfirmCwdError::Unresolvable) => {
+                tracing::warn!(
+                    command_id,
+                    "rejecting an unresolvable supervised working directory"
+                );
+                return vec![supervised_rejected(command_id, REASON_BAD_CWD)];
+            }
+            Err(child_env::ConfirmCwdError::NotUtf8) => {
+                tracing::warn!(
+                    command_id,
+                    "rejecting a non-UTF-8 supervised working directory"
+                );
+                return vec![supervised_rejected(command_id, REASON_CWD_NOT_UTF8)];
+            }
+        };
+        #[cfg(not(unix))]
+        {
+            let _ = (config, cwd, reason);
+            vec![supervised_rejected(command_id, REASON_UNSUPPORTED)]
+        }
+        #[cfg(unix)]
+        {
+            self.spawn_supervised_unix(config, spawn, reason, &cwd)
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_supervised_unix(
+        &mut self,
+        config: &Config,
+        spawn: &SupervisedSpawn,
+        reason: &str,
+        cwd: &Path,
+    ) -> Vec<OutboundFrame> {
+        let command_id = spawn.command_id.as_str();
+        let terminal_id = spawn.terminal_id.as_str();
+        let marker = match terminal_crypto::random_nonce() {
+            Ok(bytes) => bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            Err(error) => {
+                tracing::warn!(error = %error, command_id, "generating a supervised marker failed");
+                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+            }
+        };
+        let out = match OutputKey::first() {
+            Ok(out) => out,
+            Err(error) => {
+                tracing::warn!(error = %error, command_id, "generating a terminal output key failed");
+                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+            }
+        };
+        let (program, args) = match self.supervised_program.clone() {
+            Some(program) => program,
+            None => match std::env::current_exe() {
+                Ok(path) => (
+                    path.to_string_lossy().into_owned(),
+                    vec!["terminal".to_string(), "supervised-run".to_string()],
+                ),
+                Err(error) => {
+                    tracing::warn!(error = %error, command_id, "locating the wsmp binary failed");
+                    return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                }
+            },
+        };
+        let mut env = terminal_env(config);
+        env.push((SUPERVISED_ENV_COMMAND.to_string(), spawn.command.clone()));
+        env.push((SUPERVISED_ENV_REASON.to_string(), reason.to_string()));
+        env.push((
+            SUPERVISED_ENV_REQUESTER.to_string(),
+            spawn.requester.clone(),
+        ));
+        env.push((
+            SUPERVISED_ENV_SHARE.to_string(),
+            if spawn.share_output { "1" } else { "0" }.to_string(),
+        ));
+        env.push((SUPERVISED_ENV_MARKER.to_string(), marker.clone()));
+        let (cols, rows) = (80, 24);
+        let pty = match spawn_pty(
+            &program,
+            &args,
+            cwd,
+            &env,
+            cols,
+            rows,
+            &self.tx,
+            terminal_id,
+        ) {
+            Ok(pty) => pty,
+            Err(error) => {
+                tracing::warn!(error = %error, command_id, "starting a supervised terminal failed");
+                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+            }
+        };
+        let now = Instant::now();
+        self.sessions.insert(
+            terminal_id.to_string(),
+            TerminalSession {
+                multi: true,
+                viewers: BTreeMap::new(),
+                writer: None,
+                pty_size: (cols, rows),
+                out: Some(out),
+                detached_at: Some(now),
+                scrollback: VecDeque::new(),
+                pty: Some(pty),
+                supervised: Some(Supervised {
+                    command_id: command_id.to_string(),
+                    share_output: spawn.share_output,
+                    review: false,
+                    phase: SupervisedPhase::Starting,
+                    child: supervised_pty::ChildLink::new(&marker),
+                    capture: Capture::default(),
+                    spawned_at: now,
+                    finished_at: None,
+                    exit_status: (None, None),
+                    start_failed: false,
+                }),
+            },
+        );
+        vec![OutboundFrame::Control(ClientControlMessage::TermSpawned {
+            terminal_id: terminal_id.to_string(),
+            command_id: command_id.to_string(),
+        })]
+    }
+
+    /// `supervised.cancel`: end the command's terminal in whatever state it
+    /// is. With `if_waiting` (the server's confirm deadline, or a decline
+    /// from the browser) it is a request this registry decides: a request
+    /// still waiting is declined (`supervised.declined`, then `term.exit`)
+    /// and its command never starts; one whose Enter was already taken keeps
+    /// running, and the `supervised.accepted` already sent is the answer.
+    pub(crate) fn cancel_supervised(
+        &mut self,
+        command_id: &str,
+        if_waiting: bool,
+    ) -> Vec<OutboundFrame> {
+        let found = self.sessions.iter().find_map(|(terminal_id, session)| {
+            session
+                .supervised
+                .as_ref()
+                .filter(|supervised| supervised.command_id == command_id)
+                .map(|supervised| {
+                    (
+                        terminal_id.clone(),
+                        supervised.awaiting(),
+                        supervised.start_failed,
+                    )
+                })
+        });
+        let Some((terminal_id, awaiting, start_failed)) = found else {
+            return Vec::new();
+        };
+        if !if_waiting || start_failed {
+            return self.close(&terminal_id);
+        }
+        if !awaiting {
+            return Vec::new();
+        }
+        let mut frames = vec![OutboundFrame::Control(
+            ClientControlMessage::SupervisedDeclined {
+                command_id: command_id.to_string(),
+            },
+        )];
+        frames.extend(self.close(&terminal_id));
+        frames
+    }
+
+    /// The confirm child or the command exited: report the outcome, then end
+    /// the terminal, or keep a finished one whose capture waits for review.
+    #[cfg(unix)]
+    fn finish_supervised(&mut self, terminal_id: &str, now: Instant) -> Vec<OutboundFrame> {
+        let (status, phase, command_id, share_output, review, start_failed) = {
+            let Some(session) = self.sessions.get_mut(terminal_id) else {
+                return Vec::new();
+            };
+            let Some(phase) = session
+                .supervised
+                .as_ref()
+                .map(|supervised| supervised.phase)
+            else {
+                return Vec::new();
+            };
+            if phase == SupervisedPhase::Finished {
+                return Vec::new();
+            }
+            let status = session.pty.take().map(shutdown_pty).unwrap_or((None, None));
+            let Some(supervised) = session.supervised.as_mut() else {
+                return Vec::new();
+            };
+            supervised.exit_status = status;
+            (
+                status,
+                phase,
+                supervised.command_id.clone(),
+                supervised.share_output,
+                supervised.review,
+                supervised.start_failed,
+            )
+        };
+        let mut frames = Vec::new();
+        if phase != SupervisedPhase::Running {
+            // No Enter was taken (or its `go` never reached the child): the
+            // command did not start. Only a real decline says `declined`.
+            if !start_failed {
+                frames.push(OutboundFrame::Control(
+                    ClientControlMessage::SupervisedDeclined { command_id },
+                ));
+            }
+            self.sessions.remove(terminal_id);
+            frames.push(term_exit(terminal_id, status));
+            return frames;
+        }
+        let done = |review: bool, output_bytes: Option<u64>| {
+            OutboundFrame::Control(ClientControlMessage::SupervisedDone {
+                command_id: command_id.clone(),
+                exit_code: status.0,
+                signal: signal_token(status.1),
+                review,
+                output_bytes,
+            })
+        };
+        if share_output && review {
+            frames.push(done(true, None));
+            let Some(session) = self.sessions.get_mut(terminal_id) else {
+                return frames;
+            };
+            let message = session.supervised.as_mut().map(|supervised| {
+                supervised.phase = SupervisedPhase::Finished;
+                supervised.finished_at = Some(now);
+                supervised.capture_message()
+            });
+            if let Some(mut message) = message {
+                let viewers = session.viewers.keys().cloned().collect::<Vec<_>>();
+                for viewer_id in viewers {
+                    frames.extend(session.seal_unicast(terminal_id, &viewer_id, &message));
+                }
+                wipe_capture_message(&mut message);
+            }
+            return frames;
+        }
+        if share_output {
+            let (head, tail, total) = match self
+                .sessions
+                .get(terminal_id)
+                .and_then(|session| session.supervised.as_ref())
+            {
+                Some(supervised) => {
+                    let (head, tail) = supervised.capture.parts();
+                    (head, tail, supervised.capture.total)
+                }
+                None => (Vec::new(), Vec::new(), 0),
+            };
+            for (seq, part, body) in [
+                (1, SupervisedOutputPart::Head, head),
+                (2, SupervisedOutputPart::Tail, tail),
+            ] {
+                if body.is_empty() {
+                    continue;
+                }
+                frames.push(OutboundFrame::Binary(
+                    RelayBinaryFrameMetadata::SupervisedOutput {
+                        command_id: command_id.clone(),
+                        part,
+                        seq,
+                    },
+                    body,
+                ));
+            }
+            frames.push(done(false, Some(total)));
+        } else {
+            frames.push(done(false, None));
+        }
+        self.sessions.remove(terminal_id);
+        frames.push(term_exit(terminal_id, status));
+        frames
     }
 
     /// A 2.4 (single-viewer) registry with a test shell.
@@ -1487,7 +2134,7 @@ impl TerminalRegistry {
         {
             return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
         }
-        let prepared = match prepare_handshake(startup, self.sessions.len(), &handshake) {
+        let prepared = match prepare_handshake(startup, self.human_count(), &handshake) {
             Ok(prepared) => prepared,
             Err(reject) => return vec![*reject],
         };
@@ -1521,7 +2168,7 @@ impl TerminalRegistry {
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
         let viewer_id = handshake.viewer_id;
-        if self.sessions.len() >= MAX_TERMINALS {
+        if self.human_count() >= MAX_TERMINALS {
             return vec![*handshake_rejected(handshake, REASON_LIMIT)];
         }
         let home = match user_home() {
@@ -1605,6 +2252,7 @@ impl TerminalRegistry {
             detached_at: None,
             scrollback: VecDeque::new(),
             pty: Some(pty),
+            supervised: None,
         };
         let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermOpened {
             terminal_id: terminal_id.to_string(),
@@ -1630,7 +2278,14 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get(terminal_id) else {
             return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
         };
-        if !startup.allow_human_terminal() || !terminal_supported() {
+        // A supervised terminal is gated by the MCP command policy, not by the
+        // human terminal switch; approval still applies to every viewer.
+        let allowed = if session.supervised.is_some() {
+            startup.mcp_command_mode().allows_supervised()
+        } else {
+            startup.allow_human_terminal()
+        };
+        if !allowed || !terminal_supported() {
             return vec![*handshake_rejected(
                 &handshake,
                 if terminal_supported() {
@@ -1867,6 +2522,7 @@ impl TerminalRegistry {
         })];
         if multi {
             frames.extend(session.join_frames(terminal_id, viewer_key));
+            frames.extend(session.supervised_join_frames(terminal_id, viewer_key));
         } else {
             let replay = session.scrollback.iter().copied().collect::<Vec<_>>();
             frames.extend(session.seal_legacy_data(terminal_id, &replay));
@@ -1960,21 +2616,21 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
+        let recorded = session
+            .supervised
+            .as_ref()
+            .map_or((None, None), |supervised| supervised.exit_status);
         #[cfg(unix)]
-        let (exit_code, signal) = {
+        let status = {
             let mut session = session;
-            session.pty.take().map(shutdown_pty).unwrap_or((None, None))
+            session.pty.take().map(shutdown_pty).unwrap_or(recorded)
         };
         #[cfg(not(unix))]
-        let (exit_code, signal) = {
+        let status = {
             drop(session);
-            (None, None)
+            recorded
         };
-        vec![OutboundFrame::Control(ClientControlMessage::TermExit {
-            terminal_id: terminal_id.to_string(),
-            exit_code,
-            signal: signal_token(signal),
-        })]
+        vec![term_exit(terminal_id, status)]
     }
 
     pub(crate) fn handle_sealed(
@@ -2005,6 +2661,15 @@ impl TerminalRegistry {
         };
         match action {
             Incoming::Write(bytes) => {
+                // Type-ahead before a supervised confirm screen is drawn, and
+                // input after its command exited, is dropped here for good.
+                if !self
+                    .sessions
+                    .get(terminal_id)
+                    .is_some_and(TerminalSession::accepts_input)
+                {
+                    return Vec::new();
+                }
                 let mut frames = Vec::new();
                 if self.multi {
                     match self.claim_writer(terminal_id, &viewer_key) {
@@ -2022,6 +2687,15 @@ impl TerminalRegistry {
                 frames
             }
             Incoming::Resize { cols, rows } => {
+                #[cfg(unix)]
+                if self
+                    .sessions
+                    .get(terminal_id)
+                    .is_some_and(|session| session.pty.is_none())
+                {
+                    // A finished supervised command has no PTY to resize.
+                    return Vec::new();
+                }
                 if !self.multi {
                     return if self.resize_terminal(terminal_id, cols, rows).is_err() {
                         self.close(terminal_id)
@@ -2049,6 +2723,7 @@ impl TerminalRegistry {
                     Err(_) => self.close(terminal_id),
                 }
             }
+            Incoming::ReviewToggle(on) => self.toggle_review(terminal_id, &viewer_key, on),
             Incoming::Ignore => Vec::new(),
             Incoming::Close => self.close(terminal_id),
             Incoming::DropViewer => {
@@ -2056,6 +2731,37 @@ impl TerminalRegistry {
                 self.remove_viewer(terminal_id, &viewer_key, Some(REASON_BAD_FRAME))
             }
         }
+    }
+
+    /// Any viewer may turn review on or off until the command exits. Every
+    /// viewer hears the new state. On a human terminal the frame is invalid.
+    fn toggle_review(
+        &mut self,
+        terminal_id: &str,
+        viewer_key: &str,
+        on: bool,
+    ) -> Vec<OutboundFrame> {
+        let Some(session) = self.sessions.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        let Some(supervised) = session.supervised.as_mut() else {
+            tracing::warn!(
+                terminal_id,
+                "removing a viewer after a review frame on a human terminal"
+            );
+            return self.remove_viewer(terminal_id, viewer_key, Some(REASON_BAD_FRAME));
+        };
+        if !supervised.share_output
+            || supervised.phase == SupervisedPhase::Finished
+            || supervised.review == on
+        {
+            return Vec::new();
+        }
+        supervised.review = on;
+        session
+            .seal_broadcast(terminal_id, &TermPlaintextV2::ReviewState(on))
+            .into_iter()
+            .collect()
     }
 
     /// Track dropped input per viewer. The first drop in a run yields one
@@ -2144,6 +2850,9 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
+        if session.supervised.is_some() {
+            return session.supervised_bytes(terminal_id, bytes);
+        }
         // Scrollback is always recorded; output is sealed only for viewers.
         push_scrollback(&mut session.scrollback, bytes);
         if session.multi {
@@ -2153,9 +2862,21 @@ impl TerminalRegistry {
         }
     }
 
+    /// PTY EOF. A supervised terminal is finished only after its child is
+    /// reaped, so the outcome and exit status are never lost.
     #[cfg(unix)]
     pub(crate) fn on_eof(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        self.close(terminal_id)
+        let Some(session) = self.sessions.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        let Some(supervised) = session.supervised.as_mut() else {
+            return self.close(terminal_id);
+        };
+        supervised.child.eof = true;
+        if session.pty.as_ref().is_some_and(|pty| pty.exited.is_some()) {
+            return self.finish_supervised(terminal_id, Instant::now());
+        }
+        Vec::new()
     }
 
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
@@ -2178,15 +2899,24 @@ impl TerminalRegistry {
         frames.extend(self.recheck_approvals(now));
         #[cfg(unix)]
         frames.extend(self.close_exited_shells(now));
-        // Pending viewers do not keep a terminal alive.
+        // Pending viewers do not keep a terminal alive. An unanswered confirm
+        // screen and an unreviewed capture have their own deadlines.
         let expired = self
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                session.viewers.is_empty()
-                    && session.detached_at.is_some_and(|detached| {
-                        now.saturating_duration_since(detached) >= self.idle_limit
-                    })
+            .filter(|(_, session)| match session.supervised.as_ref() {
+                Some(supervised) if supervised.awaiting() => {
+                    now.saturating_duration_since(supervised.spawned_at) >= self.confirm_ttl
+                }
+                Some(supervised) if supervised.phase == SupervisedPhase::Finished => supervised
+                    .finished_at
+                    .is_some_and(|at| now.saturating_duration_since(at) >= self.review_ttl),
+                _ => {
+                    session.viewers.is_empty()
+                        && session.detached_at.is_some_and(|detached| {
+                            now.saturating_duration_since(detached) >= self.idle_limit
+                        })
+                }
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -2214,15 +2944,25 @@ impl TerminalRegistry {
                     pty.exited = Some((code, signal, now));
                 }
             }
+            // A supervised command whose PTY already hit EOF has delivered
+            // all of its output; it need not wait out the drain.
+            let all_output = session
+                .supervised
+                .as_ref()
+                .is_some_and(|supervised| supervised.child.eof);
             if pty.exited.is_some_and(|(_, _, at)| {
-                now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
+                all_output || now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
             }) {
-                drained.push(terminal_id.clone());
+                drained.push((terminal_id.clone(), session.supervised.is_some()));
             }
         }
         let mut frames = Vec::new();
-        for terminal_id in drained {
-            frames.extend(self.close(&terminal_id));
+        for (terminal_id, supervised) in drained {
+            if supervised {
+                frames.extend(self.finish_supervised(&terminal_id, now));
+            } else {
+                frames.extend(self.close(&terminal_id));
+            }
         }
         frames
     }
@@ -2489,8 +3229,16 @@ impl ExecRegistry {
         if !valid_id(command_id) {
             return vec![exec_rejected(command_id, REASON_BAD_COMMAND)];
         }
-        if !startup.allow_mcp_commands() {
-            return vec![exec_rejected(command_id, REASON_DISABLED)];
+        let mode = startup.mcp_command_mode();
+        if !mode.allows_exec() {
+            // `supervised` lets an agent act here only through a person
+            // pressing Enter on a supervised terminal.
+            let reason = if mode.allows_supervised() {
+                REASON_SUPERVISED_ONLY
+            } else {
+                REASON_DISABLED
+            };
+            return vec![exec_rejected(command_id, reason)];
         }
         if self.sessions.contains_key(command_id) {
             return vec![exec_rejected(command_id, REASON_ALREADY_OPEN)];
@@ -2532,6 +3280,16 @@ impl ExecRegistry {
 
     pub(crate) fn cancel(&mut self, command_id: &str) -> Vec<OutboundFrame> {
         self.finish(command_id, true, false)
+    }
+
+    /// An `exec.start` the daemon could not read (for example a string with
+    /// an unpaired surrogate): refuse it so the server's request ends now.
+    /// Nothing runs. A command already running under that id is untouched.
+    pub(crate) fn reject_malformed(&self, command_id: &str) -> Vec<OutboundFrame> {
+        if !valid_id(command_id) || self.sessions.contains_key(command_id) {
+            return Vec::new();
+        }
+        vec![exec_rejected(command_id, REASON_BAD_COMMAND)]
     }
 
     pub(crate) fn on_bytes(
@@ -2814,6 +3572,7 @@ fn spawn_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::McpCommandMode;
     use crate::terminal_crypto::CliTerminalKey;
 
     fn channel() -> (SyncSender<FromWorker>, mpsc::Receiver<FromWorker>) {
@@ -2823,7 +3582,7 @@ mod tests {
     fn enabled_startup(approval: bool) -> TerminalStartup {
         let config = Config {
             allow_human_terminal: true,
-            allow_mcp_commands: true,
+            mcp_command_mode: McpCommandMode::Unsupervised,
             require_terminal_approval: approval,
             ..Config::default()
         };
@@ -3510,6 +4269,8 @@ mod tests {
         Key(u32),
         Size(u16, u16),
         Data(Vec<u8>),
+        Review(bool),
+        Capture(u64, Vec<u8>, Vec<u8>),
         Opaque,
     }
 
@@ -3653,6 +4414,13 @@ mod tests {
                         }
                         TermPlaintextV2::Resize { cols, rows } => Seen::Size(cols, rows),
                         TermPlaintextV2::Data(bytes) => Seen::Data(bytes),
+                        TermPlaintextV2::ReviewState(on) => Seen::Review(on),
+                        TermPlaintextV2::ReviewCapture { total, head, tail } => {
+                            Seen::Capture(total, head, tail)
+                        }
+                        TermPlaintextV2::ReviewToggle(_) => {
+                            panic!("the CLI never sends a review toggle")
+                        }
                     },
                 );
             }
@@ -4899,5 +5667,721 @@ mod tests {
         );
         drop(live);
         drop(rx);
+    }
+
+    // Supervised (agent-requested) terminals.
+
+    #[cfg(unix)]
+    const SUPERVISED_COMMAND_ID: &str = "cmd-supervised-1";
+
+    /// Stands in for `wsmp terminal supervised-run`: draws a screen, prints the
+    /// ready marker, reads one line (canonical tty, so type-ahead would be
+    /// read too), declines on `q`, else prints the accepted marker and "runs".
+    #[cfg(unix)]
+    /// A stand-in for `wsmp terminal supervised-run` with the same marker
+    /// and `go` handshake: after Enter it prints `accepted` with echo off,
+    /// then runs its "command" only once the daemon's `go` token arrives.
+    #[cfg(unix)]
+    fn fake_confirm(witness: Option<&Path>) -> String {
+        let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
+        let touch = witness.map_or(String::new(), |path| {
+            format!("touch '{}'\n", path.display())
+        });
+        format!(
+            r#"sleep 0.4
+printf 'SCREEN\n'
+printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
+IFS= read -r line
+case "$line" in q*) printf 'Declined\n'; exit 0;; esac
+printf 'got[%s]\n' "$line"
+stty -echo -icanon min 1 time 0
+printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
+go=$(head -c {go_len})
+stty echo icanon
+[ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
+{touch}printf 'after-accept\n'
+printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
+exit 3
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn supervised_startup(mode: McpCommandMode, approval: bool) -> TerminalStartup {
+        let config = Config {
+            allow_human_terminal: false,
+            mcp_command_mode: mode,
+            require_terminal_approval: approval,
+            ..Config::default()
+        };
+        TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config)
+    }
+
+    #[cfg(unix)]
+    fn supervised_registry(tx: SyncSender<FromWorker>, script: &str) -> TerminalRegistry {
+        let mut terminals = multi_registry(tx);
+        terminals.supervised_program = Some((
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), script.to_string()],
+        ));
+        terminals
+    }
+
+    #[cfg(unix)]
+    fn spawn_request(share_output: bool) -> SupervisedSpawn {
+        SupervisedSpawn {
+            terminal_id: MULTI_TERMINAL.to_string(),
+            command_id: SUPERVISED_COMMAND_ID.to_string(),
+            command: "make install".to_string(),
+            cwd: None,
+            reason: Some("needs your password".to_string()),
+            requester: "test agent".to_string(),
+            share_output,
+        }
+    }
+
+    #[cfg(unix)]
+    fn phase(terminals: &TerminalRegistry) -> Option<SupervisedPhase> {
+        terminals
+            .sessions
+            .get(MULTI_TERMINAL)
+            .and_then(|session| session.supervised.as_ref())
+            .map(|supervised| supervised.phase)
+    }
+
+    /// Run the relay loop's worker and poll steps until `done` holds.
+    #[cfg(unix)]
+    fn pump_until(
+        terminals: &mut TerminalRegistry,
+        rx: &mpsc::Receiver<FromWorker>,
+        frames: &mut Vec<OutboundFrame>,
+        done: impl Fn(&TerminalRegistry, &[OutboundFrame]) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(terminals, frames) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting on the supervised terminal"
+            );
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
+                    frames.extend(terminals.on_bytes(&terminal_id, &bytes));
+                }
+                Ok(FromWorker::TerminalEof { terminal_id }) => {
+                    frames.extend(terminals.on_eof(&terminal_id));
+                }
+                _ => {}
+            }
+            frames.extend(terminals.poll(Instant::now()));
+        }
+    }
+
+    #[cfg(unix)]
+    fn has_exit(_: &TerminalRegistry, frames: &[OutboundFrame]) -> bool {
+        controls(frames)
+            .iter()
+            .any(|message| matches!(message, ClientControlMessage::TermExit { .. }))
+    }
+
+    #[cfg(unix)]
+    fn seen_data(seen: &[Seen]) -> Vec<u8> {
+        seen.iter()
+            .filter_map(|item| match item {
+                Seen::Data(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        supervised_pty::find_subslice(haystack, needle).is_some()
+    }
+
+    #[cfg(unix)]
+    fn outcome_kinds(frames: &[OutboundFrame]) -> Vec<&'static str> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Control(ClientControlMessage::TermSpawned { .. }) => Some("spawned"),
+                OutboundFrame::Control(ClientControlMessage::SupervisedAccepted { .. }) => {
+                    Some("accepted")
+                }
+                OutboundFrame::Control(ClientControlMessage::SupervisedDeclined { .. }) => {
+                    Some("declined")
+                }
+                OutboundFrame::Control(ClientControlMessage::SupervisedDone { .. }) => Some("done"),
+                OutboundFrame::Control(ClientControlMessage::TermExit { .. }) => Some("exit"),
+                OutboundFrame::Binary(
+                    RelayBinaryFrameMetadata::SupervisedOutput { part, .. },
+                    _,
+                ) => Some(match part {
+                    SupervisedOutputPart::Head => "head",
+                    SupervisedOutputPart::Tail => "tail",
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn type_ahead_before_the_screen_is_dropped_and_enter_after_it_runs_and_shares() {
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(None));
+        // No human terminal switch: supervised terminals do not need it.
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
+        assert_eq!(phase(&terminals), Some(SupervisedPhase::Starting));
+
+        let mut a = TestViewer::new(1);
+        let joined = attach_viewer(&mut terminals, &startup, &mut a);
+        let mut seen = a.receive(MULTI_TERMINAL, &joined);
+        assert!(seen.contains(&Seen::Review(false)), "{seen:?}");
+
+        // Typed before the confirm screen was drawn: dropped, never queued.
+        let label = a.id.clone();
+        assert!(
+            send(
+                &mut terminals,
+                &mut a,
+                &label,
+                &TermPlaintextV2::Data(b"early\r".to_vec())
+            )
+            .is_empty()
+        );
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "head", "done", "exit"]
+        );
+        seen.extend(a.receive(MULTI_TERMINAL, &frames));
+        let shown = seen_data(&seen);
+        assert!(contains(&shown, b"SCREEN"));
+        assert!(
+            contains(&shown, b"got[ok]"),
+            "{}",
+            String::from_utf8_lossy(&shown)
+        );
+        assert!(!contains(&shown, b"early"));
+        // The markers before Enter never reach a viewer.
+        let before_accept =
+            &shown[..supervised_pty::find_subslice(&shown, b"after-accept").expect("output")];
+        assert!(!contains(before_accept, b"wsmp-supervised"));
+
+        let head = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Binary(RelayBinaryFrameMetadata::SupervisedOutput { .. }, body) => {
+                    Some(body.clone())
+                }
+                _ => None,
+            })
+            .expect("head");
+        assert!(contains(&head, b"after-accept"));
+        assert!(!contains(&head, b"got["));
+        assert!(!contains(&head, b"SCREEN"));
+        // The spoofed marker the command printed after Enter is plain output.
+        assert!(contains(&head, b"wsmp-supervised;ready"));
+        let done = controls(&frames)
+            .into_iter()
+            .find_map(|message| match message {
+                ClientControlMessage::SupervisedDone {
+                    exit_code,
+                    review,
+                    output_bytes,
+                    ..
+                } => Some((*exit_code, *review, *output_bytes)),
+                _ => None,
+            })
+            .expect("done");
+        assert_eq!(done, (Some(3), false, Some(head.len() as u64)));
+        assert!(terminals.sessions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declining_reports_declined_then_exit_and_runs_nothing() {
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(None));
+        let startup = supervised_startup(McpCommandMode::Unsupervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(2);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"q\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        assert_eq!(outcome_kinds(&frames), vec!["spawned", "declined", "exit"]);
+    }
+
+    /// Raw PTY output of the supervised terminal, not yet handed to the
+    /// registry, until `needle` shows up.
+    #[cfg(unix)]
+    fn hold_output_until(rx: &mpsc::Receiver<FromWorker>, needle: &[u8]) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut held = Vec::new();
+        let mut seen = Vec::new();
+        while !contains(&seen, needle) {
+            assert!(Instant::now() < deadline, "timed out waiting for output");
+            if let Ok(FromWorker::TerminalBytes { bytes, .. }) =
+                rx.recv_timeout(Duration::from_millis(20))
+            {
+                seen.extend(&bytes);
+                held.push(bytes);
+            }
+        }
+        held
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expiry_handled_before_the_enter_declines_and_the_command_never_starts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let witness = tmp.path().join("ran");
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(9);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        // Enter was pressed and the child said so, but the expiry is handled
+        // before the daemon reads that: the request is still waiting.
+        let held = hold_output_until(&rx, b"wsmp-supervised;accepted;");
+        let answer = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true);
+        assert_eq!(outcome_kinds(&answer), vec!["declined", "exit"]);
+        for bytes in held {
+            assert!(terminals.on_bytes(MULTI_TERMINAL, &bytes).is_empty());
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !witness.exists(),
+            "the command started without the daemon's go"
+        );
+        assert!(terminals.sessions.is_empty());
+        // Nothing but the waiting request is answered: an unknown id is a no-op.
+        assert!(terminals.cancel_supervised("cmd-unknown", true).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enter_taken_before_the_expiry_keeps_running_to_its_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let witness = tmp.path().join("ran");
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(10);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Running)
+        });
+        // The expiry arrives after the Enter was taken: it is not obeyed.
+        assert!(
+            terminals
+                .cancel_supervised(SUPERVISED_COMMAND_ID, true)
+                .is_empty()
+        );
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "head", "done", "exit"]
+        );
+        assert!(witness.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_browser_decline_after_the_enter_is_ignored_and_the_command_runs_to_its_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let witness = tmp.path().join("ran");
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(11);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Running)
+        });
+        // The server's decline request, exactly as it arrives on the wire.
+        let wire = format!(
+            r#"{{"type":"supervised.cancel","commandId":"{SUPERVISED_COMMAND_ID}","reason":"decline"}}"#
+        );
+        let Ok(crate::protocol::ServerControlMessage::SupervisedCancel {
+            command_id,
+            if_waiting,
+        }) = crate::protocol::parse_server_control(&wire)
+        else {
+            panic!("decline request did not parse");
+        };
+        assert!(if_waiting);
+        // Enter came first: the decline is not obeyed.
+        assert!(
+            terminals
+                .cancel_supervised(&command_id, if_waiting)
+                .is_empty()
+        );
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "head", "done", "exit"]
+        );
+        assert!(witness.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enter_whose_go_cannot_be_written_is_not_reported_as_a_decline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let witness = tmp.path().join("ran");
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(12);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        let held = hold_output_until(&rx, b"wsmp-supervised;accepted;");
+        // The PTY input fails before the daemon takes the accepted marker.
+        terminals
+            .sessions
+            .get(MULTI_TERMINAL)
+            .and_then(|session| session.pty.as_ref())
+            .expect("pty")
+            .input
+            .fail();
+        for bytes in held {
+            let out = terminals.on_bytes(MULTI_TERMINAL, &bytes);
+            assert!(!outcome_kinds(&out).contains(&"accepted"));
+        }
+        // A stop now ends the terminal without claiming anyone declined.
+        let answer = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true);
+        assert_eq!(outcome_kinds(&answer), vec!["exit"]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!witness.exists(), "the command started without go");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_withholds_output_from_the_relay_and_hands_the_capture_to_viewers() {
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(None));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(3);
+        let joined = attach_viewer(&mut terminals, &startup, &mut a);
+        let _ = a.receive(MULTI_TERMINAL, &joined);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        let toggled = send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::ReviewToggle(true),
+        );
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &toggled),
+            vec![Seen::Review(true)]
+        );
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, |_, frames| {
+            outcome_kinds(frames).contains(&"done")
+        });
+        assert_eq!(outcome_kinds(&frames), vec!["spawned", "accepted", "done"]);
+        assert!(controls(&frames).iter().any(|message| matches!(
+            message,
+            ClientControlMessage::SupervisedDone {
+                review: true,
+                output_bytes: None,
+                ..
+            }
+        )));
+        let capture = a
+            .receive(MULTI_TERMINAL, &frames)
+            .into_iter()
+            .find_map(|item| match item {
+                Seen::Capture(total, head, tail) => Some((total, head, tail)),
+                _ => None,
+            })
+            .expect("capture for the attached viewer");
+        assert!(contains(&capture.1, b"after-accept"));
+        assert_eq!(capture.0, capture.1.len() as u64);
+        assert!(capture.2.is_empty());
+        assert_eq!(phase(&terminals), Some(SupervisedPhase::Finished));
+
+        // Input after the command exited goes nowhere; a later viewer still
+        // gets the review state and the capture.
+        assert!(
+            send(
+                &mut terminals,
+                &mut a,
+                &label,
+                &TermPlaintextV2::Data(b"x".to_vec())
+            )
+            .is_empty()
+        );
+        assert!(
+            send(
+                &mut terminals,
+                &mut a,
+                &label,
+                &TermPlaintextV2::ReviewToggle(false)
+            )
+            .is_empty()
+        );
+        let mut b = TestViewer::new(4);
+        let joined = attach_viewer(&mut terminals, &startup, &mut b);
+        let seen = b.receive(MULTI_TERMINAL, &joined);
+        assert!(seen.contains(&Seen::Review(true)), "{seen:?}");
+        assert!(seen.iter().any(|item| matches!(item, Seen::Capture(..))));
+
+        let ended = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false);
+        assert_eq!(outcome_kinds(&ended), vec!["exit"]);
+        assert!(controls(&ended).iter().any(|message| matches!(
+            message,
+            ClientControlMessage::TermExit {
+                exit_code: Some(3),
+                ..
+            }
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_output_never_leaves_the_cli_and_review_cannot_be_toggled() {
+        let (tx, rx) = channel();
+        let mut terminals = supervised_registry(tx, &fake_confirm(None));
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(false));
+        let mut a = TestViewer::new(5);
+        let joined = attach_viewer(&mut terminals, &startup, &mut a);
+        let seen = a.receive(MULTI_TERMINAL, &joined);
+        assert!(!seen.iter().any(|item| matches!(item, Seen::Review(_))));
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        assert!(
+            send(
+                &mut terminals,
+                &mut a,
+                &label,
+                &TermPlaintextV2::ReviewToggle(true)
+            )
+            .is_empty()
+        );
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "done", "exit"]
+        );
+        assert!(controls(&frames).iter().any(|message| matches!(
+            message,
+            ClientControlMessage::SupervisedDone {
+                review: false,
+                output_bytes: None,
+                ..
+            }
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_spawn_refuses_a_cwd_the_confirm_screen_cannot_show_exactly() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let bad = root.path().join(OsStr::from_bytes(b"a\xff"));
+        std::fs::create_dir(&bad).expect("non-utf8 dir");
+        // The agent's cwd is text, so a non-UTF-8 directory arrives through
+        // a symlink (or the `$HOME` default / `~/` expansion); the check is
+        // on the resolved physical path either way.
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&bad, &link).expect("symlink");
+        let (tx, _rx) = channel();
+        let mut terminals = supervised_registry(tx, "sleep 30");
+        let supervised = supervised_startup(McpCommandMode::Supervised, false);
+        let mut request = spawn_request(true);
+        request.cwd = Some(link.to_str().expect("utf8 link").to_string());
+        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_CWD_NOT_UTF8
+        ));
+        assert!(terminals.sessions.is_empty());
+
+        // A UTF-8 directory is accepted.
+        let good = root.path().join("good");
+        std::fs::create_dir(&good).expect("dir");
+        request.cwd = Some(good.to_str().expect("utf8").to_string());
+        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
+        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_gates_supervised_spawn_attach_and_exec() {
+        let (tx, _rx) = channel();
+        let mut terminals = supervised_registry(tx.clone(), "sleep 30");
+        let off = supervised_startup(McpCommandMode::Off, false);
+        let frames = terminals.spawn_supervised(&off, &Config::default(), &spawn_request(true));
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_DISABLED
+        ));
+        assert!(terminals.sessions.is_empty());
+
+        let supervised = supervised_startup(McpCommandMode::Supervised, false);
+        let frames =
+            terminals.spawn_supervised(&supervised, &Config::default(), &spawn_request(true));
+        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
+        // One request waiting for Enter per CLI.
+        let mut second = spawn_request(true);
+        second.terminal_id = "term-supervised-2".to_string();
+        second.command_id = "cmd-supervised-2".to_string();
+        assert!(matches!(
+            controls(&terminals.spawn_supervised(&supervised, &Config::default(), &second))[0],
+            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_LIMIT
+        ));
+        // With the policy off, a viewer cannot attach to it.
+        let mut a = TestViewer::new(6);
+        let refused = terminals.attach(&off, None, a.handshake(MULTI_TERMINAL, 0, 0));
+        assert_eq!(
+            rejection(&refused),
+            Some((Some(a.id.clone()), REASON_DISABLED.to_string()))
+        );
+        // Approval still applies to supervised terminals.
+        let approval = supervised_startup(McpCommandMode::Supervised, true);
+        let identity = TerminalIdentity {
+            public_key: CliTerminalKey::generate()
+                .expect("id")
+                .public_b64url()
+                .to_string(),
+            signature: None,
+        };
+        let mut handshake = a.handshake(MULTI_TERMINAL, 0, 0);
+        handshake.identity = Some(&identity);
+        let pending = terminals.attach(&approval, None, handshake);
+        assert!(matches!(
+            controls(&pending)[0],
+            ClientControlMessage::TermPending { .. }
+        ));
+        let _ = &mut a;
+
+        // The supervised terminal does not take a human terminal slot.
+        let human = enabled_startup(false);
+        for tag in [7, 8] {
+            let viewer = TestViewer::new(tag);
+            let id = format!("term-human-{tag}");
+            let frames = terminals.open(
+                &human,
+                &Config::default(),
+                None,
+                viewer.handshake(&id, 80, 24),
+            );
+            assert!(
+                matches!(
+                    controls(&frames)[0],
+                    ClientControlMessage::TermOpened { .. }
+                ),
+                "human terminal {tag} was refused"
+            );
+        }
+
+        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+        let frames = execs.start(&supervised, &Config::default(), "cmd-exec-1", "true", None);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::ExecRejected { reason, .. } if reason == REASON_SUPERVISED_ONLY
+        ));
+        let frames = execs.start(&off, &Config::default(), "cmd-exec-2", "true", None);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::ExecRejected { reason, .. } if reason == REASON_DISABLED
+        ));
+        let _ = terminals.kill_all();
     }
 }

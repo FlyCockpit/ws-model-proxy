@@ -56,22 +56,7 @@ export type McpPersonalTokenRow = Prisma.McpPersonalTokenGetPayload<{
   select: typeof mcpPersonalTokenSelection;
 }>;
 
-/**
- * Where-clause for a user's ACTIVE personal tokens — token and grant both
- * unrevoked, and not yet expired (null expiry = lives until revoked). Shared
- * by listMine and the create-path active-token cap so the two can't drift.
- */
-export function activeMcpPersonalTokenWhere(
-  userId: string,
-  now: Date,
-): Prisma.McpPersonalTokenWhereInput {
-  return {
-    userId,
-    revokedAt: null,
-    grant: { revokedAt: null },
-    OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-  };
-}
+export { activeMcpPersonalTokenWhere } from "./mcp-token-active";
 
 export function digestMcpPersonalTokenSecret(rawSecret: string): string {
   return hmacDigestForForwarderPurpose({ purpose: "mcpToken", value: rawSecret });

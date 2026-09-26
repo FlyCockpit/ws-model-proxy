@@ -33,6 +33,10 @@ enum Sub {
     ///
     /// Creates the identity key on first use.
     Fingerprint,
+    /// Internal: the confirm screen of an agent-requested (supervised)
+    /// command. The relay daemon runs it inside the command's terminal.
+    #[command(hide = true)]
+    SupervisedRun,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -44,8 +48,12 @@ enum Approvals {
 }
 
 pub fn run(args: &Args) -> Result<()> {
+    if matches!(args.command, Sub::SupervisedRun) {
+        return crate::supervised_run::run();
+    }
     let state_dir = crate::paths::state_dir()?;
     match &args.command {
+        Sub::SupervisedRun => {}
         Sub::Approve { code } => {
             let code = approvals::approve(&state_dir, code)?;
             if args.json {

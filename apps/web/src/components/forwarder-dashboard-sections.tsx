@@ -11,6 +11,7 @@ import {
   transformerSupportedModalities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { cliDeviceMatchesSearch } from "@ws-model-proxy/config/cli-device-name";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
@@ -43,6 +44,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
+import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
@@ -197,7 +199,7 @@ function SectionHeader({
   return (
     <div className="mb-4 flex flex-col gap-3 border-b pb-4 sm:flex-row sm:items-start sm:justify-between">
       <div className="min-w-0">
-        <h2 className="text-lg font-semibold">{title}</h2>
+        <h1 className="text-lg font-semibold">{title}</h1>
         <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{description}</p>
       </div>
       {action ? <div className="shrink-0">{action}</div> : null}
@@ -609,9 +611,7 @@ export function CliEndpointsModelsSection() {
   const matchingDevices = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase();
     return (devicesData ?? []).flatMap((device) => {
-      const deviceMatches = [device.slug, device.label].some((value) =>
-        value.toLocaleLowerCase().includes(needle),
-      );
+      const deviceMatches = cliDeviceMatchesSearch(device, needle);
       const endpoints = device.endpoints.flatMap((endpoint) => {
         const matchesHealth =
           healthFilter === "all" ||
@@ -643,26 +643,28 @@ export function CliEndpointsModelsSection() {
   }, [devicesData, healthFilter, search]);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
-  const removeCli = useMutation(
-    orpc.forwarderManagement.removeCliDeviceMetadata.mutationOptions({
+  const removeCli = useMutation({
+    ...orpc.forwarderManagement.removeCliDeviceMetadata.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:metadata.deleted"));
         setDeleteTarget(null);
       },
     }),
-  );
-  const removeEndpoint = useMutation(
-    orpc.forwarderManagement.removeEndpointMetadata.mutationOptions({
+    meta: { deletionEntity: "cliDevice" },
+  });
+  const removeEndpoint = useMutation({
+    ...orpc.forwarderManagement.removeEndpointMetadata.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:metadata.deleted"));
         setDeleteTarget(null);
       },
     }),
-  );
-  const removeModel = useMutation(
-    orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
+    meta: { deletionEntity: "endpoint" },
+  });
+  const removeModel = useMutation({
+    ...orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
       onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         const impacted = data?.impactedPools ?? [];
@@ -678,7 +680,8 @@ export function CliEndpointsModelsSection() {
         setDeleteTarget(null);
       },
     }),
-  );
+    meta: { deletionEntity: "discoveredModel" },
+  });
   const updateModelCapabilities = useMutation(
     orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
       onSuccess: (data) => {
@@ -776,7 +779,7 @@ export function CliEndpointsModelsSection() {
               <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="font-medium">{device.label}</h3>
+                    <h3 className="min-w-0 truncate font-medium">{device.displayName}</h3>
                     <StatusPill muted={device.isStale}>{device.status}</StatusPill>
                     {device.isStale ? (
                       <StatusPill muted>{t("dashboard:status.stale")}</StatusPill>
@@ -797,20 +800,27 @@ export function CliEndpointsModelsSection() {
                       : t("dashboard:clis.inventoryUnconfirmed")}
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="touch"
-                  onClick={() =>
-                    setDeleteTarget({ kind: "cli", id: device.id, label: device.slug })
-                  }
-                >
-                  <Trash2 className="size-4" />
-                  {t("dashboard:metadata.delete")}
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <CliDeviceRename device={device} />
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="touch"
+                    onClick={() =>
+                      setDeleteTarget({ kind: "cli", id: device.id, label: device.slug })
+                    }
+                  >
+                    <Trash2 className="size-4" />
+                    {t("dashboard:metadata.delete")}
+                  </Button>
+                </div>
               </div>
 
-              <CliDeviceFeatureSwitches cliDeviceId={device.id} device={device} />
+              <CliDeviceFeatureSwitches
+                cliDeviceId={device.id}
+                deviceName={device.displayName}
+                device={device}
+              />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (
@@ -1063,7 +1073,11 @@ export function CliEndpointsModelsSection() {
           if (!open) setDeleteTarget(null);
         }}
         title={t("dashboard:metadata.deleteTitle")}
-        description={t("dashboard:metadata.deleteDescription")}
+        description={
+          deleteTarget?.kind === "cli"
+            ? t("dashboard:metadata.deleteCliDescription")
+            : t("dashboard:metadata.deleteDescription")
+        }
         confirmToken={deleteTarget?.label ?? ""}
         typePrompt={t("dashboard:metadata.typePrompt")}
         copyAriaLabel={t("dashboard:actions.copyConfirm")}

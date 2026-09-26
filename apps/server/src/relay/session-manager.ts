@@ -1,12 +1,21 @@
 import { randomBytes } from "node:crypto";
 import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  allowsHeadlessCommands,
+  allowsSupervisedCommands,
+  lowestMcpCommandMode,
+  type McpCommandModeName,
+  mcpCommandModeFromDb,
+  mcpCommandModeToDb,
+} from "@ws-model-proxy/api/lib/mcp-command-mode";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
   markPoolMembersForCliUnavailable,
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
@@ -21,11 +30,13 @@ import {
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
+  helloNeedsUpgrade,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
+  RELAY_UPGRADE_REQUIRED_MESSAGE,
   type RelayBinaryFrameMetadata,
   type RelayClientControlMessage,
   type RelayFailure,
@@ -76,7 +87,8 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
 
 export type CliReportedFeatures = {
   humanTerminal: boolean;
-  mcpCommands: boolean;
+  /** The CLI's own MCP command mode (its config), from hello. */
+  mcpCommandMode: McpCommandModeName;
   terminalApproval: boolean;
   terminalSupported: boolean;
 };
@@ -92,6 +104,74 @@ export type TrackedCliCommand = {
   appendOutput(stream: "stdout" | "stderr", body: Uint8Array): void;
 };
 
+/** What the terminal socket lists for an agent-requested (supervised) terminal. */
+export type SupervisedTerminalListing = {
+  commandId: string;
+  status: SupervisedCommandStatus;
+  requester: string;
+  reason: string | null;
+  command: string;
+  cwd: string | null;
+  shareOutput: boolean;
+  createdAt: string;
+  /** Deadline of the current wait (confirm or review); null otherwise. */
+  expiresAt: string | null;
+  exitCode: number | null;
+  signal: string | null;
+};
+
+/** Why a supervised terminal went away, as seen by its command record. */
+export type SupervisedTerminalGoneCause =
+  /** The CLI reported `term.exit`. */
+  | "exit"
+  /** The owner ended it from the browser (`close`: End session / Decline). */
+  | "user"
+  /** A malformed frame closed it, or the server ended it after settling the record. */
+  | "closed"
+  /** The relay session went away (disconnect, replacement, shutdown, revocation). */
+  | "disconnected"
+  /** The device policy no longer allows supervised commands. */
+  | "policy";
+
+/**
+ * A supervised command as the session manager sees it. The record itself
+ * (status, output, timers) lives in `cli-commands.ts`; these hooks are how
+ * relay frames reach it. Every hook ignores calls that do not fit the
+ * record's current status.
+ */
+export type TrackedSupervisedCommand = {
+  commandId: string;
+  terminalId: string;
+  cliDeviceId: string;
+  userId: string;
+  listing(): SupervisedTerminalListing;
+  onSpawned(): void;
+  onRejected(reason: string): void;
+  onAccepted(): void;
+  onDeclined(): void;
+  onDone(result: {
+    exitCode?: number;
+    signal?: string;
+    review: boolean;
+    outputBytes?: number;
+  }): void;
+  onOutput(part: "head" | "tail", body: Uint8Array): void;
+  onTerminalGone(cause: SupervisedTerminalGoneCause): void;
+  /**
+   * The CLI's report on a terminal the server already ended: `accepted`
+   * (the command had started) or `settled` (its terminal is gone for good).
+   */
+  onLateReport(report: "accepted" | "settled"): void;
+  /**
+   * The owner declined from the browser. Never ends a command that started:
+   * `requested` when the request still waited for Enter and the CLI was
+   * asked to decline it (the CLI decides; an Enter it took first wins),
+   * `started` when the Enter already won, `unavailable` when the CLI could
+   * not be asked, `ended` when the request is over.
+   */
+  requestDecline(): "requested" | "started" | "unavailable" | "ended";
+};
+
 /** One browser tab's attachment to a terminal. `connId` is the browser socket. */
 type TerminalViewer = { connId: string; attachedAt: number };
 type TerminalPendingViewer = { connId: string; requestedAt: number };
@@ -100,7 +180,6 @@ export type TerminalRecord = {
   terminalId: string;
   userId: string;
   cliDeviceId: string;
-  label: string;
   cols: number;
   rows: number;
   /**
@@ -120,6 +199,22 @@ export type TerminalRecord = {
   writerViewerId: string | null;
   phase: "pending" | "opening" | "open";
   createdAt: number;
+  /**
+   * `agent`: a supervised terminal the CLI spawned for an MCP request. It
+   * has its own slot limits, is gated by the MCP command mode (not the human
+   * terminal grant), and starts with no viewers.
+   */
+  origin: "user" | "agent";
+  /** Set iff `origin` is `agent`. */
+  supervised: TrackedSupervisedCommand | null;
+  /**
+   * Agent terminals: browser sockets that sent Decline. They hear whether an
+   * Enter beat it (`decline` event, once, on the waiting -> running step) and
+   * the terminal's exit, even when they do not view the terminal. Kept until
+   * the terminal ends (the set goes with it) or the socket closes (its entry
+   * is removed); bounded by the owner's sockets.
+   */
+  decliners?: Set<string>;
 };
 
 export type TerminalWriterLabel = "you" | "other" | "none";
@@ -148,6 +243,8 @@ export type TerminalLifecycleEvent =
       connIds: string[];
       exitCode?: number;
       signal?: string;
+      /** A supervised terminal: its command's status once the terminal ended. */
+      supervisedStatus?: SupervisedTerminalListing["status"];
     }
   /** 2.4 only: another tab took the terminal. */
   | { type: "detached"; terminalId: string; connId: string }
@@ -158,6 +255,8 @@ export type TerminalLifecycleEvent =
       count: number;
       recipients: Array<{ connId: string; writer: TerminalWriterLabel }>;
     }
+  /** A Decline these sockets sent lost to an Enter: the command started. */
+  | { type: "decline"; terminalId: string; connIds: string[]; outcome: "started" }
   | {
       type: "sealed";
       terminalId: string;
@@ -166,7 +265,9 @@ export type TerminalLifecycleEvent =
       /** Set on 2.5 broadcast frames. */
       epoch?: number;
       body: Uint8Array;
-    };
+    }
+  /** This user's terminal list changed without a browser asking (supervised requests). */
+  | { type: "list_changed"; userId: string };
 
 type TerminalBridge = {
   onTerminalEvent(event: TerminalLifecycleEvent): void;
@@ -184,6 +285,8 @@ export const TERMINAL_CLI_LIMIT = 2;
 export const TERMINAL_VIEWER_LIMIT = 8;
 const CLI_SEALED_BUFFER_LIMIT = 1024 * 1024;
 const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
+/** Ended supervised terminals whose CLI `term.exit` is still awaited, per session. */
+const ENDING_SUPERVISED_MAX = 16;
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 
 type SessionState = {
@@ -192,7 +295,7 @@ type SessionState = {
   connectedAt: Date;
   lastHeartbeatAt: Date;
   cliDeviceId: string | null;
-  cli: { slug: string; label: string } | null;
+  cli: { slug: string } | null;
   registered: boolean;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
@@ -205,9 +308,18 @@ type SessionState = {
   /** 2.5 CLI identity proof, relayed to browsers as is. */
   terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
-  allowMcpCommands: boolean;
+  /** Server grant for MCP commands (dashboard). The CLI's own mode is in `features`. */
+  mcpCommandMode: McpCommandModeName;
   terminalsById: Map<string, TerminalRecord>;
   commandsById: Map<string, TrackedCliCommand>;
+  /** Supervised commands by command id, from `term.spawn` until their terminal ends. */
+  supervisedById: Map<string, TrackedSupervisedCommand>;
+  /**
+   * Supervised commands whose terminal the server ended, by terminal id,
+   * until the CLI's own `term.exit` for it: a `supervised.accepted` still in
+   * flight then records that the command had started.
+   */
+  endingSupervised: Map<string, TrackedSupervisedCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
 };
@@ -228,26 +340,18 @@ type ActiveRelayRequest = ActiveRelayResponseHandlers & {
 
 type HelloMessage = Extract<RelayClientControlMessage, { type: "hello" }>;
 
-/** Terminal and exec capabilities, present from 2.4 on. */
+/** Terminal, exec, and supervised-command capabilities (2.6). */
 function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities"]): {
   features: CliReportedFeatures;
   terminalPublicKey: string;
   terminalViewers: boolean;
   terminalIdentity: CliTerminalIdentity | null;
-} | null {
-  if (!relayProtocolAtLeast(capabilities.protocolVersion, "2.4")) return null;
-  if (!("features" in capabilities)) return null;
+} {
   return {
     features: capabilities.features,
     terminalPublicKey: capabilities.terminalPublicKey,
-    terminalViewers:
-      relayProtocolAtLeast(capabilities.protocolVersion, "2.5") &&
-      "terminalViewers" in capabilities &&
-      capabilities.terminalViewers === true,
-    terminalIdentity:
-      "terminalIdentity" in capabilities && capabilities.terminalIdentity
-        ? capabilities.terminalIdentity
-        : null,
+    terminalViewers: capabilities.terminalViewers === true,
+    terminalIdentity: capabilities.terminalIdentity ?? null,
   };
 }
 
@@ -261,10 +365,30 @@ function mintViewerId(terminal?: TerminalRecord): string {
 }
 
 /** Distinct browser sockets that hold or wait for this terminal. */
+/**
+ * A supervised terminal's exit fields from its settled record: the final
+ * status, and the command's own exit code or signal when it ran (a review
+ * that ends the kept session happens after the command exited).
+ */
+function supervisedExitFields(supervised: TrackedSupervisedCommand): {
+  supervisedStatus: SupervisedTerminalListing["status"];
+  exitCode?: number;
+  signal?: string;
+} {
+  const listing = supervised.listing();
+  return {
+    supervisedStatus: listing.status,
+    ...(listing.exitCode !== null ? { exitCode: listing.exitCode } : {}),
+    ...(listing.signal !== null ? { signal: listing.signal } : {}),
+  };
+}
+
+/** Sockets that hear a terminal's exit: its viewers and any tab whose Decline is out. */
 function terminalConnIds(terminal: TerminalRecord): string[] {
   const connIds = new Set<string>();
   for (const viewer of terminal.viewers.values()) connIds.add(viewer.connId);
   for (const pending of terminal.pendingViewers.values()) connIds.add(pending.connId);
+  for (const connId of terminal.decliners ?? []) connIds.add(connId);
   return [...connIds];
 }
 
@@ -308,36 +432,22 @@ function firstEntry<T>(map: Map<string, T>): [string, T] | null {
 }
 
 function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRelayFeatures {
-  const cliVersion = message.cli.version ?? null;
-  const interactive = relayProtocolAtLeast(message.protocolVersion, "2.4")
-    ? interactiveCapabilities(message.cli.capabilities)
-    : null;
-  if (interactive) {
-    const features = interactive.features;
-    return {
-      cliVersion,
-      relayProtocolVersion: message.protocolVersion,
-      reportedHumanTerminal: features.humanTerminal,
-      reportedMcpCommands: features.mcpCommands,
-      reportedTerminalApproval: features.terminalApproval,
-      reportedTerminalSupported: features.terminalSupported,
-      featuresReportedAt: now,
-    };
-  }
+  const features = message.cli.capabilities.features;
   return {
-    cliVersion,
+    cliVersion: message.cli.version ?? null,
     relayProtocolVersion: message.protocolVersion,
-    reportedHumanTerminal: null,
-    reportedMcpCommands: null,
-    reportedTerminalApproval: null,
-    reportedTerminalSupported: null,
-    featuresReportedAt: null,
+    reportedHumanTerminal: features.humanTerminal,
+    reportedMcpCommandMode: mcpCommandModeToDb(features.mcpCommandMode),
+    reportedTerminalApproval: features.terminalApproval,
+    reportedTerminalSupported: features.terminalSupported,
+    reportedHostname: message.cli.hostname ?? null,
+    featuresReportedAt: now,
   };
 }
 
 function interactiveTargetFromBinary(
   frame: ArrayBuffer,
-): { kind: "terminal" | "command"; id: string } | null {
+): { kind: "terminal" | "command" | "supervised"; id: string } | null {
   if (frame.byteLength < 4) return null;
   const metadataLength = new DataView(frame).getUint32(0, false);
   if (metadataLength > RELAY_JSON_CONTROL_MAX_BYTES || frame.byteLength < 4 + metadataLength) {
@@ -356,6 +466,9 @@ function interactiveTargetFromBinary(
       typeof record.commandId === "string"
     ) {
       return { kind: "command", id: record.commandId };
+    }
+    if (record.type === "supervised.output" && typeof record.commandId === "string") {
+      return { kind: "supervised", id: record.commandId };
     }
     return null;
   } catch {
@@ -422,9 +535,11 @@ export class RelaySessionManager {
       terminalViewers: false,
       terminalIdentity: null,
       allowHumanTerminal: false,
-      allowMcpCommands: false,
+      mcpCommandMode: "off",
       terminalsById: new Map(),
       commandsById: new Map(),
+      supervisedById: new Map(),
+      endingSupervised: new Map(),
       unauthenticatedTimer,
       bodyStreamsByRequest: new Map(),
     });
@@ -432,6 +547,14 @@ export class RelaySessionManager {
 
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
     const session = this.requireSession(socket);
+    // An older CLI gets a message it prints ("upgrade wsmp"), not an opaque
+    // schema rejection. Every released CLI treats protocol.error as fatal.
+    if (!session.registered && helloNeedsUpgrade(frame)) {
+      console.error("[relay] refused a hello older than the minimum relay protocol");
+      closeWithProtocolError(socket, RELAY_UPGRADE_REQUIRED_MESSAGE);
+      await this.removeSession(socket, now);
+      return;
+    }
     let message: RelayClientControlMessage;
     try {
       message = parseRelayClientControlFrame(frame);
@@ -453,46 +576,39 @@ export class RelaySessionManager {
     }
 
     if (message.type === "hello") {
-      if (message.protocolVersion === "2.0" && message.endpoints.length > 1) {
-        closeWithProtocolError(
-          socket,
-          "Legacy relay clients may publish only one endpoint; upgrade wsmp for multi-endpoint routing.",
-        );
-        await this.removeSession(socket, now);
-        return;
-      }
       try {
         const registration = await persistRelayRegistration({
           identity: session.identity,
           cli: message.cli,
           endpoints: message.endpoints,
-          inventoryConfirmed: message.protocolVersion !== "2.0",
-          endpointTargeting: message.protocolVersion !== "2.0",
+          inventoryConfirmed: true,
+          endpointTargeting: true,
           connection: true,
           reported: reportedFeaturesFromHello(message, now),
           now,
         });
+        if (this.sessionsBySocket.get(socket) !== session) {
+          // Detached while registration ran (socket closed, or its credential
+          // revoked / device deleted). The registration committed CONNECTED
+          // for a session that no longer exists: do not route to it, and put
+          // the device status back unless another live session owns it.
+          await this.settleDetachedRegistration(registration.cliDeviceId, now);
+          return;
+        }
         session.cliDeviceId = registration.cliDeviceId;
-        session.cli = { slug: message.cli.slug, label: message.cli.label };
+        session.cli = { slug: message.cli.slug };
         session.registered = true;
-        session.inventoryConfirmed = message.protocolVersion !== "2.0";
-        session.endpointTargeting = message.protocolVersion !== "2.0";
+        session.inventoryConfirmed = true;
+        session.endpointTargeting = true;
         session.protocolVersion = message.protocolVersion;
         session.cliVersion = message.cli.version ?? null;
         session.allowHumanTerminal = registration.allowHumanTerminal;
-        session.allowMcpCommands = registration.allowMcpCommands;
+        session.mcpCommandMode = registration.mcpCommandMode;
         const interactive = interactiveCapabilities(message.cli.capabilities);
-        if (interactive) {
-          session.features = interactive.features;
-          session.terminalPublicKey = interactive.terminalPublicKey;
-          session.terminalViewers = interactive.terminalViewers;
-          session.terminalIdentity = interactive.terminalIdentity;
-        } else {
-          session.features = null;
-          session.terminalPublicKey = null;
-          session.terminalViewers = false;
-          session.terminalIdentity = null;
-        }
+        session.features = interactive.features;
+        session.terminalPublicKey = interactive.terminalPublicKey;
+        session.terminalViewers = interactive.terminalViewers;
+        session.terminalIdentity = interactive.terminalIdentity;
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
@@ -508,6 +624,8 @@ export class RelaySessionManager {
           }),
         );
       } catch (error) {
+        // Already detached and closed by whoever detached it.
+        if (this.sessionsBySocket.get(socket) !== session) return;
         const relayError =
           error instanceof RelayRegistrationError && error.code === "access_denied"
             ? "access_denied"
@@ -553,6 +671,9 @@ export class RelaySessionManager {
           endpointTargeting: session.endpointTargeting,
           now,
         });
+        // Detached during the write: nothing to acknowledge. An inventory
+        // update never writes connection state, so there is nothing to undo.
+        if (this.sessionsBySocket.get(socket) !== session) return;
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -562,6 +683,21 @@ export class RelaySessionManager {
           }),
         );
       } catch (error) {
+        if (this.sessionsBySocket.get(socket) !== session) return;
+        if (error instanceof RelayRegistrationError && error.code === "access_denied") {
+          // The credential was revoked (or its owner removed) since the hello.
+          socket.send(
+            encodeRelayServerControlMessage({
+              type: "protocol.error",
+              failure: "protocol_error",
+              message: "access_denied",
+              requestId: message.id,
+            }),
+          );
+          socket.close(1008, "access_denied");
+          await this.removeSession(socket, now);
+          return;
+        }
         const messageText =
           error instanceof RelayRegistrationError ? error.message : "inventory update failed";
         socket.send(
@@ -645,6 +781,17 @@ export class RelaySessionManager {
       message.type === "exec.done"
     ) {
       this.handleExecControl(session, message);
+      return;
+    }
+
+    if (
+      message.type === "term.spawned" ||
+      message.type === "supervised.rejected" ||
+      message.type === "supervised.accepted" ||
+      message.type === "supervised.declined" ||
+      message.type === "supervised.done"
+    ) {
+      this.handleSupervisedControl(session, message);
     }
   }
 
@@ -671,6 +818,14 @@ export class RelaySessionManager {
           parsed.metadata.type === "exec.stdout" ? "stdout" : "stderr",
           parsed.body,
         );
+        return;
+      }
+      if (parsed.metadata.type === "supervised.output") {
+        // The record keeps it only when output was requested and the command
+        // has exited without review (see `onOutput`).
+        session.supervisedById
+          .get(parsed.metadata.commandId)
+          ?.onOutput(parsed.metadata.part, parsed.body);
       }
     } catch (error) {
       const target = interactiveTargetFromBinary(frame);
@@ -682,6 +837,11 @@ export class RelaySessionManager {
         const session = this.sessionsBySocket.get(socket);
         const command = session?.commandsById.get(target.id);
         if (session && command?.status === "running") this.cancelTrackedCommand(session, command);
+      } else if (target?.kind === "supervised") {
+        const session = this.sessionsBySocket.get(socket);
+        const supervised = session?.supervisedById.get(target.id);
+        const terminal = supervised ? session?.terminalsById.get(supervised.terminalId) : undefined;
+        if (session && terminal) this.closeTerminal(session, terminal, true, "closed");
       }
       console.error(
         "[relay] binary frame rejected",
@@ -744,15 +904,46 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
-    return async () => {
-      await prisma.cliDevice.update({
-        where: { id: cliDeviceId },
-        data: { status: cliStatus, lastDisconnectedAt: now },
-        select: { id: true },
-      });
-      await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
-      this.poolMemberRecovery.wake();
-    };
+    return () => this.writeDeviceDisconnected(cliDeviceId, { now, cliStatus, failureClass });
+  }
+
+  /**
+   * Persists that no session serves this device. `updateMany` because the
+   * device may have been deleted (its sessions are closed right after).
+   */
+  private async writeDeviceDisconnected(
+    cliDeviceId: string,
+    {
+      now,
+      cliStatus,
+      failureClass,
+    }: {
+      now: Date;
+      cliStatus: "DISCONNECTED" | "STALE";
+      failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+    },
+  ) {
+    await prisma.cliDevice.updateMany({
+      where: { id: cliDeviceId },
+      data: { status: cliStatus, lastDisconnectedAt: now },
+    });
+    await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
+    this.poolMemberRecovery.wake();
+  }
+
+  /**
+   * A hello's registration committed (device CONNECTED) after its session was
+   * detached. The session never entered routing; undo the connected status
+   * unless another live session now owns the device (its own registration
+   * wrote CONNECTED and routing points at it).
+   */
+  private async settleDetachedRegistration(cliDeviceId: string, now: Date) {
+    if (this.sessionsByCliDeviceId.has(cliDeviceId)) return;
+    await this.writeDeviceDisconnected(cliDeviceId, {
+      now,
+      cliStatus: "DISCONNECTED",
+      failureClass: "WEBSOCKET_DISCONNECTED",
+    });
   }
 
   async checkStaleSessions(now = new Date()) {
@@ -880,22 +1071,118 @@ export class RelaySessionManager {
   async onCliFeatureGrantsChanged(cliDeviceId: string) {
     const device = await prisma.cliDevice.findUnique({
       where: { id: cliDeviceId },
-      select: { allowHumanTerminal: true, allowMcpCommands: true },
+      select: { allowHumanTerminal: true, mcpCommandMode: true },
     });
     this.applyFeatureGrants(cliDeviceId, {
       allowHumanTerminal: device?.allowHumanTerminal === true,
-      allowMcpCommands: device?.allowMcpCommands === true,
+      mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
     });
+  }
+
+  /**
+   * Closes every relay socket, registered or not, that authenticated with one
+   * of these credentials. Called after the revocation commits (re-login
+   * reattach, CLI token revoke, device or user deletion). Websocket auth
+   * refuses the revoked secret from then on, and registration re-checks it
+   * inside its transaction, so a socket that authenticated just before the
+   * commit but opened after this call is refused at its hello. A hello whose
+   * registration was in flight when its socket was closed here does not enter
+   * routing (see the hello handler's detach check).
+   *
+   * Per-process: sockets held by another server replica are not reached here;
+   * they are refused at their next hello or inventory update.
+   */
+  async closeSessionsForRevokedCredentials(
+    revoked: { kind: CliWebsocketIdentity["kind"]; ids: readonly string[] },
+    now = new Date(),
+  ) {
+    if (revoked.ids.length === 0) return;
+    const ids = new Set(revoked.ids);
+    await this.closeSessionsMatching(
+      (session) => session.identity.kind === revoked.kind && ids.has(session.identity.id),
+      now,
+    );
+  }
+
+  /**
+   * Closes every relay socket, registered or not, whose authenticated
+   * identity belongs to a user that was just deleted. Matched by
+   * `identity.userId` (every live session carries it), not by a credential-id
+   * snapshot, so a credential minted between any snapshot and the delete is
+   * covered too. Called after the user row's delete committed, through
+   * `@ws-model-proxy/auth/user-deletion-listeners`, by every user-delete
+   * path: the dashboard `users.remove` procedure, Better Auth's
+   * `user.delete.before` hook (which performs the delete itself) and the
+   * user-deletion sweeper that finishes a pending delete.
+   *
+   * Also called when a deletion is marked (`onUserDeletionMarked`), before
+   * the user row is gone.
+   *
+   * Per-process: sockets held by another replica are not reached here. From
+   * the mark on, credential authentication and relay registration refuse the
+   * user (`userCredentialAccessBlocked`), so that replica refuses them at the
+   * next hello or inventory update and websocket auth refuses any reconnect;
+   * the credential rows cascade with the user once the deletion completes.
+   * Same exception in this process for CLI relay sockets only: a registration
+   * whose owner check read the user before the mark and whose in-memory
+   * register runs after this close leaves a live socket. It grants the owner
+   * nothing (every model, MCP and command admission re-reads the marker) and
+   * is refused at its next hello or inventory update. Browser terminal
+   * sockets have no such exception: they register (pending) before their
+   * admission read, so `TerminalBrowserHub.revokeTerminalAccessForUser`
+   * closes every one that is registered, and a later one's read sees the
+   * mark (see `admitBrowserConnection`). Relay identities are CLI
+   * credentials owned by `userId`; impersonation (Better Auth
+   * `session.impersonatedBy`) exists only on browser sessions.
+   */
+  async closeSessionsForUser(userId: string, now = new Date()) {
+    await this.closeSessionsMatching((session) => session.identity.userId === userId, now);
+  }
+
+  private async closeSessionsMatching(matches: (session: SessionState) => boolean, now: Date) {
+    const sessions = [...this.sessionsBySocket.values()].filter(matches);
+    // Close and detach every matching socket before any database write, so a
+    // failed or slow status write cannot leave a later socket open.
+    const writes: Array<() => Promise<void>> = [];
+    for (const session of sessions) {
+      this.teardownInteractiveWork(session);
+      if (session.socket.readyState === WS_READY_STATE_OPEN) {
+        session.socket.send(
+          encodeRelayServerControlMessage({
+            type: "protocol.error",
+            failure: "protocol_error",
+            message: "access_denied",
+          }),
+        );
+        session.socket.close(1008, "access_denied");
+      }
+      const write = this.detachSession(session.socket, {
+        now,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      });
+      if (write) writes.push(write);
+    }
+    for (const write of writes) {
+      try {
+        await write();
+      } catch (error) {
+        console.error(
+          "[relay] revoked session status write failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
+    }
   }
 
   applyFeatureGrants(
     cliDeviceId: string,
-    grants: { allowHumanTerminal: boolean; allowMcpCommands: boolean },
+    grants: { allowHumanTerminal: boolean; mcpCommandMode: McpCommandModeName },
   ) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
     session.allowHumanTerminal = grants.allowHumanTerminal;
-    session.allowMcpCommands = grants.allowMcpCommands;
+    session.mcpCommandMode = grants.mcpCommandMode;
     this.reconcileInteractiveGrants(session);
   }
 
@@ -908,7 +1195,8 @@ export class RelaySessionManager {
         protocolVersion: session.protocolVersion,
         cliVersion: session.cliVersion,
         humanTerminal: session.features?.humanTerminal ?? false,
-        mcpCommands: session.features?.mcpCommands ?? false,
+        mcpCommandMode: session.features?.mcpCommandMode ?? "off",
+        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
         terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
@@ -925,7 +1213,8 @@ export class RelaySessionManager {
     let cli = 0;
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        if (terminal.phase === "pending") continue;
+        // Supervised terminals have their own limits (see cli-commands.ts).
+        if (terminal.phase === "pending" || terminal.origin === "agent") continue;
         if (terminal.userId === userId) user += 1;
         if (terminal.cliDeviceId === cliDeviceId) cli += 1;
       }
@@ -950,31 +1239,42 @@ export class RelaySessionManager {
   ): Array<{
     terminalId: string;
     cliDeviceId: string;
-    label: string;
     /** Kept for one release: viewerCount > 0. */
     viewerAttached: boolean;
     viewerCount: number;
     attachedHere: boolean;
     writerHere: boolean;
+    origin: "user" | "agent";
+    /** Present for agent terminals. Server-asserted request details. */
+    supervised?: SupervisedTerminalListing;
   }> {
     const terminals: ReturnType<RelaySessionManager["listTerminalsForUser"]> = [];
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
+        // A supervised terminal is listed once the CLI spawned it: before
+        // that there is nothing to attach to.
+        if (terminal.origin === "agent" && terminal.phase !== "open") continue;
         const writer = terminalWriterViewerId(terminal);
         const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
         terminals.push({
           terminalId: terminal.terminalId,
           cliDeviceId: terminal.cliDeviceId,
-          label: terminal.label,
           viewerAttached: terminal.viewers.size > 0,
           viewerCount: terminal.viewers.size,
           attachedHere: connId !== undefined && connViewerIds(terminal, connId).length > 0,
           writerHere: connId !== undefined && writerConn === connId,
+          origin: terminal.origin,
+          ...(terminal.supervised ? { supervised: terminal.supervised.listing() } : {}),
         });
       }
     }
     return terminals;
+  }
+
+  /** Tell the browser hub that this user's terminal list changed. */
+  notifyTerminalListChanged(userId: string) {
+    terminalBridge?.onTerminalEvent({ type: "list_changed", userId });
   }
 
   /**
@@ -987,7 +1287,6 @@ export class RelaySessionManager {
     terminalId: string;
     userId: string;
     cliDeviceId: string;
-    label: string;
     cols: number;
     rows: number;
     browserPublicKey: string;
@@ -1014,7 +1313,6 @@ export class RelaySessionManager {
       terminalId: input.terminalId,
       userId: input.userId,
       cliDeviceId: input.cliDeviceId,
-      label: input.label,
       cols: input.cols,
       rows: input.rows,
       multiViewer,
@@ -1023,6 +1321,8 @@ export class RelaySessionManager {
       writerViewerId: null,
       phase: approvalRequired ? "pending" : "opening",
       createdAt: now,
+      origin: "user",
+      supervised: null,
     };
     if (multiViewer) {
       // 2.5: the opener joins the viewer set on term.opened.
@@ -1060,7 +1360,9 @@ export class RelaySessionManager {
     const located = this.terminalForUser(input.terminalId, input.userId);
     if (!located) return { ok: false, error: "not_found" };
     const { session, terminal } = located;
-    if (!this.canStartTerminal(session)) return { ok: false, error: "offline" };
+    const allowed =
+      terminal.origin === "agent" ? this.canRunSupervised(session) : this.canStartTerminal(session);
+    if (!allowed) return { ok: false, error: "offline" };
     const now = Date.now();
     if (!terminal.multiViewer) {
       const viewerId = mintViewerId(terminal);
@@ -1114,11 +1416,43 @@ export class RelaySessionManager {
     return true;
   }
 
+  /**
+   * "End session": the owner ends the terminal for everyone, whatever runs
+   * in it. On an agent terminal this is an explicit kill, also of a command
+   * that just started; declining is `declineTerminalFromBrowser`.
+   */
   closeTerminalFromBrowser(terminalId: string, userId: string): boolean {
     const located = this.terminalForUser(terminalId, userId);
     if (!located) return false;
-    this.closeTerminal(located.session, located.terminal, true);
+    this.closeTerminal(located.session, located.terminal, true, "user");
     return true;
+  }
+
+  /**
+   * "Decline" on an agent request. Never kills anything: a request still
+   * waiting for Enter is a stop request to the CLI, which declines it unless
+   * an Enter came first; a command whose Enter came first keeps running.
+   * The declining socket stays attached (if it was) and hears the outcome:
+   * the exit (declined) or a `decline` event saying the command started.
+   */
+  declineTerminalFromBrowser(
+    terminalId: string,
+    userId: string,
+    connId: string,
+  ): "requested" | "started" | "not_found" | "invalid" | "offline" {
+    const located = this.terminalForUser(terminalId, userId);
+    if (!located) return "not_found";
+    const { terminal } = located;
+    if (!terminal.supervised) return "invalid";
+    const answer = terminal.supervised.requestDecline();
+    if (answer === "requested") {
+      terminal.decliners ??= new Set();
+      terminal.decliners.add(connId);
+      return "requested";
+    }
+    if (answer === "started") return "started";
+    if (answer === "unavailable") return "offline";
+    return "not_found";
   }
 
   /** On 2.5 the server stamps the viewer id of this socket's pending attachment. */
@@ -1136,7 +1470,7 @@ export class RelaySessionManager {
       viewerId = pendingViewerIdForConn(terminal, connId);
       if (!viewerId) return "not_found";
     }
-    if (!this.canSignalTerminal(session)) return "offline";
+    if (!this.canSignalTerminal(session, terminal)) return "offline";
     this.sendControl(session, {
       type: "term.auth",
       terminalId,
@@ -1161,7 +1495,7 @@ export class RelaySessionManager {
     if (!located) return "missing";
     const viewerId = attachedViewerIdForConn(located.terminal, connId);
     if (!viewerId) return "missing";
-    if (!this.canSignalTerminal(located.session)) return "missing";
+    if (!this.canSignalTerminal(located.session, located.terminal)) return "missing";
     if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return "missing";
     // A slow CLI must not grow this process without a bound.
     if ((located.session.socket.bufferedAmount ?? 0) > CLI_SEALED_BUFFER_LIMIT) return "dropped";
@@ -1180,14 +1514,135 @@ export class RelaySessionManager {
     const session = this.sessionsByCliDeviceId.get(command.cliDeviceId);
     if (!session || !this.canStartExec(session)) return false;
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
-    session.commandsById.set(command.commandId, command);
-    this.sendControl(session, {
+    // Encoded first: a string the CLI could not read throws here, before
+    // anything is registered or sent.
+    const frame = encodeRelayServerControlMessage({
       type: "exec.start",
       commandId: command.commandId,
       command: start.command,
       ...(start.cwd !== undefined ? { cwd: start.cwd } : {}),
     });
+    session.commandsById.set(command.commandId, command);
+    session.socket.send(frame);
     return true;
+  }
+
+  /**
+   * Register a supervised terminal and send `term.spawn`. False means no
+   * frame was sent and nothing was registered. The terminal is listed once
+   * the CLI answers `term.spawned`.
+   */
+  dispatchSupervisedSpawn(
+    command: TrackedSupervisedCommand,
+    spawn: {
+      command: string;
+      cwd?: string;
+      reason?: string;
+      requester: string;
+      shareOutput: boolean;
+    },
+  ): boolean {
+    if (this.relayDrain) return false;
+    const session = this.sessionsByCliDeviceId.get(command.cliDeviceId);
+    if (!session || !this.canRunSupervised(session)) return false;
+    if (this.hasTerminal(command.terminalId) || session.supervisedById.has(command.commandId)) {
+      return false;
+    }
+    // Encoded first: a string the CLI could not read throws here, before
+    // anything is registered or sent.
+    const frame = encodeRelayServerControlMessage({
+      type: "term.spawn",
+      terminalId: command.terminalId,
+      commandId: command.commandId,
+      command: spawn.command,
+      ...(spawn.cwd !== undefined ? { cwd: spawn.cwd } : {}),
+      ...(spawn.reason !== undefined ? { reason: spawn.reason } : {}),
+      requester: spawn.requester,
+      shareOutput: spawn.shareOutput,
+    });
+    const terminal: TerminalRecord = {
+      terminalId: command.terminalId,
+      userId: command.userId,
+      cliDeviceId: command.cliDeviceId,
+      cols: 80,
+      rows: 24,
+      multiViewer: true,
+      viewers: new Map(),
+      pendingViewers: new Map(),
+      writerViewerId: null,
+      phase: "opening",
+      createdAt: Date.now(),
+      origin: "agent",
+      supervised: command,
+    };
+    session.terminalsById.set(terminal.terminalId, terminal);
+    session.supervisedById.set(command.commandId, command);
+    session.socket.send(frame);
+    return true;
+  }
+
+  /**
+   * End a supervised command's terminal from the server side (confirm or
+   * review deadline, token revoked or narrowed, review submitted). The CLI
+   * kills whatever runs and drops the session; viewers see the exit.
+   */
+  cancelSupervised(
+    cliDeviceId: string,
+    commandId: string,
+    cause: SupervisedTerminalGoneCause = "closed",
+  ) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    const supervised = session?.supervisedById.get(commandId);
+    if (!session || !supervised) return;
+    const terminal = session.terminalsById.get(supervised.terminalId);
+    session.supervisedById.delete(commandId);
+    if (session.socket.readyState === WS_READY_STATE_OPEN) {
+      this.sendControl(session, { type: "supervised.cancel", commandId });
+      this.awaitSupervisedEnd(session, supervised);
+    }
+    // The record settles first, so the exit carries its final status.
+    supervised.onTerminalGone(cause);
+    if (terminal) {
+      session.terminalsById.delete(terminal.terminalId);
+      terminalBridge?.onTerminalEvent({
+        type: "exit",
+        terminalId: terminal.terminalId,
+        connIds: terminalConnIds(terminal),
+        ...supervisedExitFields(supervised),
+      });
+    }
+    this.notifyTerminalListChanged(supervised.userId);
+  }
+
+  /**
+   * Ask the CLI to stop a supervised request that still waits for Enter
+   * (confirm deadline or browser decline). Nothing is torn down here: the
+   * CLI answers with `supervised.declined` + `term.exit`, or with the
+   * `supervised.accepted` it already sent if the Enter came first.
+   */
+  requestSupervisedStop(
+    cliDeviceId: string,
+    commandId: string,
+    reason: "expire" | "decline",
+  ): boolean {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session?.supervisedById.has(commandId)) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    this.sendControl(session, { type: "supervised.cancel", commandId, reason });
+    return true;
+  }
+
+  /** Keep listening for the CLI's last word on a terminal the server ended. */
+  private awaitSupervisedEnd(session: SessionState, supervised: TrackedSupervisedCommand) {
+    session.endingSupervised.delete(supervised.terminalId);
+    session.endingSupervised.set(supervised.terminalId, supervised);
+    // Bounded: the CLI answers every close with `term.exit`; a CLI that does
+    // not only loses the "had it started" detail for its oldest entries.
+    while (session.endingSupervised.size > ENDING_SUPERVISED_MAX) {
+      const oldest = session.endingSupervised.keys().next().value;
+      if (oldest === undefined) break;
+      session.endingSupervised.delete(oldest);
+    }
   }
 
   forgetCommand(cliDeviceId: string, commandId: string) {
@@ -1458,27 +1913,71 @@ export class RelaySessionManager {
     );
   }
 
-  private canSignalTerminal(session: SessionState): boolean {
+  /**
+   * Whether the CLI can hear terminal frames. A human terminal needs the
+   * CLI's browser-terminal switch; a supervised one only a 2.6 relay.
+   * Without a terminal, whether any terminal frame may be sent at all.
+   */
+  private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
+    if (!relayProtocolAtLeast(session.protocolVersion, "2.6")) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    if (terminal?.origin === "agent") return true;
+    if (terminal === undefined) return true;
+    return session.features?.humanTerminal === true;
+  }
+
+  /** The lower of the dashboard grant and the CLI's own mode. */
+  private effectiveCommandMode(session: SessionState): McpCommandModeName {
+    return lowestMcpCommandMode(session.mcpCommandMode, session.features?.mcpCommandMode);
+  }
+
+  /**
+   * Why a command start that passed its checks was then refused at the
+   * dispatch gate by the command mode: the dashboard grant or the CLI's own
+   * mode changed meanwhile. Null when the mode still allows it (the refusal
+   * was something else: offline, draining, ...).
+   */
+  commandModeRefusal(
+    cliDeviceId: string,
+    kind: "headless" | "supervised",
+  ): "grant_disabled" | "feature_disabled" | "supervised_only" | null {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session) return null;
+    const allows = kind === "headless" ? allowsHeadlessCommands : allowsSupervisedCommands;
+    const grant = session.mcpCommandMode;
+    if (!allows(grant)) return grant === "off" ? "grant_disabled" : "supervised_only";
+    const reported = session.features?.mcpCommandMode ?? "off";
+    if (!allows(reported)) return reported === "off" ? "feature_disabled" : "supervised_only";
+    return null;
+  }
+
+  /** Supervised terminals: MCP command mode, not the human terminal grant. */
+  private supervisedPolicyAllows(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.features?.humanTerminal === true &&
-      session.socket.readyState === WS_READY_STATE_OPEN
+      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      allowsSupervisedCommands(this.effectiveCommandMode(session)) &&
+      session.features?.terminalSupported === true &&
+      session.terminalPublicKey !== null
+    );
+  }
+
+  private canRunSupervised(session: SessionState): boolean {
+    return (
+      this.supervisedPolicyAllows(session) && session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
 
   private canStartExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.allowMcpCommands &&
-      session.features?.mcpCommands === true &&
+      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      allowsHeadlessCommands(this.effectiveCommandMode(session)) &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
 
   private canSignalExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.features?.mcpCommands === true &&
+      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
@@ -1490,49 +1989,73 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
     if (!terminalOk) {
-      const signal =
-        relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-        session.features?.humanTerminal === true &&
-        session.socket.readyState === WS_READY_STATE_OPEN;
-      this.closeAllTerminals(session, signal);
+      this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "user");
+    }
+    // Supervised terminals follow the MCP command mode, not the human grant.
+    if (!this.supervisedPolicyAllows(session)) {
+      this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "agent");
     }
     const execOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.allowMcpCommands &&
-      session.features?.mcpCommands === true;
+      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
   }
 
   private teardownInteractiveWork(session: SessionState) {
-    const signalTerminals =
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.features?.humanTerminal === true &&
-      session.socket.readyState === WS_READY_STATE_OPEN;
-    this.closeAllTerminals(session, signalTerminals);
+    this.closeAllTerminals(session, this.canSignalTerminal(session), "disconnected");
     this.cancelAllCommands(session);
   }
 
-  private closeAllTerminals(session: SessionState, signalCli: boolean) {
+  private closeAllTerminals(
+    session: SessionState,
+    signalCli: boolean,
+    cause: SupervisedTerminalGoneCause,
+    origin?: TerminalRecord["origin"],
+  ) {
     for (const terminal of [...session.terminalsById.values()]) {
-      this.closeTerminal(session, terminal, signalCli);
+      if (origin !== undefined && terminal.origin !== origin) continue;
+      this.closeTerminal(session, terminal, signalCli, cause);
     }
   }
 
-  private closeTerminal(session: SessionState, terminal: TerminalRecord, signalCli: boolean) {
+  /**
+   * Forget a terminal, tell its viewers it exited, and optionally tell the
+   * CLI to close it (`term.close` also ends a supervised terminal). A
+   * supervised terminal's command record hears why.
+   */
+  private closeTerminal(
+    session: SessionState,
+    terminal: TerminalRecord,
+    signalCli: boolean,
+    cause: SupervisedTerminalGoneCause = "closed",
+  ) {
     session.terminalsById.delete(terminal.terminalId);
     if (signalCli && session.socket.readyState === WS_READY_STATE_OPEN) {
       this.sendControl(session, { type: "term.close", terminalId: terminal.terminalId });
+    }
+    const supervised = terminal.supervised;
+    if (supervised) {
+      if (session.supervisedById.get(supervised.commandId) === supervised) {
+        session.supervisedById.delete(supervised.commandId);
+      }
+      if (signalCli && session.socket.readyState === WS_READY_STATE_OPEN) {
+        this.awaitSupervisedEnd(session, supervised);
+      }
+      // The record settles first, so the exit carries its final status.
+      supervised.onTerminalGone(cause);
     }
     terminalBridge?.onTerminalEvent({
       type: "exit",
       terminalId: terminal.terminalId,
       connIds: terminalConnIds(terminal),
+      ...(supervised ? supervisedExitFields(supervised) : {}),
     });
+    if (supervised) this.notifyTerminalListChanged(terminal.userId);
   }
 
   /** 2.4: the new viewer takes the terminal and every other tab hears `detached`. */
@@ -1560,7 +2083,7 @@ export class RelaySessionManager {
     if (!wasViewer && !wasPending) return false;
     const writerLeft = terminal.writerViewerId === viewerId;
     if (writerLeft) terminal.writerViewerId = null;
-    if (this.canSignalTerminal(session)) {
+    if (this.canSignalTerminal(session, terminal)) {
       if (terminal.multiViewer) {
         this.sendControl(session, {
           type: "term.detach",
@@ -1657,6 +2180,7 @@ export class RelaySessionManager {
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
+        terminal.decliners?.delete(connId);
         for (const viewerId of connViewerIds(terminal, connId)) {
           this.removeViewer(session, terminal, viewerId);
         }
@@ -1731,6 +2255,15 @@ export class RelaySessionManager {
   ) {
     const terminal = session.terminalsById.get(message.terminalId);
     if (!terminal) {
+      if (message.type === "term.exit") {
+        // The CLI's last word on a supervised terminal the server ended.
+        const ending = session.endingSupervised.get(message.terminalId);
+        if (ending) {
+          session.endingSupervised.delete(message.terminalId);
+          ending.onLateReport("settled");
+        }
+        return;
+      }
       // A late open/attach/pending for a terminal we no longer track (for
       // example one whose handshake expired) would otherwise leave a shell
       // with no server-side owner. Ask the CLI to close it; the CLI treats a
@@ -1762,13 +2295,31 @@ export class RelaySessionManager {
     }
     if (message.type === "term.exit") {
       session.terminalsById.delete(terminal.terminalId);
+      const supervised = terminal.supervised;
+      if (supervised) {
+        if (session.supervisedById.get(supervised.commandId) === supervised) {
+          session.supervisedById.delete(supervised.commandId);
+        }
+        // The record settles first, so the exit carries its final status.
+        supervised.onTerminalGone("exit");
+      }
       terminalBridge?.onTerminalEvent({
         type: "exit",
         terminalId: terminal.terminalId,
         connIds: terminalConnIds(terminal),
         ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
         ...(message.signal !== undefined ? { signal: message.signal } : {}),
+        ...(supervised ? { supervisedStatus: supervised.listing().status } : {}),
       });
+      if (supervised) this.notifyTerminalListChanged(terminal.userId);
+      return;
+    }
+    // A supervised terminal is spawned with `term.spawn`, never opened by a
+    // browser; before `term.spawned` nothing on it can be attached.
+    if (
+      terminal.origin === "agent" &&
+      (message.type === "term.opened" || terminal.phase !== "open")
+    ) {
       return;
     }
     if (terminal.multiViewer) {
@@ -1982,6 +2533,103 @@ export class RelaySessionManager {
   }
 
   /**
+   * CLI reports for a supervised command. Only the command the server
+   * dispatched to this very session is touched; a frame naming another
+   * command id is dropped.
+   */
+  private handleSupervisedControl(
+    session: SessionState,
+    message: Extract<
+      RelayClientControlMessage,
+      {
+        type:
+          | "term.spawned"
+          | "supervised.rejected"
+          | "supervised.accepted"
+          | "supervised.declined"
+          | "supervised.done";
+      }
+    >,
+  ) {
+    const supervised = session.supervisedById.get(message.commandId);
+    if (!supervised) {
+      // A spawn the server no longer tracks (cancelled meanwhile): end it.
+      if (message.type === "term.spawned" && this.canSignalTerminal(session)) {
+        this.sendControl(session, { type: "term.close", terminalId: message.terminalId });
+      }
+      const ending = [...session.endingSupervised.values()].find(
+        (candidate) => candidate.commandId === message.commandId,
+      );
+      if (ending && message.type === "supervised.accepted") {
+        ending.onLateReport("accepted");
+      } else if (
+        ending &&
+        (message.type === "supervised.declined" || message.type === "supervised.rejected")
+      ) {
+        session.endingSupervised.delete(ending.terminalId);
+        ending.onLateReport("settled");
+      }
+      return;
+    }
+    const terminal = session.terminalsById.get(supervised.terminalId);
+    if (message.type === "term.spawned") {
+      if (message.terminalId !== supervised.terminalId || !terminal) return;
+      if (terminal.phase === "open") return;
+      terminal.phase = "open";
+      supervised.onSpawned();
+      this.notifyTerminalListChanged(supervised.userId);
+      return;
+    }
+    if (message.type === "supervised.rejected") {
+      // Nothing was spawned, so no term.exit follows.
+      session.supervisedById.delete(supervised.commandId);
+      supervised.onRejected(message.reason);
+      if (terminal) {
+        session.terminalsById.delete(terminal.terminalId);
+        terminalBridge?.onTerminalEvent({
+          type: "exit",
+          terminalId: terminal.terminalId,
+          connIds: terminalConnIds(terminal),
+          supervisedStatus: supervised.listing().status,
+        });
+      }
+      this.notifyTerminalListChanged(supervised.userId);
+      return;
+    }
+    if (message.type === "supervised.accepted") {
+      const wasWaiting = supervised.listing().status === "awaiting_user";
+      supervised.onAccepted();
+      // A Decline still out lost to this Enter: tell those tabs it started
+      // (once: a repeated `accepted` changes nothing).
+      const decliners = terminal?.decliners;
+      if (
+        terminal &&
+        decliners &&
+        decliners.size > 0 &&
+        wasWaiting &&
+        supervised.listing().status === "running"
+      ) {
+        terminalBridge?.onTerminalEvent({
+          type: "decline",
+          terminalId: terminal.terminalId,
+          connIds: [...decliners],
+          outcome: "started",
+        });
+      }
+    } else if (message.type === "supervised.declined") {
+      supervised.onDeclined();
+    } else {
+      supervised.onDone({
+        ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
+        ...(message.signal !== undefined ? { signal: message.signal } : {}),
+        review: message.review,
+        ...(message.outputBytes !== undefined ? { outputBytes: message.outputBytes } : {}),
+      });
+    }
+    this.notifyTerminalListChanged(supervised.userId);
+  }
+
+  /**
    * A term.* / exec.* frame that fails schema validation closes that terminal
    * or command only. Other malformed frames return false so the relay socket
    * still takes the protocol-error path.
@@ -1999,9 +2647,24 @@ export class RelaySessionManager {
     if (typeof type !== "string") return false;
     if (type.startsWith("term.")) {
       const terminalId = typeof record.terminalId === "string" ? record.terminalId : null;
-      const terminal = terminalId ? session.terminalsById.get(terminalId) : undefined;
-      if (terminal) this.closeTerminal(session, terminal, this.canSignalTerminal(session));
+      let terminal = terminalId ? session.terminalsById.get(terminalId) : undefined;
+      if (!terminal && typeof record.commandId === "string") {
+        const supervised = session.supervisedById.get(record.commandId);
+        terminal = supervised ? session.terminalsById.get(supervised.terminalId) : undefined;
+      }
+      if (terminal) {
+        this.closeTerminal(session, terminal, this.canSignalTerminal(session, terminal), "closed");
+      }
       console.error("[relay] malformed terminal frame");
+      return true;
+    }
+    if (type.startsWith("supervised.")) {
+      const commandId = typeof record.commandId === "string" ? record.commandId : null;
+      const supervised = commandId ? session.supervisedById.get(commandId) : undefined;
+      const terminal = supervised ? session.terminalsById.get(supervised.terminalId) : undefined;
+      if (terminal)
+        this.closeTerminal(session, terminal, this.canSignalTerminal(session), "closed");
+      console.error("[relay] malformed supervised-command frame");
       return true;
     }
     if (type.startsWith("exec.")) {

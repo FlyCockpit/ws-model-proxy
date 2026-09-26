@@ -7,6 +7,7 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import {
   effectiveProviderEgress,
   egressProviderAccountLabels,
@@ -349,6 +350,11 @@ export async function authenticateModelApiTokenSecret(
   if (!token || token.revokedAt || (token.expiresAt && token.expiresAt <= new Date())) {
     return null;
   }
+  const owner = await prisma.user.findUnique({
+    where: { id: token.userId },
+    select: { banned: true, banExpires: true, deletionRequestedAt: true },
+  });
+  if (!owner || userCredentialAccessBlocked(owner, new Date())) return null;
 
   const matches = verifyForwarderHmacDigest({
     purpose: "modelApiToken",

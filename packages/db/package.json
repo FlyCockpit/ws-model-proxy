@@ -16,11 +16,23 @@
     },
     "./postgres-notifications": {
       "default": "./src/postgres-notifications.ts"
+    },
+    "./capacity-lock-order": {
+      "default": "./src/capacity-lock-order.ts"
+    },
+    "./parent-deletion": {
+      "default": "./src/parent-deletion.ts"
+    },
+    "./parent-deletion-residual": {
+      "default": "./src/parent-deletion-residual.ts"
+    },
+    "./user-deletion-access": {
+      "default": "./src/user-deletion-access.ts"
     }
   },
   "scripts": {
     "check-types": "tsc --noEmit",
-    "db:push": "prisma db push && node scripts/apply-schema-hardening.mjs",
+    "db:push": "node scripts/push-schema.mjs && node scripts/apply-schema-hardening.mjs",
     "db:push:dangerous": "bash ../../scripts/db-push-dangerous-local.sh",
     "db:generate": "prisma generate",
     "db:validate": "prisma validate && prisma format --check && ../../scripts/test-docker-entrypoint-schema.sh && node scripts/verify-schema-hardening.mjs",
@@ -40,6 +52,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@types/pg": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
     "prisma": "^7.10.0",
     "typescript": "catalog:"

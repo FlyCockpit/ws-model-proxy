@@ -250,6 +250,8 @@
     "userRestored": "Usuario restaurado",
     "restoreFailed": "No se pudo restaurar ese usuario.",
     "userDeleted": "Usuario eliminado",
+    "userDeletePending": "Eliminación iniciada; la cuenta se quitará en breve",
+    "deletingBadge": "Eliminando",
     "deleteFailed": "No se pudo eliminar ese usuario.",
     "deleteTitle": "Eliminar este usuario?",
     "deleteDescription": "Esto elimina permanentemente la cuenta. No se puede deshacer.",

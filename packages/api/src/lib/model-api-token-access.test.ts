@@ -45,6 +45,9 @@ const db = prisma as unknown as {
   modelApiTokenAllowlistEntry: {
     findMany: MockInstance;
   };
+  user: {
+    findUnique: MockInstance;
+  };
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
@@ -138,6 +141,7 @@ describe("effectiveProviderEgress", () => {
 describe("modelApiTokenAccess", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.user.findUnique.mockResolvedValue({ banned: false, deletionRequestedAt: null });
   });
 
   describe("authenticateModelApiTokenSecret", () => {

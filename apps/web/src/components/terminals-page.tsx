@@ -10,6 +10,14 @@ import {
 } from "@ws-model-proxy/ui/components/alert-dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@ws-model-proxy/ui/components/command";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -22,14 +30,28 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@ws-model-proxy/ui/components/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { EllipsisVertical, Plus, ShieldAlert, ShieldCheck, SquareTerminal, X } from "lucide-react";
+import {
+  Bot,
+  EllipsisVertical,
+  Plus,
+  ShieldAlert,
+  ShieldCheck,
+  SquareTerminal,
+  X,
+} from "lucide-react";
 import { type ComponentProps, createContext, type ReactNode, useContext, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import {
+  AgentRequestPanel,
+  ReviewOutputDialog,
+  tabAwaitsReview,
+} from "@/components/supervised-request";
 import {
   cliIdentitiesNeedAttention,
   cliIdentitiesToShow,
@@ -40,11 +62,12 @@ import { TerminalStatusDot } from "@/components/terminal-status-dot";
 import { WideContent } from "@/components/wide-content";
 import { TERMINAL_GONE, type TerminalTab } from "@/hooks/use-terminal-sessions";
 import { deviceId, deviceText, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
+import { readCliDeviceFeatures } from "@/lib/cli-device-features";
 import {
-  featureReasonKey,
-  readCliDeviceFeatures,
-  terminalOpenBlockReason,
-} from "@/lib/cli-device-features";
+  type CliPickerOption,
+  cliPickerOption,
+  filterCliPickerOptions,
+} from "@/lib/terminal-cli-picker";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
 
@@ -56,6 +79,11 @@ function terminalRejectionLabel(t: (key: string) => string, reason: string | nul
 }
 
 const APPROVAL_COMMAND_PREFIX = "wsmp terminal approve";
+
+/** An agent request that is still waiting for Enter is declined, not ended. */
+function endSessionLabelKey(tab: TerminalTab | null): "decline" | "end" {
+  return tab?.origin === "agent" && tab.supervised?.status === "awaiting_user" ? "decline" : "end";
+}
 
 /**
  * False while another dashboard page hides the workspace. Menus and dialogs
@@ -91,80 +119,115 @@ function ChromeTextButton({ className, ...props }: ComponentProps<"button">) {
   );
 }
 
-/** The CLI picker. `trigger` is the element that opens it. */
+/** The searchable CLI picker. `trigger` is the element that opens it. */
 function NewTerminalMenu({
   trigger,
   children,
 }: {
-  trigger: ComponentProps<typeof DropdownMenuTrigger>["render"];
+  trigger: ComponentProps<typeof PopoverTrigger>["render"];
   children: ReactNode;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const workspace = useTerminalWorkspace();
   const visible = useContext(WorkspaceVisibleContext);
   const [open, setOpen] = useState(false);
-  if (!visible && open) setOpen(false);
+  const [query, setQuery] = useState("");
+  // Every close path (dismiss, pick, workspace hidden) goes through here so a
+  // search never outlives the popover.
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  if (!visible && open) close();
   const devices = workspace.devicesQuery.data ?? [];
+  const options = devices.flatMap((device): CliPickerOption[] => {
+    const id = deviceId(device);
+    if (!id) return [];
+    return [
+      cliPickerOption({
+        id,
+        displayName: deviceText(device, "displayName"),
+        slug: deviceText(device, "slug"),
+        reportedHostname: deviceText(device, "reportedHostname"),
+        terminal: readCliDeviceFeatures(device).features.terminal,
+        trust: workspace.cliTrust[id]?.status,
+      }),
+    ];
+  });
+  const filtered = filterCliPickerOptions(options, query);
   return (
-    <DropdownMenu
+    <Popover
       open={open}
       onOpenChange={(next) => {
         // The provider's CLI list outlives page visits; refresh availability
         // (a CLI may have come online) whenever the picker opens.
-        if (next) {
-          void workspace.devicesQuery.refetch();
-          void workspace.refreshClis();
+        if (!next) {
+          close();
+          return;
         }
-        setOpen(next);
+        void workspace.devicesQuery.refetch();
+        void workspace.refreshClis();
+        setOpen(true);
       }}
     >
-      <DropdownMenuTrigger render={trigger}>{children}</DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        {devices.length === 0 ? (
-          <p className="px-2 py-2 text-sm text-muted-foreground">
+      <PopoverTrigger render={trigger}>{children}</PopoverTrigger>
+      <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] p-0">
+        {options.length === 0 ? (
+          <p className="px-3 py-3 text-sm text-muted-foreground">
             {t("dashboard:terminals.emptyClis")}
           </p>
         ) : (
-          devices.map((device) => {
-            const id = deviceId(device);
-            if (!id) return null;
-            const features = readCliDeviceFeatures(device);
-            const block = terminalOpenBlockReason(features.features.terminal);
-            const trust = workspace.cliTrust[id]?.status;
-            const identityBlock =
-              trust === "changed"
-                ? "dashboard:terminals.rejection.identity_changed"
-                : trust === "invalid"
-                  ? "dashboard:terminals.rejection.identity_invalid"
-                  : null;
-            const label = deviceText(device, "label") ?? deviceText(device, "slug") ?? id;
-            return (
-              <DropdownMenuItem
-                key={id}
-                disabled={block !== null || identityBlock !== null}
-                className="min-h-11 items-start"
-                onClick={() => {
-                  if (block || identityBlock) return;
-                  workspace.openCli(id);
-                  setOpen(false);
-                }}
-              >
-                <span className="flex min-w-0 flex-col items-start gap-0.5">
-                  <span className="max-w-full truncate">{label}</span>
-                  {block ? (
-                    <span className="text-xs text-muted-foreground">
-                      {t(featureReasonKey(block))}
-                    </span>
-                  ) : identityBlock ? (
-                    <span className="text-xs text-destructive">{t(identityBlock)}</span>
-                  ) : null}
-                </span>
-              </DropdownMenuItem>
-            );
-          })
+          <Command shouldFilter={false} label={t("dashboard:terminals.cliList")}>
+            <CommandInput
+              placeholder={t("dashboard:terminals.cliSearch")}
+              value={query}
+              onValueChange={setQuery}
+              className="min-h-11 text-sm"
+            />
+            <CommandList>
+              {filtered.length === 0 ? (
+                <CommandEmpty>{t("dashboard:terminals.cliSearchEmpty")}</CommandEmpty>
+              ) : (
+                <CommandGroup>
+                  {filtered.map((option) => (
+                    <CommandItem
+                      key={option.id}
+                      value={option.id}
+                      disabled={option.blockKey !== null}
+                      className="min-h-11 items-start text-sm"
+                      onSelect={() => {
+                        if (option.blockKey) return;
+                        workspace.openCli(option.id);
+                        close();
+                      }}
+                    >
+                      <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
+                        <span className="max-w-full truncate">{option.name}</span>
+                        {option.slug && option.slug !== option.name ? (
+                          <span className="max-w-full truncate font-mono text-xs text-muted-foreground">
+                            {option.slug}
+                          </span>
+                        ) : null}
+                        {option.blockKey ? (
+                          <span
+                            className={cn(
+                              "text-xs",
+                              option.blockIsIdentity ? "text-destructive" : "text-muted-foreground",
+                            )}
+                          >
+                            {t(option.blockKey)}
+                          </span>
+                        ) : null}
+                      </span>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              )}
+            </CommandList>
+          </Command>
         )}
-      </DropdownMenuContent>
-    </DropdownMenu>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -181,7 +244,10 @@ function TabStrip({
   const identities = cliIdentitiesToShow(workspace.clis, workspace.cliTrust);
   const attention = cliIdentitiesNeedAttention(workspace.clis, workspace.cliTrust);
   const canEnd =
-    active?.terminalId != null && active.phase !== "exited" && active.phase !== "rejected";
+    active?.terminalId != null &&
+    active.phase !== "exited" &&
+    active.phase !== "rejected" &&
+    active.ending !== "pending";
   const addDisabled = !workspace.identityReady || workspace.devicesQuery.isPending;
   const visible = useContext(WorkspaceVisibleContext);
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -196,11 +262,16 @@ function TabStrip({
             return (
               <div
                 key={tab.localId}
+                data-origin={tab.origin}
                 className={cn(
                   "group flex shrink-0 items-center border-e border-(--term-border)",
                   selected
                     ? "bg-(--term-bg) text-(--term-fg) shadow-[inset_0_2px_0_var(--color-primary)]"
                     : "text-(--term-muted) hover:bg-(--term-hover) hover:text-(--term-fg)",
+                  tab.origin === "agent" &&
+                    (selected
+                      ? "shadow-[inset_0_2px_0_var(--color-amber-400)]"
+                      : "bg-amber-400/10 text-amber-200"),
                 )}
               >
                 <button
@@ -210,8 +281,15 @@ function TabStrip({
                   className="flex min-h-11 max-w-56 items-center gap-2 ps-3 pe-1 text-sm focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
                   onClick={() => workspace.selectTab(tab.localId)}
                 >
+                  {tab.origin === "agent" ? (
+                    <Bot className="size-4 shrink-0 text-amber-400" aria-hidden="true" />
+                  ) : null}
                   <TerminalStatusDot tab={tab} />
-                  <span className="truncate">{workspace.tabLabel(tab)}</span>
+                  <span className="truncate">
+                    {tab.origin === "agent"
+                      ? t("dashboard:agentRequests.tabLabel", { cli: workspace.tabLabel(tab) })
+                      : workspace.tabLabel(tab)}
+                  </span>
                 </button>
                 <ChromeButton
                   className={cn(
@@ -261,7 +339,9 @@ function TabStrip({
               className="min-h-11"
               onClick={() => onEnd(active.localId)}
             >
-              {t("dashboard:terminals.endSession")}
+              {endSessionLabelKey(active) === "decline"
+                ? t("dashboard:agentRequests.decline")
+                : t("dashboard:terminals.endSession")}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -334,6 +414,26 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
           </ChromeTextButton>
         </Banner>
       ) : null}
+      {active?.origin === "agent" ? (
+        <AgentRequestPanel
+          tab={active}
+          onView={() => workspace.selectTab(active.localId)}
+          onReviewOutputChange={(on) => workspace.setReviewOutput(active.localId, on)}
+        />
+      ) : null}
+      {active?.ending === "pending" ? (
+        <Banner>
+          <p className="min-w-0 text-(--term-muted)" role="status">
+            {t("dashboard:terminals.ending")}
+          </p>
+        </Banner>
+      ) : active?.ending === "failed" && active.phase !== "exited" ? (
+        <Banner tone="problem">
+          <p className="min-w-0" role="alert">
+            {t("dashboard:terminals.endFailed")}
+          </p>
+        </Banner>
+      ) : null}
       {active?.approvalCode ? <ApprovalNotice code={active.approvalCode} /> : null}
       {active?.phase === "rejected" && !active.approvalCode ? (
         <Banner tone="problem">
@@ -351,7 +451,7 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
           </p>
         </Banner>
       ) : null}
-      {active?.phase === "exited" ? (
+      {active?.phase === "exited" && active.origin !== "agent" ? (
         <Banner>
           <p className="min-w-0 text-(--term-muted)">
             {active.error === TERMINAL_GONE
@@ -490,6 +590,14 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
     setIdentitiesOpen(false);
   }
   const active = workspace.tabs.find((tab) => tab.localId === workspace.activeLocalId) ?? null;
+  const endKey = endSessionLabelKey(
+    workspace.tabs.find((tab) => tab.localId === endTarget) ?? null,
+  );
+  // One review at a time; the active tab's first.
+  const reviewTab =
+    (active && tabAwaitsReview(active) ? active : null) ??
+    workspace.tabs.find(tabAwaitsReview) ??
+    null;
   const devicesQuery = workspace.devicesQuery;
   const showSkeleton = devicesQuery.isPending && workspace.tabs.length === 0;
   // Open terminals stay usable when the CLI list fails; only the empty state needs it.
@@ -503,6 +611,7 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
         style={TERMINAL_CHROME_VARS}
         className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-(--term-bg) text-(--term-fg)"
       >
+        <h1 className="sr-only">{t("dashboard:terminals.title")}</h1>
         <TabStrip onEnd={setEndTarget} onShowIdentities={() => setIdentitiesOpen(true)} />
         <Notices onReviewIdentities={() => setIdentitiesOpen(true)} />
 
@@ -540,6 +649,13 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
         <StatusBar tab={active} />
 
         <IdentitiesDialog open={identitiesOpen} onOpenChange={setIdentitiesOpen} />
+        {visible && reviewTab ? (
+          <ReviewOutputDialog
+            key={`${reviewTab.localId}:${reviewTab.supervised?.commandId ?? ""}`}
+            tab={reviewTab}
+            onSettled={workspace.clearReviewCapture}
+          />
+        ) : null}
         <AlertDialog
           open={endTarget !== null}
           onOpenChange={(open) => {
@@ -548,9 +664,15 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
         >
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>{t("dashboard:terminals.endSessionTitle")}</AlertDialogTitle>
+              <AlertDialogTitle>
+                {endKey === "decline"
+                  ? t("dashboard:agentRequests.declineTitle")
+                  : t("dashboard:terminals.endSessionTitle")}
+              </AlertDialogTitle>
               <AlertDialogDescription>
-                {t("dashboard:terminals.endSessionDescription")}
+                {endKey === "decline"
+                  ? t("dashboard:agentRequests.declineDescription")
+                  : t("dashboard:terminals.endSessionDescription")}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
@@ -561,11 +683,17 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
                 variant="destructive"
                 className="min-h-11 w-full sm:w-auto"
                 onClick={() => {
-                  if (endTarget) workspace.endSession(endTarget);
+                  // The action is the one this dialog names: a Decline is
+                  // never sent as an End session (which would kill a command
+                  // whose Enter came first).
+                  if (endTarget && endKey === "decline") workspace.declineRequest(endTarget);
+                  else if (endTarget) workspace.endSession(endTarget);
                   setEndTarget(null);
                 }}
               >
-                {t("dashboard:terminals.endSession")}
+                {endKey === "decline"
+                  ? t("dashboard:agentRequests.decline")
+                  : t("dashboard:terminals.endSession")}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

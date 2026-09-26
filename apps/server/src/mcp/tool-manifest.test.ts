@@ -64,11 +64,14 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "model_api_tokens_preview",
   "cli_tokens_list",
   "relay_requests_list",
+  "overview_metrics",
+  "overview_health",
 ];
 
 /** Write catalog — exact names, verbatim. */
 const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_guarded_pool_create",
+  "forwarder_cli_device_rename",
   "forwarder_cli_metadata_remove",
   "forwarder_endpoint_metadata_remove",
   "forwarder_model_metadata_remove",
@@ -115,6 +118,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_pool_member_test",
   "forwarder_chat_completion_test",
   "forwarder_cli_command_run",
+  "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
 ];
 
@@ -141,6 +145,7 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_pool_member_test: "RUN",
   forwarder_chat_completion_test: "RUN",
   forwarder_cli_command_run: "RUN",
+  forwarder_cli_supervised_command_start: "RUN",
 });
 
 /** Exact catalog targets (name → target) for drift detection. */
@@ -168,7 +173,10 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   model_api_tokens_preview: "modelApiTokens.preview",
   cli_tokens_list: "cliCredentials.listTokens",
   relay_requests_list: "relayMetadata.listOwn",
+  overview_metrics: "overview.metrics",
+  overview_health: "overview.health",
   forwarder_guarded_pool_create: "forwarderManagement.createGuardedModelPool",
+  forwarder_cli_device_rename: "forwarderManagement.renameCliDevice",
   forwarder_cli_metadata_remove: "forwarderManagement.removeCliDeviceMetadata",
   forwarder_endpoint_metadata_remove: "forwarderManagement.removeEndpointMetadata",
   forwarder_model_metadata_remove: "forwarderManagement.removeDiscoveredModelMetadata",
@@ -216,6 +224,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_pool_member_test: "core:model-api/runPoolMemberTest",
   forwarder_chat_completion_test: "core:model-api/runChatCompletionDiagnostic",
   forwarder_cli_command_run: "core:forwarderCliCommandRun",
+  forwarder_cli_supervised_command_start: "core:forwarderCliSupervisedCommandStart",
   forwarder_cli_command_result: "core:forwarderCliCommandResult",
 });
 
@@ -245,13 +254,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 23 read + 48 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 25 read + 50 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(23);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(48);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(71);
+    expect(PLAN_READ_TOOLS).toHaveLength(25);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(50);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(75);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -326,6 +335,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "modelApiTokens.create",
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
+      "cliCredentials.deviceLoginRequest",
       "providerManagement.createCredential",
       "providerManagement.replaceCredential",
       "providerManagement.listUsageReport",
@@ -340,6 +350,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpTokens.updateMine",
       "mcpTokens.revokeMine",
       "forwarderManagement.setCliDeviceFeatureGrants",
+      "supervisedCommands.pending",
+      "supervisedCommands.submitOutput",
     ]) {
       expect(excluded.has(required)).toBe(true);
     }
@@ -416,7 +428,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     // Drive EVERY procedure-backed tool through the real dispatch path.
     let dispatched = 0;
     for (const tool of MCP_TOOL_MANIFEST) {
-      if (!tool.invokeProcedure) continue; // 4 extracted cores (2 diagnostics + 2 CLI commands)
+      if (!tool.invokeProcedure) continue; // 5 extracted cores (2 diagnostics + 3 CLI commands)
       const before = invoked.length;
       await tool.invokeProcedure(recordingClient, {});
       dispatched += 1;
@@ -426,9 +438,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 71 catalog entries − 4 core diagnostics = 67 procedure dispatches.
-    expect(dispatched).toBe(67);
-    expect(invoked).toHaveLength(67);
+    // 75 catalog entries − 5 extracted cores = 70 procedure dispatches.
+    expect(dispatched).toBe(70);
+    expect(invoked).toHaveLength(70);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

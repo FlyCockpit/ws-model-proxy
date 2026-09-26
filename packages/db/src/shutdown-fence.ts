@@ -136,6 +136,23 @@ export class DbRequestAbortFenceError extends DbShutdownFenceError {
 }
 
 /**
+ * Dispatch-level shutdown rejection (DbShutdownFenceError family): a
+ * dispatch-fenced client (`createStatementBoundedPrismaClient` in
+ * ./client-factory.ts) refused to write a statement to the wire, or to open a
+ * connection, because the global shutdown fence is armed. It reaches callers
+ * through the driver adapter, so a Prisma error may wrap it; code that must
+ * tell a shutdown stop from a failure checks {@link isDbShutdownFenceArmed}
+ * (the fence never disarms in production).
+ */
+export class DbDispatchFenceError extends DbShutdownFenceError {
+  constructor() {
+    super();
+    this.message = "database shutdown fence is active: SQL dispatch refused";
+    this.name = "DbDispatchFenceError";
+  }
+}
+
+/**
  * Prohibited-operation error (pass 7, user-decision terminal policy):
  * client extensions are NOT supported through the fenced shared client.
  * `$extends` can hand consumers derived shapes the proxy boundary cannot

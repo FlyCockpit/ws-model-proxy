@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import { adminProcedure, protectedProcedure } from "../index";
 
@@ -12,6 +13,49 @@ const deleteOwnInput = z
   .refine((input) => input.ids.length > 0 || input.createdBefore || input.createdAfter, {
     message: "Provide ids, createdBefore, or createdAfter.",
   });
+
+/**
+ * History deletion only removes TERMINAL requests. A PENDING request has not
+ * been counted in the usage rollups yet (its finalizer counts it in the same
+ * transaction as its terminal transition); deleting it would lose that
+ * increment and make its in-flight finalizer a no-op. In-flight rows stay and
+ * can be deleted once they finish.
+ */
+const TERMINAL_ONLY = {
+  status: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
+} satisfies Prisma.RelayRequestWhereInput;
+
+const RELAY_DELETE_BATCH = 500;
+
+/**
+ * Deletes matching (terminal) relay requests in id-ordered batches. Capacity
+ * lock order (@ws-model-proxy/db/capacity-lock-order): the DELETE's ON DELETE
+ * SET NULL rewrites the referencing admission_request rows, which an
+ * admitter locks before it updates their relay rows. The shared helper takes
+ * both kinds of row with SKIP LOCKED, so this delete never waits on a row an
+ * in-flight admission holds; such a row is left in place (it is reported by
+ * the returned count and can be deleted by a later request).
+ */
+async function deleteRelayRequestsInLockOrder(where: Prisma.RelayRequestWhereInput) {
+  let deletedCount = 0;
+  let after: string | undefined;
+  for (;;) {
+    const cursor = after;
+    const batch = await prisma.$transaction(async (tx) => {
+      const rows = await tx.relayRequest.findMany({
+        where: cursor === undefined ? where : { AND: [where, { id: { gt: cursor } }] },
+        select: { id: true },
+        orderBy: { id: "asc" },
+        take: RELAY_DELETE_BATCH,
+      });
+      const ids = rows.map((row) => row.id);
+      return { ids, deleted: await deleteTerminalRelayRequestsWithoutWaiting(tx, ids) };
+    });
+    deletedCount += batch.deleted;
+    if (batch.ids.length < RELAY_DELETE_BATCH) return deletedCount;
+    after = batch.ids.at(-1);
+  }
+}
 
 const pruneInput = z
   .object({
@@ -218,21 +262,20 @@ export const relayMetadataRouter = {
       });
     }
 
-    const result = await prisma.relayRequest.deleteMany({
-      where: {
-        userId: context.session.user.id,
-        ...(input.ids.length > 0 ? { id: { in: input.ids } } : {}),
-        ...(input.createdBefore || input.createdAfter
-          ? {
-              createdAt: {
-                ...(input.createdBefore ? { lt: input.createdBefore } : {}),
-                ...(input.createdAfter ? { gte: input.createdAfter } : {}),
-              },
-            }
-          : {}),
-      },
+    const deletedCount = await deleteRelayRequestsInLockOrder({
+      userId: context.session.user.id,
+      ...TERMINAL_ONLY,
+      ...(input.ids.length > 0 ? { id: { in: input.ids } } : {}),
+      ...(input.createdBefore || input.createdAfter
+        ? {
+            createdAt: {
+              ...(input.createdBefore ? { lt: input.createdBefore } : {}),
+              ...(input.createdAfter ? { gte: input.createdAfter } : {}),
+            },
+          }
+        : {}),
     });
-    return { deletedCount: result.count };
+    return { deletedCount };
   }),
 
   prune: adminProcedure.input(pruneInput).handler(async ({ input }) => {
@@ -242,19 +285,18 @@ export const relayMetadataRouter = {
       });
     }
 
-    const result = await prisma.relayRequest.deleteMany({
-      where: {
-        ...(input.ownerUserId ? { userId: input.ownerUserId } : {}),
-        ...(input.createdBefore || input.createdAfter
-          ? {
-              createdAt: {
-                ...(input.createdBefore ? { lt: input.createdBefore } : {}),
-                ...(input.createdAfter ? { gte: input.createdAfter } : {}),
-              },
-            }
-          : {}),
-      },
+    const deletedCount = await deleteRelayRequestsInLockOrder({
+      ...TERMINAL_ONLY,
+      ...(input.ownerUserId ? { userId: input.ownerUserId } : {}),
+      ...(input.createdBefore || input.createdAfter
+        ? {
+            createdAt: {
+              ...(input.createdBefore ? { lt: input.createdBefore } : {}),
+              ...(input.createdAfter ? { gte: input.createdAfter } : {}),
+            },
+          }
+        : {}),
     });
-    return { deletedCount: result.count };
+    return { deletedCount };
   }),
 };

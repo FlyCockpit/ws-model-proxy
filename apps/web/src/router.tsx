@@ -1,4 +1,4 @@
-import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query";
+import { QueryCache, QueryClient } from "@tanstack/react-query";
 import { createRouter } from "@tanstack/react-router";
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query";
 import { createIsomorphicFn } from "@tanstack/react-start";
@@ -9,7 +9,8 @@ import ErrorState from "./components/error-state";
 import Loader from "./components/loader";
 import i18n from "./i18n";
 import { routeTree } from "./routeTree.gen";
-import { friendly } from "./utils/friendly-error";
+import { type DeletionEntity, friendly } from "./utils/friendly-error";
+import { createAppMutationCache } from "./utils/mutation-error-toast";
 import { orpc } from "./utils/orpc";
 import { shouldRetryQuery } from "./utils/query-retry";
 
@@ -36,21 +37,15 @@ export function getRouter() {
         });
       },
     }),
-    mutationCache: new MutationCache({
-      // Surface mutation failures by default so no action ever fails silently.
-      // Mutations that handle their own errors (e.g. inline form errors) can
-      // opt out with `useMutation({ meta: { skipGlobalErrorToast: true } })`.
-      // Mutations that just want context-specific fallback copy (instead of the
-      // generic "Something didn't work") set
-      // `meta: { errorFallbackKey: "ns:key" }` — no per-call onError toast.
-      onError: (error, _vars, _ctx, mutation) => {
-        if (mutation.meta?.skipGlobalErrorToast) return;
-        const fallback = mutation.meta?.errorFallbackKey
-          ? i18n.t(mutation.meta.errorFallbackKey)
-          : undefined;
-        toast.error(friendly(error, fallback));
-      },
-    }),
+    // Surface mutation failures by default so no action ever fails silently.
+    // Mutations that handle their own errors (e.g. inline form errors) can
+    // opt out with `useMutation({ meta: { skipGlobalErrorToast: true } })`.
+    // Mutations that just want context-specific fallback copy (instead of the
+    // generic "Something didn't work") set
+    // `meta: { errorFallbackKey: "ns:key" }` — no per-call onError toast.
+    // Delete mutations set `meta: { deletionEntity }` so a structured
+    // deletion CONFLICT shows its specific copy (utils/mutation-error-toast).
+    mutationCache: createAppMutationCache((key) => i18n.t(key)),
   });
 
   const router = createRouter({
@@ -76,6 +71,13 @@ declare module "@tanstack/react-router" {
   interface Register {
     router: ReturnType<typeof getRouter>;
   }
+  interface StaticDataRouteOption {
+    /**
+     * Dashboard page geometry. "fill" pages (terminals, chat test) own the
+     * whole content pane; everything else renders in the padded container.
+     */
+    dashboardLayout?: "padded" | "fill";
+  }
 }
 
 declare module "@tanstack/react-query" {
@@ -90,6 +92,12 @@ declare module "@tanstack/react-query" {
        * called `toast.error(friendly(err, t("ns:key")))`.
        */
       errorFallbackKey?: string;
+      /**
+       * Set on delete mutations: a CONFLICT carrying a structured deletion
+       * reason (`data.reason`) toasts the entity's specific copy instead of
+       * the generic conflict message.
+       */
+      deletionEntity?: DeletionEntity;
     };
   }
 }

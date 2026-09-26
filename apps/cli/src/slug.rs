@@ -55,7 +55,15 @@ pub fn validate_slug(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// `seed` as a slug, or a generated `{fallback_prefix}-…` slug when it has too
+/// little usable text.
 pub fn slugify_seed(seed: &str, fallback_prefix: &str) -> String {
+    slugify(seed).unwrap_or_else(|| generated_slug(fallback_prefix))
+}
+
+/// `seed` lowercased with runs of other characters folded to one hyphen, or
+/// `None` when the result is not a valid slug. Deterministic.
+pub fn slugify(seed: &str) -> Option<String> {
     let mut output = String::new();
     let mut previous_hyphen = false;
     for ch in seed.trim().to_lowercase().chars() {
@@ -73,11 +81,7 @@ pub fn slugify_seed(seed: &str, fallback_prefix: &str) -> String {
     while output.ends_with('-') {
         output.pop();
     }
-    if validate_slug(&output).is_ok() {
-        output
-    } else {
-        generated_slug(fallback_prefix)
-    }
+    validate_slug(&output).ok().map(|()| output)
 }
 
 pub fn generated_slug(prefix: &str) -> String {
@@ -119,6 +123,14 @@ mod tests {
         assert!(validate_slug("admin").is_err());
         assert!(validate_slug("a--b").is_err());
         assert!(validate_slug("-abc").is_err());
+    }
+
+    #[test]
+    fn slugify_folds_a_hostname() {
+        assert_eq!(slugify("Desk-01.local").as_deref(), Some("desk-01-local"));
+        assert_eq!(slugify("  My Laptop  ").as_deref(), Some("my-laptop"));
+        assert_eq!(slugify("PC"), None);
+        assert_eq!(slugify("API"), None);
     }
 
     #[test]

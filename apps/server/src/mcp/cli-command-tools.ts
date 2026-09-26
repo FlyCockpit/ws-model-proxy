@@ -1,11 +1,17 @@
 import {
   type CliCommandSnapshot,
   snapshotCliCommand,
+  snapshotSupervisedCommand,
   startCliCommand,
+  startSupervisedCommand,
   waitCliCommand,
 } from "../relay/cli-commands.js";
 import type { McpRequestCredential } from "./cli-command-access.js";
-import { parseCliCommandSnapshot, presentCliCommand } from "./cli-command-output.js";
+import {
+  parseCliCommandSnapshot,
+  presentCliCommand,
+  presentSupervisedCommand,
+} from "./cli-command-output.js";
 
 type CliCommandDeps = {
   userId: string;
@@ -25,9 +31,21 @@ const CLI_REJECTION_MESSAGES = {
   grant_disabled: "CLI commands are disabled for this device",
   offline: "CLI is offline or does not support this protocol",
   feature_disabled: "CLI has MCP commands disabled in wsmp config",
+  supervised_only:
+    "This device allows only supervised commands; use forwarder_cli_supervised_command_start so a person confirms the command",
+  unsupported: "Supervised commands need a CLI with terminal support (Unix)",
   limit: "too many commands",
-  invalid_command: "command must be 1..=4096 bytes and contain no NUL",
+  invalid_command:
+    "command and cwd must be well-formed Unicode text (no unpaired surrogates), 1..=4096 UTF-8 bytes, and contain no NUL",
+  invalid_reason:
+    "reason must be well-formed Unicode text (no unpaired surrogates) of at most 500 characters (Unicode code points) and contain no NUL",
+  token_inactive:
+    "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
 } as const;
+
+/** Shown on the supervised tool: what the agent can and cannot learn. */
+export const CLI_SUPERVISED_COMMAND_NOTICE =
+  "Opens a terminal on the CLI that shows the person your reason and the exact command; nothing runs until they press Enter there, and they may decline. Poll forwarder_cli_command_result with the commandId (statuses: awaiting_user, running, awaiting_output_review, exited, declined, expired, cancelled, rejected; declined, expired and rejected never ran, and an ended request reports started: true, false, or null when not known yet). Output is returned only with shareOutput: true, and the person may review, edit, or redact it first; output.mode says which (shared, reviewed, redacted, private). Waiting for the person expires after 15 minutes.";
 
 export type CliCommandRejectionCode = keyof typeof CLI_REJECTION_MESSAGES;
 
@@ -150,6 +168,56 @@ export async function runForwarderCliCommand(
   return presentCliCommand(parsed, undefined);
 }
 
+export function adaptCliSupervisedStartInput(input: unknown): {
+  cliDeviceId: string;
+  command: string;
+  cwd?: string;
+  reason?: string;
+  shareOutput: boolean;
+} {
+  const record = asRecord(input) ?? {};
+  const cwd = record.cwd;
+  const reason = record.reason;
+  return {
+    cliDeviceId: typeof record.cliDeviceId === "string" ? record.cliDeviceId : "",
+    command: typeof record.command === "string" ? record.command : "",
+    ...(typeof cwd === "string" ? { cwd } : {}),
+    ...(typeof reason === "string" ? { reason } : {}),
+    shareOutput: record.shareOutput === true,
+  };
+}
+
+/**
+ * Ask a person to run a command in a supervised terminal on their CLI. The
+ * result is the request id; the outcome comes from forwarder_cli_command_result.
+ */
+export async function runForwarderCliSupervisedCommandStart(
+  input: unknown,
+  deps: CliCommandDeps,
+): Promise<unknown> {
+  const pat = requireCliPat(deps.credential);
+  const adapted = adaptCliSupervisedStartInput(input);
+  const started = await startSupervisedCommand({
+    userId: deps.userId,
+    tokenId: pat.tokenId,
+    expiresAt: pat.expiresAt,
+    cliDeviceId: adapted.cliDeviceId,
+    command: adapted.command,
+    ...(adapted.cwd !== undefined ? { cwd: adapted.cwd } : {}),
+    ...(adapted.reason !== undefined ? { reason: adapted.reason } : {}),
+    shareOutput: adapted.shareOutput,
+  });
+  if (!started.ok) throw new McpCliCommandRejectedError(started.error);
+  return {
+    commandId: started.commandId,
+    kind: "supervised",
+    status: "awaiting_user",
+    waitingUntil: started.expiresAt,
+    shareOutput: adapted.shareOutput,
+    next: "Ask the user to open Terminals in the dashboard and answer the agent request; then poll forwarder_cli_command_result.",
+  };
+}
+
 export function adaptCliCommandResultInput(input: unknown): {
   commandId: string;
   progress?: boolean;
@@ -168,6 +236,8 @@ export async function runForwarderCliCommandResult(
 ): Promise<unknown> {
   const pat = requireCliPat(deps.credential);
   const adapted = adaptCliCommandResultInput(input);
+  const supervised = snapshotSupervisedCommand(adapted.commandId, deps.userId, pat.tokenId);
+  if (supervised !== null) return presentSupervisedCommand(supervised);
   const raw = await snapshotCliCommand(adapted.commandId, deps.userId, pat.tokenId);
   if (raw == null) throw new McpCliCommandRejectedError("not_found");
   const parsed = parseCliCommandSnapshot(raw, adapted.commandId);

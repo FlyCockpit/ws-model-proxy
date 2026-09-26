@@ -10,6 +10,14 @@ export const TERMINAL_HKDF_LABEL_V2 = "wsmp-term-v2";
 export const TERMINAL_BROADCAST_LABEL = "wsmp-term-v2-out";
 export const TERMINAL_APPROVAL_LABEL_V2 = "wsmp-term-approve-v2";
 export const PLAINTEXT_OUTPUT_KEY = 0x03;
+/** Browser -> CLI: turn output review on (1) or off (0) for a supervised command. */
+export const PLAINTEXT_REVIEW_TOGGLE = 0x04;
+/** CLI -> browser, unicast: the exact output capture awaiting review. */
+export const PLAINTEXT_REVIEW_CAPTURE = 0x05;
+/** CLI -> browser: the terminal-wide review flag the CLI holds. */
+export const PLAINTEXT_REVIEW_STATE = 0x06;
+export const REVIEW_CAPTURE_HEAD_MAX = 8192;
+export const REVIEW_CAPTURE_TAIL_MAX = 40960;
 export const TERMINAL_CLI_IDENTITY_LABEL = "wsmp-term-cli-id-v1";
 const OUTPUT_KEY_PLAINTEXT_LENGTH = 1 + 4 + 32;
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -31,7 +39,9 @@ export type TerminalPlaintext =
 /** v2 plaintexts. `0x03` carries the shared output key and only arrives unicast. */
 export type TerminalPlaintextV2 =
   | TerminalPlaintext
-  | { kind: "outputKey"; epoch: number; key: Uint8Array };
+  | { kind: "outputKey"; epoch: number; key: Uint8Array }
+  | { kind: "reviewState"; on: boolean }
+  | { kind: "reviewCapture"; head: Uint8Array; tail: Uint8Array; totalBytes: number };
 
 export type TerminalSessionKeys = {
   ikm: Uint8Array;
@@ -582,8 +592,60 @@ export function encodeTerminalOutputKey(epoch: number, key: Uint8Array): Uint8Ar
   return concatBytes([Uint8Array.of(PLAINTEXT_OUTPUT_KEY), be32(epoch), key]);
 }
 
-/** v2 decoder. The v1 `decodeTerminalPlaintext` keeps rejecting `0x03`. */
+/** `[0x04, on]`: the only supervised-command control a browser sends. */
+export function encodeTerminalReviewToggle(on: boolean): Uint8Array {
+  return Uint8Array.of(PLAINTEXT_REVIEW_TOGGLE, on ? 1 : 0);
+}
+
+function decodeFlag(bytes: Uint8Array, name: string): boolean {
+  if (bytes.byteLength !== 2 || (bytes[1] !== 0 && bytes[1] !== 1)) {
+    throw new Error(`${name} plaintext is invalid`);
+  }
+  return bytes[1] === 1;
+}
+
+/** `[0x05, be64(totalBytes), be32(headLen), head, tail]`. */
+function decodeReviewCapture(bytes: Uint8Array): TerminalPlaintextV2 {
+  if (bytes.byteLength < 13) throw new Error("review capture plaintext is too short");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const total = view.getBigUint64(1, false);
+  const headLength = view.getUint32(9, false);
+  if (headLength > REVIEW_CAPTURE_HEAD_MAX || headLength > bytes.byteLength - 13) {
+    throw new Error("review capture head is invalid");
+  }
+  const tailLength = bytes.byteLength - 13 - headLength;
+  if (tailLength > REVIEW_CAPTURE_TAIL_MAX) throw new Error("review capture tail is invalid");
+  if (total > BigInt(Number.MAX_SAFE_INTEGER) || total < BigInt(headLength)) {
+    throw new Error("review capture total is invalid");
+  }
+  return {
+    kind: "reviewCapture",
+    head: bytes.slice(13, 13 + headLength),
+    tail: bytes.slice(13 + headLength),
+    totalBytes: Number(total),
+  };
+}
+
+/** Test and tooling counterpart of the CLI's capture encoder. */
+export function encodeTerminalReviewCapture(input: {
+  head: Uint8Array;
+  tail: Uint8Array;
+  totalBytes: number;
+}): Uint8Array {
+  const header = new Uint8Array(13);
+  const view = new DataView(header.buffer);
+  header[0] = PLAINTEXT_REVIEW_CAPTURE;
+  view.setBigUint64(1, BigInt(input.totalBytes), false);
+  view.setUint32(9, input.head.byteLength, false);
+  return concatBytes([header, input.head, input.tail]);
+}
+
+/** v2 decoder. The v1 `decodeTerminalPlaintext` keeps rejecting `0x03`..`0x06`. */
 export function decodeTerminalPlaintextV2(bytes: Uint8Array): TerminalPlaintextV2 {
+  if (bytes[0] === PLAINTEXT_REVIEW_STATE) {
+    return { kind: "reviewState", on: decodeFlag(bytes, "review state") };
+  }
+  if (bytes[0] === PLAINTEXT_REVIEW_CAPTURE) return decodeReviewCapture(bytes);
   if (bytes[0] !== PLAINTEXT_OUTPUT_KEY) return decodeTerminalPlaintext(bytes);
   if (bytes.byteLength !== OUTPUT_KEY_PLAINTEXT_LENGTH) {
     throw new Error("output key plaintext must be 37 bytes");

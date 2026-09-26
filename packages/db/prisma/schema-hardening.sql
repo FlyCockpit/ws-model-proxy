@@ -3,23 +3,32 @@
 
 BEGIN;
 
-CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 START 1;
-
--- Serialize the compatibility cutover with old writers. PostgreSQL trigger DDL
--- also takes strong table locks, but taking every participating table up front
--- in parent-to-child order avoids observing a half-reconciled graph and gives
--- concurrent transactions one consistent lock order. An insert that committed
--- before these locks is included by the backfill below; one that starts after
--- the locks is released sees the installed trigger.
-LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
+-- DL-1 deploy lock order: this transaction takes EVERY table it touches in
+-- one statement, up front, in the strongest mode any later statement needs
+-- (ACCESS EXCLUSIVE: ALTER TABLE / DROP TRIGGER), with NOWAIT. It therefore
+-- never waits on a lock while holding one, so it cannot be part of a lock
+-- cycle with live capacity work (admission, lease release, relay writers);
+-- when any table is busy the statement fails at once with 55P03 and
+-- apply-schema-hardening.mjs retries the whole transaction with backoff. No
+-- later statement upgrades a lock. "Touches" is over-approximated: every
+-- repository table named anywhere below, including tables only read by
+-- backfills or by trigger/function bodies (backfill writes fire those
+-- triggers). verify-schema-hardening.mjs fails when a table named in this
+-- file is missing from this list. An insert that committed before these
+-- locks is included by the backfills below; one that starts after they are
+-- released sees the installed triggers.
+LOCK TABLE "user", discovered_model, execution_target, model_pool, model_api_token,
   pool_member, pool_grant, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, admission_request, capacity_waiter,
-  capacity_lease, provider_account, provider_model, provider_credential,
+  capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
-  relay_execution_event,
-  cache_affinity_record IN SHARE ROW EXCLUSIVE MODE;
+  relay_execution_event, usage_rollup_minute, usage_rollup_hour,
+  cache_affinity_record, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+
+-- Not a table: taken after the lock so the LOCK is the first statement.
+CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 START 1;
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
@@ -440,19 +449,10 @@ FROM relay_execution_event event
 WHERE event."eventType" = 'ATTEMPT_STARTED'
 ON CONFLICT ("attemptId") DO NOTHING;
 
-WITH latest_terminal AS (
-  SELECT DISTINCT ON ("relayRequestId") "relayRequestId", "createdAt", "terminalState", "errorClass"
-    FROM relay_execution_event
-   WHERE "eventType" IN ('TERMINAL', 'CRASH_RECOVERED')
-     AND "attemptKind" = 'EXECUTION' AND "terminalState" IS NOT NULL
-   ORDER BY "relayRequestId", "createdAt" DESC
-)
-UPDATE relay_request request
-   SET status = terminal."terminalState"::"RelayRequestStatus",
-       "completedAt" = COALESCE(request."completedAt", terminal."createdAt"),
-       "errorClass" = COALESCE(request."errorClass", terminal."errorClass")
-  FROM latest_terminal terminal
- WHERE request.id = terminal."relayRequestId" AND request.status = 'PENDING';
+-- No statement in this file may move relay_request out of PENDING: every
+-- terminal transition must go through the application's status-guarded path
+-- that writes the usage rollup in the same transaction (usage-rollup.ts).
+-- verify-schema-hardening.mjs rejects any `UPDATE relay_request ... status`.
 
 ALTER TABLE relay_execution_attempt DROP CONSTRAINT IF EXISTS relay_execution_attempt_shape_check;
 ALTER TABLE relay_execution_attempt ADD CONSTRAINT relay_execution_attempt_shape_check CHECK (
@@ -1133,19 +1133,19 @@ BEGIN
       FROM response_stickiness_record record
       LEFT JOIN execution_target target ON target.id = record."selectedExecutionTargetId"
       LEFT JOIN provider_model model ON model.id = target."providerModelId"
-      LEFT JOIN provider_account account ON account.id = model."providerAccountId"
+      LEFT JOIN provider_account acct ON acct.id = model."providerAccountId"
       LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
       LEFT JOIN model_api_token token ON token.id = record."modelApiTokenId"
      WHERE record."routingVersion" >= 3
        AND (target.id IS NULL
          OR model.id IS NULL
-         OR account.id IS NULL
+         OR acct.id IS NULL
          OR pool.id IS NULL
          OR target."providerModelId" IS DISTINCT FROM record."providerModelId"
          OR model."providerAccountId" IS DISTINCT FROM record."providerAccountId"
          OR model."upstreamModelId" IS DISTINCT FROM record."providerUpstreamModelId"
          OR target."userId" IS DISTINCT FROM model."userId"
-         OR model."userId" IS DISTINCT FROM account."userId"
+         OR model."userId" IS DISTINCT FROM acct."userId"
          OR pool."userId" IS DISTINCT FROM target."userId"
          OR NOT EXISTS (
            SELECT 1 FROM pool_member member
@@ -1405,13 +1405,13 @@ BEGIN
   ELSIF TG_TABLE_NAME = 'response_stickiness_record' THEN
     IF NEW."routingVersion" >= 3 THEN
       SELECT et."userId", et."providerModelId", model."providerAccountId",
-             model."upstreamModelId", account."endpointIdentity", account."endpointVersion",
+             model."upstreamModelId", acct."endpointIdentity", acct."endpointVersion",
              pool."userId"
         INTO target_owner, provider_model, provider_account, provider_upstream_model,
              provider_endpoint_identity, provider_endpoint_version, pool_owner
         FROM execution_target et
         JOIN provider_model model ON model.id = et."providerModelId"
-        JOIN provider_account account ON account.id = model."providerAccountId"
+        JOIN provider_account acct ON acct.id = model."providerAccountId"
         JOIN model_pool pool ON pool.id = NEW."targetModelPoolId"
        WHERE et.id = NEW."selectedExecutionTargetId";
       IF target_owner IS NULL
@@ -2335,5 +2335,196 @@ FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
+
+-- Usage rollups keep the RESOURCE owner's history when a REQUESTER is deleted.
+-- requesterUserId is not a foreign key (a SET NULL / SET DEFAULT action would
+-- collide with an existing sentinel row in the composite primary key), so this
+-- AFTER DELETE trigger merges the deleted user's requester rows into the ''
+-- sentinel requester of the same owner/bucket/pool/member/target/source, and
+-- drops rows the user also owned (the owner FK cascade has already removed
+-- them).
+--
+-- Ordering and locks (READ COMMITTED):
+--  * The trigger name sorts after PostgreSQL's RI_ConstraintTrigger_*
+--    triggers, so it runs after the cascades of this DELETE: the relay_request
+--    cascade (requests this user MADE) has waited for any in-flight finalizer
+--    holding such a request's row lock and seen its rollup commit, and no
+--    later finalizer can write a row with requesterUserId = this user.
+--  * Minute rows are moved before hour rows. DELETE ... RETURNING row-locks
+--    them, so a concurrent compaction either committed first (its hour rows
+--    are then visible to the hour step's fresh statement snapshot) or skips
+--    the locked rows (FOR UPDATE SKIP LOCKED).
+--  * The '' sentinel upserts run in the application's rollup key order
+--    (bucketStart, then the text keys by code point, i.e. COLLATE "C"), the
+--    same order writeRollupIncrements uses for finalizers and compaction, so
+--    two writers of overlapping sentinel keys never wait on each other in
+--    opposite orders.
+--
+-- Known issue F2-02 (user-accepted; deferred to DL-1 design (d), which makes
+-- the history telemetry tables foreign-key free): transient deadlocks, not
+-- prevented here, recovered as described below. When the user being
+-- deleted is also a resource OWNER, (a) an in-flight finalizer of a request
+-- on the user's pool/target holds that relay_request row lock and inserts a
+-- new rollup row whose ownerUserId FK takes KEY SHARE on this "user" row,
+-- while this DELETE holds the "user" row and its cascade waits for the
+-- relay_request row lock; (b) compaction holds minute rows the owner cascade
+-- must delete while its hour INSERT's owner FK waits for this "user" row.
+-- (Case (a) blocks on the relay_request row because the pool/target cascade
+-- sets that request's requestedModelPoolId / execution-target links NULL.)
+-- PostgreSQL aborts one transaction of the cycle atomically: an aborted
+-- finalizer leaves its request PENDING and uncounted, to be re-run by the
+-- deferred local-finalization registry or counted later by crash repair or
+-- the abandoned-request reaper; an aborted compaction batch is retried by the
+-- next sweep; an aborted user delete surfaces as a retryable error
+-- (users.remove).
+-- Nothing is lost or double-counted because every side commits or rolls back
+-- as a whole.
+CREATE OR REPLACE FUNCTION detach_usage_rollup_requester()
+RETURNS trigger LANGUAGE plpgsql AS $usage_rollup_detach_requester$
+BEGIN
+  WITH moved AS (
+    DELETE FROM usage_rollup_minute WHERE "requesterUserId" = OLD.id RETURNING *
+  )
+  INSERT INTO usage_rollup_minute AS target (
+    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+  )
+  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
+    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+    FROM moved
+   WHERE "ownerUserId" <> OLD.id
+   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
+     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
+  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source)
+  DO UPDATE SET
+      "requests" = target."requests" + EXCLUDED."requests",
+      "successes" = target."successes" + EXCLUDED."successes",
+      "errors" = target."errors" + EXCLUDED."errors",
+      "cancels" = target."cancels" + EXCLUDED."cancels",
+      "retries" = target."retries" + EXCLUDED."retries",
+      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
+      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
+      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
+      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
+      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
+      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
+      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
+      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
+      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
+      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
+      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "updatedAt" = now();
+
+  WITH moved AS (
+    DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *
+  )
+  INSERT INTO usage_rollup_hour AS target (
+    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+  )
+  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
+    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+    FROM moved
+   WHERE "ownerUserId" <> OLD.id
+   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
+     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
+  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source)
+  DO UPDATE SET
+      "requests" = target."requests" + EXCLUDED."requests",
+      "successes" = target."successes" + EXCLUDED."successes",
+      "errors" = target."errors" + EXCLUDED."errors",
+      "cancels" = target."cancels" + EXCLUDED."cancels",
+      "retries" = target."retries" + EXCLUDED."retries",
+      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
+      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
+      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
+      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
+      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
+      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
+      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
+      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
+      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
+      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
+      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "updatedAt" = now();
+
+  RETURN OLD;
+END;
+$usage_rollup_detach_requester$;
+
+DROP TRIGGER IF EXISTS usage_rollup_detach_requester ON "user";
+CREATE TRIGGER usage_rollup_detach_requester AFTER DELETE ON "user"
+FOR EACH ROW EXECUTE FUNCTION detach_usage_rollup_requester();
+
+-- DEL-STATE commit-point denial: no browser session commits for a user whose
+-- deletion is pending ("deletionRequestedAt" set). The application's Better
+-- Auth hook (session.create.before) refuses the ordinary case with a 403, but
+-- its read and the adapter's INSERT are separate statements, so a deletion
+-- mark committed between them would otherwise leave a live session behind.
+--
+-- The owner row is read FOR SHARE, which conflicts with the mark's UPDATE
+-- (FOR NO KEY UPDATE) but not with the FOR KEY SHARE of ordinary child
+-- inserts. So the two serialize in either order (READ COMMITTED re-reads the
+-- newest row version after a wait):
+--  * mark first: this insert waits for the mark to commit, then sees the
+--    marker and is refused;
+--  * insert first: the mark (requestUserDeletion: UPDATE "user", then DELETE
+--    FROM session, one transaction) waits for this transaction, and its
+--    DELETE then removes the committed session.
+-- FOR KEY SHARE would not serialize with the mark and leaks the session.
+--
+-- Lock order: the inserter holds nothing else a capacity transaction can wait
+-- on (a Better Auth session insert is a single statement, or runs in
+-- sign-up's transaction on a brand-new user row), and it takes no capacity
+-- lock after this one, so waiting here on a mark, an L7 user lock or any user
+-- writer closes no cycle. Nothing in the deletion subsystem inserts sessions.
+--
+-- Impersonation (IMP-MARK): Better Auth's impersonate-user inserts a session
+-- with "userId" = the target and "impersonatedBy" = the acting admin, a plain
+-- column without a foreign key. The mark deletes the sessions a user acts
+-- through (userId OR impersonatedBy), so the insert also reads the
+-- impersonator FOR SHARE, with the same two orders as above, and refuses a
+-- pending or missing (deleted) impersonator. Both reads are FOR SHARE on
+-- "user" rows and only wait on user writers; two FOR SHARE locks never
+-- conflict with each other, and the mark and the ordered delete each write one
+-- user row, so the pair closes no cycle either.
+CREATE OR REPLACE FUNCTION refuse_session_for_deleting_user()
+RETURNS trigger LANGUAGE plpgsql AS $session_refuse_deleting_user$
+DECLARE
+  pending boolean;
+BEGIN
+  SELECT u."deletionRequestedAt" IS NOT NULL INTO pending
+    FROM "user" u
+   WHERE u.id = NEW."userId"
+     FOR SHARE;
+  IF FOUND AND pending THEN
+    RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';
+  END IF;
+  IF NEW."impersonatedBy" IS NOT NULL THEN
+    SELECT u."deletionRequestedAt" IS NOT NULL INTO pending
+      FROM "user" u
+     WHERE u.id = NEW."impersonatedBy"
+       FOR SHARE;
+    IF NOT FOUND OR pending THEN
+      RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$session_refuse_deleting_user$;
+
+DROP TRIGGER IF EXISTS session_refuse_deleting_user ON session;
+CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session
+FOR EACH ROW EXECUTE FUNCTION refuse_session_for_deleting_user();
 
 COMMIT;

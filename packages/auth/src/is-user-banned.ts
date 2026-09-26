@@ -15,27 +15,9 @@
  * hook), so the active window is `banExpires >= now`. Parity with that
  * strict-inequality comparison is pinned by an installed-hook test with a
  * frozen clock.
-
-/** The ban-relevant subset of a Better Auth / Prisma user row. */
-export interface BannableUser {
-  banned?: boolean | null;
-  banExpires?: Date | null;
-}
-
-/**
- * Whether the user's ban is ACTIVE at `now`.
  *
- * - no ban flag / `banned: false` / `banned: null` → never banned here;
- * - `banned: true` with no expiry → indefinite ban, always active;
- * - `banned: true` with a future expiry → active until the expiry;
- * - `banned: true` with an expiry in the past (`banExpires < now`) →
- *   expired, not active (the account is admissible again; Better Auth
- *   clears nothing on its own, so the stale flag + past date pair keeps
- *   occurring in real data). An expiry EXACTLY at `now` is still active.
+ * The implementation lives in `@ws-model-proxy/db/user-deletion-access` (the
+ * database package cannot depend on this one) so every access gate shares one
+ * rule; this module re-exports it.
  */
-export function isUserBanned(user: BannableUser, now: Date): boolean {
-  if (user.banned !== true) return false;
-  const expires = user.banExpires;
-  if (expires === null || expires === undefined) return true;
-  return expires.getTime() >= now.getTime();
-}
+export { type BannableUser, isUserBanned } from "@ws-model-proxy/db/user-deletion-access";

@@ -5,6 +5,7 @@ import {
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
 import {
   isEmailConfigured,
@@ -14,14 +15,26 @@ import {
 } from "@ws-model-proxy/mailer";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
+import { createAuthMiddleware } from "better-auth/api";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
+import {
+  DISABLED_DEVICE_AUTHORIZATION_PATHS,
+  requireCliDeviceLoginScope,
+} from "./cli-device-login-scope";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
+import {
+  mapSessionRefusalToForbidden,
+  refuseAdminRestoreOfDeletingUser,
+  refuseSessionForDeletingUser,
+} from "./user-deletion-access-guard";
+import { notifyUserDeleted, notifyUserDeletionMarked } from "./user-deletion-listeners";
+import { refuseUndeletableUserBeforeCredentialDelete } from "./user-deletion-preflight";
 import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
@@ -126,6 +139,9 @@ export const auth = betterAuth({
   // wholesale for Prisma-shaped errors). See api-error-logging.ts.
   onAPIError: {
     onError: (error: unknown) => {
+      // DEL-STATE commit point: the session trigger's refusal answers 403
+      // like the session.create.before hook (./user-deletion-access-guard.ts).
+      mapSessionRefusalToForbidden(error);
       const line = sanitizedApiErrorLogLine(error);
       if (line !== null) console.error(line);
     },
@@ -224,6 +240,8 @@ export const auth = betterAuth({
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
   },
+  // Only the device-flow session endpoint; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
+  disabledPaths: [...DISABLED_DEVICE_AUTHORIZATION_PATHS],
   plugins: [
     admin({
       defaultRole: "user",
@@ -270,15 +288,19 @@ export const auth = betterAuth({
           }
         : {}),
     }),
-    // OAuth 2.0 Device Authorization Grant (RFC 8628). Lets CLI clients that
-    // can't paste a static token bootstrap an admin session via /device. We do
-    // not enable `oauthProvider` here — device flow alone is enough for MVP.
+    // OAuth 2.0 Device Authorization Grant (RFC 8628) for `wsmp login`. The
+    // plugin handles the request and approval steps; the approved code is
+    // redeemed only by `cliCredentials.exchangeDeviceCode` for one device
+    // credential. Its session-minting `/device/token` is disabled above.
     // The plugin's options schema uses `z.custom(() => true)` for the
     // `schema` field without `.optional()`, so we have to pass it explicitly
     // (even as `undefined`) or zod rejects the call at startup.
     deviceAuthorization({
       expiresIn: "30m",
       interval: "5s",
+      // Every request names the CLI slug it is for (`cli-slug:<slug>`); the
+      // approval page shows it and the exchange mints for that slug only.
+      onDeviceAuthRequest: requireCliDeviceLoginScope,
       // The adapter looks up `db.deviceCode` by the schema key `deviceCode`,
       // and the options-schema parser marks `schema` as nonoptional, so pass
       // the Prisma model mapping explicitly.
@@ -293,7 +315,39 @@ export const auth = betterAuth({
       baseUrl: env.BETTER_AUTH_URL,
     }),
   ],
+  hooks: {
+    // Defense in depth for the pending-deletion restore contract
+    // (./user-deletion-access-guard.ts); consumers enforce the marker.
+    before: createAuthMiddleware(async (ctx) => {
+      await refuseAdminRestoreOfDeletingUser(ctx);
+    }),
+  },
   databaseHooks: {
+    // On a user-delete route, Better Auth deletes sessions and accounts
+    // before the user. These hooks refuse a delete that retained history
+    // would fail before the first of them is removed
+    // (./user-deletion-preflight.ts).
+    session: {
+      // A pending deletion refuses every new session whatever the ban fields
+      // hold (./user-deletion-access-guard.ts).
+      create: {
+        before: async (session) => {
+          await refuseSessionForDeletingUser(session);
+        },
+      },
+      delete: {
+        before: async (session, context) => {
+          await refuseUndeletableUserBeforeCredentialDelete(session, context);
+        },
+      },
+    },
+    account: {
+      delete: {
+        before: async (account, context) => {
+          await refuseUndeletableUserBeforeCredentialDelete(account, context);
+        },
+      },
+    },
     user: {
       create: {
         before: async (user, context) => {
@@ -329,6 +383,36 @@ export const auth = betterAuth({
               role: policy.role,
             },
           };
+        },
+      },
+      delete: {
+        // Admin remove-user (and the self-service delete-user route, which is
+        // not enabled) reach internalAdapter.deleteUser after deleting the
+        // user's sessions and accounts. Its plain adapter DELETE would cascade
+        // into capacity rows while admissions hold capacity locks (DL-1), and
+        // through the whole request history under one statement. The hook
+        // performs the durable, bounded delete itself
+        // (@ws-model-proxy/db/parent-deletion: preflight, deletion marker and
+        // ban, history drain in short batches, then the capacity-graph delete
+        // in lock order) and returns false so Better Auth skips its own
+        // DELETE. Retained history was already refused before sessions and
+        // accounts were touched (./user-deletion-preflight.ts). If completion
+        // fails transiently the marker stays and the deletion sweeper finishes
+        // the user, so the route still reports success. After the delete
+        // commits, close the deleted user's live relay sessions in this
+        // process (see user-deletion-listeners.ts); Better Auth runs no
+        // delete.after for a delete the before hook declined.
+        before: async (user) => {
+          const result = await deleteUserDurably(prisma, user.id, {
+            onMarked: notifyUserDeletionMarked,
+            onTransientFailure: (error) =>
+              console.error(
+                "[auth] user delete incomplete, the deletion sweeper will finish it:",
+                error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+              ),
+          });
+          if (result === "deleted") await notifyUserDeleted(user.id);
+          return false;
         },
       },
     },
