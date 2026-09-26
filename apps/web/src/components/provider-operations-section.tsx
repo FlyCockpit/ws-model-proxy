@@ -37,6 +37,8 @@ import { z } from "zod";
 
 import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { ProviderCatalogImport } from "@/components/provider-catalog-import";
+import { ProviderPresetButtons } from "@/components/provider-presets";
 import { WideContent } from "@/components/wide-content";
 import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
@@ -778,6 +780,14 @@ export function ProviderOperationsSection() {
         className="mt-6 grid gap-3 rounded-xl border bg-muted/20 p-4 md:grid-cols-2 xl:grid-cols-5"
         onSubmit={(event) => submitProviderForm(event, accountForm.handleSubmit)}
       >
+        <ProviderPresetButtons
+          className="md:col-span-2 xl:col-span-5"
+          onApply={(preset) => {
+            accountForm.setFieldValue("providerType", preset.providerType);
+            accountForm.setFieldValue("baseUrl", preset.baseUrl);
+            accountForm.setFieldValue("authType", preset.authType);
+          }}
+        />
         {(["label", "providerType", "baseUrl"] as const).map((name) => (
           <accountForm.Field key={name} name={name}>
             {(field) => (
@@ -1108,6 +1118,10 @@ export function ProviderOperationsSection() {
                   </Button>
                 </form>
               </div>
+
+              {selected.providerType === "openrouter" ? (
+                <ProviderCatalogImport providerAccountId={selected.id} />
+              ) : null}
 
               <div className="min-w-0">
                 <h3 className="font-medium">{t("dashboard:providers.configuredModels")}</h3>

@@ -1175,6 +1175,72 @@
       "confidence": "Confidence"
     }
   },
+  "providerCatalog": {
+    "presets": {
+      "label": "Provider presets",
+      "openrouter": "OpenRouter",
+      "openai": "OpenAI",
+      "anthropic": "Anthropic",
+      "custom": "Custom OpenAI-compatible",
+      "hint": "Presets fill in the type, base URL and authentication. OpenRouter serves Chat Completions."
+    },
+    "picker": {
+      "label": "Search the OpenRouter catalog",
+      "placeholder": "Search models by name or id",
+      "toolsOnly": "Tool calling only",
+      "empty": "No models match.",
+      "loadMore": "Load more",
+      "loadFailed": "Could not load the catalog.",
+      "disabled": "External providers are disabled for this deployment.",
+      "unavailable": "The OpenRouter catalog is unavailable right now. Try again later.",
+      "stale": "Showing a cached copy of the catalog.",
+      "context": "{{value}} context",
+      "contextUnknown": "Context unknown",
+      "price": "${{input}} in / ${{output}} out per 1M tokens",
+      "priceUnknown": "Price varies",
+      "free": "Free",
+      "tools": "Tools",
+      "reasoning": "Reasoning",
+      "vision": "Images"
+    },
+    "reasons": {
+      "NO_TEXT_OUTPUT": "No text output",
+      "NO_TOOLS": "No tool calling, but this pool supports tools",
+      "SMALLER_CONTEXT": "Smaller context than this pool",
+      "NO_IMAGE_INPUT": "No image input, but this pool accepts images",
+      "NO_REASONING": "No reasoning, but this pool supports it",
+      "UNKNOWN_PRICE": "Price unknown or variable",
+      "FREE_MODEL": "Free model: prompts may be logged or used for training, and it has its own rate limits",
+      "EXPIRING": "Scheduled for removal",
+      "MODERATED": "Moderated: responses may be filtered"
+    },
+    "import": {
+      "title": "Import from catalog",
+      "description": "Pick an OpenRouter model to add it with its context window, capabilities and current price.",
+      "action": "Import model",
+      "pending": "Importing…",
+      "success": "Model imported.",
+      "updated": "Model updated from the catalog.",
+      "failed": "Could not import the model.",
+      "disabledHint": "New models start disabled. Enable them in the model list.",
+      "pricingUnknown": "The catalog has no fixed price for this model, so no price was set.",
+      "pricingScheduled": "A scheduled price already exists, so the catalog price was not applied.",
+      "contextDrift": "The catalog lists a context window of {{catalog}} tokens; this model is set to {{current}}. Edit the model to change it."
+    },
+    "equivalent": {
+      "title": "External equivalent model",
+      "description": "The OpenRouter model this pool is equivalent to. People who use their own key see it as the suggested model. It sends no traffic by itself.",
+      "current": "Current: {{model}}",
+      "none": "No equivalent declared.",
+      "save": "Save equivalent",
+      "clear": "Clear",
+      "saved": "External equivalent saved.",
+      "cleared": "External equivalent cleared.",
+      "failed": "Could not save the external equivalent.",
+      "loadFailed": "Could not load the external equivalent.",
+      "disabled": "External providers are disabled for this deployment. You can still clear the declaration."
+    }
+  },
   "welcomeBack": "Welcome back, {{name}}",
   "overview": {
     "title": "Overview",

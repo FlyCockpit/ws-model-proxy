@@ -33,6 +33,7 @@ import {
 } from "../lib/provider-egress";
 import {
   inventoryProtocolForProviderType,
+  providerInventorySurfacesAllowed,
   providerProtocolForType,
 } from "../lib/provider-protocol";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
@@ -69,7 +70,12 @@ function assertInventoryMatchesProviderType(
   inventory: z.infer<typeof openAiCompatibleCapabilitiesSchema> | null | undefined,
 ) {
   const expected = inventoryProtocolForProviderType(providerType);
-  if (expected === null || (inventory && inventory.protocol !== expected))
+  if (
+    expected === null ||
+    (inventory &&
+      (inventory.protocol !== expected ||
+        !providerInventorySurfacesAllowed(providerType, inventory)))
+  )
     throw new ORPCError("BAD_REQUEST", {
       message: "Invalid provider protocol configuration.",
     });

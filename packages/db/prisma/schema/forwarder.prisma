@@ -988,6 +988,11 @@ model ModelPool {
   affinityConversationWeight      Int                           @default(150)
   affinityConfirmedCacheWeight    Int                           @default(250)
   affinityLoadPenaltyWeight       Int                           @default(100)
+  /// Owner-declared external equivalent: a verbatim OpenRouter catalog id
+  /// (for example "qwen/qwen3-coder"), picked from the public catalog. It is
+  /// the default suggestion for callers' own-key models and never routes
+  /// traffic by itself. Null = no equivalent declared.
+  externalEquivalentModel         String?
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
