@@ -286,7 +286,6 @@ integration("PostgreSQL capacity admission primitives", () => {
           slug: `pool-policy-race-${suffix}`,
           name: "Pool policy race",
           capacityConcurrencyLimit: null,
-          publicEgressAcknowledged: true,
         },
       });
       const account = await writer.providerAccount.create({
@@ -455,7 +454,6 @@ integration("PostgreSQL capacity admission primitives", () => {
           slug: `dl1-lock-order-${suffix}`,
           name: "Lock order proof",
           capacityConcurrencyLimit: null,
-          publicEgressAcknowledged: true,
         },
       });
       const capacity = await writer.inferenceCapacity.create({

@@ -181,7 +181,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: true,
+
         advanced: {
           physicalCountStrategy: "ENGINE_REPORTED",
           contextMargin: 1_024,
@@ -261,7 +261,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
       memberContextCeiling: 32_768,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: true,
+
       advanced: {
         physicalCountStrategy: "ENGINE_REPORTED",
         contextMargin: 1_024,

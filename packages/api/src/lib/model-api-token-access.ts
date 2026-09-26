@@ -8,6 +8,7 @@ import {
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import { env } from "@ws-model-proxy/env/server";
 import {
   effectiveProviderEgress,
   egressProviderAccountLabels,
@@ -181,10 +182,13 @@ function serializeModelPool(
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalMemberCount: (row.PoolMembers ?? []).length,
-    effectiveProviderEgress: effectiveProviderEgress({
-      fallbackEnabled: row.fallbackEnabled,
-      externalMemberCount: (row.PoolMembers ?? []).length,
-    }),
+    effectiveProviderEgress:
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+      (accessGrantId === null || row.fallbackForGrantees) &&
+      effectiveProviderEgress({
+        fallbackEnabled: row.fallbackEnabled,
+        externalMemberCount: (row.PoolMembers ?? []).length,
+      }),
     providerAccountLabels: egressProviderAccountLabels({
       fallbackEnabled: row.fallbackEnabled,
       members: (row.PoolMembers ?? []).map((member) => ({

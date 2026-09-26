@@ -23,8 +23,13 @@ import { ORPCError } from "@orpc/server";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { OVERVIEW_RANGES } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import {
+  effectiveProviderEgress,
+  externalFallbackMemberWhere,
+} from "../lib/effective-provider-egress";
 import {
   type Accumulator,
   type AggregateRow,
@@ -56,6 +61,7 @@ function includedSources(includeTestTraffic: boolean): RelaySource[] {
 
 const poolSelect = {
   id: true,
+  fallbackEnabled: true,
   name: true,
   slug: true,
   PoolMembers: {
@@ -336,6 +342,15 @@ export const overviewRouter = {
       const seriesKeys = members.map((member) => member.seriesKey);
       return {
         poolId: pool.id,
+        effectiveProviderEgress:
+          env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+          effectiveProviderEgress({
+            fallbackEnabled: pool.fallbackEnabled,
+            externalMemberCount: pool.PoolMembers.filter(
+              (member) =>
+                member.tier === "PUBLIC_OVERFLOW" && member.ExecutionTarget?.ProviderModel,
+            ).length,
+          }),
         name: pool.name,
         slug: pool.slug,
         current: statsFromAccumulator(current),
@@ -387,7 +402,15 @@ export const overviewRouter = {
             where: { granteeUserId: userId, poolId: { in: sharedPoolIds } },
             select: {
               poolId: true,
-              ModelPool: { select: { name: true, slug: true } },
+              ModelPool: {
+                select: {
+                  name: true,
+                  slug: true,
+                  fallbackEnabled: true,
+                  fallbackForGrantees: true,
+                  _count: { select: { PoolMembers: { where: externalFallbackMemberWhere } } },
+                },
+              },
               Owner: { select: { slug: true } },
             },
           });
@@ -402,6 +425,14 @@ export const overviewRouter = {
           poolId,
           // Labelled only while the pool is still shared with you.
           available: grant !== undefined,
+          effectiveProviderEgress: Boolean(
+            env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+              grant?.ModelPool.fallbackForGrantees &&
+              effectiveProviderEgress({
+                fallbackEnabled: grant.ModelPool.fallbackEnabled,
+                externalMemberCount: grant.ModelPool._count.PoolMembers,
+              }),
+          ),
           name: grant?.ModelPool.name ?? null,
           slug: grant?.ModelPool.slug ?? null,
           ownerSlug: grant?.Owner.slug ?? null,

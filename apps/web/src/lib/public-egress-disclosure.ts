@@ -3,7 +3,7 @@ export type PublicEgressResource = {
   effectiveProviderEgress?: boolean;
 };
 
-/** Names resources the server marked non-private. Does not scan member tiers. */
+/** Names pools with static external availability for this viewer. Plain names remain local. */
 export function publicEgressResourceNames(resources: PublicEgressResource[]): string[] {
   return resources
     .filter((resource) => resource.effectiveProviderEgress === true)

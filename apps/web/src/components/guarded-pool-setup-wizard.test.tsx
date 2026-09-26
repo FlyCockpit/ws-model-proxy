@@ -259,11 +259,11 @@ describe("GuardedPoolSetupWizard", () => {
     expect(budgets).toContain("pools.wizard.advanced.unlimitedWarning");
   });
 
-  it("renders the egress acknowledgement only after provider selection", () => {
+  it("explains external fallback without an extra confirmation", () => {
     expect(renderStep(2)).not.toContain("dashboard:pools.wizard.egressWarning");
     const withProvider = renderStep(2, ["provider"]);
-    expect(withProvider).toContain("dashboard:pools.wizard.egressWarning");
-    expect(withProvider).toContain("dashboard:pools.wizard.fields.publicEgressAcknowledged");
+    expect(withProvider).toContain("dashboard:pools.wizard.externalFallbackHint");
+    expect(withProvider).not.toContain("publicEgressAcknowledged");
   });
 
   it("disables provider checkboxes and explains why when deployment egress is off", () => {
@@ -324,7 +324,7 @@ describe("GuardedPoolSetupWizard", () => {
     providerTier: "PUBLIC_OVERFLOW" as const,
     providerConcurrencyLimit: 1,
     dailySpendLimit: "10.00",
-    publicEgressAcknowledged: true,
+
     physicalCountStrategy: "CONSERVATIVE_ESTIMATE" as const,
     contextMargin: 0,
     borrowPolicy: "WHEN_IDLE" as const,

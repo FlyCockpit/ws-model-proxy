@@ -15,8 +15,9 @@ export type ModelOption = {
   maxAttachmentBytes: number | null;
   reasoning: VisibleModels["directModels"][number]["reasoning"];
   compatibility?: VisibleModels["modelPools"][number]["compatibility"];
-  /** Present for pools. True when requests may leave the deployment. */
+  /** Static external availability for this viewer; plain names remain local. */
   effectiveProviderEgress?: boolean;
+  providerAccountLabels?: readonly string[];
 };
 
 export type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";

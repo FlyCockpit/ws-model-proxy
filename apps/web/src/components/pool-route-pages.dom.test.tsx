@@ -311,7 +311,7 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackSteps.account")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.model")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.ceiling")).toBeTruthy();
-    expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.enable")).toBeTruthy();
     // Owner fallback settings: the plain name stays local; grantees are not
     // covered unless the owner opts in.
     expect(screen.getByText("dashboard:pools.fallbackSettings.enabled")).toBeTruthy();
@@ -366,38 +366,18 @@ describe("dedicated pool pages", () => {
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
     });
 
-    it("asks for grantee privacy confirmation and retries with it", async () => {
+    it("enables fallback in one save without a grantee confirmation", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";
       state.pools = [fallbackPool()];
-      state.nextReject = {
-        name: "updateModelPool",
-        error: {
-          code: "BAD_REQUEST",
-          data: {
-            reason: "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED",
-            poolName: "Primary",
-            grantees: [{ email: "grantee@example.test", name: "Grantee" }],
-          },
-        },
-      };
       mount(<PoolDetailPage poolId="pool-1" />);
-
       fireEvent.click(
         screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
       );
       submit();
-      await waitFor(() => expect(screen.getByText("grantee@example.test")).toBeTruthy());
+      await waitFor(() => expect(updateCalls()).toHaveLength(1));
+      expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackEnabled: true });
       expect(toast.error).not.toHaveBeenCalled();
-      fireEvent.click(
-        screen.getByRole("button", { name: "dashboard:pools.granteePrivacyConfirmAction" }),
-      );
-      await waitFor(() => expect(updateCalls()).toHaveLength(2));
-      expect(updateCalls()[1]?.variables).toEqual({
-        id: "pool-1",
-        fallbackEnabled: true,
-        confirmGranteePrivacyChange: true,
-      });
     });
 
     it("surfaces other save errors instead of swallowing them", async () => {

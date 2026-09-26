@@ -43,6 +43,7 @@ vi.mock("@/utils/orpc", () => {
     updatedAt: new Date(0),
   };
   const queryValue = (operation: string) => {
+    if (operation === "deploymentFlags") return { providerEgressEnabled: true };
     if (operation === "listAccounts") return [account];
     if (operation === "listModels") return state.models;
     if (operation === "listUsageReportPage" || operation === "listProviderAttempts")

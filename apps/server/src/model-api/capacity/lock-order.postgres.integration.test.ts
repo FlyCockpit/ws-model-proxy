@@ -287,7 +287,6 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
           userId: user.id,
           slug: `dl1-relay-${suffix}`,
           name: "Relay order",
-          publicEgressAcknowledged: true,
         },
       });
       const request = await fixtures.admissionRequest.create({
@@ -438,7 +437,6 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
             slug: `dl1-l6-${label}-${suffix}`,
             name: label,
             capacityConcurrencyLimit: null,
-            publicEgressAcknowledged: true,
           },
         });
         const members: Array<{ id: string }> = [];

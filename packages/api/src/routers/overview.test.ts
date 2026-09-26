@@ -10,6 +10,9 @@ vi.mock("@ws-model-proxy/db", async () => {
   const actual = await vi.importActual<typeof import("@ws-model-proxy/db")>("@ws-model-proxy/db");
   return { default: mockDeep(), Prisma: actual.Prisma };
 });
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true },
+}));
 vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://overview-test", NODE_ENV: "test" },
 }));
@@ -85,6 +88,7 @@ function pool() {
     id: "pool-1",
     name: "Coding",
     slug: "coding",
+    fallbackEnabled: false,
     PoolMembers: [
       {
         id: "member-a",
@@ -329,6 +333,28 @@ describe("overviewRouter.metrics", () => {
     }
   });
 
+  it("shows static external availability on owner overview cards despite unhealthy members", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        ...pool(),
+        fallbackEnabled: true,
+        PoolMembers: [
+          {
+            id: "external",
+            tier: "PUBLIC_OVERFLOW",
+            healthStatus: "UNHEALTHY",
+            routingStatus: "DISABLED",
+            ExecutionTarget: {
+              kind: "PROVIDER_MODEL",
+              ProviderModel: { upstreamModelId: "model", ProviderAccount: { label: "Provider" } },
+            },
+          },
+        ],
+      },
+    ]);
+    const result = await client().metrics({ range: "1h" });
+    expect(result.pools[0]?.effectiveProviderEgress).toBe(true);
+  });
   it("reports the caller's own usage of pools shared with them, separately from owned totals", async () => {
     db.$queryRaw
       .mockResolvedValueOnce([]) // owned aggregates
@@ -353,7 +379,13 @@ describe("overviewRouter.metrics", () => {
     db.poolGrant.findMany.mockResolvedValue([
       {
         poolId: "shared-pool",
-        ModelPool: { name: "Team GPUs", slug: "team-gpus" },
+        ModelPool: {
+          name: "Team GPUs",
+          slug: "team-gpus",
+          fallbackEnabled: true,
+          fallbackForGrantees: true,
+          _count: { PoolMembers: 1 },
+        },
         Owner: { slug: "alice" },
       },
     ]);
@@ -367,11 +399,17 @@ describe("overviewRouter.metrics", () => {
       expect.objectContaining({
         poolId: "shared-pool",
         available: true,
+        effectiveProviderEgress: true,
         name: "Team GPUs",
         ownerSlug: "alice",
         current: expect.objectContaining({ requests: 7, errors: 1 }),
       }),
-      expect.objectContaining({ poolId: "revoked-pool", available: false, name: null }),
+      expect.objectContaining({
+        poolId: "revoked-pool",
+        available: false,
+        effectiveProviderEgress: false,
+        name: null,
+      }),
     ]);
     // Shared-pool usage is not traffic you serve.
     expect(result.totals.current.requests).toBe(0);

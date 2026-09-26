@@ -143,11 +143,41 @@ follow-ups to locally served responses stay on their local member.
   `fallbackForGrantees` are rejected (a person changes them in the dashboard),
   and the guarded pool tool creates local-only pools. A new
   `externalAfterWaitMs` must not exceed the pool's local wait budget; a save
-  that does not change it is never rejected because of it. The guarded pool wizard still
-  accepts and ignores `publicEgressAcknowledged`, and rejects provider models
+  that does not change it is never rejected because of it. The guarded pool wizard also strips the old arguments and rejects provider models
   at the PRIMARY tier.
 - Owners can turn fallback off without removing external members.
 - Wait budgets are measured on the database clock. A budget of 0 now means
   "admit only if a slot is free right now" instead of never admitting.
 - With the deployment switch off, provider keys and configuration can still be
   listed, revoked, and deleted.
+
+
+## Dashboard flow
+
+On a pool’s **Fallback** page, enable **Allow external fallback** and optionally
+**Also for grantees**. The second setting lets shared users use your providers
+at your expense; their token and request must still opt in. The page shows both
+model names with copy buttons. Selecting provider models in the setup wizard
+enables fallback for the owner; sharing it stays off. No additional confirmation,
+grantee notice, or email is sent.
+
+Model API tokens start with external access off. During creation, or in the
+**External providers** editor afterward, a person can allow external providers.
+Enabling external access includes every allowlisted pool; uncheck individual
+pools to keep them local only. All-visible tokens allow all pools or none.
+Enabling the permission lets prompts, attachments, tools, and generated output
+leave this deployment for third-party providers when the request uses
+`<pool>:external` and local members cannot serve it. If creation succeeds but
+the separate permission save cannot be confirmed, the secret remains visible;
+check the token’s permissions before using it.
+
+The **external** badge describes availability for the viewer, based on the
+deployment switch, pool settings, and configured provider members. It does not
+promise current provider health or imply that plain-name requests go external.
+Chat Test lists a separate `:external` entry for eligible pools; selecting it
+provides the signed-in person’s consent for that test.
+
+Provider management remains on the Pools and Fallback pages when the deployment
+switch is off. Stored account and key details remain visible, with revoke and
+delete actions available. Creation, edits, imports, and credential tests are
+hidden or disabled. Secrets are never returned.

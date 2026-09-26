@@ -516,9 +516,9 @@ try {
               'pre-other-provider-model');
     INSERT INTO model_pool
       (id, "createdAt", "updatedAt", "userId", slug, name,
-       "publicEgressEnabled", "publicEgressAcknowledged")
+       "publicEgressEnabled")
     VALUES ('pre-provider-pool', NOW(), NOW(), 'owner-a', 'pre-provider', 'Pre provider',
-      TRUE, TRUE);
+      TRUE);
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
     VALUES ('pre-provider-member', NOW(), NOW(), 'pre-provider-pool',
@@ -539,9 +539,9 @@ try {
     -- provider-backed PRIMARY members (the heavier one must keep order 0).
     INSERT INTO model_pool
       (id, "createdAt", "updatedAt", "userId", slug, name,
-       "publicEgressEnabled", "publicEgressAcknowledged")
+       "publicEgressEnabled")
     VALUES ('pre-primary-pool', NOW(), NOW(), 'owner-a', 'pre-primary', 'Pre primary',
-      FALSE, TRUE);
+      FALSE);
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, weight)
     VALUES ('pre-primary-provider-member', NOW(), NOW(), 'pre-primary-pool',
@@ -797,7 +797,7 @@ try {
   `);
   // Disabling fallback no longer requires removing configured members.
   await client.query(`
-    UPDATE model_pool SET "publicEgressEnabled" = FALSE, "publicEgressAcknowledged" = FALSE
+    UPDATE model_pool SET "publicEgressEnabled" = FALSE
      WHERE id = 'pre-primary-pool'
   `);
 
@@ -833,9 +833,9 @@ try {
       'other-provider-model');
     INSERT INTO model_pool
       (id, "createdAt", "updatedAt", "userId", slug, name,
-       "publicEgressEnabled", "publicEgressAcknowledged")
+       "publicEgressEnabled")
     VALUES ('sticky-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider',
-      'Sticky provider', TRUE, TRUE);
+      'Sticky provider', TRUE);
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
     VALUES ('sticky-provider-member', NOW(), NOW(), 'sticky-provider-pool',
@@ -1225,7 +1225,7 @@ try {
       (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
     VALUES ('provider-target-a', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL', 'provider-model-a');
     UPDATE model_pool
-       SET "publicEgressEnabled" = TRUE, "publicEgressAcknowledged" = TRUE
+       SET "publicEgressEnabled" = TRUE
      WHERE id = 'pool-a';
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")

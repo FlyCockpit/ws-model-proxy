@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
     BETTER_AUTH_SECRET: "test-better-auth-secret",
   },
 }));
@@ -661,4 +662,50 @@ describe("external requester validity SQL", () => {
       "REQUESTER_ACCESS_BLOCKED",
     );
   });
+});
+
+describe("static external availability for each viewer", () => {
+  it.each([
+    [true, true, true, false, 1, true],
+    [true, false, true, false, 1, false],
+    [true, false, true, true, 1, true],
+    [false, true, true, true, 1, false],
+    [true, true, false, true, 1, false],
+    [true, true, true, true, 0, false],
+  ])(
+    "switch %s owner %s enabled %s grantees %s members %s -> %s",
+    async (enabled, owner, fallbackEnabled, fallbackForGrantees, memberCount, expected) => {
+      const { env } = await import("@ws-model-proxy/env/server");
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+      try {
+        const row = {
+          ...modelPoolRow({
+            id: "pool",
+            userId: "owner",
+            userSlug: "owner",
+            slug: "pool",
+            name: "Pool",
+          }),
+          fallbackEnabled,
+          fallbackForGrantees,
+          PoolMembers: Array.from({ length: memberCount }, () => ({
+            tier: "PUBLIC_OVERFLOW",
+            healthStatus: "UNHEALTHY",
+            routingStatus: "DISABLED",
+          })),
+        };
+        db.discoveredModel.findMany.mockResolvedValue([]);
+        db.modelPool.findMany.mockResolvedValue(owner ? [row] : []);
+        db.poolGrant.findMany.mockResolvedValue(owner ? [] : [{ id: "grant", ModelPool: row }]);
+        const result = await listVisibleModelTargetsForToken({
+          id: "token",
+          userId: owner ? "owner" : "grantee",
+          scopeMode: "ALL_VISIBLE",
+        });
+        expect(result.modelPools[0]?.effectiveProviderEgress).toBe(expected);
+      } finally {
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+      }
+    },
+  );
 });

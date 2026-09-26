@@ -6,6 +6,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
+  providerEgressEnabled: true,
+  credentials: [] as Array<Record<string, unknown>>,
+  calls: [] as string[],
   accounts: [] as Array<Record<string, unknown>>,
   models: [] as Array<Record<string, unknown>>,
   pricing: [] as Array<Record<string, unknown>>,
@@ -43,6 +46,7 @@ vi.mock("@/utils/orpc", () => {
     mutationOptions: (options: Record<string, unknown>) => ({
       ...options,
       mutationFn: async (input: Record<string, unknown>) => {
+        state.calls.push(name);
         if (name === "createAccount") {
           state.accountPayload = input;
           return { id: "created-account" };
@@ -97,6 +101,7 @@ vi.mock("@/utils/orpc", () => {
     orpc: {
       deploymentFlags: query("deploymentFlags", () => ({
         privateNetworksAllowed: state.allowPrivateNetworks,
+        providerEgressEnabled: state.providerEgressEnabled,
       })),
       providerManagement: {
         key: () => ["providerManagement"],
@@ -131,6 +136,9 @@ function mount() {
 afterEach(() => {
   cleanup();
   state.accounts = [];
+  state.credentials = [];
+  state.calls = [];
+  state.providerEgressEnabled = true;
   state.models = [];
   state.pricing = [];
   state.accountPayload = undefined;
@@ -441,5 +449,44 @@ describe("ProviderOperationsSection mounted forms", () => {
     );
     expect(toast.warning).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("provider management with external providers disabled", () => {
+  it("keeps the empty page reachable without creation", () => {
+    state.providerEgressEnabled = false;
+    mount();
+    expect(screen.getByText("dashboard:providers.disabledDeployment")).toBeTruthy();
+    expect(screen.getByText("dashboard:providers.empty")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /actions.addAccount/ })).toBeNull();
+  });
+
+  it("keeps keys viewable and revocable and accounts deletable, with tests disabled", async () => {
+    state.providerEgressEnabled = false;
+    state.accounts = [
+      {
+        id: "account-a",
+        label: "Stored provider",
+        providerType: "openai",
+        baseUrl: "https://provider.example/v1",
+        authType: "BEARER",
+        enabled: true,
+        updatedAt: new Date(0),
+      },
+    ];
+    state.credentials = [{ id: "credential-a", status: "ACTIVE", displaySuffix: "1234" }];
+    mount();
+    expect(screen.getByText(/dashboard:providers.activeSuffix/).textContent).toContain("1234");
+    expect(screen.queryByRole("button", { name: /actions.replaceCredential/ })).toBeNull();
+    const test = screen.getByRole("button", { name: /actions.test/ });
+    expect(test.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(test);
+    expect(state.calls).not.toContain("testCredential");
+    fireEvent.click(screen.getByRole("button", { name: /actions.revokeCredential/ }));
+    await waitFor(() => expect(state.calls).toContain("revokeCredential"));
+    const remove = screen.getByRole("button", { name: /actions.deleteAccount/ });
+    fireEvent.click(remove);
+    fireEvent.click(remove);
+    await waitFor(() => expect(state.calls).toContain("deleteAccount"));
   });
 });

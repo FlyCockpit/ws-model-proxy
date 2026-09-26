@@ -1398,14 +1398,6 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
       "Human-only output review: an agent must never review or release the output of its own request.",
   },
   {
-    target: "forwarderManagement.listDashboardNotices",
-    reason: "human-only dashboard notices",
-  },
-  {
-    target: "forwarderManagement.dismissDashboardNotice",
-    reason: "human-only dashboard notices",
-  },
-  {
     target: "mcpTokens.updateMine",
     reason:
       "Human-only MCP personal-token capability edits: a connected MCP client must not widen or narrow its own or other credentials.",

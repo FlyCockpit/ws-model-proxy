@@ -758,3 +758,12 @@ describe("G5 — advertised schemas bound tool input size", () => {
     }
   });
 });
+
+it("has no dashboard pool-notice procedures or tool exclusions", () => {
+  expect(Object.keys(appRouter.forwarderManagement)).not.toEqual(
+    expect.arrayContaining(["listDashboardNotices", "dismissDashboardNotice"]),
+  );
+  expect(
+    [...MCP_TOOL_MANIFEST, ...MCP_TOOL_EXCLUSIONS].map((entry) => entry.target).join("\n"),
+  ).not.toMatch(/DashboardNotice/);
+});

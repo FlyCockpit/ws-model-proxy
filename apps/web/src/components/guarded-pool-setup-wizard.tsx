@@ -220,7 +220,6 @@ export function GuardedPoolSetupWizard({
       providerTier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
-      publicEgressAcknowledged: false,
       physicalCountStrategy: "CONSERVATIVE_ESTIMATE" as
         | "TOKENIZER"
         | "TEMPLATE_AWARE"
@@ -264,7 +263,6 @@ export function GuardedPoolSetupWizard({
           memberContextCeiling: value.memberContextCeiling,
           reservedSlots: value.reservedSlots,
           localWaitBudgetMs: value.localWaitBudgetMs,
-          publicEgressAcknowledged: value.publicEgressAcknowledged,
           advanced: {
             physicalCountStrategy: value.physicalCountStrategy,
             contextMargin: value.contextMargin,
@@ -387,7 +385,6 @@ export function GuardedPoolSetupWizard({
       "providerTier",
       "providerConcurrencyLimit",
       "dailySpendLimit",
-      "publicEgressAcknowledged",
       "tokenAttemptLimit",
       "tokenDayLimit",
       "tokenMonthLimit",
@@ -1100,7 +1097,7 @@ export function GuardedPoolSetupWizard({
                       </option>
                     </select>
                     <p className="text-sm text-muted-foreground">
-                      {t("dashboard:pools.wizard.providerTierDisclosure")}
+                      {t("dashboard:pools.wizard.externalFallbackHint")}
                     </p>
                   </div>
                 )}
@@ -1109,7 +1106,6 @@ export function GuardedPoolSetupWizard({
                 {(count) =>
                   count > 0 ? (
                     <div className="space-y-4 rounded-md bg-amber-500/10 p-4 text-amber-950 dark:text-amber-50">
-                      <p className="text-sm">{t("dashboard:pools.wizard.egressWarning")}</p>
                       <div className="grid gap-4 sm:grid-cols-2">
                         {(["providerConcurrencyLimit", "dailySpendLimit"] as const).map((name) => (
                           <form.Field key={name} name={name}>
@@ -1213,30 +1209,6 @@ export function GuardedPoolSetupWizard({
                           </p>
                         </div>
                       </details>
-                      <form.Field name="publicEgressAcknowledged">
-                        {(field) => (
-                          <label
-                            className="flex min-h-11 items-start gap-3"
-                            {...errorProps("publicEgressAcknowledged")}
-                          >
-                            <Checkbox
-                              checked={field.state.value}
-                              onCheckedChange={(checked) => field.handleChange(checked === true)}
-                            />
-                            <span className="text-sm">
-                              {t("dashboard:pools.wizard.fields.publicEgressAcknowledged")}
-                            </span>
-                          </label>
-                        )}
-                      </form.Field>
-                      {stepErrors.publicEgressAcknowledged ? (
-                        <p
-                          id="wizard-publicEgressAcknowledged-error"
-                          className="text-sm text-destructive"
-                        >
-                          {stepErrors.publicEgressAcknowledged}
-                        </p>
-                      ) : null}
                     </div>
                   ) : null
                 }

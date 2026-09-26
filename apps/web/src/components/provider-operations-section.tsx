@@ -36,17 +36,12 @@ import {
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
-import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { ProviderCatalogImport } from "@/components/provider-catalog-import";
 import { ProviderPresetButtons } from "@/components/provider-presets";
 import { WideContent } from "@/components/wide-content";
 import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
-import {
-  type GranteePrivacyConfirm,
-  granteePrivacyConfirmationFromError,
-} from "@/lib/grantee-privacy-confirmation";
 import { orpc } from "@/utils/orpc";
 
 const showValue = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
@@ -316,7 +311,8 @@ export function ProviderOperationsSection() {
   const showDate = (value: Date | string | null | undefined) =>
     value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
-  const { privateNetworksAllowed: allowPrivateNetworks } = useDeploymentFlags();
+  const { privateNetworksAllowed: allowPrivateNetworks, providerEgressEnabled } =
+    useDeploymentFlags();
   const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
   const privateNetworkMessage = isDeploymentAdmin
     ? t("dashboard:deploymentFeatures.privateNetworkAdmin")
@@ -424,9 +420,6 @@ export function ProviderOperationsSection() {
     tier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
     publicOrder: "0",
   });
-  const [privacyConfirm, setPrivacyConfirm] = useState<
-    (GranteePrivacyConfirm & { retry: () => void }) | null
-  >(null);
   const budgetDefaults = {
     concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
@@ -628,40 +621,12 @@ export function ProviderOperationsSection() {
       onError: () => toast.error(t("dashboard:providers.feedback.failed")),
     }),
   );
-  const updatePool = useMutation(
-    orpc.forwarderManagement.updateModelPool.mutationOptions({
-      onSuccess: () => {
-        setPrivacyConfirm(null);
-        invalidate();
-      },
-      onError: (error, variables) => {
-        const confirmation = granteePrivacyConfirmationFromError(error);
-        if (confirmation) {
-          setPrivacyConfirm({
-            ...confirmation,
-            retry: () => updatePool.mutate({ ...variables, confirmGranteePrivacyChange: true }),
-          });
-          return;
-        }
-        toast.error(t("dashboard:providers.feedback.failed"));
-      },
-    }),
-  );
   const addPoolMember = useMutation(
     orpc.forwarderManagement.addProviderPoolMember.mutationOptions({
       onSuccess: () => {
-        setPrivacyConfirm(null);
         invalidate();
       },
-      onError: (error, variables) => {
-        const confirmation = granteePrivacyConfirmationFromError(error);
-        if (confirmation) {
-          setPrivacyConfirm({
-            ...confirmation,
-            retry: () => addPoolMember.mutate({ ...variables, confirmGranteePrivacyChange: true }),
-          });
-          return;
-        }
+      onError: () => {
         toast.error(t("dashboard:providers.feedback.failed"));
       },
     }),
@@ -800,64 +765,82 @@ export function ProviderOperationsSection() {
         </div>
       </div>
 
-      <form
-        ref={accountFormRef}
-        noValidate
-        className="mt-6 grid gap-3 rounded-xl border bg-muted/20 p-4 md:grid-cols-2 xl:grid-cols-5"
-        onSubmit={(event) => submitProviderForm(event, accountForm.handleSubmit)}
-      >
-        <ProviderPresetButtons
-          className="md:col-span-2 xl:col-span-5"
-          onApply={(preset) => {
-            accountForm.setFieldValue("providerType", preset.providerType);
-            accountForm.setFieldValue("baseUrl", preset.baseUrl);
-            accountForm.setFieldValue("authType", preset.authType);
-          }}
-        />
-        {(["label", "providerType", "baseUrl"] as const).map((name) => (
-          <accountForm.Field key={name} name={name}>
+      {!providerEgressEnabled ? (
+        <p role="note" className="mt-4 rounded-md border bg-muted/40 p-3 text-sm">
+          {t("dashboard:providers.disabledDeployment")}
+        </p>
+      ) : null}
+      {providerEgressEnabled ? (
+        <form
+          ref={accountFormRef}
+          noValidate
+          className="mt-6 grid gap-3 rounded-xl border bg-muted/20 p-4 md:grid-cols-2 xl:grid-cols-5"
+          onSubmit={(event) =>
+            submitProviderForm(event, () => {
+              if (providerEgressEnabled) return accountForm.handleSubmit();
+            })
+          }
+        >
+          <ProviderPresetButtons
+            className="md:col-span-2 xl:col-span-5"
+            onApply={(preset) => {
+              accountForm.setFieldValue("providerType", preset.providerType);
+              accountForm.setFieldValue("baseUrl", preset.baseUrl);
+              accountForm.setFieldValue("authType", preset.authType);
+            }}
+          />
+          {(["label", "providerType", "baseUrl"] as const).map((name) => (
+            <accountForm.Field key={name} name={name}>
+              {(field) => (
+                <Field
+                  id={`provider-account-${name}`}
+                  errors={field.state.meta.errors}
+                  label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
+                  className={name === "baseUrl" ? "md:col-span-2" : undefined}
+                  hint={name === "baseUrl" ? privateNetworkHint : undefined}
+                >
+                  <Input
+                    type={name === "baseUrl" ? "url" : "text"}
+                    value={field.state.value}
+                    onBlur={field.handleBlur}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                  />
+                </Field>
+              )}
+            </accountForm.Field>
+          ))}
+          <accountForm.Field name="authType">
             {(field) => (
               <Field
-                id={`provider-account-${name}`}
+                id="provider-account-authType"
                 errors={field.state.meta.errors}
-                label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
-                className={name === "baseUrl" ? "md:col-span-2" : undefined}
-                hint={name === "baseUrl" ? privateNetworkHint : undefined}
+                label={t("dashboard:providers.fields.authType")}
               >
-                <Input
-                  type={name === "baseUrl" ? "url" : "text"}
+                <select
+                  className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
                   value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
+                  onChange={(event) =>
+                    field.handleChange(event.target.value as "API_KEY" | "BEARER")
+                  }
+                >
+                  <option value="BEARER">{t("dashboard:providers.enums.BEARER")}</option>
+                  <option value="API_KEY">{t("dashboard:providers.enums.API_KEY")}</option>
+                </select>
               </Field>
             )}
           </accountForm.Field>
-        ))}
-        <accountForm.Field name="authType">
-          {(field) => (
-            <Field
-              id="provider-account-authType"
-              errors={field.state.meta.errors}
-              label={t("dashboard:providers.fields.authType")}
+          <div className="flex items-end md:col-span-2 xl:col-span-1">
+            <Button
+              type="submit"
+              className="w-full"
+              size="touch"
+              disabled={createAccount.isPending}
             >
-              <select
-                className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
-                value={field.state.value}
-                onChange={(event) => field.handleChange(event.target.value as "API_KEY" | "BEARER")}
-              >
-                <option value="BEARER">{t("dashboard:providers.enums.BEARER")}</option>
-                <option value="API_KEY">{t("dashboard:providers.enums.API_KEY")}</option>
-              </select>
-            </Field>
-          )}
-        </accountForm.Field>
-        <div className="flex items-end md:col-span-2 xl:col-span-1">
-          <Button type="submit" className="w-full" size="touch" disabled={createAccount.isPending}>
-            <Plus className="size-4" /> {t("dashboard:providers.actions.addAccount")}
-          </Button>
-        </div>
-      </form>
+              <Plus className="size-4" /> {t("dashboard:providers.actions.addAccount")}
+            </Button>
+          </div>
+        </form>
+      ) : null}
 
       {accounts.data.length === 0 ? (
         <p className="mt-6 rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">
@@ -905,7 +888,9 @@ export function ProviderOperationsSection() {
                   <Button
                     variant="outline"
                     size="touch"
-                    disabled={!credentialActive || testCredential.isPending}
+                    disabled={
+                      !providerEgressEnabled || !credentialActive || testCredential.isPending
+                    }
                     onClick={() => testCredential.mutate({ providerAccountId: selected.id })}
                   >
                     <RefreshCw className="size-4" /> {t("dashboard:providers.actions.test")}
@@ -913,7 +898,7 @@ export function ProviderOperationsSection() {
                   <Button
                     variant="outline"
                     size="touch"
-                    disabled={setAccountEnabled.isPending}
+                    disabled={!providerEgressEnabled || setAccountEnabled.isPending}
                     onClick={() =>
                       setAccountEnabled.mutate({ id: selected.id, enabled: !selected.enabled })
                     }
@@ -943,20 +928,26 @@ export function ProviderOperationsSection() {
                 </div>
               </div>
 
-              <UpdateAccountForm
-                key={`account-${selected.id}-${selected.updatedAt.toString()}`}
-                account={selected}
-                authTypeLocked={Boolean(credentials.data?.length)}
-                privateNetworkHint={privateNetworkHint}
-                privateNetworkMessage={privateNetworkMessage}
-              />
+              {providerEgressEnabled ? (
+                <UpdateAccountForm
+                  key={`account-${selected.id}-${selected.updatedAt.toString()}`}
+                  account={selected}
+                  authTypeLocked={Boolean(credentials.data?.length)}
+                  privateNetworkHint={privateNetworkHint}
+                  privateNetworkMessage={privateNetworkMessage}
+                />
+              ) : null}
 
               <div className="grid gap-6 lg:grid-cols-2">
                 <form
                   ref={credentialFormRef}
                   noValidate
                   className="min-w-0 space-y-3"
-                  onSubmit={(event) => submitProviderForm(event, credentialForm.handleSubmit)}
+                  onSubmit={(event) =>
+                    submitProviderForm(event, () => {
+                      if (providerEgressEnabled) return credentialForm.handleSubmit();
+                    })
+                  }
                 >
                   <h3 className="flex items-center gap-2 font-medium">
                     <KeyRound className="size-4" />
@@ -975,39 +966,43 @@ export function ProviderOperationsSection() {
                         })
                       : t("dashboard:providers.noCredential")}
                   </p>
-                  <credentialForm.Field name="credential">
-                    {(field) => (
-                      <Field
-                        id="provider-secret"
-                        errors={field.state.meta.errors}
-                        label={
-                          credentialActive
-                            ? t("dashboard:providers.fields.replacementSecret")
-                            : t("dashboard:providers.fields.secret")
-                        }
+                  {providerEgressEnabled ? (
+                    <>
+                      <credentialForm.Field name="credential">
+                        {(field) => (
+                          <Field
+                            id="provider-secret"
+                            errors={field.state.meta.errors}
+                            label={
+                              credentialActive
+                                ? t("dashboard:providers.fields.replacementSecret")
+                                : t("dashboard:providers.fields.secret")
+                            }
+                          >
+                            <Input
+                              type="password"
+                              autoComplete="new-password"
+                              value={field.state.value}
+                              onBlur={field.handleBlur}
+                              onChange={(event) => field.handleChange(event.target.value)}
+                            />
+                          </Field>
+                        )}
+                      </credentialForm.Field>
+                      <p className="text-xs text-muted-foreground">
+                        {t("dashboard:providers.secretNeverShown")}
+                      </p>
+                      <Button
+                        type="submit"
+                        size="touch"
+                        disabled={saveCredential.isPending || replaceCredential.isPending}
                       >
-                        <Input
-                          type="password"
-                          autoComplete="new-password"
-                          value={field.state.value}
-                          onBlur={field.handleBlur}
-                          onChange={(event) => field.handleChange(event.target.value)}
-                        />
-                      </Field>
-                    )}
-                  </credentialForm.Field>
-                  <p className="text-xs text-muted-foreground">
-                    {t("dashboard:providers.secretNeverShown")}
-                  </p>
-                  <Button
-                    type="submit"
-                    size="touch"
-                    disabled={saveCredential.isPending || replaceCredential.isPending}
-                  >
-                    {credentialActive
-                      ? t("dashboard:providers.actions.replaceCredential")
-                      : t("dashboard:providers.actions.saveCredential")}
-                  </Button>
+                        {credentialActive
+                          ? t("dashboard:providers.actions.replaceCredential")
+                          : t("dashboard:providers.actions.saveCredential")}
+                      </Button>
+                    </>
+                  ) : null}
                   {credentialActive ? (
                     <Button
                       type="button"
@@ -1020,132 +1015,138 @@ export function ProviderOperationsSection() {
                     </Button>
                   ) : null}
                 </form>
-                <form
-                  ref={createModelFormRef}
-                  noValidate
-                  className="min-w-0 space-y-3"
-                  onSubmit={(event) => submitProviderForm(event, createModelForm.handleSubmit)}
-                >
-                  <h3 className="font-medium">{t("dashboard:providers.models")}</h3>
-                  <createModelForm.Field name="upstreamModelId">
-                    {(field) => (
-                      <Field
-                        id="provider-new-model-upstreamModelId"
-                        errors={field.state.meta.errors}
-                        label={t("dashboard:providers.fields.upstreamModel")}
-                      >
-                        <Input
-                          value={field.state.value}
-                          onBlur={field.handleBlur}
-                          onChange={(event) => field.handleChange(event.target.value)}
-                        />
-                      </Field>
-                    )}
-                  </createModelForm.Field>
-                  <createModelForm.Field name="displayName">
-                    {(field) => (
-                      <Field
-                        id="provider-new-model-displayName"
-                        errors={field.state.meta.errors}
-                        label={t("dashboard:providers.fields.displayName")}
-                      >
-                        <Input
-                          value={field.state.value}
-                          onBlur={field.handleBlur}
-                          onChange={(event) => field.handleChange(event.target.value)}
-                        />
-                      </Field>
-                    )}
-                  </createModelForm.Field>
-                  <createModelForm.Field name="nativeSurface">
-                    {(field) => (
-                      <Field label={t("dashboard:providers.fields.nativeSurface")}>
-                        <select
-                          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as typeof field.state.value)
-                          }
-                        >
-                          {[
-                            "OPENAI_CHAT_COMPLETIONS",
-                            "OPENAI_RESPONSES",
-                            "ANTHROPIC_MESSAGES",
-                          ].map((surface) => (
-                            <option key={surface} value={surface}>
-                              {t(`dashboard:models.surfaces.${surface}`)}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
-                    )}
-                  </createModelForm.Field>
-                  <createModelForm.Field name="streaming">
-                    {(field) => (
-                      <label className="flex min-h-11 items-center gap-3 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={field.state.value}
-                          onChange={(event) => field.handleChange(event.target.checked)}
-                        />
-                        {t("dashboard:providers.fields.streaming")}
-                      </label>
-                    )}
-                  </createModelForm.Field>
-                  <createModelForm.Subscribe selector={(state) => state.values.nativeSurface}>
-                    {(nativeSurface) =>
-                      nativeSurface === "ANTHROPIC_MESSAGES" ? (
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <createModelForm.Field name="anthropicVersion">
-                            {(field) => (
-                              <Field
-                                errors={field.state.meta.errors}
-                                label={t("dashboard:providers.fields.anthropicVersion")}
-                              >
-                                <Input
-                                  value={field.state.value}
-                                  onBlur={field.handleBlur}
-                                  onChange={(event) => field.handleChange(event.target.value)}
-                                />
-                              </Field>
-                            )}
-                          </createModelForm.Field>
-                          <createModelForm.Field name="betaFeatures">
-                            {(field) => (
-                              <Field label={t("dashboard:providers.fields.anthropicBetas")}>
-                                <Input
-                                  value={field.state.value}
-                                  onBlur={field.handleBlur}
-                                  onChange={(event) => field.handleChange(event.target.value)}
-                                />
-                              </Field>
-                            )}
-                          </createModelForm.Field>
-                        </div>
-                      ) : null
+                {providerEgressEnabled ? (
+                  <form
+                    ref={createModelFormRef}
+                    noValidate
+                    className="min-w-0 space-y-3"
+                    onSubmit={(event) =>
+                      submitProviderForm(event, () => {
+                        if (providerEgressEnabled) return createModelForm.handleSubmit();
+                      })
                     }
-                  </createModelForm.Subscribe>
-                  <createModelForm.Field name="capabilityInventory">
-                    {(field) => (
-                      <CapabilityInventoryInput
-                        id="provider-new-model-capabilityInventory"
-                        errors={field.state.meta.errors}
-                        label={t("dashboard:providers.fields.capabilityInventory")}
-                        value={field.state.value}
-                        onBlur={field.handleBlur}
-                        onChange={field.handleChange}
-                        placeholder={t("dashboard:providers.capabilityInventoryHint")}
-                      />
-                    )}
-                  </createModelForm.Field>
-                  <Button type="submit" size="touch" disabled={createModel.isPending}>
-                    <Plus className="size-4" />
-                    {t("dashboard:providers.actions.addModel")}
-                  </Button>
-                </form>
+                  >
+                    <h3 className="font-medium">{t("dashboard:providers.models")}</h3>
+                    <createModelForm.Field name="upstreamModelId">
+                      {(field) => (
+                        <Field
+                          id="provider-new-model-upstreamModelId"
+                          errors={field.state.meta.errors}
+                          label={t("dashboard:providers.fields.upstreamModel")}
+                        >
+                          <Input
+                            value={field.state.value}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                          />
+                        </Field>
+                      )}
+                    </createModelForm.Field>
+                    <createModelForm.Field name="displayName">
+                      {(field) => (
+                        <Field
+                          id="provider-new-model-displayName"
+                          errors={field.state.meta.errors}
+                          label={t("dashboard:providers.fields.displayName")}
+                        >
+                          <Input
+                            value={field.state.value}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                          />
+                        </Field>
+                      )}
+                    </createModelForm.Field>
+                    <createModelForm.Field name="nativeSurface">
+                      {(field) => (
+                        <Field label={t("dashboard:providers.fields.nativeSurface")}>
+                          <select
+                            className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                            value={field.state.value}
+                            onChange={(event) =>
+                              field.handleChange(event.target.value as typeof field.state.value)
+                            }
+                          >
+                            {[
+                              "OPENAI_CHAT_COMPLETIONS",
+                              "OPENAI_RESPONSES",
+                              "ANTHROPIC_MESSAGES",
+                            ].map((surface) => (
+                              <option key={surface} value={surface}>
+                                {t(`dashboard:models.surfaces.${surface}`)}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                      )}
+                    </createModelForm.Field>
+                    <createModelForm.Field name="streaming">
+                      {(field) => (
+                        <label className="flex min-h-11 items-center gap-3 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={field.state.value}
+                            onChange={(event) => field.handleChange(event.target.checked)}
+                          />
+                          {t("dashboard:providers.fields.streaming")}
+                        </label>
+                      )}
+                    </createModelForm.Field>
+                    <createModelForm.Subscribe selector={(state) => state.values.nativeSurface}>
+                      {(nativeSurface) =>
+                        nativeSurface === "ANTHROPIC_MESSAGES" ? (
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <createModelForm.Field name="anthropicVersion">
+                              {(field) => (
+                                <Field
+                                  errors={field.state.meta.errors}
+                                  label={t("dashboard:providers.fields.anthropicVersion")}
+                                >
+                                  <Input
+                                    value={field.state.value}
+                                    onBlur={field.handleBlur}
+                                    onChange={(event) => field.handleChange(event.target.value)}
+                                  />
+                                </Field>
+                              )}
+                            </createModelForm.Field>
+                            <createModelForm.Field name="betaFeatures">
+                              {(field) => (
+                                <Field label={t("dashboard:providers.fields.anthropicBetas")}>
+                                  <Input
+                                    value={field.state.value}
+                                    onBlur={field.handleBlur}
+                                    onChange={(event) => field.handleChange(event.target.value)}
+                                  />
+                                </Field>
+                              )}
+                            </createModelForm.Field>
+                          </div>
+                        ) : null
+                      }
+                    </createModelForm.Subscribe>
+                    <createModelForm.Field name="capabilityInventory">
+                      {(field) => (
+                        <CapabilityInventoryInput
+                          id="provider-new-model-capabilityInventory"
+                          errors={field.state.meta.errors}
+                          label={t("dashboard:providers.fields.capabilityInventory")}
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={field.handleChange}
+                          placeholder={t("dashboard:providers.capabilityInventoryHint")}
+                        />
+                      )}
+                    </createModelForm.Field>
+                    <Button type="submit" size="touch" disabled={createModel.isPending}>
+                      <Plus className="size-4" />
+                      {t("dashboard:providers.actions.addModel")}
+                    </Button>
+                  </form>
+                ) : null}
               </div>
 
-              {selected.providerType === "openrouter" ? (
+              {providerEgressEnabled && selected.providerType === "openrouter" ? (
                 <ProviderCatalogImport providerAccountId={selected.id} />
               ) : null}
 
@@ -1179,7 +1180,7 @@ export function ProviderOperationsSection() {
                             type="button"
                             size="touch"
                             variant="outline"
-                            disabled={updateModel.isPending}
+                            disabled={!providerEgressEnabled || updateModel.isPending}
                             onClick={() =>
                               updateModel.mutate({ id: model.id, enabled: !model.enabled })
                             }
@@ -1215,15 +1216,17 @@ export function ProviderOperationsSection() {
                           </Button>
                         </div>
                       </div>
-                      <details className="mt-3">
-                        <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                          {t("dashboard:providers.actions.editModel")}
-                        </summary>
-                        <UpdateModelForm
-                          key={`model-${model.id}-${model.updatedAt.toString()}`}
-                          model={model}
-                        />
-                      </details>
+                      {providerEgressEnabled ? (
+                        <details className="mt-3">
+                          <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                            {t("dashboard:providers.actions.editModel")}
+                          </summary>
+                          <UpdateModelForm
+                            key={`model-${model.id}-${model.updatedAt.toString()}`}
+                            model={model}
+                          />
+                        </details>
+                      ) : null}
                     </div>
                   ))}
                   {!models.data?.length ? (
@@ -1240,7 +1243,11 @@ export function ProviderOperationsSection() {
                     ref={pricingFormRef}
                     noValidate
                     className="min-w-0 space-y-3"
-                    onSubmit={(event) => submitProviderForm(event, pricingForm.handleSubmit)}
+                    onSubmit={(event) =>
+                      submitProviderForm(event, () => {
+                        if (providerEgressEnabled) return pricingForm.handleSubmit();
+                      })
+                    }
                   >
                     <h3 className="font-medium">{t("dashboard:providers.pricing")}</h3>
                     {pricing.isError ? (
@@ -1292,7 +1299,11 @@ export function ProviderOperationsSection() {
                         </pricingForm.Field>
                       ))}
                     </div>
-                    <Button type="submit" size="touch" disabled={createPricing.isPending}>
+                    <Button
+                      type="submit"
+                      size="touch"
+                      disabled={!providerEgressEnabled || createPricing.isPending}
+                    >
                       {t("dashboard:providers.actions.savePricingDraft")}
                     </Button>
                     <div className="divide-y rounded-xl border">
@@ -1317,6 +1328,7 @@ export function ProviderOperationsSection() {
                                 size="touch"
                                 variant="outline"
                                 disabled={
+                                  !providerEgressEnabled ||
                                   updatePricing.isPending ||
                                   !pricingForm.state.values.input ||
                                   !pricingForm.state.values.output
@@ -1338,7 +1350,7 @@ export function ProviderOperationsSection() {
                                 type="button"
                                 size="touch"
                                 variant="outline"
-                                disabled={activatePricing.isPending}
+                                disabled={!providerEgressEnabled || activatePricing.isPending}
                                 onClick={() => activatePricing.mutate({ id: row.id })}
                               >
                                 {t("dashboard:providers.actions.activate")}
@@ -1376,7 +1388,11 @@ export function ProviderOperationsSection() {
                     aria-label={t("dashboard:providers.budgets")}
                     noValidate
                     className="min-w-0 space-y-3"
-                    onSubmit={(event) => submitProviderForm(event, budgetForm.handleSubmit)}
+                    onSubmit={(event) =>
+                      submitProviderForm(event, () => {
+                        if (providerEgressEnabled) return budgetForm.handleSubmit();
+                      })
+                    }
                   >
                     <h3 className="font-medium">{t("dashboard:providers.budgets")}</h3>
                     {policies.isError ? (
@@ -1461,7 +1477,9 @@ export function ProviderOperationsSection() {
                         <Button
                           type="submit"
                           size="touch"
-                          disabled={createBudget.isPending || !activePricing}
+                          disabled={
+                            !providerEgressEnabled || createBudget.isPending || !activePricing
+                          }
                         >
                           {t("dashboard:providers.actions.activateBudget")}
                         </Button>
@@ -1509,7 +1527,7 @@ export function ProviderOperationsSection() {
                                   type="button"
                                   size="touch"
                                   variant="outline"
-                                  disabled={replaceBudget.isPending}
+                                  disabled={!providerEgressEnabled || replaceBudget.isPending}
                                   onClick={() =>
                                     replaceBudget.mutate({
                                       id: policy.id,
@@ -1607,7 +1625,7 @@ export function ProviderOperationsSection() {
                         </Field>
                       ) : null}
                       <p className="text-sm text-muted-foreground md:col-span-3">
-                        {t("dashboard:providers.primaryEgressDisclosure")}
+                        {t("dashboard:providers.externalFallbackHint")}
                       </p>
                       <div className="flex flex-wrap items-end gap-2 md:col-span-3">
                         {attachmentDraft.tier === "PUBLIC_OVERFLOW" ? (
@@ -1616,6 +1634,7 @@ export function ProviderOperationsSection() {
                             size="touch"
                             variant="outline"
                             disabled={
+                              !providerEgressEnabled ||
                               !attachmentDraft.poolId ||
                               createBudget.isPending ||
                               !budgetForm.state.canSubmit ||
@@ -1639,21 +1658,8 @@ export function ProviderOperationsSection() {
                         <Button
                           type="button"
                           size="touch"
-                          variant="outline"
-                          disabled={!attachmentDraft.poolId || updatePool.isPending}
-                          onClick={() =>
-                            updatePool.mutate({
-                              id: attachmentDraft.poolId,
-                              fallbackEnabled: true,
-                            })
-                          }
-                        >
-                          {t("dashboard:providers.actions.acknowledgeEgress")}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="touch"
                           disabled={
+                            !providerEgressEnabled ||
                             !attachmentDraft.poolId ||
                             (attachmentDraft.tier === "PUBLIC_OVERFLOW" &&
                               !Number.isInteger(Number(attachmentDraft.publicOrder))) ||
@@ -1704,7 +1710,7 @@ export function ProviderOperationsSection() {
                                 · {t(`dashboard:providers.enums.${member.routingStatus}`)}
                               </p>
                               <p className="mt-1 break-words text-xs text-muted-foreground">
-                                {t("dashboard:providers.grantEgressDisclosure", {
+                                {t("dashboard:providers.accessSummary", {
                                   grants:
                                     pool.grants.map((grant) => grant.granteeEmail).join(", ") ||
                                     t("dashboard:providers.none"),
@@ -1725,7 +1731,7 @@ export function ProviderOperationsSection() {
                                 type="button"
                                 size="touch"
                                 variant="outline"
-                                disabled={reorderPoolMember.isPending}
+                                disabled={!providerEgressEnabled || reorderPoolMember.isPending}
                                 onClick={() =>
                                   reorderPoolMember.mutate({ id: member.id, direction: "EARLIER" })
                                 }
@@ -1736,7 +1742,7 @@ export function ProviderOperationsSection() {
                                 type="button"
                                 size="touch"
                                 variant="outline"
-                                disabled={reorderPoolMember.isPending}
+                                disabled={!providerEgressEnabled || reorderPoolMember.isPending}
                                 onClick={() =>
                                   reorderPoolMember.mutate({ id: member.id, direction: "LATER" })
                                 }
@@ -1759,7 +1765,7 @@ export function ProviderOperationsSection() {
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {t("dashboard:providers.egressAcknowledgement")}
+                    {t("dashboard:providers.externalRequestHint")}
                   </p>
                   {modelApiTokens.isError ? (
                     <InlineRetry
@@ -1982,7 +1988,7 @@ export function ProviderOperationsSection() {
                     type="button"
                     size="touch"
                     variant="outline"
-                    disabled={repairAttempts.isPending}
+                    disabled={!providerEgressEnabled || repairAttempts.isPending}
                     onClick={() => repairAttempts.mutate({ providerAccountId: selected.id })}
                   >
                     <Wrench className="size-4" /> {t("dashboard:providers.actions.repair")}
@@ -2038,14 +2044,6 @@ export function ProviderOperationsSection() {
           ) : null}
         </div>
       )}
-      <GranteePrivacyConfirmDialog
-        confirmation={privacyConfirm}
-        pending={updatePool.isPending || addPoolMember.isPending}
-        onOpenChange={(open) => {
-          if (!open) setPrivacyConfirm(null);
-        }}
-        onConfirm={() => privacyConfirm?.retry()}
-      />
     </section>
   );
 }

@@ -379,19 +379,16 @@
     "hideTerminals": "Hide open terminals"
   },
   "notices": {
-    "region": "Notices",
-    "dismiss": "Dismiss",
-    "poolExternalProvider": "{{pool}} may send requests to an external provider."
+    "dismiss": "Dismiss"
   },
   "pools": {
     "notFound": "This pool was not found or is no longer available to you.",
     "privacyBadge": {
-      "private": "Private",
-      "external": "May use external providers"
+      "private": "local",
+      "external": "external",
+      "ownerProviders": "Owner’s providers",
+      "hint": "External fallback available: {{providers}}. Use :external with a token that allows external providers; plain names stay local."
     },
-    "granteePrivacyConfirmTitle": "This pool may send data to an external provider",
-    "granteePrivacyConfirmDescription": "{{pool}} is already shared. Requests from these people may leave this deployment. They will be notified. Their access is not paused.",
-    "granteePrivacyConfirmAction": "Confirm and continue",
     "affinity": {
       "title": "Cache-aware routing",
       "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
@@ -524,15 +521,16 @@
     },
     "fallbackDescription": "External fallback is used only for requests that name owner/pool:external, after local members are at capacity or unhealthy.",
     "fallbackSettings": {
-      "description": "Callers use {{externalModelId}} to allow external providers. {{modelId}} always stays on local members.",
-      "enabled": "Use external fallback for :external requests",
-      "forGrantees": "Pay for external fallback used by people I share this pool with",
+      "description": "Requests use {{externalModelId}} and a token that allows external providers to send prompts outside this deployment when the local pool is saturated or cannot serve the request. {{modelId}} always stays local.",
+      "enabled": "Allow external fallback",
+      "forGrantees": "Also for grantees",
       "externalAfterWaitMs": "Wait for local capacity before going external (ms)",
       "externalAfterWaitHint": "0 goes external at once when no local member is free. If the local wait budget is shorter, the shorter wait applies.",
       "waitInvalid": "Enter a whole number of milliseconds from 0 to 600000.",
       "save": "Save fallback settings",
       "saved": "Fallback settings saved",
-      "failed": "Could not save fallback settings. Try again."
+      "failed": "Could not save fallback settings. Try again.",
+      "granteesHint": "You pay provider charges for people you share this pool with. Their requests still need :external and a token that allows external providers."
     },
     "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment.",
     "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
@@ -540,10 +538,9 @@
       "account": "Add a provider account and credential",
       "model": "Add a model and its pricing",
       "ceiling": "Set a spend ceiling",
-      "acknowledge": "Acknowledge that requests leave this deployment"
+      "enable": "Allow external fallback in this pool’s settings, then attach the provider model"
     },
     "addFallbackProvider": "Add fallback provider",
-    "accessEgressHint": "Granting access to a pool with providers requires an egress acknowledgement.",
     "streaming": "streaming",
     "surfaceCounts": "{{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
     "surfaceTierCounts": "{{tier}}: {{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
@@ -600,8 +597,6 @@
       "create": "Create protected pool",
       "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
       "disabled": "Disabled",
-      "egressRequired": "Acknowledge provider egress before attaching any provider target.",
-      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment.",
       "enabled": "Enabled",
       "fields": {
         "concurrency": "Physical concurrency ceiling",
@@ -620,7 +615,6 @@
         "providerConcurrencyLimit": "Provider concurrency ceiling",
         "providerTier": "Provider member tier",
         "finiteSpendProtection": "I will configure a finite provider spending limit before attaching a public target.",
-        "publicEgressAcknowledged": "I understand which request data can leave this deployment.",
         "recommendedSurface": "Recommended API",
         "recommendedSurfaceHint": "Auto-set once when the pool first has primary members: the best-ranked API shared by those primary members, native support preferred with strict adaptation as fallback. It is not recomputed afterward except auto-repair. Any API that every primary member can serve natively or through strict adaptation is valid.",
         "reservedSlots": "Reserved slots on the shared runtime",
@@ -691,7 +685,6 @@
       "providerOrder": "Guarded provider order",
       "providerOrderExact": "Select providers in fallback order. Arrow controls change the durable order.",
       "providerEgressDisabled": "Provider egress is disabled for this deployment (the WMP_PUBLIC_PROVIDER_EGRESS_ENABLED setting is off), so provider targets cannot be attached until the deployment enables it.",
-      "providerTierDisclosure": "Provider PRIMARY participates before public overflow and sends request data outside this deployment without requiring the overflow opt-in. Credentials and budgets apply to both tiers.",
       "selectLocalModel": "Select local model {{name}}",
       "selectProvider": "Select provider model {{name}}",
       "moveProviderUp": "Move provider earlier",
@@ -709,7 +702,6 @@
         "recommendedSurface": "Choose an API that every selected primary member can serve, natively or through protocol adaptation. It defaults to the best-ranked API shared by the pool's first primary members.",
         "physicalConcurrencyLimit": "Enter a physical concurrency limit from 1 to 10000.",
         "physicalMaxContext": "Enter a physical context limit from 1 to 100000000.",
-        "publicEgressAcknowledged": "Acknowledge the exact public-egress disclosure.",
         "reservedSlots": "Reserved slots cannot exceed this pool's concurrency ceiling.",
         "slug": "Enter a valid, available-style pool slug.",
         "contextMargin": "Enter a context margin from 0 to 10000000.",
@@ -727,15 +719,12 @@
         "tokenLifetimeLimit": "Enter a positive token limit or choose UNLIMITED.",
         "spendMonthLimit": "Enter a positive spend limit or choose UNLIMITED."
       },
-      "publicEgress": "Allow guarded public overflow",
-      "publicEgressHint": "Keep local targets preferred and use configured providers only after local capacity cannot serve the request.",
       "reservationInvalid": "Reserved slots cannot exceed the concurrency ceiling.",
       "reviewSafe": "This setup keeps concurrency, context, waiting, and spending protections finite. Public targets are not usable until their provider policy and order are configured.",
       "spendRequired": "Confirm finite spending protection before enabling public overflow.",
       "step": "Step {{current}} of {{total}}",
       "steps": {
         "capacity": "Protect local capacity",
-        "egress": "Choose API and egress",
         "models": "Choose local models",
         "review": "Review safeguards"
       },
@@ -744,7 +733,8 @@
         "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
         "OPENAI_RESPONSES": "OpenAI Responses"
       },
-      "title": "Set up a model pool"
+      "title": "Set up a model pool",
+      "externalFallbackHint": "Selected providers enable external fallback for you. Requests only go external with <pool>:external and a token that allows external providers, when local members cannot serve them. Sharing external fallback stays off until you enable it in pool settings."
     },
     "createDescription": "Create an OpenAI-compatible pooled model ID.",
     "createTitle": "Create pool",
@@ -771,9 +761,6 @@
     "grantsTitle": "Grants",
     "grantRevoked": "Pool access revoked",
     "grantTitle": "Grant pool access",
-    "grantEgressWarning": "Granting {{pool}} lets this user send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow. Provider charges may apply.",
-    "grantEgressWarningTitle": "This grant can use external-provider egress",
-    "grantEgressAcknowledge": "I understand requests on this pool may be sent to a provider, including when public overflow is on, and that provider charges may apply.",
     "memberTestSurface": "Member test API surface",
     "memberTestMode": "Member test execution mode",
     "memberTestSurfaces": {
@@ -901,10 +888,12 @@
   "tokens": {
     "externalAccess": {
       "title": "External providers",
-      "description": "Tokens are private only by default. When allowed, a request may use an external provider only if it names the pool as owner/pool:external and the pool owner allows it. Plain pool names never leave this deployment.",
+      "description": "Off by default. Enabling this lets prompts, attachments, tools, and output leave this deployment for third-party providers. Requests must use <pool>:external, the pool owner must allow fallback, and local members must be unable to serve the request. Plain pool names stay local.",
       "allow": "Allow external providers for {{name}}",
-      "poolsHint": "Allowlist tokens: choose which pools may use external providers.",
-      "saved": "External provider access updated"
+      "poolsHint": "External access includes each allowlisted pool when enabled. Uncheck any pool to keep it local only.",
+      "saved": "External provider access updated",
+      "createAllow": "Allow external providers",
+      "createFailed": "Token created, but its external-access update could not be confirmed. Copy the secret now and check its permissions below before using it."
     },
     "allVisible": "All visible",
     "allowlist": "Allowlist",
@@ -945,15 +934,15 @@
     "scopeMode": "Scope mode",
     "typeTokenName": "Type the token name to confirm",
     "visiblePreview": "{{count}} models visible to this token",
-    "publicEgressWarningTitle": "Some pools may send data outside this deployment",
-    "publicEgressWarning": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to an external provider.",
-    "publicEgressWarningNamed": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to {{providers}}."
+    "publicEgressWarningTitle": "External fallback is available",
+    "publicEgressWarning": "Pools: {{pools}}. Enabling external access on a token lets prompts leave this deployment for third-party providers, only with <pool>:external when local members cannot serve the request. Plain names stay local.",
+    "publicEgressWarningNamed": "Pools: {{pools}}. Providers: {{providers}}. Enabling external access on a token lets prompts leave this deployment, only with <pool>:external when local members cannot serve the request. Plain names stay local."
   },
   "providers": {
-    "title": "Public provider operations",
-    "description": "Configure external provider accounts, credentials, models, budgets, pricing identity, and the accounting trail used by public overflow.",
-    "loadFailed": "Provider operations could not be loaded. Check that public provider egress is configured and try again.",
-    "empty": "No provider accounts yet. Add a disabled account, then add and test its credential before enabling public egress.",
+    "title": "External providers",
+    "description": "Manage provider accounts, keys, models, budgets, pricing, and external fallback usage.",
+    "loadFailed": "Provider operations could not be loaded. Try again.",
+    "empty": "No stored provider accounts.",
     "accountList": "Provider accounts",
     "secretDisclosure": "Secrets are encrypted and only their suffix is displayed",
     "secretNeverShown": "The secret is submitted once and is never returned by the API.",
@@ -988,12 +977,9 @@
     "unknownCurrency": "unknown currency",
     "activePricingRequired": "Activate a pricing version before creating a finite spend policy. Its currency is used exactly; currencies are never converted.",
     "poolAttachments": "Pool provider members",
-    "poolAttachmentsDescription": "Attach an enabled provider as a primary member or as explicitly ordered public overflow. Both tiers enforce credentials, pricing, budgets, and accounting.",
-    "primaryEgressDisclosure": "Provider primary requests leave this deployment and may incur provider charges. Unlike public overflow, primary membership does not require the pool's overflow opt-in.",
+    "poolAttachmentsDescription": "Attach provider models as ordered external fallback members. Credentials, pricing, budgets, and accounting apply to every external request.",
     "poolLoadFailed": "Pools could not be loaded.",
     "publicOrder": "Public order {{order}}",
-    "egressAcknowledgement": "Acknowledgement applies to this pool only. Requests using a disclosed grant or token may leave the deployment and incur provider charges.",
-    "grantEgressDisclosure": "Pool grants that can egress: {{grants}}. Model API tokens that can egress: {{tokens}}.",
     "none": "none",
     "reportFailed": "Usage rows could not be loaded.",
     "budgetActivityFailed": "Budget activity could not be loaded.",
@@ -1003,7 +989,7 @@
     "modelsFailed": "Provider models could not be loaded.",
     "pricingFailed": "Pricing versions could not be loaded.",
     "policiesFailed": "Budget policies could not be loaded.",
-    "tokensFailed": "Token egress visibility could not be loaded.",
+    "tokensFailed": "Token scope details could not be loaded.",
     "repairStatus": "Reconciliation repair status",
     "repairLoadFailed": "Repair status could not be loaded.",
     "noRepairItems": "No provider attempts need attention in this window.",
@@ -1040,7 +1026,7 @@
     "noAudit": "No audit events for this account.",
     "noCapabilities": "No validated native capability inventory",
     "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning and optional reasoningConfig, hosted tools, context limits, source, and confidence.",
-    "visibilityDisclosure": "Anyone with a model API token or pool grant that can see a public-egress pool may cause requests to leave your deployment and consume the attached provider budgets.",
+    "visibilityDisclosure": "Visible pools remain local by default. External requests need <pool>:external, token permission, and the owner’s fallback settings, and can consume provider budgets only when local members cannot serve the request.",
     "fields": {
       "label": "Account label",
       "type": "Provider type",
@@ -1100,7 +1086,6 @@
       "retire": "Retire",
       "deactivate": "Deactivate",
       "createAttachmentProtection": "Create attachment protection",
-      "acknowledgeEgress": "Enable external fallback",
       "attachProvider": "Attach provider",
       "moveLater": "Move later",
       "detachProvider": "Detach provider from pool",
@@ -1194,7 +1179,11 @@
       "cost": "Reported / calculated cost",
       "identity": "Pricing · accounting version",
       "confidence": "Confidence"
-    }
+    },
+    "disabledDeployment": "External providers are disabled on this deployment. Stored accounts and key details remain available; you can revoke keys and delete configuration. Creation, edits, and credential tests are disabled.",
+    "externalFallbackHint": "Enable “Allow external fallback” in the pool’s Fallback settings before attaching a provider. Provider models never serve plain pool names.",
+    "externalRequestHint": "Only <pool>:external requests with token permission can use these providers when local members cannot serve the request. Provider charges apply.",
+    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting."
   },
   "providerCatalog": {
     "presets": {

@@ -631,7 +631,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     await user.click(
       await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider"),
     );
-    expect(screen.getByText("dashboard:pools.wizard.egressWarning")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.wizard.externalFallbackHint")).toBeTruthy();
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.budgetTitle"));
 
     const budgetLabels = [
@@ -655,7 +655,6 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     await user.clear(concurrency);
     await user.type(concurrency, "3");
 
-    await user.click(screen.getByText("dashboard:pools.wizard.fields.publicEgressAcknowledged"));
     await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
     expect(screen.getByText("dashboard:pools.wizard.atomicRollback")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
@@ -668,7 +667,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
       slug: "guarded-pool",
       recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
       memberContextCeiling: null,
-      publicEgressAcknowledged: true,
+
       providerModels: [
         {
           providerModelId: "provider-a",

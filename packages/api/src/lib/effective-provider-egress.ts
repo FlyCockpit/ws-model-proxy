@@ -42,9 +42,6 @@ export function egressProviderAccountLabels(input: {
   return [...labels].sort((left, right) => left.localeCompare(right));
 }
 
-/** Owner must resubmit with the confirm flag before a shared pool becomes non-private. */
-export const GRANTEE_PRIVACY_CONFIRMATION_REQUIRED = "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED";
-
 export const grantPoolAccessServerMessages = {
   userNotFound: "User not found.",
   cannotGrantToSelf: "Cannot grant a pool to yourself.",
