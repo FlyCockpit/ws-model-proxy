@@ -50,6 +50,35 @@
  * FOR UPDATE and runs its ON DELETE CASCADE / SET NULL actions as further
  * writes to the child rows.
  *
+ * Provider management/health order (PR2-C10), skipping unused levels:
+ *   provider-budget-* advisories -> L0 execution-target:provider-model fence
+ *   (when creating a target or editing policy) -> provider_account FOR UPDATE
+ *   -> provider-pricing:<user>:<model> advisory -> provider_model row
+ *   -> provider_pricing_version rows -> provider_credential / provider_attempt
+ *   rows -> child inserts -> L2 target policy -> L5 capacity rows.
+ * Provider rows sit between L0 and L2. Acquire the account before any model
+ * or pricing write, including pricing INSERTs: their FK checks can take KEY
+ * SHARE on account/model in either RI trigger order. Audit INSERTs also take
+ * KEY SHARE on the account. These provider parents must already be held;
+ * later model updates/audits (even after L2/L5) only re-enter held locks.
+ * A freshly inserted model's id is transaction-private and needs no L0 fence;
+ * its pricing advisory cannot contend. Catalog import re-enters its advisory
+ * after locking the existing model. Pricing-only writers need no L0 fence.
+ * Pricing writers take the model FOR NO KEY UPDATE (pricing fields are not
+ * keys), compatible with target-insert FK KEY SHARE during pool setup. They
+ * never wait on pool/target/capacity locks. Import and updateModel share the
+ * L0 fence with provider attach before taking the account/model rows; none
+ * requests a pool row or another identity fence afterwards. The static
+ * inventory and pricing writer sequence tests include implicit FK locks.
+ *
+ * Deferred provider siblings (NOT covered by this order proof): budget
+ * admission/reservation and usage-ledger INSERTs still take account/model FK
+ * locks in database-dependent RI trigger order. Settlement takes an attempt
+ * before ledger FK parents; runtime takes account -> model -> attempt. Also,
+ * user deletion takes L7 user -> provider cascade while provider child inserts
+ * can take KEY SHARE on user after account. These pre-existing risks require
+ * separate follow-up; neither terminal status nor an audit is a lock.
+ *
  * Consequences enforced here and in the callers:
  * - L1/L2 parent rows (`execution_target`, `model_pool`, `pool_member`,
  *   `user`) are never held FOR UPDATE, explicitly or implicitly, by a

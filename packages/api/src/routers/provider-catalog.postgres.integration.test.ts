@@ -21,6 +21,8 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
     | {
         prisma: typeof import("@ws-model-proxy/db").default;
         router: typeof import("./provider-catalog");
+        management: typeof import("./provider-management");
+        locks: typeof import("../lib/capacity-policy-safety");
         parseCatalog: typeof import("../lib/provider-catalog-model").parseCatalog;
       }
     | undefined;
@@ -33,12 +35,14 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
-    const [db, router, model] = await Promise.all([
+    const [db, router, model, management, locks] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./provider-catalog"),
       import("../lib/provider-catalog-model"),
+      import("./provider-management"),
+      import("../lib/capacity-policy-safety"),
     ]);
-    modules = { prisma: db.default, router, parseCatalog: model.parseCatalog };
+    modules = { prisma: db.default, router, parseCatalog: model.parseCatalog, management, locks };
   });
 
   afterAll(() => {
@@ -92,9 +96,12 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
       },
     } as Session;
     const client = createRouterClient(modules.router.createProviderCatalogRouter(catalog), {
-      context: { session } satisfies Context,
+      context: { session, services: undefined } satisfies Context,
     });
-    return { prisma: modules.prisma, user, account, client };
+    const management = createRouterClient(modules.management.providerManagementRouter, {
+      context: { session, services: undefined } satisfies Context,
+    });
+    return { prisma: modules.prisma, user, account, client, management };
   }
 
   const activePrices = (
@@ -271,4 +278,91 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
     });
     expect(model).toEqual({ deletedAt: null, enabled: false });
   });
+
+  it("activation cannot invert an import's account -> pricing -> model locks", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const { locks } = modules;
+    const { prisma, user, account, client, management } = await fixture();
+    useCatalog([catalogEntry()]);
+    const imported = await client.importModel({
+      providerAccountId: account.id,
+      modelId: "qwen/qwen3-coder",
+    });
+    const draft = await management.createPricingVersion({
+      providerModelId: imported.model.id,
+      version: "concurrent-user-price",
+      currency: "USD",
+      accountingVersion: "provider-billable-v1",
+      confidence: "CALCULATED",
+      ratesPerMillion: { input: "9", output: "9" },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+      effectiveAt: new Date(Date.now() + 60_000),
+    });
+    let activation: ReturnType<typeof management.activatePricingVersion> | undefined;
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
+          await tx.$executeRaw`SET LOCAL lock_timeout = '3s'`;
+          await tx.$executeRaw`SET LOCAL statement_timeout = '4s'`;
+          const [backend] = await tx.$queryRaw<
+            Array<{ pid: number }>
+          >`SELECT pg_backend_pid() AS pid`;
+          if (!backend) throw new Error("Backend pid unavailable");
+          // Deterministic import-side lock driver: precisely importModel's
+          // existing-model prefix, paused after account. The real activation
+          // must queue there WITHOUT holding the pricing advisory/rows/model.
+          // Before PR2-C10 it holds those and waits on the audit FK to account;
+          // the next advisory below then deadlocks (the short detector is here,
+          // outside import's retry wrapper, so retry cannot hide the regression).
+          await locks.lockExecutionTargetIdentities(tx, [`provider-model:${imported.model.id}`]);
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${account.id} AND "userId" = ${user.id} FOR UPDATE`;
+          activation = management.activatePricingVersion({ id: draft.id });
+          // Observe rejection immediately; assert it after the driver releases.
+          void activation.catch(() => undefined);
+          let blocked = false;
+          for (let poll = 0; poll < 300; poll++) {
+            const [row] = await prisma.$queryRaw<Array<{ blocked: boolean }>>`
+            SELECT EXISTS (
+              SELECT 1 FROM pg_stat_activity
+              WHERE ${backend.pid}::int = ANY(pg_blocking_pids(pid))
+            ) AS blocked`;
+            if (row?.blocked) {
+              blocked = true;
+              break;
+            }
+            await tick();
+          }
+          expect(blocked).toBe(true);
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${user.id}:${imported.model.id}`}, 0))`;
+          await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${imported.model.id} AND "userId" = ${user.id} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_pricing_version WHERE "providerModelId" = ${imported.model.id} AND "userId" = ${user.id} FOR UPDATE`;
+        },
+        { timeout: 8_000 },
+      );
+      expect(activation).toBeDefined();
+      await expect(activation).resolves.toMatchObject({ id: draft.id, status: "ACTIVE" });
+      expect((await activePrices(prisma, imported.model.id)).map((row) => row.id)).toEqual([
+        draft.id,
+      ]);
+      const audit = await prisma.providerAuditEvent.count({
+        where: { userId: user.id, action: "PRICING_ACTIVATED", subjectId: draft.id },
+      });
+      expect(audit).toBe(1);
+    } finally {
+      // Never leave a live writer behind when an assertion or timeout fails.
+      if (activation) await Promise.allSettled([activation]);
+    }
+  }, 20_000);
 });

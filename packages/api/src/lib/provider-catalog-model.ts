@@ -183,14 +183,13 @@ function catalogPricing(
 ): CatalogPricing {
   const base = priceTier(raw);
   if (raw?.overrides === undefined || raw.overrides === null)
-    return { ...base, variable: raw?.prompt === "-1" || raw?.completion === "-1", tiers: [] };
+    return { ...base, variable: isVariable(raw), tiers: [] };
   const tiers = priceTiersSchema.safeParse(raw.overrides);
   // Unparseable tiers cannot be bounded: the price is unknown (fail closed).
   if (!tiers.success) return { ...base, variable: true, tiers: [] };
   return {
     ...base,
-    variable:
-      raw.prompt === "-1" || raw.completion === "-1" || tiers.data.some((tier) => isVariable(tier)),
+    variable: isVariable(raw) || tiers.data.some((tier) => isVariable(tier)),
     tiers: tiers.data.map(priceTier),
   };
 }
@@ -417,16 +416,18 @@ function maxUnits(values: readonly bigint[]): bigint {
  *
  * The schedule has one rate per token category, but OpenRouter bills some
  * models in tiers (`pricing.overrides`, e.g. 2x input from 272k prompt tokens,
- * or by time of day). Each category's rate is therefore the upper bound across
- * the base price and every tier, so the calculated cost of any token-priced
- * request is never below what OpenRouter charges for those tokens. It does not
- * cover non-token charges (web search, images, audio, per-request fees); the
- * FAIL_CLOSED rule covers usage categories the schedule does not price.
+ * or by time of day). For the five parsed per-token categories (input, output,
+ * cache read, cache write and reasoning), the schedule takes the maximum rate
+ * across the base price and override tiers, with the fallbacks below. This
+ * bounds only those parsed rates. Non-token charges (e.g. web search) and
+ * unparsed token types (e.g. 1h cache writes and audio) are not covered; this
+ * is not a bound on the provider's total charge. FAIL_CLOSED applies only to
+ * unknown usage categories that the usage parser actually reports.
  *
- * The usage parser reports cache reads/writes and reasoning separately from
+ * The schedule represents cache reads/writes and reasoning separately from
  * input and output, so each gets an explicit rate. A tier that does not price
- * one of them is bounded by the input (cache) or output (reasoning) upper
- * bound, the rate OpenRouter otherwise bills those tokens at.
+ * one of them uses the input (cache) or output (reasoning) upper bound as its
+ * fallback.
  */
 export function catalogRatesPerMillion(model: CatalogModel): CatalogRatesPerMillion | null {
   const pricing = model.pricing;

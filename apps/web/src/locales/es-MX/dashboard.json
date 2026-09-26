@@ -1247,7 +1247,7 @@
       "pricingCatalogRetired": "El catálogo ya no indica un precio fijo para este modelo, así que se retiró el precio anterior del catálogo. No hay precio definido; las solicitudes con un límite de gasto se rechazan hasta que agregues uno.",
       "pricingUserKept": "Tu propio precio sigue activo, así que no se aplicó el precio del catálogo.",
       "pricingUpdated": "El precio del catálogo cambió: se retiró el precio anterior del catálogo y el nuevo está activo.",
-      "pricingTiered": "Este modelo tiene precios por niveles. Se usó la tarifa más alta de cada tipo de token, así que el gasto nunca se subestima.",
+      "pricingTiered": "Precios por niveles: se importó la tarifa máxima de cada categoría de tokens analizada entre el precio base y los niveles alternativos. No se cubren los cargos que no son por tokens (como búsquedas web) ni los tipos de tokens no analizados (como escrituras en caché de 1 hora y audio).",
       "pricingScheduled": "Ya existe un precio programado, así que no se aplicó el precio del catálogo.",
       "contextDrift": "El catálogo indica una ventana de contexto de {{catalog}} tokens; este modelo tiene {{current}}. Edita el modelo para cambiarla."
     },

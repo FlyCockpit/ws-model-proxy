@@ -202,8 +202,10 @@ async function catalogAuthoredPricingIds(
  *   changed, and retired when the catalog no longer gives a bounded price, so
  *   SPEND rules fail closed (PRICING_UNAVAILABLE) instead of settling on a
  *   stale rate. The model's `pricingVersion` pointer follows.
- * Caller holds the account row lock; this takes the per-model pricing
- * advisory lock (same key as activatePricingVersion) before reading prices.
+ * Caller holds the account and model rows (or has just inserted the model).
+ * For an existing model it already holds the per-model pricing advisory;
+ * taking it again here is re-entrant. For a new, transaction-private model id
+ * it cannot contend. Pricing and audit FK locks land on held provider parents.
  */
 async function applyCatalogPricing(
   tx: Prisma.TransactionClient,
@@ -384,7 +386,11 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
         // Lock order (capacity-lock-order L0 first, then provider rows):
         //   execution-target:provider-model:<id> identity fence (existing
         //   model only) -> provider_account row -> per-model pricing advisory
-        //   lock -> provider_model row.
+        //   lock -> provider_model row -> pricing rows -> child inserts.
+        // Pricing inserts take implicit FK KEY SHARE on account and model;
+        // audit inserts take it on account. Both parents are already held,
+        // so RI trigger order cannot add a reverse wait edge. Later model
+        // writes and the repeated pricing advisory only re-enter held locks.
         // The fence matches updateModel and provider attach, which take it
         // before the account row. It is needed whenever this import can create
         // (backfill) the model's execution target. A brand-new model needs no

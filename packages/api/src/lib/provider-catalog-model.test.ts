@@ -165,7 +165,7 @@ describe("live-shaped catalog entries", () => {
       cacheWrite: "0.132",
       reasoning: "0.528",
     });
-    // Non-token keys (web_search, audio, 1h cache write) are not token rates.
+    // Non-token web_search and unparsed audio / 1h cache token rates are excluded.
     expect(catalogRatesPerMillion(flat)).toEqual({
       input: "3",
       output: "15",
@@ -183,6 +183,30 @@ describe("live-shaped catalog entries", () => {
 });
 
 describe("tiered pricing that cannot be bounded", () => {
+  it.each(["prompt", "completion", "input_cache_read", "input_cache_write", "internal_reasoning"])(
+    "treats base %s = -1 as variable with absent, null, empty or populated overrides",
+    (category) => {
+      for (const overrides of [undefined, null, [], [{ prompt: "0.000002" }]]) {
+        const [model] = parseCatalog({
+          data: [
+            catalogEntry({
+              pricing: {
+                prompt: "0.000001",
+                completion: "0.000002",
+                [category]: "-1",
+                overrides,
+              },
+            }),
+          ],
+        });
+        if (!model) throw new Error("fixture");
+        expect(model.pricing.variable).toBe(true);
+        expect(catalogRatesPerMillion(model)).toBeNull();
+        expect(catalogCompatibility(model, null).warn).toContain("UNKNOWN_PRICE");
+      }
+    },
+  );
+
   const tiered = (overrides: unknown) =>
     parseCatalog({
       data: [
@@ -393,7 +417,7 @@ describe("pricing conversion", () => {
     ["0.0000002", "0.2"],
     ["0.00000002", "0.02"],
     ["1", "1000000"],
-    // Rounded up at 9 decimals so estimates never undercount.
+    // Rounded up at 9 decimals so conversion never lowers the listed rate.
     ["0.0000000833333333333333", "0.083333334"],
     ["0.000000000000001", "0.000000001"],
   ])("converts %s USD/token to %s USD/M", (value, expected) => {
