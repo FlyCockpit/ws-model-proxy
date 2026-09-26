@@ -127,6 +127,7 @@ describe("credential probe", () => {
     expect(providerCredentialProbe(providerType, baseUrl)).toEqual({
       url: expected,
       headers: accept,
+      verifiesCredential: true,
     });
   });
 
@@ -137,6 +138,7 @@ describe("credential probe", () => {
     expect(providerCredentialProbe("anthropic", baseUrl)).toEqual({
       url: expected,
       headers: { ...accept, "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION },
+      verifiesCredential: true,
     });
   });
 
@@ -145,6 +147,8 @@ describe("credential probe", () => {
       ["openrouter", "https://openrouter.ai/api"],
       ["openai", "https://api.openai.com"],
       ["anthropic", "https://api.anthropic.com"],
+      ["openai-compatible", "https://gateway.example/v1"],
+      ["anthropic-compatible", "https://gateway.example"],
     ] as const) {
       expect(new URL(providerCredentialProbe(type, baseUrl).url).origin).toBe(
         new URL(baseUrl).origin,
@@ -152,15 +156,40 @@ describe("credential probe", () => {
     }
   });
 
-  it.each(["openai-compatible", "anthropic-compatible", "unknown"])(
-    "keeps the base URL for %s (no endpoint every implementation serves)",
-    (providerType) => {
-      expect(providerCredentialProbe(providerType, "https://provider.example/v1")).toEqual({
-        url: "https://provider.example/v1",
-        headers: accept,
+  // A compatible gateway's root may be a public landing/health page, so the
+  // root is never probed; the family's model list is, but cannot verify.
+  it.each([
+    ["openai-compatible", "https://gateway.example", "https://gateway.example/v1/models", accept],
+    [
+      "openai-compatible",
+      "https://gateway.example/v1",
+      "https://gateway.example/v1/models",
+      accept,
+    ],
+    [
+      "anthropic-compatible",
+      "https://gateway.example/anthropic",
+      "https://gateway.example/anthropic/v1/models",
+      { ...accept, "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION },
+    ],
+  ])(
+    "probes the conventional model list for %s at %s without claiming verification",
+    (providerType, baseUrl, expected, headers) => {
+      expect(providerCredentialProbe(providerType, baseUrl)).toEqual({
+        url: expected,
+        headers,
+        verifiesCredential: false,
       });
     },
   );
+
+  it("never verifies an unknown type (refused before egress anyway)", () => {
+    expect(providerCredentialProbe("unknown", "https://provider.example/v1")).toEqual({
+      url: "https://provider.example/v1",
+      headers: accept,
+      verifiesCredential: false,
+    });
+  });
 
   it("leaves an invalid base URL for the egress layer to reject", () => {
     expect(providerCredentialProbe("openrouter", "not a url").url).toBe("not a url");
@@ -168,18 +197,28 @@ describe("credential probe", () => {
 });
 
 describe("credential probe classification", () => {
+  const success = { ok: true, outcome: "SUCCESS", reason: null };
+  const refused = { ok: false, outcome: "FAILURE", reason: "INVALID_CREDENTIAL" };
+  const failed = { ok: false, outcome: "FAILURE", reason: "UNEXPECTED_STATUS" };
+  const unverified = { ok: false, outcome: "INCONCLUSIVE", reason: "UNVERIFIED" };
+  const inconclusive = { ok: false, outcome: "INCONCLUSIVE", reason: "UNEXPECTED_STATUS" };
+
   it.each([
-    [200, { ok: true, reason: null }],
-    [204, { ok: true, reason: null }],
-    [401, { ok: false, reason: "INVALID_CREDENTIAL" }],
-    [403, { ok: false, reason: "INVALID_CREDENTIAL" }],
-    [404, { ok: false, reason: "UNEXPECTED_STATUS" }],
-    [421, { ok: false, reason: "UNEXPECTED_STATUS" }],
-    [429, { ok: false, reason: "UNEXPECTED_STATUS" }],
-    [500, { ok: false, reason: "UNEXPECTED_STATUS" }],
-    [101, { ok: false, reason: "UNEXPECTED_STATUS" }],
-    [null, { ok: false, reason: "UNEXPECTED_STATUS" }],
-  ] as const)("classifies %s", (status, expected) => {
-    expect(classifyCredentialProbeStatus(status)).toEqual(expected);
-  });
+    [200, success, unverified],
+    [204, success, unverified],
+    [401, refused, refused],
+    [403, refused, refused],
+    [404, failed, inconclusive],
+    [421, failed, inconclusive],
+    [429, failed, inconclusive],
+    [500, failed, inconclusive],
+    [101, failed, inconclusive],
+    [null, failed, inconclusive],
+  ] as const)(
+    "classifies %s (verifying endpoint, unverifying endpoint)",
+    (status, verifying, unverifying) => {
+      expect(classifyCredentialProbeStatus(status, true)).toEqual(verifying);
+      expect(classifyCredentialProbeStatus(status, false)).toEqual(unverifying);
+    },
+  );
 });

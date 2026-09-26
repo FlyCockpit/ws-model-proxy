@@ -1022,6 +1022,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "cost",
     inputSchema: confirmedArgs("RUN"),
+    descriptionNote:
+      "Result outcome SUCCESS means an endpoint known to require the key accepted it. FAILURE with reason INVALID_CREDENTIAL means the provider refused the key. INCONCLUSIVE means this provider type has no endpoint known to check keys: the key is neither confirmed nor refused.",
     invokeProcedure: procedureInvoker((client) => client.providerManagement.testCredential),
   },
   {

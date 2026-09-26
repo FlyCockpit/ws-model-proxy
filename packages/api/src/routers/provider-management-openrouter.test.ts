@@ -175,6 +175,7 @@ describe("OpenRouter credential test", () => {
     egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: true,
+      outcome: "SUCCESS",
       statusCode: 200,
       reason: null,
     });
@@ -195,6 +196,7 @@ describe("OpenRouter credential test", () => {
     egressMock.request.mockResolvedValue({ statusCode: 401, resume: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: false,
+      outcome: "FAILURE",
       statusCode: 401,
       reason: "INVALID_CREDENTIAL",
     });
@@ -262,6 +264,7 @@ describe("OpenAI and Anthropic credential tests", () => {
       egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
       await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
         ok: true,
+        outcome: "SUCCESS",
         statusCode: 200,
         reason: null,
       });
@@ -307,6 +310,7 @@ describe("OpenAI and Anthropic credential tests", () => {
     egressMock.request.mockResolvedValue({ statusCode: status, resume: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: false,
+      outcome: "FAILURE",
       statusCode: status,
       reason,
     });

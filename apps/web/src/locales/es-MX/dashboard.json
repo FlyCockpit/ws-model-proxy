@@ -1037,6 +1037,7 @@
       "testPassed": "La prueba de credencial pasó",
       "testFailed": "La prueba de credencial falló",
       "testRejected": "El proveedor rechazó esta credencial",
+      "testUnverified": "No se pudo confirmar esta credencial: este tipo de proveedor no tiene un endpoint conocido que verifique claves",
       "failed": "No se pudo guardar el cambio",
       "pricingCreated": "Borrador de precios guardado",
       "pricingActivated": "Versión de precios activada",

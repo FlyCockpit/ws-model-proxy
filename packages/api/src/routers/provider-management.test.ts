@@ -1502,6 +1502,7 @@ describe("providerManagementRouter security boundary", () => {
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
       ok: true,
+      outcome: "SUCCESS",
       statusCode: 204,
       reason: null,
     });
@@ -1557,16 +1558,32 @@ describe("providerManagementRouter security boundary", () => {
         providerType,
         baseUrl: "https://provider.example/v1",
       });
-      await expect(client.testCredential({ providerAccountId: "account" })).resolves.toMatchObject({
-        ok: true,
+      // A 2xx from a compatible gateway's model list cannot prove the key
+      // was checked: inconclusive, never a pass.
+      await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
+        ok: false,
+        outcome: "INCONCLUSIVE",
+        reason: "UNVERIFIED",
+        statusCode: 204,
       });
       expect(egressMock.request).toHaveBeenLastCalledWith(
-        "https://provider.example/v1",
-        { method: "GET", headers: { accept: "application/json" } },
+        "https://provider.example/v1/models",
+        {
+          method: "GET",
+          headers:
+            protocol === "anthropic"
+              ? { accept: "application/json", "anthropic-version": "2023-06-01" }
+              : { accept: "application/json" },
+        },
         expect.objectContaining({ egressEnabled: true }),
         protocol,
         { type: "BEARER", token: "super-secret-value" },
       );
+      expect(db.providerAuditEvent.create.mock.calls.at(-1)?.[0].data.metadata).toEqual({
+        outcome: "INCONCLUSIVE",
+        statusCode: 204,
+        reason: "UNVERIFIED",
+      });
     }
 
     db.providerAccount.findFirst.mockResolvedValue({
@@ -1647,6 +1664,7 @@ describe("providerManagementRouter security boundary", () => {
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
       ok: true,
+      outcome: "SUCCESS",
       statusCode: 204,
       reason: null,
     });

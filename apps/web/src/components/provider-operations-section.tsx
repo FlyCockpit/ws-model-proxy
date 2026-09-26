@@ -499,16 +499,22 @@ export function ProviderOperationsSection() {
   );
   const testCredential = useMutation(
     orpc.providerManagement.testCredential.mutationOptions({
-      onSuccess: (result) =>
-        result.ok
-          ? toast.success(t("dashboard:providers.feedback.testPassed"))
-          : toast.error(
-              t(
-                result.reason === "INVALID_CREDENTIAL"
-                  ? "dashboard:providers.feedback.testRejected"
-                  : "dashboard:providers.feedback.testFailed",
-              ),
+      onSuccess: (result) => {
+        if (result.outcome === "SUCCESS")
+          toast.success(t("dashboard:providers.feedback.testPassed"));
+        // Not a pass and not a refusal: this provider type has no endpoint
+        // known to require the key.
+        else if (result.outcome === "INCONCLUSIVE")
+          toast.warning(t("dashboard:providers.feedback.testUnverified"));
+        else
+          toast.error(
+            t(
+              result.reason === "INVALID_CREDENTIAL"
+                ? "dashboard:providers.feedback.testRejected"
+                : "dashboard:providers.feedback.testFailed",
             ),
+          );
+      },
       onError: () => toast.error(t("dashboard:providers.feedback.testFailed")),
     }),
   );

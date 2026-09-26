@@ -56,39 +56,60 @@ export function providerRequestPathname(basePathname: string, requestPathname: s
   return `${base}${request}`;
 }
 
-type CredentialProbe = { path: string; headers?: Readonly<Record<string, string>> };
+type CredentialProbe = {
+  path: string;
+  headers?: Readonly<Record<string, string>>;
+  /**
+   * Whether the endpoint is known to require the key, so a 2xx proves the
+   * key was accepted. False means a 2xx may only show the endpoint is public.
+   */
+  verifiesCredential: boolean;
+};
 
 /**
  * Authenticated endpoint used by "Test credential", relative to the account
  * base URL. API roots do not tell a valid key from an invalid one (OpenAI's
- * answers 421, Anthropic's and OpenRouter's 404, with or without a key).
+ * answers 421, Anthropic's and OpenRouter's 404, with or without a key; a
+ * gateway's root may be a public landing or health page).
  * - openrouter `GET /v1/key`: 401 for a missing or bogus key (checked live).
  * - openai `GET /v1/models`: Bearer-authenticated model list; 401 for a bad key.
  * - anthropic `GET /v1/models`: needs `x-api-key` and `anthropic-version`;
  *   401 for a bad key.
- * The `-compatible` types have no endpoint every implementation serves, so
- * they keep probing the configured base URL (pre-existing behavior).
+ * - `-compatible` types probe their family's conventional `GET /v1/models`,
+ *   but no endpoint is known to require a key on every implementation (many
+ *   serve the model list publicly, some not at all). A 401/403 there still
+ *   shows the key was refused; anything else is inconclusive, never a pass.
  */
 const PROVIDER_CREDENTIAL_PROBE = {
-  openrouter: { path: "/v1/key" },
-  openai: { path: "/v1/models" },
+  openrouter: { path: "/v1/key", verifiesCredential: true },
+  openai: { path: "/v1/models", verifiesCredential: true },
   anthropic: {
     path: "/v1/models",
     headers: { "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION },
+    verifiesCredential: true,
   },
-} as const satisfies Partial<Record<ProviderType, CredentialProbe>>;
+  "openai-compatible": { path: "/v1/models", verifiesCredential: false },
+  "anthropic-compatible": {
+    path: "/v1/models",
+    headers: { "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION },
+    verifiesCredential: false,
+  },
+} as const satisfies Record<ProviderType, CredentialProbe>;
 
 /**
  * Request "Test credential" sends. It is always on the account's own base URL
- * (same origin and path prefix), so the key goes nowhere new.
+ * (same origin and path prefix), so the key goes nowhere new. Unknown types
+ * are refused before egress; if one reaches here it probes nothing new (the
+ * base URL itself) and can never verify.
  */
 export function providerCredentialProbe(
   providerType: string,
   baseUrl: string,
-): { url: string; headers: Record<string, string> } {
+): { url: string; headers: Record<string, string>; verifiesCredential: boolean } {
   const headers: Record<string, string> = { accept: "application/json" };
   const normalized = normalizedType(providerType);
-  if (!Object.hasOwn(PROVIDER_CREDENTIAL_PROBE, normalized)) return { url: baseUrl, headers };
+  if (!Object.hasOwn(PROVIDER_CREDENTIAL_PROBE, normalized))
+    return { url: baseUrl, headers, verifiesCredential: false };
   const probe: CredentialProbe =
     PROVIDER_CREDENTIAL_PROBE[normalized as keyof typeof PROVIDER_CREDENTIAL_PROBE];
   let url: URL;
@@ -96,22 +117,46 @@ export function providerCredentialProbe(
     url = new URL(baseUrl);
   } catch {
     // The egress layer rejects the invalid base URL itself.
-    return { url: baseUrl, headers };
+    return { url: baseUrl, headers, verifiesCredential: probe.verifiesCredential };
   }
   url.pathname = providerRequestPathname(url.pathname, probe.path);
-  return { url: url.toString(), headers: { ...headers, ...probe.headers } };
+  return {
+    url: url.toString(),
+    headers: { ...headers, ...probe.headers },
+    verifiesCredential: probe.verifiesCredential,
+  };
 }
 
-/** Credential-test classification from the probe's HTTP status. */
-export type CredentialProbeReason = "INVALID_CREDENTIAL" | "UNEXPECTED_STATUS";
+/**
+ * Credential-test result from the probe's HTTP status.
+ * - SUCCESS: 2xx from an endpoint known to require the key.
+ * - FAILURE: 401/403 (`INVALID_CREDENTIAL`, the key was refused), or another
+ *   status from an endpoint known to require the key (`UNEXPECTED_STATUS`).
+ * - INCONCLUSIVE: the endpoint is not known to require a key, so a 2xx
+ *   (`UNVERIFIED`) or another status (`UNEXPECTED_STATUS`) says nothing about
+ *   the key either way.
+ */
+export type CredentialProbeResult =
+  | { ok: true; outcome: "SUCCESS"; reason: null }
+  | { ok: false; outcome: "FAILURE"; reason: "INVALID_CREDENTIAL" | "UNEXPECTED_STATUS" }
+  | { ok: false; outcome: "INCONCLUSIVE"; reason: "UNVERIFIED" | "UNEXPECTED_STATUS" };
 
 export function classifyCredentialProbeStatus(
   statusCode: number | null,
-): { ok: true; reason: null } | { ok: false; reason: CredentialProbeReason } {
-  if (statusCode !== null && statusCode >= 200 && statusCode < 300)
-    return { ok: true, reason: null };
-  if (statusCode === 401 || statusCode === 403) return { ok: false, reason: "INVALID_CREDENTIAL" };
-  return { ok: false, reason: "UNEXPECTED_STATUS" };
+  verifiesCredential: boolean,
+): CredentialProbeResult {
+  if (statusCode === 401 || statusCode === 403)
+    return { ok: false, outcome: "FAILURE", reason: "INVALID_CREDENTIAL" };
+  const success = statusCode !== null && statusCode >= 200 && statusCode < 300;
+  if (verifiesCredential)
+    return success
+      ? { ok: true, outcome: "SUCCESS", reason: null }
+      : { ok: false, outcome: "FAILURE", reason: "UNEXPECTED_STATUS" };
+  return {
+    ok: false,
+    outcome: "INCONCLUSIVE",
+    reason: success ? "UNVERIFIED" : "UNEXPECTED_STATUS",
+  };
 }
 
 /**
