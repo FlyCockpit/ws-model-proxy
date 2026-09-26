@@ -24,6 +24,7 @@ export function createProductionCapacityRuntime() {
     runtime,
     async close() {
       clearInterval(maintenanceTimer);
+      await runtime.close();
       await wakeSource.close();
     },
   };

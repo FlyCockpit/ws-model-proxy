@@ -3570,7 +3570,10 @@ async function relayDirect({
       headers: builtRequest.headers,
       ...relayAttemptBody(builtRequest.body),
       timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-      abortSignal: request.signal,
+      abortSignal:
+        capacityLease?.state === "ADMITTED"
+          ? (capacityLease.lease.signal ?? request.signal)
+          : request.signal,
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
@@ -3995,6 +3998,7 @@ async function relayPool({
         try {
           result = await dispatchPublicOverflow({
             ...providerRequest,
+            signal: admission.lease.signal ?? request.signal,
             forcedPoolMemberId: selectedPoolMemberId,
             retrySingleTargetPrecommit: remaining.length > 1,
           });
@@ -5137,7 +5141,10 @@ async function relayPool({
         headers: builtRequest.headers,
         ...relayAttemptBody(builtRequest.body),
         timeoutMs: attemptTimeoutMs,
-        abortSignal: request.signal,
+        abortSignal:
+          capacityLease?.state === "ADMITTED"
+            ? (capacityLease.lease.signal ?? request.signal)
+            : request.signal,
         onResponseBodyChunk: (chunk) => {
           responseIdCapture?.push(chunk, operation.stream);
         },
@@ -5873,7 +5880,10 @@ async function relaySelectedModelNoFailover({
     headers: builtRequest.headers,
     ...relayAttemptBody(builtRequest.body),
     timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-    abortSignal: request.signal,
+    abortSignal:
+      capacityLease?.state === "ADMITTED"
+        ? (capacityLease.lease.signal ?? request.signal)
+        : request.signal,
     onResponseBodyChunk: responseIdCapture
       ? (chunk) => responseIdCapture.push(chunk, operation.stream)
       : undefined,
@@ -7168,6 +7178,7 @@ async function relayBoundProviderResponse(input: {
     try {
       result = await dispatchPublicOverflow({
         ...boundRequest,
+        signal: admission.lease.signal ?? input.request.signal,
         forcedPoolMemberId: exactTarget.poolMemberId,
       });
     } catch (error) {

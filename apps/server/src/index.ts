@@ -20,6 +20,7 @@ import {
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
+import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
 import {
   providerAttemptExpiryEnabled,
   startProviderAttemptExpiry,
@@ -270,7 +271,7 @@ async function runShutdownSequence() {
       stopCliCommandSweep();
       stopTerminalSessionRecheck();
       relaySessionManager.dispose();
-      await capacityLifecycle?.close();
+      await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()]);
     },
     closeBrowserSockets: () => {
       terminalBrowserHub.closeAll();

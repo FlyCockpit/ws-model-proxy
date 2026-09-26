@@ -762,7 +762,27 @@ integration("PostgreSQL capacity admission primitives", () => {
       );
       if (live.state !== "ADMITTED") throw new Error("Expected live database-clock lease.");
       const beforeHeartbeat = await databaseNow();
-      await expect(secondManager.heartbeat(live.lease, 2_000)).resolves.toBe(true);
+      // F2-CAP-1: renewal must not wait for an unrelated admission/reclaim
+      // transaction's L4/L5 locks. This file is already registered in test:postgres.
+      await first.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const renewal = await Promise.race([
+            secondManager.heartbeat(live.lease, 2_000),
+            new Promise<never>((_resolve, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error("heartbeat waited on admission locks")),
+                1_000,
+              );
+            }),
+          ]);
+          expect(renewal).toBe(true);
+        } finally {
+          clearTimeout(timeout);
+        }
+      });
       const [heartbeated, afterHeartbeat] = await Promise.all([
         first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
         databaseNow(),

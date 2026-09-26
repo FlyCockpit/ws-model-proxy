@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
 import { StoreCapacityAdmissionRuntime } from "./runtime.js";
+import type { CapacityAdmissionStore, CapacityLeaseHandle } from "./types.js";
 
 describe("capacity admission runtime", () => {
   it("rejects polling intervals that cannot safely refresh waiting heartbeats", () => {
@@ -369,5 +370,263 @@ describe("capacity admission runtime", () => {
     ).rejects.toBe(maintainFailure);
     // No signal abort → the catch terminal state is EXPIRED.
     expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
+  });
+});
+
+// F2-CAP-1: model admission precedes dispatch, which may wait longer than the
+// original 30s TTL before there is a Response to wrap.
+describe("admitted lease ownership", () => {
+  function fixture() {
+    const lease = {
+      leaseId: "lease",
+      attemptId: "attempt",
+      capacityId: "capacity",
+      executionTargetId: "target",
+      fencingToken: 1n,
+      expiresAt: new Date(Date.now() + 30_000),
+    };
+    let active = true;
+    const store = {
+      acquire: vi.fn<CapacityAdmissionStore["acquire"]>(async () => ({ state: "ADMITTED", lease })),
+      heartbeat: vi.fn(async (_lease: CapacityLeaseHandle, _extensionMs: number) => {
+        if (!active || lease.expiresAt.getTime() <= Date.now()) return false;
+        lease.expiresAt = new Date(Date.now() + 30_000);
+        return true;
+      }),
+      release: vi.fn(async () => {
+        active = false;
+        return true;
+      }),
+      terminalizeAttempt: vi.fn<CapacityAdmissionStore["terminalizeAttempt"]>(async () => ({
+        state: "CANCELLED",
+      })),
+      reclaimExpired: vi.fn(async () => 0),
+    };
+    const runtime = new StoreCapacityAdmissionRuntime(store);
+    const attempt = {
+      requestId: "request",
+      attemptId: "attempt",
+      ownerId: "owner",
+      sourceKind: "DIRECT" as const,
+      basePriority: 16,
+      connectionOwner: "test",
+      deadlineAt: new Date(Date.now() + 900_000),
+      candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+    };
+    const admit = async (signal?: AbortSignal) => {
+      const result = await runtime.acquire(attempt, signal);
+      if (result.state !== "ADMITTED") throw new Error("Expected admission");
+      return result.lease;
+    };
+    return { lease, store, runtime, attempt, admit };
+  }
+
+  afterEach(() => vi.useRealTimers());
+
+  it("has no owner or timer when closed without admissions", async () => {
+    vi.useFakeTimers();
+    const { runtime, attempt, store } = fixture();
+    await runtime.close();
+    expect(await runtime.acquire(attempt)).toEqual({ state: "CANCELLED" });
+    expect(store.acquire).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retains capacity during a 31s dispatch and adopts the same heartbeat cadence", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, lease, admit } = fixture();
+    const handle = await admit();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(4);
+    expect(lease.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    expect(handle.signal?.aborted).toBe(false);
+    const response = runtime.hold(new Response(new ReadableStream()), handle);
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(5);
+    await response.body!.cancel();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(5);
+    expect(store.release).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["false", "reject"])(
+    "aborts pending dispatch when heartbeat returns %s",
+    async (mode) => {
+      vi.useFakeTimers();
+      const { runtime, store, admit } = fixture();
+      const handle = await admit();
+      const cancelled = vi.fn();
+      const dispatch = new Promise<void>((_resolve, reject) => {
+        handle.signal!.addEventListener("abort", () => {
+          cancelled();
+          reject(handle.signal!.reason);
+        });
+      });
+      const outcome = expect(dispatch).rejects.toThrow();
+      if (mode === "false") store.heartbeat.mockResolvedValueOnce(false);
+      else store.heartbeat.mockRejectedValueOnce(new Error("db unavailable"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await outcome;
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(store.release).toHaveBeenCalledOnce();
+      // Late headers cannot revive a lost owner or expose upstream bytes.
+      const late = runtime.hold(new Response("late data"), handle);
+      await expect(late.text()).rejects.toThrow();
+      await runtime.release(handle);
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(store.heartbeat).toHaveBeenCalledTimes(2);
+      expect(store.release).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("aborts dispatch if a heartbeat stalls beyond the last acknowledged TTL", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    let complete!: (retained: boolean) => void;
+    store.heartbeat.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          complete = resolve;
+        }),
+    );
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(handle.signal?.aborted).toBe(true);
+    expect(store.release).toHaveBeenCalledOnce();
+    complete(true);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+    await runtime.close();
+  });
+
+  it("fails closed when initial ownership confirmation finds a stale lease", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, attempt } = fixture();
+    store.heartbeat.mockResolvedValueOnce(false);
+    expect(await runtime.acquire(attempt)).toEqual({ state: "CANCELLED" });
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("deduplicates idempotent admission and overlapping heartbeat calls", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const first = await admit();
+    const second = await admit();
+    expect(second.signal).toBe(first.signal);
+    let complete!: (retained: boolean) => void;
+    store.heartbeat.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          complete = resolve;
+        }),
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    const response = runtime.hold(new Response(new ReadableStream()), second);
+    await runtime.release(first);
+    complete(false);
+    await response.body!.cancel().catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["client abort", "dispatch failure", "shutdown", "EOF", "body error", "body cancel"])(
+    "stops ownership on %s",
+    async (exit) => {
+      vi.useFakeTimers();
+      const { runtime, store, admit } = fixture();
+      const client = new AbortController();
+      const handle = await admit(client.signal);
+      await vi.advanceTimersByTimeAsync(10_000);
+      if (exit === "client abort") client.abort();
+      else if (exit === "shutdown") await runtime.close();
+      else if (exit === "dispatch failure") await runtime.release(handle);
+      else if (exit === "EOF")
+        expect(await runtime.hold(new Response("done"), handle).text()).toBe("done");
+      else if (exit === "body cancel")
+        await runtime.hold(new Response(new ReadableStream()), handle).body!.cancel();
+      else {
+        const body = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("body failed"));
+          },
+        });
+        await expect(runtime.hold(new Response(body), handle).text()).rejects.toThrow(
+          "body failed",
+        );
+      }
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(handle.signal?.aborted).toBe(true);
+      expect(store.heartbeat).toHaveBeenCalledTimes(2);
+      expect(store.release).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("cancels pending admission after its bounded polling delay on shutdown", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, attempt } = fixture();
+    store.acquire.mockResolvedValue({ state: "WAITING", requestId: "request" });
+    const pending = runtime.acquire(attempt);
+    await vi.advanceTimersByTimeAsync(1);
+    const polls = store.acquire.mock.calls.length;
+    await runtime.close();
+    // The no-notification polling fallback has an existing bounded delay.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(store.acquire).toHaveBeenCalledTimes(polls);
+    expect(await pending).toEqual({ state: "CANCELLED" });
+    expect(store.terminalizeAttempt).toHaveBeenCalledWith("attempt", "CANCELLED");
+    expect(store.heartbeat).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases an admission returned after shutdown without dispatching", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, lease, attempt } = fixture();
+    let complete!: () => void;
+    store.acquire.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = () => resolve({ state: "ADMITTED", lease });
+        }),
+    );
+    const pending = runtime.acquire(attempt);
+    await vi.advanceTimersByTimeAsync(0);
+    store.terminalizeAttempt.mockImplementationOnce(async () => ({
+      state: "ADMITTED" as const,
+      lease,
+    }));
+    await runtime.close();
+    complete();
+    expect(await pending).toEqual({ state: "CANCELLED" });
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases the failed member and gives failover its own independent owner", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, lease, admit } = fixture();
+    const first = await admit();
+    await runtime.release(first);
+    store.acquire.mockResolvedValueOnce({
+      state: "ADMITTED",
+      lease: { ...lease, leaseId: "second", fencingToken: 2n },
+    });
+    store.heartbeat.mockClear().mockResolvedValue(true);
+    const second = await admit();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(first.signal?.aborted).toBe(true);
+    expect(second.signal?.aborted).toBe(false);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    expect(store.heartbeat.mock.calls[0]?.[0]).toMatchObject({ leaseId: "second" });
+    await runtime.release(second);
+    expect(store.release).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

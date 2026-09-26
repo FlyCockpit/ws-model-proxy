@@ -295,3 +295,95 @@ describe("capacity wakeup polling", () => {
     ).resolves.toEqual({ state: "CANCELLED" });
   });
 });
+
+describe("capacity heartbeat lock footprint", () => {
+  it("renews with one fenced UPDATE and no transaction or admission locks", async () => {
+    const execute = vi.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(0);
+    const transaction = vi.fn();
+    const db = { $executeRaw: execute, $transaction: transaction };
+    const store = new PostgresCapacityAdmissionStore(
+      db as unknown as ConstructorParameters<typeof PostgresCapacityAdmissionStore>[0],
+    );
+    const lease = {
+      leaseId: "lease",
+      attemptId: "attempt",
+      capacityId: "capacity",
+      executionTargetId: "target",
+      fencingToken: 3n,
+      expiresAt: new Date(),
+    };
+    await expect(store.heartbeat(lease, 30_000)).resolves.toBe(true);
+    await expect(store.heartbeat(lease, 30_000)).resolves.toBe(false);
+    expect(transaction).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(2);
+    const [sql, ...parameters] = execute.mock.calls[0]!;
+    expect(sql.join("?")).toMatch(
+      /UPDATE capacity_lease[\s\S]*state = 'ACTIVE' AND "expiresAt" > clock_timestamp\(\)/,
+    );
+    expect(parameters).toEqual([30_000, "lease", 3n]);
+    await expect(store.heartbeat(lease, 0)).rejects.toThrow(RangeError);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("preserves a lease renewed between idempotent acquire's expiry read and UPDATE", async () => {
+  const now = new Date();
+  const expired = {
+    id: "lease",
+    attemptId: "attempt",
+    capacityId: "capacity",
+    executionTargetId: "target",
+    fencingToken: 1n,
+    state: "ACTIVE",
+    expiresAt: new Date(now.getTime() - 1),
+  };
+  const renewed = { ...expired, expiresAt: new Date(now.getTime() + 30_000) };
+  const existing = {
+    id: "admission",
+    state: "ADMITTED",
+    Lease: expired,
+    Waiters: [],
+    deadlineAt: now,
+  };
+  const tx = {
+    $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([{ now }]),
+    capacityWaiter: { findMany: vi.fn().mockResolvedValue([]) },
+    admissionRequest: {
+      findUnique: vi.fn().mockResolvedValue(existing),
+      update: vi.fn(),
+    },
+    capacityLease: {
+      findUniqueOrThrow: vi.fn().mockResolvedValueOnce(expired).mockResolvedValue(renewed),
+      // PostgreSQL's conditional UPDATE loses to the concurrent renewal.
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+  };
+  const db = {
+    $transaction: vi.fn(async (work: (client: typeof tx) => Promise<unknown>) => work(tx)),
+  };
+  const store = new PostgresCapacityAdmissionStore(
+    db as unknown as ConstructorParameters<typeof PostgresCapacityAdmissionStore>[0],
+  );
+  await expect(
+    store.acquire({
+      requestId: "request",
+      attemptId: "attempt",
+      ownerId: "owner",
+      sourceKind: "DIRECT",
+      basePriority: 16,
+      connectionOwner: "test",
+      deadlineAt: now,
+      candidates: [],
+    }),
+  ).resolves.toMatchObject({
+    state: "ADMITTED",
+    lease: { leaseId: "lease", expiresAt: renewed.expiresAt },
+  });
+  expect(tx.capacityLease.updateMany).toHaveBeenCalledWith(
+    expect.objectContaining({
+      where: expect.objectContaining({ expiresAt: { lte: now } }),
+    }),
+  );
+  expect(tx.admissionRequest.update).not.toHaveBeenCalled();
+});
