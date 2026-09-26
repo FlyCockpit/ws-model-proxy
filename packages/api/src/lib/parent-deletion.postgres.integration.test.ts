@@ -879,6 +879,32 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
   });
 
+  it("the drain reports pending once it has passed more busy admissions than its bound (g1-M1)", async () => {
+    const { prisma, deletion } = required();
+    const g = await graph("many-held-waiters");
+    const over = deletion.PARENT_DELETION_MAX_PASSED_ADMISSIONS + 1;
+    await terminalAdmissions(g, over);
+    // Every waiter held by one other transaction: each request is passed.
+    const held = await holdRowLock(
+      `SELECT id FROM capacity_waiter WHERE "poolId" = '${g.pool.id}' FOR UPDATE`,
+    );
+    try {
+      const outcome = await settle(
+        deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] }),
+      );
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("the drain carried an unbounded passed list");
+      expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
+      // Nothing busy was deleted.
+      expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(over);
+    } finally {
+      await held.release();
+    }
+    // Inverse: once the waiters are free the next run drains every request.
+    await deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] });
+    expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
+  }, 120_000);
+
   it("a lock wait past the drain bound reports pending, keeps the marker and lets the sweep go on (F2-07)", async () => {
     const { prisma, deletion } = required();
     const { sweepPendingUserDeletions } = await import(
@@ -1946,27 +1972,49 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         holdRowLock(`SELECT id FROM relay_execution_event WHERE id = '${event.id}' FOR UPDATE`),
       ),
     );
-    // Release the holders one per second: each wait stays under the lock
-    // timeout, the running total passes the statement timeout.
-    const releaseAll = (async () => {
-      for (const holder of holders) {
+    // Release, 1 s after the cascade starts waiting on it, whichever holder
+    // pg_blocking_pids() reports for the cascade backend: each wait stays
+    // under the lock timeout while the running total passes the statement
+    // timeout. The cascade visits the rows in heap order, not creation order,
+    // so a fixed release order could leave it waiting 2 s on one row and end
+    // it with 55P03 instead (g2-T1).
+    const cascadeStarted = Date.now();
+    const cascade = settle(
+      deletion.runParentDeletionDrainBatch(prisma, undefined, (tx) =>
+        order.deleteTerminalRelayRequestsWithoutWaiting(tx, [relay.id]),
+      ),
+    );
+    const cascadeSettled = cascade.then(() => null);
+    const holderByPid = new Map(holders.map((holder) => [holder.pid, holder]));
+    const releasing = (async () => {
+      const remaining = new Set(holderByPid.keys());
+      while (remaining.size > 0) {
+        // Racing the batch stops the loop once the statement timeout cancels
+        // the DELETE (the later holders then never block).
+        const pid = await Promise.race([
+          waitForBlocker("DELETE FROM relay_request", remaining, 20_000).catch(() => null),
+          cascadeSettled,
+        ]);
+        if (pid === null) return;
         await sleep(1_000);
-        await holder.release();
+        await holderByPid.get(pid)!.release();
+        remaining.delete(pid);
       }
     })();
     try {
-      const cascadeStarted = Date.now();
-      await expect(
-        deletion.runParentDeletionDrainBatch(prisma, undefined, (tx) =>
-          order.deleteTerminalRelayRequestsWithoutWaiting(tx, [relay.id]),
-        ),
-      ).rejects.toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
+      const outcome = await cascade;
+      const cascadeMs = Date.now() - cascadeStarted;
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("the cascade was not stopped");
+      expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
       // Cancelled by the statement bound (R2-17-5), not a 2 s lock wait.
-      expect(Date.now() - cascadeStarted).toBeGreaterThanOrEqual(
+      expect(cascadeMs).toBeGreaterThanOrEqual(
         deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS - 100,
       );
+      expect(cascadeMs).toBeLessThan(deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 1_000);
     } finally {
-      await releaseAll;
+      await releasing;
+      for (const holder of holders) await holder.release();
     }
     expect(await prisma.relayRequest.count({ where: { id: relay.id } })).toBe(1);
     expect(await prisma.relayExecutionEvent.count({ where: { relayRequestId: relay.id } })).toBe(5);
@@ -3383,4 +3431,168 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(outcome.error).toMatchObject({ code: "PARENT_DELETION_OWNER_REQUIRED" });
     expect(await prisma.user.count({ where: { id: g.user.id } })).toBe(1);
   });
+
+  // F2-07 (process level): the database step is `disconnectDatabaseClients`
+  // (apps/server/src/graceful-shutdown.ts, called from index.ts
+  // `disconnectPrisma`). A request admitted before the fence (users.setRole on
+  // the real shared singleton) waits on the user row the sweep's final delete
+  // holds while that COMMIT runs a slow deferred trigger. pg-pool's end()
+  // waits for the request's checked-out client, so an unbounded shared
+  // disconnect waited on the sweep's COMMIT (18 s measured by the final
+  // review); the shared disconnect now ends at SHARED_DISCONNECT_TIMEOUT_MS.
+  // These two tests run last: the first abandons the shared client's
+  // disconnect (it finishes once the blocked request does).
+  it("a shared disconnect waiting behind a quarantined sweep COMMIT is abandoned at its deadline: the database step takes at most J + D + D_shared (F2-07)", async () => {
+    const { prisma, observer, fence, deadline, timeouts, users } = required();
+    const user = await markedUser("shared-shutdown");
+    const admin = await graph("shared-shutdown-admin");
+    await hideOtherMarkers([user.id]);
+    const stepBoundMs =
+      timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
+      timeouts.USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS +
+      timeouts.SHARED_DISCONNECT_TIMEOUT_MS;
+    // Outlasts the whole database step, so the COMMIT is still running when
+    // it returns.
+    const triggerSleepS = (stepBoundMs + 5_000) / 1_000;
+    await observer.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION wsmp_test_shared_slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.id = '${user.id}' THEN PERFORM pg_sleep(${triggerSleepS}); END IF;
+        RETURN NULL;
+      END $$`);
+    await observer.$executeRawUnsafe(`
+      CREATE CONSTRAINT TRIGGER wsmp_test_shared_slow_commit AFTER DELETE ON "user"
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION wsmp_test_shared_slow_commit()`);
+    const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
+    const before = new Set(await sweepBackends());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const handle = await productionSweepHandle();
+    const stop = await startSweep(handle.prisma);
+    const warnings: string[] = [];
+    let writer: ReturnType<typeof settle> | undefined;
+    let sharedDisconnect: Promise<void> | undefined;
+    let slowPid = 0;
+    try {
+      const slow = await waitForSweepActivity(
+        (row) => row.query === "COMMIT" && row.wait_event === "PgSleep",
+        before,
+      );
+      slowPid = slow.pid;
+      // A request admitted before shutdown, on the shared singleton.
+      const client = createRouterClient(users.usersRouter, { context: sessionFor(admin.user) });
+      writer = settle(client.setRole({ userId: user.id, role: "user" }));
+      await waitForBlocker("UPDATE", new Set([slowPid]));
+
+      let stopping: Promise<void> | undefined;
+      let teardown:
+        | Awaited<ReturnType<typeof deadline.disconnectDatabaseClients<unknown>>>
+        | undefined;
+      const started = Date.now();
+      await deadline.runGracefulShutdownSequence({
+        stopPeriodicJobs: () => {
+          stopping = stop();
+        },
+        closeBrowserSockets: () => undefined,
+        drainHttp: async () => undefined,
+        closeRelaySessions: () => undefined,
+        closeMcpHandler: async () => {
+          fence.armDbShutdownFence();
+        },
+        // index.ts disconnectPrisma, with the warnings captured.
+        disconnectPrisma: async () => {
+          teardown = await deadline.disconnectDatabaseClients({
+            shutDownSweep: () =>
+              sweep.shutDownUserDeletionSweep({
+                stopped: () => stopping ?? stop(),
+                client: handle,
+                warn: (message) => warnings.push(message),
+              }),
+            shared: {
+              // The real shared singleton; the promise is kept only so the
+              // test can await the abandoned disconnect afterwards.
+              $disconnect: () => {
+                sharedDisconnect = prisma.$disconnect();
+                return sharedDisconnect;
+              },
+            },
+            warn: (message) => warnings.push(message),
+          });
+        },
+        log: () => undefined,
+        logError: () => undefined,
+      });
+      const elapsedMs = Date.now() - started;
+      const commitRunning = (await sweepActivity(before)).some(
+        (row) => row.pid === slowPid && row.query === "COMMIT",
+      );
+      report(
+        `shared disconnect behind a quarantined sweep COMMIT: database step ${elapsedMs} ms (bound ${stepBoundMs} ms), shared ${teardown?.shared}, sweep COMMIT still running ${commitRunning}`,
+      );
+      // The sweep's join ran out (the stall was live) and its pool was
+      // quarantined; the shared disconnect then hit its own deadline.
+      expect(teardown?.sweep).toMatchObject({ joined: false });
+      expect(teardown?.shared).toBe("timeout");
+      expect(elapsedMs).toBeLessThan(stepBoundMs + 500);
+      // The join really ran out and the shared disconnect waited its deadline.
+      expect(elapsedMs).toBeGreaterThanOrEqual(
+        timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + timeouts.SHARED_DISCONNECT_TIMEOUT_MS - 100,
+      );
+      expect(warnings).toContain(
+        "[server] shared database client disconnect did not finish before its deadline.",
+      );
+      // The process did not wait on the server: the sweep COMMIT still runs.
+      expect(commitRunning).toBe(true);
+    } finally {
+      fence.disarmDbShutdownFence();
+      if (slowPid !== 0) await waitForBackendGone(slowPid, 30_000);
+      await writer;
+      await sharedDisconnect;
+      await observer.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS wsmp_test_shared_slow_commit ON "user"`,
+      );
+      await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_shared_slow_commit()");
+      await stop();
+      await handle.prisma.$disconnect();
+      errors.mockRestore();
+      logs.mockRestore();
+      warns.mockRestore();
+    }
+    // After the trigger ended: the user is gone, or it keeps its marker and
+    // generation and a fresh sweep deletes it.
+    await expectRecoverableOutcome(user);
+  }, 90_000);
+
+  it("a healthy shared disconnect finishes at once without a warning (F2-07 inverse)", async () => {
+    const { prisma, deadline } = required();
+    const handle = await productionSweepHandle();
+    const stop = await startSweep(handle.prisma);
+    // The shared client holds live connections (a query ran on it).
+    await prisma.user.count();
+    const warnings: string[] = [];
+    try {
+      const started = Date.now();
+      const teardown = await deadline.disconnectDatabaseClients({
+        shutDownSweep: () => shutDownSweep("nothing (healthy shared)", stop, handle),
+        shared: prisma,
+        warn: (message) => warnings.push(message),
+      });
+      const elapsedMs = Date.now() - started;
+      report(`healthy database step: ${elapsedMs} ms, shared ${teardown.shared}`);
+      expect(teardown.shared).toBe("done");
+      expect(teardown.sweep?.outcome).toEqual({
+        joined: true,
+        quarantined: null,
+        disconnected: true,
+      });
+      expect(warnings).toEqual([]);
+      expect(elapsedMs).toBeLessThan(1_000);
+    } finally {
+      required().fence.disarmDbShutdownFence();
+      await stop();
+    }
+    // The shared client reconnects on its next query after the disconnect.
+    expect(await prisma.user.count()).toBeGreaterThan(0);
+  }, 60_000);
 });

@@ -1,6 +1,11 @@
 import { PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS } from "@ws-model-proxy/db/parent-deletion";
 import { describe, expect, it } from "vitest";
 import {
+  HTTP_DRAIN_TIMEOUT_MS,
+  MCP_CLOSE_SHADOW_AWAIT_MS,
+  PROCESS_SHUTDOWN_DEADLINE_MS,
+  RELAY_CLOSE_TIMEOUT_MS,
+  SHARED_DISCONNECT_TIMEOUT_MS,
   USER_DELETION_SWEEP_CONNECT_TIMEOUT_MS,
   USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS,
   USER_DELETION_SWEEP_JOIN_TIMEOUT_MS,
@@ -67,5 +72,39 @@ describe("shutdown timing arithmetic", () => {
     expect(USER_DELETION_SWEEP_CONNECT_TIMEOUT_MS).toBeGreaterThan(0);
     expect(PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS).toBeGreaterThan(0);
     expect(USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+
+  // F2-07 (class): the database step waits on the sweep for at most J + D and
+  // on the shared disconnect for at most D_shared; the process watchdog is the
+  // sum of every step bound plus a margin, so it never fires before a bounded
+  // step finishes, and it ends any step without a bound.
+  it("pins the database step: J + D + D_shared", () => {
+    expect(SHARED_DISCONNECT_TIMEOUT_MS).toBe(2_000);
+    expect(
+      USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
+        USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS +
+        SHARED_DISCONNECT_TIMEOUT_MS,
+    ).toBe(10_500);
+  });
+
+  it("pins the process deadline: the sum of the step bounds plus a margin", () => {
+    const steps =
+      HTTP_DRAIN_TIMEOUT_MS +
+      RELAY_CLOSE_TIMEOUT_MS +
+      MCP_CLOSE_SHADOW_AWAIT_MS +
+      USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
+      USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS +
+      SHARED_DISCONNECT_TIMEOUT_MS;
+    expect(steps).toBe(35_500);
+    expect(PROCESS_SHUTDOWN_DEADLINE_MS).toBe(40_000);
+    const margin = PROCESS_SHUTDOWN_DEADLINE_MS - steps;
+    expect(margin).toBeGreaterThanOrEqual(4_000);
+    // Not padded far past the steps.
+    expect(margin).toBeLessThanOrEqual(10_000);
+  });
+
+  it("gives the shared disconnect and the watchdog positive bounds", () => {
+    expect(SHARED_DISCONNECT_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(PROCESS_SHUTDOWN_DEADLINE_MS).toBeGreaterThan(0);
   });
 });

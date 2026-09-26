@@ -350,6 +350,10 @@ integration("device-code exchange with real PostgreSQL", () => {
   }
 
   /** Resolves once `pattern` waits on a lock or `settled` settles, whichever is first. */
+  // A pg_stat_activity LIKE pattern matching the ordered user delete's
+  // statement text while it waits on a lock; it is not SQL that runs.
+  const USER_DELETE_WAITER = '%DELETE FROM "public"."user"%'; // policy: bounded-delete (LIKE pattern, not SQL)
+
   async function waitingOrSettled(pattern: string, settled: Promise<unknown>): Promise<void> {
     let done = false;
     void settled.finally(() => {
@@ -462,7 +466,7 @@ integration("device-code exchange with real PostgreSQL", () => {
       );
       await waitingOrSettled("%device_code%", login);
       const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
-      await waitingOrSettled('%DELETE FROM "public"."user"%', deleting);
+      await waitingOrSettled(USER_DELETE_WAITER, deleting);
       await pause.release();
       const [loginResult, deleteResult] = await Promise.all([login, deleting]);
 
@@ -555,7 +559,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const pause = await pauseAfter("cli_device", "DELETE", user.id, 16_004_004);
     try {
       const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
-      await waitingOrSettled('%DELETE FROM "public"."user"%', deleting);
+      await waitingOrSettled(USER_DELETE_WAITER, deleting);
       const login = outcome(
         access.mintCliDeviceCredentialFromApprovedDeviceCode({
           deviceCode,

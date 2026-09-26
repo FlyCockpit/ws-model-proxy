@@ -11,8 +11,10 @@ import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
 import {
+  disconnectDatabaseClients,
   drainHttpWithDeadline,
   runGracefulShutdownSequence,
+  runProcessShutdown,
   runWithDeadline,
 } from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
@@ -32,6 +34,7 @@ import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
+import { HTTP_DRAIN_TIMEOUT_MS, RELAY_CLOSE_TIMEOUT_MS } from "./shutdown-timeouts.js";
 import {
   createUserDeletionSweepClient,
   shutDownUserDeletionSweep,
@@ -122,9 +125,6 @@ try {
 // Start listening
 // ---------------------------------------------------------------------------
 
-const DRAIN_TIMEOUT_MS = 10_000;
-/** Bound on the final relay close (DB writes for CLIs still busy at drain end). */
-const RELAY_CLOSE_TIMEOUT_MS = 5_000;
 const serverPort = env.SERVER_PORT ?? env.PORT ?? 3000;
 
 const server = serve(
@@ -235,14 +235,23 @@ const stopTerminalSessionRecheck = startUnrefInterval(() => {
 
 let isShuttingDown = false;
 let userDeletionSweepStopped: Promise<void> | null = null;
-// The sweep's shutdown bounds (join, disconnect) live in ./shutdown-timeouts.ts
-// next to the sweep client's statement and connect bounds.
+// Every shutdown bound (drain, relay close, MCP close, sweep join and
+// disconnect, shared disconnect) and the process deadline that sums them live
+// in ./shutdown-timeouts.ts, with the invariants they enforce.
 
-async function shutdown(signal: string) {
+function shutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
 
+  // The process watchdog is armed here, before anything is awaited: the
+  // process exits with status 1 at PROCESS_SHUTDOWN_DEADLINE_MS whatever a
+  // step is still waiting on, and with status 0 once the sequence finished.
+  runProcessShutdown({ sequence: runShutdownSequence });
+}
+
+// The graceful sequence (graceful-shutdown.ts order is unit-tested).
+async function runShutdownSequence() {
   await runGracefulShutdownSequence({
     // Stop the periodic jobs so they can't fire mid-shutdown.
     stopPeriodicJobs: async () => {
@@ -290,7 +299,7 @@ async function shutdown(signal: string) {
     //    the MCP factory DURING/AFTER the Prisma disconnect.
     drainHttp: () =>
       drainHttpWithDeadline({
-        timeoutMs: DRAIN_TIMEOUT_MS,
+        timeoutMs: HTTP_DRAIN_TIMEOUT_MS,
         stopAdmission: () => {
           relaySessionManager.beginDrain();
           return new Promise<void>((resolve) => {
@@ -355,16 +364,22 @@ async function shutdown(signal: string) {
       // pool if it has not settled (a COMMIT can outlast every server-side
       // bound), and disconnects it under a short deadline: this step waits on
       // the sweep for at most USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
-      // USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS.
-      await shutDownUserDeletionSweep({
-        stopped: () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
-        client: userDeletionSweepClient,
+      // USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS. The shared client then
+      // disconnects under SHARED_DISCONNECT_TIMEOUT_MS: a request operation
+      // admitted before the fence can wait on a row the quarantined sweep
+      // backend still holds, and the pool's end() waits for its client, so an
+      // unbounded disconnect would wait on sweep work indirectly. Past the
+      // deadline it is abandoned (warned) and the process exit closes it.
+      await disconnectDatabaseClients({
+        shutDownSweep: () =>
+          shutDownUserDeletionSweep({
+            stopped: () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
+            client: userDeletionSweepClient,
+          }),
+        shared: prisma,
       });
-      await prisma.$disconnect();
     },
   });
-  console.log("[server] Shutdown complete.");
-  process.exit(0);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

@@ -55,7 +55,12 @@
  * USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS` (./shutdown-timeouts.ts). The
  * server work a quarantine leaves behind resolves by commit or rollback
  * after the process leaves; the marker and generation make either outcome
- * recoverable.
+ * recoverable. That work can still hold row locks a shared-client operation
+ * admitted before the fence waits on; the shared client's disconnect is
+ * therefore bounded too (`disconnectDatabaseClients`, ./graceful-shutdown.ts),
+ * so the process never waits on sweep work beyond the join plus the two
+ * disconnect deadlines, and the process watchdog
+ * (`PROCESS_SHUTDOWN_DEADLINE_MS`) bounds everything else.
  * A failure once the fence is armed is a shutdown stop, not a sweep failure:
  * it is logged as such, records no backoff or abandon, and does not count
  * toward the failed-tick escalation. Request paths (users.remove, Better
@@ -171,10 +176,12 @@ export type UserDeletionSweepShutdown = {
  * that settled in time is never quarantined: its warm connection closes
  * gracefully.
  *
- * So shutdown waits on the sweep for at most `joinTimeoutMs +
+ * So this step waits on the sweep for at most `joinTimeoutMs +
  * disconnectTimeoutMs`, even when the database never finishes the
  * transaction in flight (see ./shutdown-timeouts.ts for why that can happen
- * and why both of its outcomes are recoverable).
+ * and why both of its outcomes are recoverable). Called through
+ * `disconnectDatabaseClients` (./graceful-shutdown.ts), which then bounds the
+ * shared client's disconnect as well.
  */
 export async function shutDownUserDeletionSweep({
   stopped,

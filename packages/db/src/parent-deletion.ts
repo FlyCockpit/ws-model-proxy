@@ -139,6 +139,15 @@ export const PARENT_DELETION_MAX_DRAIN_ROWS_PER_RUN = 2_000_000;
 /** Max inner drain-loop iterations per step label in one invocation. */
 export const PARENT_DELETION_MAX_DRAIN_LOOP_ITERATIONS = 100_000;
 
+/**
+ * Max terminal admission requests one drain invocation passes because a waiter
+ * of theirs is busy (g1-M1). The passed ids are kept in memory and sent with
+ * every later batch's scan, so past this bound the drain stops with
+ * {@link ParentDeletionDrainPendingError} (retried later) instead of carrying
+ * a growing exclusion list.
+ */
+export const PARENT_DELETION_MAX_PASSED_ADMISSIONS = 10_000;
+
 // ---------------------------------------------------------------------------
 // Table-level contract (checked against the Prisma schema by a unit test)
 // ---------------------------------------------------------------------------
@@ -623,6 +632,11 @@ export async function drainParentDeletionHistory(
         );
         passed.push(...busy);
         report["admission_request.passed"] = (report["admission_request.passed"] ?? 0) + busy.size;
+        if (passed.length > PARENT_DELETION_MAX_PASSED_ADMISSIONS) {
+          throw new ParentDeletionDrainPendingError(
+            "Parent deletion history drain passed too many busy admission requests; retry later.",
+          );
+        }
         const eligible = ids.filter((id) => !busy.has(id));
         const deletedRows =
           eligible.length > 0

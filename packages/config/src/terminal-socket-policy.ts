@@ -27,4 +27,4 @@ export const TERMINAL_BROWSER_JSON_BUDGET = 16;
  * answered `rate_limited` (refused unread: the browser sends it again) and
  * the frames accepted before it run on. The socket is not closed.
  */
-export const TERMINAL_BROWSER_TEXT_PENDING_LIMIT = TERMINAL_BROWSER_JSON_LIMIT;
+export const TERMINAL_BROWSER_TEXT_PENDING_LIMIT = 20;

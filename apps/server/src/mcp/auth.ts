@@ -20,6 +20,7 @@ import type { Context } from "hono";
 import { RateLimiterRes } from "rate-limiter-flexible";
 import { mcpIdentityKey, mcpIdentityQuotaLimiter } from "../mcp-rate-limit";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "../public-request-url";
+import { MCP_CLOSE_SHADOW_AWAIT_MS } from "../shutdown-timeouts";
 import { createMcpAdmissionGate, type McpAdmission, type McpAdmissionGate } from "./admission";
 import type { McpRequestCredential } from "./cli-command-access";
 import { createMcpContext, type McpContext, type McpSessionUser } from "./context";
@@ -384,7 +385,7 @@ export function createMcpRequestHandler(options: CreateMcpRequestHandlerOptions)
  * eventually times out at ~300s — can outlive it, and the permit then
  * releases with a sanitized log line instead of blocking shutdown).
  */
-const DEFAULT_ABORT_SHADOW_AWAIT_MS = 10_000;
+const DEFAULT_ABORT_SHADOW_AWAIT_MS = MCP_CLOSE_SHADOW_AWAIT_MS;
 
 /**
  * Release the admission permit only after the admitted promise (verifier /

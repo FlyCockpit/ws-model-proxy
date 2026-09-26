@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  disconnectDatabaseClients,
   drainHttpWithDeadline,
   runGracefulShutdownSequence,
+  runProcessShutdown,
   runWithDeadline,
 } from "./graceful-shutdown";
+import { PROCESS_SHUTDOWN_DEADLINE_MS, SHARED_DISCONNECT_TIMEOUT_MS } from "./shutdown-timeouts";
 
 /**
  * Graceful-shutdown ORDERING tests (Phase 4 item 4): the MCP
@@ -367,5 +370,171 @@ describe("runWithDeadline", () => {
   it("returns as soon as the work finishes", async () => {
     await runWithDeadline(async () => {}, 5_000, "relay session close", { warn: () => {} });
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// F2-07: the database step bounds the shared disconnect too. Executed
+// against PostgreSQL (a shared UPDATE blocked on a row the quarantined sweep
+// COMMIT holds) in packages/api/src/lib/parent-deletion.postgres.integration.test.ts.
+describe("disconnectDatabaseClients", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the sweep shutdown first, then abandons a shared disconnect that never settles at its deadline", async () => {
+    const order: string[] = [];
+    const warnings: string[] = [];
+    let result: Awaited<ReturnType<typeof disconnectDatabaseClients<string>>> | undefined;
+    const run = disconnectDatabaseClients({
+      shutDownSweep: async () => {
+        order.push("sweep");
+        return "sweep-outcome";
+      },
+      shared: {
+        $disconnect: () => {
+          order.push("shared");
+          return new Promise<void>(() => {});
+        },
+      },
+      warn: (message) => warnings.push(message),
+    }).then((value) => {
+      result = value;
+    });
+    await vi.advanceTimersByTimeAsync(SHARED_DISCONNECT_TIMEOUT_MS - 1);
+    expect(result).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await run;
+    expect(order).toEqual(["sweep", "shared"]);
+    expect(result).toEqual({ sweep: "sweep-outcome", shared: "timeout" });
+    expect(warnings).toEqual([
+      "[server] shared database client disconnect did not finish before its deadline.",
+      expect.stringContaining("Abandoning the shared database client"),
+    ]);
+  });
+
+  it("returns done without a warning when the shared disconnect is healthy (inverse)", async () => {
+    const warnings: string[] = [];
+    const result = await disconnectDatabaseClients({
+      shutDownSweep: async () => "ok",
+      shared: { $disconnect: async () => {} },
+      warn: (message) => warnings.push(message),
+    });
+    expect(result).toEqual({ sweep: "ok", shared: "done" });
+    expect(warnings).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("still disconnects the shared client when the sweep shutdown throws (sanitized log)", async () => {
+    const errors: string[] = [];
+    let disconnected = false;
+    const result = await disconnectDatabaseClients({
+      shutDownSweep: async () => {
+        throw new TypeError("secret SQL text");
+      },
+      shared: {
+        $disconnect: async () => {
+          disconnected = true;
+        },
+      },
+      warn: () => {},
+      logError: (message, error) =>
+        errors.push(`${message} ${error instanceof Error ? error.constructor.name : ""}`),
+    });
+    expect(disconnected).toBe(true);
+    expect(result).toEqual({ sweep: undefined, shared: "done" });
+    expect(errors).toEqual(["[server] Error shutting down the user deletion sweep: TypeError"]);
+  });
+});
+
+// F2-07 (class): the process watchdog ends shutdown at the deadline whatever a
+// step waits on.
+describe("runProcessShutdown", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("exits with status 1 at the deadline when a step never settles", async () => {
+    const exit = vi.fn();
+    const errors: string[] = [];
+    const { watchdog } = runProcessShutdown({
+      sequence: () => new Promise<void>(() => {}),
+      exit,
+      log: () => {},
+      logError: (message) => errors.push(message),
+    });
+    // Armed synchronously, before anything was awaited, and unref'd.
+    expect(vi.getTimerCount()).toBe(1);
+    expect(watchdog.hasRef()).toBe(false);
+    await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_DEADLINE_MS - 1);
+    expect(exit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(errors).toEqual(["[server] Shutdown deadline exceeded; exiting."]);
+  });
+
+  it("ends a real sequence whose step has no bound: exit(1) at the deadline, never exit(0)", async () => {
+    const exit = vi.fn();
+    runProcessShutdown({
+      sequence: () =>
+        runGracefulShutdownSequence({
+          stopPeriodicJobs: () => {},
+          closeBrowserSockets: () => {},
+          drainHttp: async () => {},
+          closeRelaySessions: () => {},
+          // A future step without a bound.
+          closeMcpHandler: () => new Promise<void>(() => {}),
+          disconnectPrisma: async () => {},
+          log: () => {},
+          logError: () => {},
+        }),
+      exit,
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_DEADLINE_MS);
+    expect(exit.mock.calls).toEqual([[1]]);
+  });
+
+  it("exits with status 0 once the sequence finished, before the deadline (normal path)", async () => {
+    const exit = vi.fn();
+    const logs: string[] = [];
+    const { done, watchdog } = runProcessShutdown({
+      sequence: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      },
+      exit,
+      log: (message) => logs.push(message),
+      logError: () => {},
+    });
+    expect(watchdog.hasRef()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await done;
+    expect(exit.mock.calls).toEqual([[0]]);
+    expect(logs).toEqual(["[server] Shutdown complete."]);
+  });
+
+  it("exits with status 1 when the sequence itself rejects (sanitized log)", async () => {
+    const exit = vi.fn();
+    const errors: string[] = [];
+    const { done } = runProcessShutdown({
+      sequence: async () => {
+        throw new RangeError("secret");
+      },
+      exit,
+      log: () => {},
+      logError: (message) => errors.push(message),
+    });
+    await done;
+    expect(exit.mock.calls).toEqual([[1]]);
+    expect(errors).toEqual(["[server] Shutdown sequence failed (RangeError); exiting."]);
   });
 });
