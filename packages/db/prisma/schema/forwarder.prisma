@@ -1494,7 +1494,9 @@ model RelayRequest {
   /// Prompt-free public overflow correlation and commitment telemetry.
   publicEgress               Boolean                 @default(false)
   publicOverflowReason       String?
-  /// Prompt-free route that served the request: "local", "pool-external", or "own-key".
+  /// Prompt-free route that served or finally failed: "local", "pool-external", or "own-key".
+  /// Pending own-key rows persist send intent immediately before provider I/O;
+  /// abandoned tiers restore the prior route and target before any continuation.
   /// Null for requests that never reached a pool route decision.
   fallbackRoute              String?
   selectedPoolMemberTier     String?
@@ -1551,7 +1553,8 @@ model RelayRequest {
 /// sentinel (never NULL) so the composite primary key is a real conflict
 /// target: PostgreSQL treats NULLs as distinct in unique indexes, which would
 /// make ON CONFLICT never merge.
-/// Users: `ownerUserId` is the RESOURCE owner (requested pool's owner, else
+/// Users: own-key rows use the requester as `ownerUserId`, with empty pool/member
+/// keys. Otherwise `ownerUserId` is the RESOURCE owner (requested pool's owner, else
 /// the execution target's owner, else the requester when nothing resolved);
 /// owners see all traffic on what they own and deleting the owner cascades.
 /// `requesterUserId` is the RelayRequest owner and is deliberately NOT a
@@ -1600,7 +1603,7 @@ model UsageRollupMinute {
   @@map("usage_rollup_minute")
 }
 
-/// Hourly compaction of UsageRollupMinute (same key and counters), kept 13
+/// Hourly compaction of UsageRollupMinute (same key, own-key owner semantics and counters), kept 13
 /// months. Rows are only written by the retention compaction job.
 model UsageRollupHour {
   bucketStart           DateTime

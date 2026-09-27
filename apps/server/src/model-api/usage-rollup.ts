@@ -52,7 +52,8 @@ export type RelayRequestSourceValue = RelayRollupRow["source"];
 
 /**
  * Rollup key. Two user columns:
- *  - `ownerUserId`: the RESOURCE owner - the requested pool's owner for pool
+ *  - `ownerUserId`: own-key uses the requester (empty pool/member keys).
+ *    Otherwise the RESOURCE owner - the requested pool's owner for pool
  *    traffic, else the execution target's owner for direct traffic, else
  *    (nothing resolved) the requester. Owners see every requester's traffic
  *    on what they own. FK to user, ON DELETE CASCADE: deleting the owner
@@ -161,7 +162,7 @@ export function rollupIncrementForRequest(
   };
 }
 
-/** See UsageRollupKey: pool owner, else target owner, else the requester. */
+/** See UsageRollupKey: own-key requester, else pool/target owner or requester. */
 export function resourceOwnerUserId(row: RelayRollupRow): string {
   if (row.fallbackRoute === "own-key") return row.userId;
   if (row.requestedModelPoolId && row.RequestedModelPool) return row.RequestedModelPool.userId;

@@ -133,6 +133,8 @@ export interface PublicOverflowRequest {
   /** Set only for requester-owned DIRECT dispatch; never a pool member. */
   ownKeyProviderModelId?: string;
   admittedExecutionTargetId?: string;
+  /** Persist route/target intent after setup and consent, before any transport I/O. */
+  beforeProviderSend?: (target: PublicProviderTarget) => Promise<void>;
   /** Requester and credential scopes remain distinct from the pool owner. */
   affinityTenantUserId?: string;
   affinitySecurityScope?: string;
@@ -457,6 +459,11 @@ export async function claimPublicProviderCredentialForSend(input: {
 }): Promise<PublicProviderSendClaim> {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
+  if (
+    input.consent.ownKeyProviderModelId &&
+    input.target.providerModelId !== input.consent.ownKeyProviderModelId
+  )
+    return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
   return prisma.$transaction(
     async (tx): Promise<PublicProviderSendClaim> => {
       const denial = await lockExternalSendConsent(tx, input.consent);
@@ -708,7 +715,15 @@ export type PublicOverflowResult =
       markFirstClientByte: () => Promise<void>;
       affinity: PublicProviderTarget["affinity"];
     }
-  | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
+  | {
+      dispatched: false;
+      reason: PublicOverflowSkipReason;
+      detail?: string;
+      /** True if any transport invocation may have reached the provider. */
+      providerIoStarted?: true;
+      /** Retain the last rejected provider response when no later tier can serve. */
+      providerFailure?: { target: PublicProviderTarget; status?: number; retryAfter?: string };
+    };
 
 function targetProtocol(providerType: string): ProviderProtocol | null {
   return providerProtocolForType(providerType);
@@ -1171,9 +1186,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   const cacheReadTokens = usageInteger(
     usage.cache_read_input_tokens ?? promptDetails?.cached_tokens,
   );
-  const cacheWriteTokens = usageInteger(
-    usage.cache_creation_input_tokens ?? promptDetails?.cache_write_tokens,
-  );
+  const cacheWriteTokens = usageInteger(usage.cache_creation_input_tokens);
   const reasoningTokens = usageInteger(completionDetails?.reasoning_tokens);
   const inputAudioTokens = usageInteger(promptDetails?.audio_tokens);
   const outputAudioTokens = usageInteger(completionDetails?.audio_tokens);
@@ -1189,7 +1202,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     usage.prompt_tokens_details !== undefined ||
     usage.completion_tokens_details !== undefined;
   const inputTokens = openAiShape
-    ? exclusiveMany(promptTotal, [cacheReadTokens, cacheWriteTokens, inputAudioTokens])
+    ? exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens])
     : promptTotal;
   const outputTokens = openAiShape
     ? exclusiveMany(completionTotal, [
@@ -1244,26 +1257,15 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     "total_cost",
     "currency",
     "pricing_version",
-    "is_byok",
-    "cost_details",
   ]);
-  const knownPromptDetailKeys = new Set(["cached_tokens", "cache_write_tokens", "audio_tokens"]);
+  const knownPromptDetailKeys = new Set(["cached_tokens", "audio_tokens"]);
   const knownCompletionDetailKeys = new Set([
     "reasoning_tokens",
     "audio_tokens",
     "accepted_prediction_tokens",
     "rejected_prediction_tokens",
   ]);
-  const costDetails = usageRecord(usage.cost_details);
-  const knownCostDetails = new Set([
-    "upstream_inference_cost",
-    "upstream_inference_prompt_cost",
-    "upstream_inference_completions_cost",
-  ]);
-  const hasUnknownUsageCategory =
-    Object.keys(usage).some((key) => !knownUsageKeys.has(key)) ||
-    (usage.cost_details !== undefined &&
-      (!costDetails || Object.keys(costDetails).some((key) => !knownCostDetails.has(key))));
+  const hasUnknownUsageCategory = Object.keys(usage).some((key) => !knownUsageKeys.has(key));
   const hasUnknownPromptDetail =
     promptDetails !== undefined &&
     Object.keys(promptDetails).some((key) => !knownPromptDetailKeys.has(key));
@@ -1300,8 +1302,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   );
   const impossibleBreakdown =
     (promptTotal !== undefined &&
-      exclusiveMany(promptTotal, [cacheReadTokens, cacheWriteTokens, inputAudioTokens]) ===
-        undefined) ||
+      exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens]) === undefined) ||
     (completionTotal !== undefined &&
       exclusiveMany(completionTotal, [
         reasoningTokens,
@@ -2059,6 +2060,8 @@ export async function dispatchPublicOverflow(
   let lastAdmission: ProviderBudgetAdmission | undefined;
   // The transient reason the last admitted attempt did not send, when it
   // reached the health claim or beyond (see the final return).
+  let anyProviderIoStarted = false;
+  let providerFailure: Extract<PublicOverflowResult, { dispatched: false }>["providerFailure"];
   let lastSendFailure:
     | "PROVIDER_UNHEALTHY"
     | "SEND_CLAIM_FAILED"
@@ -2442,7 +2445,12 @@ export async function dispatchPublicOverflow(
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
-      return { dispatched: false, reason: claim.reason };
+      return {
+        dispatched: false,
+        reason: claim.reason,
+        ...(anyProviderIoStarted ? { providerIoStarted: true as const } : {}),
+        providerFailure,
+      };
     }
     let providerIoStarted = false;
     try {
@@ -2460,7 +2468,10 @@ export async function dispatchPublicOverflow(
         ]),
       };
       const auth = providerAuth(target, claim.secret);
+      await request.beforeProviderSend?.(target);
       providerIoStarted = true;
+      anyProviderIoStarted = true;
+      providerFailure = { target };
       const response = await providerHttpsRequest(
         target.baseUrl,
         options,
@@ -2484,6 +2495,12 @@ export async function dispatchPublicOverflow(
         // bounded body before retry, retaining raw usage/cost when present;
         // ambiguous, truncated, or oversized bodies keep conservative liability.
         const retryUsage = await readRetryableProviderUsage(response, pricing);
+        const retryAfter = response.headers["retry-after"];
+        providerFailure = {
+          target,
+          status,
+          retryAfter: typeof retryAfter === "string" ? retryAfter : undefined,
+        };
         if (!response.complete) response.destroy();
         // Heartbeat loss means a successor may already own health state. Do
         // not let this orphan's retryable response mutate that state. The
@@ -2985,6 +3002,8 @@ export async function dispatchPublicOverflow(
   // before any attempt).
   return {
     dispatched: false,
+    ...(anyProviderIoStarted ? { providerIoStarted: true as const } : {}),
+    providerFailure,
     reason:
       lastAdmission && !lastAdmission.admitted
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"

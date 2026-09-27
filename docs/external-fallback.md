@@ -252,3 +252,9 @@ recognized cost metadata; unknown categories still fail closed. Provider
 search, image and audio service charges can be non-token charges: token prices
 and token-based budgets are not a bound on the provider's total bill. The
 picker and import summary disclose this limitation.
+
+### Own-key failure and accounting
+
+Own-key capacity admission tries only capacity available now, preserving time for the owner-paid tier and any remaining local wait. A skipped own-key tier permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No tier changes after a response commits. When the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header.
+
+Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted tier durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.

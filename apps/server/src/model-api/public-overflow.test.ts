@@ -640,6 +640,17 @@ describe("public overflow compatibility", () => {
       },
     };
 
+    const mismatch = await withEgressEnabled(() =>
+      claimPublicProviderCredentialForSend({
+        userId: identity.userId,
+        target,
+        keyring,
+        consent: { ...GRANTEE_TOKEN_CONSENT, ownKeyProviderModelId: "different-model" },
+      }),
+    );
+    expect(mismatch).toEqual({ claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" });
+    expect(tx.providerCredential.update).not.toHaveBeenCalled();
+
     const claim = await withEgressEnabled(() =>
       claimPublicProviderCredentialForSend({
         userId: identity.userId,
@@ -1435,7 +1446,7 @@ describe("provider request path", () => {
   });
 });
 
-it("normalizes OpenRouter cache-write, audio and recognized cost metadata without losing tokens", () => {
+it("keeps unrecognized gateway cache/cost metadata conservative without changing common-provider billing", () => {
   const usage = parseProviderUsage([
     Buffer.from(
       JSON.stringify({
@@ -1453,12 +1464,11 @@ it("normalizes OpenRouter cache-write, audio and recognized cost metadata withou
     ),
   ]);
   expect(usage).toMatchObject({
-    inputTokens: 8n,
+    inputTokens: 12n,
     outputTokens: 7n,
     cacheReadTokens: 3n,
-    cacheWriteTokens: 4n,
     reasoningTokens: 2n,
     additionalBillableTokens: 6n,
-    categoriesComplete: true,
+    categoriesComplete: false,
   });
 });

@@ -99,7 +99,7 @@ it("owner aggregate returns only a count after checking ownership", async () => 
     select: { id: true },
   });
   expect(db.relayRequest.count).toHaveBeenCalledWith({
-    where: { requestedModelPoolId: "pool", fallbackRoute: "own-key" },
+    where: { requestedModelPoolId: "pool", fallbackRoute: "own-key", status: "SUCCEEDED" },
   });
   expect(db.relayRequest.findMany).not.toHaveBeenCalled();
   db.modelPool.findFirst.mockResolvedValue(null);

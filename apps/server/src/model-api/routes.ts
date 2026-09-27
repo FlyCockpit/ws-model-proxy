@@ -177,6 +177,7 @@ import {
   type PublicOverflowReason,
   type PublicOverflowRequest,
   type PublicOverflowSkipReason,
+  type PublicProviderTarget,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
@@ -779,7 +780,15 @@ type RelayMetadataCreate = {
   requestedSurface: string;
 };
 
+type RouteIdentity = {
+  fallbackRoute: FallbackRoute | null;
+  selectedExecutionTargetId: string | null;
+  selectedDiscoveredModelId: string | null;
+  selectedPoolMemberId: string | null;
+};
+
 type RelayMetadataUpdate = {
+  routeIdentity?: RouteIdentity;
   selectedDiscoveredModelId?: string;
   status: "SUCCEEDED" | "FAILED" | "CANCELED";
   startedAt: Date;
@@ -2044,6 +2053,7 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       ? { transformerErrorClass: update.transformerErrorClass }
       : {}),
     ...(update.fallbackRoute ? { fallbackRoute: update.fallbackRoute } : {}),
+    ...update.routeIdentity,
   };
   if (update.localExecution && update.userId) {
     const localTerminal = update.localTerminal ?? update.terminal;
@@ -2492,6 +2502,9 @@ async function failRelayMetadata({
   userId,
   localTerminal,
   fallbackRoute,
+  routeIdentity,
+  httpStatusCode,
+  upstreamStatusCode,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -2506,6 +2519,9 @@ async function failRelayMetadata({
   userId?: string;
   localTerminal?: RelayAttemptTerminal;
   fallbackRoute?: FallbackRoute;
+  routeIdentity?: RouteIdentity;
+  httpStatusCode?: number;
+  upstreamStatusCode?: number;
 }) {
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
@@ -2526,11 +2542,12 @@ async function failRelayMetadata({
     userId,
     localTerminal,
     fallbackRoute,
+    routeIdentity,
     terminal: {
       ok: false,
       failure,
-      httpStatusCode: relayFailureHttpStatus(failure),
-      upstreamStatusCode: null,
+      httpStatusCode: httpStatusCode ?? relayFailureHttpStatus(failure),
+      upstreamStatusCode: upstreamStatusCode ?? null,
       usage: null,
       metrics: null,
       responseBytes: responseBytes ?? 0,
@@ -3751,17 +3768,40 @@ async function relayPool({
     operation: operation.capability,
     requestBytes: null,
     contextCount: operation.contextCount,
-    // fallbackRoute stays null until a route is decided: "local" once the
-    // request is served or fails on the local path (or a local attempt
-    // starts), "pool-external" only when a provider response commits.
+    // Provider route intent is persisted at the send boundary. A tier that
+    // does not commit supersedes it before returning to local or pool routing.
   });
-  let decidedRoute: FallbackRoute | undefined;
+  let routeIdentity: RouteIdentity = {
+    fallbackRoute: null,
+    selectedExecutionTargetId: null,
+    selectedDiscoveredModelId: null,
+    selectedPoolMemberId: null,
+  };
+  const providerRouteIdentity = (provider: PublicProviderTarget): RouteIdentity => ({
+    fallbackRoute: provider.ownKey ? "own-key" : "pool-external",
+    selectedExecutionTargetId: provider.executionTargetId,
+    selectedDiscoveredModelId: null,
+    selectedPoolMemberId: provider.ownKey ? null : provider.poolMemberId,
+  });
+  const persistRouteIdentity = async (identity: RouteIdentity) => {
+    // Await supersession before admitting another tier or writing terminal
+    // metadata. A failed write stops routing; it cannot leak stale identity
+    // into a subsequent route's finalizer or rollup.
+    await prisma.relayRequest.update({ where: { id: relayRequestId }, data: identity });
+    routeIdentity = identity;
+  };
+  let externalFailure: Extract<
+    Awaited<ReturnType<typeof dispatchPublicOverflow>>,
+    {
+      dispatched: false;
+    }
+  >["providerFailure"];
   const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
-    failRelayMetadata({ ...input, fallbackRoute: input.fallbackRoute ?? decidedRoute });
+    failRelayMetadata({ ...input, routeIdentity });
   const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
     updateRelayMetadata(relayRequestId, {
       ...update,
-      fallbackRoute: update.fallbackRoute ?? decidedRoute,
+      routeIdentity,
     });
 
   // The caller's own concurrency caps (per token, per user) are never a
@@ -4011,7 +4051,9 @@ async function relayPool({
               poolMemberId: ownKey ? undefined : providerTarget.poolMemberId,
               candidateOrder,
               deadlineAt: new Date(relayDeadlineMs),
-              waitBudgetMs: providerTarget.capacityWaitBudgetMs ?? null,
+              // Own-key is opportunistic; leave the relay budget for the
+              // independently consented owner-paid tier and local resume.
+              waitBudgetMs: ownKey ? 0 : (providerTarget.capacityWaitBudgetMs ?? null),
             })),
           },
           signal: request.signal,
@@ -4024,26 +4066,17 @@ async function relayPool({
           return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         }
         let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+        const previousRoute = routeIdentity;
         try {
-          if (ownKey) {
-            // Durable route identity precedes provider effects, including crash repair.
-            decidedRoute = "own-key";
-            await prisma.relayRequest.update({
-              where: { id: relayRequestId },
-              data: {
-                fallbackRoute: "own-key",
-                selectedDiscoveredModelId: null,
-                selectedPoolMemberId: null,
-                selectedExecutionTargetId: admission.lease.executionTargetId,
-              },
-            });
-          }
           result = await dispatchPublicOverflow({
             ...tierRequest,
             admittedExecutionTargetId: admission.lease.executionTargetId,
             signal: admission.lease.signal ?? request.signal,
             forcedPoolMemberId: selectedPoolMemberId,
             retrySingleTargetPrecommit: remaining.length > 1 || ownKey,
+            beforeProviderSend: ownKey
+              ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))
+              : undefined,
           });
         } catch (error) {
           // Admission owns the lease until dispatch commits successfully. A
@@ -4057,6 +4090,9 @@ async function relayPool({
           return result;
         }
         await capacityRuntime.release(admission.lease);
+        // Also supersede an indeterminate failed intent write: a database
+        // acknowledgement can be lost even if the write committed.
+        if (ownKey) await persistRouteIdentity(previousRoute);
         lastResult = result;
         // Consent is request-wide: a denial (at dispatch entry or at the send
         // boundary) ends the external phase for every member.
@@ -4064,7 +4100,7 @@ async function relayPool({
         // A provider attempt that did not commit is retryable only under the
         // operation's existing exact retry policy. Never re-admit the same
         // physical member during this tier traversal.
-        if (!providerRequest.retrySafe) return result;
+        if (!providerRequest.retrySafe && result.providerIoStarted) return result;
         remaining = remaining.filter((item) => item.poolMemberId !== selectedPoolMemberId);
       }
       return lastResult;
@@ -4112,9 +4148,18 @@ async function relayPool({
         (ownResult.dispatched ||
           (isExternalConsentDenialReason(ownResult.reason) &&
             ownResult.reason !== "OWN_KEY_CONSENT_WITHDRAWN") ||
-          !providerRequest.retrySafe)
+          (!providerRequest.retrySafe && ownResult.providerIoStarted))
           ? ownResult
           : await dispatchExternalTier();
+      // An absent or independently forbidden owner-paid plan must not erase
+      // a useful own-key outcome (including the upstream status/Retry-After).
+      if (
+        ownResult &&
+        !ownResult.dispatched &&
+        !result.dispatched &&
+        ["POOL_PRIVATE", "GRANTEE_NOT_COVERED", "NO_COMPATIBLE_PROVIDER"].includes(result.reason)
+      )
+        result = ownResult;
     } catch (error) {
       // Nothing was dispatched and the error ends the request: release the
       // caller lease and the local capacity lease exactly once (both are
@@ -4135,8 +4180,13 @@ async function relayPool({
         callerLeaseReleased = true;
         globalLease = outerCallerLease;
       } else releaseCallerLease();
-      return { dispatched: false, reason: result.reason };
+      externalFailure = result.providerFailure;
+      return {
+        dispatched: false,
+        reason: result.providerFailure?.status === 429 ? "PROVIDER_SATURATED" : result.reason,
+      };
     }
+    routeIdentity = providerRouteIdentity(result.target);
     const externalReason = externalFallbackReasonHeader(reason);
     await prisma.relayRequest
       .update({
@@ -4425,7 +4475,7 @@ async function relayPool({
     listedMembers.length === 0 ||
     (forcedPoolMemberId != null && members.length === 0 && external.consent);
   if (!providerOnly) {
-    decidedRoute = "local";
+    routeIdentity = { ...routeIdentity, fallbackRoute: "local" };
     externalAttempt.localRouteDecided = true;
   }
   /**
@@ -4445,8 +4495,31 @@ async function relayPool({
             ? "cancelled"
             : "disconnected";
     await operation.dispose?.();
-    await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
-    if (reason !== "UNAVAILABLE") return operationFailureResponse(operation, failure);
+    if (externalFailure) await persistRouteIdentity(providerRouteIdentity(externalFailure.target));
+    await failPoolRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure,
+      upstreamStatusCode: externalFailure?.status,
+      httpStatusCode: externalFailure?.status,
+    });
+    if (externalFailure) {
+      const response = operationFailureResponse(operation, failure);
+      const headers = new Headers(response.headers);
+      if (reason === "SATURATED") headers.set("retry-after", "1");
+      const retryAfter = safeProviderRetryAfter(externalFailure.retryAfter ?? null);
+      if (retryAfter) headers.set("retry-after", retryAfter);
+      headers.set(ROUTE_HEADER, externalFailure.target.ownKey ? "own-key" : "pool-fallback");
+      return new Response(response.body, {
+        status: externalFailure.status ?? response.status,
+        headers,
+      });
+    }
+    if (reason !== "UNAVAILABLE") {
+      const response = operationFailureResponse(operation, failure);
+      if (reason === "SATURATED") response.headers.set("retry-after", "1");
+      return response;
+    }
     return externalRouteErrorResponse(operation.family, {
       code: "external_unavailable",
       message: `No external provider for "${externalModelId(target.modelId)}" is available right now, and the pool has no local members. Try again later.`,
@@ -5185,6 +5258,12 @@ async function relayPool({
               fencingToken: capacityLease.lease.fencingToken,
             }
           : undefined,
+    };
+    routeIdentity = {
+      fallbackRoute: "local",
+      selectedExecutionTargetId: member.ExecutionTarget?.id ?? null,
+      selectedDiscoveredModelId: member.DiscoveredModel.id,
+      selectedPoolMemberId: member.id,
     };
     try {
       await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
@@ -7111,13 +7190,20 @@ async function relayBoundProviderResponse(input: {
     operation: input.capability,
     requestBytes: input.body.byteLength,
     contextCount: input.contextCount,
-    // fallbackRoute is recorded only when a provider response commits.
+    // Own-key send intent is durable before transport; pool fallback records
+    // its route when the response commits. Bound requests never change targets.
   });
   // H1: the caller's own cap applies to every bound operation exactly as to
   // relayPool: a caller at its cap gets 429 before any listing or dispatch,
   // and the lease is held until the provider response settles. Released
   // exactly once on every exit (not dispatched, throw, precommit throw,
   // terminal including abort and client disconnect).
+  let boundRouteIdentity: RouteIdentity = {
+    fallbackRoute: null,
+    selectedExecutionTargetId: null,
+    selectedDiscoveredModelId: null,
+    selectedPoolMemberId: null,
+  };
   let callerLease: ModelApiLimitLease;
   try {
     callerLease = input.limiter.acquireGlobal({
@@ -7126,9 +7212,12 @@ async function relayBoundProviderResponse(input: {
     });
   } catch (error) {
     const failure: RelayFailure = error instanceof ModelApiLimitError ? error.failure : "unknown";
-    await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
-      metadataUpdateError,
-    );
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt: boundStartedAt,
+      failure,
+      routeIdentity: boundRouteIdentity,
+    }).catch(metadataUpdateError);
     return openAiFailureJsonResponse(failure);
   }
   let callerLeaseReleased = false;
@@ -7260,21 +7349,23 @@ async function relayBoundProviderResponse(input: {
     if (admission.state !== "ADMITTED") return { dispatched: false, reason: "PROVIDER_SATURATED" };
     let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
     try {
-      if (ownKey)
-        await prisma.relayRequest.update({
-          where: { id: relayRequestId },
-          data: {
-            fallbackRoute: "own-key",
-            selectedDiscoveredModelId: null,
-            selectedPoolMemberId: null,
-            selectedExecutionTargetId: exactTarget.executionTargetId,
-          },
-        });
       result = await dispatchPublicOverflow({
         ...boundRequest,
         admittedExecutionTargetId: admission.lease.executionTargetId,
         signal: admission.lease.signal ?? input.request.signal,
         forcedPoolMemberId: exactTarget.poolMemberId,
+        beforeProviderSend: ownKey
+          ? async (provider) => {
+              const identity: RouteIdentity = {
+                fallbackRoute: "own-key",
+                selectedDiscoveredModelId: null,
+                selectedPoolMemberId: null,
+                selectedExecutionTargetId: provider.executionTargetId,
+              };
+              await prisma.relayRequest.update({ where: { id: relayRequestId }, data: identity });
+              boundRouteIdentity = identity;
+            }
+          : undefined,
       });
     } catch (error) {
       await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
@@ -7297,6 +7388,7 @@ async function relayBoundProviderResponse(input: {
     await failRelayMetadata({
       relayRequestId,
       startedAt: boundStartedAt,
+      routeIdentity: boundRouteIdentity,
       failure: input.request.signal.aborted ? "cancelled" : "unknown",
     }).catch(metadataUpdateError);
     throw error;
@@ -7316,9 +7408,12 @@ async function relayBoundProviderResponse(input: {
           : result.reason === "BOUND_TARGET_INVALID" || result.reason === "REQUESTER_NOT_VISIBLE"
             ? "not_found"
             : "disconnected";
-    await failRelayMetadata({ relayRequestId, startedAt: boundStartedAt, failure }).catch(
-      metadataUpdateError,
-    );
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt: boundStartedAt,
+      failure,
+      routeIdentity: boundRouteIdentity,
+    }).catch(metadataUpdateError);
     // Restorable consent withdrawals are permission errors; a lost exact
     // grant permanently invalidates the binding, just as at arrival.
     if (denied) return externalRouteErrorResponse("responses", denied);

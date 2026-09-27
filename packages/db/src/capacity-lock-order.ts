@@ -138,6 +138,17 @@
  *       on any of those parents. Clear takes only the preference row.
  *       The preference composite FKs are key-shares on already held parents.
  *
+ * Preference setter transaction (separate from the send claim): starts with
+ * nothing held, then pool SHARE -> exact grant SHARE -> requester account
+ * SHARE -> model SHARE -> preference upsert. The L1 pool SHARE is reviewed:
+ * capacity admission's FK KEY SHARE is compatible; pool writers and ordered
+ * user deletion serialize at the pool before reaching grants/provider rows.
+ * Provider writers serialize at the account before reaching model/preference;
+ * none waits on the granting owner's pool while holding those rows. Grant or
+ * model deletion reaches preference only after its parent lock; clear holds
+ * only preference. No holder of preference waits for a parent. The setter
+ * neither holds nor later acquires a capacity lock, so adds no reverse edge.
+ *
  * After C6 (C5 for pool fallback; the last statement that can wait) it re-reads the requester's
  * token and `user` row WITHOUT a lock in one SQL statement that evaluates
  * token expiry, ban and deletion mark against statement_timestamp()

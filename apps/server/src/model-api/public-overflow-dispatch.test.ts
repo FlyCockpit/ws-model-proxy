@@ -2311,9 +2311,10 @@ describe("public overflow terminal response dispatch", () => {
       });
       await vi.advanceTimersByTimeAsync(10_000);
 
-      await expect(dispatched).resolves.toEqual({
+      await expect(dispatched).resolves.toMatchObject({
         dispatched: false,
         reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
       });
       expect(providerSignal?.aborted).toBe(true);
       expect(recordProviderOutcome).not.toHaveBeenCalled();
@@ -2522,6 +2523,56 @@ describe("own-key dispatch and authoritative send claim", () => {
     };
     return { fixture, model, request, tx, locks };
   }
+  it("persists send intent after consent but before transport, and reports possible I/O on failure", async () => {
+    const { request, tx } = setup();
+    const beforeProviderSend = vi.fn(async () => {
+      expect(tx.providerCredential.update).toHaveBeenCalled();
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+    });
+    providerHttpsRequest.mockRejectedValueOnce(new Error("connection lost"));
+    const result = await dispatchPublicOverflow({
+      ...request,
+      retrySafe: false,
+      beforeProviderSend,
+    });
+    expect(beforeProviderSend).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      dispatched: false,
+      providerIoStarted: true,
+      providerFailure: { target: { ownKey: true } },
+    });
+  });
+  it("never sends when durable intent persistence fails", async () => {
+    const { request } = setup();
+    const result = await dispatchPublicOverflow({
+      ...request,
+      beforeProviderSend: async () => {
+        throw new Error("database unavailable");
+      },
+    });
+    expect(result).toMatchObject({ dispatched: false });
+    expect(result).not.toHaveProperty("providerIoStarted");
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({ dispatchOutcome: "NOT_SENT" }),
+    );
+  });
+  it("retains provider 429 and Retry-After for a rejected precommit response", async () => {
+    const { request } = setup();
+    providerHttpsRequest.mockResolvedValueOnce(
+      Object.assign(Readable.from([Buffer.from('{"error":{"message":"busy"}}')]), {
+        statusCode: 429,
+        headers: { "content-type": "application/json", "retry-after": "17" },
+        complete: true,
+      }),
+    );
+    const result = await dispatchPublicOverflow({ ...request, retrySingleTargetPrecommit: true });
+    expect(result).toMatchObject({
+      dispatched: false,
+      providerIoStarted: true,
+      providerFailure: { status: 429, retryAfter: "17", target: { ownKey: true } },
+    });
+  });
   it("charges the requester and skips affinity even when owner fallback is off", async () => {
     const { request, locks } = setup();
     const result = await dispatchPublicOverflow(request);
@@ -2589,7 +2640,10 @@ describe("own-key dispatch and authoritative send claim", () => {
       if (condition === "credential") tx.providerCredential.findFirst.mockResolvedValue(null);
       return { admitted: true, providerAttemptId: "anchor", reservationIds: ["reservation"] };
     });
-    const result = await dispatchPublicOverflow(request);
+    const beforeProviderSend = vi.fn();
+    const result = await dispatchPublicOverflow({ ...request, beforeProviderSend });
+    expect(beforeProviderSend).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty("providerIoStarted");
     const expectedReason = ["token", "allowlist", "expired", "revoked"].includes(condition)
       ? "CALLER_CONSENT_WITHDRAWN"
       : condition === "grant"

@@ -30,10 +30,11 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard/terminals` | Browser terminals on the user's own CLIs. |
 | `/{lang}/dashboard/cli-tokens` | Own manually created CLI tokens. |
 | `/{lang}/dashboard/model-api-tokens` | Own OpenAI-compatible model API tokens. |
+| `/{lang}/dashboard/providers` | Own provider keys and per-shared-pool own-key preferences; read/clear while egress is disabled. |
 | `/{lang}/dashboard/pools` | Own model pools with static external-availability badges and provider operations (read/revoke/delete when external providers are disabled); pool cards lead to their dedicated detail pages. |
 | `/{lang}/dashboard/pools/new` | Guided model-pool creation. |
 | `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool overview, identity editor, and local members. |
-| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only external fallback and grantee switches, copyable local/:external model names, ordered providers, plus the external-equivalent model picker (OpenRouter catalog; declaring one is the owner's BYOK consent). |
+| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only external fallback and grantee switches, copyable local/:external model names, ordered providers, plus the external-equivalent model picker (OpenRouter catalog; declaring one is the owner's BYOK consent), and aggregate successful own-key requests. |
 | `/{lang}/dashboard/pools/{poolId}/routing` | Owner-only protocol compatibility and cache-affinity settings. |
 | `/{lang}/dashboard/pools/{poolId}/capacity` | Owner-only pool admission and capacity policy. |
 | `/{lang}/dashboard/pools/{poolId}/media` | Owner-only media transformer, transcription fallback, and attachment settings. |
@@ -70,5 +71,3 @@ Navigation destinations are defined in `apps/web/src/lib/nav-items.ts` and filte
 - The `_auth` layout also enforces mandatory 2FA setup when `force2fa` is enabled.
 - The `admin` layout returns 404 for non-admins; do not add admin links to navigation visible to all users.
 - Client-side links should preserve the current locale segment. Use `<Link to="/$lang/dashboard" params={{ lang }} />` rather than hardcoded `/dashboard` strings.
-
-- `/$lang/dashboard/providers` — Provider keys and grantee own-key choices (Pools tab).

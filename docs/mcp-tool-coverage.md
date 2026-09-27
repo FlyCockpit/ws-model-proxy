@@ -90,6 +90,10 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
+| `poolFallbackPreferences.clear` | — (excluded) | — | — | — | — | — | Human-only own-key preference management. |
+| `poolFallbackPreferences.list` | — (excluded) | — | — | — | — | — | Private dashboard preferences. |
+| `poolFallbackPreferences.ownerAggregate` | — (excluded) | — | — | — | — | — | Dashboard aggregate count. |
+| `poolFallbackPreferences.set` | — (excluded) | — | — | — | — | — | Human-only own-key egress consent. |
 | `providerCatalog.getPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker. |
 | `providerCatalog.importModel` | — (excluded) | — | — | — | — | — | Human-only catalog import; agents use the confirmed provider model tools. |
 | `providerCatalog.search` | — (excluded) | — | — | — | — | — | Human-only catalog picker: an outbound OpenRouter catalog fetch that stays out of MCP. |

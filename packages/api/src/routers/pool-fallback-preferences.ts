@@ -18,7 +18,7 @@ export const poolFallbackPreferencesRouter = {
       // Count only: no requester identities, target ids, prices or provider data.
       return {
         count: await prisma.relayRequest.count({
-          where: { requestedModelPoolId: pool.id, fallbackRoute: "own-key" },
+          where: { requestedModelPoolId: pool.id, fallbackRoute: "own-key", status: "SUCCEEDED" },
         }),
       };
     }),
