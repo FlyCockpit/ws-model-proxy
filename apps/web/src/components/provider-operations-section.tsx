@@ -5,6 +5,7 @@ import {
   parseOpenAiCompatibleCapabilities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { PROVIDER_PRIVATE_NETWORK_REJECTED } from "@ws-model-proxy/api/lib/provider-egress";
+import { PROVIDER_PRESET_BASE_URL } from "@ws-model-proxy/api/lib/provider-protocol";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -57,6 +58,10 @@ function orpcDataReason(error: unknown): string | null {
   const reason = (data as { reason?: unknown }).reason;
   return typeof reason === "string" ? reason : null;
 }
+
+// The OpenAI API root: request paths such as `/v1/chat/completions` are
+// appended, so the default must not end in `/v1`.
+const DEFAULT_ACCOUNT_BASE_URL: string = PROVIDER_PRESET_BASE_URL.openai;
 
 export const providerAccountFormSchema = z.object({
   providerType: z
@@ -494,10 +499,29 @@ export function ProviderOperationsSection() {
   );
   const testCredential = useMutation(
     orpc.providerManagement.testCredential.mutationOptions({
-      onSuccess: (result) =>
-        result.ok
-          ? toast.success(t("dashboard:providers.feedback.testPassed"))
-          : toast.error(t("dashboard:providers.feedback.testFailed")),
+      onSuccess: (result) => {
+        if (result.outcome === "SUCCESS")
+          toast.success(t("dashboard:providers.feedback.testPassed"));
+        // Not a pass and not a refusal: the key may only lack permission to
+        // list models, or this provider type has no endpoint known to
+        // require the key.
+        else if (result.outcome === "INCONCLUSIVE")
+          toast.warning(
+            t(
+              result.reason === "INSUFFICIENT_PERMISSION"
+                ? "dashboard:providers.feedback.testForbidden"
+                : "dashboard:providers.feedback.testUnverified",
+            ),
+          );
+        else
+          toast.error(
+            t(
+              result.reason === "INVALID_CREDENTIAL"
+                ? "dashboard:providers.feedback.testRejected"
+                : "dashboard:providers.feedback.testFailed",
+            ),
+          );
+      },
       onError: () => toast.error(t("dashboard:providers.feedback.testFailed")),
     }),
   );
@@ -661,7 +685,7 @@ export function ProviderOperationsSection() {
     defaultValues: {
       label: "",
       providerType: "openai",
-      baseUrl: "https://api.openai.com/v1",
+      baseUrl: DEFAULT_ACCOUNT_BASE_URL,
       authType: "BEARER" as "API_KEY" | "BEARER",
     },
     validators: {

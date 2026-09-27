@@ -32,8 +32,9 @@ import {
   validateProviderBaseUrl,
 } from "../lib/provider-egress";
 import {
+  classifyCredentialProbeStatus,
   inventoryProtocolForProviderType,
-  providerCredentialProbeUrl,
+  providerCredentialProbe,
   providerInventorySurfacesAllowed,
   providerProtocolForType,
 } from "../lib/provider-protocol";
@@ -1790,6 +1791,7 @@ export const providerManagementRouter = {
       );
       let statusCode: number | null = null;
       let requestError: unknown;
+      const probe = providerCredentialProbe(account.providerType, account.baseUrl);
       // G1: never START the external (cost-incurring) HTTPS probe for an
       // already-aborted caller.
       throwIfCallerAborted();
@@ -1799,8 +1801,8 @@ export const providerManagementRouter = {
             ? ({ type: "BEARER", token: secret } as const)
             : ({ type: "API_KEY", apiKey: secret } as const);
         const response = await providerHttpsRequest(
-          providerCredentialProbeUrl(account.providerType, account.baseUrl),
-          { method: "GET", headers: { accept: "application/json" } },
+          probe.url,
+          { method: "GET", headers: probe.headers },
           policy(),
           protocol,
           providerAuth,
@@ -1810,7 +1812,15 @@ export const providerManagementRouter = {
       } catch (error) {
         requestError = error;
       }
-      const ok = requestError === undefined && (statusCode ?? 500) < 400;
+      // SUCCESS needs a 2xx from an endpoint known to require the key;
+      // 401 means the key was not accepted; 403 (the key may only lack
+      // permission for the probe endpoint) and a 2xx or other status from an
+      // endpoint not known to require a key are INCONCLUSIVE, never a pass.
+      // A transport error, timeout or refused redirect is a FAILURE that says
+      // nothing about the key. Reasons are fixed codes, never provider text.
+      const classified = classifyCredentialProbeStatus(statusCode, probe.verifiesCredential);
+      const outcome = requestError === undefined ? classified.outcome : ("FAILURE" as const);
+      const reason = requestError === undefined ? classified.reason : ("REQUEST_FAILED" as const);
       // G1: a caller that aborted while the HTTPS probe was in flight must
       // not trigger the audit write transaction either (the MCP per-request
       // abort fence would reject it anyway — this check keeps the intent
@@ -1832,13 +1842,14 @@ export const providerManagementRouter = {
             providerAccountId: account.id,
             action: "CREDENTIAL_TESTED",
             subjectId: row.id,
-            metadata: { outcome: ok ? "SUCCESS" : "FAILURE", statusCode },
+            metadata:
+              outcome === "SUCCESS" ? { outcome, statusCode } : { outcome, statusCode, reason },
           },
         });
       }, providerWriteTransaction);
       if (requestError !== undefined)
         throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(requestError) });
-      return { ok, statusCode };
+      return { ...classified, statusCode };
     }),
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     readRevokeOrDeleteAllowed();

@@ -14,6 +14,8 @@ const state = vi.hoisted(() => ({
   updateModelResult: undefined as Record<string, unknown> | undefined,
   updateModelPayloads: [] as Array<Record<string, unknown>>,
   allowPrivateNetworks: true,
+  credentials: [] as Array<Record<string, unknown>>,
+  testResult: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -46,6 +48,7 @@ vi.mock("@/utils/orpc", () => {
           return { id: "created-account" };
         }
         if (name === "createBudgetPolicy") state.budgetPayload = input;
+        if (name === "testCredential") return state.testResult ?? {};
         if (name === "updateModel") {
           state.updateModelPayloads.push(input);
           return state.updateModelResult ?? {};
@@ -57,7 +60,7 @@ vi.mock("@/utils/orpc", () => {
   const providerQueries = {
     listAccounts: query("accounts", () => state.accounts),
     listModels: query("models", () => state.models),
-    listCredentials: query("credentials", () => []),
+    listCredentials: query("credentials", () => state.credentials),
     listAuditEvents: query("audits", () => []),
     listUsageReportPage: query("usage", () => ({ items: [], nextCursor: null })),
     getUsageTotals: query("usageTotals", () => ({ totals: [] })),
@@ -135,12 +138,66 @@ afterEach(() => {
   state.updateModelResult = undefined;
   state.updateModelPayloads = [];
   state.allowPrivateNetworks = true;
+  state.credentials = [];
+  state.testResult = undefined;
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.warning).mockClear();
 });
 
 describe("ProviderOperationsSection mounted forms", () => {
+  it.each([
+    [{ ok: true, outcome: "SUCCESS", reason: null }, "success", "testPassed"],
+    [{ ok: false, outcome: "FAILURE", reason: "INVALID_CREDENTIAL" }, "error", "testRejected"],
+    [{ ok: false, outcome: "FAILURE", reason: "UNEXPECTED_STATUS" }, "error", "testFailed"],
+    // A compatible gateway cannot confirm a key: a warning, never "passed".
+    [{ ok: false, outcome: "INCONCLUSIVE", reason: "UNVERIFIED" }, "warning", "testUnverified"],
+    // 403: the key may only lack permission to list models, not a rejection.
+    [
+      { ok: false, outcome: "INCONCLUSIVE", reason: "INSUFFICIENT_PERMISSION" },
+      "warning",
+      "testForbidden",
+    ],
+    [
+      { ok: false, outcome: "INCONCLUSIVE", reason: "UNEXPECTED_STATUS" },
+      "warning",
+      "testUnverified",
+    ],
+  ] as const)("reports credential test %j as a %s toast", async (result, kind, key) => {
+    state.accounts = [
+      {
+        id: "account-a",
+        label: "Gateway",
+        providerType: "openai-compatible",
+        baseUrl: "https://gateway.example",
+        authType: "BEARER",
+        enabled: false,
+        healthStatus: "HEALTHY",
+        healthCheckedAt: null,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    state.credentials = [{ id: "credential-a", status: "ACTIVE" }];
+    state.testResult = { ...result, statusCode: 200 };
+    mount();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /dashboard:providers\.actions\.test/u }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(toast[kind])).toHaveBeenCalledWith(`dashboard:providers.feedback.${key}`),
+    );
+    for (const other of ["success", "error", "warning"] as const) {
+      if (other !== kind) expect(vi.mocked(toast[other])).not.toHaveBeenCalled();
+    }
+  });
+
+  // Request paths carry `/v1`; a `/v1` default produced `/v1/v1/...` upstream.
+  it("defaults the new account to the unversioned OpenAI API root", () => {
+    mount();
+    const baseUrl = screen.getByLabelText("dashboard:providers.fields.baseUrl");
+    expect((baseUrl as HTMLInputElement).value).toBe("https://api.openai.com");
+  });
+
   it("says private and loopback URLs are rejected before submit when that flag is off", () => {
     state.allowPrivateNetworks = false;
     mount();

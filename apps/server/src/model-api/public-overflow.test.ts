@@ -26,6 +26,7 @@ import {
   engineCacheConfirmedFromRetainedResponse,
   engineCacheConfirmedFromUsage,
   exactResponsesNativeSurface,
+  joinProviderPath,
   matchesExactResponsesBinding,
   parseProviderUsage,
   providerHealthOutcome,
@@ -1415,3 +1416,21 @@ function claimTarget() {
     },
   };
 }
+
+describe("provider request path", () => {
+  it.each([
+    // Accounts saved with the old `https://api.openai.com/v1` form default.
+    ["https://api.openai.com/v1", "/v1/chat/completions", "/v1/chat/completions"],
+    [
+      "https://api.openai.com/v1/",
+      "/v1/responses/resp_1?include=x",
+      "/v1/responses/resp_1?include=x",
+    ],
+    ["https://api.openai.com", "/v1/chat/completions", "/v1/chat/completions"],
+    ["https://openrouter.ai/api", "/v1/chat/completions", "/api/v1/chat/completions"],
+    ["https://gateway.example/openai", "/v1/messages", "/openai/v1/messages"],
+    ["https://gateway.example/openai/v1", "/v1/messages", "/openai/v1/messages"],
+  ])("joins %s with %s without doubling /v1", (baseUrl, path, expected) => {
+    expect(joinProviderPath(baseUrl, path)).toBe(expected);
+  });
+});

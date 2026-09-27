@@ -22,11 +22,16 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     baseUrl: PROVIDER_PRESET_BASE_URL.openrouter,
     authType: "BEARER",
   },
-  { key: "openai", providerType: "openai", baseUrl: "https://api.openai.com", authType: "BEARER" },
+  {
+    key: "openai",
+    providerType: "openai",
+    baseUrl: PROVIDER_PRESET_BASE_URL.openai,
+    authType: "BEARER",
+  },
   {
     key: "anthropic",
     providerType: "anthropic",
-    baseUrl: "https://api.anthropic.com",
+    baseUrl: PROVIDER_PRESET_BASE_URL.anthropic,
     authType: "API_KEY",
   },
   { key: "custom", providerType: "openai-compatible", baseUrl: "", authType: "BEARER" },
