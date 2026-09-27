@@ -72,6 +72,9 @@ If the attempt cannot send (no compatible external member, provider busy or
 unhealthy, a consent withdrawn since the request arrived), `:external` never
 gets worse local service than the plain name:
 
+The table describes owner-paid fallback. Own-key provider-only failures can
+preserve the upstream status as described under [Own-key failure and accounting](#own-key-failure-and-accounting).
+
 | Situation | Result |
 | --- | --- |
 | Local wait expired, pool has local members | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
@@ -80,6 +83,7 @@ gets worse local service than the plain name:
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
 | Pool has only external members, anything else (unhealthy, failure before the first byte, fallback or consent withdrawn) | `503 external_unavailable` |
+| Client cancels before a provider response is committed | `499 cancelled` (also recorded as 499, irrespective of a rejected upstream status) |
 
 All of these carry `x-wsmp-fallback: unavailable`.
 
@@ -246,15 +250,18 @@ compatibility. Own-key durable records and headers use `own-key`.
 
 Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
-Audio rates bound both input/output and additional-token accounting. Usage
-parses OpenRouter cache-write token details, audio tokens, reasoning, cost and
-recognized cost metadata; unknown categories still fail closed. Provider
+Audio rates bound both input/output and additional-token accounting. The shared
+usage parser supports existing token categories and direct cost, but does not
+normalize OpenRouter `cache_write_tokens`, `is_byok`, or `cost_details` metadata.
+Those unknown categories keep accounting on the conservative liability path.
+Complete OpenRouter usage normalization is deferred to a separate PR with
+provider-specific tests. Provider
 search, image and audio service charges can be non-token charges: token prices
 and token-based budgets are not a bound on the provider's total bill. The
 picker and import summary disclose this limitation.
 
 ### Own-key failure and accounting
 
-Own-key capacity admission tries only capacity available now, preserving time for the owner-paid tier and any remaining local wait. A skipped own-key tier permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No tier changes after a response commits. When the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header.
+Own-key capacity admission tries only capacity available now, preserving time for the owner-paid tier and any remaining local wait. A skipped own-key tier permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No tier changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the relay's cancellation status. Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
 
 Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted tier durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.

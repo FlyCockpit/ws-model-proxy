@@ -1214,7 +1214,12 @@ BEGIN
     SELECT format('relay request selection row=%s', request.id)
       FROM relay_request request
       JOIN execution_target target ON target.id = request."selectedExecutionTargetId"
-     WHERE target."userId" <> request."userId"
+      LEFT JOIN model_pool pool ON pool.id = request."requestedModelPoolId"
+     WHERE target."userId" IS DISTINCT FROM CASE
+             WHEN request."fallbackRoute" = 'own-key' OR request."requestedModelPoolId" IS NULL
+               THEN request."userId"
+             ELSE pool."userId"
+           END
         OR (request."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM request."selectedDiscoveredModelId")
   ) invalid;
@@ -1552,7 +1557,30 @@ BEGIN
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      IF target_owner IS NULL OR target_owner <> NEW."userId"
+      -- userId is the caller. Local and owner-paid pool targets belong to the
+      -- pool owner; DIRECT and own-key targets belong to the caller. This is
+      -- historical identity, not a live-grant authorization check.
+      consumer_owner := NEW."userId";
+      IF NEW."requestedModelPoolId" IS NOT NULL AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key' THEN
+        SELECT "userId" INTO consumer_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+      END IF;
+      -- A pool's SET NULL cascade removes the ownership anchor. Detach its
+      -- cross-tenant selection as well, rather than retaining an unverifiable
+      -- target or blocking parent deletion. No terminal state is changed.
+      IF TG_OP = 'UPDATE' AND OLD."requestedModelPoolId" IS NOT NULL
+         AND NEW."requestedModelPoolId" IS NULL
+         AND NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId"
+         AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+         AND NEW."fallbackRoute" IS NOT DISTINCT FROM OLD."fallbackRoute"
+         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+         AND target_owner IS DISTINCT FROM NEW."userId"
+         AND NOT EXISTS (SELECT 1 FROM model_pool WHERE id = OLD."requestedModelPoolId") THEN
+        NEW."selectedExecutionTargetId" := NULL;
+        NEW."selectedDiscoveredModelId" := NULL;
+        NEW."selectedPoolMemberId" := NULL;
+        RETURN NEW;
+      END IF;
+      IF target_owner IS NULL OR target_owner IS DISTINCT FROM consumer_owner
          OR (NEW."selectedDiscoveredModelId" IS NOT NULL
              AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
@@ -1584,7 +1612,7 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId" ON relay_request
+  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute" ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';

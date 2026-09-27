@@ -4959,6 +4959,312 @@ describe("model API routes", () => {
     },
   );
 
+  describe.each(["owner", "grantee", "after-own-key"] as const)(
+    "%s owner-paid provider-only outcomes retain the existing contract",
+    (caller) => {
+      it.each([undefined, 408, 409, 429, 500, 502, 503, 504, "cancelled"] as const)(
+        "preserves status, error, headers and recorded status for provider failure %s",
+        async (outcome) => {
+          const { own, paid } = ownKeyRouteFixture();
+          if (caller !== "after-own-key") {
+            mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+              directModels: [],
+              modelPools: [
+                {
+                  ...externalPoolTarget,
+                  ownerUserId: caller === "owner" ? "user-id" : "pool-owner-id",
+                  accessGrantId: caller === "owner" ? null : "grant",
+                  fallbackForGrantees: true,
+                },
+              ],
+            });
+          } else {
+            publicOverflow.dispatch.mockImplementationOnce(
+              async (request: PublicOverflowRequest) => {
+                await request.beforeProviderSend?.(own);
+                return {
+                  dispatched: false,
+                  reason: "PROVIDER_UNAVAILABLE",
+                  providerIoStarted: true,
+                  providerFailure: { target: own, status: 429, retryAfter: "17" },
+                };
+              },
+            );
+          }
+          const controller = new AbortController();
+          publicOverflow.dispatch.mockImplementationOnce(async () => {
+            if (outcome === "cancelled") controller.abort();
+            return {
+              dispatched: false,
+              reason: "PROVIDER_UNAVAILABLE",
+              providerIoStarted: true,
+              providerFailure: {
+                target: paid,
+                status: outcome === "cancelled" ? 500 : outcome,
+                retryAfter: "17",
+              },
+            };
+          });
+          const response = await appWith(
+            new FakeRelayManager(),
+            admittingCapacityRuntime(),
+          ).request("/chat/completions", {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+            signal: controller.signal,
+          });
+          expect(response.status).toBe(outcome === "cancelled" ? 499 : 503);
+          expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+          expect(response.headers.get("x-wsmp-route")).toBeNull();
+          expect(response.headers.get("x-wsmp-served-model")).toBeNull();
+          expect(response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+          expect(response.headers.get("retry-after")).toBeNull();
+          await expect(response.json()).resolves.toMatchObject({
+            error: { code: outcome === "cancelled" ? "cancelled" : "external_unavailable" },
+          });
+          expect(
+            Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+          ).toMatchObject({
+            status: outcome === "cancelled" ? "CANCELED" : "FAILED",
+            httpStatusCode: outcome === "cancelled" ? 499 : 503,
+            upstreamStatusCode: null,
+            fallbackRoute: null,
+            selectedExecutionTargetId: null,
+            selectedPoolMemberId: null,
+          });
+          expect(publicOverflow.dispatch).toHaveBeenCalledTimes(caller === "after-own-key" ? 2 : 1);
+        },
+      );
+    },
+  );
+
+  it("keeps the owner-paid never-retry policy even when a member did no I/O", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([externalProviderTarget("first"), externalProviderTarget("second")]),
+    );
+    publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason: "BUDGET_EXCEEDED" });
+    const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+    try {
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
+  it.each(["owner-paid", "own-key"] as const)(
+    "keeps the decided %s failure if terminal telemetry fails",
+    async (tier) => {
+      const { own, paid } = ownKeyRouteFixture();
+      if (tier === "owner-paid") {
+        mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+          directModels: [],
+          modelPools: [externalPoolTarget],
+        });
+      } else {
+        publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+          listedExternalTargets(ownKey ? [own] : [], {
+            enabled: Boolean(ownKey),
+            fallbackForGrantees: true,
+          }),
+        );
+      }
+      publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+        if (tier === "own-key") await request.beforeProviderSend?.(own);
+        return {
+          dispatched: false,
+          reason: "PROVIDER_UNAVAILABLE",
+          providerIoStarted: true,
+          providerFailure: { target: tier === "own-key" ? own : paid, status: 502 },
+        };
+      });
+      // Route UPDATEs before terminalization succeed; only the final telemetry fails.
+      const update = db.relayRequest.update.getMockImplementation()!;
+      db.relayRequest.update.mockImplementation(async (args) => {
+        if (args.data.status === "FAILED") throw new Error("terminal telemetry unavailable");
+        return update(args);
+      });
+      const logged = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+        expect(response.status).toBe(tier === "own-key" ? 502 : 503);
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(logged).toHaveBeenCalled();
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
+
+  it("keeps own-key cancellation status after a rejected upstream response", async () => {
+    const { own } = ownKeyRouteFixture();
+    publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+      listedExternalTargets(ownKey ? [own] : [], {
+        enabled: Boolean(ownKey),
+        fallbackForGrantees: true,
+      }),
+    );
+    const controller = new AbortController();
+    publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+      await request.beforeProviderSend?.(own);
+      controller.abort();
+      return {
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
+        providerFailure: { target: own, status: 500 },
+      };
+    });
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      },
+    );
+    expect(response.status).toBe(499);
+    expect(response.headers.get("x-wsmp-route")).toBeNull();
+    expect(
+      Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+    ).toMatchObject({
+      status: "CANCELED",
+      httpStatusCode: 499,
+      upstreamStatusCode: 500,
+      fallbackRoute: "own-key",
+    });
+  });
+
+  it.each(["saturated", "missing-member", "disabled", "uncovered"] as const)(
+    "preserves owner-paid admission/listing outcome: %s",
+    async (outcome) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const paid = externalProviderTarget("paid");
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([paid], {
+          enabled: outcome !== "disabled",
+          fallbackForGrantees: outcome !== "uncovered",
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: outcome === "disabled" ? "POOL_PRIVATE" : "GRANTEE_NOT_COVERED",
+      });
+      const capacity = admittingCapacityRuntime();
+      if (outcome === "saturated")
+        vi.mocked(capacity.acquire).mockResolvedValue({ state: "EXPIRED" });
+      if (outcome === "missing-member")
+        vi.mocked(capacity.acquire).mockResolvedValue({
+          state: "ADMITTED",
+          lease: {
+            leaseId: "missing-member",
+            attemptId: "attempt",
+            capacityId: paid.inferenceCapacityId,
+            executionTargetId: paid.executionTargetId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        });
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(
+        outcome === "saturated" || outcome === "missing-member" ? 429 : 503,
+      );
+      expect(response.headers.get("retry-after")).toBeNull();
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      if (outcome === "disabled" || outcome === "uncovered")
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      if (outcome === "missing-member") expect(capacity.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("classifies a failed own-key restore and never admits another tier", async () => {
+    const { own } = ownKeyRouteFixture();
+    const update = db.relayRequest.update.getMockImplementation()!;
+    publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+      await request.beforeProviderSend?.(own);
+      db.relayRequest.update.mockImplementation(async (args) => {
+        if (args.data.fallbackRoute === null) throw new Error("restore unavailable");
+        return update(args);
+      });
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: true };
+    });
+    const logged = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const capacity = admittingCapacityRuntime();
+    try {
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "disconnected" } });
+      expect(capacity.acquire).toHaveBeenCalledOnce();
+      expect(capacity.release).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(
+        Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+      ).toMatchObject({
+        status: "FAILED",
+        httpStatusCode: 503,
+        fallbackRoute: "own-key",
+        selectedExecutionTargetId: own.executionTargetId,
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   // R1-A: a grantee's consent carries the exact grant the request was
   // resolved under, which the send claim requires to still exist.
   it("binds a grantee's :external consent to the grant the request was resolved under", async () => {

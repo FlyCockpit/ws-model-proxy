@@ -787,6 +787,8 @@ type RouteIdentity = {
   selectedPoolMemberId: string | null;
 };
 
+class RouteIdentityPersistenceError extends Error {}
+
 type RelayMetadataUpdate = {
   routeIdentity?: RouteIdentity;
   selectedDiscoveredModelId?: string;
@@ -3787,7 +3789,11 @@ async function relayPool({
     // Await supersession before admitting another tier or writing terminal
     // metadata. A failed write stops routing; it cannot leak stale identity
     // into a subsequent route's finalizer or rollup.
-    await prisma.relayRequest.update({ where: { id: relayRequestId }, data: identity });
+    try {
+      await prisma.relayRequest.update({ where: { id: relayRequestId }, data: identity });
+    } catch (cause) {
+      throw new RouteIdentityPersistenceError("Could not persist routing identity", { cause });
+    }
     routeIdentity = identity;
   };
   let externalFailure: Extract<
@@ -3796,6 +3802,7 @@ async function relayPool({
       dispatched: false;
     }
   >["providerFailure"];
+  let ownKeyOutcome = false;
   const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
     failRelayMetadata({ ...input, routeIdentity });
   const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
@@ -3993,9 +4000,18 @@ async function relayPool({
             accessGrantId: consent.accessGrantId,
           })
         : await listPublicOverflowTargets(target.ownerUserId, target.id);
-      if (!listed.enabled)
-        return { dispatched: false, reason: ownKey ? "OWN_KEY_CONSENT_WITHDRAWN" : "POOL_PRIVATE" };
-      if (!ownKey && !consent.requesterIsOwner && !listed.fallbackForGrantees)
+      if (ownKey && !listed.enabled)
+        return { dispatched: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
+      // These tier distinctions preserve an earlier own-key outcome. Requests
+      // without own-key retain the existing compatibility/dispatcher decisions.
+      if (!ownKey && consent.ownKeyProviderModelId && !listed.enabled)
+        return { dispatched: false, reason: "POOL_PRIVATE" };
+      if (
+        !ownKey &&
+        consent.ownKeyProviderModelId &&
+        !consent.requesterIsOwner &&
+        !listed.fallbackForGrantees
+      )
         return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
       const compatibleTargets = (providerTargets: typeof listed.targets) =>
         providerTargets.flatMap((providerTarget) => {
@@ -4060,6 +4076,10 @@ async function relayPool({
         });
         if (admission.state !== "ADMITTED")
           return { dispatched: false, reason: "PROVIDER_SATURATED" };
+        if (!ownKey && !admission.lease.poolMemberId) {
+          await capacityRuntime.release(admission.lease);
+          return { dispatched: false, reason: "PROVIDER_SATURATED" };
+        }
         const selectedPoolMemberId = ownKey ? "" : admission.lease.poolMemberId;
         if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
           await capacityRuntime.release(admission.lease);
@@ -4100,7 +4120,7 @@ async function relayPool({
         // A provider attempt that did not commit is retryable only under the
         // operation's existing exact retry policy. Never re-admit the same
         // physical member during this tier traversal.
-        if (!providerRequest.retrySafe && result.providerIoStarted) return result;
+        if (!providerRequest.retrySafe && (!ownKey || result.providerIoStarted)) return result;
         remaining = remaining.filter((item) => item.poolMemberId !== selectedPoolMemberId);
       }
       return lastResult;
@@ -4160,6 +4180,7 @@ async function relayPool({
         ["POOL_PRIVATE", "GRANTEE_NOT_COVERED", "NO_COMPATIBLE_PROVIDER"].includes(result.reason)
       )
         result = ownResult;
+      ownKeyOutcome = result === ownResult;
     } catch (error) {
       // Nothing was dispatched and the error ends the request: release the
       // caller lease and the local capacity lease exactly once (both are
@@ -4167,11 +4188,20 @@ async function relayPool({
       // it never lingers PENDING (R-J).
       releaseCallerLease();
       await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+      const failure: RelayFailure = request.signal.aborted
+        ? "cancelled"
+        : error instanceof RouteIdentityPersistenceError
+          ? "disconnected"
+          : "unknown";
       await failPoolRelayMetadata({
         relayRequestId,
         startedAt,
-        failure: request.signal.aborted ? "cancelled" : "unknown",
+        failure,
       }).catch(metadataUpdateError);
+      if (error instanceof RouteIdentityPersistenceError) {
+        metadataUpdateError(error);
+        return operationFailureResponse(operation, failure);
+      }
       throw error;
     }
     if (!result.dispatched) {
@@ -4180,10 +4210,10 @@ async function relayPool({
         callerLeaseReleased = true;
         globalLease = outerCallerLease;
       } else releaseCallerLease();
-      externalFailure = result.providerFailure;
+      externalFailure = ownKeyOutcome ? result.providerFailure : undefined;
       return {
         dispatched: false,
-        reason: result.providerFailure?.status === 429 ? "PROVIDER_SATURATED" : result.reason,
+        reason: externalFailure?.status === 429 ? "PROVIDER_SATURATED" : result.reason,
       };
     }
     routeIdentity = providerRouteIdentity(result.target);
@@ -4495,29 +4525,32 @@ async function relayPool({
             ? "cancelled"
             : "disconnected";
     await operation.dispose?.();
-    if (externalFailure) await persistRouteIdentity(providerRouteIdentity(externalFailure.target));
+    // Final attribution is telemetry, not permission to send or switch tiers.
+    // Write it with the terminal transition; a failure must not change the
+    // already-decided response. Only own-key preserves upstream failure facts.
+    if (externalFailure) routeIdentity = providerRouteIdentity(externalFailure.target);
+    const providerStatus = failure === "cancelled" ? undefined : externalFailure?.status;
     await failPoolRelayMetadata({
       relayRequestId,
       startedAt,
       failure,
       upstreamStatusCode: externalFailure?.status,
-      httpStatusCode: externalFailure?.status,
-    });
+      httpStatusCode: providerStatus,
+    }).catch(metadataUpdateError);
     if (externalFailure) {
       const response = operationFailureResponse(operation, failure);
       const headers = new Headers(response.headers);
       if (reason === "SATURATED") headers.set("retry-after", "1");
       const retryAfter = safeProviderRetryAfter(externalFailure.retryAfter ?? null);
       if (retryAfter) headers.set("retry-after", retryAfter);
-      headers.set(ROUTE_HEADER, externalFailure.target.ownKey ? "own-key" : "pool-fallback");
       return new Response(response.body, {
-        status: externalFailure.status ?? response.status,
+        status: providerStatus ?? response.status,
         headers,
       });
     }
     if (reason !== "UNAVAILABLE") {
       const response = operationFailureResponse(operation, failure);
-      if (reason === "SATURATED") response.headers.set("retry-after", "1");
+      if (ownKeyOutcome && reason === "SATURATED") response.headers.set("retry-after", "1");
       return response;
     }
     return externalRouteErrorResponse(operation.family, {
