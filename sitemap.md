@@ -70,3 +70,5 @@ Navigation destinations are defined in `apps/web/src/lib/nav-items.ts` and filte
 - The `_auth` layout also enforces mandatory 2FA setup when `force2fa` is enabled.
 - The `admin` layout returns 404 for non-admins; do not add admin links to navigation visible to all users.
 - Client-side links should preserve the current locale segment. Use `<Link to="/$lang/dashboard" params={{ lang }} />` rather than hardcoded `/dashboard` strings.
+
+- `/$lang/dashboard/providers` — Provider keys and grantee own-key choices (Pools tab).

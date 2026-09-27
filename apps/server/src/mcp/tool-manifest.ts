@@ -1348,6 +1348,13 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Admin-only observability.",
   },
   {
+    target: "poolFallbackPreferences.set",
+    reason: "Human-only own-key egress consent.",
+  },
+  { target: "poolFallbackPreferences.clear", reason: "Human-only own-key preference management." },
+  { target: "poolFallbackPreferences.ownerAggregate", reason: "Dashboard aggregate count." },
+  { target: "poolFallbackPreferences.list", reason: "Private dashboard preferences." },
+  {
     target: "providerCatalog.search",
     reason:
       "Human-only catalog picker: an outbound OpenRouter catalog fetch that stays out of MCP.",

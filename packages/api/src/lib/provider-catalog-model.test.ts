@@ -37,6 +37,8 @@ describe("parseCatalog", () => {
         cacheRead: "0.00000002",
         cacheWrite: null,
         reasoning: null,
+        cacheWrite1h: null,
+        audio: null,
         variable: false,
         tiers: [],
       },
@@ -165,13 +167,14 @@ describe("live-shaped catalog entries", () => {
       cacheWrite: "0.132",
       reasoning: "0.528",
     });
-    // Non-token web_search and unparsed audio / 1h cache token rates are excluded.
+    // Audio and 1h cache writes are bounded; non-token web search is disclosed separately.
     expect(catalogRatesPerMillion(flat)).toEqual({
-      input: "3",
+      input: "10",
       output: "15",
       cacheRead: "0.3",
-      cacheWrite: "3.75",
+      cacheWrite: "6",
       reasoning: "15",
+      additional: "15",
     });
   });
 
@@ -520,4 +523,37 @@ describe("stableJson", () => {
     );
     expect(stableJson({ a: 1 })).not.toBe(stableJson({ a: 2 }));
   });
+});
+
+it("bounds 1h cache writes and audio across base and tier rates", () => {
+  const model = parseCatalog({
+    data: [
+      catalogEntry({
+        pricing: {
+          prompt: "0.000001",
+          completion: "0.000002",
+          input_cache_write_1h: "0.000009",
+          audio: "0.000012",
+        },
+      }),
+    ],
+  })[0]!;
+  expect(catalogRatesPerMillion(model)).toMatchObject({
+    input: "12",
+    output: "12",
+    cacheWrite: "12",
+    additional: "12",
+  });
+});
+it.each([
+  "input_cache_read",
+  "input_cache_write",
+  "input_cache_write_1h",
+  "internal_reasoning",
+  "audio",
+])("treats base variable %s as unbounded", (key) => {
+  const model = parseCatalog({
+    data: [catalogEntry({ pricing: { prompt: "0.000001", completion: "0.000002", [key]: "-1" } })],
+  })[0]!;
+  expect(catalogRatesPerMillion(model)).toBeNull();
 });

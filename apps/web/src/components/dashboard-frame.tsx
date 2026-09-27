@@ -50,6 +50,12 @@ const dashboardSections = [
     exact: false,
   },
   {
+    to: "/$lang/dashboard/providers",
+    labelKey: "dashboard:nav.providers",
+    icon: KeyRound,
+    exact: false,
+  },
+  {
     to: "/$lang/dashboard/capacity",
     labelKey: "dashboard:nav.capacity",
     icon: Gauge,

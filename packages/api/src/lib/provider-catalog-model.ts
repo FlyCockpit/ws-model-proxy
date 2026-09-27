@@ -44,6 +44,8 @@ function hasMalformedBasePrice(source: unknown): boolean {
     isMalformedListedPrice(record.completion) ||
     isMalformedListedPrice(record.input_cache_read) ||
     isMalformedListedPrice(record.input_cache_write) ||
+    isMalformedListedPrice(record.input_cache_write_1h) ||
+    isMalformedListedPrice(record.audio) ||
     isMalformedListedPrice(record.internal_reasoning)
   );
 }
@@ -61,6 +63,8 @@ const priceTierSchema = z.object({
   completion: strictPrice,
   input_cache_read: strictPrice,
   input_cache_write: strictPrice,
+  input_cache_write_1h: strictPrice,
+  audio: strictPrice,
   internal_reasoning: strictPrice,
 });
 const priceTiersSchema = z.array(priceTierSchema).max(32);
@@ -94,6 +98,8 @@ const catalogEntrySchema = z.object({
       completion: priceSchema,
       input_cache_read: priceSchema,
       input_cache_write: priceSchema,
+      input_cache_write_1h: priceSchema,
+      audio: priceSchema,
       internal_reasoning: priceSchema,
       overrides: z.unknown().optional(),
     })
@@ -129,6 +135,8 @@ export interface CatalogPriceTier {
   cacheRead: string | null;
   cacheWrite: string | null;
   reasoning: string | null;
+  cacheWrite1h?: string | null;
+  audio?: string | null;
 }
 
 export interface CatalogPricing extends CatalogPriceTier {
@@ -176,6 +184,8 @@ type RawPriceTier = {
   completion?: string | null;
   input_cache_read?: string | null;
   input_cache_write?: string | null;
+  input_cache_write_1h?: string | null;
+  audio?: string | null;
   internal_reasoning?: string | null;
 };
 
@@ -186,6 +196,8 @@ function priceTier(raw: RawPriceTier | null | undefined): CatalogPriceTier {
     cacheRead: price(raw?.input_cache_read),
     cacheWrite: price(raw?.input_cache_write),
     reasoning: price(raw?.internal_reasoning),
+    cacheWrite1h: price(raw?.input_cache_write_1h),
+    audio: price(raw?.audio),
   };
 }
 
@@ -195,6 +207,8 @@ function isVariable(raw: RawPriceTier | null | undefined): boolean {
     raw?.completion,
     raw?.input_cache_read,
     raw?.input_cache_write,
+    raw?.input_cache_write_1h,
+    raw?.audio,
     raw?.internal_reasoning,
   ].includes("-1");
 }
@@ -410,6 +424,7 @@ export type CatalogRatesPerMillion = {
   cacheRead: string;
   cacheWrite: string;
   reasoning: string;
+  additional?: string;
 };
 
 /**
@@ -446,8 +461,8 @@ function maxUnits(values: readonly bigint[]): bigint {
  * or by time of day). For the five parsed per-token categories (input, output,
  * cache read, cache write and reasoning), the schedule takes the maximum rate
  * across the base price and override tiers, with the fallbacks below. This
- * bounds only those parsed rates. Non-token charges (e.g. web search) and
- * unparsed token types (e.g. 1h cache writes and audio) are not covered; this
+ * also bounds 1h cache writes and audio tokens using the category maximum.
+ * Non-token charges (web search, images, audio services) are not covered; this
  * is not a bound on the provider's total charge. FAIL_CLOSED applies only to
  * unknown usage categories that the usage parser actually reports.
  *
@@ -460,24 +475,34 @@ export function catalogRatesPerMillion(model: CatalogModel): CatalogRatesPerMill
   const pricing = model.pricing;
   if (pricing.variable || pricing.prompt === null || pricing.completion === null) return null;
   const tiers: CatalogPriceTier[] = [pricing, ...pricing.tiers];
-  const units = (value: string | null) => (value === null ? null : perTokenToUnits(value));
+  const units = (value: string | null | undefined) =>
+    value == null ? null : perTokenToUnits(value);
   const bound = (key: keyof CatalogPriceTier, fallback: bigint | null): bigint | null => {
     const values: bigint[] = [];
     for (const tier of tiers) {
       const value = units(tier[key]);
       if (value !== null) values.push(value);
-      else if (tier[key] !== null) return null;
+      else if (tier[key] != null) return null;
       else if (fallback !== null) values.push(fallback);
     }
     return values.length > 0 ? maxUnits(values) : null;
   };
   // Prompt and completion always exist on the base tier; a tier that omits
   // them inherits the base rate, which is already in the bound.
-  const input = bound("prompt", null);
-  const output = bound("completion", null);
+  const audio = bound("audio", 0n);
+  const baseInput = bound("prompt", null);
+  const baseOutput = bound("completion", null);
+  if (audio === null || baseInput === null || baseOutput === null) return null;
+  const input = maxUnits([baseInput, audio]);
+  const output = maxUnits([baseOutput, audio]);
   if (input === null || output === null) return null;
   const cacheRead = bound("cacheRead", input);
-  const cacheWrite = bound("cacheWrite", input);
+  const cacheWriteBase = bound("cacheWrite", input);
+  const cacheWrite1h = bound("cacheWrite1h", input);
+  const cacheWrite =
+    cacheWriteBase === null || cacheWrite1h === null
+      ? null
+      : maxUnits([cacheWriteBase, cacheWrite1h]);
   const reasoning = bound("reasoning", output);
   if (cacheRead === null || cacheWrite === null || reasoning === null) return null;
   return {
@@ -486,6 +511,7 @@ export function catalogRatesPerMillion(model: CatalogModel): CatalogRatesPerMill
     cacheRead: unitsToDecimal(cacheRead),
     cacheWrite: unitsToDecimal(cacheWrite),
     reasoning: unitsToDecimal(reasoning),
+    ...(audio > 0n ? { additional: unitsToDecimal(maxUnits([input, output, audio])) } : {}),
   };
 }
 

@@ -531,6 +531,7 @@ model ProviderModel {
   PricingVersions            ProviderPricingVersion[]
   AttemptEvents              PublicProviderAttemptEvent[]
   ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderModel")
+  PoolFallbackPreferences    PoolFallbackPreference[]
 
   @@unique([providerAccountId, upstreamModelId])
   @@unique([id, userId])
@@ -1288,8 +1289,10 @@ model PoolGrant {
   Owner                     User                       @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Grantee                   User                       @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ResponseStickinessRecords ResponseStickinessRecord[]
+  FallbackPreferences       PoolFallbackPreference[]
 
   @@unique([poolId, granteeUserId])
+  @@unique([id, poolId, granteeUserId])
   @@index([ownerUserId])
   @@index([granteeUserId])
   @@map("pool_grant")
@@ -1400,7 +1403,7 @@ model ResponseStickinessRecord {
   nativeSurface             String?
   upstreamResponseIdDigest  String?
   /// Version 3 provider bindings: the consented route that created the
-  /// binding ("pool-external"). Null provider bindings predate caller consent
+  /// binding ("pool-external" or "own-key"). Null provider bindings predate caller consent
   /// and are never honored.
   fallbackRoute             String?
   expiresAt                 DateTime?
@@ -1491,7 +1494,7 @@ model RelayRequest {
   /// Prompt-free public overflow correlation and commitment telemetry.
   publicEgress               Boolean                 @default(false)
   publicOverflowReason       String?
-  /// Prompt-free route that served the request: "local" or "pool-external".
+  /// Prompt-free route that served the request: "local", "pool-external", or "own-key".
   /// Null for requests that never reached a pool route decision.
   fallbackRoute              String?
   selectedPoolMemberTier     String?
@@ -1750,4 +1753,25 @@ model MediaAsset {
   @@index([expiresAt])
   @@index([userId, sha256])
   @@map("media_asset")
+}
+
+/// Grantee-only own-key choice. The exact grant tuple prevents substitution;
+/// deletion of the grant or provider model removes the preference atomically.
+model PoolFallbackPreference {
+  protocolAdaptationEnabled Boolean       @default(false)
+  id                        String        @id @default(cuid(2))
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @default(now()) @updatedAt
+  userId                    String
+  poolId                    String
+  poolGrantId               String
+  providerModelId           String
+  PoolGrant                 PoolGrant     @relation(fields: [poolGrantId, poolId, userId], references: [id, poolId, granteeUserId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel             ProviderModel @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([poolId, userId])
+  @@index([poolGrantId, poolId, userId])
+  @@index([providerModelId, userId])
+  @@index([userId])
+  @@map("pool_fallback_preference")
 }

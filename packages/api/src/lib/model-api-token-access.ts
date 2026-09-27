@@ -59,6 +59,8 @@ export type VisibleModelPoolTarget = {
   fallbackForGrantees: boolean;
   /** Configured external fallback (provider) members, regardless of health. */
   externalMemberCount: number;
+  externalEquivalentModel?: string | null;
+  ownKeyProviderModelId?: string | null;
   /**
    * Static availability for this viewer: deployment switch, pool fallback,
    * configured members, and owner or live grant with grantee coverage.
@@ -116,6 +118,7 @@ const modelPoolSelect = {
   protocolAdaptationEnabled: true,
   fallbackEnabled: true,
   fallbackForGrantees: true,
+  externalEquivalentModel: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
@@ -180,6 +183,7 @@ function serializeModelPool(
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
+    externalEquivalentModel: row.externalEquivalentModel,
     externalMemberCount: (row.PoolMembers ?? []).length,
     ...poolProviderDisclosure({
       isOwner: row.userId === viewerUserId,
@@ -227,15 +231,41 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
       select: {
         id: true,
         ModelPool: { select: modelPoolSelect },
+        FallbackPreferences: {
+          where: {
+            ProviderModel: {
+              enabled: true,
+              deletedAt: null,
+              ProviderAccount: {
+                enabled: true,
+                deletedAt: null,
+                CurrentCredential: { status: "ACTIVE" },
+              },
+            },
+          },
+          select: { providerModelId: true },
+        },
       },
     }),
   ]);
 
   const directModels = directModelRows.map(serializeDirectModel);
   const ownedPools = ownedPoolRows.map((row) => serializeModelPool(row, userId));
-  const grantedPools = grantedPoolRows.map((grant) =>
-    serializeModelPool(grant.ModelPool, userId, grant.id),
-  );
+  const grantedPools = grantedPoolRows.map((grant) => {
+    const pool = serializeModelPool(grant.ModelPool, userId, grant.id);
+    const ownKeyProviderModelId = grant.FallbackPreferences?.[0]?.providerModelId ?? null;
+    return {
+      ...pool,
+      ownKeyProviderModelId,
+      effectiveProviderEgress:
+        pool.effectiveProviderEgress ||
+        Boolean(
+          env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+            pool.externalEquivalentModel &&
+            ownKeyProviderModelId,
+        ),
+    };
+  });
 
   return {
     directModels,
@@ -370,7 +400,8 @@ export type ExternalSendConsentDenial =
   /** The pool is gone or its owner turned `fallbackEnabled` off. */
   | "POOL_PRIVATE"
   /** A grantee's request, and the owner turned `fallbackForGrantees` off. */
-  | "GRANTEE_NOT_COVERED";
+  | "GRANTEE_NOT_COVERED"
+  | "OWN_KEY_CONSENT_WITHDRAWN";
 
 /**
  * The identity an `:external` consent was minted for. `accessGrantId` is the
@@ -385,6 +416,7 @@ export type ExternalConsentIdentity = {
   poolId: string;
   ownerUserId: string;
   accessGrantId: string | null;
+  ownKeyProviderModelId?: string;
 };
 
 type ConsentReadClient = Pick<
@@ -554,11 +586,19 @@ export async function lockExternalSendConsent(
   }
   const pool = await tx.modelPool.findFirst({
     where: { id: input.poolId, userId: input.ownerUserId },
-    select: { fallbackEnabled: true, fallbackForGrantees: true },
+    select: { fallbackEnabled: true, fallbackForGrantees: true, externalEquivalentModel: true },
   });
   const rows = await readCallerConsentRows(tx, input);
   const callerDenial = callerConsentDenial(input, rows);
   if (callerDenial === "REQUESTER_NOT_VISIBLE") return callerDenial;
+  if (input.ownKeyProviderModelId) {
+    if (callerDenial) return callerDenial;
+    if (requesterIsOwner || !pool?.externalEquivalentModel) return "OWN_KEY_CONSENT_WITHDRAWN";
+    // Preference writers acquire pool -> grant before the preference row.
+    // Provider delete/disable takes account -> model before cascading to it;
+    // the send claim locks the preference only AFTER account/model.
+    return null;
+  }
   if (!pool?.fallbackEnabled) return "POOL_PRIVATE";
   if (!requesterIsOwner && !pool.fallbackForGrantees) return "GRANTEE_NOT_COVERED";
   return callerDenial;

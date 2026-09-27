@@ -102,6 +102,7 @@ const GRAPH_TABLES: Record<string, string> = {
   model_pool: "configuration",
   pool_member: "configuration",
   pool_grant: "configuration",
+  pool_fallback_preference: "configuration: at most one per exact pool grant",
   model_api_token: "configuration",
   model_api_token_allowlist_entry: "configuration",
   provider_account: "configuration",

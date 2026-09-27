@@ -1434,3 +1434,31 @@ describe("provider request path", () => {
     expect(joinProviderPath(baseUrl, path)).toBe(expected);
   });
 });
+
+it("normalizes OpenRouter cache-write, audio and recognized cost metadata without losing tokens", () => {
+  const usage = parseProviderUsage([
+    Buffer.from(
+      JSON.stringify({
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 10,
+          total_tokens: 30,
+          prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 4, audio_tokens: 5 },
+          completion_tokens_details: { reasoning_tokens: 2, audio_tokens: 1 },
+          cost: 0.01,
+          cost_details: { upstream_inference_cost: 0.01 },
+          is_byok: false,
+        },
+      }),
+    ),
+  ]);
+  expect(usage).toMatchObject({
+    inputTokens: 8n,
+    outputTokens: 7n,
+    cacheReadTokens: 3n,
+    cacheWriteTokens: 4n,
+    reasoningTokens: 2n,
+    additionalBillableTokens: 6n,
+    categoriesComplete: true,
+  });
+});

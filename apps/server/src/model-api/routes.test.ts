@@ -4642,6 +4642,103 @@ describe("model API routes", () => {
     };
   }
 
+  it.each(["success", "precommit", "forbidden", "stream-failure"] as const)(
+    "own-key %s uses requester DIRECT capacity, with only permitted precommit failover",
+    async (mode) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant",
+            fallbackEnabled: mode !== "forbidden" && mode !== "success",
+            fallbackForGrantees: mode !== "forbidden" && mode !== "success",
+            externalEquivalentModel: "vendor/model",
+            ownKeyProviderModelId: "own-model",
+          },
+        ],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const own = {
+        ...externalProviderTarget("own"),
+        poolMemberId: "",
+        ownKey: true,
+        providerModelId: "own-model",
+      };
+      const paid = externalProviderTarget("paid");
+      publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+        ownKey
+          ? listedExternalTargets([own], { fallbackForGrantees: true })
+          : {
+              ...listedExternalTargets([paid], { fallbackForGrantees: mode !== "forbidden" }),
+              enabled: mode !== "forbidden",
+            },
+      );
+      if (mode === "precommit" || mode === "forbidden") {
+        publicOverflow.dispatch.mockResolvedValueOnce({
+          dispatched: false,
+          reason: "PROVIDER_UNAVAILABLE",
+        });
+        if (mode === "precommit")
+          publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(paid));
+      } else {
+        const result = externalDispatchResult(own);
+        publicOverflow.dispatch.mockResolvedValueOnce(
+          mode === "stream-failure"
+            ? { ...result, terminal: Promise.resolve({ ok: false, responseBytes: 1 }) }
+            : result,
+        );
+      }
+      const capacity = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      await response.text();
+      expect(capacity.acquire).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          ownerId: "user-id",
+          sourceKind: "DIRECT",
+          poolId: undefined,
+          candidates: [
+            expect.objectContaining({
+              executionTargetId: own.executionTargetId,
+              poolMemberId: undefined,
+            }),
+          ],
+        }),
+        expect.anything(),
+      );
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        userId: "user-id",
+        ownKeyProviderModelId: "own-model",
+      });
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(mode === "precommit" ? 2 : 1);
+      if (mode === "precommit") {
+        expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+        expect(publicOverflow.dispatch.mock.calls[1]?.[0]).toMatchObject({
+          userId: "pool-owner-id",
+        });
+      } else if (mode !== "forbidden") expect(response.headers.get("x-wsmp-route")).toBe("own-key");
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            fallbackRoute: "own-key",
+            selectedDiscoveredModelId: null,
+            selectedPoolMemberId: null,
+          }),
+        }),
+      );
+    },
+  );
+
   // R1-A: a grantee's consent carries the exact grant the request was
   // resolved under, which the send claim requires to still exist.
   it("binds a grantee's :external consent to the grant the request was resolved under", async () => {
@@ -4701,7 +4798,7 @@ describe("model API routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
     expect(response.headers.get("x-wsmp-fallback-reason")).toBe("no_local_member");
     expect(response.headers.get("x-wsmp-served-model")).toBe("provider-upstream");
     expect(response.headers.get("access-control-expose-headers")).toContain("x-wsmp-route");
@@ -6959,7 +7056,7 @@ describe("model API routes", () => {
       body: JSON.stringify({ model: EXTERNAL_MODEL_ID, input: "hello", store: true }),
     });
     expect(create.status).toBe(200);
-    expect(create.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(create.headers.get("x-wsmp-route")).toBe("pool-fallback");
     await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
     const binding = db.responseStickinessRecord.upsert.mock.calls.at(-1)?.[0].create;
@@ -7474,6 +7571,77 @@ describe("model API routes", () => {
       ...overrides,
     };
   }
+
+  it.each([
+    ["CALLER_CONSENT_WITHDRAWN", 403],
+    ["OWN_KEY_CONSENT_WITHDRAWN", 403],
+    ["BOUND_TARGET_INVALID", 404],
+    ["REQUESTER_NOT_VISIBLE", 404],
+    ["PROVIDER_UNAVAILABLE", 503],
+  ] as const)(
+    "own-key bound follow-up preserves route and maps %s to %s",
+    async (reason, status) => {
+      const ownPool = {
+        ...externalPoolTarget,
+        ownerUserId: "pool-owner-id",
+        accessGrantId: "grant",
+        externalEquivalentModel: "vendor/model",
+        ownKeyProviderModelId: "provider-model",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+      };
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [ownPool],
+      });
+      externalConsent.poolIds = [ownPool.id];
+      db.responseStickinessRecord.findUnique.mockResolvedValue(
+        consentedProviderBinding({
+          fallbackRoute: "own-key",
+          poolGrantId: "grant",
+          PoolGrant: {
+            id: "grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      const target = {
+        ...externalProviderTarget(""),
+        ownKey: true,
+        executionTargetId: "provider-target",
+        providerModelId: "provider-model",
+        upstreamModelId: "gpt-response",
+        nativeSurfaces: ["openai-responses"] as PublicProviderTarget["nativeSurfaces"],
+      };
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([target], { fallbackForGrantees: true }),
+      );
+      publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason });
+      const capacity = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), capacity).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: EXTERNAL_MODEL_ID,
+          previous_response_id: "resp_provider",
+          input: "next",
+        }),
+      });
+      expect(response.status).toBe(status);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        userId: "user-id",
+        ownKeyProviderModelId: "provider-model",
+        retrySafe: false,
+      });
+      expect(capacity.acquire).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerId: "user-id", sourceKind: "DIRECT", poolId: undefined }),
+        expect.anything(),
+      );
+    },
+  );
 
   it("requires :external to continue an externally served response", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({

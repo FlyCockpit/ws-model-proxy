@@ -299,13 +299,51 @@ describe("client-facing errors and headers", () => {
         status: 201,
         headers: { "access-control-expose-headers": "x-wsmp-transform" },
       }),
-      { "x-wsmp-route": "pool-external", "x-wsmp-served-model": "gpt-upstream" },
+      { "x-wsmp-route": "pool-fallback", "x-wsmp-served-model": "gpt-upstream" },
     );
     expect(response.status).toBe(201);
-    expect(response.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
     expect(response.headers.get("access-control-expose-headers")).toBe(
       "x-wsmp-transform, x-wsmp-route, x-wsmp-served-model",
     );
     await expect(response.text()).resolves.toBe("body");
   });
+});
+
+describe("own-key initial E0", () => {
+  const input = () => ({
+    requested: true,
+    requester: { userId: "grantee", source: "API_TOKEN" as const, modelApiTokenId: "token" },
+    tokenPermitsPool: true,
+    pool: {
+      ...pool,
+      accessGrantId: "exact-grant",
+      externalEquivalentModel: "vendor/model",
+      ownKeyProviderModelId: "own-model",
+      fallbackEnabled: false,
+      fallbackForGrantees: false,
+    },
+  });
+  it("permits a grantee own key independently of owner-paid flags", () => {
+    expect(evaluateExternalEgress(input())).toMatchObject({
+      granted: true,
+      consent: { ownKeyProviderModelId: "own-model", accessGrantId: "exact-grant" },
+    });
+  });
+  it.each(["suffix", "switch", "token", "grant", "equivalent", "preference", "owner", "mcp"])(
+    "refuses when %s is absent",
+    (condition) => {
+      const request = input();
+      if (condition === "suffix") request.requested = false;
+      if (condition === "token") request.tokenPermitsPool = false;
+      if (condition === "grant") Object.assign(request.pool, { accessGrantId: null });
+      if (condition === "equivalent")
+        Object.assign(request.pool, { externalEquivalentModel: null });
+      if (condition === "preference") Object.assign(request.pool, { ownKeyProviderModelId: null });
+      if (condition === "owner") request.requester.userId = pool.ownerUserId;
+      if (condition === "mcp") Object.assign(request.requester, { source: "MCP" });
+      const result = withSwitch(condition !== "switch", () => evaluateExternalEgress(request));
+      expect(result.granted).toBe(false);
+    },
+  );
 });

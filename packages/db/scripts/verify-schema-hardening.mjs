@@ -18,6 +18,8 @@ const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = a
   readFile(new URL("./apply-schema-hardening.mjs", import.meta.url), "utf8"),
 ]);
 const requiredFragments = [
+  "pool_fallback_preference_grantee",
+  "own-key preference requires the exact non-owner grant",
   "model_pool_recommended_surface_override_check",
   'UPDATE model_pool\n   SET "recommendedSurfaceOverride" = NULL',
   "execution_target_kind_source_xor_check",

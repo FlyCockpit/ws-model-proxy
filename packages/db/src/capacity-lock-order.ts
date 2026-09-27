@@ -128,10 +128,17 @@
  *   C3  `model_api_token` FOR SHARE (the requester's token, if any);
  *   C4  `model_api_token_allowlist_entry` FOR SHARE (that token's entry for
  *       the pool);
- *   C5  `provider_account` FOR UPDATE, then `provider_credential` FOR UPDATE
+ *   C5  `provider_account` FOR UPDATE, then (own-key only) `provider_model`
+ *       FOR SHARE, then `provider_credential` FOR UPDATE
  *       (the order every provider lifecycle writer uses).
  *
- * After C5 (the last statement that can wait) it re-reads the requester's
+ *   C6  own-key only: `pool_fallback_preference` FOR SHARE. Preference writers
+ *       take pool -> grant -> account -> model -> preference, and deletes
+ *       cascade from grant/model into preference. No preference holder waits
+ *       on any of those parents. Clear takes only the preference row.
+ *       The preference composite FKs are key-shares on already held parents.
+ *
+ * After C6 (C5 for pool fallback; the last statement that can wait) it re-reads the requester's
  * token and `user` row WITHOUT a lock in one SQL statement that evaluates
  * token expiry, ban and deletion mark against statement_timestamp()
  * (`recheckExternalSendRequesterValidity`). The snapshot and its clock must

@@ -377,7 +377,8 @@
     "terminals": "Terminals",
     "openTerminals": "Open terminals",
     "showTerminals": "Show open terminals",
-    "hideTerminals": "Hide open terminals"
+    "hideTerminals": "Hide open terminals",
+    "providers": "Providers"
   },
   "notices": {
     "dismiss": "Dismiss"
@@ -1465,5 +1466,30 @@
       "failed": "Couldn't send the review. Try again.",
       "truncated": "The command printed {{bytes}} bytes; only the start and the end are kept."
     }
+  },
+  "byok": {
+    "title": "Providers",
+    "description": "Manage your provider keys and choose your own fallback model for pools shared with you. Local capacity is always tried first.",
+    "keys": "Provider keys",
+    "pools": "Pools",
+    "media": "Your own provider receives the payload after the pool’s media transformer runs. Your key is tried first when local service is unavailable; if it fails before the response starts, the pool’s fallback can be tried when the owner allows it. Your provider charges you.",
+    "disabled": "External providers are disabled. You can view and remove choices and revoke or delete keys.",
+    "empty": "No pools have been shared with you yet.",
+    "ownerMissing": "The owner has not declared an equivalent model. Own-key routing is unavailable.",
+    "unset": "Using the pool’s fallback when allowed. Choose a model to use your own key first.",
+    "ready": "Own key ready: {{model}}",
+    "unavailable": "Your chosen provider is unavailable. Check that its account, model and key are enabled.",
+    "tokenMissing": "No active API token allows external access to this pool. Enable Allow external providers and include this pool on allowlist tokens.",
+    "clear": "Clear own-key choice",
+    "account": "Your provider account",
+    "chooseAccount": "Choose an enabled account",
+    "existing": "Use an existing model",
+    "chooseModel": "Choose an enabled model",
+    "nonToken": "Providers may charge separately for web search, images and audio services. Token prices and token-based budgets do not bound those charges.",
+    "saving": "Saving…",
+    "importUse": "Import and use this model",
+    "failed": "Could not save your own-key choice. Try again.",
+    "aggregate": "Requests served with grantees’ own keys: {{count}}",
+    "adaptation": "Allow protocol adaptation for my own model"
   }
 }
