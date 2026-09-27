@@ -231,3 +231,13 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(esDashboard).not.toHaveProperty("description");
   });
 });
+
+it("keeps external consent keys in sync and removes obsolete pool notices", () => {
+  for (const key of ["pools", "tokens", "providers", "notices"] as const) {
+    expect(keyTree(esDashboard[key]).sort()).toEqual(keyTree(enDashboard[key]).sort());
+  }
+  const keys = keyTree(enDashboard).join("\n");
+  expect(keys).not.toMatch(
+    /publicEgressAcknowledged|granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
+  );
+});

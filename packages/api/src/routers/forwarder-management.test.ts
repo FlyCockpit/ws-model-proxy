@@ -23,10 +23,6 @@ const testEnv = vi.hoisted(() => ({
 const mailerState = vi.hoisted(() => ({
   configured: false,
   sendEmail: vi.fn(async () => undefined),
-  renderPoolExternalProviderNotice: vi.fn(() => ({
-    subject: "Pool may send requests to an external provider",
-    html: "<p>external provider</p>",
-  })),
 }));
 
 // The ordered-delete locking runs against real PostgreSQL
@@ -79,7 +75,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 vi.mock("@ws-model-proxy/mailer", () => ({
   isEmailConfigured: () => mailerState.configured,
   sendEmail: mailerState.sendEmail,
-  renderPoolExternalProviderNotice: mailerState.renderPoolExternalProviderNotice,
 }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -471,7 +466,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.create.mockResolvedValue({ id: "pool-id" });
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
 
-    await client().createGuardedModelPool({
+    await httpClient().createGuardedModelPool({
+      ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
       slug: "default-context",
       name: "Default context",
       localModelIds: ["local-id"],
@@ -496,6 +492,9 @@ describe("forwarderManagementRouter", () => {
         }),
       }),
     );
+    expect(
+      JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
+    ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
   });
 
   it("defaults cache-affinity routing on for new guarded pools while honoring an explicit opt-out", async () => {
@@ -2235,7 +2234,7 @@ describe("forwarderManagementRouter", () => {
     ).resolves.toMatchObject({ fallbackEnabled: true });
   });
 
-  describe("grantee privacy confirmation", () => {
+  describe("caller-controlled external fallback", () => {
     const grantee = {
       granteeUserId: "grantee-id",
       Grantee: { email: "ada@example.com", name: "Ada", locale: "en-US" },
@@ -2263,72 +2262,32 @@ describe("forwarderManagementRouter", () => {
       );
     }
 
-    it("names grantees and does not apply a private-to-external change without confirmation", async () => {
-      privateSharedPool();
-
-      await expect(
-        client().updateModelPool({
-          id: "pool-id",
-          fallbackEnabled: true,
-        }),
-      ).rejects.toMatchObject({
-        code: "CONFLICT",
-        message: expect.stringContaining("ada@example.com"),
-        data: {
-          reason: "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED",
-          poolName: "Shared",
-          grantees: [{ email: "ada@example.com", name: "Ada" }],
-        },
-      });
-      expect(db.modelPool.update).not.toHaveBeenCalled();
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
-      expect(mailerState.sendEmail).not.toHaveBeenCalled();
-    });
-
-    it("applies the change and records notices when the owner confirms", async () => {
-      privateSharedPool();
-
-      await expect(
-        client().updateModelPool({
-          id: "pool-id",
-          fallbackEnabled: true,
-          confirmGranteePrivacyChange: true,
-        }),
-      ).resolves.toMatchObject({ fallbackEnabled: true });
-      expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
-        data: [
-          {
-            userId: "grantee-id",
-            kind: "POOL_EXTERNAL_PROVIDER",
-            poolId: "pool-id",
-            poolName: "Shared",
-          },
-        ],
-      });
-      expect(mailerState.sendEmail).not.toHaveBeenCalled();
-    });
-
-    it("emails grantees only after the notice is stored when SMTP is configured", async () => {
+    it("enables shared fallback without notices or email, including with SMTP configured", async () => {
       privateSharedPool();
       mailerState.configured = true;
+      await expect(
+        client().updateModelPool({ id: "pool-id", fallbackEnabled: true }),
+      ).resolves.toMatchObject({ fallbackEnabled: true });
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
+      expect(mailerState.sendEmail).not.toHaveBeenCalled();
+      expect(db.poolGrant.findMany).not.toHaveBeenCalled();
+    });
 
-      await client().updateModelPool({
+    it("ignores obsolete confirmation inputs from old clients", async () => {
+      privateSharedPool();
+      const oldInput = {
         id: "pool-id",
         fallbackEnabled: true,
-        confirmGranteePrivacyChange: true,
+        publicEgressAcknowledged: false,
+        confirmGranteePrivacyChange: false,
+      };
+      await expect(client().updateModelPool(oldInput)).resolves.toMatchObject({
+        fallbackEnabled: true,
       });
-
-      expect(db.dashboardNotice.createMany).toHaveBeenCalled();
-      expect(mailerState.sendEmail).toHaveBeenCalledWith(
-        expect.objectContaining({
-          to: "ada@example.com",
-          subject: "Pool may send requests to an external provider",
-        }),
-      );
-      expect(db.dashboardNotice.createMany.mock.invocationCallOrder[0]).toBeLessThan(
-        mailerState.sendEmail.mock.invocationCallOrder[0] ?? 0,
-      );
-      expect(JSON.stringify(db.dashboardNotice.createMany.mock.calls)).not.toContain("sk-");
+      const write = db.modelPool.update.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+      expect(write.data).not.toHaveProperty("publicEgressAcknowledged");
+      expect(write.data).not.toHaveProperty("confirmGranteePrivacyChange");
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
     it("does not require confirmation when the shared pool has no grantees", async () => {
@@ -2364,7 +2323,7 @@ describe("forwarderManagementRouter", () => {
       expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
-    it("requires confirmation before the first external member of an enabled shared pool", async () => {
+    it("attaches the first external member of an enabled shared pool without notices", async () => {
       db.modelPool.findFirst.mockResolvedValue({
         id: "pool-id",
         name: "Shared",
@@ -2388,40 +2347,22 @@ describe("forwarderManagementRouter", () => {
       db.poolMember.create.mockResolvedValue({ id: "external-provider-member" });
 
       await expect(
-        client().addProviderPoolMember({
+        httpClient().addProviderPoolMember({
+          ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
           poolId: "pool-id",
           providerModelId: "provider-model",
           tier: "PUBLIC_OVERFLOW",
           publicOrder: 0,
-        }),
-      ).rejects.toMatchObject({
-        code: "CONFLICT",
-        message: expect.stringContaining("ada@example.com"),
-      });
-      expect(db.poolMember.create).not.toHaveBeenCalled();
-      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
-
-      await expect(
-        client().addProviderPoolMember({
-          poolId: "pool-id",
-          providerModelId: "provider-model",
-          tier: "PUBLIC_OVERFLOW",
-          publicOrder: 0,
-          confirmGranteePrivacyChange: true,
         }),
       ).resolves.toEqual({
         id: "external-provider-member",
         executionTargetId: "provider-target",
       });
-      expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
-        data: [
-          expect.objectContaining({
-            userId: "grantee-id",
-            poolName: "Shared",
-            kind: "POOL_EXTERNAL_PROVIDER",
-          }),
-        ],
-      });
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
+      expect(mailerState.sendEmail).not.toHaveBeenCalled();
+      expect(
+        JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
+      ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
     });
 
     it("never promotes a provider member to PRIMARY", async () => {
@@ -2467,7 +2408,6 @@ describe("forwarderManagementRouter", () => {
         client().updatePoolMember({
           id: "member-id",
           tier: "PRIMARY",
-          confirmGranteePrivacyChange: true,
         }),
       ).rejects.toMatchObject({ code: "BAD_REQUEST" });
       expect(db.poolMember.update).not.toHaveBeenCalled();
@@ -3355,7 +3295,8 @@ describe("forwarderManagementRouter", () => {
     });
 
     await expect(
-      client().updatePoolMember({
+      httpClient().updatePoolMember({
+        ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
         id: "provider-primary-member",
         capacityPriority: 24,
         capacityConcurrencyMode: "LIMITED",
@@ -3369,6 +3310,9 @@ describe("forwarderManagementRouter", () => {
         capacityContextMargin: 1_024,
       }),
     ).resolves.toMatchObject({ id: "provider-primary-member", tier: "PUBLIC_OVERFLOW" });
+    expect(JSON.stringify(db.poolMember.update.mock.calls)).not.toMatch(
+      /publicEgressAcknowledged|confirmGranteePrivacyChange/,
+    );
 
     expect(db.poolMember.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -4030,18 +3974,6 @@ describe("forwarderManagementRouter", () => {
       protocol: "openai-compatible",
       surfaces: {
         openaiChatCompletions: {
-          source: "provider",
-          confidence: "exact",
-          supported: true,
-          streaming: true,
-        },
-      },
-    };
-    const responsesNativeCapabilities = {
-      version: 3,
-      protocol: "openai-compatible",
-      surfaces: {
-        openaiResponses: {
           source: "provider",
           confidence: "exact",
           supported: true,
@@ -5155,4 +5087,98 @@ describe("setCliDeviceFeatureGrants", () => {
       available: false,
     });
   });
+});
+
+function disclosurePool() {
+  return {
+    id: "disclosure-pool",
+    userId: "owner-private",
+    slug: "shared",
+    name: "Shared",
+    description: null,
+    fallbackEnabled: true,
+    fallbackForGrantees: true,
+    User: { slug: "owner" },
+    PoolGrants: [],
+    PoolMembers: [
+      {
+        id: "private-member",
+        tier: "PUBLIC_OVERFLOW",
+        healthStatus: "UNHEALTHY",
+        ExecutionTarget: {
+          id: "private-target",
+          providerModelId: "private-provider-model",
+          ProviderModel: {
+            id: "private-provider-model",
+            upstreamModelId: "private-upstream",
+            PricingVersions: [],
+            ProviderAccount: {
+              id: "private-account-id",
+              label: "Owner private billing label",
+              providerType: "openrouter",
+              baseUrl: "https://owner-private.example.test",
+              credentialMetadata: "private-credential",
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
+describe("provider disclosure at the serialized API boundary", () => {
+  it.each([
+    ["owner", true, true, true, true],
+    ["eligible grantee", false, true, true, true],
+    ["grantee coverage off", false, true, true, false],
+    ["deployment off", false, false, true, true],
+    ["fallback off", false, true, false, true],
+  ] as const)(
+    "visibleModels: %s",
+    async (_case, owner, enabled, fallbackEnabled, fallbackForGrantees) => {
+      const { env } = await import("@ws-model-proxy/env/server");
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+      const row = {
+        ...disclosurePool(),
+        fallbackEnabled,
+        fallbackForGrantees,
+        userId: owner ? "user-id" : "owner-private",
+      };
+      db.appSetting.findUnique.mockResolvedValue(null);
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockImplementation(async (args: { where?: { userId?: string } }) =>
+        args.where?.userId ? (owner ? [row] : []) : [row],
+      );
+      db.poolGrant.findMany.mockResolvedValue(owner ? [] : [{ id: "live-grant", ModelPool: row }]);
+      db.poolMember.findMany.mockResolvedValue([]);
+      try {
+        const result = await httpClient().visibleModels();
+        const wire = JSON.stringify(result);
+        const pool = result.modelPools[0];
+        const eligible = enabled && fallbackEnabled && (owner || fallbackForGrantees);
+        expect(pool?.providerAccountLabels).toEqual(
+          owner && fallbackEnabled ? ["Owner private billing label"] : [],
+        );
+        expect(pool).toHaveProperty("providerTypes", eligible ? ["openrouter"] : []);
+        if (!owner) {
+          expect(wire).not.toMatch(
+            /Owner private billing label|private-account-id|owner-private\.example|private-credential|private-provider-model|private-upstream|private-target|private-member/,
+          );
+          if (!eligible) expect(wire).not.toContain("openrouter");
+        }
+      } finally {
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+      }
+    },
+  );
+});
+
+it("omits a shared pool entirely after its grant is revoked", async () => {
+  db.appSetting.findUnique.mockResolvedValue(null);
+  db.discoveredModel.findMany.mockResolvedValue([]);
+  db.modelPool.findMany.mockResolvedValue([]);
+  db.poolGrant.findMany.mockResolvedValue([]);
+  const result = await httpClient().visibleModels();
+  expect(result.modelPools).toEqual([]);
+  expect(JSON.stringify(result)).not.toMatch(/openrouter|Owner private billing label/);
 });

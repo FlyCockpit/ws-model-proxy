@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import { useOverviewRange } from "@/hooks/use-overview-range";
@@ -420,7 +421,14 @@ function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth
   );
 }
 
-type TrafficRow = { key: string; title: string; subtitle: string | null; stats: OverviewStats };
+type TrafficRow = {
+  external?: boolean;
+  providers?: readonly string[];
+  key: string;
+  title: string;
+  subtitle: string | null;
+  stats: OverviewStats;
+};
 
 function DirectTable({ metrics, t }: { metrics: OverviewMetrics; t: DashboardT }) {
   return (
@@ -454,6 +462,8 @@ function SharedPoolsTable({ metrics, t }: { metrics: OverviewMetrics; t: Dashboa
       firstColumn={t("overview.shared.columns.pool")}
       rows={metrics.sharedPools.map((row) => ({
         key: row.poolId,
+        external: row.effectiveProviderEgress,
+        providers: row.providerTypes,
         title: row.available && row.name ? row.name : t("overview.shared.unavailable"),
         subtitle: row.ownerSlug ? t("overview.shared.owner", { owner: row.ownerSlug }) : null,
         stats: row.current,
@@ -516,7 +526,10 @@ function TrafficTable({
             {rows.map((row) => (
               <tr key={row.key} className="border-b last:border-0">
                 <td className="max-w-64 py-2 pr-3">
-                  <div className="truncate font-medium">{row.title}</div>
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="truncate font-medium">{row.title}</span>
+                    {row.external ? <PoolPrivacyBadge external providers={row.providers} /> : null}
+                  </div>
                   {row.subtitle ? (
                     <div className="truncate text-xs text-muted-foreground">{row.subtitle}</div>
                   ) : null}

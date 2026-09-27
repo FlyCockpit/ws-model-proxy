@@ -281,6 +281,7 @@ const poolTarget: VisibleModelPoolTarget = {
   externalMemberCount: 0,
   effectiveProviderEgress: false,
   providerAccountLabels: [],
+  providerTypes: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };

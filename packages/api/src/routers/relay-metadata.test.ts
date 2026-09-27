@@ -119,6 +119,7 @@ describe("relayMetadataRouter", () => {
         selectedDiscoveredModelId: "model-id",
         requestedExecutionTargetId: "target-id",
         selectedExecutionTargetId: "target-id",
+        RequestedExecutionTarget: { userId: "user-id" },
         status: "SUCCEEDED",
         startedAt: new Date("2026-01-01T00:00:00.000Z"),
         completedAt: new Date("2026-01-01T00:00:02.000Z"),
@@ -384,4 +385,57 @@ describe("relayMetadataRouter", () => {
       },
     );
   });
+});
+
+describe("shared request history provider identity", () => {
+  it.each(["owner", "grantee", "deleted-pool"])(
+    "preserves usage but scopes resource identity for %s",
+    async (viewer) => {
+      db.appSetting.findUnique.mockResolvedValue(null);
+      db.relayRequest.findMany.mockResolvedValue([
+        {
+          id: "my-request",
+          requestedModelPoolId: viewer === "deleted-pool" ? null : "shared-pool",
+          RequestedModelPool:
+            viewer === "deleted-pool"
+              ? null
+              : { userId: viewer === "owner" ? "user-id" : "someone-else" },
+          selectedExecutionTargetId: "private-provider-target",
+          selectedPoolMemberId: "private-provider-member",
+          providerAttemptId: "private-provider-attempt",
+          providerFencingToken: 7n,
+          admissionFencingToken: 7n,
+          admissionCapacityId: "private-provider-capacity",
+          publicEgress: true,
+          status: "SUCCEEDED",
+          promptTokens: 3,
+          requestBytes: null,
+          responseBytes: null,
+          auxiliaryRequestBytes: 0n,
+          auxiliaryResponseBytes: 0n,
+          ExecutionEvents: [
+            {
+              id: "my-event",
+              executionTargetId: "private-provider-target",
+              poolMemberId: "private-provider-member",
+              attemptId: "private-provider-attempt",
+              admissionFencingToken: 7n,
+            },
+          ],
+          providerAccountId: "private-account",
+          providerModelId: "private-model",
+          ProviderAccount: { label: "Private account label", providerType: "openrouter" },
+        },
+      ]);
+      const result = await createRouterClient(relayMetadataRouter, {
+        context: buildContext(),
+      }).listOwn();
+      expect(result[0]).toMatchObject({ id: "my-request", promptTokens: 3, publicEgress: true });
+      const wire = JSON.stringify(result);
+      expect(wire).not.toMatch(/private-account|private-model|Private account label|openrouter/);
+      if (viewer === "owner")
+        expect(result[0]?.selectedExecutionTargetId).toBe("private-provider-target");
+      else expect(wire).not.toMatch(/private-provider/);
+    },
+  );
 });

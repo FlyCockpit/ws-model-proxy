@@ -10,6 +10,9 @@ vi.mock("@ws-model-proxy/db", async () => {
   const actual = await vi.importActual<typeof import("@ws-model-proxy/db")>("@ws-model-proxy/db");
   return { default: mockDeep(), Prisma: actual.Prisma };
 });
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true },
+}));
 vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://overview-test", NODE_ENV: "test" },
 }));
@@ -85,6 +88,7 @@ function pool() {
     id: "pool-1",
     name: "Coding",
     slug: "coding",
+    fallbackEnabled: false,
     PoolMembers: [
       {
         id: "member-a",
@@ -329,6 +333,29 @@ describe("overviewRouter.metrics", () => {
     }
   });
 
+  it("shows static external availability on owner overview cards despite unhealthy members", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        ...pool(),
+        fallbackEnabled: true,
+        PoolMembers: [
+          {
+            id: "external",
+            tier: "PUBLIC_OVERFLOW",
+            healthStatus: "UNHEALTHY",
+            routingStatus: "DISABLED",
+            ExecutionTarget: {
+              kind: "PROVIDER_MODEL",
+              ProviderModel: { upstreamModelId: "model", ProviderAccount: { label: "Provider" } },
+            },
+          },
+        ],
+      },
+    ]);
+    const result = await client().metrics({ range: "1h" });
+    expect(result.pools[0]?.effectiveProviderEgress).toBe(true);
+    expect(result.pools[0]?.members[0]?.location).toBe("Provider");
+  });
   it("reports the caller's own usage of pools shared with them, separately from owned totals", async () => {
     db.$queryRaw
       .mockResolvedValueOnce([]) // owned aggregates
@@ -353,7 +380,20 @@ describe("overviewRouter.metrics", () => {
     db.poolGrant.findMany.mockResolvedValue([
       {
         poolId: "shared-pool",
-        ModelPool: { name: "Team GPUs", slug: "team-gpus" },
+        ModelPool: {
+          name: "Team GPUs",
+          slug: "team-gpus",
+          fallbackEnabled: true,
+          fallbackForGrantees: true,
+          PoolMembers: [
+            {
+              tier: "PUBLIC_OVERFLOW",
+              ExecutionTarget: {
+                ProviderModel: { ProviderAccount: { providerType: "openrouter" } },
+              },
+            },
+          ],
+        },
         Owner: { slug: "alice" },
       },
     ]);
@@ -367,16 +407,97 @@ describe("overviewRouter.metrics", () => {
       expect.objectContaining({
         poolId: "shared-pool",
         available: true,
+        effectiveProviderEgress: true,
         name: "Team GPUs",
         ownerSlug: "alice",
         current: expect.objectContaining({ requests: 7, errors: 1 }),
       }),
-      expect.objectContaining({ poolId: "revoked-pool", available: false, name: null }),
+      expect.objectContaining({
+        poolId: "revoked-pool",
+        available: false,
+        effectiveProviderEgress: false,
+        name: null,
+      }),
     ]);
     // Shared-pool usage is not traffic you serve.
     expect(result.totals.current.requests).toBe(0);
     expect(result.pools).toEqual([]);
   });
+
+  it.each([
+    [true, true, true, true],
+    [false, true, true, true],
+    [true, false, true, true],
+    [true, true, false, true],
+    [true, true, true, false],
+  ])(
+    "shared disclosure: switch %s fallback %s coverage %s grant %s",
+    async (enabled, fallbackEnabled, fallbackForGrantees, liveGrant) => {
+      const { env } = await import("@ws-model-proxy/env/server");
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+      db.$queryRaw
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          aggregate({
+            poolId: "shared",
+            requests: 1n,
+            poolMemberId: "private-member",
+            executionTargetId: "private-target",
+          }),
+        ])
+        .mockResolvedValueOnce([]);
+      db.poolGrant.findMany.mockResolvedValue(
+        liveGrant
+          ? [
+              {
+                poolId: "shared",
+                Owner: { slug: "owner" },
+                ModelPool: {
+                  name: "Shared",
+                  slug: "shared",
+                  fallbackEnabled,
+                  fallbackForGrantees,
+                  _count: { PoolMembers: 1 },
+                  PoolMembers: [
+                    {
+                      tier: "PUBLIC_OVERFLOW",
+                      ExecutionTarget: {
+                        ProviderModel: {
+                          ProviderAccount: {
+                            providerType: "openrouter",
+                            label: "Private owner label",
+                            id: "private-account",
+                            baseUrl: "https://private.example.test",
+                            credentialMetadata: "private-credential",
+                          },
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            ]
+          : [],
+      );
+      try {
+        const result = await client().metrics({ range: "1h" });
+        const eligible = enabled && fallbackEnabled && fallbackForGrantees && liveGrant;
+        expect(result.sharedPools[0]).toHaveProperty(
+          "providerTypes",
+          eligible ? ["openrouter"] : [],
+        );
+        const wire = JSON.stringify(result);
+        expect(wire).not.toMatch(
+          /Private owner label|private-account|private\.example|private-credential|private-member|private-target/,
+        );
+        if (!eligible) expect(wire).not.toContain("openrouter");
+      } finally {
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+      }
+    },
+  );
 
   it("skips shared-pool queries when filtering to one owned pool", async () => {
     db.modelPool.findMany.mockResolvedValue([pool()]);

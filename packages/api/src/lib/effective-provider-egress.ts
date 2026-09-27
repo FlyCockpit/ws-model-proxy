@@ -1,3 +1,5 @@
+import { providerProtocolForType } from "./provider-protocol";
+
 /**
  * External fallback members: PUBLIC_OVERFLOW members whose execution target is
  * a provider model. PRIMARY members are always local (enforced by the schema
@@ -23,27 +25,45 @@ export function effectiveProviderEgress(input: {
   return input.fallbackEnabled && input.externalMemberCount > 0;
 }
 
-/**
- * Account labels that can receive `:external` pool traffic. Only external
- * fallback members count, and only while fallback is on. Labels are display
- * names, never credentials.
- */
-export function egressProviderAccountLabels(input: {
+/** Viewer-scoped display metadata. Account labels are owner-private. */
+export function poolProviderDisclosure(input: {
+  isOwner: boolean;
+  hasLiveGrant: boolean;
+  providerEgressEnabled: boolean;
   fallbackEnabled: boolean;
-  members: ReadonlyArray<{ tier: string; accountLabel?: string | null }>;
-}): string[] {
-  if (!input.fallbackEnabled) return [];
-  const labels = new Set<string>();
-  for (const member of input.members) {
-    const label = member.accountLabel;
-    if (!label || member.tier !== "PUBLIC_OVERFLOW") continue;
-    labels.add(label);
-  }
-  return [...labels].sort((left, right) => left.localeCompare(right));
+  fallbackForGrantees: boolean;
+  members: ReadonlyArray<{
+    tier: string;
+    accountLabel?: string | null;
+    providerType?: string | null;
+  }>;
+}) {
+  const members = input.members.filter((member) => member.tier === "PUBLIC_OVERFLOW");
+  const eligible =
+    input.providerEgressEnabled &&
+    (input.isOwner || (input.hasLiveGrant && input.fallbackForGrantees)) &&
+    effectiveProviderEgress({
+      fallbackEnabled: input.fallbackEnabled,
+      externalMemberCount: members.length,
+    });
+  const sorted = (values: string[]) => [...new Set(values)].sort((a, b) => a.localeCompare(b));
+  return {
+    effectiveProviderEgress: eligible,
+    providerAccountLabels:
+      input.isOwner && input.fallbackEnabled
+        ? sorted(members.flatMap((member) => (member.accountLabel ? [member.accountLabel] : [])))
+        : [],
+    // Never pass through arbitrary free-text provider types from stored rows.
+    providerTypes: eligible
+      ? sorted(
+          members.flatMap((member) => {
+            const type = member.providerType?.trim().toLowerCase();
+            return type && providerProtocolForType(type) ? [type] : [];
+          }),
+        )
+      : [],
+  };
 }
-
-/** Owner must resubmit with the confirm flag before a shared pool becomes non-private. */
-export const GRANTEE_PRIVACY_CONFIRMATION_REQUIRED = "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED";
 
 export const grantPoolAccessServerMessages = {
   userNotFound: "User not found.",

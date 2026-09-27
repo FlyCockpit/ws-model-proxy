@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   models: [] as Array<Record<string, unknown>>,
   pools: [] as Array<Record<string, unknown>>,
+  providerEgressEnabled: true,
   isDesktop: false,
   lang: "en-US",
 }));
@@ -40,7 +41,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 });
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, options?: { providers?: string }) =>
+      options?.providers ? `${key}: ${options.providers}` : key,
+  }),
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -62,8 +66,16 @@ vi.mock("@/utils/orpc", () => ({
       visibleModels: {
         queryOptions: () => ({
           queryKey: ["visibleModels"],
-          initialData: { directModels: state.models, modelPools: state.pools },
-          queryFn: async () => ({ directModels: state.models, modelPools: state.pools }),
+          initialData: {
+            providerEgressEnabled: state.providerEgressEnabled,
+            directModels: state.models,
+            modelPools: state.pools,
+          },
+          queryFn: async () => ({
+            providerEgressEnabled: state.providerEgressEnabled,
+            directModels: state.models,
+            modelPools: state.pools,
+          }),
         }),
       },
     },
@@ -191,6 +203,7 @@ afterEach(() => {
   cleanup();
   state.models = [];
   state.pools = [];
+  state.providerEgressEnabled = true;
   state.isDesktop = false;
   state.lang = "en-US";
   vi.unstubAllGlobals();
@@ -213,25 +226,44 @@ describe("Chat Test quick wins", () => {
     expect(screen.getByText("dashboard:chatTest.modelKinds.pool")).toBeTruthy();
   });
 
-  it("shows the external-provider badge for a non-private pool and not for a direct model", async () => {
+  it("shows the external-provider badge for a pool with external fallback and not for a direct model", async () => {
     state.models = [directModel];
-    state.pools = [{ ...poolModel, effectiveProviderEgress: true }];
+    state.pools = [
+      {
+        ...poolModel,
+        effectiveProviderEgress: true,
+        providerAccountLabels: [],
+        providerTypes: ["openrouter"],
+      },
+    ];
     await act(async () => {
       mount();
     });
 
     expect(screen.getAllByText("dashboard:pools.privacyBadge.external").length).toBeGreaterThan(0);
     expect(screen.queryByText("dashboard:pools.privacyBadge.private")).toBeNull();
+    expect(screen.getByText("pool/demo:external")).toBeTruthy();
+    expect(
+      screen.getAllByTitle("dashboard:pools.privacyBadge.hint: openrouter").length,
+    ).toBeGreaterThan(0);
   });
 
-  it("shows the private badge when a pool does not use an external provider", async () => {
-    state.pools = [{ ...poolModel, effectiveProviderEgress: false }];
-    await act(async () => {
-      mount();
-    });
+  it.each([true, false])(
+    "shows the private badge with an ineligible pool and deployment switch %s",
+    async (enabled) => {
+      state.providerEgressEnabled = enabled;
+      state.pools = [{ ...poolModel, effectiveProviderEgress: false }];
+      await act(async () => {
+        mount();
+      });
 
-    expect(screen.getAllByText("dashboard:pools.privacyBadge.private").length).toBeGreaterThan(0);
-  });
+      expect(screen.getAllByText("dashboard:pools.privacyBadge.private").length).toBeGreaterThan(0);
+      expect(screen.queryByText("pool/demo:external")).toBeNull();
+      expect(screen.queryByText("dashboard:pools.fallbackDisabledDeployment") !== null).toBe(
+        !enabled,
+      );
+    },
+  );
 
   it("keeps direct-model surface controls out of request settings", async () => {
     state.models = [directModel];

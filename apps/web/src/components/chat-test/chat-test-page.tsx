@@ -106,17 +106,24 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       maxAttachmentBytes: model.maxAttachmentBytes,
       reasoning: model.reasoning,
     })),
-    ...visibleModels.modelPools.map((pool) => ({
-      id: pool.id,
-      modelId: pool.modelId,
-      label: pool.name,
-      kind: pool.target,
-      attachmentModalities: pool.attachmentModalities,
-      maxAttachmentBytes: pool.maxAttachmentBytes,
-      reasoning: pool.reasoning,
-      compatibility: pool.compatibility,
-      effectiveProviderEgress: pool.effectiveProviderEgress,
-    })),
+    ...visibleModels.modelPools.flatMap((pool) => {
+      const option = {
+        id: pool.id,
+        modelId: pool.modelId,
+        label: pool.name,
+        kind: pool.target,
+        attachmentModalities: pool.attachmentModalities,
+        maxAttachmentBytes: pool.maxAttachmentBytes,
+        reasoning: pool.reasoning,
+        compatibility: pool.compatibility,
+        effectiveProviderEgress: pool.effectiveProviderEgress,
+        providerAccountLabels: pool.providerAccountLabels,
+        providerTypes: pool.providerTypes,
+      };
+      return pool.effectiveProviderEgress
+        ? [option, { ...option, modelId: `${pool.modelId}:external` }]
+        : [option];
+    }),
   ];
 }
 
@@ -1097,6 +1104,11 @@ export function ChatTestPage({ lang }: { lang: string }) {
             onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
+          {visibleModelsData?.providerEgressEnabled === false ? (
+            <p className="max-w-sm text-sm text-muted-foreground">
+              {t("dashboard:pools.fallbackDisabledDeployment")}
+            </p>
+          ) : null}
           {effectiveSurface ? (
             <span className="inline-flex min-h-11 max-w-full items-center rounded-full border bg-muted px-3 text-xs text-muted-foreground">
               {t(`dashboard:chatTest.surface.${effectiveSurface}`)}

@@ -148,7 +148,6 @@ integration("DL-1 capacity lock order for API writers", () => {
           slug: `dl1-api-${label}-${suffix}`,
           name: label,
           capacityConcurrencyLimit: null,
-          publicEgressAcknowledged: true,
         },
       });
       // Provider targets are external fallback members (PRIMARY is local-only).
@@ -393,7 +392,6 @@ integration("DL-1 capacity lock order for API writers", () => {
         userId: user.id,
         slug: `dl1-fill-${suffix}`,
         name: "Null fill",
-        publicEgressAcknowledged: true,
       },
     });
     const writer = modules.createPrismaClient(databaseUrl as string);

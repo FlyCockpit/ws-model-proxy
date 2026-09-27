@@ -979,6 +979,7 @@ model ModelPool {
   externalAfterWaitMs             Int                           @default(2000)
   /// Deprecated. No longer read or required anywhere; dropped by the final
   /// cleanup release (APPLY_SCHEMA=dangerous).
+  /// Dead legacy column: no longer read or written; retained until PR5 schema cleanup.
   publicEgressAcknowledged        Boolean                       @default(false)
   /// Permit developer instructions to collapse into the target protocol's system role.
   allowLossyDeveloperRoleCollapse Boolean                       @default(false)
@@ -1294,12 +1295,12 @@ model PoolGrant {
   @@map("pool_grant")
 }
 
+// Dead legacy notice enum/table: no producers or consumers; retained until PR5.
 enum DashboardNoticeKind {
   POOL_EXTERNAL_PROVIDER
 }
 
-/// Durable in-app notice. Written in the same transaction as the pool change
-/// that requires it, before any email attempt.
+/// Dead legacy notices retained for the final PR5 schema cleanup.
 model DashboardNotice {
   id        String              @id @default(cuid(2))
   createdAt DateTime            @default(now())

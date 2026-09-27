@@ -11,6 +11,7 @@ import { ArrowRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
+import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { WideContent } from "@/components/wide-content";
 import {
   chartRows,
@@ -90,9 +91,19 @@ export function OverviewPoolCard({
     >
       <header className="flex min-w-0 flex-col gap-2 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <h3 id={`overview-pool-${pool.poolId}`} className="truncate text-base font-semibold">
-            {pool.name}
-          </h3>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h3 id={`overview-pool-${pool.poolId}`} className="truncate text-base font-semibold">
+              {pool.name}
+            </h3>
+            {pool.effectiveProviderEgress ? (
+              <PoolPrivacyBadge
+                external
+                providers={pool.members.flatMap((member) =>
+                  member.kind === "PROVIDER" && member.location ? [member.location] : [],
+                )}
+              />
+            ) : null}
+          </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {t("overview.pools.summary", {
               requests: formatCount(locale, pool.current.requests),

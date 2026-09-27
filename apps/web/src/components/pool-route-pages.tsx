@@ -32,16 +32,11 @@ import {
   PoolMemberForm,
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
-import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
 
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
-import {
-  type GranteePrivacyConfirm,
-  granteePrivacyConfirmationFromError,
-} from "@/lib/grantee-privacy-confirmation";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -93,6 +88,7 @@ type PoolDetailContextValue = {
   capacities: PoolDetailCapacity[];
   capacityAvailability: ReturnType<typeof resolveCapacityAvailability>;
   providerEgressEnabled: boolean;
+  deploymentFlags: ReturnType<typeof useDeploymentFlags>["query"];
   openMember: (member: "create" | string | null) => void;
   openGrant: () => void;
   openDelete: () => void;
@@ -113,7 +109,6 @@ export function PoolsListPage({ lang }: { lang: string }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const { providerEgressEnabled } = useDeploymentFlags();
   const capacityAvailability = resolveCapacityAvailability();
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
@@ -194,7 +189,15 @@ export function PoolsListPage({ lang }: { lang: string }) {
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                       <h3 className="font-medium">{pool.name}</h3>
-                      <PoolPrivacyBadge external={pool.effectiveProviderEgress} />
+                      <PoolPrivacyBadge
+                        external={pool.effectiveProviderEgress}
+                        providers={pool.members.flatMap((member) =>
+                          member.tier === "PUBLIC_OVERFLOW" &&
+                          member.providerModel?.ProviderAccount.label
+                            ? [member.providerModel.ProviderAccount.label]
+                            : [],
+                        )}
+                      />
                       <span className="text-xs text-muted-foreground">{pool.slug}</span>
                     </div>
                     <div className="mt-2 max-w-2xl">
@@ -255,7 +258,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
         </div>
       )}
 
-      {providerEgressEnabled ? <ProviderOperationsSection /> : null}
+      <ProviderOperationsSection />
     </section>
   );
 }
@@ -266,7 +269,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const { providerEgressEnabled } = useDeploymentFlags();
+  const { providerEgressEnabled, query: deploymentFlags } = useDeploymentFlags();
   const capacityAvailability = resolveCapacityAvailability();
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
@@ -341,6 +344,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
     capacities: capacities.data ?? [],
     capacityAvailability,
     providerEgressEnabled,
+    deploymentFlags,
     openMember: setMemberDialog,
     openGrant: () => setGrantOpen(true),
     openDelete: () => setDeletePoolOpen(true),
@@ -354,7 +358,16 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
         <PageHeader
           title={pool.name}
           description={pool.description || pool.slug}
-          badge={<PoolPrivacyBadge external={pool.effectiveProviderEgress} />}
+          badge={
+            <PoolPrivacyBadge
+              external={pool.effectiveProviderEgress}
+              providers={pool.members.flatMap((member) =>
+                member.tier === "PUBLIC_OVERFLOW" && member.providerModel?.ProviderAccount.label
+                  ? [member.providerModel.ProviderAccount.label]
+                  : [],
+              )}
+            />
+          }
           action={
             <div className="flex flex-wrap gap-2">
               <Button size="touch" variant="outline" onClick={() => setGrantOpen(true)}>
@@ -659,12 +672,24 @@ export function PoolDetailTab({
             ))}
           </ul>
         )}
-        <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
-          {t("dashboard:pools.accessEgressHint")}
-        </p>
       </section>
     );
   }
+  if (detail.deploymentFlags.isPending)
+    return (
+      <div aria-busy="true" className="space-y-4">
+        <Skeleton className="h-6 w-48" />
+        <Skeleton className="h-5 w-full" />
+        <Skeleton className="h-80 w-full" />
+      </div>
+    );
+  if (detail.deploymentFlags.isError)
+    return (
+      <InlineRetry
+        message={t("dashboard:deploymentFeatures.loadFailed")}
+        onRetry={detail.deploymentFlags.refetch}
+      />
+    );
   const overflowMembers = pool.members
     .filter((member) => member.tier === "PUBLIC_OVERFLOW")
     .sort(
@@ -688,7 +713,11 @@ export function PoolDetailTab({
           {t("dashboard:pools.fallbackDisabledDeployment")}
         </p>
       ) : null}
-      <PoolFallbackSettings key={`${pool.id}-fallback`} pool={pool} />
+      <PoolFallbackSettings
+        key={`${pool.id}-fallback`}
+        pool={pool}
+        providerEgressEnabled={fallbackEnabled}
+      />
       {overflowMembers.length ? (
         <ol className="space-y-2">
           {overflowMembers.map((member, index) => (
@@ -711,7 +740,7 @@ export function PoolDetailTab({
             <li>{t("dashboard:pools.fallbackSteps.account")}</li>
             <li>{t("dashboard:pools.fallbackSteps.model")}</li>
             <li>{t("dashboard:pools.fallbackSteps.ceiling")}</li>
-            <li>{t("dashboard:pools.fallbackSteps.acknowledge")}</li>
+            <li>{t("dashboard:pools.fallbackSteps.enable")}</li>
           </ol>
           {fallbackEnabled ? (
             <Button className="mt-4" size="touch" render={<a href="#provider-operations" />}>
@@ -720,11 +749,9 @@ export function PoolDetailTab({
           ) : null}
         </div>
       )}
-      {detail.providerEgressEnabled ? (
-        <div id="provider-operations">
-          <ProviderOperationsSection />
-        </div>
-      ) : null}
+      <div id="provider-operations">
+        <ProviderOperationsSection />
+      </div>
     </section>
   );
 }
@@ -733,30 +760,22 @@ export function PoolDetailTab({
  * Owner fallback settings. Callers opt in per request with
  * `owner/pool:external`; the plain name never leaves the deployment.
  */
-function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
+function PoolFallbackSettings({
+  pool,
+  providerEgressEnabled,
+}: {
+  pool: PoolDetailModel;
+  providerEgressEnabled: boolean;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const [privacyConfirm, setPrivacyConfirm] = useState<
-    (GranteePrivacyConfirm & { retry: () => void }) | null
-  >(null);
   const update = useMutation({
     ...orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
-        setPrivacyConfirm(null);
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.fallbackSettings.saved"));
       },
-      onError: (error, variables) => {
-        // Turning fallback on for a shared pool with external members needs
-        // the owner's explicit confirmation (grantee privacy change).
-        const confirmation = granteePrivacyConfirmationFromError(error);
-        if (confirmation) {
-          setPrivacyConfirm({
-            ...confirmation,
-            retry: () => update.mutate({ ...variables, confirmGranteePrivacyChange: true }),
-          });
-          return;
-        }
+      onError: (error) => {
         toast.error(friendly(error, t("dashboard:pools.fallbackSettings.failed")));
       },
     }),
@@ -786,6 +805,14 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
       // Send only what changed, so an unrelated stored value can never make
       // this save fail. Enabling stays gated by the deployment switch
       // server-side; disabling is always allowed and keeps members configured.
+      if (!providerEgressEnabled) {
+        const enablingFallback = value.fallbackEnabled && !pool.fallbackEnabled;
+        const enablingGrantees = value.fallbackForGrantees && !pool.fallbackForGrantees;
+        if (enablingFallback || enablingGrantees) {
+          toast.error(t("dashboard:pools.fallbackSettings.enableBlockedDeployment"));
+          return;
+        }
+      }
       const externalAfterWaitMs = Number(value.externalAfterWaitMs);
       const changes = {
         ...(value.fallbackEnabled !== pool.fallbackEnabled
@@ -797,7 +824,7 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
         ...(externalAfterWaitMs !== pool.externalAfterWaitMs ? { externalAfterWaitMs } : {}),
       };
       if (Object.keys(changes).length === 0) return;
-      // Errors are surfaced by the mutation's onError (toast or confirmation).
+      // Errors are surfaced by the mutation's onError (toast).
       await update.mutateAsync({ id: pool.id, ...changes }).catch(() => undefined);
     },
   });
@@ -816,10 +843,15 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
           modelId: pool.canonicalModelId,
         })}
       </p>
+      <div className="space-y-2">
+        <CopyableModelId modelId={pool.canonicalModelId} />
+        <CopyableModelId modelId={`${pool.canonicalModelId}:external`} />
+      </div>
       <form.Field name="fallbackEnabled">
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
+              disabled={update.isPending || (!providerEgressEnabled && !field.state.value)}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />
@@ -831,6 +863,7 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
         {(field) => (
           <label className="flex min-h-11 items-center gap-3 text-sm">
             <Checkbox
+              disabled={update.isPending || (!providerEgressEnabled && !field.state.value)}
               checked={field.state.value}
               onCheckedChange={(checked) => field.handleChange(checked === true)}
             />
@@ -838,6 +871,9 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
           </label>
         )}
       </form.Field>
+      <p className="text-xs text-muted-foreground">
+        {t("dashboard:pools.fallbackSettings.granteesHint")}
+      </p>
       <form.Field name="externalAfterWaitMs">
         {(field) => (
           <div className="space-y-2">
@@ -873,14 +909,6 @@ function PoolFallbackSettings({ pool }: { pool: PoolDetailModel }) {
           </Button>
         )}
       </form.Subscribe>
-      <GranteePrivacyConfirmDialog
-        confirmation={privacyConfirm}
-        pending={update.isPending}
-        onOpenChange={(open) => {
-          if (!open) setPrivacyConfirm(null);
-        }}
-        onConfirm={() => privacyConfirm?.retry()}
-      />
     </form>
   );
 }

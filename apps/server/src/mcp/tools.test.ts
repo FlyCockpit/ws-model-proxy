@@ -15,11 +15,15 @@ import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest"
  * no test touches a real database.
  */
 
+const providerGate = vi.hoisted(() => ({ enabled: true }));
+
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
-    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    get WMP_PUBLIC_PROVIDER_EGRESS_ENABLED() {
+      return providerGate.enabled;
+    },
     NODE_ENV: "test",
     // auth.ts builds the MCP rate limiters at module scope (the full-chain
     // test below imports it).
@@ -1653,4 +1657,101 @@ describe("CLI command tools", () => {
       expect(cliRuntime.snapshotCliCommand).not.toHaveBeenCalled();
     });
   });
+});
+
+function disclosurePool() {
+  return {
+    id: "disclosure-pool",
+    userId: "owner-private",
+    slug: "shared",
+    name: "Shared",
+    description: null,
+    fallbackEnabled: true,
+    fallbackForGrantees: true,
+    User: { slug: "owner" },
+    PoolGrants: [],
+    PoolMembers: [
+      {
+        id: "private-member",
+        tier: "PUBLIC_OVERFLOW",
+        healthStatus: "UNHEALTHY",
+        ExecutionTarget: {
+          id: "private-target",
+          providerModelId: "private-provider-model",
+          ProviderModel: {
+            id: "private-provider-model",
+            upstreamModelId: "private-upstream",
+            PricingVersions: [],
+            ProviderAccount: {
+              id: "private-account-id",
+              label: "Owner private billing label",
+              providerType: "openrouter",
+              baseUrl: "https://owner-private.example.test",
+              credentialMetadata: "private-credential",
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
+describe("MCP preview provider disclosure", () => {
+  for (const toolName of ["model_api_tokens_preview", "forwarder_models_visible_list"] as const)
+    it.each([
+      ["owner", true, true, true, true],
+      ["eligible grantee", false, true, true, true],
+      ["grantee coverage off", false, true, true, false],
+      ["deployment off", false, false, true, true],
+      ["fallback off", false, true, false, true],
+    ] as const)("%s", async (_case, owner, enabled, fallbackEnabled, fallbackForGrantees) => {
+      providerGate.enabled = enabled;
+      const row = {
+        ...disclosurePool(),
+        fallbackEnabled,
+        fallbackForGrantees,
+        userId: owner ? USER.id : "owner-private",
+      };
+      const queries = prisma as unknown as {
+        discoveredModel: { findMany: MockInstance };
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolGrant: { findMany: MockInstance };
+        appSetting: { findUnique: MockInstance };
+      };
+      queries.appSetting.findUnique.mockResolvedValue(null);
+      queries.discoveredModel.findMany.mockResolvedValue([]);
+      queries.modelPool.findMany.mockImplementation(
+        async (args: { where?: { userId?: string } }) =>
+          args.where?.userId ? (owner ? [row] : []) : [row],
+      );
+      queries.poolMember.findMany.mockResolvedValue([]);
+      queries.poolGrant.findMany.mockResolvedValue(
+        owner ? [] : [{ id: "live-grant", ModelPool: row }],
+      );
+      try {
+        const authInfo = buildAuthInfo(["mcp:read"]);
+        bindRequest(authInfo);
+        const { body } = await callTool(authInfo, toolName, { scopeMode: "ALL_VISIBLE" });
+        expect(body.result?.isError).toBeUndefined();
+        const result = body.result?.structuredContent?.result as {
+          modelPools: Array<{ providerAccountLabels: string[]; providerTypes: string[] }>;
+        };
+        expect(result.modelPools[0]?.providerAccountLabels).toEqual(
+          owner && fallbackEnabled ? ["Owner private billing label"] : [],
+        );
+        const eligible = enabled && fallbackEnabled && (owner || fallbackForGrantees);
+        expect(result.modelPools[0]?.providerTypes).toEqual(eligible ? ["openrouter"] : []);
+        if (!owner) {
+          // Both MCP text and structured content must be safe.
+          const wire = JSON.stringify(body);
+          expect(wire).not.toMatch(
+            /Owner private billing label|private-account-id|owner-private\.example|private-credential|private-provider-model/,
+          );
+          if (!eligible) expect(wire).not.toContain("openrouter");
+        }
+      } finally {
+        providerGate.enabled = true;
+      }
+    });
 });

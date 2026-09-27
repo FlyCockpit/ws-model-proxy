@@ -100,6 +100,7 @@ function serializeTargets(targets: VisibleModelTargets) {
       fallbackForGrantees: pool.fallbackForGrantees,
       effectiveProviderEgress: pool.effectiveProviderEgress,
       providerAccountLabels: pool.providerAccountLabels,
+      providerTypes: pool.providerTypes,
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,

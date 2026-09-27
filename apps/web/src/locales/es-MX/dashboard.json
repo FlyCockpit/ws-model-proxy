@@ -211,7 +211,8 @@
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
     "privateNetworkAdmin": "Las URL privadas y de loopback se rechazan. Define `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
-    "privateNetworkUser": "Las URL privadas y de loopback se rechazan."
+    "privateNetworkUser": "Las URL privadas y de loopback se rechazan.",
+    "loadFailed": "No se pudo cargar la configuración de la implementación. Inténtalo de nuevo."
   },
   "endpoints": {
     "empty": "No hay endpoints registrados para este CLI.",
@@ -379,19 +380,16 @@
     "hideTerminals": "Ocultar terminales abiertas"
   },
   "notices": {
-    "region": "Avisos",
-    "dismiss": "Descartar",
-    "poolExternalProvider": "{{pool}} puede enviar solicitudes a un proveedor externo."
+    "dismiss": "Descartar"
   },
   "pools": {
     "notFound": "No se encontró este grupo o ya no está disponible para ti.",
     "privacyBadge": {
-      "private": "Privado",
-      "external": "Puede usar proveedores externos"
+      "private": "local",
+      "external": "externo",
+      "ownerProviders": "Proveedores del propietario",
+      "hint": "Respaldo externo disponible: {{providers}}. Usa :external con un token que permita proveedores externos; los nombres simples permanecen locales."
     },
-    "granteePrivacyConfirmTitle": "Este grupo puede enviar datos a un proveedor externo",
-    "granteePrivacyConfirmDescription": "{{pool}} ya está compartido. Las solicitudes de estas personas pueden salir de esta instalación. Se les avisará. Su acceso no se pausa.",
-    "granteePrivacyConfirmAction": "Confirmar y continuar",
     "affinity": {
       "title": "Enrutamiento según caché",
       "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
@@ -524,26 +522,27 @@
     },
     "fallbackDescription": "El respaldo externo se usa solo para solicitudes que nombran propietario/pool:external, cuando los miembros locales están a capacidad máxima o no son saludables.",
     "fallbackSettings": {
-      "description": "Quienes llaman usan {{externalModelId}} para permitir proveedores externos. {{modelId}} siempre se queda en los miembros locales.",
-      "enabled": "Usar respaldo externo para solicitudes :external",
-      "forGrantees": "Pagar el respaldo externo que usen las personas con quienes comparto este pool",
+      "description": "Las solicitudes usan {{externalModelId}} y un token que permita proveedores externos para enviar prompts fuera de esta implementación cuando el pool local está saturado o no puede atender la solicitud. {{modelId}} siempre permanece local.",
+      "enabled": "Permitir respaldo externo",
+      "forGrantees": "También para usuarios con acceso compartido",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
       "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",
-      "failed": "No se pudieron guardar los ajustes de respaldo. Inténtalo de nuevo."
+      "failed": "No se pudieron guardar los ajustes de respaldo. Inténtalo de nuevo.",
+      "enableBlockedDeployment": "No puedes activar el respaldo ni la cobertura para usuarios con acceso compartido mientras los proveedores externos estén desactivados en esta implementación.",
+      "granteesHint": "Tú pagas los cargos del proveedor de las personas con quienes compartes este pool. Sus solicitudes aún necesitan :external y un token que permita proveedores externos."
     },
-    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
+    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación. Aún puedes desactivar el respaldo y la cobertura para usuarios con acceso compartido y cambiar los tiempos de espera; activarlos no está disponible hasta que se habiliten los proveedores.",
     "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
     "fallbackSteps": {
       "account": "Agrega una cuenta y credencial de proveedor",
       "model": "Agrega un modelo y sus precios",
       "ceiling": "Establece un límite de gasto",
-      "acknowledge": "Reconoce que las solicitudes salen de esta implementación"
+      "enable": "Permite el respaldo externo en la configuración de este pool y luego agrega el modelo del proveedor"
     },
     "addFallbackProvider": "Agregar proveedor de respaldo",
-    "accessEgressHint": "Dar acceso a un pool con proveedores requiere reconocer la salida de datos.",
     "streaming": "streaming",
     "surfaceCounts": "{{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
     "surfaceTierCounts": "{{tier}}: {{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
@@ -600,8 +599,6 @@
       "create": "Crear pool protegido",
       "description": "Elige primero la capacidad local y luego decide explícitamente si las solicitudes pueden salir de tu infraestructura.",
       "disabled": "Desactivado",
-      "egressRequired": "Reconoce la salida al proveedor antes de adjuntar cualquier destino de proveedor.",
-      "egressWarning": "Las solicitudes al proveedor PRIMARY, y las solicitudes de desbordamiento cuando estén habilitadas, envían prompts, adjuntos, definiciones de herramientas y resultados generados fuera de esta implementación.",
       "enabled": "Activado",
       "fields": {
         "concurrency": "Límite de concurrencia física",
@@ -620,7 +617,6 @@
         "providerConcurrencyLimit": "Límite de concurrencia del proveedor",
         "providerTier": "Nivel del miembro proveedor",
         "finiteSpendProtection": "Configuraré un límite finito de gasto del proveedor antes de adjuntar un destino público.",
-        "publicEgressAcknowledged": "Entiendo qué datos de la solicitud pueden salir de esta implementación.",
         "recommendedSurface": "API recomendada",
         "recommendedSurfaceHint": "Se establece automáticamente una sola vez cuando el pool tiene por primera vez miembros primarios: la API mejor clasificada compartida por esos miembros primarios, con preferencia nativa y la adaptación estricta como respaldo. No se recalcula después, salvo reparación automática. Cualquier API que todos los miembros primarios puedan servir, de forma nativa o mediante adaptación estricta, es válida.",
         "reservedSlots": "Espacios reservados en el runtime compartido",
@@ -691,7 +687,6 @@
       "providerOrder": "Orden de proveedores protegido",
       "providerOrderExact": "Selecciona proveedores en orden de fallback. Las flechas cambian el orden duradero.",
       "providerEgressDisabled": "La salida a proveedores está deshabilitada para esta implementación (la configuración WMP_PUBLIC_PROVIDER_EGRESS_ENABLED está desactivada), por lo que no se pueden adjuntar destinos de proveedor hasta que la implementación la active.",
-      "providerTierDisclosure": "El proveedor PRINCIPAL participa antes del desbordamiento público y envía datos fuera de este despliegue sin exigir la habilitación del desbordamiento. Las credenciales y los presupuestos se aplican a ambos niveles.",
       "selectLocalModel": "Seleccionar modelo local {{name}}",
       "selectProvider": "Seleccionar modelo de proveedor {{name}}",
       "moveProviderUp": "Mover proveedor antes",
@@ -709,7 +704,6 @@
         "recommendedSurface": "Elige una API que todos los miembros primarios seleccionados puedan servir, de forma nativa o mediante adaptación de protocolo. Su valor predeterminado es la API mejor clasificada compartida por los primeros miembros primarios del pool.",
         "physicalConcurrencyLimit": "Ingresa un límite de concurrencia física de 1 a 10000.",
         "physicalMaxContext": "Ingresa un límite de contexto físico de 1 a 100000000.",
-        "publicEgressAcknowledged": "Reconoce la divulgación exacta de salida pública.",
         "reservedSlots": "Los espacios reservados no pueden superar el tope de concurrencia de este pool.",
         "slug": "Ingresa un slug de pool válido.",
         "contextMargin": "Ingresa un margen de contexto de 0 a 10000000.",
@@ -727,15 +721,12 @@
         "tokenLifetimeLimit": "Ingresa un límite positivo de tokens o elige UNLIMITED.",
         "spendMonthLimit": "Ingresa un límite positivo de gasto o elige UNLIMITED."
       },
-      "publicEgress": "Permitir desbordamiento público protegido",
-      "publicEgressHint": "Mantén preferidos los destinos locales y usa proveedores configurados solo cuando la capacidad local no pueda atender la solicitud.",
       "reservationInvalid": "Los espacios reservados no pueden superar el límite de concurrencia.",
       "reviewSafe": "Esta configuración mantiene finitas las protecciones de concurrencia, contexto, espera y gasto. Los destinos públicos no se pueden usar hasta configurar su política y orden.",
       "spendRequired": "Confirma la protección de gasto finita antes de activar el desbordamiento público.",
       "step": "Paso {{current}} de {{total}}",
       "steps": {
         "capacity": "Proteger capacidad local",
-        "egress": "Elegir API y salida",
         "models": "Elegir modelos locales",
         "review": "Revisar protecciones"
       },
@@ -744,7 +735,8 @@
         "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
         "OPENAI_RESPONSES": "OpenAI Responses"
       },
-      "title": "Configurar un pool de modelos"
+      "title": "Configurar un pool de modelos",
+      "externalFallbackHint": "Los proveedores seleccionados habilitan el respaldo externo para ti. Las solicitudes solo salen con <pool>:external y un token que permita proveedores externos, cuando los miembros locales no pueden atenderlas. El respaldo externo compartido permanece desactivado hasta habilitarlo en la configuración del pool."
     },
     "createDescription": "Crea un ID de modelo agrupado compatible con OpenAI.",
     "createTitle": "Crear pool",
@@ -771,9 +763,6 @@
     "grantsTitle": "Permisos",
     "grantRevoked": "Acceso al pool revocado",
     "grantTitle": "Dar acceso al pool",
-    "grantEgressWarning": "Dar acceso a {{pool}} permite que esta persona envíe instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público. Pueden aplicarse cargos.",
-    "grantEgressWarningTitle": "Este permiso puede usar salida a proveedores externos",
-    "grantEgressAcknowledge": "Entiendo que las solicitudes de este pool pueden enviarse a un proveedor, incluso cuando el desbordamiento público está activado, y que pueden aplicarse cargos del proveedor.",
     "memberTestSurface": "Superficie de API para probar el miembro",
     "memberTestMode": "Modo de ejecución para probar el miembro",
     "memberTestSurfaces": {
@@ -866,10 +855,10 @@
     "weight": "Peso"
   },
   "providers": {
-    "title": "Operaciones de proveedores públicos",
-    "description": "Configura cuentas, credenciales, modelos, presupuestos, identidad de precios y el historial contable usado por el desbordamiento público.",
-    "loadFailed": "No se pudieron cargar las operaciones de proveedores. Verifica la configuración e inténtalo de nuevo.",
-    "empty": "Todavía no hay cuentas de proveedor. Agrega una cuenta deshabilitada y prueba su credencial antes de habilitar la salida pública.",
+    "title": "Proveedores externos",
+    "description": "Administra cuentas de proveedores, claves, modelos, presupuestos, precios y uso del respaldo externo.",
+    "loadFailed": "No se pudieron cargar las operaciones de proveedores. Inténtalo de nuevo.",
+    "empty": "No hay cuentas de proveedores guardadas.",
     "accountList": "Cuentas de proveedor",
     "secretDisclosure": "Los secretos se cifran y solo se muestra su sufijo",
     "secretNeverShown": "El secreto se envía una vez y la API nunca lo devuelve.",
@@ -904,12 +893,9 @@
     "unknownCurrency": "moneda desconocida",
     "activePricingRequired": "Activa una versión de precios antes de crear una política de gasto finita. Se usa exactamente su moneda; nunca se convierten monedas.",
     "poolAttachments": "Miembros proveedores del pool",
-    "poolAttachmentsDescription": "Vincula un proveedor habilitado como miembro principal o como desbordamiento público ordenado. Ambos niveles aplican credenciales, precios, presupuestos y contabilidad.",
-    "primaryEgressDisclosure": "Las solicitudes al proveedor principal salen de este despliegue y pueden generar cargos. A diferencia del desbordamiento público, no requieren habilitar el respaldo público del pool.",
+    "poolAttachmentsDescription": "Agrega modelos de proveedores como miembros ordenados de respaldo externo. Las credenciales, precios, presupuestos y contabilidad se aplican a cada solicitud externa.",
     "poolLoadFailed": "No se pudieron cargar los pools.",
     "publicOrder": "Orden público {{order}}",
-    "egressAcknowledgement": "El reconocimiento se aplica solo a este pool. Las solicitudes con permisos o tokens indicados pueden salir del despliegue y generar cargos.",
-    "grantEgressDisclosure": "Permisos del pool que pueden salir: {{grants}}. Tokens de API que pueden salir: {{tokens}}.",
     "none": "ninguno",
     "reportFailed": "No se pudieron cargar las filas de uso.",
     "budgetActivityFailed": "No se pudo cargar la actividad del presupuesto.",
@@ -919,7 +905,7 @@
     "modelsFailed": "No se pudieron cargar los modelos.",
     "pricingFailed": "No se pudieron cargar las versiones de precios.",
     "policiesFailed": "No se pudieron cargar las políticas.",
-    "tokensFailed": "No se pudo cargar la visibilidad de salida de tokens.",
+    "tokensFailed": "No se pudieron cargar los detalles del alcance de los tokens.",
     "repairStatus": "Estado de reparación de conciliación",
     "repairLoadFailed": "No se pudo cargar el estado de reparación.",
     "noRepairItems": "Ningún intento necesita atención en esta ventana.",
@@ -956,7 +942,7 @@
     "noAudit": "No hay eventos de auditoría para esta cuenta.",
     "noCapabilities": "No hay un inventario validado de capacidades nativas",
     "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento y reasoningConfig opcional, límites de contexto, fuente y confianza.",
-    "visibilityDisclosure": "Quien tenga un token de API de modelo o un permiso de pool visible puede provocar que las solicitudes salgan del despliegue y consuman los presupuestos adjuntos.",
+    "visibilityDisclosure": "Los pools visibles permanecen locales de forma predeterminada. Las solicitudes externas necesitan <pool>:external, permiso del token y la configuración de respaldo del propietario, y solo consumen presupuestos de proveedores cuando los miembros locales no pueden atenderlas.",
     "fields": {
       "label": "Etiqueta de cuenta",
       "type": "Tipo de proveedor",
@@ -1016,7 +1002,6 @@
       "retire": "Retirar",
       "deactivate": "Desactivar",
       "createAttachmentProtection": "Crear protección del adjunto",
-      "acknowledgeEgress": "Habilitar respaldo externo",
       "attachProvider": "Adjuntar proveedor",
       "moveLater": "Mover después",
       "detachProvider": "Separar proveedor del pool",
@@ -1110,7 +1095,11 @@
       "cost": "Costo reportado / calculado",
       "identity": "Precio · versión contable",
       "confidence": "Confianza"
-    }
+    },
+    "disabledDeployment": "Los proveedores externos están deshabilitados en esta implementación. Las cuentas guardadas y los detalles de las claves siguen disponibles; puedes revocar claves y eliminar configuración. La creación, edición y pruebas de credenciales están deshabilitadas.",
+    "externalFallbackHint": "Habilita “Permitir respaldo externo” en la configuración de respaldo del pool antes de agregar un proveedor. Los modelos de proveedores nunca atienden nombres simples de pools.",
+    "externalRequestHint": "Solo las solicitudes <pool>:external con permiso del token pueden usar estos proveedores cuando los miembros locales no pueden atenderlas. Se aplican cargos del proveedor.",
+    "accessSummary": "Accesos compartidos al pool: {{grants}}. Tokens que incluyen este pool: {{tokens}}. El acceso externo también requiere el consentimiento del token y la configuración del pool para usuarios con acceso compartido."
   },
   "publication": {
     "unpublished": "Sin publicar"
@@ -1148,10 +1137,14 @@
   "tokens": {
     "externalAccess": {
       "title": "Proveedores externos",
-      "description": "Los tokens son solo privados de forma predeterminada. Cuando se permite, una solicitud puede usar un proveedor externo solo si nombra el pool como propietario/pool:external y el propietario del pool lo permite. Los nombres de pool sin sufijo nunca salen de esta implementación.",
+      "description": "Desactivado de forma predeterminada. Habilitarlo permite enviar prompts, adjuntos, herramientas y resultados fuera de esta implementación a proveedores externos. Las solicitudes deben usar <pool>:external, el propietario debe permitir el respaldo y los miembros locales no deben poder atender la solicitud. Los nombres simples permanecen locales.",
       "allow": "Permitir proveedores externos para {{name}}",
-      "poolsHint": "Tokens con lista de permitidos: elige qué pools pueden usar proveedores externos.",
-      "saved": "Acceso a proveedores externos actualizado"
+      "poolsHint": "Los tokens nuevos incluyen cada pool seleccionado. Desmarca cualquier pool para mantenerlo solo local.",
+      "saved": "Acceso a proveedores externos actualizado",
+      "createAllow": "Permitir proveedores externos",
+      "createFailed": "Se creó el token, pero no se pudo confirmar la actualización de acceso externo. Copia el secreto ahora y revisa sus permisos abajo antes de usarlo.",
+      "disabledDeployment": "Los proveedores externos están desactivados en esta implementación. Se conservan tus permisos guardados. Puedes desactivar el acceso externo y retirar el consentimiento por pool; activar el acceso o agregar pools no está disponible mientras los proveedores estén desactivados.",
+      "savedPoolsHint": "Elige qué pools pueden usar proveedores externos. La primera vez que actives el acceso, marca cada pool individualmente; ninguno se incluye automáticamente. Al desactivar y reactivar el acceso externo se conservan estas opciones."
     },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",
@@ -1192,9 +1185,9 @@
     "scopeMode": "Modo de alcance",
     "typeTokenName": "Escribe el nombre del token para confirmar",
     "visiblePreview": "{{count}} modelos visibles para este token",
-    "publicEgressWarningTitle": "Algunos grupos pueden enviar datos fuera de esta instalación",
-    "publicEgressWarning": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a un proveedor externo.",
-    "publicEgressWarningNamed": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a {{providers}}."
+    "publicEgressWarningTitle": "Respaldo externo disponible",
+    "publicEgressWarning": "Pools: {{pools}}. Habilitar el acceso externo de un token permite enviar prompts fuera de esta implementación a proveedores externos, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales.",
+    "publicEgressWarningNamed": "Pools: {{pools}}. Proveedores: {{providers}}. Habilitar el acceso externo de un token permite enviar prompts fuera de esta implementación, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales."
   },
   "providerCatalog": {
     "presets": {

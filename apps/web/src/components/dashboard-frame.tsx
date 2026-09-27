@@ -19,7 +19,6 @@ import { useTranslation } from "react-i18next";
 
 import { AgentRequestsBadge } from "@/components/agent-requests-badge";
 import { AgentRequestsNotice } from "@/components/agent-requests-notice";
-import { DashboardNotices } from "@/components/dashboard-notices";
 import { TerminalStatusDot } from "@/components/terminal-status-dot";
 import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { TerminalWorkspaceProvider, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
@@ -191,10 +190,9 @@ function DashboardLayout({
         {layout === "fill" ? (
           <>
             <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
-            {/* empty:hidden drops the padding when there are no notices. */}
-            <div data-dashboard-notices="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
+            {/* Keep agent requests visible above fill routes. */}
+            <div data-agent-requests="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
               {onTerminals ? null : <AgentRequestsNotice lang={lang} />}
-              <DashboardNotices />
             </div>
             {/* The terminals route renders nothing; the workspace below fills instead. */}
             <div
@@ -214,7 +212,6 @@ function DashboardLayout({
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
                 <AgentRequestsNotice lang={lang} />
-                <DashboardNotices />
                 <Outlet />
               </div>
             </div>

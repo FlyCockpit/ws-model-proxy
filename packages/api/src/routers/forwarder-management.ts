@@ -47,15 +47,8 @@ import {
 } from "../lib/discovered-inference-capacity";
 import {
   effectiveProviderEgress,
-  egressProviderAccountLabels,
   grantPoolAccessServerMessages,
 } from "../lib/effective-provider-egress";
-import {
-  countExternalFallbackMembers,
-  deliverGranteePrivacyEmails,
-  gateSharedPoolPrivacyChange,
-  recordGranteePrivacyNotices,
-} from "../lib/grantee-privacy";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   lowestMcpCommandMode,
@@ -596,6 +589,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
     }),
   );
   return {
+    providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
     directModels: targets.directModels.map((model) => ({
       target: model.target,
       id: model.id,
@@ -627,13 +621,8 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       fallbackEnabled: pool.fallbackEnabled,
       fallbackForGrantees: pool.fallbackForGrantees,
       effectiveProviderEgress: pool.effectiveProviderEgress,
-      providerAccountLabels: egressProviderAccountLabels({
-        fallbackEnabled: serializedPools.get(pool.id)?.fallbackEnabled ?? pool.fallbackEnabled,
-        members: (serializedPools.get(pool.id)?.members ?? []).map((member) => ({
-          tier: member.tier,
-          accountLabel: member.providerModel?.ProviderAccount.label ?? null,
-        })),
-      }),
+      providerAccountLabels: pool.providerAccountLabels,
+      providerTypes: pool.providerTypes,
       compatibility: serializedPools.get(pool.id)?.compatibility ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
@@ -896,13 +885,15 @@ function serializePool(row: ModelPoolRow) {
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalAfterWaitMs: row.externalAfterWaitMs,
-    effectiveProviderEgress: effectiveProviderEgress({
-      fallbackEnabled: row.fallbackEnabled,
-      externalMemberCount: row.PoolMembers.filter(
-        (member) =>
-          member.tier === "PUBLIC_OVERFLOW" && member.ExecutionTarget?.providerModelId != null,
-      ).length,
-    }),
+    effectiveProviderEgress:
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+      effectiveProviderEgress({
+        fallbackEnabled: row.fallbackEnabled,
+        externalMemberCount: row.PoolMembers.filter(
+          (member) =>
+            member.tier === "PUBLIC_OVERFLOW" && member.ExecutionTarget?.providerModelId != null,
+        ).length,
+      }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
     capacityPriority: row.capacityPriority,
@@ -1567,8 +1558,6 @@ export const forwarderManagementRouter = {
             memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable().default(null),
             reservedSlots: z.number().int().min(0).max(10_000),
             localWaitBudgetMs: z.number().int().min(0).max(600_000),
-            /** Deprecated and ignored: external fallback needs per-request caller opt-in. */
-            publicEgressAcknowledged: z.boolean().optional(),
             advanced: z
               .object({
                 physicalCountStrategy: z.enum([
@@ -2636,7 +2625,6 @@ export const forwarderManagementRouter = {
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
         ...poolFallbackFields,
-        confirmGranteePrivacyChange: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
@@ -2805,21 +2793,6 @@ export const forwarderManagementRouter = {
         if (!current || current.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         }
-        const externalMemberCount = await countExternalFallbackMembers(tx, input.id);
-        const lockedFallbackEnabled = input.fallbackEnabled ?? current.fallbackEnabled;
-        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
-          poolId: input.id,
-          poolName: current.name,
-          currentlyNonPrivate: effectiveProviderEgress({
-            fallbackEnabled: current.fallbackEnabled,
-            externalMemberCount,
-          }),
-          nextNonPrivate: effectiveProviderEgress({
-            fallbackEnabled: lockedFallbackEnabled,
-            externalMemberCount,
-          }),
-          confirmed: input.confirmGranteePrivacyChange === true,
-        });
         if (
           input.protocolAdaptationEnabled !== undefined ||
           input.allowLossyDeveloperRoleCollapse !== undefined
@@ -2958,21 +2931,9 @@ export const forwarderManagementRouter = {
           },
           select: poolSelect,
         });
-        await recordGranteePrivacyNotices(tx, {
-          poolId: input.id,
-          poolName: current.name,
-          grantees: privacyGrantees,
-        });
-        return {
-          row,
-          notice:
-            privacyGrantees.length > 0
-              ? { poolName: current.name, grantees: privacyGrantees }
-              : null,
-        };
+        return row;
       });
-      await deliverGranteePrivacyEmails(updated.notice);
-      return serializePool(updated.row);
+      return serializePool(updated);
     }),
 
   deleteModelPool: protectedProcedure
@@ -3189,7 +3150,6 @@ export const forwarderManagementRouter = {
         tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).default("PUBLIC_OVERFLOW"),
         publicOrder: z.number().int().min(0).max(10_000).optional(),
         weight: z.number().int().min(0).max(10_000).default(1),
-        confirmGranteePrivacyChange: z.boolean().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -3305,20 +3265,6 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
-        const externalMemberCount = await countExternalFallbackMembers(tx, pool.id);
-        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
-          poolId: pool.id,
-          poolName: pool.name,
-          currentlyNonPrivate: effectiveProviderEgress({
-            fallbackEnabled: pool.fallbackEnabled,
-            externalMemberCount,
-          }),
-          nextNonPrivate: effectiveProviderEgress({
-            fallbackEnabled: pool.fallbackEnabled,
-            externalMemberCount: externalMemberCount + 1,
-          }),
-          confirmed: input.confirmGranteePrivacyChange === true,
-        });
         const existingTarget = await tx.executionTarget.findUnique({
           where: { providerModelId: input.providerModelId },
           select: { id: true, inferenceCapacityId: true },
@@ -3426,19 +3372,8 @@ export const forwarderManagementRouter = {
             });
           }
         }
-        await recordGranteePrivacyNotices(tx, {
-          poolId: pool.id,
-          poolName: pool.name,
-          grantees: privacyGrantees,
-        });
-        return {
-          id: member.id,
-          executionTargetId: target.id,
-          notice:
-            privacyGrantees.length > 0 ? { poolName: pool.name, grantees: privacyGrantees } : null,
-        };
+        return { id: member.id, executionTargetId: target.id };
       });
-      await deliverGranteePrivacyEmails(attached.notice);
       return { id: attached.id, executionTargetId: attached.executionTargetId };
     }),
 
@@ -3451,7 +3386,6 @@ export const forwarderManagementRouter = {
           routingStatus: routingStatusSchema.optional(),
           tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
           publicOrder: z.number().int().min(0).max(10_000).optional(),
-          confirmGranteePrivacyChange: z.boolean().optional(),
           capacityPriority: z.number().int().min(0).max(31).nullable().optional(),
           capacityConcurrencyMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
           capacityConcurrencyLimit: z.number().int().min(1).max(10_000).nullable().optional(),
@@ -3522,7 +3456,7 @@ export const forwarderManagementRouter = {
 
           // Serialize every tier/order transition with pool attachment and
           // reorder operations. Re-read all policy inputs after taking the lock
-          // so acknowledgement and protection cannot be revoked concurrently.
+          // so pool settings and protection cannot be revoked concurrently.
           await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
           if (candidate.executionTargetId)
             await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
@@ -3711,25 +3645,6 @@ export const forwarderManagementRouter = {
             });
           }
 
-          const promotingProviderPrimary =
-            Boolean(providerModel) && member.tier !== "PRIMARY" && nextTier === "PRIMARY";
-          const privacyGrantees = promotingProviderPrimary
-            ? await gateSharedPoolPrivacyChange(tx, {
-                poolId: member.poolId,
-                poolName: member.ModelPool.name,
-                currentlyNonPrivate: effectiveProviderEgress({
-                  fallbackEnabled: member.ModelPool.fallbackEnabled,
-                  externalMemberCount: await countExternalFallbackMembers(
-                    tx,
-                    member.poolId,
-                    member.id,
-                  ),
-                }),
-                nextNonPrivate: true,
-                confirmed: input.confirmGranteePrivacyChange === true,
-              })
-            : [];
-
           // Move existing rows out of the unique public-order range before
           // assigning the normalized contiguous order.
           if (overflow.length > 0)
@@ -3812,23 +3727,11 @@ export const forwarderManagementRouter = {
           const memberResult = Object.hasOwn(updated, "tier")
             ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
             : updated;
-          await recordGranteePrivacyNotices(tx, {
-            poolId: member.poolId,
-            poolName: member.ModelPool.name,
-            grantees: privacyGrantees,
-          });
-          return {
-            member: memberResult,
-            notice:
-              privacyGrantees.length > 0
-                ? { poolName: member.ModelPool.name, grantees: privacyGrantees }
-                : null,
-          };
+          return memberResult;
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
-      await deliverGranteePrivacyEmails(updatedMember.notice);
-      return updatedMember.member;
+      return updatedMember;
     }),
 
   reorderProviderPoolMember: protectedProcedure
@@ -4156,7 +4059,7 @@ export const forwarderManagementRouter = {
       // No grant-time egress acknowledgement: a grantee's data leaves the
       // deployment only when the grantee asks for `owner/pool:external` with
       // a consenting credential AND the owner enabled fallbackForGrantees.
-      // The pool row lock keeps grants serialized with pool privacy changes
+      // The pool row lock keeps grants serialized with pool settings changes
       // (lock order: model_pool first).
       return runSerializableTransaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
@@ -4221,23 +4124,4 @@ export const forwarderManagementRouter = {
   visibleModels: protectedProcedure.handler(async ({ context }) =>
     serializeVisibleTargets(await listVisibleModelTargetsForUser(context.session.user.id)),
   ),
-
-  listDashboardNotices: protectedProcedure.handler(async ({ context }) => {
-    return prisma.dashboardNotice.findMany({
-      where: { userId: context.session.user.id, readAt: null },
-      orderBy: { createdAt: "desc" },
-      take: 20,
-      select: { id: true, createdAt: true, kind: true, poolId: true, poolName: true },
-    });
-  }),
-
-  dismissDashboardNotice: protectedProcedure
-    .input(z.object({ id: idSchema }))
-    .handler(async ({ input, context }) => {
-      const result = await prisma.dashboardNotice.updateMany({
-        where: { id: input.id, userId: context.session.user.id, readAt: null },
-        data: { readAt: new Date() },
-      });
-      return { dismissed: result.count > 0 };
-    }),
 };

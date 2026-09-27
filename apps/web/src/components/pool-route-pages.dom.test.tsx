@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   capacityEnabled: true,
   providerEgressEnabled: false,
+  flagsStatus: "ready" as "ready" | "pending" | "error",
   tab: "overview" as "overview" | "fallback" | "routing" | "capacity" | "media" | "access",
   detailTab: null as
     | null
@@ -99,7 +100,18 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: () => unknown) => ({
-    queryOptions: () => ({ queryKey: [key], queryFn: async () => data(), initialData: data() }),
+    queryOptions: () => ({
+      queryKey: [key],
+      queryFn: async () => {
+        if (key === "deploymentFlags" && state.flagsStatus === "pending")
+          return new Promise<unknown>(() => {});
+        if (key === "deploymentFlags" && state.flagsStatus === "error")
+          throw new Error("flags failed");
+        return data();
+      },
+      initialData:
+        key === "deploymentFlags" && state.flagsStatus === "pending" ? undefined : data(),
+    }),
   });
   const deferredQuery = (key: string, data: () => unknown) => ({
     queryOptions: () => ({ queryKey: [key], queryFn: async () => data() }),
@@ -168,6 +180,7 @@ function mount(children: ReactNode) {
 afterEach(() => {
   cleanup();
   state.capacityEnabled = true;
+  state.flagsStatus = "ready";
   state.providerEgressEnabled = false;
   state.tab = "overview";
   state.pools = [];
@@ -311,7 +324,7 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackSteps.account")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.model")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.ceiling")).toBeTruthy();
-    expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.enable")).toBeTruthy();
     // Owner fallback settings: the plain name stays local; grantees are not
     // covered unless the owner opts in.
     expect(screen.getByText("dashboard:pools.fallbackSettings.enabled")).toBeTruthy();
@@ -346,6 +359,23 @@ describe("dedicated pool pages", () => {
         screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }),
       );
 
+    it.each(["pending", "error"] as const)(
+      "does not describe %s flags as disabled",
+      async (status) => {
+        state.flagsStatus = status;
+        state.tab = "fallback";
+        state.pools = [fallbackPool()];
+        mount(<PoolDetailPage poolId="pool-1" />);
+        if (status === "pending") expect(document.querySelector('[aria-busy="true"]')).toBeTruthy();
+        else
+          expect(await screen.findByText("dashboard:deploymentFeatures.loadFailed")).toBeTruthy();
+        expect(screen.queryByText("dashboard:pools.fallbackDisabledDeployment")).toBeNull();
+        expect(
+          screen.queryByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+        ).toBeNull();
+      },
+    );
+
     it("sends only the changed fields", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";
@@ -366,38 +396,18 @@ describe("dedicated pool pages", () => {
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
     });
 
-    it("asks for grantee privacy confirmation and retries with it", async () => {
+    it("enables fallback in one save without a grantee confirmation", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";
       state.pools = [fallbackPool()];
-      state.nextReject = {
-        name: "updateModelPool",
-        error: {
-          code: "BAD_REQUEST",
-          data: {
-            reason: "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED",
-            poolName: "Primary",
-            grantees: [{ email: "grantee@example.test", name: "Grantee" }],
-          },
-        },
-      };
       mount(<PoolDetailPage poolId="pool-1" />);
-
       fireEvent.click(
         screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
       );
       submit();
-      await waitFor(() => expect(screen.getByText("grantee@example.test")).toBeTruthy());
+      await waitFor(() => expect(updateCalls()).toHaveLength(1));
+      expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackEnabled: true });
       expect(toast.error).not.toHaveBeenCalled();
-      fireEvent.click(
-        screen.getByRole("button", { name: "dashboard:pools.granteePrivacyConfirmAction" }),
-      );
-      await waitFor(() => expect(updateCalls()).toHaveLength(2));
-      expect(updateCalls()[1]?.variables).toEqual({
-        id: "pool-1",
-        fallbackEnabled: true,
-        confirmGranteePrivacyChange: true,
-      });
     });
 
     it("surfaces other save errors instead of swallowing them", async () => {
@@ -420,7 +430,7 @@ describe("dedicated pool pages", () => {
     });
   });
 
-  it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {
+  it("allows fallback withdrawal and wait-time edits when provider egress is off", async () => {
     state.providerEgressEnabled = false;
     state.tab = "fallback";
     state.pools = [
@@ -430,6 +440,9 @@ describe("dedicated pool pages", () => {
         name: "Primary",
         description: null,
         canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 2000,
         members: [],
         grants: [],
         compatibility: { recommendedSurface: null },
@@ -440,6 +453,85 @@ describe("dedicated pool pages", () => {
     mount(<PoolDetailPage poolId="pool-1" />);
 
     expect(screen.getByText("dashboard:pools.fallbackDisabledDeployment")).toBeTruthy();
+
+    const enableFallback = screen.getByRole("checkbox", {
+      name: "dashboard:pools.fallbackSettings.enabled",
+    });
+    const forGrantees = screen.getByRole("checkbox", {
+      name: "dashboard:pools.fallbackSettings.forGrantees",
+    });
+    expect(enableFallback.getAttribute("aria-disabled")).not.toBe("true");
+    expect(forGrantees.getAttribute("aria-disabled")).not.toBe("true");
+
+    fireEvent.click(enableFallback);
+    fireEvent.click(forGrantees);
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(state.mutationCalls.filter((call) => call.name === "updateModelPool")).toHaveLength(1),
+    );
+    expect(state.mutationCalls[0]?.variables).toEqual({
+      id: "pool-1",
+      fallbackEnabled: false,
+      fallbackForGrantees: false,
+    });
+
+    state.mutationCalls = [];
+    state.pools = [
+      {
+        ...(state.pools[0] as Record<string, unknown>),
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+      },
+    ];
+    cleanup();
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.change(
+      screen.getByLabelText("dashboard:pools.fallbackSettings.externalAfterWaitMs"),
+      { target: { value: "4500" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(state.mutationCalls.filter((call) => call.name === "updateModelPool")).toHaveLength(1),
+    );
+    expect(state.mutationCalls[0]?.variables).toEqual({
+      id: "pool-1",
+      externalAfterWaitMs: 4500,
+    });
+  });
+
+  it("blocks turning fallback on when provider egress is off", async () => {
+    state.providerEgressEnabled = false;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
+    for (const name of [
+      "dashboard:pools.fallbackSettings.enabled",
+      "dashboard:pools.fallbackSettings.forGrantees",
+    ]) {
+      const control = screen.getByRole("checkbox", { name });
+      expect(
+        control.getAttribute("aria-disabled") === "true" || control.hasAttribute("disabled"),
+      ).toBe(true);
+      fireEvent.click(control);
+    }
+    expect(state.mutationCalls).toEqual([]);
   });
 
   it("shows stored member policy values and does not mark an override as inherited", () => {

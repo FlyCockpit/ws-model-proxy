@@ -90,7 +90,14 @@ export function ModelPicker({
             {selected?.modelId ?? t("dashboard:chatTest.modelPicker")}
           </span>
           {selected?.kind === "MODEL_POOL" ? (
-            <PoolPrivacyBadge external={selected.effectiveProviderEgress === true} />
+            <PoolPrivacyBadge
+              external={selected.effectiveProviderEgress === true}
+              providers={
+                selected.providerAccountLabels?.length
+                  ? selected.providerAccountLabels
+                  : selected.providerTypes
+              }
+            />
           ) : null}
         </span>
         <ChevronsUpDown className="size-4 shrink-0 opacity-50" />
@@ -112,7 +119,7 @@ export function ModelPicker({
               <CommandGroup>
                 {filtered.map((option) => (
                   <CommandItem
-                    key={`${option.kind}:${option.id}`}
+                    key={`${option.kind}:${option.modelId}`}
                     value={option.modelId}
                     data-checked={option.modelId === value}
                     onSelect={() => {
@@ -131,7 +138,14 @@ export function ModelPicker({
                     </span>
                     <span className="inline-flex shrink-0 items-center gap-2">
                       {option.kind === "MODEL_POOL" ? (
-                        <PoolPrivacyBadge external={option.effectiveProviderEgress === true} />
+                        <PoolPrivacyBadge
+                          external={option.effectiveProviderEgress === true}
+                          providers={
+                            option.providerAccountLabels?.length
+                              ? option.providerAccountLabels
+                              : option.providerTypes
+                          }
+                        />
                       ) : null}
                       <span className="rounded-full border bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
                         {option.kind === "MODEL_POOL"

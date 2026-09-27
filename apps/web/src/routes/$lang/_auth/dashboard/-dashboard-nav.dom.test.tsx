@@ -42,24 +42,6 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
-vi.mock("@/utils/orpc", () => ({
-  orpc: {
-    forwarderManagement: {
-      listDashboardNotices: {
-        queryOptions: () => ({
-          queryKey: ["dashboard-notices"],
-          queryFn: async () => routeState.notices,
-          initialData: routeState.notices,
-        }),
-        key: () => ["dashboard-notices"],
-      },
-      dismissDashboardNotice: {
-        mutationOptions: () => ({ mutationFn: async () => ({ dismissed: true }) }),
-      },
-    },
-  },
-}));
-
 const agentRequests = vi.hoisted(() => ({ count: 0 }));
 
 vi.mock("@/hooks/use-pending-agent-requests", () => ({
@@ -70,7 +52,6 @@ type RouteMatchStub = { staticData?: { dashboardLayout?: "padded" | "fill" } };
 
 const routeState = vi.hoisted(() => ({
   matches: [] as RouteMatchStub[],
-  notices: [] as { id: string; kind: string; poolName: string }[],
 }));
 
 const router = vi.hoisted(() => ({ navigate: (_options: object): void => undefined }));
@@ -108,7 +89,6 @@ afterEach(() => {
   useUiPreferences.setState({ sidebarCollapsed: false });
   workspace.tabs = [];
   routeState.matches = [];
-  routeState.notices = [];
   agentRequests.count = 0;
 });
 
@@ -209,9 +189,8 @@ describe("dashboard layout flag", () => {
     expect(screen.getByTestId("dashboard-outlet")).toBeTruthy();
   });
 
-  it("fills the pane for fill routes and keeps dashboard notices", () => {
+  it("fills the pane for fill routes", () => {
     routeState.matches = [{}, { staticData: { dashboardLayout: "fill" } }];
-    routeState.notices = [{ id: "n1", kind: "POOL_EXTERNAL_PROVIDER", poolName: "Main" }];
     renderLayout();
     const fill = document.querySelector("[data-dashboard-layout='fill']");
     expect(fill).toBeTruthy();
@@ -220,7 +199,6 @@ describe("dashboard layout flag", () => {
     expect(fill?.className).toContain("min-w-0");
     expect(within(fill as HTMLElement).getByTestId("dashboard-outlet")).toBeTruthy();
     expect(document.querySelector("[data-dashboard-layout='padded']")).toBeNull();
-    expect(screen.getByRole("region", { name: "notices.region" })).toBeTruthy();
     expect(document.querySelector("[data-dashboard-nav='strip']")).toBeTruthy();
   });
 });

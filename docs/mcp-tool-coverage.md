@@ -56,11 +56,9 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.dismissDashboardNotice` | — (excluded) | — | — | — | — | — | human-only dashboard notices |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
 | `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listDashboardNotices` | — (excluded) | — | — | — | — | — | human-only dashboard notices |
 | `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
 | `forwarderManagement.listModelPools` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
 | `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |

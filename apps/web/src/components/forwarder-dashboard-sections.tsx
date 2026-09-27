@@ -46,7 +46,6 @@ import { z } from "zod";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
-import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -61,10 +60,6 @@ import {
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
 
-import {
-  type GranteePrivacyConfirm,
-  granteePrivacyConfirmationFromError,
-} from "@/lib/grantee-privacy-confirmation";
 import {
   egressProviderAccountLabels,
   publicEgressResourceNames,
@@ -1302,10 +1297,6 @@ export function shouldShowCapacitySection(
   data: CapacityRow[] | undefined,
 ): boolean {
   return enabled && (isLoading || data !== undefined);
-}
-
-export function shouldShowProviderOperationsSection(providerEgressEnabled: boolean | undefined) {
-  return providerEgressEnabled === true;
 }
 
 export function CapacitySetupForm({
@@ -2669,9 +2660,6 @@ export function PoolMemberForm({
   const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
     member?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
   );
-  const [privacyConfirm, setPrivacyConfirm] = useState<
-    (GranteePrivacyConfirm & { retry: () => Promise<void> }) | null
-  >(null);
   const createMember = useMutation(
     orpc.forwarderManagement.addPoolMember.mutationOptions({
       onSuccess: () => {
@@ -2809,28 +2797,7 @@ export function PoolMemberForm({
               };
               try {
                 await updateMember.mutateAsync(providerMemberUpdate);
-              } catch (error) {
-                const confirmation = granteePrivacyConfirmationFromError(error);
-                if (confirmation) {
-                  setPrivacyConfirm({
-                    ...confirmation,
-                    retry: async () => {
-                      await updateMember.mutateAsync({
-                        ...providerMemberUpdate,
-                        confirmGranteePrivacyChange: true,
-                      });
-                      if (capacityEnabled) {
-                        await queryClient.invalidateQueries({
-                          queryKey: orpc.capacityManagement.key(),
-                        });
-                      }
-                      toast.success(t("dashboard:pools.memberUpdated"));
-                      setPrivacyConfirm(null);
-                      onSuccess();
-                    },
-                  });
-                  return;
-                }
+              } catch {
                 throw new MutationFailure();
               }
             } else {
@@ -3093,18 +3060,6 @@ export function PoolMemberForm({
       <Button type="submit" size="touch" disabled={!canSubmit || isPending}>
         {isPending ? t("common:actions.saving") : t("common:actions.save")}
       </Button>
-      <GranteePrivacyConfirmDialog
-        confirmation={privacyConfirm}
-        pending={updateMember.isPending}
-        onOpenChange={(open) => {
-          if (!open) setPrivacyConfirm(null);
-        }}
-        onConfirm={() => {
-          void privacyConfirm?.retry().catch(() => {
-            toast.error(t("common:somethingWentWrong"));
-          });
-        }}
-      />
     </form>
   );
 }
@@ -3411,31 +3366,8 @@ export function ModelApiTokensSection() {
     refetch: refetchVisibleModels,
   } = useQuery(orpc.forwarderManagement.visibleModels.queryOptions());
   const [createOpen, setCreateOpen] = useState(false);
-  const [name, setName] = useState("");
-  const [scopeMode, setScopeMode] = useState<ScopeMode>("ALL_VISIBLE");
-  const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
-  const [secret, setSecret] = useState("");
+  const [creatingToken, setCreatingToken] = useState(false);
   const [revokeToken, setRevokeToken] = useState<ModelApiToken | null>(null);
-  const {
-    data: previewData,
-    isPending: previewIsPending,
-    isError: previewIsError,
-    refetch: refetchPreview,
-  } = useQuery(
-    orpc.modelApiTokens.preview.queryOptions({
-      input: { scopeMode, modelIds: scopeMode === "ALLOWLIST" ? selectedModelIds : [] },
-    }),
-  );
-  const create = useMutation(
-    orpc.modelApiTokens.create.mutationOptions({
-      onSuccess: (result) => {
-        queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
-        setSecret(result.secret);
-        setName("");
-        toast.success(t("dashboard:tokens.created"));
-      },
-    }),
-  );
   const revoke = useMutation(
     orpc.modelApiTokens.revoke.mutationOptions({
       onSuccess: () => {
@@ -3476,13 +3408,7 @@ export function ModelApiTokensSection() {
           <Dialog
             open={createOpen}
             onOpenChange={(open) => {
-              setCreateOpen(open);
-              if (!open) {
-                setName("");
-                setScopeMode("ALL_VISIBLE");
-                setSelectedModelIds([]);
-                setSecret("");
-              }
+              if (!creatingToken) setCreateOpen(open);
             }}
           >
             <DialogTrigger
@@ -3500,78 +3426,12 @@ export function ModelApiTokensSection() {
                   {t("dashboard:tokens.createModelApiDescription")}
                 </DialogDescription>
               </DialogHeader>
-              <form
-                className="space-y-4"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  if (!name) return;
-                  create.mutate({
-                    name,
-                    scopeMode,
-                    modelIds: scopeMode === "ALLOWLIST" ? selectedModelIds : [],
-                  });
-                }}
-              >
-                <div className="space-y-2">
-                  <Label htmlFor="model-api-token-name">{t("dashboard:tokens.name")}</Label>
-                  <Input
-                    id="model-api-token-name"
-                    value={name}
-                    onChange={(event) => setName(event.target.value)}
-                    inputMode="text"
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>{t("dashboard:tokens.scopeMode")}</Label>
-                  <SegmentedControl
-                    value={scopeMode}
-                    onChange={setScopeMode}
-                    ariaLabel={t("dashboard:tokens.scopeMode")}
-                    items={[
-                      { value: "ALL_VISIBLE", label: t("dashboard:tokens.allVisible") },
-                      { value: "ALLOWLIST", label: t("dashboard:tokens.allowlist") },
-                    ]}
-                  />
-                </div>
-                {scopeMode === "ALLOWLIST" ? (
-                  <VisibleModelChecklist
-                    visibleModels={visibleModelsData}
-                    selectedModelIds={selectedModelIds}
-                    onSelectedModelIdsChange={setSelectedModelIds}
-                  />
-                ) : null}
-                {previewIsPending ? (
-                  <Skeleton className="h-24 w-full" />
-                ) : previewIsError ? (
-                  <InlineRetry
-                    variant="destructive"
-                    message={t("dashboard:tokens.previewFailed")}
-                    onRetry={refetchPreview}
-                  />
-                ) : (
-                  <VisibleModelPreview preview={previewData} />
-                )}
-                {secret ? (
-                  <SecretDisplay secret={secret} label={t("dashboard:tokens.modelApiSecret")} />
-                ) : null}
-                <DialogFooter>
-                  <Button
-                    type="submit"
-                    size="touch"
-                    disabled={
-                      !name ||
-                      create.isPending ||
-                      Boolean(secret) ||
-                      (scopeMode === "ALLOWLIST" && selectedModelIds.length === 0)
-                    }
-                  >
-                    {create.isPending
-                      ? t("dashboard:tokens.creating")
-                      : t("dashboard:tokens.create")}
-                  </Button>
-                </DialogFooter>
-              </form>
+              {createOpen ? (
+                <ModelApiTokenCreateForm
+                  visibleModels={visibleModelsData}
+                  onPendingChange={setCreatingToken}
+                />
+              ) : null}
             </DialogContent>
           </Dialog>
         }
@@ -3583,7 +3443,11 @@ export function ModelApiTokensSection() {
       ) : null}
       <TokenEgressWarnings pools={visibleModelsData.modelPools} />
       <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
-      <TokenExternalAccess tokens={tokensData} pools={visibleModelsData.modelPools} />
+      <TokenExternalAccess
+        tokens={tokensData}
+        pools={visibleModelsData.modelPools}
+        providerEgressEnabled={visibleModelsData.providerEgressEnabled}
+      />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3603,6 +3467,231 @@ export function ModelApiTokensSection() {
   );
 }
 
+function ModelApiTokenCreateForm({
+  visibleModels,
+  onPendingChange,
+}: {
+  visibleModels: VisibleModels;
+  onPendingChange: (pending: boolean) => void;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const [secret, setSecret] = useState("");
+  const [consentFailed, setConsentFailed] = useState(false);
+  const create = useMutation(orpc.modelApiTokens.create.mutationOptions());
+  const update = useMutation({
+    ...orpc.modelApiTokens.updateExternalAccess.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const form = useForm({
+    defaultValues: {
+      name: "",
+      scopeMode: "ALL_VISIBLE" as ScopeMode,
+      modelIds: [] as string[],
+      allowExternal: false,
+      excludedPoolIds: [] as string[],
+    },
+    validators: {
+      onSubmit: z
+        .object({
+          name: z.string().trim().min(1).max(120),
+          scopeMode: z.enum(["ALL_VISIBLE", "ALLOWLIST"]),
+          modelIds: z.array(z.string()),
+          allowExternal: z.boolean(),
+          excludedPoolIds: z.array(z.string()),
+        })
+        .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0),
+    },
+    onSubmit: async ({ value }) => {
+      if (secret) return;
+      onPendingChange(true);
+      try {
+        const result = await create.mutateAsync({
+          name: value.name,
+          scopeMode: value.scopeMode,
+          modelIds: value.scopeMode === "ALLOWLIST" ? value.modelIds : [],
+        });
+        // Retain the one-time secret even if the separate human consent save fails.
+        setSecret(result.secret);
+        let consentSaved = true;
+        if (value.allowExternal && visibleModels.providerEgressEnabled) {
+          try {
+            await update.mutateAsync({
+              id: result.token.id,
+              allowExternal: true,
+              ...(value.scopeMode === "ALLOWLIST"
+                ? {
+                    externalModelPoolIds: visibleModels.modelPools
+                      .filter(
+                        (pool) =>
+                          value.modelIds.includes(pool.modelId) &&
+                          !value.excludedPoolIds.includes(pool.id),
+                      )
+                      .map((pool) => pool.id),
+                  }
+                : {}),
+            });
+          } catch {
+            consentSaved = false;
+            setConsentFailed(true);
+          }
+        }
+        void queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
+        if (consentSaved) toast.success(t("dashboard:tokens.created"));
+      } catch {
+        // The standard mutation error toast reports creation failures.
+      } finally {
+        onPendingChange(false);
+      }
+    },
+  });
+  return (
+    <form
+      className="min-w-0 space-y-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void form.handleSubmit();
+      }}
+    >
+      <fieldset
+        disabled={create.isPending || update.isPending || Boolean(secret)}
+        className="min-w-0 space-y-4"
+      >
+        <form.Field name="name">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor="model-api-token-name">{t("dashboard:tokens.name")}</Label>
+              <Input
+                id="model-api-token-name"
+                className="min-h-11"
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          )}
+        </form.Field>
+        <form.Subscribe
+          selector={(state) => ({ values: state.values, isSubmitting: state.isSubmitting })}
+        >
+          {({ values, isSubmitting }) => (
+            <>
+              <div className="space-y-2">
+                <Label>{t("dashboard:tokens.scopeMode")}</Label>
+                <SegmentedControl
+                  value={values.scopeMode}
+                  onChange={(value: ScopeMode) => form.setFieldValue("scopeMode", value)}
+                  ariaLabel={t("dashboard:tokens.scopeMode")}
+                  items={[
+                    { value: "ALL_VISIBLE", label: t("dashboard:tokens.allVisible") },
+                    { value: "ALLOWLIST", label: t("dashboard:tokens.allowlist") },
+                  ]}
+                />
+              </div>
+              {values.scopeMode === "ALLOWLIST" ? (
+                <VisibleModelChecklist
+                  visibleModels={visibleModels}
+                  selectedModelIds={values.modelIds}
+                  onSelectedModelIdsChange={(ids) => form.setFieldValue("modelIds", ids)}
+                />
+              ) : null}
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <Checkbox
+                  disabled={!visibleModels.providerEgressEnabled}
+                  checked={values.allowExternal}
+                  onCheckedChange={(checked) =>
+                    form.setFieldValue("allowExternal", checked === true)
+                  }
+                />
+                {t("dashboard:tokens.externalAccess.createAllow")}
+              </label>
+              <p className="text-sm text-muted-foreground">
+                {t("dashboard:tokens.externalAccess.description")}
+              </p>
+              {!visibleModels.providerEgressEnabled ? (
+                <p role="note" className="text-sm text-muted-foreground">
+                  {t("dashboard:tokens.externalAccess.disabledDeployment")}
+                </p>
+              ) : null}
+              {values.allowExternal && values.scopeMode === "ALLOWLIST" ? (
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:tokens.externalAccess.poolsHint")}
+                  </p>
+                  {visibleModels.modelPools
+                    .filter((pool) => values.modelIds.includes(pool.modelId))
+                    .map((pool) => (
+                      <label key={pool.id} className="flex min-h-11 items-center gap-3 text-sm">
+                        <Checkbox
+                          disabled={!visibleModels.providerEgressEnabled}
+                          checked={!values.excludedPoolIds.includes(pool.id)}
+                          onCheckedChange={(checked) =>
+                            form.setFieldValue(
+                              "excludedPoolIds",
+                              checked === true
+                                ? values.excludedPoolIds.filter((id) => id !== pool.id)
+                                : [...values.excludedPoolIds, pool.id],
+                            )
+                          }
+                        />
+                        {pool.name}
+                      </label>
+                    ))}
+                </div>
+              ) : null}
+              <TokenScopePreview scopeMode={values.scopeMode} modelIds={values.modelIds} />
+
+              {consentFailed ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {t("dashboard:tokens.externalAccess.createFailed")}
+                </p>
+              ) : null}
+              <DialogFooter>
+                <Button
+                  type="submit"
+                  size="touch"
+                  disabled={
+                    !values.name.trim() ||
+                    isSubmitting ||
+                    Boolean(secret) ||
+                    (values.scopeMode === "ALLOWLIST" && values.modelIds.length === 0)
+                  }
+                >
+                  {isSubmitting ? t("dashboard:tokens.creating") : t("dashboard:tokens.create")}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </form.Subscribe>
+      </fieldset>
+      {secret ? (
+        <SecretDisplay secret={secret} label={t("dashboard:tokens.modelApiSecret")} />
+      ) : null}
+    </form>
+  );
+}
+
+function TokenScopePreview({ scopeMode, modelIds }: { scopeMode: ScopeMode; modelIds: string[] }) {
+  const { t } = useTranslation("dashboard");
+  const preview = useQuery(
+    orpc.modelApiTokens.preview.queryOptions({
+      input: { scopeMode, modelIds: scopeMode === "ALLOWLIST" ? modelIds : [] },
+    }),
+  );
+  if (preview.isPending) return <Skeleton className="h-24 w-full" />;
+  if (preview.isError)
+    return (
+      <InlineRetry
+        variant="destructive"
+        message={t("tokens.previewFailed")}
+        onRetry={preview.refetch}
+      />
+    );
+  return <VisibleModelPreview preview={preview.data} />;
+}
+
 /**
  * Human-only consent for `owner/pool:external` (never exposed to MCP). New and
  * existing tokens are private-only until a person turns this on. Allowlist
@@ -3611,7 +3700,9 @@ export function ModelApiTokensSection() {
 function TokenExternalAccess({
   tokens,
   pools,
+  providerEgressEnabled,
 }: {
+  providerEgressEnabled: boolean;
   tokens: ModelApiToken[];
   pools: VisibleModels["modelPools"];
 }) {
@@ -3636,6 +3727,11 @@ function TokenExternalAccess({
           {t("dashboard:tokens.externalAccess.description")}
         </p>
       </div>
+      {!providerEgressEnabled ? (
+        <p role="note" className="text-sm text-muted-foreground">
+          {t("dashboard:tokens.externalAccess.disabledDeployment")}
+        </p>
+      ) : null}
       <ul className="divide-y">
         {activeTokens.map((token) => {
           const allowlistPoolIds =
@@ -3646,9 +3742,12 @@ function TokenExternalAccess({
               <label className="flex min-h-11 items-center gap-3 text-sm">
                 <Checkbox
                   checked={token.allowExternal}
-                  disabled={update.isPending}
+                  disabled={update.isPending || (!providerEgressEnabled && !token.allowExternal)}
                   onCheckedChange={(checked) =>
-                    update.mutate({ id: token.id, allowExternal: checked === true })
+                    update.mutate({
+                      id: token.id,
+                      allowExternal: checked === true,
+                    })
                   }
                 />
                 <span className="min-w-0 break-words">
@@ -3658,13 +3757,15 @@ function TokenExternalAccess({
               {token.allowExternal && allowlistPoolIds.length > 0 ? (
                 <div className="space-y-1 pl-8">
                   <p className="text-xs text-muted-foreground">
-                    {t("dashboard:tokens.externalAccess.poolsHint")}
+                    {t("dashboard:tokens.externalAccess.savedPoolsHint")}
                   </p>
                   {allowlistPoolIds.map((poolId) => (
                     <label key={poolId} className="flex min-h-11 items-center gap-3 text-sm">
                       <Checkbox
                         checked={included.has(poolId)}
-                        disabled={update.isPending}
+                        disabled={
+                          update.isPending || (!providerEgressEnabled && !included.has(poolId))
+                        }
                         onCheckedChange={(checked) => {
                           const next = new Set(included);
                           if (checked === true) next.add(poolId);
@@ -3772,7 +3873,12 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
         ))}
         {preview.modelPools.map((pool) => (
           <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
-            <PoolPrivacyBadge external={pool.effectiveProviderEgress === true} />
+            <PoolPrivacyBadge
+              external={pool.effectiveProviderEgress === true}
+              providers={
+                pool.providerAccountLabels?.length ? pool.providerAccountLabels : pool.providerTypes
+              }
+            />
             <code className="min-w-0 break-all font-mono text-xs text-muted-foreground">
               {pool.id}
             </code>
@@ -3792,6 +3898,7 @@ function TokenEgressWarnings({
     name: string;
     effectiveProviderEgress?: boolean;
     providerAccountLabels?: readonly string[];
+    providerTypes?: readonly string[];
   }>;
   compact?: boolean;
 }) {

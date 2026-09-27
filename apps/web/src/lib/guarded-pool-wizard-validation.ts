@@ -399,7 +399,6 @@ export function buildGuardedPoolWizardSchema(input: GuardedPoolWizardSchemaInput
       providerTier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]),
       providerConcurrencyLimit: z.number().int().min(1).max(10_000),
       dailySpendLimit: z.string(),
-      publicEgressAcknowledged: z.boolean(),
       physicalCountStrategy: z.enum([
         "TOKENIZER",
         "TEMPLATE_AWARE",
@@ -435,8 +434,6 @@ export function buildGuardedPoolWizardSchema(input: GuardedPoolWizardSchemaInput
         ctx.addIssue({ code: "custom", path: ["providerModelIds"] });
       if (value.reservedSlots > value.memberConcurrencyLimit)
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
-        ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       if (providerSelectionBlockedByEgress(input.providerEgressEnabled, value.providerModelIds))
         ctx.addIssue({ code: "custom", path: ["providerEgressBlocked"] });
       if (
