@@ -18,7 +18,6 @@ const state = vi.hoisted(() => ({
   updateModelResult: undefined as Record<string, unknown> | undefined,
   updateModelPayloads: [] as Array<Record<string, unknown>>,
   allowPrivateNetworks: true,
-  credentials: [] as Array<Record<string, unknown>>,
   testResult: undefined as Record<string, unknown> | undefined,
 }));
 
