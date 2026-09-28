@@ -225,6 +225,9 @@ export const cliCredentialsRouter = {
    * write matches and the other gets CONFLICT. Better Auth's own `/device`,
    * `/device/approve` and `/device/deny` are disabled
    * (`DISABLED_DEVICE_AUTHORIZATION_PATHS`), so nothing else claims a code.
+   * The server requires the CSRF header on this procedure on every deployment
+   * (`ALWAYS_CSRF_PROTECTED_PROCEDURES`, apps/server/src/csrf-policy.ts), as
+   * Better Auth's origin check did on the route it replaces.
    */
   approveDeviceLogin: protectedProcedure
     .input(z.object({ userCode: userCodeSchema, slug: cliSlugSchema }))

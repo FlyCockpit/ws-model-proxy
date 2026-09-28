@@ -487,9 +487,21 @@ mod tests {
             .local_flags
     }
 
+    /// The two tests that panic on purpose: the panic hook one installs is
+    /// process-global, so a sibling's panic must not run it mid-test.
+    static PANIC_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn panic_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+        PANIC_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn raw_mode_is_restored_when_the_run_panics() {
         use nix::sys::termios::LocalFlags;
+
+        let _serial = panic_tests_lock();
 
         let pty = nix::pty::openpty(None, None).expect("opening a pty");
         let tty = pty.slave;
@@ -509,6 +521,8 @@ mod tests {
     #[test]
     fn the_panic_hook_restores_the_terminal_when_no_destructor_runs() {
         use nix::sys::termios::LocalFlags;
+
+        let _serial = panic_tests_lock();
 
         let pty = nix::pty::openpty(None, None).expect("opening a pty");
         let tty = pty.slave;
@@ -547,7 +561,12 @@ mod tests {
         let raw_mode = RawMode::enter(&tty, confirm_raw_mode).expect("entering raw mode");
         raw_mode.restore();
         let after = nix::sys::termios::tcgetattr(&tty).expect("reading pty settings");
-        assert_eq!(after.local_flags, before.local_flags);
+        // PENDIN is kernel state, not a setting: BSD kernels (macOS) set it
+        // when a terminal returns to canonical mode.
+        let settings = |flags: nix::sys::termios::LocalFlags| {
+            flags.difference(nix::sys::termios::LocalFlags::PENDIN)
+        };
+        assert_eq!(settings(after.local_flags), settings(before.local_flags));
         assert_eq!(after.input_flags, before.input_flags);
         assert_eq!(after.control_chars, before.control_chars);
     }

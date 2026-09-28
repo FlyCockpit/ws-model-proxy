@@ -205,6 +205,17 @@ function nonAsciiTransition(state: number): number {
   return GROUND;
 }
 
+/** The parser state after one code point (or UTF-16 code unit of one). */
+function nextState(state: number, code: number): number {
+  const anywhere = anywhereTransition(code);
+  if (anywhere !== null) return anywhere;
+  if (isExecutable(code)) return state === OSC_STRING && code === 0x07 ? GROUND : state;
+  // DEL is ignored in every state.
+  if (code === 0x7f) return state;
+  if (state === GROUND) return GROUND;
+  return code >= 0xa0 ? nonAsciiTransition(state) : printableTransition(state, code);
+}
+
 /**
  * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms — CSI, OSC,
  * the control strings DCS, SOS, PM and APC, and other escapes — including a
@@ -227,25 +238,114 @@ function stripTerminalSequences(text: string): string {
       out += text.slice(runStart, index);
       runStart = -1;
     }
-    const anywhere = anywhereTransition(code);
-    if (anywhere !== null) {
-      state = anywhere;
-    } else if (isExecutable(code)) {
-      if (state === OSC_STRING && code === 0x07) state = GROUND;
-      else if (executesC0(state)) out += text[index] ?? "";
-    } else if (code === 0x7f) {
-      // DEL is ignored in every state.
-    } else if (code >= 0xa0) {
-      state = nonAsciiTransition(state);
-      // The terminal reads code points: an astral character is one input,
-      // so its low surrogate goes with the high one instead of printing alone.
-      const next = text.charCodeAt(index + 1);
-      if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) index += 1;
-    } else {
-      state = printableTransition(state, code);
-    }
+    if (isExecutable(code) && executesC0(state)) out += text[index] ?? "";
+    state = nextState(state, code);
+    // The terminal reads code points: an astral character is one input, so
+    // its low surrogate goes with the high one instead of printing alone.
+    const next = text.charCodeAt(index + 1);
+    if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) index += 1;
   }
   if (runStart >= 0) out += text.slice(runStart);
+  return out;
+}
+
+/**
+ * Follows the terminal parser (and a UTF-8 decoder, as TextDecoder decodes)
+ * across the bytes a bounded capture drops from the front of its rolling
+ * tail. A capture drops bytes until {@link atBoundary}, so its tail always
+ * starts where the terminal is in its ground state on a whole character:
+ * parsing the tail on its own then keeps exactly what parsing the whole
+ * stream keeps from that point. Without it, a tail that starts inside a DCS,
+ * APC, PM or OSC body would show that hidden body as text.
+ *
+ * The Rust CLI's capture (`apps/cli/src/terminal_parse.rs`) implements the
+ * same rules for supervised output.
+ */
+export class TerminalByteState {
+  private state = GROUND;
+  private needed = 0;
+  private seen = 0;
+  private codePoint = 0;
+  private lower = 0x80;
+  private upper = 0xbf;
+
+  /** True in the ground state with no partial character pending. */
+  get atBoundary(): boolean {
+    return this.state === GROUND && this.needed === 0;
+  }
+
+  /** Feeds one byte (WHATWG UTF-8 decoding, U+FFFD for invalid input). */
+  feed(byte: number): void {
+    if (this.needed === 0) {
+      if (byte <= 0x7f) this.state = nextState(this.state, byte);
+      else if (byte >= 0xc2 && byte <= 0xdf) this.start(1, byte & 0x1f);
+      else if (byte >= 0xe0 && byte <= 0xef) {
+        if (byte === 0xe0) this.lower = 0xa0;
+        if (byte === 0xed) this.upper = 0x9f;
+        this.start(2, byte & 0x0f);
+      } else if (byte >= 0xf0 && byte <= 0xf4) {
+        if (byte === 0xf0) this.lower = 0x90;
+        if (byte === 0xf4) this.upper = 0x8f;
+        this.start(3, byte & 0x07);
+      } else this.state = nextState(this.state, 0xfffd);
+      return;
+    }
+    if (byte < this.lower || byte > this.upper) {
+      // The partial character is invalid: it decodes to U+FFFD, and this
+      // byte starts over.
+      this.reset();
+      this.state = nextState(this.state, 0xfffd);
+      this.feed(byte);
+      return;
+    }
+    this.lower = 0x80;
+    this.upper = 0xbf;
+    this.codePoint = (this.codePoint << 6) | (byte & 0x3f);
+    this.seen += 1;
+    if (this.seen === this.needed) {
+      const codePoint = this.codePoint;
+      this.reset();
+      this.state = nextState(this.state, codePoint);
+    }
+  }
+
+  private start(needed: number, bits: number): void {
+    this.needed = needed;
+    this.codePoint = bits;
+  }
+
+  private reset(): void {
+    this.needed = 0;
+    this.seen = 0;
+    this.codePoint = 0;
+    this.lower = 0x80;
+    this.upper = 0xbf;
+  }
+}
+
+/**
+ * A capture's rolling tail after appending `chunk`: at most `max` bytes, then
+ * advanced further while `state` is not at a boundary, so it starts where the
+ * terminal parser is in its ground state (see {@link TerminalByteState}).
+ * Every byte dropped from the front goes through `state`, in stream order.
+ */
+export function appendRollingTail(
+  tail: Uint8Array,
+  chunk: Uint8Array,
+  max: number,
+  state: TerminalByteState,
+): Uint8Array {
+  const total = tail.length + chunk.length;
+  const mustDrop = Math.max(0, total - max);
+  let start = 0;
+  while (start < total && (start < mustDrop || !state.atBoundary)) {
+    state.feed(start < tail.length ? (tail[start] ?? 0) : (chunk[start - tail.length] ?? 0));
+    start += 1;
+  }
+  if (start >= tail.length) return chunk.slice(start - tail.length);
+  const out = new Uint8Array(total - start);
+  out.set(tail.subarray(start), 0);
+  out.set(chunk, tail.length - start);
   return out;
 }
 
@@ -282,7 +382,9 @@ function concatBytes(head: Uint8Array, tail: Uint8Array): Uint8Array {
  * tail that still overlaps the head until the stream is longer than both
  * caps, so a covered stream (`totalBytes <= head + tail`) is head plus the
  * non-overlapping suffix of tail — not a blind concatenation. A longer
- * stream has a gap: lossy-utf8(head) + ellipsis + lossy-utf8(tail).
+ * stream has a gap: lossy-utf8(head) + ellipsis + lossy-utf8(tail). The
+ * capture starts its tail at a terminal-parser boundary (see
+ * {@link TerminalByteState}), so the tail is parsed from the ground state.
  */
 export function formatBoundedStream(stream: BoundedByteView): CliStreamText {
   const truncated = stream.totalBytes > stream.head.length + stream.tail.length;

@@ -5,7 +5,7 @@ import { onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
-import { createContext } from "@ws-model-proxy/api/context";
+import { type Context as ApiContext, createContext } from "@ws-model-proxy/api/context";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -22,6 +22,7 @@ import { logger } from "hono/logger";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
+import { ALWAYS_CSRF_PROTECTED_PROCEDURES } from "./csrf-policy.js";
 import { deviceCodeBodyCap, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
@@ -862,10 +863,19 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api-reference/*", createRateLimiterMiddleware(rpcLimiter));
 
   // When CORS_ORIGIN is set (cross-origin deployment), validate the x-csrf-token
-  // header sent by the client's SimpleCsrfProtectionLinkPlugin. Same-origin
-  // deployments don't need this because browsers block cross-origin custom
-  // headers at preflight anyway.
-  const csrfPlugins = env.CORS_ORIGIN ? [new SimpleCsrfProtectionHandlerPlugin()] : [];
+  // header sent by the client's SimpleCsrfProtectionLinkPlugin on every
+  // procedure. Same-origin deployments check it only on the procedures in
+  // ALWAYS_CSRF_PROTECTED_PROCEDURES: a cross-origin page (a same-site
+  // sibling subdomain, whose request still carries the SameSite=Lax session
+  // cookie) cannot add the header without a CORS preflight, which a
+  // same-origin deployment never grants.
+  const csrfPlugins = [
+    new SimpleCsrfProtectionHandlerPlugin<ApiContext>({
+      exclude: env.CORS_ORIGIN
+        ? false
+        : ({ path }) => !ALWAYS_CSRF_PROTECTED_PROCEDURES.has(path.join(".")),
+    }),
+  ];
 
   const apiHandler = new OpenAPIHandler(appRouter, {
     plugins: [

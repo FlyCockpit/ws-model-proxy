@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  appendRollingTail,
   CLI_OUTPUT_ELLIPSIS,
+  CLI_STREAM_HEAD_MAX_BYTES,
+  CLI_STREAM_TAIL_MAX_BYTES,
   cleanText,
   formatBoundedStream,
   redactCredentialSubstrings,
+  TerminalByteState,
 } from "./cli-command-output";
 
 const bytes = (text: string) => new TextEncoder().encode(text);
@@ -159,5 +164,136 @@ describe("formatBoundedStream", () => {
     expect(
       formatBoundedStream({ head: new Uint8Array(), tail: new Uint8Array(), totalBytes: 0 }),
     ).toEqual({ text: "", truncated: false, totalBytes: 0 });
+  });
+});
+
+/** A capture as the runtimes keep it: head, rolling tail, total. */
+function capture(stream: Uint8Array, chunkSize: number, tailMax = CLI_STREAM_TAIL_MAX_BYTES) {
+  const state = new TerminalByteState();
+  let tail = new Uint8Array();
+  for (let offset = 0; offset < stream.length; offset += chunkSize) {
+    tail = appendRollingTail(tail, stream.subarray(offset, offset + chunkSize), tailMax, state);
+  }
+  return {
+    head: stream.subarray(0, CLI_STREAM_HEAD_MAX_BYTES),
+    tail,
+    totalBytes: stream.length,
+  };
+}
+
+describe("appendRollingTail", () => {
+  it("matches every shared vector (the Rust CLI's capture checks the same file)", () => {
+    const shared = JSON.parse(
+      readFileSync(new URL("./terminal-tail-vectors.json", import.meta.url), "utf8"),
+    ) as { vectors: Array<{ streamHex: string; chunk: number; max: number; tailHex: string }> };
+    expect(shared.vectors.length).toBeGreaterThan(20);
+    for (const vector of shared.vectors) {
+      const stream = Uint8Array.from(Buffer.from(vector.streamHex, "hex"));
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      for (let offset = 0; offset < stream.length; offset += vector.chunk) {
+        tail = appendRollingTail(
+          tail,
+          stream.subarray(offset, offset + vector.chunk),
+          vector.max,
+          state,
+        );
+      }
+      expect(Buffer.from(tail).toString("hex"), vector.streamHex).toBe(vector.tailHex);
+    }
+  });
+
+  it("keeps exactly the last bytes of plain output", () => {
+    const stream = bytes("line of plain output\n".repeat(5000));
+    const view = capture(stream, 4096);
+    expect(view.tail).toEqual(stream.subarray(stream.length - CLI_STREAM_TAIL_MAX_BYTES));
+  });
+
+  it.each([
+    ["DCS", "\u001bPq", "\u001b\\"],
+    ["APC", "\u001b_", "\u001b\\"],
+    ["PM", "\u001b^", "\u001b\\"],
+    ["OSC", "\u001b]52;c;", "\u0007"],
+    ["8-bit APC", "\u009f", "\u009c"],
+  ])("never shows a %s body that the head/tail gap cuts into", (_label, open, close) => {
+    const stream = bytes(`VISIBLE\n${open}${"x".repeat(60_000)}\nHIDDEN PAYLOAD\n${close} AFTER\n`);
+    for (const chunkSize of [1, 4096, 1 << 20]) {
+      const view = formatBoundedStream(capture(stream, chunkSize));
+      expect(view.truncated).toBe(true);
+      expect(view.text).not.toContain("HIDDEN");
+      expect(view.text).not.toContain("xxx");
+      // The tail starts right after the terminator; " AFTER" survives the
+      // partial-token trim a truncated tail gets.
+      expect(view.text.endsWith(" AFTER\n")).toBe(true);
+    }
+  });
+
+  it("does not split a UTF-8 encoded C1 introducer at the tail's start", () => {
+    // U+009F (APC) is C2 9F. A tail starting at the 9F byte would decode it
+    // as U+FFFD and show the APC body.
+    const prefix = new Uint8Array(CLI_STREAM_TAIL_MAX_BYTES).fill(0x61);
+    const body = bytes("HIDDEN\u009cAFTER");
+    const stream = new Uint8Array(prefix.length + 2 + body.length);
+    stream.set(prefix, 0);
+    stream.set([0xc2, 0x9f], prefix.length);
+    stream.set(body, prefix.length + 2);
+    // One byte more than the tail holds, so the cut falls between C2 and 9F.
+    const view = capture(stream, 1, body.length + 1);
+    expect(new TextDecoder().decode(view.tail)).toBe("AFTER");
+  });
+
+  it("parses a tail on its own exactly as the whole stream parses from there", () => {
+    const pieces = [
+      "a",
+      "b ",
+      "\n",
+      "\u001b",
+      "[",
+      "31m",
+      "]",
+      "P",
+      "_",
+      "^",
+      "X",
+      "\\",
+      "\u0007",
+      "\u0018",
+      "\u009b",
+      "\u009c",
+      "\u009d",
+      "\u0090",
+      "é",
+      "😀",
+      "\ufffd",
+    ];
+    const raw = [0xc2, 0xe0, 0x80, 0xed, 0xf4, 0xff];
+    let seed = 7;
+    const random = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let round = 0; round < 3000; round += 1) {
+      const parts: number[] = [];
+      const length = 1 + random(40);
+      for (let item = 0; item < length; item += 1) {
+        if (random(8) === 0) parts.push(raw[random(raw.length)] ?? 0);
+        else parts.push(...bytes(pieces[random(pieces.length)] ?? ""));
+      }
+      const stream = Uint8Array.from(parts);
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      const max = 1 + random(12);
+      let offset = 0;
+      while (offset < stream.length) {
+        const end = Math.min(stream.length, offset + 1 + random(5));
+        tail = appendRollingTail(tail, stream.subarray(offset, end), max, state);
+        offset = end;
+      }
+      const dropped = stream.subarray(0, stream.length - tail.length);
+      const decode = (value: Uint8Array) => new TextDecoder().decode(value);
+      expect(cleanText(decode(stream)), JSON.stringify(parts)).toBe(
+        cleanText(decode(dropped)) + cleanText(decode(tail)),
+      );
+    }
   });
 });

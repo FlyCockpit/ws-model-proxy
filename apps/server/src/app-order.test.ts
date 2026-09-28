@@ -741,3 +741,74 @@ describe("createApp registration contract — device-code body cap runs first (f
     expect(pulls).toBeLessThanOrEqual(DEVICE_CODE_BODY_MAX_BYTES / 1024 + 4);
   });
 });
+
+describe("createApp registration contract — device-login approval needs the CSRF header", () => {
+  const approveBody = JSON.stringify({ json: { userCode: "ABCDEFGH", slug: "desk-01" } });
+  // A same-origin deployment: no CORS_ORIGIN, so the rest of /rpc checks no
+  // CSRF header (read by createApp at construction).
+  let savedCorsOrigin: string | undefined;
+  beforeEach(() => {
+    savedCorsOrigin = envMock.CORS_ORIGIN;
+    Reflect.deleteProperty(envMock, "CORS_ORIGIN");
+  });
+  afterEach(() => {
+    if (savedCorsOrigin !== undefined) envMock.CORS_ORIGIN = savedCorsOrigin;
+  });
+
+  it("refuses a headerless approval (a no-preflight cross-origin POST) before any auth or write", async () => {
+    const app = await buildApp(false);
+    for (const contentType of [undefined, "application/json", "text/plain"]) {
+      const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+        method: "POST",
+        headers: {
+          ...HOST,
+          origin: "https://evil.example.com",
+          ...(contentType ? { "content-type": contentType } : {}),
+        },
+        body: new TextEncoder().encode(approveBody),
+      });
+      expect(res.status, String(contentType)).toBe(403);
+      expect(await res.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
+    }
+  });
+
+  it("refuses it inside a batch too, even when the inner request names the header", async () => {
+    const app = await buildApp(false);
+    const res = await app.request(`${BASE}/rpc/__batch__`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json", "x-orpc-batch": "buffered" },
+      body: JSON.stringify([
+        {
+          url: `${BASE}/rpc/cliCredentials/approveDeviceLogin`,
+          headers: { "x-csrf-token": "orpc" },
+          body: JSON.parse(approveBody),
+        },
+      ]),
+    });
+    const text = await res.text();
+    expect(text).toContain("CSRF_TOKEN_MISMATCH");
+    expect(text).not.toContain("UNAUTHORIZED");
+  });
+
+  it("lets a request with the header reach the procedure (the session check answers)", async () => {
+    const app = await buildApp(false);
+    const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+      body: approveBody,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("leaves the CLI's headerless exchange alone on a same-origin deployment", async () => {
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "198.51.100.44" } });
+    const res = await app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json" },
+      body: JSON.stringify({ json: { deviceCode: "headerless-code", cliSlug: "desk-01" } }),
+    });
+    // The mocked database has no such code: the procedure ran.
+    expect(res.status).toBe(404);
+  });
+});

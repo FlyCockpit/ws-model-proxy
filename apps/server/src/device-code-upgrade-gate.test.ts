@@ -11,14 +11,19 @@ import { DEVICE_CODE_BODY_MAX_BYTES, deviceCodeUpgradeGate } from "./device-code
 
 function app() {
   const reached = vi.fn();
+  const types: Array<string | undefined> = [];
   const hono = new Hono();
   hono.use("/api/auth/device/code", deviceCodeUpgradeGate);
   hono.post("/api/auth/device/code", async (c) => {
+    types.push(c.req.header("content-type"));
     reached(await c.req.text());
     return c.json({ device_code: "real", user_code: "ABCD-EFGH" });
   });
-  return { hono, reached };
+  return { hono, reached, types };
 }
+
+const CLI_JSON = JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" });
+const CLI_FORM = "client_id=ws-model-proxy&scope=cli-slug%3Adesk-01";
 
 describe("device-code upgrade gate", () => {
   it.each([
@@ -45,65 +50,128 @@ describe("device-code upgrade gate", () => {
     expect(reached).not.toHaveBeenCalled();
   });
 
-  it("passes a request with a scope (valid or not) to Better Auth with its body intact", async () => {
-    const { hono, reached } = app();
-    for (const scope of ["cli-slug:desk-01", "not-a-slug-scope"]) {
-      const body = JSON.stringify({ client_id: "ws-model-proxy", scope });
-      const response = await hono.request("/api/auth/device/code", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-      expect(await response.json()).toMatchObject({ device_code: "real" });
-      expect(reached).toHaveBeenLastCalledWith(body);
-    }
-    const form = "client_id=ws-model-proxy&scope=cli-slug%3Adesk-01";
-    await hono.request("/api/auth/device/code", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: form,
-    });
-    expect(reached).toHaveBeenLastCalledWith(form);
-  });
-
-  it("strips a caller-supplied user_id so a public caller cannot pre-bind a code", async () => {
-    const { hono, reached } = app();
-    // JSON.
-    let response = await hono.request("/api/auth/device/code", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+  // What reaches Better Auth: only client_id and scope, as JSON under exactly
+  // application/json, however the caller encoded or disguised the request.
+  it.each([
+    ["the CLI's own request", "application/json", CLI_JSON, CLI_JSON],
+    [
+      "an invalid scope (Better Auth answers it)",
+      "application/json",
+      JSON.stringify({ client_id: "ws-model-proxy", scope: "not-a-slug-scope" }),
+      JSON.stringify({ client_id: "ws-model-proxy", scope: "not-a-slug-scope" }),
+    ],
+    ["a form", "application/x-www-form-urlencoded", CLI_FORM, CLI_JSON],
+    [
+      "a form with a charset",
+      "application/x-www-form-urlencoded; charset=UTF-8",
+      CLI_FORM,
+      CLI_JSON,
+    ],
+    [
+      "a mixed-case form type",
+      "Application/X-Www-Form-Urlencoded",
+      `${CLI_FORM}&user_id=victim`,
+      CLI_JSON,
+    ],
+    ["a form user_id", "application/x-www-form-urlencoded", `${CLI_FORM}&user_id=victim`, CLI_JSON],
+    [
+      "a percent-encoded form key",
+      "application/x-www-form-urlencoded",
+      `${CLI_FORM}&user%5Fid=victim`,
+      CLI_JSON,
+    ],
+    [
+      "a repeated form key",
+      "application/x-www-form-urlencoded",
+      `${CLI_FORM}&user_id=a&user_id=b`,
+      CLI_JSON,
+    ],
+    [
+      "a repeated form scope (first wins)",
+      "application/x-www-form-urlencoded",
+      `${CLI_FORM}&scope=cli-slug%3Aother`,
+      CLI_JSON,
+    ],
+    [
+      "a JSON user_id",
+      "application/json",
+      JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01", user_id: "victim" }),
+      CLI_JSON,
+    ],
+    [
+      "an escaped JSON key",
+      "application/json",
+      '{"client_id":"ws-model-proxy","scope":"cli-slug:desk-01","user\\u005fid":"victim"}',
+      CLI_JSON,
+    ],
+    [
+      "a repeated JSON key",
+      "application/json",
+      '{"client_id":"ws-model-proxy","scope":"cli-slug:desk-01","user_id":"a","user_id":"b"}',
+      CLI_JSON,
+    ],
+    [
+      "a nested user_id",
+      "application/json",
+      JSON.stringify({
         client_id: "ws-model-proxy",
         scope: "cli-slug:desk-01",
-        user_id: "victim-account",
+        extra: { user_id: "victim" },
       }),
-    });
-    expect(await response.json()).toMatchObject({ device_code: "real" });
-    expect(reached).toHaveBeenLastCalledWith(
-      JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" }),
-    );
-    // Form-urlencoded.
-    response = await hono.request("/api/auth/device/code", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "client_id=ws-model-proxy&scope=cli-slug%3Adesk-01&user_id=victim-account",
-    });
-    expect(await response.json()).toMatchObject({ device_code: "real" });
-    expect(reached).toHaveBeenLastCalledWith("client_id=ws-model-proxy&scope=cli-slug%3Adesk-01");
-  });
-
-  it("does not rewrite a body that carries no user_id", async () => {
-    const { hono, reached } = app();
-    // Non-canonical JSON spacing must survive untouched when there is nothing
-    // to strip.
-    const body = '{ "client_id": "ws-model-proxy", "scope": "cli-slug:desk-01" }';
+      CLI_JSON,
+    ],
+    [
+      "a __proto__ key",
+      "application/json",
+      '{"client_id":"ws-model-proxy","scope":"cli-slug:desk-01","__proto__":{"user_id":"victim"}}',
+      CLI_JSON,
+    ],
+    [
+      "a form hidden in a JSON string under a type that names both",
+      "application/json; x=application/x-www-form-urlencoded",
+      JSON.stringify({
+        client_id: "ws-model-proxy",
+        scope: "cli-slug:desk-01",
+        extra: "&user_id=victim&x=",
+      }),
+      CLI_JSON,
+    ],
+    ["an upper-case JSON type", "APPLICATION/JSON", CLI_JSON, CLI_JSON],
+    ["a +json type", "application/vnd.wsmp+json", CLI_JSON, CLI_JSON],
+    [
+      "a non-string client_id",
+      "application/json",
+      JSON.stringify({ client_id: 7, scope: "cli-slug:desk-01" }),
+      JSON.stringify({ scope: "cli-slug:desk-01" }),
+    ],
+    ["a whitespace-padded body", "application/json", `  ${CLI_JSON}\n`, CLI_JSON],
+  ])("forwards only client_id and scope for %s", async (_label, type, body, forwarded) => {
+    const { hono, reached, types } = app();
     const response = await hono.request("/api/auth/device/code", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": type },
       body,
     });
     expect(await response.json()).toMatchObject({ device_code: "real" });
-    expect(reached).toHaveBeenLastCalledWith(body);
+    expect(reached).toHaveBeenLastCalledWith(forwarded);
+    expect(types).toEqual(["application/json"]);
+  });
+
+  it.each([
+    ["an array", "application/json", "[1,2]", 400],
+    ["malformed JSON", "application/json", '{"scope":', 400],
+    ["a JSON string", "application/json", '"cli-slug:desk-01"', 400],
+    ["multipart", "multipart/form-data; boundary=x", CLI_FORM, 415],
+    ["text", "text/plain", CLI_JSON, 415],
+  ])("refuses %s before Better Auth", async (_label, type, body, status) => {
+    const { hono, reached } = app();
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: { "content-type": type },
+      body,
+    });
+    expect(response.status).toBe(status);
+    expect(reached).not.toHaveBeenCalled();
   });
 
   /** A body with no Content-Length that yields 1 KiB chunks on demand. */
@@ -153,7 +221,7 @@ describe("device-code upgrade gate", () => {
     expect(reached).not.toHaveBeenCalled();
   });
 
-  it("passes an unlength'd body at the cap to Better Auth intact", async () => {
+  it("passes an unlength'd body at the cap on to Better Auth", async () => {
     const { hono, reached } = app();
     const text = JSON.stringify({ scope: "cli-slug:desk-01", pad: "" });
     const padded = JSON.stringify({
@@ -176,7 +244,7 @@ describe("device-code upgrade gate", () => {
       duplex: "half",
     } as RequestInit);
     expect(await response.json()).toMatchObject({ device_code: "real" });
-    expect(reached).toHaveBeenLastCalledWith(padded);
+    expect(reached).toHaveBeenLastCalledWith(JSON.stringify({ scope: "cli-slug:desk-01" }));
   });
 
   it("uses an upgrade message that a 0.3.x login prints instead of retrying", () => {
@@ -251,6 +319,12 @@ describe("device-code upgrade gate + Better Auth /device/code", () => {
     ["mixed-case JSON type", "Application/JSON", `${JSON_START},"user_id":"victim-account"}`],
     ["escaped JSON key", "application/json", `${JSON_START},"user\\u005fid":"victim-account"}`],
     [
+      "JSON type that also names the form type (Better Auth re-reads it as a form)",
+      "application/json; note=application/x-www-form-urlencoded",
+      `${JSON_START},"extra":"&client_id=ws-model-proxy&scope=cli-slug:desk-01&user_id=victim-account&x="}`,
+    ],
+    ["+json type", "application/vnd.wsmp+json", `${JSON_START},"user_id":"victim-account"}`],
+    [
       "repeated JSON key",
       "application/json",
       `${JSON_START},"user_id":"victim-account","user_id":"victim-account"}`,
@@ -285,14 +359,16 @@ describe("device-code upgrade gate + Better Auth /device/code", () => {
     expect(db.deviceCode).toHaveLength(0);
   });
 
-  it("forwards a +json body with user_id stripped (Better Auth itself refuses the type)", async () => {
+  it("refuses a body that is not a JSON object with 400 and creates nothing", async () => {
     const { hono, db } = buildHandler();
-    const response = await hono.request("/api/auth/device/code", {
-      method: "POST",
-      headers: { "content-type": "application/vnd.wsmp+json" },
-      body: `${JSON_START},"user_id":"victim-account"}`,
-    });
-    expect(response.status).toBe(415);
+    for (const body of ["[1,2]", "not json", '"cli-slug:desk-01"']) {
+      const response = await hono.request("/api/auth/device/code", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(response.status, body).toBe(400);
+    }
     expect(db.deviceCode).toHaveLength(0);
   });
 });

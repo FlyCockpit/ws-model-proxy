@@ -12,7 +12,11 @@ import type {
   SupervisedCommandStatus,
   SupervisedOutputMode,
 } from "@ws-model-proxy/api/lib/supervised-command-types";
-import { cleanText } from "@ws-model-proxy/config/cli-command-output";
+import {
+  appendRollingTail,
+  cleanText,
+  TerminalByteState,
+} from "@ws-model-proxy/config/cli-command-output";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { relayProtocolAtLeast } from "./protocol.js";
@@ -118,6 +122,8 @@ type MutableBounded = {
   head: Uint8Array;
   tail: Uint8Array;
   totalBytes: number;
+  /** The terminal parser across the bytes dropped from the tail's front. */
+  tailState: TerminalByteState;
 };
 
 type CommandRecord = TrackedCliCommand & {
@@ -140,7 +146,12 @@ type CommandRecord = TrackedCliCommand & {
 const commandsById = new Map<string, CommandRecord>();
 
 function emptyBounded(): MutableBounded {
-  return { head: new Uint8Array(), tail: new Uint8Array(), totalBytes: 0 };
+  return {
+    head: new Uint8Array(),
+    tail: new Uint8Array(),
+    totalBytes: 0,
+    tailState: new TerminalByteState(),
+  };
 }
 
 function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -152,14 +163,6 @@ function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
   return merged;
 }
 
-function rollingAppend(existing: Uint8Array, chunk: Uint8Array, max: number): Uint8Array {
-  if (chunk.byteLength >= max) return chunk.subarray(chunk.byteLength - max).slice();
-  const combined = existing.byteLength + chunk.byteLength;
-  if (combined <= max) return concatBytes(existing, chunk);
-  const keep = max - chunk.byteLength;
-  return concatBytes(existing.subarray(existing.byteLength - keep), chunk);
-}
-
 function appendBounded(state: MutableBounded, chunk: Uint8Array) {
   if (chunk.byteLength === 0) return;
   const copy = chunk.slice();
@@ -168,7 +171,9 @@ function appendBounded(state: MutableBounded, chunk: Uint8Array) {
     const take = Math.min(room, copy.byteLength);
     state.head = concatBytes(state.head, copy.subarray(0, take));
   }
-  state.tail = rollingAppend(state.tail, copy, TAIL_MAX_BYTES);
+  // Starts at a terminal-parser boundary, so a DCS/APC/PM/OSC body that the
+  // head/tail gap cuts into is never shown as text.
+  state.tail = appendRollingTail(state.tail, copy, TAIL_MAX_BYTES, state.tailState);
   state.totalBytes += copy.byteLength;
 }
 
