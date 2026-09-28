@@ -26,7 +26,9 @@ const availableClassName = "border-amber-500/40 bg-amber-500/10 text-amber-950 d
  * activation and hover, so they are reachable on touch devices and by
  * keyboard alone. Inside another interactive control
  * (a combobox trigger, a list option, a checkbox label) pass
- * `interactive={false}`; a nested button would be invalid there.
+ * `interactive={false}`; a nested button would be invalid there. The 44px hit
+ * area reaches 12px above and below the 20px chip, so stacked badges need
+ * rows at least 44px tall (`min-h-11`) or their hit areas overlap.
  */
 export function PoolFallbackBadge({
   routes,

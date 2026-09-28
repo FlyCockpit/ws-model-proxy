@@ -223,6 +223,24 @@ function dedupePools(pools: VisibleModelPoolTarget[]): VisibleModelPoolTarget[] 
   return deduped;
 }
 
+/**
+ * A grantee's saved own-key preference counts only while its provider model
+ * and account are enabled, not deleted, and hold an ACTIVE credential. Every
+ * surface that lists the own-key route (token preview, Chat Test, Overview)
+ * filters with this.
+ */
+export const readyOwnKeyPreferenceWhere = {
+  ProviderModel: {
+    enabled: true,
+    deletedAt: null,
+    ProviderAccount: {
+      enabled: true,
+      deletedAt: null,
+      CurrentCredential: { status: "ACTIVE" },
+    },
+  },
+} satisfies Prisma.PoolFallbackPreferenceWhereInput;
+
 export async function listVisibleModelTargetsForUser(userId: string): Promise<VisibleModelTargets> {
   const [directModelRows, ownedPoolRows, grantedPoolRows] = await Promise.all([
     prisma.discoveredModel.findMany({
@@ -242,17 +260,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         id: true,
         ModelPool: { select: modelPoolSelect },
         FallbackPreferences: {
-          where: {
-            ProviderModel: {
-              enabled: true,
-              deletedAt: null,
-              ProviderAccount: {
-                enabled: true,
-                deletedAt: null,
-                CurrentCredential: { status: "ACTIVE" },
-              },
-            },
-          },
+          where: readyOwnKeyPreferenceWhere,
           select: { providerModelId: true },
         },
       },

@@ -47,7 +47,9 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   gone.** The old oRPC and MCP arguments (`publicEgressAcknowledged`,
   `publicEgressEnabled`, the privacy-confirm flags) are silently stripped. Use
   `fallbackEnabled`, `fallbackForGrantees` and `externalAfterWaitMs` on the
-  pool procedures.
+  pool procedures in the dashboard or oRPC API. Over MCP only
+  `externalAfterWaitMs` is accepted: MCP rejects `fallbackEnabled` and
+  `fallbackForGrantees` (only a person may change them, in the dashboard).
 - **Context-ceiling requests on plain names now fail** instead of falling back
   to a provider. With `:external` and token consent they may go external.
 - **A wait budget of 0 means "admit only if a slot is free right now"**

@@ -476,6 +476,16 @@ it("never saves external consent from a create draft while the switch is off", a
   expect(state.calls.map((call) => call.name)).toEqual(["create"]);
 });
 
+it("gives each stacked preview badge a 44px row so hit areas do not overlap", async () => {
+  mount();
+  openCreate();
+  const badges = await screen.findAllByRole("button", {
+    name: "dashboard:pools.fallbackBadge.label",
+  });
+  expect(badges.length).toBeGreaterThanOrEqual(2);
+  for (const badge of badges) expect(badge.parentElement?.className).toContain("min-h-11");
+});
+
 it("words the saved-pools hint for tokens that got their pools at creation too", () => {
   state.tokens = [existingToken()];
   mount();

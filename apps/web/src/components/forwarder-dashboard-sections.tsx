@@ -3866,7 +3866,8 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
           </code>
         ))}
         {preview.modelPools.map((pool) => (
-          <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
+          // min-h-11 keeps each badge's 44px hit area inside its own row.
+          <div key={pool.id} className="flex min-h-11 min-w-0 flex-wrap items-center gap-2">
             <PoolFallbackBadge
               routes={pool.externalRoutes}
               providers={

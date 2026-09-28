@@ -31,6 +31,7 @@ import {
   externalFallbackMemberWhere,
   poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
+import { readyOwnKeyPreferenceWhere } from "../lib/model-api-token-access";
 import {
   type Accumulator,
   type AggregateRow,
@@ -404,17 +405,7 @@ export const overviewRouter = {
             select: {
               poolId: true,
               FallbackPreferences: {
-                where: {
-                  ProviderModel: {
-                    enabled: true,
-                    deletedAt: null,
-                    ProviderAccount: {
-                      enabled: true,
-                      deletedAt: null,
-                      CurrentCredential: { status: "ACTIVE" },
-                    },
-                  },
-                },
+                where: readyOwnKeyPreferenceWhere,
                 select: { providerModelId: true },
               },
               ModelPool: {

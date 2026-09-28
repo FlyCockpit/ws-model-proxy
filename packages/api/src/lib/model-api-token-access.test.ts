@@ -751,6 +751,27 @@ describe("static external availability for each viewer", () => {
         });
         expect(result.modelPools[0]?.externalRoutes).toEqual(expected);
         expect(result.modelPools[0]?.effectiveProviderEgress).toBe(expected.length > 0);
+        // Only a ready preference counts: live model and account, ACTIVE credential.
+        expect(db.poolGrant.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            select: expect.objectContaining({
+              FallbackPreferences: {
+                where: {
+                  ProviderModel: {
+                    enabled: true,
+                    deletedAt: null,
+                    ProviderAccount: {
+                      enabled: true,
+                      deletedAt: null,
+                      CurrentCredential: { status: "ACTIVE" },
+                    },
+                  },
+                },
+                select: { providerModelId: true },
+              },
+            }),
+          }),
+        );
       } finally {
         env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
       }

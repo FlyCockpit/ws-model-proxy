@@ -19,6 +19,7 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { overviewRouter } = await import("./overview");
+const { readyOwnKeyPreferenceWhere } = await import("../lib/model-api-token-access");
 
 const db = prisma as unknown as {
   appSetting: { findUnique: MockInstance };
@@ -403,6 +404,17 @@ describe("overviewRouter.metrics", () => {
     expect(db.poolGrant.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { granteeUserId: "owner-id", poolId: { in: ["shared-pool", "revoked-pool"] } },
+      }),
+    );
+    // The own-key route counts only a ready preference, as on the token surfaces.
+    expect(db.poolGrant.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({
+          FallbackPreferences: {
+            where: readyOwnKeyPreferenceWhere,
+            select: { providerModelId: true },
+          },
+        }),
       }),
     );
     expect(result.sharedPools).toEqual([
