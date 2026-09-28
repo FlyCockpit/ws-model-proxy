@@ -211,7 +211,12 @@ describe("OpenRouter usage dialect", () => {
   it.each([
     [
       "a usage object nested in usage",
-      (usage: Record<string, unknown>) => ({ usage: { ...usage, usage: { ...usage } } }),
+      (usage: Record<string, unknown>) => ({
+        usage: {
+          ...usage,
+          usage: { ...usage, cost: 0.000001, currency: "USD", pricing_version: "v" },
+        },
+      }),
     ],
     [
       "a sibling response.usage",
@@ -222,7 +227,11 @@ describe("OpenRouter usage dialect", () => {
     const { usage } = structuredClone(openRouterFixture.nonStream) as {
       usage: Record<string, unknown>;
     };
-    expect(usageFromObject(envelope(usage), "openrouter")?.categoriesComplete).toBe(false);
+    const ambiguous = usageFromObject(envelope(usage), "openrouter");
+    expect(ambiguous?.categoriesComplete).toBe(false);
+    // Evidence only: neither container's charge may settle.
+    expect(ambiguous?.reportedCost).toBeUndefined();
+    expect(ambiguous?.authoritativeBillableTokens).toBeUndefined();
     expect(usageFromObject({ usage }, "openrouter")?.categoriesComplete).toBe(true);
   });
 

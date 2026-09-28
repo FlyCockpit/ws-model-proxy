@@ -266,7 +266,9 @@ liability path. OpenRouter reports usage once per response, so a response that
 carries two different usage observations anywhere in the stream (including one
 the parser cannot read, or a second usage container in one record) keeps them
 as audit evidence only: neither an earlier charge nor an earlier total can
-settle below the liability. Other provider types do not accept this
+settle below the liability. A stream settles only the single usage record it
+actually carried; usage-looking text elsewhere (for example in SSE comments)
+never settles. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices

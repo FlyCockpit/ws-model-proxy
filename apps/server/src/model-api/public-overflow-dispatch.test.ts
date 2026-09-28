@@ -2904,6 +2904,60 @@ describe("OpenRouter owner-paid settlement", () => {
     60_000,
   );
 
+  it("settles only the usage record the stream itself carried", async () => {
+    db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+    try {
+      const small = {
+        prompt_tokens: 1,
+        completion_tokens: 0,
+        total_tokens: 1,
+        cost: 0.000001,
+        is_byok: false,
+      };
+      const big = {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        is_byok: false,
+      };
+      const data = (value: unknown) => Buffer.from(`data: ${JSON.stringify(value)}\n\n`);
+      const comment = (text: string) => Buffer.from(`: ${text}\n\n`);
+      const padding = (count: number) =>
+        Array.from({ length: count }, () => comment("x".repeat(1024)));
+      const done = Buffer.from("data: [DONE]\n\n");
+      // A record whose usage sits in a root `response`, outside both windows.
+      const responseContainer = await settleOwnerStream("openrouter", [
+        data({ choices: [], usage: small }),
+        ...padding(600),
+        data({ choices: [], response: big }),
+        ...padding(1100),
+        done,
+      ]);
+      // Usage text inside an SSE comment is not a record.
+      const commentOnly = await settleOwnerStream("openrouter", [
+        comment(JSON.stringify({ usage: small })),
+        ...padding(1200),
+        done,
+      ]);
+      for (const settled of [responseContainer, commentOnly]) {
+        expect(settled.usage?.reportedCost).toBeUndefined();
+        expect(settled.usage?.calculatedCost).toBeUndefined();
+        if (settled.usage) expect(providerBillableTokens(settled.usage)).toBeUndefined();
+      }
+      // One honest record held by both the prefix and the tail still settles.
+      const overlap = await settleOwnerStream("openrouter", [
+        ...padding(40),
+        data({ choices: [], usage: big }),
+        ...padding(1000),
+        done,
+      ]);
+      expect(overlap.usage.categoriesComplete).toBe(true);
+      expect(providerBillableTokens(overlap.usage)).toBe(1_100n);
+    } finally {
+      db.providerPricingVersion.findFirst.mockReset();
+    }
+  }, 60_000);
+
   it.each([
     { label: "complete prefix, incomplete tail", writes: [0, 1000], complete: false },
     { label: "incomplete prefix, complete tail", writes: [1000, 0], complete: false },

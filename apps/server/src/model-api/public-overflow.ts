@@ -1253,6 +1253,17 @@ export function usageFromObject(
   const openRouter = dialect === "openrouter";
   if (!value || typeof value !== "object") return undefined;
   const root = value as Record<string, unknown>;
+  // Only one usage container is read: a second envelope container, or a
+  // `usage` nested inside the top-level one, would hide the other counts and
+  // charge. The OpenRouter dialect keeps such a record as evidence only.
+  if (
+    openRouter &&
+    ([root.usage, root.response, root.message].filter((item) => item != null).length > 1 ||
+      (root.usage != null && usageRecord(root.usage)?.usage != null))
+  ) {
+    const observed = usageFromObject(value, "generic");
+    return observed && unattributableUsage(observed);
+  }
   // Responses terminal stream events nest the authoritative usage object in
   // `response.usage`; Chat and Anthropic expose it at the other two shapes.
   const raw = (root.usage ?? root.response ?? root.message) as Record<string, unknown> | undefined;
@@ -1374,10 +1385,6 @@ export function usageFromObject(
   const hasOpenRouterUnknown =
     openRouter &&
     (!openRouterMetadataValid(usage) ||
-      // Only one usage container is read: a second envelope container, or a
-      // `usage` nested inside the top-level one, would hide the other counts.
-      [root.usage, root.response, root.message].filter((item) => item != null).length > 1 ||
-      (root.usage != null && usage !== root.usage) ||
       // The generic parser reads only the first of two alias spellings and
       // ignores a non-object detail container. Both would let a second
       // representation hide counts or unknown keys, so the dialect rejects them.
@@ -1526,8 +1533,8 @@ export function parseProviderUsage(
     try {
       const parsed: unknown = JSON.parse(candidate);
       if (dialect === "openrouter") {
-        const envelope = openRouterUsageEnvelopeKey(parsed);
-        if (envelope !== undefined) openRouterEnvelopes.add(envelope);
+        const carried = openRouterUsageEnvelope(parsed);
+        if (carried) openRouterEnvelopes.add(carried.envelope);
       }
       const observed = usageFromObject(parsed, dialect);
       if (observed) {
@@ -1689,20 +1696,22 @@ export function retainProviderUsagePrefix(
 }
 
 /**
- * Identity of the usage an OpenRouter response record carries (top-level
- * `usage`, or a nested `response.usage` / `message.usage`), or undefined when
- * it carries none. `usage: null` is absence: Chat streams send it in every
- * intermediate chunk.
+ * The usage an OpenRouter response record carries, selected exactly as
+ * `usageFromObject` selects it: `envelope` identifies every usage container in
+ * the record and `observation` is the selected usage object (its `rawUsage`).
+ * `usage: null` is absence: Chat streams send it in every intermediate chunk.
  */
-export function openRouterUsageEnvelopeKey(value: unknown): string | undefined {
+export function openRouterUsageEnvelope(
+  value: unknown,
+): { envelope: string; observation: string } | undefined {
   const root = usageRecord(value);
   if (!root) return undefined;
-  const containers = [
-    root.usage ?? null,
-    usageRecord(root.response)?.usage ?? null,
-    usageRecord(root.message)?.usage ?? null,
-  ];
-  return containers.some((item) => item !== null) ? JSON.stringify(containers) : undefined;
+  const containers = [root.usage ?? null, root.response ?? null, root.message ?? null];
+  const raw = containers.find((item) => item !== null);
+  if (raw === undefined) return undefined;
+  const nested = usageRecord(raw)?.usage;
+  const selected = nested && typeof nested === "object" ? nested : raw;
+  return { envelope: JSON.stringify(containers), observation: JSON.stringify(selected) };
 }
 
 /** Drops a window's calculated cost; only the merged categories may be priced. */
@@ -1748,10 +1757,13 @@ export function mergeProviderUsage(
   dialect: ProviderUsageDialect = "generic",
 ): RawProviderUsage | undefined {
   if (!initial || !tail) return tail ?? initial;
+  // Overlapping windows can hold the same OpenRouter record: one observation.
   if (
     dialect === "openrouter" &&
-    JSON.stringify(initial.rawUsage) !== JSON.stringify(tail.rawUsage)
+    JSON.stringify(initial.rawUsage) === JSON.stringify(tail.rawUsage)
   )
+    return tail;
+  if (dialect === "openrouter")
     return unattributableUsage({
       ...withoutCalculatedCost(initial),
       ...Object.fromEntries(Object.entries(tail).filter(([, value]) => value !== undefined)),
@@ -2798,14 +2810,19 @@ export async function dispatchPublicOverflow(
       // OpenRouter reports usage once. Distinct usage-bearing records are
       // counted over the whole stream, not only the retained prefix and tail:
       // a record between them could otherwise leave an earlier one to settle.
+      // Only the single observation this count saw may settle; anything the
+      // retained windows yield beyond it (SSE comment text, a divergent
+      // container) is evidence only.
       const openRouterUsageEnvelopes =
-        terminalDecoder && target.usageDialect === "openrouter" ? new Set<string>() : undefined;
+        terminalDecoder && target.usageDialect === "openrouter"
+          ? new Map<string, string>()
+          : undefined;
       const observeUsageEnvelope = (data: string) => {
         if (!openRouterUsageEnvelopes || openRouterUsageEnvelopes.size > 1 || data === "[DONE]")
           return;
         try {
-          const envelope = openRouterUsageEnvelopeKey(JSON.parse(data));
-          if (envelope !== undefined) openRouterUsageEnvelopes.add(envelope);
+          const carried = openRouterUsageEnvelope(JSON.parse(data));
+          if (carried) openRouterUsageEnvelopes.set(carried.envelope, carried.observation);
         } catch {
           // Non-JSON records carry no usage.
         }
@@ -2883,8 +2900,16 @@ export async function dispatchPublicOverflow(
             surface,
             target.usageDialect,
           );
+          const countedObservations = openRouterUsageEnvelopes
+            ? [...openRouterUsageEnvelopes.values()]
+            : [];
           const combinedUsage =
-            mergedUsage && openRouterUsageEnvelopes && openRouterUsageEnvelopes.size > 1
+            mergedUsage &&
+            openRouterUsageEnvelopes &&
+            !(
+              countedObservations.length === 1 &&
+              JSON.stringify(mergedUsage.rawUsage) === countedObservations[0]
+            )
               ? unattributableUsage(mergedUsage)
               : mergedUsage;
           const combinedCost =
