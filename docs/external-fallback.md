@@ -262,13 +262,14 @@ conservative liability path until a redacted capture confirms it. Two spellings
 of the same count (for example `prompt_tokens_details` and
 `input_tokens_details`), a non-object detail container, and any other
 unrecognized or malformed field also keep that response on the conservative
-liability path. OpenRouter reports usage once per response, so a response that
-carries two different usage observations anywhere in the stream (including one
-the parser cannot read, or a second usage container in one record) keeps them
-as audit evidence only: neither an earlier charge nor an earlier total can
-settle below the liability. A stream settles only the single usage record it
-actually carried; usage-looking text elsewhere (for example in SSE comments)
-never settles. Other provider types do not accept this
+liability path. OpenRouter reports usage once, in a root `usage` object, so a
+response settles only when it carries exactly one distinct usage-bearing record
+(an SSE `data:` record anywhere in the stream, or the whole non-stream body) and
+that record is complete. Several different records, a second usage container in
+one record (`usage.usage`, a root `response` or `message`), or a stream that
+stops being valid SSE keep the usage as audit evidence only: no charge and no
+total from it settles below the liability. Usage-looking text outside a record
+(for example in SSE comments or a truncated body) is never read. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices

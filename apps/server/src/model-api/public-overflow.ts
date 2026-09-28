@@ -1253,13 +1253,15 @@ export function usageFromObject(
   const openRouter = dialect === "openrouter";
   if (!value || typeof value !== "object") return undefined;
   const root = value as Record<string, unknown>;
-  // Only one usage container is read: a second envelope container, or a
-  // `usage` nested inside the top-level one, would hide the other counts and
-  // charge. The OpenRouter dialect keeps such a record as evidence only.
+  // OpenRouter (Chat only) reports usage in a root `usage` object. Only one
+  // container is read: another root container, or a `usage` nested inside the
+  // top-level one, would hide the other counts and charge. The dialect keeps
+  // any such record as evidence only.
   if (
     openRouter &&
-    ([root.usage, root.response, root.message].filter((item) => item != null).length > 1 ||
-      (root.usage != null && usageRecord(root.usage)?.usage != null))
+    (usageRecord(root.usage) === undefined ||
+      [root.usage, root.response, root.message].filter((item) => item != null).length > 1 ||
+      usageRecord(root.usage)?.usage != null)
   ) {
     const observed = usageFromObject(value, "generic");
     return observed && unattributableUsage(observed);
@@ -1504,6 +1506,8 @@ export function parseProviderUsage(
   dialect: ProviderUsageDialect = "generic",
 ) {
   if (chunks.length === 0) return undefined;
+  if (dialect === "openrouter")
+    return openRouterUsageFromRecords(...openRouterRecords(chunks), pricing);
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   const candidates = [text];
   // SSE observations are decoded in wire order below. Tail extraction is for
@@ -1523,20 +1527,12 @@ export function parseProviderUsage(
   }
   let found: RawProviderUsage | undefined;
   let categoriesComplete = true;
-  // Every usage-bearing record counts, including one the parser cannot read:
-  // an unreadable later observation must not leave an earlier one to settle.
-  const openRouterEnvelopes = new Set<string>();
   const rawObservations: Prisma.InputJsonValue[] = [];
   const rawObservationKeys = new Set<string>();
   for (const candidate of candidates) {
     if (!candidate || candidate === "[DONE]") continue;
     try {
-      const parsed: unknown = JSON.parse(candidate);
-      if (dialect === "openrouter") {
-        const carried = openRouterUsageEnvelope(parsed);
-        if (carried) openRouterEnvelopes.add(carried.envelope);
-      }
-      const observed = usageFromObject(parsed, dialect);
+      const observed = usageFromObject(JSON.parse(candidate), dialect);
       if (observed) {
         if (observed.categoriesComplete === false) categoriesComplete = false;
         if (observed.rawUsage !== undefined) {
@@ -1557,8 +1553,6 @@ export function parseProviderUsage(
     }
   }
   if (!found) return undefined;
-  if (dialect === "openrouter" && (rawObservations.length > 1 || openRouterEnvelopes.size > 1))
-    return unattributableUsage({ ...found, rawUsage: rawObservations });
   const normalized: RawProviderUsage = {
     ...found,
     rawUsage: rawObservations.length === 1 ? found.rawUsage : rawObservations,
@@ -1569,6 +1563,13 @@ export function parseProviderUsage(
         ? categoriesComplete
         : found.categoriesComplete,
   };
+  return withCalculatedCost(normalized, pricing);
+}
+
+function withCalculatedCost(
+  normalized: RawProviderUsage,
+  pricing: ProviderPricingSchedule | undefined,
+): RawProviderUsage {
   const calculated = pricing ? calculatedCostForUsage(normalized, pricing) : undefined;
   return calculated
     ? {
@@ -1696,22 +1697,112 @@ export function retainProviderUsagePrefix(
 }
 
 /**
- * The usage an OpenRouter response record carries, selected exactly as
- * `usageFromObject` selects it: `envelope` identifies every usage container in
- * the record and `observation` is the selected usage object (its `rawUsage`).
- * `usage: null` is absence: Chat streams send it in every intermediate chunk.
+ * Identity of the usage an OpenRouter response record carries: every usage
+ * container of the root (`usage`, `response`, `message`), or undefined when it
+ * carries none. `usage: null` is absence: Chat streams send it in every
+ * intermediate chunk.
  */
-export function openRouterUsageEnvelope(
-  value: unknown,
-): { envelope: string; observation: string } | undefined {
+export function openRouterUsageEnvelope(value: unknown): string | undefined {
   const root = usageRecord(value);
   if (!root) return undefined;
   const containers = [root.usage ?? null, root.response ?? null, root.message ?? null];
-  const raw = containers.find((item) => item !== null);
-  if (raw === undefined) return undefined;
-  const nested = usageRecord(raw)?.usage;
-  const selected = nested && typeof nested === "object" ? nested : raw;
-  return { envelope: JSON.stringify(containers), observation: JSON.stringify(selected) };
+  return containers.some((item) => item !== null) ? JSON.stringify(containers) : undefined;
+}
+
+/**
+ * Collects the distinct usage-bearing records of one OpenRouter response.
+ * Two distinct records already make the response unattributable, so at most
+ * two are kept (bounded memory over an arbitrarily long stream).
+ */
+export class OpenRouterUsageRecords {
+  readonly #records = new Map<string, unknown>();
+
+  observe(value: unknown) {
+    if (this.#records.size > 1) return;
+    const envelope = openRouterUsageEnvelope(value);
+    if (envelope !== undefined && !this.#records.has(envelope)) this.#records.set(envelope, value);
+  }
+
+  observeData(data: string) {
+    if (this.#records.size > 1 || data === "[DONE]") return;
+    try {
+      this.observe(JSON.parse(data));
+    } catch {
+      // Non-JSON records carry no usage.
+    }
+  }
+
+  get records(): readonly unknown[] {
+    return [...this.#records.values()];
+  }
+}
+
+/**
+ * Decodes a retained OpenRouter body into records: its SSE `data:` records when
+ * it is an SSE stream, otherwise the whole body as one JSON document. Comment
+ * lines, and usage-looking text outside a complete record, never become one.
+ */
+function openRouterRecords(
+  chunks: readonly Uint8Array[],
+): [records: readonly unknown[], readable: boolean] {
+  const collected = new OpenRouterUsageRecords();
+  const decoder = new SseDecoder();
+  let sawRecord = false;
+  let readable = true;
+  try {
+    for (const chunk of chunks)
+      for (const record of decoder.push(chunk)) {
+        sawRecord = true;
+        collected.observeData(record.data);
+      }
+    for (const record of decoder.finish()) {
+      sawRecord = true;
+      collected.observeData(record.data);
+    }
+  } catch {
+    // Not SSE: read the whole body as JSON below. A stream that stops being
+    // valid SSE after some records may hide a later record: unreadable.
+    readable = !sawRecord;
+  }
+  if (sawRecord) return [collected.records, readable];
+  try {
+    collected.observe(
+      JSON.parse(new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))))),
+    );
+  } catch {
+    // A truncated or non-JSON body carries no attributable usage.
+  }
+  return [collected.records, true];
+}
+
+/**
+ * The ONE place OpenRouter usage becomes settleable (design:
+ * orchestration design-openrouter-usage.md). Input is every usage-bearing
+ * record of the response (`readable: false` when some of it could not be
+ * decoded, so a record may be missing). Exactly one distinct record that the dialect
+ * accepts as complete settles; several records, or one it does not accept,
+ * are evidence only (the admitted liability stays); none is missing usage.
+ */
+export function openRouterUsageFromRecords(
+  records: readonly unknown[],
+  readable: boolean,
+  pricing?: ProviderPricingSchedule,
+): RawProviderUsage | undefined {
+  if (records.length === 0) return undefined;
+  const observed = records.map((record) => usageFromObject(record, "openrouter"));
+  const only = records.length === 1 && readable ? observed[0] : undefined;
+  if (only?.categoriesComplete === true) return withCalculatedCost(only, pricing);
+  const evidence = observed.at(-1);
+  const rawUsage = records.map((record) => {
+    const root = usageRecord(record);
+    return JSON.parse(
+      JSON.stringify([root?.usage ?? null, root?.response ?? null, root?.message ?? null]),
+    ) as Prisma.InputJsonValue;
+  });
+  return unattributableUsage({
+    ...(evidence ?? { accountingVersion: "provider-billable-v1", confidence: "REPORTED" }),
+    rawUsage: rawUsage.length === 1 ? rawUsage[0] : rawUsage,
+  });
 }
 
 /** Drops a window's calculated cost; only the merged categories may be priced. */
@@ -1754,21 +1845,8 @@ export function mergeProviderUsage(
   initial: RawProviderUsage | undefined,
   tail: RawProviderUsage | undefined,
   surface?: ProtocolSurface,
-  dialect: ProviderUsageDialect = "generic",
 ): RawProviderUsage | undefined {
   if (!initial || !tail) return tail ?? initial;
-  // Overlapping windows can hold the same OpenRouter record: one observation.
-  if (
-    dialect === "openrouter" &&
-    JSON.stringify(initial.rawUsage) === JSON.stringify(tail.rawUsage)
-  )
-    return tail;
-  if (dialect === "openrouter")
-    return unattributableUsage({
-      ...withoutCalculatedCost(initial),
-      ...Object.fromEntries(Object.entries(tail).filter(([, value]) => value !== undefined)),
-      rawUsage: [initial.rawUsage, tail.rawUsage],
-    } as RawProviderUsage);
   // A calculated cost describes only the window it was priced from. The merged
   // categories must be priced again (the dispatcher does); keeping either
   // window's cost could settle spend for an observation that is incomplete.
@@ -2807,26 +2885,13 @@ export async function dispatchPublicOverflow(
       let protocolFailed = false;
       let deliveredProtocolTerminal = false;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
-      // OpenRouter reports usage once. Distinct usage-bearing records are
-      // counted over the whole stream, not only the retained prefix and tail:
-      // a record between them could otherwise leave an earlier one to settle.
-      // Only the single observation this count saw may settle; anything the
-      // retained windows yield beyond it (SSE comment text, a divergent
-      // container) is evidence only.
-      const openRouterUsageEnvelopes =
+      // OpenRouter usage settles only from the records the whole stream
+      // carried (not the retained prefix and tail windows): see
+      // `openRouterUsageFromRecords`.
+      const openRouterStreamRecords =
         terminalDecoder && target.usageDialect === "openrouter"
-          ? new Map<string, string>()
+          ? new OpenRouterUsageRecords()
           : undefined;
-      const observeUsageEnvelope = (data: string) => {
-        if (!openRouterUsageEnvelopes || openRouterUsageEnvelopes.size > 1 || data === "[DONE]")
-          return;
-        try {
-          const carried = openRouterUsageEnvelope(JSON.parse(data));
-          if (carried) openRouterUsageEnvelopes.set(carried.envelope, carried.observation);
-        } catch {
-          // Non-JSON records carry no usage.
-        }
-      };
       const reconcile = (streamComplete: boolean): Promise<void> => {
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
@@ -2885,33 +2950,19 @@ export async function dispatchPublicOverflow(
               fencingToken,
             }).catch(() => false);
           }
-          const tailUsage = parseProviderUsage(
-            !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
-            pricing,
-            target.usageDialect,
-          );
-          const initialUsage =
-            responseBytes > 1024 * 1024
-              ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
-              : undefined;
-          const mergedUsage = mergeProviderUsage(
-            initialUsage,
-            tailUsage,
-            surface,
-            target.usageDialect,
-          );
-          const countedObservations = openRouterUsageEnvelopes
-            ? [...openRouterUsageEnvelopes.values()]
-            : [];
-          const combinedUsage =
-            mergedUsage &&
-            openRouterUsageEnvelopes &&
-            !(
-              countedObservations.length === 1 &&
-              JSON.stringify(mergedUsage.rawUsage) === countedObservations[0]
-            )
-              ? unattributableUsage(mergedUsage)
-              : mergedUsage;
+          const combinedUsage = openRouterStreamRecords
+            ? openRouterUsageFromRecords(openRouterStreamRecords.records, true, pricing)
+            : mergeProviderUsage(
+                responseBytes > 1024 * 1024
+                  ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
+                  : undefined,
+                parseProviderUsage(
+                  !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+                  pricing,
+                  target.usageDialect,
+                ),
+                surface,
+              );
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost
@@ -3014,7 +3065,7 @@ export async function dispatchPublicOverflow(
                 if (terminalDecoder && !protocolTerminal) {
                   const records = terminalDecoder.finish();
                   for (const record of records) {
-                    observeUsageEnvelope(record.data);
+                    openRouterStreamRecords?.observeData(record.data);
                     const outcome = classifyTerminalRecord(
                       record,
                       nativeSurface ?? request.requestedSurface,
@@ -3056,7 +3107,7 @@ export async function dispatchPublicOverflow(
               if (terminalDecoder) {
                 const records = terminalDecoder.push(chunk.value);
                 for (const record of records) {
-                  observeUsageEnvelope(record.data);
+                  openRouterStreamRecords?.observeData(record.data);
                   const outcome = classifyTerminalRecord(
                     record,
                     nativeSurface ?? request.requestedSurface,

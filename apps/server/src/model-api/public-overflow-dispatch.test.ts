@@ -2808,9 +2808,27 @@ describe("OpenRouter owner-paid settlement", () => {
   ])(
     "settles $providerType usage to the pool owner (categoriesComplete $complete)",
     async ({ providerType, complete }) => {
-      const settled = await settleOwnerStream(providerType, [
-        Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`),
-      ]);
+      // Catalog-import-shaped rates (the import always writes reasoning).
+      db.providerPricingVersion.findFirst.mockResolvedValue({
+        ...pricingRow(),
+        pricing: {
+          ratesPerMillion: {
+            input: "1",
+            output: "4",
+            cacheRead: "0.1",
+            cacheWrite: "1.25",
+            reasoning: "4",
+          },
+        },
+      });
+      let settled: Awaited<ReturnType<typeof settleOwnerStream>>;
+      try {
+        settled = await settleOwnerStream(providerType, [
+          Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`),
+        ]);
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
+      }
       expect(settled).toMatchObject({
         userId: "owner",
         poolId: "pool",
@@ -2821,6 +2839,9 @@ describe("OpenRouter owner-paid settlement", () => {
       if (complete) {
         expect(billed).toBe(1_280n);
         expect(billed! < liability.tokens).toBe(true);
+        // 600*1 + 50*4 + 600*0.1 + 30*4 per million: real prices, not the reservation.
+        expect(settled.usage.calculatedCost?.toString()).toBe("0.00098");
+        expect(settled.usage.calculatedCostPricingVersion).toBe("price-1");
       } else {
         // Fail closed: settlement keeps the full reservation (liability path).
         expect(billed).toBeUndefined();
@@ -2828,9 +2849,6 @@ describe("OpenRouter owner-paid settlement", () => {
     },
   );
 
-  // Usage split across the retained prefix and the 1 MiB tail: a calculated
-  // cost priced from one complete window must not survive a merge with an
-  // incomplete one, in either order.
   // OpenRouter reports usage once. A second distinct observation (split
   // across the windows) cannot be attributed to one snapshot, so an earlier
   // charge or authoritative total must not settle below the liability.

@@ -256,6 +256,180 @@ describe("OpenRouter usage dialect", () => {
     expect(single?.reportedCost).toBe(0.000001);
   });
 
+  describe("attribution grammar (design-openrouter-usage)", () => {
+    const usage = () =>
+      structuredClone(openRouterFixture.nonStream.usage) as unknown as Record<string, unknown>;
+    const other = () => ({ ...usage(), completion_tokens: 90, total_tokens: 1290 });
+    const chunk = (extra: Record<string, unknown>) =>
+      JSON.stringify({
+        id: "gen",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "m",
+        choices: [],
+        ...extra,
+      });
+    const sse = (records: string[], eol = "\n") =>
+      records.map((record) => `${record}${eol}${eol}`).join("");
+    const data = (extra: Record<string, unknown>) => `data: ${chunk(extra)}`;
+    const content = `data: ${chunk({ choices: [{ index: 0, delta: { content: "x" } }], usage: null })}`;
+    const done = "data: [DONE]";
+    const body = (value: unknown) =>
+      JSON.stringify({ ...openRouterFixture.nonStream, ...(value as object) });
+    type Outcome = "settles" | "evidence" | "none";
+    const rows: [string, string, Outcome][] = [
+      ["one stream record", sse([content, data({ usage: usage() }), done]), "settles"],
+      ["one non-stream body", body({}), "settles"],
+      [
+        "a byte-identical duplicate record",
+        sse([data({ usage: usage() }), data({ usage: usage() }), done]),
+        "settles",
+      ],
+      [
+        "usage: null chunks around the record",
+        sse([content, data({ usage: null }), data({ usage: usage() }), done]),
+        "settles",
+      ],
+      [
+        "usage before content (out of order)",
+        sse([data({ usage: usage() }), content, done]),
+        "settles",
+      ],
+      ["CRLF framing", sse([content, data({ usage: usage() }), done], "\r\n"), "settles"],
+      ["CR framing", sse([content, data({ usage: usage() }), done], "\r"), "settles"],
+      [
+        "a usage-looking comment beside the record",
+        sse([`: ${JSON.stringify({ usage: other() })}`, data({ usage: usage() }), done]),
+        "settles",
+      ],
+      [
+        "two distinct records",
+        sse([data({ usage: other() }), data({ usage: usage() }), done]),
+        "evidence",
+      ],
+      [
+        "a later record with an unknown key",
+        sse([data({ usage: usage() }), data({ usage: { future_tokens: 5 } }), done]),
+        "evidence",
+      ],
+      [
+        "a later total-only record",
+        sse([data({ usage: usage() }), data({ usage: { total_tokens: 9 } }), done]),
+        "evidence",
+      ],
+      [
+        "a later root response container",
+        sse([data({ usage: usage() }), data({ response: other() }), done]),
+        "evidence",
+      ],
+      [
+        "only a root message container",
+        sse([data({ message: { usage: usage() } }), done]),
+        "evidence",
+      ],
+      [
+        "a nested usage.usage",
+        sse([data({ usage: { ...other(), usage: usage() } }), done]),
+        "evidence",
+      ],
+      [
+        "a sibling response.usage",
+        sse([data({ usage: usage(), response: { usage: other() } }), done]),
+        "evidence",
+      ],
+      [
+        "aliased detail containers",
+        sse([data({ usage: { ...usage(), input_tokens_details: { cached_tokens: 0 } } }), done]),
+        "evidence",
+      ],
+      [
+        "aliased prompt counts",
+        sse([data({ usage: { ...usage(), input_tokens: 1200 } }), done]),
+        "evidence",
+      ],
+      [
+        "a non-object detail container",
+        sse([data({ usage: { ...usage(), completion_tokens_details: [] } }), done]),
+        "evidence",
+      ],
+      [
+        "an unknown top-level key",
+        sse([data({ usage: { ...usage(), future_tokens: 1 } }), done]),
+        "evidence",
+      ],
+      [
+        "a string count",
+        sse([data({ usage: { ...usage(), completion_tokens: "80" } }), done]),
+        "evidence",
+      ],
+      [
+        "positive cache writes",
+        sse([
+          data({
+            usage: {
+              ...usage(),
+              prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 1 },
+            },
+          }),
+          done,
+        ]),
+        "evidence",
+      ],
+      ["an array usage", sse([data({ usage: [usage()] }), done]), "evidence"],
+      ["a total-only record", sse([data({ usage: { total_tokens: 1280 } }), done]), "evidence"],
+      [
+        "valid SSE and junk in one chunk (decoder rejects it: nothing read)",
+        `${sse([data({ usage: usage() })])}{"usage":1}\n\n`,
+        "none",
+      ],
+      [
+        "usage only in a comment",
+        sse([`: ${JSON.stringify({ usage: usage() })}`, content, done]),
+        "none",
+      ],
+      ["no usage at all", sse([content, done]), "none"],
+      ["a truncated non-stream body", body({}).slice(0, -40), "none"],
+    ];
+
+    it.each(rows.map(([label, wire, expected]) => ({ label, wire, expected })))(
+      "$label → $expected",
+      ({ wire, expected }) => {
+        const parsed = parseProviderUsage([encode(wire)], catalogPricing(fullRates), "openrouter");
+        if (expected === "none") {
+          expect(parsed).toBeUndefined();
+          return;
+        }
+        expect(parsed).toBeDefined();
+        if (expected === "settles") {
+          expect(parsed).toMatchObject({
+            categoriesComplete: true,
+            inputTokens: 600n,
+            reportedCost: 0.0021,
+          });
+          expect(providerBillableTokens(parsed!)).toBe(1280n);
+          expect(parsed?.calculatedCost?.toString()).toBe("0.00098");
+        } else {
+          expect(parsed?.categoriesComplete).toBe(false);
+          expect(parsed?.reportedCost).toBeUndefined();
+          expect(parsed?.calculatedCost).toBeUndefined();
+          expect(parsed?.authoritativeBillableTokens).toBeUndefined();
+          expect(providerBillableTokens(parsed!)).toBeUndefined();
+        }
+      },
+    );
+
+    it("keeps a record evidence when the stream stops being valid SSE after it", () => {
+      const parsed = parseProviderUsage(
+        [encode(sse([data({ usage: usage() })])), encode('{"usage":1}\n\n')],
+        catalogPricing(fullRates),
+        "openrouter",
+      );
+      expect(parsed?.categoriesComplete).toBe(false);
+      expect(parsed?.reportedCost).toBeUndefined();
+      expect(parsed?.calculatedCost).toBeUndefined();
+    });
+  });
+
   it("accepts is_byok, cost_details and server_tool_use only as metadata", () => {
     const usage = withUsage((value) =>
       Object.assign(value, {
@@ -337,7 +511,10 @@ describe("OpenRouter usage dialect", () => {
         ),
       );
       expect(generic).toBe(preDialectOutputs[index]);
-      expect(openRouter).toBe(generic);
+      // OpenRouter (Chat only) reads a root `usage` object; a Responses or
+      // Anthropic nesting is evidence only in its dialect.
+      if ((payload as { usage?: unknown }).usage !== undefined) expect(openRouter).toBe(generic);
+      else expect(usageFromObject(payload, "openrouter")?.categoriesComplete).toBe(false);
       // The default parameter is the generic dialect.
       expect(
         JSON.stringify(usageFromObject(payload), (_key, value) =>
