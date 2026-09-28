@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   declineRequest: vi.fn(),
   tabs: [] as Array<Record<string, unknown>>,
   activeLocalId: null as string | null,
+  status: "open" as "connecting" | "open" | "closed" | "unauthorized",
 }));
 
 vi.mock("react-i18next", () => ({
@@ -25,7 +26,7 @@ vi.mock("@/hooks/use-terminal-workspace", () => ({
     return typeof value === "string" && value.length > 0 ? value : null;
   },
   useTerminalWorkspace: () => ({
-    status: "open",
+    status: state.status,
     identityReady: true,
     clis: [{ cliDeviceId: "cli-1", slug: "desk", publicKey: "key" }],
     cliTrust: { "cli-1": { status: "trusted", fingerprint: "ABCD EFGH" } },
@@ -90,6 +91,7 @@ afterEach(() => {
   state.declineRequest.mockReset();
   state.tabs = [];
   state.activeLocalId = null;
+  state.status = "open";
 });
 
 function openPicker() {
@@ -109,6 +111,30 @@ describe("TerminalWorkspaceView", () => {
     // Coming back does not reopen it.
     view.rerender(<TerminalWorkspaceView visible />);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("connection notices", () => {
+  it("says it is reconnecting after an ordinary close", () => {
+    state.status = "closed";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:terminals.reconnecting")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "common:actions.reload" })).toBeNull();
+  });
+
+  it("shows a signed-out state with a reload action after a 4401, not a reconnect notice", () => {
+    state.status = "unauthorized";
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    try {
+      render(<TerminalWorkspaceView visible />);
+      expect(screen.getByRole("alert").textContent).toBe("dashboard:terminals.signedOut");
+      expect(screen.queryByText("dashboard:terminals.reconnecting")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.reload" }));
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

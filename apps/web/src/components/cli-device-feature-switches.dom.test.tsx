@@ -142,6 +142,30 @@ describe("CLI feature switches", () => {
     expect(screen.getAllByText("dashboard:clis.features.configDisabled").length).toBe(2);
   });
 
+  it("describes the Unsupervised option by its danger, selected or not (F2)", () => {
+    const danger = "dashboard:clis.features.commandModeHelp.unsupervised";
+    const describedText = (radio: HTMLElement) => {
+      const id = radio.getAttribute("aria-describedby");
+      return id ? document.getElementById(id)?.textContent : null;
+    };
+    const view = renderSwitches({
+      terminal: { granted: false, deviceAllows: true, supported: true, live: true },
+      commands: commands(),
+    });
+    expect(describedText(modeRadio("unsupervised"))).toBe(danger);
+    expect(modeRadio("off").getAttribute("aria-describedby")).toBeNull();
+    expect(modeRadio("supervised").getAttribute("aria-describedby")).toBeNull();
+    view.unmount();
+
+    renderSwitches({
+      terminal: { granted: false, deviceAllows: true, supported: true, live: true },
+      commands: commands({ mode: "unsupervised", effectiveMode: "unsupervised" }),
+    });
+    expect(describedText(modeRadio("unsupervised"))).toBe(danger);
+    // One danger text, shown: not duplicated for screen readers.
+    expect(screen.getAllByText(danger)).toHaveLength(1);
+  });
+
   it("keeps the current grant selectable so it can be lowered", async () => {
     const user = userEvent.setup();
     renderSwitches({

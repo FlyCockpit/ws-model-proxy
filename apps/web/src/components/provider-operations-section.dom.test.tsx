@@ -19,6 +19,8 @@ const state = vi.hoisted(() => ({
   updateModelPayloads: [] as Array<Record<string, unknown>>,
   allowPrivateNetworks: true,
   testResult: undefined as Record<string, unknown> | undefined,
+  pools: [] as Array<Record<string, unknown>>,
+  mutationFailures: {} as Record<string, unknown>,
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -58,6 +60,7 @@ vi.mock("@/utils/orpc", () => {
       ...options,
       mutationFn: async (input: Record<string, unknown>) => {
         state.calls.push(name);
+        if (name in state.mutationFailures) throw state.mutationFailures[name];
         if (name === "createAccount") {
           state.accountPayload = input;
           return { id: "created-account" };
@@ -121,7 +124,7 @@ vi.mock("@/utils/orpc", () => {
       },
       forwarderManagement: {
         key: () => ["forwarderManagement"],
-        listModelPools: query("pools", () => []),
+        listModelPools: query("pools", () => state.pools),
         addProviderPoolMember: mutation("addProviderPoolMember"),
         removePoolMember: mutation("removePoolMember"),
         reorderProviderPoolMember: mutation("reorderProviderPoolMember"),
@@ -133,10 +136,15 @@ vi.mock("@/utils/orpc", () => {
 });
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import { ProviderOperationsSection } from "./provider-operations-section";
 
-function mount() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function mount({ appToasts = false }: { appToasts?: boolean } = {}) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    // The app's global mutation toast, with keys shown as `t(key)`.
+    ...(appToasts ? { mutationCache: createAppMutationCache((key) => `t(${key})`) } : {}),
+  });
   return render(
     <QueryClientProvider client={client}>
       <ProviderOperationsSection />
@@ -160,6 +168,8 @@ afterEach(() => {
   state.allowPrivateNetworks = true;
   state.credentials = [];
   state.testResult = undefined;
+  state.pools = [];
+  state.mutationFailures = {};
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.warning).mockClear();
@@ -461,6 +471,91 @@ describe("ProviderOperationsSection mounted forms", () => {
     );
     expect(toast.warning).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("provider pool member removal", () => {
+  function withAttachedMember() {
+    state.accounts = [
+      {
+        id: "account-a",
+        label: "Primary",
+        providerType: "openai",
+        baseUrl: "https://api.example.com/v1",
+        authType: "BEARER",
+        enabled: true,
+        healthStatus: "HEALTHY",
+        healthCheckedAt: null,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    state.models = [
+      {
+        id: "model-a",
+        upstreamModelId: "gpt-example",
+        displayName: "Example",
+        pricingVersion: "v1",
+        healthStatus: "HEALTHY",
+        enabled: true,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    state.pools = [
+      {
+        id: "pool-a",
+        name: "Team pool",
+        grants: [],
+        members: [
+          {
+            id: "member-a",
+            tier: "PRIMARY",
+            publicOrder: null,
+            routingStatus: "ACTIVE",
+            providerModel: {
+              displayName: "Example",
+              upstreamModelId: "gpt-example",
+              ProviderAccount: { id: "account-a" },
+            },
+          },
+        ],
+      },
+    ];
+  }
+
+  const conflict = (reason: string) => ({
+    status: 409,
+    code: "CONFLICT",
+    message: "raw server message",
+    data: { reason },
+  });
+
+  it.each([
+    ["retained_history", "t(errors:deletionConflict.retainedHistory.poolMember)"],
+    ["delete_pending", "t(errors:deletionConflict.deletePending)"],
+    ["delete_contended", "t(errors:deletionConflict.deleteContended)"],
+  ])("toasts the localized %s copy once when detaching is refused", async (reason, copy) => {
+    withAttachedMember();
+    state.mutationFailures = { removePoolMember: conflict(reason) };
+    mount({ appToasts: true });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "dashboard:providers.actions.detachProvider" }),
+    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(copy));
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(state.calls).toContain("removePoolMember");
+  });
+
+  it("falls back to the providers failure copy without a deletion reason", async () => {
+    withAttachedMember();
+    state.mutationFailures = { removePoolMember: { status: 500, code: "INTERNAL_SERVER_ERROR" } };
+    mount({ appToasts: true });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "dashboard:providers.actions.detachProvider" }),
+    );
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("t(dashboard:providers.feedback.failed)"),
+    );
+    expect(toast.error).toHaveBeenCalledTimes(1);
   });
 });
 

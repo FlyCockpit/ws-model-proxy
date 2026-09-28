@@ -61,6 +61,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "cliSearch",
       "cliSearchEmpty",
       "reconnecting",
+      "signedOut",
       "exited",
       "gone",
       "rejected",

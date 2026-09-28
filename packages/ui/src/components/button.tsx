@@ -7,7 +7,10 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground [a]:hover:bg-primary/80",
+        // Link-button hover keeps its label at AA over every surface in both
+        // themes (apps/web/src/lib/theme-contrast.test.ts).
+        default:
+          "bg-primary text-primary-foreground [a]:hover:bg-primary/95 dark:[a]:hover:bg-primary/90",
         outline:
           "border-border bg-background hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
         secondary:

@@ -185,6 +185,35 @@ ceremonial confirmation. The exact per-tool policy is in the
 [coverage artifact](./mcp-tool-coverage.md); the wrapper strips the
 confirmation field before the underlying procedure runs.
 
+## Tool errors
+
+A failed tool call returns `isError: true`, a short stable text, and
+`structuredContent.error.code`. Application messages are never copied into
+tool output. Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
+`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `TOO_MANY_REQUESTS`);
+anything else is `INTERNAL_ERROR` with a `requestId`. Wrapper-level errors
+use their own codes (for example `INSUFFICIENT_SCOPE`, `CONFIRMATION_REQUIRED`,
+`INVALID_INPUT`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
+
+A deletion-related `CONFLICT` also carries a stable `reason`
+(`@ws-model-proxy/config/deletion-conflict`), in the text (`Conflict:
+<reason>`) and in `structuredContent`:
+
+```json
+{ "error": { "code": "CONFLICT", "reason": "retained_history" } }
+```
+
+| `reason` | Meaning | What to do |
+| --- | --- | --- |
+| `retained_history` | Capacity or provider history must be kept, so the item can never be deleted. | Disable or archive it instead. |
+| `delete_pending` | Requests are still in flight on the item; nothing was deleted. | Retry once they finish. |
+| `delete_contended` | The delete kept losing its locks to live traffic; nothing was deleted. | Retry. |
+| `still_attached` | A capacity is still attached to a pool member. | Detach it first. |
+| `not_stale` | A stale-only delete found the item reporting recently. | Nothing; it is live. |
+| `deletion_in_progress` | The user is being deleted and cannot be restored. | Nothing. |
+
+Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
+
 ## Login, consent, and scope step-up
 
 The authorization flow uses Better Auth's signed OAuth transaction

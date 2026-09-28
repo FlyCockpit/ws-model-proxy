@@ -1871,11 +1871,20 @@ export class RelaySessionManager {
       // leaves sessionsBySocket, removeSessionWithStatus returns without failing
       // its terminals, commands, or relay requests, and must not mark the device
       // DISCONNECTED.
+      // R-12-1: every viewer attached through the old connection is released
+      // (its terminal ends: `exit` to each attached, pending, or declining
+      // browser socket), and the owners' other tabs get a fresh list, since
+      // the device's terminals and live features changed without them asking.
+      const owners = new Set<string>([newSession.identity.userId]);
+      for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
       this.teardownInteractiveWork(existing);
       this.failActiveRequestsForSession(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);
       clearTimeout(existing.unauthenticatedTimer);
+      this.sessionsByCliDeviceId.set(newSession.cliDeviceId, newSession);
+      for (const userId of owners) this.notifyTerminalListChanged(userId);
+      return;
     }
     this.sessionsByCliDeviceId.set(newSession.cliDeviceId, newSession);
   }

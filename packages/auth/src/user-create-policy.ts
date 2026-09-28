@@ -1,4 +1,4 @@
-import { SIGNUP_DISABLED_MESSAGE } from "./signup-policy";
+import { SignupDisabledError } from "./signup-policy";
 
 const DEFAULT_ROLE = "user";
 const FIRST_USER_ROLE = "admin";
@@ -64,7 +64,7 @@ export function resolveUserCreatePolicy(input: UserCreatePolicyInput): UserCreat
   const mayBootstrapAdmin = isFirstUser && input.adminBootstrapAllowed === true;
 
   if (!input.signupEnabled && !mayBootstrapAdmin && !isAdminCreate) {
-    throw new Error(SIGNUP_DISABLED_MESSAGE);
+    throw new SignupDisabledError();
   }
 
   return {

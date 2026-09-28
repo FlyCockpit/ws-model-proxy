@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import {
   TERMINAL_BROWSER_JSON_BUDGET,
   TERMINAL_BROWSER_JSON_LIMIT,
@@ -21,16 +21,16 @@ class MockWebSocket {
   readyState = 0;
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: unknown }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
   constructor(public url: string) {
     MockWebSocket.instances.push(this);
   }
   send(data: string | ArrayBuffer) {
     this.sent.push(data);
   }
-  close() {
+  close(code = 1005) {
     this.readyState = MockWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
   open() {
     this.readyState = MockWebSocket.OPEN;
@@ -53,6 +53,14 @@ function SocketProbe({ onOpen, onDisconnect }: { onOpen?: () => void; onDisconne
       send
     </button>
   );
+}
+
+function StatusProbe() {
+  const socket = useTerminalSocket(true, {
+    onMessage: () => undefined,
+    onSealed: () => undefined,
+  });
+  return <output>{socket.status}</output>;
 }
 
 function BurstProbe({ count }: { count: number }) {
@@ -245,6 +253,37 @@ describe("useTerminalSocket", () => {
     expect(texts()).toHaveLength(TERMINAL_BROWSER_JSON_BUDGET + 3);
     vi.useRealTimers();
   });
+  it("stops reconnecting after a 4401 close and reports the socket unauthorized", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    const view = render(<StatusProbe />);
+    const first = MockWebSocket.instances[0];
+    act(() => first?.open());
+    expect(view.getByRole("status").textContent).toBe("open");
+    act(() => first?.close(4401));
+    expect(view.getByRole("status").textContent).toBe("unauthorized");
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(MockWebSocket.instances).toHaveLength(1);
+    vi.useRealTimers();
+  });
+
+  it("keeps reconnecting after any other close", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    const view = render(<StatusProbe />);
+    const first = MockWebSocket.instances[0];
+    act(() => first?.open());
+    act(() => first?.close(1013));
+    expect(view.getByRole("status").textContent).toBe("closed");
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
+    vi.useRealTimers();
+  });
+
   it("backs off a socket that closes right after opening, and resets after a stable one", () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0);

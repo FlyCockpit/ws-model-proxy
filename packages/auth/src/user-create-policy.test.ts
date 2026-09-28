@@ -104,6 +104,19 @@ describe("resolveUserCreatePolicy", () => {
     ).toThrow(SIGNUP_DISABLED_MESSAGE);
   });
 
+  it("refuses with a coded error callers classify without reading the message", () => {
+    expect(() =>
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 3,
+        adminBootstrapAllowed: false,
+        emailConfigured: false,
+        requestedRole: undefined,
+        contextPath: "/sign-up/email",
+      }),
+    ).toThrow(expect.objectContaining({ code: "SIGNUP_DISABLED" }));
+  });
+
   it("fails closed when a creation path omits bootstrap authorization", () => {
     expect(() =>
       resolveUserCreatePolicy({

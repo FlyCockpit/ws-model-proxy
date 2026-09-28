@@ -2,13 +2,22 @@
 
 import { QueryClient, QueryClientProvider, useMutation } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import i18next from "i18next";
+import enErrors from "@/locales/en-US/errors.json";
+
+// `friendly()` reads the default i18next instance, which the app's i18n
+// module initializes; this test does not load that module.
+beforeAll(async () => {
+  await i18next.init({ lng: "en-US", resources: { "en-US": { errors: enErrors } } });
+});
+
 import type { DeletionEntity } from "./friendly-error";
 import { createAppMutationCache } from "./mutation-error-toast";
 
@@ -83,16 +92,12 @@ describe("app mutation error toast for deletes", () => {
 
   it("keeps the generic conflict copy for a CONFLICT without a known reason", async () => {
     renderDelete(conflict(), "pool");
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("That conflicts with an existing record."),
-    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(enErrors.friendly.conflict));
   });
 
   it("keeps the generic conflict copy for a mutation that is not a delete", async () => {
     renderDelete(conflict("retained_history"));
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("That conflicts with an existing record."),
-    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(enErrors.friendly.conflict));
   });
 
   it("uses the context fallback for other failures", async () => {

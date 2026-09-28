@@ -11,7 +11,7 @@ import {
 import { Hono } from "hono";
 import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
@@ -1221,9 +1221,9 @@ describe("terminal browser hub", () => {
     // Freeze time so the rate window can be filled and then aged out
     // deterministically: the pending cap counts frames, the rate window
     // counts stamps in the last TERMINAL_BROWSER_JSON_WINDOW_MS.
-    vi.useFakeTimers({ toFake: ["Date"] });
+    // The hub's rate windows run on the monotonic clock (PACE-CLK-SRV).
+    vi.useFakeTimers({ toFake: ["performance"] });
     try {
-      const base = Date.now();
       // One stalled lookup; the frames behind it pile up as pending.
       let release: (() => void) | undefined;
       db.cliDevice.findMany.mockImplementationOnce(
@@ -1237,14 +1237,12 @@ describe("terminal browser hub", () => {
       // only the most recent stamp.
       const accepted: Array<Promise<void>> = [];
       for (let index = 0; index < TERMINAL_BROWSER_TEXT_PENDING_LIMIT; index += 1) {
-        vi.setSystemTime(base + index * (TERMINAL_BROWSER_JSON_WINDOW_MS + 1));
+        if (index > 0) vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS + 1);
         accepted.push(
           terminalBrowserHub.handleText(browser, `{"type":"list","requestId":"s_${index}"}`),
         );
       }
-      const refusedAt =
-        base + TERMINAL_BROWSER_TEXT_PENDING_LIMIT * (TERMINAL_BROWSER_JSON_WINDOW_MS + 1);
-      vi.setSystemTime(refusedAt);
+      vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS + 1);
       // The pending cap is now full and the rate window has aged out. Send a
       // frame plus a burst: all are refused at the cap, and none of them may
       // record a rate stamp (the cap check runs before the rate window).
@@ -1279,6 +1277,247 @@ describe("terminal browser hub", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /** Opens a terminal from `browser` on `cli` and lets the CLI spawn it. */
+  async function openLive(browser: FakeSocket, cli: FakeSocket, cliDeviceId: string) {
+    await open(browser, cliDeviceId);
+    const termOpen = cli
+      .jsonSends()
+      .filter((message) => message.type === "term.open")
+      .at(-1);
+    const terminalId = termOpen?.terminalId as string;
+    await relaySessionManager.handleTextFrame(
+      cli,
+      JSON.stringify({
+        type: "term.opened",
+        terminalId,
+        viewerId: termOpen?.viewerId,
+        cliNonce: nonce(),
+      }),
+    );
+    return terminalId;
+  }
+
+  /** Holds the browser's text queue on one stalled list lookup. */
+  async function stallQueue(browser: FakeSocket) {
+    let release: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      db.cliDevice.findMany.mockImplementationOnce(
+        () =>
+          new Promise((settle) => {
+            release = () => settle([]);
+            resolve();
+          }),
+      );
+    });
+    const stalled = terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"stall"}');
+    await started;
+    return { stalled, release: () => release?.() };
+  }
+
+  it("never drops a detach refused at the pending cap: it runs in order and releases the viewer (DETACH-1)", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    // The open's rate slot ages out, so only the pending cap refuses below.
+    vi.useFakeTimers({ toFake: ["performance"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const terminalId = await openLive(browser, cli, "one");
+    vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+      expect.objectContaining({ terminalId, viewerAttached: true }),
+    ]);
+    const { stalled, release } = await stallQueue(browser);
+    const accepted: Array<Promise<void>> = [stalled];
+    for (let index = 1; index < TERMINAL_BROWSER_TEXT_PENDING_LIMIT; index += 1) {
+      accepted.push(
+        terminalBrowserHub.handleText(browser, `{"type":"list","requestId":"l_${index}"}`),
+      );
+    }
+    // A list past the cap is still refused ...
+    await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"over"}');
+    // ... but a detach past the cap is queued behind the accepted frames.
+    const detach = terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "detach", terminalId, requestId: "bye" }),
+    );
+    const refused = () =>
+      browser
+        .jsonSends()
+        .filter((message) => message.code === "rate_limited")
+        .map((message) => message.requestId);
+    expect(refused()).toEqual(["over"]);
+    release();
+    await Promise.all([...accepted, detach]);
+    expect(refused()).toEqual(["over"]);
+    const answers = browser
+      .jsonSends()
+      .filter((message) => message.type === "terminals" || message.type === "detached");
+    expect(answers.at(-1)).toEqual({
+      type: "detached",
+      terminalId,
+      reason: "self",
+      requestId: "bye",
+    });
+    expect(cli.jsonSends().some((message) => message.type === "term.detach")).toBe(true);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+      expect.objectContaining({ terminalId, viewerAttached: false }),
+    ]);
+  });
+
+  it("runs a detach past a spent rate window without taking a slot (DETACH-1)", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const terminalId = await openLive(browser, cli, "one");
+    db.cliDevice.findMany.mockResolvedValue([]);
+    // `open` took one slot; spend the rest of the window.
+    for (let index = 1; index < TERMINAL_BROWSER_JSON_LIMIT; index += 1) {
+      await terminalBrowserHub.handleText(browser, '{"type":"list"}');
+    }
+    await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"late"}');
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "detach", terminalId, requestId: "bye" }),
+    );
+    const sends = browser.jsonSends();
+    expect(sends.filter((message) => message.code === "rate_limited")).toEqual([
+      expect.objectContaining({ requestId: "late" }),
+    ]);
+    expect(sends.at(-1)).toMatchObject({ type: "detached", terminalId, requestId: "bye" });
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+      expect.objectContaining({ terminalId, viewerAttached: false }),
+    ]);
+    // A malformed "detach" is not exempt: it is refused like any other frame.
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "detach", terminalId: "nope", requestId: "bad" }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "rate_limited",
+      requestId: "bad",
+    });
+  });
+
+  it("bounds the detaches queued past the cap per socket (DETACH-1)", async () => {
+    const browser = attachBrowser();
+    const { stalled, release } = await stallQueue(browser);
+    const accepted: Array<Promise<void>> = [stalled];
+    for (let index = 1; index < TERMINAL_BROWSER_TEXT_PENDING_LIMIT; index += 1) {
+      accepted.push(terminalBrowserHub.handleText(browser, '{"type":"list"}'));
+    }
+    const terminalId = Buffer.alloc(16, 1).toString("base64url");
+    for (let index = 0; index < 64; index += 1) {
+      accepted.push(
+        terminalBrowserHub.handleText(
+          browser,
+          JSON.stringify({ type: "detach", terminalId, requestId: `d_${index}` }),
+        ),
+      );
+    }
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "detach", terminalId, requestId: "d_over" }),
+    );
+    expect(browser.jsonSends()).toEqual([
+      expect.objectContaining({ code: "rate_limited", requestId: "d_over" }),
+    ]);
+    release();
+    await Promise.all(accepted);
+    // Every queued detach was answered (not_found: this socket held no viewer).
+    const answered = browser
+      .jsonSends()
+      .filter((message) => message.code === "not_found")
+      .map((message) => message.requestId);
+    expect(answered).toHaveLength(64);
+  });
+
+  it("paces on the monotonic clock: a wall-clock jump neither resets nor fills a window (PACE-CLK-SRV)", async () => {
+    const browser = attachBrowser();
+    db.cliDevice.findMany.mockResolvedValue([]);
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      for (let index = 0; index < TERMINAL_BROWSER_JSON_LIMIT; index += 1) {
+        await terminalBrowserHub.handleText(browser, '{"type":"list"}');
+      }
+      // The wall clock jumps a day ahead: the window must stay full.
+      vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000);
+      await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"jump"}');
+      expect(browser.jsonSends().at(-1)).toMatchObject({
+        code: "rate_limited",
+        requestId: "jump",
+      });
+      // The wall clock jumps back: once the window really passed, frames flow.
+      vi.setSystemTime(Date.now() - 48 * 60 * 60 * 1000);
+      vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS);
+      await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"later"}');
+      expect(browser.jsonSends().at(-1)).toMatchObject({
+        type: "terminals",
+        requestId: "later",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a browser socket backed up past the JSON send limit and releases its viewers (CI-1)", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const terminalId = await openLive(browser, cli, "one");
+    const before = browser.sends.length;
+    browser.bufferedAmount = 8 * 1024 * 1024 + 1;
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"slow"}');
+    // Nothing more was written to the backed-up socket; it is closed instead.
+    expect(browser.sends.length).toBe(before);
+    expect(browser.closes).toEqual([{ code: 1013, reason: "slow_consumer" }]);
+    await Promise.resolve();
+    expect(cli.jsonSends().some((message) => message.type === "term.detach")).toBe(true);
+    expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+      expect.objectContaining({ terminalId, viewerAttached: false }),
+    ]);
+    // Forgotten: later frames of that socket are ignored.
+    await terminalBrowserHub.handleText(browser, '{"type":"list"}');
+    expect(browser.sends.length).toBe(before);
+  });
+
+  it("keeps sending to a socket below the JSON send limit (CI-1)", async () => {
+    const browser = attachBrowser();
+    browser.bufferedAmount = 8 * 1024 * 1024;
+    db.cliDevice.findMany.mockResolvedValue([]);
+    await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"ok"}');
+    expect(browser.closes).toEqual([]);
+    expect(browser.jsonSends().at(-1)).toMatchObject({ type: "terminals", requestId: "ok" });
+  });
+
+  it("releases viewers attached through a replaced CLI connection and pushes a fresh list (R-12-1)", async () => {
+    const oldCli = await connectCli("one");
+    const browser = attachBrowser();
+    const other = attachBrowser();
+    const terminalId = await openLive(browser, oldCli, "one");
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    const replacement = await connectCli("one");
+    expect(oldCli.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(browser.jsonSends()).toContainEqual({ type: "exit", terminalId });
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+    // The owner's tabs hear about it without asking.
+    await vi.waitFor(() => {
+      for (const socket of [browser, other]) {
+        expect(socket.jsonSends().some((m) => m.type === "terminals" && m.pushed)).toBe(true);
+      }
+    });
+    const pushed = other.jsonSends().find((m) => m.type === "terminals" && m.pushed);
+    expect(pushed?.terminals).toEqual([]);
+    // The released socket holds nothing on the new connection.
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "detach", terminalId, requestId: "gone" }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({ code: "not_found", requestId: "gone" });
+    expect(replacement.jsonSends().some((m) => m.type === "term.detach")).toBe(false);
   });
 
   describe("over a real loopback WebSocket (F2-08)", () => {

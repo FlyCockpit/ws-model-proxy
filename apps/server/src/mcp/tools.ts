@@ -44,6 +44,10 @@ import type {
 import { createRouterClient, ORPCError } from "@orpc/server";
 import { type AppRouterClient, appRouter } from "@ws-model-proxy/api/routers/index";
 import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
+import {
+  type DeletionConflictReason,
+  isDeletionConflictReason,
+} from "@ws-model-proxy/config/deletion-conflict";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
 import { cliCommandsAllowed, isCliCommandTool } from "./cli-command-access";
 import { McpCliCommandRejectedError } from "./cli-command-tools";
@@ -473,6 +477,21 @@ function outputTooLargeError(): ToolResult {
  * output: they become the generic internal error with the request id, plus
  * one sanitized log line.
  */
+/**
+ * The stable deletion reason of a CONFLICT (`data.reason`, one of
+ * DELETION_CONFLICT_REASONS), or null. Only that enum crosses the bridge:
+ * any other `data` (and every message) stays on the server.
+ */
+function deletionConflictReasonOf(
+  error: ORPCError<string, unknown>,
+): DeletionConflictReason | null {
+  if (error.code !== "CONFLICT") return null;
+  const data: unknown = error.data;
+  if (typeof data !== "object" || data === null || !Object.hasOwn(data, "reason")) return null;
+  const reason: unknown = Reflect.get(data, "reason");
+  return isDeletionConflictReason(reason) ? reason : null;
+}
+
 function mapToolError(
   error: unknown,
   descriptor: McpToolDescriptor,
@@ -482,6 +501,10 @@ function mapToolError(
     if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
       const stable = ORPC_ERROR_MESSAGES[error.code];
       if (stable !== undefined) {
+        const reason = deletionConflictReasonOf(error);
+        if (reason !== null) {
+          return toolError(`${stable}: ${reason}`, { error: { code: error.code, reason } });
+        }
         return toolError(stable, { error: { code: error.code } });
       }
     }

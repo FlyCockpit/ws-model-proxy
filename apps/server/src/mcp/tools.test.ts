@@ -442,6 +442,60 @@ describe("error mapping", () => {
     expect(logged).not.toContain("SECRET_SQL");
   });
 
+  it("forwards a deletion CONFLICT's stable reason, never its message", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    const { DELETION_CONFLICT_REASONS } = await import("@ws-model-proxy/config/deletion-conflict");
+    for (const reason of DELETION_CONFLICT_REASONS) {
+      db.modelApiToken.findUnique.mockRejectedValueOnce(
+        new ORPCError("CONFLICT", { message: "APP MESSAGE DETAIL", data: { reason } }),
+      );
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo);
+      const { body } = await callTool(authInfo, "model_api_token_revoke", {
+        id: "token-1",
+        confirm: "DELETE",
+      });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toBe(`Conflict: ${reason}`);
+      expect(body.result?.structuredContent).toEqual({ error: { code: "CONFLICT", reason } });
+      expect(JSON.stringify(body)).not.toContain("APP MESSAGE DETAIL");
+    }
+  });
+
+  it("drops an unknown CONFLICT reason and any other data", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    for (const data of [
+      { reason: "SECRET_REASON", extra: "SECRET_DATA" },
+      { reason: { nested: "SECRET_DATA" } },
+      "SECRET_DATA",
+      undefined,
+    ]) {
+      db.modelApiToken.findUnique.mockRejectedValueOnce(
+        new ORPCError("CONFLICT", { message: "APP MESSAGE DETAIL", data }),
+      );
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo);
+      const { body } = await callTool(authInfo, "model_api_token_revoke", {
+        id: "token-1",
+        confirm: "DELETE",
+      });
+      expect(body.result?.content?.[0]?.text).toBe("Conflict");
+      expect(body.result?.structuredContent).toEqual({ error: { code: "CONFLICT" } });
+      expect(JSON.stringify(body)).not.toContain("SECRET");
+    }
+    // A deletion reason on another code is not forwarded either.
+    db.modelApiToken.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", { data: { reason: "retained_history" } }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "model_api_token_revoke", {
+      id: "token-1",
+      confirm: "DELETE",
+    });
+    expect(body.result?.structuredContent).toEqual({ error: { code: "BAD_REQUEST" } });
+  });
+
   it("non-allowlisted oRPC codes also collapse to the generic internal error", async () => {
     const { ORPCError } = await import("@orpc/server");
     db.modelApiToken.findUnique.mockRejectedValue(

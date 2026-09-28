@@ -3,6 +3,18 @@
   "couldNotCopy": "No se pudo copiar — por favor selecciona y copia manualmente.",
   "pageDescription": "{{appName}} es una aplicación web",
   "rootError": "Esta página no cargó. Intenta de nuevo o recarga.",
+  "friendly": {
+    "generic": "Algo no funcionó. Inténtalo de nuevo.",
+    "rateLimited": "Demasiados intentos. Espera unos minutos e inténtalo de nuevo.",
+    "rateLimitedRetryAfter_one": "Demasiados intentos. Inténtalo de nuevo en {{count}} segundo.",
+    "rateLimitedRetryAfter_other": "Demasiados intentos. Inténtalo de nuevo en {{count}} segundos.",
+    "unauthorized": "Tu sesión terminó. Inicia sesión de nuevo.",
+    "forbidden": "No tienes acceso a esto.",
+    "notFound": "No se encontró.",
+    "conflict": "Eso entra en conflicto con un registro existente.",
+    "badRequest": "Esa solicitud no es válida.",
+    "serverError": "Algo no funcionó de nuestro lado. Inténtalo de nuevo en un momento."
+  },
   "deletionConflict": {
     "deletePending": "Esto todavía tiene solicitudes en curso, así que no se eliminó nada. Intenta de nuevo en un momento.",
     "deleteContended": "Esto estaba ocupado con tráfico activo, así que no se eliminó nada. Intenta de nuevo en un momento.",

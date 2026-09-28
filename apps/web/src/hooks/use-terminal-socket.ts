@@ -13,7 +13,15 @@ import {
   type TerminalServerMessage,
 } from "@/lib/terminal-protocol";
 
-export type TerminalSocketStatus = "connecting" | "open" | "closed";
+/**
+ * `unauthorized`: the relay closed the socket with 4401 (the session ended,
+ * two-factor became mandatory, or the account is being deleted). Final:
+ * no reconnect is attempted; only a reload (and sign-in) recovers.
+ */
+export type TerminalSocketStatus = "connecting" | "open" | "closed" | "unauthorized";
+
+/** The relay's close code for a session it no longer accepts. */
+export const TERMINAL_UNAUTHORIZED_CLOSE_CODE = 4401;
 
 const SOCKET_PATH = "/api/dashboard/terminal/ws";
 export type TerminalSocketHandlers = {
@@ -274,10 +282,16 @@ export function useTerminalSocket(
           }
         }
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         closeOutbox(outbox);
         if (socketRef.current === ws) socketRef.current = null;
         if (disposed) return;
+        if (event.code === TERMINAL_UNAUTHORIZED_CLOSE_CODE) {
+          // Retrying cannot succeed with this session; stop here.
+          setStatus("unauthorized");
+          handlersRef.current.onDisconnect?.();
+          return;
+        }
         setStatus("closed");
         handlersRef.current.onDisconnect?.();
         if (openedAt !== null && performance.now() - openedAt >= RECONNECT_STABLE_MS) attempt = 0;

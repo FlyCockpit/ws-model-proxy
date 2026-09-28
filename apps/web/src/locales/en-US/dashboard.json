@@ -275,6 +275,7 @@
     "cliSearch": "Search CLIs",
     "cliSearchEmpty": "No CLIs match your search.",
     "reconnecting": "Reconnecting to the terminal service…",
+    "signedOut": "You were signed out or your terminal access was revoked. Reload to sign in again.",
     "exited": "The shell exited.",
     "gone": "This terminal ended while you were disconnected.",
     "rejected": "The CLI rejected this terminal ({{reason}}).",
