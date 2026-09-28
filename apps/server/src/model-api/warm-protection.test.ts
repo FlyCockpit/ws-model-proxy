@@ -242,6 +242,25 @@ describe("S-C decision procedure", () => {
     });
   });
 
+  it("never treats the cache holder as PROTECTED, even from a stale verdict", () => {
+    const routing = protectionRouting({
+      candidates: [
+        { poolMemberId: "holder", affine: true },
+        { poolMemberId: "b", affine: false },
+      ],
+      verdicts: new Map([
+        ["holder", verdict("PROTECTED", 1_000)],
+        ["b", verdict("FULL")],
+      ]),
+      externalPlan: true,
+    });
+    expect(routing).toEqual({
+      order: ["holder", "b"],
+      initial: ["holder", "b"],
+      externalFirst: false,
+    });
+  });
+
   it("orders PROTECTED members oldest, then cheapest, first", () => {
     const candidates = ["young", "old-big", "old-small"].map((poolMemberId) => ({
       poolMemberId,

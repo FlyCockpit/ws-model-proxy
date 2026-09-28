@@ -1547,6 +1547,19 @@ describe("model API routes", () => {
       expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
     });
 
+    it("scores affinity even for a single-member pool (continuation vs new session)", async () => {
+      db.poolMember.findMany.mockResolvedValue(members(1));
+      kvPools({ a: "FREE" });
+      const { runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: true }),
+      );
+    });
+
     it("changes nothing when the warm-set read fails", async () => {
       db.poolMember.findMany.mockResolvedValue(members());
       warmProtection.load.mockRejectedValue(new Error("database unavailable"));
