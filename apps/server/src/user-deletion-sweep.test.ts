@@ -264,8 +264,13 @@ describe("sweepPendingUserDeletions", () => {
       deleted: 0,
       ...outcome,
     });
-    // One recovery write: the backoff (retry) or the abandon (archive).
-    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    // The recovery write: the backoff (retry), or the abandon (archive), which
+    // first sets the writer marker its guard requires.
+    expect(db.$executeRaw).toHaveBeenCalledTimes(write === "backoff" ? 1 : 2);
+    const [sql] = db.$executeRaw.mock.calls.at(-1) ?? [];
+    expect((sql as string[]).join("?")).toContain(
+      write === "backoff" ? '"deletionSweepNextAttemptAt"' : '"deletionGeneration" = ?',
+    );
     expect(errors).toHaveBeenCalledWith(
       write === "backoff"
         ? "[auth] user deletion sweep will retry:"
