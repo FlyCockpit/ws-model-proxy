@@ -237,6 +237,10 @@ function stripTerminalSequences(text: string): string {
       // DEL is ignored in every state.
     } else if (code >= 0xa0) {
       state = nonAsciiTransition(state);
+      // The terminal reads code points: an astral character is one input,
+      // so its low surrogate goes with the high one instead of printing alone.
+      const next = text.charCodeAt(index + 1);
+      if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) index += 1;
     } else {
       state = printableTransition(state, code);
     }

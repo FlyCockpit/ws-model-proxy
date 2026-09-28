@@ -77,6 +77,21 @@ describe("cleanText", () => {
     expect(cleanText("before\u001bP1é HIDDEN\u001b\\after")).toBe("beforeafter");
   });
 
+  it.each([
+    ["ESC", "\u001b"],
+    ["CSI", "\u001b[1"],
+    ["charset escape", "\u001b("],
+    ["8-bit CSI", "\u009b"],
+  ])("drops a whole astral character that abandons a %s", (_label, sequence) => {
+    // xterm.js drops the code point, never half of it.
+    expect(cleanText(`ok ${sequence}😀 done`)).toBe("ok  done");
+    expect(cleanText(`${sequence}😀`)).toBe("");
+  });
+
+  it("keeps astral characters in plain and styled text", () => {
+    expect(cleanText("a😀b\u001b[31m😀\u001b[0m")).toBe("a😀b😀");
+  });
+
   it("keeps the text after a sequence the terminal cancels", () => {
     // CAN and SUB end a sequence; the text after them prints.
     expect(cleanText("a\u001b[12\u0018shown")).toBe("ashown");
