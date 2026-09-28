@@ -2779,6 +2779,28 @@ describe("OpenRouter owner-paid settlement", () => {
     return reconcileProviderBudget.mock.calls[0]?.[0];
   }
 
+  const pricingRow = () => ({
+    id: "price",
+    version: "price-1",
+    currency: "USD",
+    accountingVersion: "provider-billable-v1",
+    confidence: "CALCULATED",
+    effectiveAt: new Date(0),
+    pricing: { ratesPerMillion: { input: "1", output: "4", cacheRead: "0.1" } },
+    chargeRules: {
+      inputIncludesCacheRead: false,
+      inputIncludesCacheWrite: false,
+      outputIncludesReasoning: false,
+      outputIncludesTool: false,
+      reasoningAllowanceTokens: 0,
+      toolAllowanceTokens: 0,
+      cacheReadAllowanceTokens: 0,
+      cacheWriteAllowanceTokens: 0,
+      additionalAllowanceTokens: 0,
+      unknownCategories: "FAIL_CLOSED",
+    },
+  });
+
   it.each([
     { providerType: "openrouter", complete: true },
     { providerType: "openai", complete: false },
@@ -2809,59 +2831,97 @@ describe("OpenRouter owner-paid settlement", () => {
   // Usage split across the retained prefix and the 1 MiB tail: a calculated
   // cost priced from one complete window must not survive a merge with an
   // incomplete one, in either order.
+  // OpenRouter reports usage once. A second distinct observation (split
+  // across the windows) cannot be attributed to one snapshot, so an earlier
+  // charge or authoritative total must not settle below the liability.
+  it.each([
+    {
+      label: "an earlier reported cost",
+      first: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001, cost: 0.000001 },
+      second: {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        prompt_tokens_details: { cache_write_tokens: 1000 },
+      },
+    },
+    {
+      label: "an earlier authoritative total",
+      first: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, billable_tokens: 1 },
+      second: { output_tokens: 100 },
+    },
+    {
+      label: "two complete observations",
+      first: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001 },
+      second: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 },
+    },
+  ])(
+    "keeps the liability for split observations with $label",
+    async ({ first, second }) => {
+      db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+      try {
+        const frame = (usage: Record<string, unknown>) =>
+          Buffer.from(`data: ${JSON.stringify({ usage: { ...usage, is_byok: false } })}\n\n`);
+        const padding = Array.from({ length: 1100 }, () =>
+          Buffer.from(`: ${"x".repeat(1024)}\n\n`),
+        );
+        for (const upstream of [
+          [frame(first), ...padding, frame(second), Buffer.from("data: [DONE]\n\n")],
+          // Both observations inside one retained window.
+          [...padding, frame(first), frame(second), Buffer.from("data: [DONE]\n\n")],
+        ]) {
+          const settled = await settleOwnerStream("openrouter", upstream);
+          expect(settled.observationComplete).toBe(true);
+          expect(settled.usage.categoriesComplete).toBe(false);
+          expect(settled.usage.reportedCost).toBeUndefined();
+          expect(settled.usage.calculatedCost).toBeUndefined();
+          expect(settled.usage.authoritativeBillableTokens).toBeUndefined();
+          expect(providerBillableTokens(settled.usage)).toBeUndefined();
+        }
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
+      }
+    },
+    60_000,
+  );
+
   it.each([
     { label: "complete prefix, incomplete tail", writes: [0, 1000], complete: false },
     { label: "incomplete prefix, complete tail", writes: [1000, 0], complete: false },
     { label: "complete prefix and tail", writes: [0, 0], complete: true },
-  ])("prices only the merged observation ($label)", async ({ writes, complete }) => {
-    db.providerPricingVersion.findFirst.mockResolvedValue({
-      id: "price",
-      version: "price-1",
-      currency: "USD",
-      accountingVersion: "provider-billable-v1",
-      confidence: "CALCULATED",
-      effectiveAt: new Date(0),
-      pricing: { ratesPerMillion: { input: "1", output: "4", cacheRead: "0.1" } },
-      chargeRules: {
-        inputIncludesCacheRead: false,
-        inputIncludesCacheWrite: false,
-        outputIncludesReasoning: false,
-        outputIncludesTool: false,
-        reasoningAllowanceTokens: 0,
-        toolAllowanceTokens: 0,
-        cacheReadAllowanceTokens: 0,
-        cacheWriteAllowanceTokens: 0,
-        additionalAllowanceTokens: 0,
-        unknownCategories: "FAIL_CLOSED",
-      },
-    });
-    try {
-      const usage = (cacheWrite: number) => ({
-        prompt_tokens: 1000,
-        completion_tokens: 1,
-        total_tokens: 1001,
-        is_byok: false,
-        prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: cacheWrite },
-      });
-      const frame = (data: unknown) => Buffer.from(`data: ${JSON.stringify(data)}\n\n`);
-      const settled = await settleOwnerStream("openrouter", [
-        frame({ usage: usage(writes[0]!) }),
-        ...Array.from({ length: 1100 }, () => Buffer.from(`: ${"x".repeat(1024)}\n\n`)),
-        frame({ usage: usage(writes[1]!) }),
-        Buffer.from("data: [DONE]\n\n"),
-      ]);
-      expect(settled.usage.categoriesComplete).toBe(complete);
-      if (complete) {
-        // 1000*1 + 1*4 per million, priced once from the merged categories.
-        expect(settled.usage.calculatedCost?.toString()).toBe("0.001004");
-        expect(providerBillableTokens(settled.usage)).toBe(1_001n);
-      } else {
-        expect(settled.usage.calculatedCost).toBeUndefined();
-        expect(settled.usage.calculatedCostSource).toBeUndefined();
-        expect(providerBillableTokens(settled.usage)).toBeUndefined();
+  ])(
+    "prices only the merged observation ($label)",
+    async ({ writes, complete }) => {
+      db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+      try {
+        const usage = (cacheWrite: number) => ({
+          prompt_tokens: 1000,
+          completion_tokens: 1,
+          total_tokens: 1001,
+          is_byok: false,
+          prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: cacheWrite },
+        });
+        const frame = (data: unknown) => Buffer.from(`data: ${JSON.stringify(data)}\n\n`);
+        const settled = await settleOwnerStream("openrouter", [
+          frame({ usage: usage(writes[0]!) }),
+          ...Array.from({ length: 1100 }, () => Buffer.from(`: ${"x".repeat(1024)}\n\n`)),
+          frame({ usage: usage(writes[1]!) }),
+          Buffer.from("data: [DONE]\n\n"),
+        ]);
+        expect(settled.usage.categoriesComplete).toBe(complete);
+        if (complete) {
+          // 1000*1 + 1*4 per million, priced once from the merged categories.
+          expect(settled.usage.calculatedCost?.toString()).toBe("0.001004");
+          expect(providerBillableTokens(settled.usage)).toBe(1_001n);
+        } else {
+          expect(settled.usage.calculatedCost).toBeUndefined();
+          expect(settled.usage.calculatedCostSource).toBeUndefined();
+          expect(providerBillableTokens(settled.usage)).toBeUndefined();
+        }
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
       }
-    } finally {
-      db.providerPricingVersion.findFirst.mockReset();
-    }
-  });
+    },
+    60_000,
+  );
 });

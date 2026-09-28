@@ -1538,6 +1538,8 @@ export function parseProviderUsage(
     }
   }
   if (!found) return undefined;
+  if (dialect === "openrouter" && rawObservations.length > 1)
+    return unattributableUsage({ ...found, rawUsage: rawObservations });
   const normalized: RawProviderUsage = {
     ...found,
     rawUsage: rawObservations.length === 1 ? found.rawUsage : rawObservations,
@@ -1674,12 +1676,6 @@ export function retainProviderUsagePrefix(
   return currentBytes + prefix.byteLength;
 }
 
-/**
- * Overlays tail-window usage onto prefix-window usage with tail precedence:
- * categories defined in the tail win, and categories only reported early
- * (before the response exceeded the tail window) are preserved from the
- * prefix. Undefined in both windows stays undefined.
- */
 /** Drops a window's calculated cost; only the merged categories may be priced. */
 function withoutCalculatedCost({
   calculatedCost: _cost,
@@ -1692,12 +1688,46 @@ function withoutCalculatedCost({
   return usage;
 }
 
+/**
+ * OpenRouter reports usage once per response. Two distinct observations cannot
+ * be attributed to one final snapshot: an earlier total or charge could
+ * outlive later counts. Keep them as audit evidence only, so settlement keeps
+ * the admitted liability (no charge, no authoritative total, incomplete).
+ */
+function unattributableUsage(usage: RawProviderUsage): RawProviderUsage {
+  const {
+    authoritativeBillableTokens: _total,
+    reportedCost: _cost,
+    reportedCostCurrency: _currency,
+    reportedCostPricingVersion: _version,
+    reportedCostSource: _source,
+    ...rest
+  } = withoutCalculatedCost(usage);
+  return { ...rest, categoriesComplete: false };
+}
+
+/**
+ * Overlays tail-window usage onto prefix-window usage with tail precedence:
+ * categories defined in the tail win, and categories only reported early
+ * (before the response exceeded the tail window) are preserved from the
+ * prefix. Undefined in both windows stays undefined.
+ */
 export function mergeProviderUsage(
   initial: RawProviderUsage | undefined,
   tail: RawProviderUsage | undefined,
   surface?: ProtocolSurface,
+  dialect: ProviderUsageDialect = "generic",
 ): RawProviderUsage | undefined {
   if (!initial || !tail) return tail ?? initial;
+  if (
+    dialect === "openrouter" &&
+    JSON.stringify(initial.rawUsage) !== JSON.stringify(tail.rawUsage)
+  )
+    return unattributableUsage({
+      ...withoutCalculatedCost(initial),
+      ...Object.fromEntries(Object.entries(tail).filter(([, value]) => value !== undefined)),
+      rawUsage: [initial.rawUsage, tail.rawUsage],
+    } as RawProviderUsage);
   // A calculated cost describes only the window it was priced from. The merged
   // categories must be priced again (the dispatcher does); keeping either
   // window's cost could settle spend for an observation that is incomplete.
@@ -2803,7 +2833,12 @@ export async function dispatchPublicOverflow(
             responseBytes > 1024 * 1024
               ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
               : undefined;
-          const combinedUsage = mergeProviderUsage(initialUsage, tailUsage, surface);
+          const combinedUsage = mergeProviderUsage(
+            initialUsage,
+            tailUsage,
+            surface,
+            target.usageDialect,
+          );
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost

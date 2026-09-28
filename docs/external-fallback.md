@@ -262,7 +262,9 @@ conservative liability path until a redacted capture confirms it. Two spellings
 of the same count (for example `prompt_tokens_details` and
 `input_tokens_details`), a non-object detail container, and any other
 unrecognized or malformed field also keep that response on the conservative
-liability path. Other provider types do not accept this
+liability path. OpenRouter reports usage once per response, so a response that
+carries two different usage observations keeps them as audit evidence only:
+neither an earlier charge nor an earlier total can settle below the liability. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices
