@@ -1167,6 +1167,13 @@ BEGIN
         OR (record."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM record."selectedDiscoveredModelId"))
     UNION ALL
+    SELECT format('stickiness mixed target row=%s', record.id)
+      FROM response_stickiness_record record
+     WHERE record."routingVersion" < 3
+       AND record."targetModelPoolId" IS NOT NULL
+       AND (record."targetExecutionTargetId" IS NOT NULL
+         OR record."targetDiscoveredModelId" IS NOT NULL)
+    UNION ALL
     SELECT format('stickiness pool grant row=%s', record.id)
       FROM response_stickiness_record record
       LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
@@ -1569,6 +1576,12 @@ BEGIN
     END IF;
     consumer_owner := NEW."userId";
     IF NEW."targetModelPoolId" IS NOT NULL THEN
+      -- A binding targets a pool or a direct model, never both: routing
+      -- would take the direct branch and skip the pool's checks.
+      IF NEW."targetExecutionTargetId" IS NOT NULL OR NEW."targetDiscoveredModelId" IS NOT NULL THEN
+        RAISE EXCEPTION 'stickiness binding targets either a pool or a direct model'
+          USING ERRCODE = '23514';
+      END IF;
       SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."targetModelPoolId";
       IF pool_owner IS NULL
          OR (NEW."poolGrantId" IS NULL AND pool_owner IS DISTINCT FROM NEW."userId")

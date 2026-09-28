@@ -5327,6 +5327,44 @@ async function relayPool({
       break;
     }
 
+    // Send boundary: pool access and membership were resolved before the
+    // admission and limiter waits, which are all behind us now. It runs
+    // before a half-open trial is claimed, so a denial never strands a
+    // claim. A revoked grant ends the request; a member removed or disabled
+    // meanwhile is skipped like any other unavailable member. A failed read
+    // is a denial (never a pass) and ends the request.
+    let sendDenial: Awaited<ReturnType<typeof localPoolSendDenial>> | "CHECK_FAILED";
+    try {
+      sendDenial = await localPoolSendDenial({
+        poolId: target.id,
+        ownerUserId: target.ownerUserId,
+        requesterUserId: requester.userId,
+        accessGrantId: target.accessGrantId,
+        poolMemberId: member.id,
+      });
+    } catch {
+      sendDenial = "CHECK_FAILED";
+    }
+    if (sendDenial) {
+      await settleRelayCleanup([() => cliLease.release()]);
+      await releaseCapacityAttempt();
+      if (sendDenial === "MEMBER_UNAVAILABLE") {
+        finalFailure = "not_found";
+        continue;
+      }
+      const failure: RelayFailure = sendDenial === "CHECK_FAILED" ? "unknown" : "not_found";
+      await settleRelayCleanup([() => globalLease?.release(), () => operation.dispose?.()]);
+      await failPoolRelayMetadata({
+        relayRequestId,
+        startedAt,
+        failure,
+        attemptCount,
+        requestBytes: cumulativeRequestBytes,
+        responseBytes: cumulativeResponseBytes,
+      }).catch(metadataUpdateError);
+      return operationFailureResponse(operation, failure);
+    }
+
     if (candidate.healthStatus === "HALF_OPEN") {
       let claimed: number;
       try {
@@ -5434,35 +5472,6 @@ async function relayPool({
       ]);
       finalFailure = "timeout";
       break;
-    }
-    // Send boundary: pool access and membership were resolved before the
-    // admission wait. A revoked grant ends the request; a member removed or
-    // disabled meanwhile is skipped like any other unavailable member.
-    const sendDenial = await localPoolSendDenial({
-      poolId: target.id,
-      ownerUserId: target.ownerUserId,
-      requesterUserId: requester.userId,
-      accessGrantId: target.accessGrantId,
-      poolMemberId: member.id,
-    });
-    if (sendDenial) {
-      await settleRelayCleanup([
-        () => cliLease.release(),
-        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
-      ]);
-      await releaseCapacityAttempt();
-      finalFailure = "not_found";
-      if (sendDenial === "MEMBER_UNAVAILABLE") continue;
-      await settleRelayCleanup([() => globalLease?.release(), () => operation.dispose?.()]);
-      await failPoolRelayMetadata({
-        relayRequestId,
-        startedAt,
-        failure: "not_found",
-        attemptCount,
-        requestBytes: cumulativeRequestBytes,
-        responseBytes: cumulativeResponseBytes,
-      });
-      return operationFailureResponse(operation, "not_found");
     }
     attemptCount += 1;
     let attempt: ReturnType<typeof startRelayAttempt> | null = null;
@@ -6227,25 +6236,38 @@ async function relaySelectedModelNoFailover({
   // Send boundary: the binding's pool access and member were resolved before
   // the admission wait. A grant revoked or replaced, or a member removed or
   // disabled meanwhile, is refused like at arrival (404), before any send.
-  if (
-    requestedModelPoolId &&
-    (!poolAccess ||
-      !selectedPoolMember ||
-      (await localPoolSendDenial({
-        poolId: requestedModelPoolId,
-        ownerUserId: poolAccess.ownerUserId,
-        requesterUserId: requester.userId,
-        accessGrantId: poolAccess.accessGrantId,
-        poolMemberId: selectedPoolMember.id,
-      })))
-  ) {
-    cliLease.release();
-    globalLease.release();
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-    await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return operationFailureResponse(operation, "not_found");
+  // A failed read is a denial, never a pass.
+  if (requestedModelPoolId) {
+    let failure: RelayFailure | null = "not_found";
+    if (poolAccess && selectedPoolMember) {
+      try {
+        failure = (await localPoolSendDenial({
+          poolId: requestedModelPoolId,
+          ownerUserId: poolAccess.ownerUserId,
+          requesterUserId: requester.userId,
+          accessGrantId: poolAccess.accessGrantId,
+          poolMemberId: selectedPoolMember.id,
+        }))
+          ? "not_found"
+          : null;
+      } catch {
+        failure = "unknown";
+      }
+    }
+    if (failure) {
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => globalLease.release(),
+        () =>
+          capacityLease?.state === "ADMITTED"
+            ? capacityRuntime?.release(capacityLease.lease)
+            : undefined,
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+        () => operation.dispose?.(),
+      ]);
+      await failRelayMetadata({ relayRequestId, startedAt, failure });
+      return operationFailureResponse(operation, failure);
+    }
   }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"

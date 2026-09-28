@@ -710,6 +710,31 @@ try {
       ('pre-v2-foreign-grant-binding', NOW(), NOW(), 'owner-b', 'pre-v2-foreign-grant', 2,
         'conflict-pool', 'pre-provider-grant', 'model-a', 'preexisting-target-a',
         NOW() + INTERVAL '1 hour');
+    -- Another grantee's grant on the same pool, a grant row whose owner is
+    -- not the pool owner, and a pool binding that also names a direct target.
+    INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug)
+    VALUES ('owner-c', NOW(), NOW(), 'C', 'c@example.test', 'owner-c');
+    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    VALUES ('pre-v2-pool', NOW(), NOW(), 'owner-a', 'pre-v2', 'Pre v2');
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('pre-v2-c-grant', NOW(), NOW(), 'conflict-pool', 'owner-a', 'owner-c'),
+           ('pre-v2-misowned-grant', NOW(), NOW(), 'pre-v2-pool', 'owner-b', 'owner-c');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest", "routingVersion",
+       "targetModelPoolId", "poolGrantId", "targetDiscoveredModelId",
+       "targetExecutionTargetId", "selectedDiscoveredModelId",
+       "selectedExecutionTargetId", "expiresAt")
+    VALUES
+      ('pre-v2-other-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-v2-other-grantee', 2,
+        'conflict-pool', 'pre-v2-c-grant', NULL, NULL, 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-misowned-grant-binding', NOW(), NOW(), 'owner-c', 'pre-v2-misowned', 2,
+        'pre-v2-pool', 'pre-v2-misowned-grant', NULL, NULL, 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-mixed-binding', NOW(), NOW(), 'owner-a', 'pre-v2-mixed', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', 'model-a',
+        'preexisting-target-a', NOW() + INTERVAL '1 hour');
     INSERT INTO relay_request
       (id, "createdAt", "updatedAt", "userId", "requestedDiscoveredModelId",
        "requestedExecutionTargetId", "selectedDiscoveredModelId",
@@ -734,6 +759,9 @@ try {
         "pre-invalid-cross-wire",
         "stickiness pool grant row=pre-v2-ungranted-binding",
         "stickiness pool grant row=pre-v2-foreign-grant-binding",
+        "stickiness pool grant row=pre-v2-other-grantee-binding",
+        "stickiness pool grant row=pre-v2-misowned-grant-binding",
+        "stickiness mixed target row=pre-v2-mixed-binding",
       ].every((id) => error?.detail?.includes(id)) ||
       ["pre-v2-owner-binding", "pre-v2-grantee-binding"].some((id) => error?.detail?.includes(id))
     ) {
@@ -767,6 +795,10 @@ try {
     DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'pre-v2-ungranted-binding'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'pre-v2-foreign-grant-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-other-grantee-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-misowned-grant-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-mixed-binding'; -- policy: bounded-delete
+    DELETE FROM pool_grant WHERE id = 'pre-v2-misowned-grant'; -- policy: bounded-delete
     DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay'; -- policy: bounded-delete
   `);
 

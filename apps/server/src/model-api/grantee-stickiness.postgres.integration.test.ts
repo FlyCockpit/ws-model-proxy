@@ -146,6 +146,42 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       await expect(
         binding({ targetModelPoolId: null, selectedExecutionTargetId: foreign.target.id }),
       ).rejects.toThrow(/stickiness pool binding requires the pool owner or the exact grant/);
+      // Identity changes on a live binding are always re-checked: another
+      // grantee's grant, the grantee's grant on another pool, another pool,
+      // or a foreign direct target.
+      for (const data of [
+        { poolGrantId: secondGrant.id },
+        { poolGrantId: otherGrant.id },
+        { targetModelPoolId: otherPool.id },
+      ])
+        await expect(
+          db.responseStickinessRecord.update({ where: { id: accepted.id }, data }),
+        ).rejects.toThrow(/stickiness pool binding requires the pool owner or the exact grant/);
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: accepted.id },
+          data: { targetExecutionTargetId: foreign.target.id },
+        }),
+      ).rejects.toThrow(/stickiness binding targets either a pool or a direct model/);
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: accepted.id },
+          data: {
+            targetModelPoolId: null,
+            poolGrantId: null,
+            targetExecutionTargetId: foreign.target.id,
+          },
+        }),
+      ).rejects.toThrow(/stickiness target must match its owner and discovered model/);
+      // A pool binding never also names a direct target (routing would take
+      // the direct branch and skip the pool's checks).
+      await expect(
+        binding({
+          userId: owner.id,
+          poolGrantId: null,
+          targetExecutionTargetId: memberA.target.id,
+        }),
+      ).rejects.toThrow(/stickiness binding targets either a pool or a direct model/);
       // The owner's target must be a local member of the pool when written.
       await expect(binding({ selectedExecutionTargetId: outsider.target.id })).rejects.toThrow(
         /stickiness selection must be a local member of its pool/,
@@ -320,7 +356,8 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       const createResponse = await createPromise;
       expect(createResponse.status).toBe(200);
       await createResponse.text();
-      // The binding is durable before the client sees the end of the response.
+      // The binding exists once the response is read (the EOF-before-durable
+      // ordering itself is pinned by the routes unit tests).
       expect(
         await db.responseStickinessRecord.findFirst({
           where: { userId: grantee.id, routingVersion: 2, NOT: { id: accepted.id } },
