@@ -145,6 +145,7 @@ import {
   transformerSupportedModalities,
   wrapTransformEnvelope,
 } from "./media-transform.js";
+import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
@@ -5592,6 +5593,9 @@ async function relayPool({
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
           ...(schedule ? { schedule } : {}),
+          // The shortened local phase of an `:external` caller with an external
+          // plan must not fail open on metric-FULL members: it goes external.
+          metricFailOpen: !(externalAfterWaitMs !== null && localWaitMode === "shortened"),
         },
         signal: request.signal,
       });
@@ -5678,6 +5682,18 @@ async function relayPool({
         affinityDecision = null;
       }
     }
+  }
+  // Metric routing rules (S-B part 2), after compatibility and affinity:
+  // metric-FULL members are dropped (all kept when every one is FULL; then
+  // admission fails open, except an `:external` caller's shortened local
+  // phase), and `avoid` members rank last. Grant time re-checks FULL.
+  const metricOrder = await applyMetricRoutingVerdicts(routeCandidates);
+  routeCandidates = metricOrder.candidates;
+  if (metricOrder.allFull) {
+    console.warn("[model-api] every pool candidate is metric-FULL", {
+      poolId: target.id,
+      relayRequestId,
+    });
   }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;

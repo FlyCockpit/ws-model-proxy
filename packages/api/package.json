@@ -62,6 +62,9 @@
     "./lib/engine-facts": {
       "default": "./src/lib/engine-facts.ts"
     },
+    "./lib/metric-routing": {
+      "default": "./src/lib/metric-routing.ts"
+    },
     "./lib/reasoning-contract": {
       "default": "./src/lib/reasoning-contract.ts"
     },

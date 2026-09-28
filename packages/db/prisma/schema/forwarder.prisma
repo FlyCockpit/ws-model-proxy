@@ -348,6 +348,11 @@ model CliDevice {
   rejectedRelayProtocolVersion String?
   rejectedCliVersion           String?
   relayRejectedAt              DateTime?
+  /// Remotely defined custom metric sources (`metrics.sources.set`), set over
+  /// MCP only while `mcpCommandMode` is UNSUPERVISED. The CLI still needs its
+  /// local opt-in and a hash approval of each command before one runs.
+  remoteMetricSources          Json?
+  remoteMetricSourcesAt        DateTime?
   User                         User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliTokens                    CliToken[]
   CliDeviceCredentials         CliDeviceCredential[]
@@ -1055,6 +1060,11 @@ model ModelPool {
   /// each user still picks their own model. Null = no consent: clearing it
   /// withdraws BYOK for this pool.
   externalEquivalentModel         String?
+  /// Metric-driven routing rules (S-B part 2): a zod-validated array of
+  /// `{metric, labels?, aggregate, op, threshold, effect}`
+  /// (packages/api/src/lib/metric-routing.ts). `full` makes a member FULL,
+  /// `avoid` ranks it last. Stale or missing metrics are ignored.
+  routingRules                    Json                          @default("[]")
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
@@ -1231,6 +1241,10 @@ model AdmissionRequest {
   state                   AdmissionRequestState @default(WAITING)
   terminalAt              DateTime?
   terminalReason          String?
+  /// False only while an `:external` caller with an external plan waits its
+  /// shortened local phase: metric-FULL members then stay ineligible even
+  /// when every candidate is metric-FULL, so the request goes external.
+  metricFailOpen          Boolean               @default(true)
   User                    User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelPool               ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DirectExecutionTarget   ExecutionTarget?      @relation("AdmissionRequestDirectTarget", fields: [directExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1248,6 +1262,34 @@ model AdmissionRequest {
   @@index([poolId])
   @@index([directExecutionTargetId])
   @@map("admission_request")
+}
+
+/// Metric routing verdict of relay 2.7 `node.metrics` / `endpoint.load` against
+/// the member's pool rules (S-B part 2). H-class (DL-1): no foreign keys to or
+/// from graph tables, so writing it adds no lock-order edge; admission reads
+/// it with a plain, non-locking SELECT. Rows of removed members are never
+/// read again; the retention sweep deletes rows that expired long ago.
+model PoolMemberRoutingVerdict {
+  poolMemberId String               @id
+  userId       String
+  poolId       String
+  cliDeviceId  String
+  verdict      MetricRoutingVerdict
+  /// Per rule (by index): `triggered`, `clear` or `stale`.
+  ruleStates   Json
+  evaluatedAt  DateTime
+  /// The verdict is ignored from here on (its triggering metric went stale).
+  expiresAt    DateTime
+
+  @@index([poolId])
+  @@index([expiresAt])
+  @@map("pool_member_routing_verdict")
+}
+
+enum MetricRoutingVerdict {
+  NONE
+  AVOID
+  FULL
 }
 
 model CapacityWaiter {

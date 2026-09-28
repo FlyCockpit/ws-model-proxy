@@ -371,6 +371,8 @@ const metricSourceStatusSchema = z
     intervalSecs: z.number().int().min(5).max(86_400).optional(),
     /** A reason code only: command output and stderr never leave the CLI. */
     error: z.enum(["spawn", "timeout", "exit_status", "output_too_large", "parse"]).optional(),
+    /** How often the source runs; its series are stale after 3× this (S-B part 2). */
+    intervalSecs: z.number().int().min(5).max(86_400).optional(),
   })
   .strict();
 

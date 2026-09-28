@@ -9,6 +9,10 @@
 //!
 //! Linux reads `/proc`, `/sys/class/net` and `statvfs`; other platforms send
 //! what they can (architecture, CPU count, CLI version).
+//!
+//! Custom metric sources ([`crate::metric_sources`]) run on their own
+//! short-lived threads; this thread only schedules them and reports their
+//! latest values in `node.metrics.custom`.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -19,10 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
-
 use crate::config::EndpointConfig;
 use crate::engine::{EngineKind, LoadReading};
+use crate::metric_sources::{Runner, RunnerSettings};
 use crate::protocol::{
     ClientControlMessage, EndpointLoad, ExecutionMechanism, MetricSourceOrigin, MetricSourceState,
     MetricSourceStatus, NODE_GPU_MAX, NODE_INTERFACE_MAX, NODE_METRICS_SOURCES_MAX, NodeCpu,
@@ -63,15 +66,17 @@ struct Shared {
     endpoints: Vec<EndpointConfig>,
     /// Bumped whenever `endpoints` changes, so the load scheduler resyncs.
     endpoints_generation: u64,
-    remote_sources: Vec<RemoteMetricSource>,
-    /// Set when `metrics.sources.set` arrived; the next metrics frame goes
-    /// out as soon as the minimum gap allows.
-    sources_changed: bool,
+    /// A `metrics.sources.set` list the thread has not applied yet.
+    remote_sources: Option<Vec<RemoteMetricSource>>,
 }
 
 impl Telemetry {
     /// Start sampling after `hello.ok`. `node.info` is the first frame.
-    pub(crate) fn start(tx: SyncSender<FromWorker>, endpoints: &[EndpointConfig]) -> Self {
+    pub(crate) fn start(
+        tx: SyncSender<FromWorker>,
+        endpoints: &[EndpointConfig],
+        sources: RunnerSettings,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Mutex::new(Shared {
             endpoints: endpoints.to_vec(),
@@ -81,7 +86,7 @@ impl Telemetry {
         let thread_shared = Arc::clone(&shared);
         let spawned = thread::Builder::new()
             .name("wsmp-telemetry".to_string())
-            .spawn(move || run(tx, thread_stop, thread_shared));
+            .spawn(move || run(tx, thread_stop, thread_shared, sources));
         if let Err(error) = spawned {
             tracing::warn!(error = %error, "starting the telemetry thread failed; node metrics are off");
         }
@@ -98,14 +103,13 @@ impl Telemetry {
         }
     }
 
-    /// `metrics.sources.set`: remember the remote definitions. This CLI does
-    /// not run remote sources; each is reported as `unsupported`. More than
+    /// `metrics.sources.set`: replace the remote definitions. They run only
+    /// with the local opt-in and an approval of each exact command. More than
     /// [`NODE_METRICS_SOURCES_MAX`] entries are dropped so a hostile or buggy
     /// server cannot grow the status list past the server's own schema bound.
     pub fn set_remote_sources(&self, sources: Vec<RemoteMetricSource>) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.remote_sources = bounded_remote_sources(&sources);
-            shared.sources_changed = true;
+            shared.remote_sources = Some(bounded_remote_sources(&sources));
         }
     }
 }
@@ -155,7 +159,13 @@ pub fn encode_telemetry(message: &mut ClientControlMessage) -> Option<String> {
     }
 }
 
-fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>) {
+fn run(
+    tx: SyncSender<FromWorker>,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Mutex<Shared>>,
+    sources: RunnerSettings,
+) {
+    let mut runner = Runner::new(sources);
     let mut gpu = GpuQuery::default();
     let info = collect_node_info(&mut gpu);
     if offer(&tx, ClientControlMessage::NodeInfo(info)) == Sent::Gone {
@@ -181,23 +191,25 @@ fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shar
     // Prime the CPU counters so the first metrics frame has a usage figure.
     cpu.sample();
     let mut last_metrics: Option<Instant> = None;
+    let mut sources_changed = false;
     let mut next_metrics = Instant::now() + Duration::from_secs(2);
     while !stop.load(Ordering::SeqCst) {
         let now = Instant::now();
-        let sources_changed = shared
+        if let Some(remote) = shared
             .lock()
-            .map(|shared| shared.sources_changed)
-            .unwrap_or(false);
+            .ok()
+            .and_then(|mut shared| shared.remote_sources.take())
+        {
+            runner.set_remote(remote);
+        }
+        runner.tick(now);
+        // A finished source run or a changed source state goes out as soon
+        // as the minimum gap allows.
+        sources_changed |= runner.take_changed();
         let gap_ok = last_metrics.is_none_or(|at| now.duration_since(at) >= NODE_METRICS_MIN_GAP);
         if gap_ok && (now >= next_metrics || sources_changed) {
-            let remote = match shared.lock() {
-                Ok(mut shared) => {
-                    shared.sources_changed = false;
-                    shared.remote_sources.clone()
-                }
-                Err(_) => Vec::new(),
-            };
-            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &remote);
+            sources_changed = false;
+            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &runner);
             if offer(&tx, ClientControlMessage::NodeMetrics(metrics)) == Sent::Gone {
                 return;
             }
@@ -450,27 +462,8 @@ fn same_load(left: &LoadReading, right: &LoadReading) -> bool {
         }
 }
 
-/// Status of every remotely defined source: `unsupported` until S-B part 2.
-pub fn remote_source_statuses(sources: &[RemoteMetricSource]) -> Vec<MetricSourceStatus> {
-    sources
-        .iter()
-        .filter(|source| is_metric_name(&source.name))
-        .take(NODE_METRICS_SOURCES_MAX)
-        .map(|source| MetricSourceStatus {
-            name: source.name.clone(),
-            origin: MetricSourceOrigin::Remote,
-            state: MetricSourceState::Unsupported,
-            command_sha256: Some(sha256_hex(source.command.as_bytes())),
-            interval_secs: Some(source.interval_secs).filter(|secs| {
-                (METRIC_SOURCE_INTERVAL_MIN_SECS..=METRIC_SOURCE_INTERVAL_MAX_SECS).contains(secs)
-            }),
-            error: None,
-        })
-        .collect()
-}
-
 /// Cap a remotely defined source list at the server's schema bound. Invalid
-/// names are dropped first (as [`remote_source_statuses`] does), so they
+/// names are dropped first (as the source runner does), so they
 /// cannot use up slots that valid sources after them need.
 fn bounded_remote_sources(sources: &[RemoteMetricSource]) -> Vec<RemoteMetricSource> {
     sources
@@ -487,13 +480,6 @@ pub fn is_metric_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
@@ -1003,11 +989,8 @@ fn root_disk() -> Option<NodeDiskMetrics> {
     None
 }
 
-fn collect_node_metrics(
-    cpu: &mut CpuSampler,
-    gpu: &mut GpuQuery,
-    remote_sources: &[RemoteMetricSource],
-) -> NodeMetrics {
+fn collect_node_metrics(cpu: &mut CpuSampler, gpu: &mut GpuQuery, sources: &Runner) -> NodeMetrics {
+    let (custom, sources) = sources.report(Instant::now());
     let load = read_text("/proc/loadavg").and_then(|text| parse_loadavg(&text));
     let memory = read_text("/proc/meminfo").map(|text| parse_meminfo(&text));
     let interfaces = interface_names()
@@ -1049,8 +1032,8 @@ fn collect_node_metrics(
             })
             .collect(),
         interfaces,
-        custom: Vec::new(),
-        sources: remote_source_statuses(remote_sources),
+        custom,
+        sources,
     }
 }
 
@@ -1058,7 +1041,6 @@ fn collect_node_metrics(
 mod tests {
     use super::*;
     use crate::engine::LoadSource;
-    use crate::protocol::MetricSourceFormat;
 
     #[test]
     fn byte_counters_saturate_at_the_json_safe_integer() {
@@ -1390,25 +1372,7 @@ mod tests {
             bounded_remote_sources(&many).len(),
             NODE_METRICS_SOURCES_MAX
         );
-        assert_eq!(
-            remote_source_statuses(&many).len(),
-            NODE_METRICS_SOURCES_MAX
-        );
         assert_eq!(bounded_remote_sources(&many[..2]).len(), 2);
-    }
-
-    #[test]
-    fn remote_source_statuses_carry_the_source_interval_within_bounds() {
-        let with_interval = |interval_secs: u32| RemoteMetricSource {
-            name: "fans".to_string(),
-            command: "echo 1".to_string(),
-            interval_secs,
-            timeout_secs: 5,
-            format: MetricSourceFormat::Number,
-        };
-        let intervals = [4, 5, 10, 86_400, 86_401]
-            .map(|secs| remote_source_statuses(&[with_interval(secs)])[0].interval_secs);
-        assert_eq!(intervals, [None, Some(5), Some(10), Some(86_400), None]);
     }
 
     /// Run the scheduler over one vLLM endpoint whose sampler returns the
@@ -1510,35 +1474,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_sources_are_reported_unsupported_with_command_hash() {
-        let statuses = remote_source_statuses(&[
-            RemoteMetricSource {
-                name: "gpu_fan".to_string(),
-                command: "echo 1".to_string(),
-                interval_secs: 10,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-            RemoteMetricSource {
-                name: "bad name!".to_string(),
-                command: "echo 2".to_string(),
-                interval_secs: 10,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-        ]);
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].state, MetricSourceState::Unsupported);
-        assert_eq!(statuses[0].origin, MetricSourceOrigin::Remote);
-        let hash = statuses[0].command_sha256.as_deref().expect("hash");
-        assert_eq!(hash.len(), 64);
-        assert_eq!(hash, sha256_hex(b"echo 1"));
-        assert!(
-            !format!("{statuses:?}").contains("echo 1"),
-            "the command itself is not reported"
-        );
+    fn metric_names_match_the_wire_charset() {
         assert!(is_metric_name("a.b:c-d_1"));
         assert!(!is_metric_name(""));
+        assert!(!is_metric_name("bad name"));
         assert!(!is_metric_name(&"x".repeat(65)));
     }
 

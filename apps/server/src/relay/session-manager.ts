@@ -13,6 +13,7 @@ import {
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
+import { parseStoredRemoteMetricSources } from "@ws-model-proxy/api/lib/metric-routing";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
   markPoolMembersForCliUnavailable,
@@ -23,6 +24,11 @@ import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import {
+  createRoutingEvaluationState,
+  MetricRoutingEvaluator,
+  type RoutingEvaluationState,
+} from "./metric-routing-evaluator.js";
 import {
   listDueOwnedPoolMemberRecoveries,
   type OwnedRecoveryMember,
@@ -366,6 +372,8 @@ type SessionState = {
   nodeMetricsPersistedAtMs: number | null;
   endpointLoad: Map<string, LiveEndpointLoadEntry>;
   malformedTelemetryLoggedAtMs: number | null;
+  /** Metric routing rule evaluation for this device (S-B part 2). */
+  routingEvaluation: RoutingEvaluationState | null;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -557,6 +565,7 @@ export class RelaySessionManager {
    * step) and CLI sockets by the close calls above.
    */
   private relayDrain = false;
+  private readonly routingEvaluator = new MetricRoutingEvaluator();
   private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
     getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
     listDueMembers: listDueOwnedPoolMemberRecoveries,
@@ -623,6 +632,7 @@ export class RelaySessionManager {
       nodeMetricsPersistedAtMs: null,
       endpointLoad: new Map(),
       malformedTelemetryLoggedAtMs: null,
+      routingEvaluation: null,
     });
     return true;
   }
@@ -694,6 +704,11 @@ export class RelaySessionManager {
         session.terminalViewers = interactive.terminalViewers;
         session.terminalIdentity = interactive.terminalIdentity;
         session.lastHeartbeatAt = now;
+        if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+        session.routingEvaluation = createRoutingEvaluationState(
+          session.identity.userId,
+          registration.cliDeviceId,
+        );
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
@@ -707,6 +722,7 @@ export class RelaySessionManager {
             desiredCapabilities: registration.desiredCapabilities,
           }),
         );
+        await this.sendRemoteMetricSources(session);
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
@@ -954,6 +970,9 @@ export class RelaySessionManager {
   /** Stops background recovery in controlled shutdowns and unit tests. */
   dispose() {
     this.poolMemberRecovery.stop();
+    for (const session of this.sessionsBySocket.values()) {
+      if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+    }
   }
 
   private async removeSessionWithStatus(
@@ -992,6 +1011,7 @@ export class RelaySessionManager {
     if (!session) return null;
     this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
+    if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
     this.sessionsBySocket.delete(socket);
     this.failActiveRequestsForSession(session);
     const cliDeviceId = session.cliDeviceId;
@@ -1173,6 +1193,8 @@ export class RelaySessionManager {
       allowHumanTerminal: device?.allowHumanTerminal === true,
       mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
     });
+    // Leaving `unsupervised` withdraws remote metric sources at once.
+    await this.onRemoteMetricSourcesChanged(cliDeviceId);
   }
 
   /**
@@ -1337,6 +1359,7 @@ export class RelaySessionManager {
         receivedAt: now,
         receivedAtMs: nowMs,
       });
+      this.scheduleRoutingEvaluation(session);
       return;
     }
     if (message.type === "node.info") {
@@ -1360,6 +1383,7 @@ export class RelaySessionManager {
     session.nodeMetricsAcceptedAtMs = nowMs;
     const { type: _type, ...sample } = message;
     session.nodeMetrics = { sample, receivedAt: now };
+    this.scheduleRoutingEvaluation(session);
     if (
       session.nodeMetricsPersistedAtMs !== null &&
       nowMs - session.nodeMetricsPersistedAtMs < NODE_METRICS_PERSIST_INTERVAL_MS
@@ -1380,6 +1404,60 @@ export class RelaySessionManager {
         ],
       },
     );
+  }
+
+  private scheduleRoutingEvaluation(session: SessionState) {
+    const state = session.routingEvaluation;
+    if (!state) return;
+    this.routingEvaluator.schedule(state, () => ({
+      nodeMetrics: session.nodeMetrics,
+      endpointLoad: [...session.endpointLoad.values()],
+    }));
+  }
+
+  /**
+   * Send the device's remotely defined metric sources (`metrics.sources.set`)
+   * to its live session: after `hello.ok`, and whenever the definitions or the
+   * device's MCP command mode change. Only an `unsupervised` device gets its
+   * definitions; any other mode gets an empty list, which stops them. The CLI
+   * still needs its local opt-in and a hash approval of each command.
+   */
+  private async sendRemoteMetricSources(session: SessionState) {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId) return;
+    try {
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: cliDeviceId },
+        select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
+      });
+      if (!device || device.userId !== session.identity.userId) return;
+      if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return;
+      if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
+      const sources =
+        device.mcpCommandMode === "UNSUPERVISED"
+          ? parseStoredRemoteMetricSources(device.remoteMetricSources)
+          : [];
+      session.socket.send(
+        encodeRelayServerControlMessage({
+          type: "metrics.sources.set",
+          id: `sources-${randomBytes(8).toString("hex")}`,
+          sources,
+        }),
+      );
+    } catch (error) {
+      console.error(
+        "[relay] sending remote metric sources failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /** The dashboard or MCP changed a device's remote metric sources. */
+  async onRemoteMetricSourcesChanged(cliDeviceId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session?.registered) return false;
+    await this.sendRemoteMetricSources(session);
+    return true;
   }
 
   private async writeTelemetry(

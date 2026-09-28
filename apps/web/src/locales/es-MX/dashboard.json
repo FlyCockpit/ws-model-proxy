@@ -225,7 +225,38 @@
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",
-    "upgradeUnknownVersion": "(versión desconocida)"
+    "upgradeUnknownVersion": "(versión desconocida)",
+    "metricSources": {
+      "title": "Fuentes de métricas",
+      "loadFailed": "No se pudieron cargar las fuentes de métricas de este dispositivo.",
+      "empty": "Sin fuentes de métricas.",
+      "origins": {
+        "local": "Local",
+        "remote": "Remota"
+      },
+      "states": {
+        "active": "Activa",
+        "pending_approval": "Pendiente de aprobación",
+        "refused": "Rechazada",
+        "unsupported": "No compatible",
+        "disabled": "Desactivada",
+        "failing": "Con fallas"
+      },
+      "errors": {
+        "spawn": "no se pudo iniciar",
+        "timeout": "tiempo agotado",
+        "exit_status": "terminó con error",
+        "output_too_large": "salida demasiado grande",
+        "parse": "salida no numérica"
+      },
+      "interval": "cada {{seconds}} s",
+      "pendingHint": "Apruébala en la máquina con `wsmp metrics approve {{name}}`.",
+      "refusedHint": "La CLI rechaza fuentes remotas salvo que `allowRemoteMetricSources` esté activado localmente.",
+      "notReported": "Definida en el servidor; la CLI aún no la reporta.",
+      "remoteNotAllowed": "Las fuentes remotas se envían a la CLI solo mientras su modo de comandos MCP es sin supervisión.",
+      "valuesTitle": "Valores más recientes",
+      "stale": "obsoleto"
+    }
   },
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
@@ -847,7 +878,47 @@
     "transformerTimeoutMs": "Tiempo de espera del transformador (ms)",
     "transformerMaxAssets": "Máximo de adjuntos por solicitud",
     "updated": "Pool actualizado",
-    "weight": "Peso"
+    "weight": "Peso",
+    "metricRules": {
+      "title": "Reglas de enrutamiento por métricas",
+      "description": "Marca un miembro como LLENO o evítalo según las métricas de su dispositivo. Los miembros LLENOS no reciben solicitudes nuevas (esperan en cola, van a otro miembro o salen al proveedor externo para quienes usan :external). Los miembros evitados se usan al final. Una métrica obsoleta o ausente se ignora, y si todos los miembros están LLENOS las solicitudes se siguen atendiendo.",
+      "hint": "Cada regla compara el valor más alto de una métrica (opcionalmente filtrada por etiquetas) con un umbral.",
+      "empty": "Sin reglas. El enrutamiento usa solo la capacidad.",
+      "ruleLegend": "Regla {{number}}",
+      "metric": "Métrica",
+      "labels": "Etiquetas (opcional)",
+      "op": "Comparar",
+      "threshold": "Umbral",
+      "effect": "Efecto",
+      "effects": {
+        "full": "Marcar LLENO",
+        "avoid": "Evitar"
+      },
+      "add": "Agregar regla",
+      "remove": "Quitar regla {{number}}",
+      "save": "Guardar reglas",
+      "saved": "Reglas de enrutamiento guardadas.",
+      "saveFailed": "No se pudieron guardar las reglas de enrutamiento.",
+      "loadFailed": "No se pudieron cargar las reglas de enrutamiento.",
+      "metricInvalid": "Usa de 1 a 64 letras, dígitos o _ . : -",
+      "labelsInvalid": "Usa pares clave=valor separados por comas (letras, dígitos, _ . : -).",
+      "thresholdInvalid": "Escribe un número.",
+      "membersTitle": "Miembros",
+      "badges": {
+        "full": "LLENO por métrica",
+        "avoid": "Evitado",
+        "clear": "Reglas sin activar",
+        "stale": "Métrica obsoleta",
+        "unevaluated": "Aún sin evaluar",
+        "rulesStale_one": "{{count}} regla ignorada (métrica obsoleta)",
+        "rulesStale_other": "{{count}} reglas ignoradas (métricas obsoletas)"
+      },
+      "seriesTitle": "Métricas disponibles",
+      "seriesHint": "Métricas que reportan ahora los dispositivos de los miembros. Las métricas endpoint.* (running, waiting, kv_usage, slots_busy) usan el endpoint de cada miembro.",
+      "offline": "sin conexión (instantánea guardada)",
+      "noSeries": "Aún no hay métricas.",
+      "staleValue": "obsoleta"
+    }
   },
   "providers": {
     "title": "Proveedores externos",

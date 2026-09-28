@@ -478,6 +478,15 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
   },
   {
+    name: "forwarder_pool_routing_rules_get",
+    target: "forwarderManagement.getPoolRoutingRules",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getPoolRoutingRules),
+  },
+  {
     name: "forwarder_model_pools_list",
     target: "forwarderManagement.listModelPools",
     scope: "read",
@@ -813,6 +822,32 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
+  },
+  {
+    name: "forwarder_pool_routing_rules_set",
+    target: "forwarderManagement.setPoolRoutingRules",
+    scope: "write",
+    confirmation: "RUN",
+    // A `full` rule can send `:external` callers to paid external providers.
+    classification: "cost",
+    inputSchema: confirmedArgs("RUN"),
+    descriptionNote:
+      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid'}]. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.setPoolRoutingRules),
+  },
+  {
+    name: "forwarder_device_metric_sources_set",
+    target: "forwarderManagement.setCliDeviceMetricSources",
+    scope: "write",
+    confirmation: "RUN",
+    // Defines commands that run on the person's machine.
+    classification: "external",
+    inputSchema: confirmedArgs("RUN"),
+    descriptionNote:
+      "Only for devices whose MCP command mode is unsupervised. The CLI runs a source only with its local opt-in and after the person approves the exact command (wsmp metrics approve); a changed command needs approval again.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setCliDeviceMetricSources,
+    ),
   },
   {
     name: "forwarder_model_pool_update",
@@ -1317,8 +1352,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly 26 read tools and 51 write tools
- * (46 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 28 read tools and 53 write tools
+ * (48 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 

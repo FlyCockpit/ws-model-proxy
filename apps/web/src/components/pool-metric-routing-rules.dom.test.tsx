@@ -1,0 +1,200 @@
+// @vitest-environment jsdom
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const state = vi.hoisted(() => ({
+  view: null as Record<string, unknown> | null,
+  mutationCalls: [] as unknown[],
+}));
+
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: Record<string, unknown>) =>
+      options && "count" in options ? `${key}:${String(options.count)}` : key,
+  }),
+}));
+
+vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+}));
+
+vi.mock("@/utils/orpc", () => ({
+  orpc: {
+    forwarderManagement: {
+      key: () => ["forwarderManagement"],
+      getPoolRoutingRules: {
+        queryOptions: () => ({
+          queryKey: ["routingRules"],
+          queryFn: async () => state.view,
+          initialData: state.view,
+        }),
+      },
+      setPoolRoutingRules: {
+        mutationOptions: (options?: Record<string, unknown>) => ({
+          mutationFn: async (variables: unknown) => {
+            state.mutationCalls.push(variables);
+            return variables;
+          },
+          ...options,
+        }),
+      },
+    },
+  },
+}));
+
+import { PoolMetricRoutingRules, parseLabelText } from "./pool-metric-routing-rules";
+
+function mount(children: ReactNode) {
+  return render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      {children}
+    </QueryClientProvider>,
+  );
+}
+
+function view(overrides: Record<string, unknown> = {}) {
+  return {
+    poolId: "pool-1",
+    poolSlug: "coder",
+    rules: [
+      {
+        metric: "node.gpu.temperature_c",
+        labels: { gpu: "0" },
+        aggregate: "max",
+        op: ">",
+        threshold: 85,
+        effect: "full",
+      },
+    ],
+    members: [
+      {
+        poolMemberId: "m1",
+        upstreamModelId: "qwen-a",
+        endpointSlug: "gpu",
+        cliDeviceId: "d1",
+        verdict: "full",
+        state: "active",
+        ruleStates: ["triggered"],
+        evaluatedAt: null,
+        expiresAt: null,
+        endpointSeries: [{ name: "endpoint.running", labels: {}, value: 2, stale: false }],
+      },
+      {
+        poolMemberId: "m2",
+        upstreamModelId: "qwen-b",
+        endpointSlug: "gpu",
+        cliDeviceId: "d1",
+        verdict: null,
+        state: "stale",
+        ruleStates: ["stale"],
+        evaluatedAt: null,
+        expiresAt: null,
+        endpointSeries: [],
+      },
+    ],
+    devices: [
+      {
+        cliDeviceId: "d1",
+        label: "desk",
+        live: true,
+        series: [
+          {
+            name: "node.gpu.temperature_c",
+            labels: { gpu: "0" },
+            value: 91,
+            origin: "builtin",
+            ageSeconds: 3,
+            stale: false,
+          },
+        ],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+afterEach(() => {
+  cleanup();
+  state.view = null;
+  state.mutationCalls = [];
+});
+
+describe("PoolMetricRoutingRules", () => {
+  it("shows the rules, member badges and the device's metrics", () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.getByDisplayValue("node.gpu.temperature_c")).toBeTruthy();
+    expect(screen.getByDisplayValue("gpu=0")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.metricRules.badges.full")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.metricRules.badges.stale")).toBeTruthy();
+    expect(screen.getByText('node.gpu.temperature_c{gpu="0"}')).toBeTruthy();
+    // Every rule input is a 44px target.
+    for (const input of screen.getAllByRole("textbox"))
+      expect(input.className).toContain("min-h-11");
+  });
+
+  it("adds a rule and saves the whole list with parsed labels and numbers", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    fireEvent.click(screen.getByRole("button", { name: /metricRules.add/ }));
+    const metricInputs = screen.getAllByLabelText("dashboard:pools.metricRules.metric");
+    fireEvent.change(metricInputs[1]!, { target: { value: "endpoint.waiting" } });
+    const thresholds = screen.getAllByLabelText("dashboard:pools.metricRules.threshold");
+    fireEvent.change(thresholds[1]!, { target: { value: "2.5" } });
+    const effects = screen.getAllByLabelText("dashboard:pools.metricRules.effect");
+    fireEvent.change(effects[1]!, { target: { value: "avoid" } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(1));
+    expect(state.mutationCalls[0]).toEqual({
+      poolId: "pool-1",
+      rules: [
+        {
+          metric: "node.gpu.temperature_c",
+          labels: { gpu: "0" },
+          aggregate: "max",
+          op: ">",
+          threshold: 85,
+          effect: "full",
+        },
+        { metric: "endpoint.waiting", aggregate: "max", op: ">", threshold: 2.5, effect: "avoid" },
+      ],
+    });
+  });
+
+  it("refuses malformed labels and thresholds without saving", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    fireEvent.change(screen.getByDisplayValue("gpu=0"), { target: { value: "gpu 0" } });
+    fireEvent.change(screen.getByDisplayValue("85"), { target: { value: "hot" } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() =>
+      expect(screen.getByText("dashboard:pools.metricRules.labelsInvalid")).toBeTruthy(),
+    );
+    expect(screen.getByText("dashboard:pools.metricRules.thresholdInvalid")).toBeTruthy();
+    expect(state.mutationCalls).toEqual([]);
+  });
+
+  it("removes a rule and saves an empty list", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.remove" }));
+    expect(screen.getByText("dashboard:pools.metricRules.empty")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual([{ poolId: "pool-1", rules: [] }]));
+  });
+});
+
+describe("parseLabelText", () => {
+  it("parses key=value lists and rejects anything else", () => {
+    expect(parseLabelText("")).toEqual({});
+    expect(parseLabelText(" gpu = 0 , fan=1 ")).toEqual({ gpu: "0", fan: "1" });
+    expect(parseLabelText("gpu")).toBeNull();
+    expect(parseLabelText("gpu=0=1")).toBeNull();
+    expect(parseLabelText('gpu="0"')).toBeNull();
+  });
+});

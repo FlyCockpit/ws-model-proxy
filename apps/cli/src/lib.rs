@@ -18,6 +18,7 @@ pub mod exit;
 pub mod hostname;
 pub mod logging;
 pub mod media;
+pub mod metric_sources;
 pub mod output;
 pub mod paths;
 pub mod probe;

@@ -235,6 +235,8 @@ function cliContextServices() {
       repairExpiredProviderBudgets(new Date(), scope),
     onCliFeatureGrantsChanged: (cliDeviceId: string) =>
       relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
+    onRemoteMetricSourcesChanged: (cliDeviceId: string) =>
+      relaySessionManager.onRemoteMetricSourcesChanged(cliDeviceId),
     onCliCredentialsRevoked: (revoked: {
       kind: "cliToken" | "deviceCredential";
       ids: readonly string[];

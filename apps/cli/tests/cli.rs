@@ -1065,6 +1065,7 @@ fn help_lists_ready_commands() {
         .stdout(predicate::str::contains("daemon"))
         .stdout(predicate::str::contains("service"))
         .stdout(predicate::str::contains("reload"))
+        .stdout(predicate::str::contains("metrics"))
         .stdout(predicate::str::contains("logout"));
 }
 
@@ -1997,4 +1998,190 @@ fn a_tall_command_fits_the_screen_and_follows_a_resize() {
     child.type_keys(b"q");
     assert!(child.wait_for(b"Declined."));
     assert_eq!(child.exit_code(), 0);
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_remote_sources(state: &Path, sources: Value) {
+    fs::create_dir_all(state).expect("state dir");
+    fs::write(
+        state.join("remote-metric-sources.json"),
+        serde_json::to_vec_pretty(&json!({ "sources": sources })).expect("json"),
+    )
+    .expect("write remote sources");
+}
+
+#[test]
+fn config_metric_sources_round_trip_and_opt_in_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "metrics": { "sources": { "gpu_temp": { "command": "echo 70", "format": "number" } } }
+        }),
+    );
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowRemoteMetricSources"], true);
+    let source = &cfg["metrics"]["sources"]["gpu_temp"];
+    assert_eq!(source["command"], "echo 70");
+    assert_eq!(source["intervalSecs"], 10, "default interval");
+    assert_eq!(source["timeoutSecs"], 5, "default timeout");
+    assert_eq!(source["format"], "number");
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "off"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowRemoteMetricSources").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn metrics_list_and_test_report_local_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "metrics": { "sources": {
+                "gpu": { "command": "printf 'gpu_temp{gpu=\"0\"} 71\\n'; echo leak >&2", "format": "prometheus" },
+                "fast": { "command": "echo 1", "intervalSecs": 2 }
+            } }
+        }),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    let sources = listed["sources"].as_array().expect("sources");
+    let state_of = |name: &str| {
+        sources
+            .iter()
+            .find(|source| source["name"] == name)
+            .map(|source| source["state"].clone())
+    };
+    assert_eq!(state_of("gpu"), Some(json!("active")));
+    assert_eq!(state_of("fast"), Some(json!("disabled")));
+    let tested = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "test", "gpu", "--json"]);
+        cmd
+    });
+    assert_eq!(tested["ok"], true);
+    assert_eq!(tested["series"][0]["name"], "gpu_temp");
+    assert_eq!(tested["series"][0]["labels"]["gpu"], "0");
+    assert_eq!(tested["series"][0]["value"], 71.0);
+    assert!(
+        !tested.to_string().contains("leak"),
+        "stderr is never captured"
+    );
+}
+
+#[test]
+fn metrics_approve_pins_the_exact_remote_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1 }));
+    write_remote_sources(
+        &state,
+        json!([{ "name": "fans", "command": "echo 3", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "refused", "no opt-in yet");
+
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "on"])
+        .assert()
+        .success();
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "pending_approval");
+    cli(&config, &state)
+        .args(["metrics", "test", "fans"])
+        .assert()
+        .failure();
+
+    // A hash that does not match the current command is refused.
+    cli(&config, &state)
+        .args([
+            "metrics",
+            "approve",
+            "fans",
+            "--sha256",
+            &sha256_hex("echo 4"),
+        ])
+        .assert()
+        .failure();
+    let approved = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "metrics",
+            "approve",
+            "fans",
+            "--sha256",
+            &sha256_hex("echo 3"),
+            "--json",
+        ]);
+        cmd
+    });
+    assert_eq!(approved["commandSha256"], sha256_hex("echo 3"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        cfg["metrics"]["approvedRemoteSources"]["fans"],
+        sha256_hex("echo 3")
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "active");
+
+    // The server changes the command: it needs a new approval.
+    write_remote_sources(
+        &state,
+        json!([{ "name": "fans", "command": "echo 3; rm -rf ~", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "pending_approval");
+
+    cli(&config, &state)
+        .args(["metrics", "revoke", "fans"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("metrics").is_none());
+    cli(&config, &state)
+        .args(["metrics", "approve", "missing"])
+        .assert()
+        .failure();
 }

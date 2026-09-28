@@ -45,6 +45,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
   "forwarder_device_metrics_get",
+  "forwarder_pool_routing_rules_get",
   "forwarder_model_pools_list",
   "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
@@ -81,6 +82,8 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_model_pool_create",
   "forwarder_model_pool_update",
   "forwarder_pool_fallback_update",
+  "forwarder_pool_routing_rules_set",
+  "forwarder_device_metric_sources_set",
   "forwarder_model_pool_delete",
   "forwarder_pool_member_add",
   "forwarder_provider_member_add",
@@ -149,6 +152,8 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_chat_completion_test: "RUN",
   forwarder_cli_command_run: "RUN",
   forwarder_cli_supervised_command_start: "RUN",
+  forwarder_pool_routing_rules_set: "RUN",
+  forwarder_device_metric_sources_set: "RUN",
 });
 
 /** Exact catalog targets (name → target) for drift detection. */
@@ -157,6 +162,9 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
+  forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
+  forwarder_pool_routing_rules_set: "forwarderManagement.setPoolRoutingRules",
+  forwarder_device_metric_sources_set: "forwarderManagement.setCliDeviceMetricSources",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
   forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
@@ -260,13 +268,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 27 read + 51 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 28 read + 53 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(27);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(51);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(78);
+    expect(PLAN_READ_TOOLS).toHaveLength(28);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(53);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(81);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -449,9 +457,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 78 catalog entries − 5 extracted cores = 73 procedure dispatches.
-    expect(dispatched).toBe(73);
-    expect(invoked).toHaveLength(73);
+    // 81 catalog entries − 5 extracted cores = 76 procedure dispatches.
+    expect(dispatched).toBe(76);
+    expect(invoked).toHaveLength(76);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

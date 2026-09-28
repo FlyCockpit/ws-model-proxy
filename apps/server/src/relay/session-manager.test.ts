@@ -2365,6 +2365,111 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  const fansSource = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json",
+  };
+  function sourceFrames(socket: FakeSocket) {
+    return socket.sends
+      .map((send) => JSON.parse(String(send)) as { type: string; sources?: unknown[] })
+      .filter((frame) => frame.type === "metrics.sources.set");
+  }
+
+  it("sends remote metric sources after hello.ok only while the device is unsupervised", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const unsupervised = await registered();
+    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(sourceFrames(unsupervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [fansSource] }),
+    ]);
+    unsupervised.manager.dispose();
+
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const supervised = await registered();
+    expect(sourceFrames(supervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [] }),
+    ]);
+    supervised.manager.dispose();
+  });
+
+  it("withdraws remote metric sources when the MCP command mode is lowered", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await manager.onCliFeatureGrantsChanged("cli-device-id");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource], []]);
+    // Changing the definitions pushes them to the live session.
+    expect(await manager.onRemoteMetricSourcesChanged("cli-device-id")).toBe(true);
+    expect(await manager.onRemoteMetricSourcesChanged("other-device")).toBe(false);
+    manager.dispose();
+  });
+
+  it("evaluates pool routing rules on node.metrics and writes the member verdict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { upsert: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          ModelPool: {
+            routingRules: [
+              { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
+            ],
+          },
+          DiscoveredModel: null,
+          ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.upsert.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { poolMemberId: "member-1" },
+          create: expect.objectContaining({
+            verdict: "FULL",
+            cliDeviceId: "cli-device-id",
+            userId: "user-id",
+          }),
+        }),
+      );
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requires registration before telemetry", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

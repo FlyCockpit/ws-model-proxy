@@ -425,6 +425,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
+            metricFailOpen: attempt.metricFailOpen ?? true,
             Waiters: {
               create: resolvedCandidates.map((candidate, index) => ({
                 userId: attempt.ownerId,
@@ -661,14 +662,24 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     });
     // Time filtering (candidate/request deadlines, the creating and last-chance
     // exceptions) is the planner's job, so it is decided in one place.
-    const waiters = await tx.capacityWaiter.findMany({
+    const allWaiters = await tx.capacityWaiter.findMany({
       where: { capacityId, state: "WAITING", AdmissionRequest: { state: "WAITING" } },
       include: {
         AdmissionRequest: {
-          select: { requestId: true, attemptId: true, enqueueSequence: true, deadlineAt: true },
+          select: {
+            requestId: true,
+            attemptId: true,
+            enqueueSequence: true,
+            deadlineAt: true,
+            metricFailOpen: true,
+          },
         },
       },
     });
+    // Metric routing (S-B part 2): a waiter whose member is metric-FULL is not
+    // planned, unless its whole request fails open (see #metricFullWaiterIds).
+    const metricFull = await this.#metricFullWaiterIds(tx, allWaiters, now);
+    const waiters = allWaiters.filter((waiter) => !metricFull.has(waiter.id));
     const configuredReservationMembers = await tx.poolMember.findMany({
       // Every PRIMARY (always local) execution target sharing this physical
       // capacity takes part in the same reservation accounting. External
@@ -799,6 +810,88 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       },
       rows,
     };
+  }
+
+  /**
+   * Waiters that must not be granted because their pool member is
+   * metric-FULL (a fresh `full` verdict in `pool_member_routing_verdict`).
+   *
+   * Plain, non-locking reads only: the verdict table is H-class (no foreign
+   * keys, written by the relay's rule evaluator outside any capacity lock),
+   * and the sibling-waiter read takes no row lock, so this adds no lock-order
+   * edge to the admission transaction (DL-1).
+   *
+   * Fail open per request: when every live candidate of a request is
+   * metric-FULL, metric FULL is ignored for that request and it falls back to
+   * lease-only admission, so a plain-name caller never waits on a queue that
+   * a metric keeps from draining. A request created with
+   * `metricFailOpen = false` (an `:external` caller's shortened local phase)
+   * does not fail open: its wait ends at externalAfterWaitMs and it goes
+   * external through the existing LOCAL_WAIT_EXPIRED path.
+   */
+  async #metricFullWaiterIds(
+    tx: Prisma.TransactionClient,
+    waiters: ReadonlyArray<{
+      id: string;
+      admissionRequestId: string;
+      poolMemberId: string | null;
+      AdmissionRequest: { metricFailOpen: boolean };
+    }>,
+    now: Date,
+  ): Promise<Set<string>> {
+    const memberIds = [
+      ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
+    ];
+    if (memberIds.length === 0) return new Set();
+    const fullMembers = await metricFullMemberIds(tx, memberIds, now);
+    if (fullMembers.size === 0) return new Set();
+    const blocked = waiters.filter(
+      (waiter) => waiter.poolMemberId !== null && fullMembers.has(waiter.poolMemberId),
+    );
+    const failOpenCandidates = [
+      ...new Set(
+        blocked
+          .filter((waiter) => waiter.AdmissionRequest.metricFailOpen)
+          .map((waiter) => waiter.admissionRequestId),
+      ),
+    ];
+    const failOpen = new Set<string>();
+    if (failOpenCandidates.length > 0) {
+      const siblings = await tx.capacityWaiter.findMany({
+        where: {
+          admissionRequestId: { in: failOpenCandidates },
+          state: "WAITING",
+          OR: [{ deadlineAt: null }, { deadlineAt: { gte: now } }],
+        },
+        select: { admissionRequestId: true, poolMemberId: true },
+      });
+      const unknownMembers = [
+        ...new Set(
+          siblings.flatMap((sibling) =>
+            sibling.poolMemberId && !memberIds.includes(sibling.poolMemberId)
+              ? [sibling.poolMemberId]
+              : [],
+          ),
+        ),
+      ];
+      for (const id of await metricFullMemberIds(tx, unknownMembers, now)) fullMembers.add(id);
+      for (const requestId of failOpenCandidates) {
+        const candidates = siblings.filter((sibling) => sibling.admissionRequestId === requestId);
+        if (
+          candidates.every(
+            (sibling) => sibling.poolMemberId !== null && fullMembers.has(sibling.poolMemberId),
+          )
+        ) {
+          failOpen.add(requestId);
+          logMetricFailOpen(requestId);
+        }
+      }
+    }
+    return new Set(
+      blocked
+        .filter((waiter) => !failOpen.has(waiter.admissionRequestId))
+        .map((waiter) => waiter.id),
+    );
   }
 
   /**
@@ -1372,6 +1465,33 @@ async function noLiveCandidateReason(
     where: { admissionRequestId, terminalReason: MEMBER_UNROUTABLE_REASON },
   });
   return unroutable > 0 ? MEMBER_UNROUTABLE_REASON : "candidate_deadlines";
+}
+
+/** Members with a fresh `full` routing verdict (plain read of an H-class table). */
+async function metricFullMemberIds(
+  tx: Prisma.TransactionClient,
+  memberIds: readonly string[],
+  now: Date,
+): Promise<Set<string>> {
+  if (memberIds.length === 0) return new Set();
+  const rows = await tx.poolMemberRoutingVerdict.findMany({
+    where: { poolMemberId: { in: [...memberIds] }, verdict: "FULL", expiresAt: { gt: now } },
+    select: { poolMemberId: true },
+  });
+  return new Set(rows.map((row) => row.poolMemberId));
+}
+
+const METRIC_FAIL_OPEN_LOGGED_MAX = 1_000;
+const metricFailOpenLogged = new Set<string>();
+
+/** Once per admission request (bounded): a metric-FULL fail-open happened. */
+function logMetricFailOpen(admissionRequestId: string) {
+  if (metricFailOpenLogged.has(admissionRequestId)) return;
+  if (metricFailOpenLogged.size >= METRIC_FAIL_OPEN_LOGGED_MAX) metricFailOpenLogged.clear();
+  metricFailOpenLogged.add(admissionRequestId);
+  console.warn("[capacity] every candidate is metric-FULL; admitting by leases only", {
+    admissionRequestId,
+  });
 }
 
 function schedulerDeficits(value: Prisma.JsonValue): number[] {

@@ -25,6 +25,11 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
+// Covered by cli-device-metric-sources.dom.test.tsx.
+vi.mock("@/components/cli-device-metric-sources", () => ({
+  CliDeviceMetricSources: () => null,
+}));
+
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: unknown) => ({
     queryOptions: () => ({ queryKey: [key], queryFn: async () => data, initialData: data }),

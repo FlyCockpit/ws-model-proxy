@@ -973,6 +973,9 @@ fn run_relay_session(
                     telemetry = Some(crate::telemetry::Telemetry::start(
                         worker_tx.clone(),
                         &config.endpoints,
+                        crate::metric_sources::RunnerSettings::from_environment(
+                            startup.allow_remote_metric_sources(),
+                        ),
                     ));
                 }
             }
@@ -1841,14 +1844,22 @@ where
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
         }
         ServerControlMessage::MetricsSourcesSet { id, sources } => {
-            // Remote metric sources need a local opt-in and hash approval
-            // (S-B part 2). This CLI runs none and reports each `unsupported`
-            // in its next `node.metrics`.
+            // Stored even without the opt-in so `wsmp metrics list` and
+            // `wsmp metrics approve` can show them. A remote source runs only
+            // with `allowRemoteMetricSources` and a local approval of its
+            // exact command; states go out in the next `node.metrics`.
             tracing::info!(
                 id,
                 sources = sources.len(),
-                "remote metric sources are not supported by this wsmp; reporting them unsupported"
+                opt_in = startup.allow_remote_metric_sources(),
+                "received remote metric source definitions"
             );
+            if let Err(error) = crate::metric_sources::save_remote_sources(&sources) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "storing remote metric sources failed; they apply to this session only"
+                );
+            }
             if let Some(telemetry) = telemetry {
                 telemetry.set_remote_sources(sources);
             }

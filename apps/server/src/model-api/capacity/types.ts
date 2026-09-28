@@ -56,6 +56,12 @@ export type AdmissionAttempt = {
    * another request/owner) is ignored: the schedule then starts now.
    */
   schedule?: { anchorAttemptId: string; spillDelayMs: number };
+  /**
+   * Metric routing: when every candidate is metric-FULL, ignore metric FULL
+   * and admit by leases only (default true). False only for an `:external`
+   * caller's shortened local phase, which then goes external instead.
+   */
+  metricFailOpen?: boolean;
 };
 
 export type CapacityLeaseHandle = {

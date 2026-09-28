@@ -56,5 +56,6 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Logout(args) => commands::logout::run(args),
         Command::Completions(args) => commands::completions::run(args),
         Command::Terminal(args) => commands::terminal::run(args),
+        Command::Metrics(args) => commands::metrics::run(args),
     }
 }
