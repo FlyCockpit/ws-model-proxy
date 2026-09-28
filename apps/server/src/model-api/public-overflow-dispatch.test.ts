@@ -2717,12 +2717,21 @@ describe("own-key dispatch and authoritative send claim", () => {
 
 describe("OpenRouter owner-paid settlement", () => {
   const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
-  async function settleOwnerStream(providerType: string, upstream: Buffer[]) {
+  async function settleOwnerStream(
+    providerType: string,
+    upstream: Buffer[],
+    requester: "owner" | "grantee" = "owner",
+  ) {
     reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
     providerHttpsRequest.mockReset();
-    db.modelPool.findFirst.mockResolvedValue(
-      dispatchPoolFixture("openai", "openai-chat", providerType),
-    );
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture("openai", "openai-chat", providerType),
+      fallbackForGrantees: requester === "grantee",
+    });
+    if (requester === "grantee") {
+      consentState.token = { ...consentState.token, userId: "grantee" };
+      consentState.grant = currentGrant();
+    }
     const tx = {
       ...consentDelegates(),
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
@@ -2757,7 +2766,7 @@ describe("OpenRouter owner-paid settlement", () => {
       poolId: "pool",
       requestId: `request-openrouter-${providerType}`,
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      ...ownerConsentFields(),
+      ...ownerConsentFields(requester),
       requestedProtocol: "openai",
       requestedSurface: "openai-chat",
       stream: true,
@@ -2799,6 +2808,30 @@ describe("OpenRouter owner-paid settlement", () => {
       additionalAllowanceTokens: 0,
       unknownCategories: "FAIL_CLOSED",
     },
+  });
+
+  // #62 AC: pool fallback settles against the pool owner's budget even when a
+  // grantee made the request (own-key settles against the requester, above).
+  it("settles a grantee's OpenRouter pool fallback against the owner's budget", async () => {
+    try {
+      const settled = await settleOwnerStream(
+        "openrouter",
+        [Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`)],
+        "grantee",
+      );
+      expect(settled).toMatchObject({
+        userId: "owner",
+        poolId: "pool",
+        observationComplete: true,
+        usage: { categoriesComplete: true },
+      });
+      expect(providerBillableTokens(settled.usage)).toBe(1_280n);
+      expect(vi.mocked(admitProviderBudget)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ userId: "owner", poolId: "pool" }),
+      );
+    } finally {
+      resetConsentState();
+    }
   });
 
   it.each([
