@@ -29,13 +29,16 @@ export function cliSlugFromDeviceLoginScope(scope: string | null | undefined): s
 export const WSMP_MIN_CLI_VERSION = "0.4.0";
 
 /**
- * Lifetime of a `wsmp login` device code. Single source for the
- * `deviceAuthorization` plugin's `expiresIn` (packages/auth/src/index.ts) and
- * the exchange's `retryAfterMs` clamp, so a refusal never tells a client to
- * wait past the code's expiry.
+ * Lifetime of a `wsmp login` device code, in minutes. The one number both
+ * forms below derive from: the `deviceAuthorization` plugin's `expiresIn`
+ * (packages/auth/src/index.ts) and the exchange's `retryAfterMs` clamp, so a
+ * refusal never tells a client to wait past the code's expiry.
  */
-export const CLI_DEVICE_CODE_EXPIRES_IN = "30m";
-export const CLI_DEVICE_CODE_WINDOW_MS = 30 * 60_000;
+const CLI_DEVICE_CODE_LIFETIME_MINUTES = 30;
+/** The lifetime as the plugin's `ms`-style duration string. */
+export const CLI_DEVICE_CODE_EXPIRES_IN = `${CLI_DEVICE_CODE_LIFETIME_MINUTES}m` as const;
+/** The lifetime in milliseconds. */
+export const CLI_DEVICE_CODE_LIFETIME_MS = CLI_DEVICE_CODE_LIFETIME_MINUTES * 60_000;
 
 /**
  * Device code handed to a `wsmp login` too old to send the `cli-slug:` scope.

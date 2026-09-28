@@ -54,6 +54,39 @@ describe("cleanText", () => {
     expect(cleanText("a\u001bPdcs\u001b[31mred\u001b[0m")).toBe("ared");
   });
 
+  // Each pair was checked against xterm.js's EscapeSequenceParser (the web
+  // terminal), which prints only "before" and "after" for all of them.
+  it.each([
+    ["CSI cancelled by a DCS", "\u001b[0\u001bPqHIDDEN\u001b\\"],
+    ["CSI cancelled by an APC", "\u001b[0\u001b_HIDDEN\u001b\\"],
+    ["CSI cancelled by an 8-bit APC", "\u001b[0\u009fHIDDEN\u009c"],
+    ["ESC restarted into a PM", "\u001b\u001b^HIDDEN\u001b\\"],
+    ["ESC intermediate cancelled by an APC", "\u001b(\u001b_HIDDEN\u001b\\"],
+    ["CSI intermediate cancelled by a SOS", "\u001b[1 \u001bXHIDDEN\u001b\\"],
+    ["OSC ended by a DCS", "\u001b]0;t\u001bPqHIDDEN\u001b\\"],
+    ["DCS ended by an APC", "\u001bPq\u001b_HIDDEN\u001b\\"],
+    ["CAN, then an APC", "\u001b[1\u0018\u001b_HIDDEN\u009c"],
+  ])("follows the terminal when a sequence is cut short: %s", (_label, sequence) => {
+    expect(cleanText(`before${sequence}after`)).toBe("beforeafter");
+  });
+
+  it("keeps consuming a control string past non-ASCII text, where xterm.js stops", () => {
+    // xterm.js abandons an APC at "é" and prints " HIDDEN"; other terminals
+    // consume to ST. Dropping it can only hide text, never show hidden text.
+    expect(cleanText("before\u001b_é HIDDEN\u001b\\after")).toBe("beforeafter");
+    expect(cleanText("before\u001bP1é HIDDEN\u001b\\after")).toBe("beforeafter");
+  });
+
+  it("keeps the text after a sequence the terminal cancels", () => {
+    // CAN and SUB end a sequence; the text after them prints.
+    expect(cleanText("a\u001b[12\u0018shown")).toBe("ashown");
+    expect(cleanText("a\u001b]0;t\u001ashown")).toBe("ashown");
+    // A non-ASCII character abandons a CSI and is itself dropped.
+    expect(cleanText("a\u001b[1éshown")).toBe("ashown");
+    // LF inside a CSI is executed, so it survives.
+    expect(cleanText("a\u001b[1\n2mb")).toBe("a\nb");
+  });
+
   it("never lets a control string's payload through formatBoundedStream", () => {
     const head = bytes("ok \u001bP+q544e\u001b\\ \u001b_evil\u001b\\ \u001b^pm\u001b\\ done");
     const text = formatBoundedStream({

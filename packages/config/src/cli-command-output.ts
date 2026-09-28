@@ -101,83 +101,147 @@ function stripDisallowedControls(text: string): string {
   return out;
 }
 
-const ESC = 0x1b;
-const BEL = 0x07;
-/** 8-bit String Terminator (C1). */
-const ST = 0x9c;
-
 /**
- * Index just past a control string's terminator, or the end of the text when
- * it is unterminated (a sequence cut off at the end of a buffer is dropped
- * whole). ST is `ESC \` or 8-bit 0x9c; OSC also ends at BEL, as xterm
- * accepts. Any other ESC inside the string aborts it, and parsing resumes at
- * that ESC so a following sequence is still recognized.
+ * Parser states of the VT500 escape-sequence parser (vt100.net
+ * dec_ansi_parser), the model xterm.js — the web terminal — implements in
+ * `EscapeSequenceParser`. Stripping follows the same transitions so the text
+ * kept is the text the terminal prints: a sequence the terminal hides is never
+ * shown to the model, and an ESC, CAN/SUB, or C1 introducer that cancels a
+ * sequence midway starts the next one exactly where the terminal starts it.
  */
-function skipControlString(text: string, from: number, bellEnds: boolean): number {
-  for (let index = from; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code === ST || (bellEnds && code === BEL)) return index + 1;
-    if (code === ESC) return text[index + 1] === "\\" ? index + 2 : index;
-  }
-  return text.length;
+const GROUND = 0;
+const ESCAPE = 1;
+const ESCAPE_INTERMEDIATE = 2;
+const CSI_ENTRY = 3;
+const CSI_PARAM = 4;
+const CSI_INTERMEDIATE = 5;
+const CSI_IGNORE = 6;
+const OSC_STRING = 7;
+/** SOS, PM and APC bodies. */
+const IGNORED_STRING = 8;
+const DCS_ENTRY = 9;
+const DCS_PARAM = 10;
+const DCS_INTERMEDIATE = 11;
+const DCS_IGNORE = 12;
+const DCS_PASSTHROUGH = 13;
+
+/** States in which the terminal executes a C0 control such as LF, CR or tab. */
+function executesC0(state: number): boolean {
+  return state <= CSI_IGNORE;
 }
 
-/** Index just past a CSI's final byte (0x40-0x7e), or the end of the text. */
-function skipCsi(text: string, from: number): number {
-  let index = from;
-  while (index < text.length && text.charCodeAt(index) < 0x40) index += 1;
-  return Math.min(index + 1, text.length);
+/** C0 controls the parser executes (or, inside strings, ignores) in place. */
+function isExecutable(code: number): boolean {
+  return code <= 0x17 || code === 0x19 || (code >= 0x1c && code <= 0x1f);
 }
 
 /**
- * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms:
- * CSI (`ESC [`, 0x9b); OSC (`ESC ]`, 0x9d); the control strings DCS
- * (`ESC P`, 0x90), SOS (`ESC X`, 0x98), PM (`ESC ^`, 0x9e) and APC
- * (`ESC _`, 0x9f), each through its terminator or the end of the text; and
- * other escapes (`ESC` + intermediates 0x20-0x2f + one final byte).
+ * The state after an ESC, CAN, SUB or C1 control, which act the same in every
+ * state ("anywhere" transitions); null for any other code.
+ */
+function anywhereTransition(code: number): number | null {
+  if (code === 0x1b) return ESCAPE;
+  if (code === 0x18 || code === 0x1a) return GROUND;
+  if (code < 0x80 || code > 0x9f) return null;
+  if (code === 0x90) return DCS_ENTRY;
+  if (code === 0x9b) return CSI_ENTRY;
+  if (code === 0x9d) return OSC_STRING;
+  if (code === 0x98 || code === 0x9e || code === 0x9f) return IGNORED_STRING;
+  // ST and every other C1 control end any sequence.
+  return GROUND;
+}
+
+/** The state after a printable byte (0x20-0x7e) outside GROUND. */
+function printableTransition(state: number, code: number): number {
+  switch (state) {
+    case ESCAPE:
+      if (code <= 0x2f) return ESCAPE_INTERMEDIATE;
+      if (code === 0x5b) return CSI_ENTRY;
+      if (code === 0x5d) return OSC_STRING;
+      if (code === 0x50) return DCS_ENTRY;
+      if (code === 0x58 || code === 0x5e || code === 0x5f) return IGNORED_STRING;
+      return GROUND;
+    case ESCAPE_INTERMEDIATE:
+      return code <= 0x2f ? ESCAPE_INTERMEDIATE : GROUND;
+    case CSI_ENTRY:
+    case CSI_PARAM:
+      if (code >= 0x40) return GROUND;
+      if (code <= 0x2f) return CSI_INTERMEDIATE;
+      if (code >= 0x3c) return state === CSI_ENTRY ? CSI_PARAM : CSI_IGNORE;
+      return CSI_PARAM;
+    case CSI_INTERMEDIATE:
+      if (code >= 0x40) return GROUND;
+      return code <= 0x2f ? CSI_INTERMEDIATE : CSI_IGNORE;
+    case CSI_IGNORE:
+      return code >= 0x40 ? GROUND : CSI_IGNORE;
+    case DCS_ENTRY:
+    case DCS_PARAM:
+      if (code >= 0x40) return DCS_PASSTHROUGH;
+      if (code <= 0x2f) return DCS_INTERMEDIATE;
+      if (code >= 0x3c) return state === DCS_ENTRY ? DCS_PARAM : DCS_IGNORE;
+      return DCS_PARAM;
+    case DCS_INTERMEDIATE:
+      if (code >= 0x40) return DCS_PASSTHROUGH;
+      return code <= 0x2f ? DCS_INTERMEDIATE : DCS_IGNORE;
+    default:
+      // OSC, SOS/PM/APC, DCS ignore and passthrough bodies run to their end.
+      return state;
+  }
+}
+
+/**
+ * The state after a non-ASCII printable (U+00A0 and above) outside GROUND.
+ * Inside an escape or CSI the terminal abandons the sequence and drops the
+ * character. Inside a DCS header or an SOS/PM/APC body xterm.js does the same,
+ * but other terminals keep consuming to the terminator; this keeps consuming,
+ * so text a terminal might hide is never kept.
+ */
+function nonAsciiTransition(state: number): number {
+  if (state === CSI_IGNORE || state >= OSC_STRING) {
+    return state === DCS_ENTRY || state === DCS_PARAM || state === DCS_INTERMEDIATE
+      ? DCS_IGNORE
+      : state;
+  }
+  return GROUND;
+}
+
+/**
+ * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms — CSI, OSC,
+ * the control strings DCS, SOS, PM and APC, and other escapes — including a
+ * sequence cut off at the end of the text, which is dropped whole. The text
+ * kept is what the terminal would print, plus the C0 controls it executes
+ * (tab, LF and CR survive the later control filter).
  */
 function stripTerminalSequences(text: string): string {
   let out = "";
-  let index = 0;
-  while (index < text.length) {
+  let state = GROUND;
+  let runStart = -1;
+  for (let index = 0; index < text.length; index += 1) {
     const code = text.charCodeAt(index);
-    let introducer: number | null = null;
-    let bodyStart = index + 1;
-    if (code === ESC) {
-      const next = text.charCodeAt(index + 1);
-      if (Number.isNaN(next)) break;
-      bodyStart = index + 2;
-      if (next === 0x5b) introducer = 0x9b;
-      else if (next === 0x5d) introducer = 0x9d;
-      else if (next === 0x50) introducer = 0x90;
-      else if (next === 0x58) introducer = 0x98;
-      else if (next === 0x5e) introducer = 0x9e;
-      else if (next === 0x5f) introducer = 0x9f;
-      else {
-        let end = index + 1;
-        while (end < text.length && text.charCodeAt(end) >= 0x20 && text.charCodeAt(end) <= 0x2f)
-          end += 1;
-        index = Math.min(end + 1, text.length);
-        continue;
-      }
-    } else if (
-      code === 0x9b ||
-      code === 0x9d ||
-      code === 0x90 ||
-      code === 0x98 ||
-      code === 0x9e ||
-      code === 0x9f
-    ) {
-      introducer = code;
-    }
-    if (introducer === null) {
-      out += text[index] ?? "";
-      index += 1;
+    const printable = (code >= 0x20 && code <= 0x7e) || code >= 0xa0;
+    if (state === GROUND && printable) {
+      if (runStart < 0) runStart = index;
       continue;
     }
-    if (introducer === 0x9b) index = skipCsi(text, bodyStart);
-    else index = skipControlString(text, bodyStart, introducer === 0x9d);
+    if (runStart >= 0) {
+      out += text.slice(runStart, index);
+      runStart = -1;
+    }
+    const anywhere = anywhereTransition(code);
+    if (anywhere !== null) {
+      state = anywhere;
+    } else if (isExecutable(code)) {
+      if (state === OSC_STRING && code === 0x07) state = GROUND;
+      else if (executesC0(state)) out += text[index] ?? "";
+    } else if (code === 0x7f) {
+      // DEL is ignored in every state.
+    } else if (code >= 0xa0) {
+      state = nonAsciiTransition(state);
+    } else {
+      state = printableTransition(state, code);
+    }
   }
+  if (runStart >= 0) out += text.slice(runStart);
   return out;
 }
 

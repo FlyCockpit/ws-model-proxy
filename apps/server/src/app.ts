@@ -22,7 +22,7 @@ import { logger } from "hono/logger";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
-import { deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
+import { deviceCodeBodyCap, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
@@ -581,6 +581,11 @@ export async function createApp(options: CreateAppOptions = {}) {
         bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential }),
     }),
   );
+
+  // `wsmp login`'s public, unauthenticated start: its 16 KiB cap must run
+  // BEFORE the global limit below, which buffers a body without
+  // Content-Length (up to 10 MB) before calling the next middleware.
+  app.use("/api/auth/device/code", deviceCodeBodyCap);
 
   // Body-limit — reject oversized payloads early (before JSON parsing) to
   // prevent memory exhaustion. 10 MB covers image uploads and large form

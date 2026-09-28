@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import {
-  CLI_DEVICE_CODE_WINDOW_MS,
+  CLI_DEVICE_CODE_LIFETIME_MS,
   CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
   CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE,
   cliSlugFromDeviceLoginScope,
@@ -165,9 +165,9 @@ export const cliCredentialsRouter = {
       const limit = await context.services?.limitDeviceCodeExchange?.(input.deviceCode);
       if (limit && !limit.allowed) {
         // RFC 8628 §3.5 `slow_down`, with the wait the limiter computed so a
-        // client can back off precisely. Clamped to the device-code window: an
+        // client can back off precisely. Clamped to the device-code lifetime: an
         // inflated value must not tell a client to wait past the code's expiry.
-        const retryAfterMs = Math.min(limit.retryAfterMs, CLI_DEVICE_CODE_WINDOW_MS);
+        const retryAfterMs = Math.min(limit.retryAfterMs, CLI_DEVICE_CODE_LIFETIME_MS);
         throw new ORPCError("TOO_MANY_REQUESTS", {
           message: "Device authorization polling too fast.",
           data: { ...deviceFlowErrorData("slow_down"), retryAfterMs },
@@ -230,7 +230,6 @@ export const cliCredentialsRouter = {
     .input(z.object({ userCode: userCodeSchema, slug: cliSlugSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      const now = new Date();
       const row = await prisma.deviceCode.findFirst({
         where: { userCode: { in: userCodeCandidates(input.userCode) } },
         select: { id: true, userId: true, status: true, expiresAt: true, scope: true },
@@ -238,11 +237,7 @@ export const cliCredentialsRouter = {
       if (!row || (row.userId !== null && row.userId !== userId)) {
         throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
       }
-      if (row.expiresAt <= now) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "This login request has expired. Run `wsmp login` again.",
-        });
-      }
+      if (row.expiresAt <= new Date()) throw expiredLoginRequest();
       const slug = requireDeviceLoginSlug(row.scope);
       if (slug !== input.slug) {
         throw new ORPCError("CONFLICT", {
@@ -252,15 +247,21 @@ export const cliCredentialsRouter = {
       if (row.status === "approved" && row.userId === userId) return { status: "approved", slug };
       if (row.status !== "pending") throw alreadyHandled();
 
-      const approved = await prisma.deviceCode.updateMany({
-        where: {
-          id: row.id,
-          status: "pending",
-          expiresAt: { gt: now },
-          scope: row.scope,
-          OR: [{ userId: null }, { userId }],
-        },
-        data: { status: "approved", userId },
+      const approved = await prisma.$transaction(async (tx) => {
+        // Lock the row, THEN read the clock: the expiry cut-off must be taken
+        // after any wait for a concurrent writer's lock, or a code that
+        // expired during that wait would still be approved.
+        await tx.$queryRaw`SELECT id FROM device_code WHERE id = ${row.id} FOR UPDATE`;
+        return tx.deviceCode.updateMany({
+          where: {
+            id: row.id,
+            status: "pending",
+            expiresAt: { gt: new Date() },
+            scope: row.scope,
+            OR: [{ userId: null }, { userId }],
+          },
+          data: { status: "approved", userId },
+        });
       });
       if (approved.count !== 1) {
         // The conditional write lost the race. When the winner was THIS
@@ -271,10 +272,13 @@ export const cliCredentialsRouter = {
         // caller's success.
         const current = await prisma.deviceCode.findFirst({
           where: { id: row.id },
-          select: { userId: true, status: true },
+          select: { userId: true, status: true, expiresAt: true },
         });
         if (current?.status === "approved" && current.userId === userId) {
           return { status: "approved", slug };
+        }
+        if (current?.status === "pending" && current.expiresAt <= new Date()) {
+          throw expiredLoginRequest();
         }
         throw alreadyHandled();
       }
@@ -290,6 +294,12 @@ function requireDeviceLoginSlug(scope: string | null): string {
     });
   }
   return slug;
+}
+
+function expiredLoginRequest(): ORPCError<"BAD_REQUEST", undefined> {
+  return new ORPCError("BAD_REQUEST", {
+    message: "This login request has expired. Run `wsmp login` again.",
+  });
 }
 
 function alreadyHandled(): ORPCError<"CONFLICT", undefined> {

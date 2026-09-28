@@ -460,11 +460,11 @@ describe("cliCredentialsRouter", () => {
     expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
   });
 
-  it("clamps a refusal's retryAfterMs to the device-code window", async () => {
-    const { CLI_DEVICE_CODE_WINDOW_MS } = await import("@ws-model-proxy/config/cli-device-login");
+  it("clamps a refusal's retryAfterMs to the device-code lifetime", async () => {
+    const { CLI_DEVICE_CODE_LIFETIME_MS } = await import("@ws-model-proxy/config/cli-device-login");
     const limitDeviceCodeExchange = vi.fn(async () => ({
       allowed: false as const,
-      retryAfterMs: CLI_DEVICE_CODE_WINDOW_MS * 10,
+      retryAfterMs: CLI_DEVICE_CODE_LIFETIME_MS * 10,
     }));
     const client = createRouterClient(cliCredentialsRouter, {
       context: buildContext(null, { limitDeviceCodeExchange }),
@@ -478,7 +478,7 @@ describe("cliCredentialsRouter", () => {
     if (error instanceof ORPCError) {
       expect(error.data).toEqual({
         deviceFlowError: "slow_down",
-        retryAfterMs: CLI_DEVICE_CODE_WINDOW_MS,
+        retryAfterMs: CLI_DEVICE_CODE_LIFETIME_MS,
       });
     }
   });
@@ -780,6 +780,39 @@ describe("cliCredentialsRouter", () => {
         client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
       ).resolves.toEqual({ status: "approved", slug: "desk-01" });
       expect(db.deviceCode.findFirst).toHaveBeenCalledTimes(2);
+    });
+
+    it("locks the row before the conditional write, inside one transaction", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      db.deviceCode.updateMany.mockResolvedValue({ count: 1 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" });
+
+      expect(db.$transaction).toHaveBeenCalledTimes(1);
+      const [lockSql] = db.$queryRaw.mock.calls[0] ?? [];
+      expect((lockSql as TemplateStringsArray).join("?")).toMatch(
+        /FROM device_code WHERE id = \? FOR UPDATE/,
+      );
+      expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        db.deviceCode.updateMany.mock.invocationCallOrder[0] ?? 0,
+      );
+    });
+
+    it("reports expiry, not CONFLICT, when the code expired before the write", async () => {
+      // Read while live; by the time the row lock was held it had expired, so
+      // the conditional write matched nothing.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(pendingRow({ expiresAt: new Date(Date.now() - 1) }));
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy(
+        (error: ORPCError) => error.code === "BAD_REQUEST" && error.message.includes("expired"),
+      );
     });
 
     it("still CONFLICTs when a DIFFERENT account won the same race", async () => {

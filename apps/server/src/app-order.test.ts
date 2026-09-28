@@ -714,3 +714,30 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
     }
   });
 });
+
+describe("createApp registration contract — device-code body cap runs first (f3-F2)", () => {
+  it("refuses an unlength'd oversized /device/code body without buffering it", async () => {
+    const { DEVICE_CODE_BODY_MAX_BYTES } = await import("./device-code-upgrade-gate");
+    const app = await buildApp(false);
+    const chunk = new TextEncoder().encode("x".repeat(1024));
+    let pulls = 0;
+    // 1 MiB offered in 1 KiB chunks, with no Content-Length. The app-wide
+    // 10 MB limit would read all of it before any later middleware ran.
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 1024) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const res = await app.request(`${BASE}/api/auth/device/code`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(413);
+    // 16 chunks fill the cap and the 17th crosses it; a few more are read ahead.
+    expect(pulls).toBeLessThanOrEqual(DEVICE_CODE_BODY_MAX_BYTES / 1024 + 4);
+  });
+});

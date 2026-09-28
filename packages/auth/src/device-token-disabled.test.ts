@@ -1,3 +1,7 @@
+import {
+  CLI_DEVICE_CODE_EXPIRES_IN,
+  CLI_DEVICE_CODE_LIFETIME_MS,
+} from "@ws-model-proxy/config/cli-device-login";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { deviceAuthorization } from "better-auth/plugins";
@@ -33,7 +37,7 @@ function buildAuth(disabledPaths: string[]) {
     disabledPaths,
     plugins: [
       deviceAuthorization({
-        expiresIn: "30m",
+        expiresIn: CLI_DEVICE_CODE_EXPIRES_IN,
         interval: "5s",
         onDeviceAuthRequest: requireCliDeviceLoginScope,
         schema: undefined,
@@ -120,6 +124,28 @@ describe("Better Auth /device/token", () => {
   it("still serves the device-code request the CLI uses", async () => {
     const setup = buildAuth([...DISABLED_DEVICE_AUTHORIZATION_PATHS]);
     await expect(approvedDeviceCode(setup)).resolves.toEqual(expect.any(String));
+  });
+
+  it("gives a code the lifetime the exchange's retryAfterMs clamp assumes", async () => {
+    const setup = buildAuth([...DISABLED_DEVICE_AUTHORIZATION_PATHS]);
+    const before = Date.now();
+    const started = await setup.auth.handler(
+      new Request(`${BASE_URL}/api/auth/device/code`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" }),
+      }),
+    );
+    const after = Date.now();
+    const body = (await started.json()) as { expires_in: number; device_code: string };
+    expect(body.expires_in * 1000).toBe(CLI_DEVICE_CODE_LIFETIME_MS);
+    const row = setup.db.deviceCode?.find((candidate) => candidate.deviceCode === body.device_code);
+    const expiresAt = row?.expiresAt;
+    expect(expiresAt).toBeInstanceOf(Date);
+    if (expiresAt instanceof Date) {
+      expect(expiresAt.getTime()).toBeGreaterThanOrEqual(before + CLI_DEVICE_CODE_LIFETIME_MS);
+      expect(expiresAt.getTime()).toBeLessThanOrEqual(after + CLI_DEVICE_CODE_LIFETIME_MS);
+    }
   });
 });
 

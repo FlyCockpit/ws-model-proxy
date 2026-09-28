@@ -671,6 +671,79 @@ integration("device-code exchange with real PostgreSQL", () => {
     ).resolves.toMatchObject({ userId: winner });
   });
 
+  it("does not approve a code that expires while the approval waits for its row lock", async () => {
+    const { prisma } = required();
+    const owner = await createUser();
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
+    const expiresAt = new Date(Date.now() + 1500);
+    const row = await prisma.deviceCode.create({
+      data: {
+        deviceCode: `device-${suffix}`,
+        userCode: `EXPI${suffix}`,
+        expiresAt,
+        status: "pending",
+        pollingInterval: 5000,
+        clientId: "ws-model-proxy",
+        scope: "cli-slug:expiry-wait",
+      },
+    });
+    const client = await approverClient(owner.id);
+    let release: (() => void) | undefined;
+    let reportLocked: (() => void) | undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blockerTransaction = blocker.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM device_code WHERE id = ${row.id} FOR UPDATE`;
+        reportLocked?.();
+        await released;
+      },
+      { timeout: 20_000 },
+    );
+    await locked;
+    // Starts (and reads the row) before expiry, then waits on the lock.
+    const approval = client
+      .approveDeviceLogin({ userCode: row.userCode, slug: "expiry-wait" })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    let waiting = false;
+    try {
+      for (let attempt = 0; attempt < 500 && !waiting; attempt++) {
+        const rows = await observer.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint AS count
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND wait_event_type = 'Lock'
+            AND query ILIKE '%device_code%'
+        `;
+        waiting = Number(rows[0]?.count ?? 0n) > 0;
+      }
+      expect(waiting).toBe(true);
+      expect(Date.now()).toBeLessThan(expiresAt.getTime());
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, expiresAt.getTime() + 100 - Date.now())),
+      );
+    } finally {
+      release?.();
+      await blockerTransaction;
+    }
+
+    expect(await approval).toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("expired"),
+    });
+    expect(await prisma.deviceCode.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+      status: "pending",
+      userId: null,
+    });
+  });
+
   it("classifies a real 55000 by its message: transient unless a permanent refusal (f4-c)", async () => {
     const { prisma, deletion } = required();
     const raise = (message: string) =>

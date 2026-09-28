@@ -227,4 +227,72 @@ describe("device-code upgrade gate + Better Auth /device/code", () => {
     expect(row).toBeDefined();
     expect(row?.userId ?? null).toBeNull();
   });
+
+  const FORM = "client_id=ws-model-proxy&scope=cli-slug%3Adesk-01";
+  const JSON_START = '{"client_id":"ws-model-proxy","scope":"cli-slug:desk-01"';
+  it.each([
+    ["mixed-case form type", "Application/X-Www-Form-Urlencoded", `${FORM}&user_id=victim-account`],
+    ["upper-case form type", "APPLICATION/X-WWW-FORM-URLENCODED", `${FORM}&user_id=victim-account`],
+    [
+      "form type with parameters",
+      "application/x-www-form-urlencoded; charset=UTF-8",
+      `${FORM}&user_id=victim-account`,
+    ],
+    [
+      "percent-encoded form key",
+      "application/x-www-form-urlencoded",
+      `${FORM}&user%5Fid=victim-account`,
+    ],
+    [
+      "repeated form key",
+      "application/x-www-form-urlencoded",
+      `${FORM}&user_id=victim-account&user_id=victim-account`,
+    ],
+    ["mixed-case JSON type", "Application/JSON", `${JSON_START},"user_id":"victim-account"}`],
+    ["escaped JSON key", "application/json", `${JSON_START},"user\\u005fid":"victim-account"}`],
+    [
+      "repeated JSON key",
+      "application/json",
+      `${JSON_START},"user_id":"victim-account","user_id":"victim-account"}`,
+    ],
+  ])("never binds a code to a supplied user_id: %s", async (_, type, body) => {
+    const { hono, db } = buildHandler();
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: { "content-type": type },
+      body,
+    });
+    expect(response.status).toBe(200);
+    const { device_code: deviceCode } = (await response.json()) as { device_code: string };
+    const row = db.deviceCode?.find((candidate) => candidate.deviceCode === deviceCode);
+    expect(row?.scope).toBe("cli-slug:desk-01");
+    expect(row?.userId ?? null).toBeNull();
+  });
+
+  it.each([
+    ["multipart", "multipart/form-data; boundary=x"],
+    ["text", "text/plain"],
+    ["none", ""],
+  ])("refuses a %s body with 415 and creates nothing", async (_, type) => {
+    const { hono, db } = buildHandler();
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: type ? { "content-type": type } : {},
+      // Bytes, so no Content-Type is implied when the case sends none.
+      body: new TextEncoder().encode(`${FORM}&user_id=victim-account`),
+    });
+    expect(response.status).toBe(415);
+    expect(db.deviceCode).toHaveLength(0);
+  });
+
+  it("forwards a +json body with user_id stripped (Better Auth itself refuses the type)", async () => {
+    const { hono, db } = buildHandler();
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: { "content-type": "application/vnd.wsmp+json" },
+      body: `${JSON_START},"user_id":"victim-account"}`,
+    });
+    expect(response.status).toBe(415);
+    expect(db.deviceCode).toHaveLength(0);
+  });
 });
