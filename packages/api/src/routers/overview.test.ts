@@ -636,6 +636,11 @@ describe("overviewRouter.metrics", () => {
           "providerTypes",
           eligible ? ["openrouter"] : [],
         );
+        // No own-key preference here, so the only possible route is pool fallback.
+        expect(result.sharedPools[0]).toMatchObject({
+          externalRoutes: eligible ? ["pool-fallback"] : [],
+          effectiveProviderEgress: eligible,
+        });
         const wire = JSON.stringify(result);
         expect(wire).not.toMatch(
           /Private owner label|private-account|private\.example|private-credential|private-member|private-target/,

@@ -23,10 +23,20 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 - **Transaction-mode poolers are unsupported.** PgBouncer
   `pool_mode=transaction` loses the session settings (`TimeZone`, the sweeper's
   `statement_timeout`). Connect directly or use session pooling.
-- **Schema: deploy once with `APPLY_SCHEMA=safe`.** All schema changes in this
-  release are additive. `safe` also re-applies the schema hardening that
-  carries the grantee trigger fix below; with `APPLY_SCHEMA=off` that fix is
-  not installed.
+- **Schema: deploy once with `APPLY_SCHEMA=dangerous`, after a backup.** #61
+  adds a unique constraint on `pool_grant (id, poolId, granteeUserId)`. It
+  cannot fail (`id` is already the primary key), but Prisma treats every new
+  unique constraint as possible data loss, so `APPLY_SCHEMA=safe` stops with
+  "A unique constraint covering the columns `[id,poolId,granteeUserId]` on the
+  table `pool_grant` will be added" and the container exits. The other schema
+  changes from #56–#61 are additive (`publicEgressEnabled` became
+  `fallbackEnabled` on the same column). If you upgrade straight from v0.3.1,
+  the same push also applies #51 and #53, which drop `cli_device.label` and
+  `cli_device_credential.name`; `dangerous` deletes those values. Run `safe`
+  first and read every warning it prints before switching to `dangerous`,
+  then go back to `APPLY_SCHEMA=off`. The schema deploy also re-applies the
+  schema hardening that carries the grantee trigger fix below; with
+  `APPLY_SCHEMA=off` that fix is not installed.
 
 ## Breaking changes
 
@@ -75,8 +85,8 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   responses paid by the pool owner were delivered, but their request record
   stayed pending until crash recovery. The `relay_request` consistency trigger
   now checks the selected target against the pool owner for pool routes, and
-  against the requester for own-key and direct routes (#61). Deploy with
-  `APPLY_SCHEMA=safe` to install it.
+  against the requester for own-key and direct routes (#61). The schema deploy
+  above installs it.
 
 ## Post-deploy verification
 
