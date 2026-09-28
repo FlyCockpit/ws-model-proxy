@@ -106,11 +106,16 @@ vi.mock("../../../packages/mailer/src/index", () => ({
 const mockGetConnInfo = vi.hoisted(() => vi.fn(() => ({ remote: { address: "10.0.0.1" } })));
 vi.mock("@hono/node-server/conninfo", () => ({ getConnInfo: mockGetConnInfo }));
 
+import prismaDefault from "@ws-model-proxy/db";
+import type { DeepMockProxy } from "vitest-mock-extended";
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createApp } from "./app";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import { MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match";
 import { mcpClientRegistrationLimiter } from "./rate-limit";
+import { getUserDeletionSweepHealth, startUserDeletionSweep } from "./user-deletion-sweep";
+
+const prismaMock = prismaDefault as unknown as DeepMockProxy<typeof prismaDefault>;
 
 const BASE = "https://proxy.example.com";
 const ISSUER = `${BASE}/api/auth`;
@@ -558,5 +563,89 @@ describe("createApp registration contract — MCP OAuth flag-off 404 gate (Phase
     const jwks = await app.request(`${BASE}/api/auth/jwks`);
     expect(jwks.status).toBe(200);
     expect(jwks.headers.get("x-ratelimit-limit")).toBe("2");
+  });
+});
+
+describe("createApp readiness probe — GET /ready through the real route (#79 item 3)", () => {
+  /**
+   * Runs the REAL sweep loop with an injected tick that always fails, until
+   * its health turns "failing" (the escalation threshold), so the route reads
+   * the same singleton the production loop publishes.
+   */
+  async function startFailingSweep() {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stop = startUserDeletionSweep({
+      prisma: prismaMock,
+      intervalMs: 5,
+      sweep: async () => {
+        throw new Error("connect timeout");
+      },
+    });
+    await vi.waitFor(() => expect(getUserDeletionSweepHealth()).toBe("failing"));
+    return async () => {
+      await stop();
+      errors.mockRestore();
+    };
+  }
+
+  afterEach(() => {
+    prismaMock.$queryRaw.mockReset();
+  });
+
+  it("Postgres up, no sweep loop: 200, not degraded, sweep not_running", async () => {
+    prismaMock.$queryRaw.mockResolvedValue([{ "?column?": 1 }]);
+    const app = await buildApp(true);
+    const res = await app.request(`${BASE}/ready`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      degraded: false,
+      checks: { postgres: true, userDeletionSweep: "not_running" },
+    });
+  });
+
+  it("Postgres up, sweep failing: still 200, but degraded with the coarse sweep state", async () => {
+    prismaMock.$queryRaw.mockResolvedValue([{ "?column?": 1 }]);
+    const app = await buildApp(true);
+    const stop = await startFailingSweep();
+    try {
+      const res = await app.request(`${BASE}/ready`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        degraded: true,
+        checks: { postgres: true, userDeletionSweep: "failing" },
+      });
+    } finally {
+      await stop();
+    }
+    // Stopping the loop withdraws its health.
+    const after = await app.request(`${BASE}/ready`);
+    expect(((await after.json()) as { checks: unknown }).checks).toEqual({
+      postgres: true,
+      userDeletionSweep: "not_running",
+    });
+  });
+
+  it("Postgres down: 503 whatever the sweep reports, and the body stays coarse", async () => {
+    prismaMock.$queryRaw.mockRejectedValue(
+      new Error("ECONNREFUSED 10.0.0.5:5432 password=hunter2"),
+    );
+    const app = await buildApp(true);
+    const stop = await startFailingSweep();
+    try {
+      const res = await app.request(`${BASE}/ready`);
+      expect(res.status).toBe(503);
+      const text = await res.text();
+      expect(JSON.parse(text)).toEqual({
+        ok: false,
+        degraded: false,
+        checks: { postgres: false, userDeletionSweep: "failing" },
+      });
+      // No error detail from the failed check reaches the unauthenticated body.
+      expect(text).not.toContain("ECONNREFUSED");
+    } finally {
+      await stop();
+    }
   });
 });

@@ -3961,10 +3961,24 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       const g = await graph(`adaptive-${slowAbove}`);
       const waiters = 3_000;
       await terminalAdmissions(g, waiters);
+      // Sequences are not transactional, so they record each slow attempt
+      // (count and size) although the cancelled batch rolls back.
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_slow_attempts MINVALUE 0 START 0",
+      );
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_last_slow_size MINVALUE 0 START 0",
+      );
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_slow_attempts', 0)");
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_last_slow_size', 0)");
       await observer.$executeRawUnsafe(`
         CREATE OR REPLACE FUNCTION wsmp_test_slow_waiter_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE n bigint;
         BEGIN
-          IF (SELECT count(*) FROM gone WHERE "poolId" = '${g.pool.id}') > ${slowAbove} THEN
+          SELECT count(*) INTO n FROM gone WHERE "poolId" = '${g.pool.id}';
+          IF n > ${slowAbove} THEN
+            PERFORM nextval('wsmp_test_slow_attempts');
+            PERFORM setval('wsmp_test_last_slow_size', n);
             PERFORM pg_sleep(10);
           END IF;
           RETURN NULL;
@@ -3981,7 +3995,15 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         const started = Date.now();
         const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
         const elapsed = Date.now() - started;
-        report(`adaptive drain (${label}): ${elapsed} ms, ${JSON.stringify(outcome)}`);
+        const [slow] = await observer.$queryRawUnsafe<
+          Array<{ attempts: bigint; lastSize: bigint }>
+        >(
+          `SELECT (SELECT last_value FROM wsmp_test_slow_attempts) AS attempts,
+                  (SELECT last_value FROM wsmp_test_last_slow_size) AS "lastSize"`,
+        );
+        report(
+          `adaptive drain (${label}): ${elapsed} ms, ${JSON.stringify(outcome)}, slow attempts ${slow?.attempts} (last ${slow?.lastSize} rows)`,
+        );
         // 5 000 -> 2 500 -> 1 250 -> 625 (the floor): three halvings.
         expect(deletion.PARENT_DELETION_DRAIN_BATCH / 8).toBe(
           deletion.PARENT_DELETION_DRAIN_MIN_BATCH,
@@ -3990,6 +4012,9 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           expect(outcome.ok).toBe(true);
           if (!outcome.ok) throw outcome.error;
           expect(outcome.value["batch.halved"]).toBe(3);
+          // 3 000 (all waiters), 2 500 and 1 250 were cancelled.
+          expect(Number(slow?.attempts)).toBe(3);
+          expect(Number(slow?.lastSize)).toBe(1_250);
           expect(outcome.value["capacity_waiter.delete"]).toBe(waiters);
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
         } else {
@@ -3997,6 +4022,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           if (outcome.ok) throw new Error("a floor batch past its bound was not reported");
           expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
           expect(outcome.error).toMatchObject({ timeout: "57014" });
+          // The floor itself was attempted (3 000, 2 500, 1 250, then 625)
+          // before pending: a drain without the retry stops after one.
+          expect(Number(slow?.attempts)).toBe(4);
+          expect(Number(slow?.lastSize)).toBe(deletion.PARENT_DELETION_DRAIN_MIN_BATCH);
           // Every batch rolled back.
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(waiters);
         }
@@ -4009,6 +4038,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON capacity_waiter",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_waiter_batch()");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_slow_attempts");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_last_slow_size");
       }
     },
     90_000,

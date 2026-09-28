@@ -444,8 +444,11 @@ export async function runParentDeletionDrainBatch<T>(
  * Smallest batch the drain shrinks to after statement timeouts
  * ({@link drainParentDeletionHistory}). From the default
  * {@link PARENT_DELETION_DRAIN_BATCH} that is at most three halvings, so a
- * batch that keeps timing out costs at most three extra statement bounds
- * before the drain reports pending.
+ * batch that keeps timing out costs at most three extra batch attempts
+ * before the drain reports pending. Each attempt is a whole batch
+ * transaction: its settings, the owner check and up to four work
+ * statements, each under its own statement bound. This caps retries; it is
+ * not a wall-clock deadline for the drain.
  */
 export const PARENT_DELETION_DRAIN_MIN_BATCH = 625;
 
