@@ -377,6 +377,34 @@ describe("OpenRouter usage dialect", () => {
       ],
       ["an array usage", sse([data({ usage: [usage()] }), done]), "evidence"],
       ["a total-only record", sse([data({ usage: { total_tokens: 1280 } }), done]), "evidence"],
+      // Completeness undefined: a lone record must be complete to settle.
+      [
+        "a cost-only record",
+        sse([data({ usage: { cost: 0.0021, is_byok: false } }), done]),
+        "evidence",
+      ],
+      [
+        "a record without completion_tokens",
+        sse([data({ usage: { prompt_tokens: 1200, cost: 0.0021 } }), done]),
+        "evidence",
+      ],
+      [
+        "a record with billable_tokens",
+        sse([data({ usage: { ...usage(), billable_tokens: 1 } }), done]),
+        "evidence",
+      ],
+      // Mixed line terminators merge a later record into non-JSON data.
+      ...(["\n\r\n", "\r\n\r", "\n\r"] as const).map((terminator): [string, string, Outcome] => [
+        `a later record ended by ${JSON.stringify(terminator)}`,
+        `${data({ usage: other() })}\n\n${data({ usage: usage() })}${terminator}${content}\n\n${done}\n\n`,
+        "evidence",
+      ]),
+      [
+        "a later non-JSON data record",
+        sse([data({ usage: usage() }), `${data({ usage: other() })} trailing`, done]),
+        "evidence",
+      ],
+      ["an empty data record", sse([data({ usage: usage() }), "data:", done]), "evidence"],
       [
         "valid SSE and junk in one chunk (decoder rejects it: nothing read)",
         `${sse([data({ usage: usage() })])}{"usage":1}\n\n`,

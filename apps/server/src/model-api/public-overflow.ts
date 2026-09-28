@@ -1716,6 +1716,7 @@ export function openRouterUsageEnvelope(value: unknown): string | undefined {
  */
 export class OpenRouterUsageRecords {
   readonly #records = new Map<string, unknown>();
+  #readable = true;
 
   observe(value: unknown) {
     if (this.#records.size > 1) return;
@@ -1728,12 +1729,20 @@ export class OpenRouterUsageRecords {
     try {
       this.observe(JSON.parse(data));
     } catch {
-      // Non-JSON records carry no usage.
+      // OpenRouter sends only JSON records. A non-JSON one may be a usage
+      // record merged by unusual framing (or carrying trailing bytes): it
+      // cannot be read, so no other record may settle alone.
+      this.#readable = false;
     }
   }
 
   get records(): readonly unknown[] {
     return [...this.#records.values()];
+  }
+
+  /** False once a `data:` record was not JSON (a record may be missing). */
+  get readable(): boolean {
+    return this.#readable;
   }
 }
 
@@ -1764,7 +1773,7 @@ function openRouterRecords(
     // valid SSE after some records may hide a later record: unreadable.
     readable = !sawRecord;
   }
-  if (sawRecord) return [collected.records, readable];
+  if (sawRecord) return [collected.records, readable && collected.readable];
   try {
     collected.observe(
       JSON.parse(new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))))),
@@ -2951,18 +2960,27 @@ export async function dispatchPublicOverflow(
             }).catch(() => false);
           }
           const combinedUsage = openRouterStreamRecords
-            ? openRouterUsageFromRecords(openRouterStreamRecords.records, true, pricing)
-            : mergeProviderUsage(
-                responseBytes > 1024 * 1024
-                  ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
-                  : undefined,
-                parseProviderUsage(
-                  !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
-                  pricing,
-                  target.usageDialect,
-                ),
-                surface,
-              );
+            ? openRouterUsageFromRecords(
+                openRouterStreamRecords.records,
+                openRouterStreamRecords.readable,
+                pricing,
+              )
+            : target.usageDialect === "openrouter" && !request.stream
+              ? // The whole body is the one record; an overflowing body has none.
+                nonstreamOverflow
+                ? undefined
+                : parseProviderUsage(nonstreamChunks, pricing, "openrouter")
+              : mergeProviderUsage(
+                  responseBytes > 1024 * 1024
+                    ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
+                    : undefined,
+                  parseProviderUsage(
+                    !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+                    pricing,
+                    target.usageDialect,
+                  ),
+                  surface,
+                );
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost

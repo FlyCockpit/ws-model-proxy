@@ -2957,7 +2957,14 @@ describe("OpenRouter owner-paid settlement", () => {
         ...padding(1200),
         done,
       ]);
-      for (const settled of [responseContainer, commentOnly]) {
+      // A later record the stream cannot read (non-JSON data) may hide usage.
+      const unreadableLater = await settleOwnerStream("openrouter", [
+        data({ choices: [], usage: small }),
+        Buffer.from(`data: ${JSON.stringify({ choices: [], usage: big })} trailing\n\n`),
+        done,
+      ]);
+      expect(unreadableLater.usage.categoriesComplete).toBe(false);
+      for (const settled of [responseContainer, commentOnly, unreadableLater]) {
         expect(settled.usage?.reportedCost).toBeUndefined();
         expect(settled.usage?.calculatedCost).toBeUndefined();
         if (settled.usage) expect(providerBillableTokens(settled.usage)).toBeUndefined();
