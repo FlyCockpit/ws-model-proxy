@@ -3961,14 +3961,20 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       const g = await graph(`adaptive-${slowAbove}`);
       const waiters = 3_000;
       await terminalAdmissions(g, waiters);
-      // Sequences are not transactional, so they record each slow attempt
+      // Sequences are not transactional, so they record every attempt (a
+      // BEFORE STATEMENT trigger: counted even when something else makes the
+      // DELETE itself outlast its bound on a loaded host) and each slow one
       // (count and size) although the cancelled batch rolls back.
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_waiter_attempts MINVALUE 0 START 0",
+      );
       await observer.$executeRawUnsafe(
         "CREATE SEQUENCE IF NOT EXISTS wsmp_test_slow_attempts MINVALUE 0 START 0",
       );
       await observer.$executeRawUnsafe(
         "CREATE SEQUENCE IF NOT EXISTS wsmp_test_last_slow_size MINVALUE 0 START 0",
       );
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_waiter_attempts', 0)");
       await observer.$executeRawUnsafe("SELECT setval('wsmp_test_slow_attempts', 0)");
       await observer.$executeRawUnsafe("SELECT setval('wsmp_test_last_slow_size', 0)");
       await observer.$executeRawUnsafe(`
@@ -3984,6 +3990,15 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           RETURN NULL;
         END $$`);
       await observer.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION wsmp_test_count_waiter_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM nextval('wsmp_test_waiter_attempts');
+          RETURN NULL;
+        END $$`);
+      await observer.$executeRawUnsafe(`
+        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON capacity_waiter
+          FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_count_waiter_batch()`);
+      await observer.$executeRawUnsafe(`
         CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON capacity_waiter
           REFERENCING OLD TABLE AS gone
           FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_slow_waiter_batch()`);
@@ -3996,13 +4011,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
         const elapsed = Date.now() - started;
         const [slow] = await observer.$queryRawUnsafe<
-          Array<{ attempts: bigint; lastSize: bigint }>
+          Array<{ tried: bigint; attempts: bigint; lastSize: bigint }>
         >(
-          `SELECT (SELECT last_value FROM wsmp_test_slow_attempts) AS attempts,
+          `SELECT (SELECT last_value FROM wsmp_test_waiter_attempts) AS tried,
+                  (SELECT last_value FROM wsmp_test_slow_attempts) AS attempts,
                   (SELECT last_value FROM wsmp_test_last_slow_size) AS "lastSize"`,
         );
         report(
-          `adaptive drain (${label}): ${elapsed} ms, ${JSON.stringify(outcome)}, slow attempts ${slow?.attempts} (last ${slow?.lastSize} rows)`,
+          `adaptive drain (${label}): ${elapsed} ms, ${JSON.stringify(outcome)}, waiter DELETEs ${slow?.tried}, slow ${slow?.attempts} (last ${slow?.lastSize} rows)`,
         );
         // 5 000 -> 2 500 -> 1 250 -> 625 (the floor): three halvings.
         expect(deletion.PARENT_DELETION_DRAIN_BATCH / 8).toBe(
@@ -4023,9 +4039,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
           expect(outcome.error).toMatchObject({ timeout: "57014" });
           // The floor itself was attempted (3 000, 2 500, 1 250, then 625)
-          // before pending: a drain without the retry stops after one.
-          expect(Number(slow?.attempts)).toBe(4);
-          expect(Number(slow?.lastSize)).toBe(deletion.PARENT_DELETION_DRAIN_MIN_BATCH);
+          // before pending: a drain without the retry stops after one. Counted
+          // at statement start, so a DELETE a loaded host slowed past its
+          // bound before the slow trigger ran still counts.
+          expect(Number(slow?.tried)).toBe(4);
           // Every batch rolled back.
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(waiters);
         }
@@ -4038,6 +4055,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON capacity_waiter",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_waiter_batch()");
+        await observer.$executeRawUnsafe(
+          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON capacity_waiter",
+        );
+        await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_count_waiter_batch()");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_waiter_attempts");
         await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_slow_attempts");
         await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_last_slow_size");
       }
