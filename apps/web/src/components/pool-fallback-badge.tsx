@@ -8,7 +8,7 @@ import {
 } from "@ws-model-proxy/ui/components/popover";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Cloud } from "lucide-react";
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const chipClassName =
@@ -45,6 +45,9 @@ export function PoolFallbackBadge({
   const pointerFocus = useRef(false);
   const returningFocus = useRef(false);
   const openedByFocus = useRef(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
+  const descriptionId = useId();
   if (routes.length === 0)
     return (
       <span
@@ -60,6 +63,18 @@ export function PoolFallbackBadge({
       {t("dashboard:pools.fallbackBadge.label")}
     </>
   );
+  const routeLines = [
+    ...(routes.includes("pool-fallback")
+      ? [
+          providers.length
+            ? t("dashboard:pools.fallbackBadge.routePoolFallback", {
+                providers: providers.join(", "),
+              })
+            : t("dashboard:pools.fallbackBadge.routePoolFallbackUnnamed"),
+        ]
+      : []),
+    ...(routes.includes("own-key") ? [t("dashboard:pools.fallbackBadge.routeOwnKey")] : []),
+  ];
   if (!interactive)
     return (
       <span data-fallback="available" className={cn(chipClassName, availableClassName)}>
@@ -96,7 +111,9 @@ export function PoolFallbackBadge({
         }}
         render={
           <button
+            ref={triggerRef}
             type="button"
+            aria-describedby={descriptionId}
             data-fallback="available"
             className={cn(
               chipClassName,
@@ -109,12 +126,33 @@ export function PoolFallbackBadge({
       >
         {label}
       </PopoverTrigger>
+      {/* Focus stays on the badge when the hint opens on focus, so screen
+          readers get the hint as the badge's description. */}
+      <span id={descriptionId} hidden>
+        {[
+          t("dashboard:pools.fallbackBadge.intro"),
+          ...routeLines,
+          t("dashboard:pools.fallbackBadge.consent"),
+        ].join(" ")}
+      </span>
       <PopoverContent
+        ref={popupRef}
         className="max-w-[calc(100vw-2rem)]"
         align="start"
         // Opened by focus: keep focus on the trigger so Tab moves on.
         initialFocus={() => !openedByFocus.current}
         finalFocus={() => {
+          // A function here turns off Base UI's own "focus already moved
+          // elsewhere, leave it" rule, so apply it: never pull focus back
+          // from a control the user moved to.
+          const active = document.activeElement;
+          if (
+            active &&
+            active !== document.body &&
+            active !== triggerRef.current &&
+            !popupRef.current?.contains(active)
+          )
+            return false;
           // Base UI focuses the trigger in a microtask after this call; skip
           // that one focus event, whether or not it happens.
           returningFocus.current = true;
@@ -127,18 +165,9 @@ export function PoolFallbackBadge({
         <PopoverTitle>{t("dashboard:pools.fallbackBadge.title")}</PopoverTitle>
         <PopoverDescription>{t("dashboard:pools.fallbackBadge.intro")}</PopoverDescription>
         <ul className="list-disc space-y-1 pl-4 text-xs">
-          {routes.includes("pool-fallback") ? (
-            <li>
-              {providers.length
-                ? t("dashboard:pools.fallbackBadge.routePoolFallback", {
-                    providers: providers.join(", "),
-                  })
-                : t("dashboard:pools.fallbackBadge.routePoolFallbackUnnamed")}
-            </li>
-          ) : null}
-          {routes.includes("own-key") ? (
-            <li>{t("dashboard:pools.fallbackBadge.routeOwnKey")}</li>
-          ) : null}
+          {routeLines.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
         </ul>
         <p className="text-xs text-muted-foreground">
           {t("dashboard:pools.fallbackBadge.consent")}

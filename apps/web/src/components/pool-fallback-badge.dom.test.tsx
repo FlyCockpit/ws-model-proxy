@@ -68,6 +68,56 @@ describe("PoolFallbackBadge", () => {
     await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
   });
 
+  it("does not reopen when Escape returns focus from inside the hint", async () => {
+    const user = userEvent.setup();
+    render(<PoolFallbackBadge routes={["own-key"]} />);
+    const badge = screen.getByRole("button", { name: LABEL });
+    await user.tab();
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("false"));
+    // Enter opens it with focus inside the hint; Escape hands focus back.
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(document.activeElement?.getAttribute("role")).toBe("dialog"));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(document.activeElement).toBe(badge));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(badge.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("leaves focus where the user moved it when the hint closes", async () => {
+    const user = userEvent.setup();
+    render(
+      <>
+        <PoolFallbackBadge routes={["own-key"]} />
+        <input aria-label="composer" />
+      </>,
+    );
+    const badge = screen.getByRole("button", { name: LABEL });
+    await user.keyboard("{Tab}{Escape}{Enter}");
+    await waitFor(() => expect(document.activeElement?.getAttribute("role")).toBe("dialog"));
+    const input = screen.getByRole("textbox", { name: "composer" });
+    // Focus moves on while the hint is still open (as a tap on another field
+    // does in a browser, where the exit animation delays the close).
+    input.focus();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("false"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("describes the hint to assistive technology while focus stays on the badge", () => {
+    render(<PoolFallbackBadge routes={["pool-fallback", "own-key"]} providers={["openrouter"]} />);
+    const badge = screen.getByRole("button", { name: LABEL });
+    const description = document.getElementById(badge.getAttribute("aria-describedby") ?? "");
+    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.intro");
+    expect(description?.textContent).toContain(
+      "dashboard:pools.fallbackBadge.routePoolFallback: openrouter",
+    );
+    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.routeOwnKey");
+    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.consent");
+  });
+
   it("reopens on focus after tabbing away and back", async () => {
     const user = userEvent.setup();
     render(
