@@ -88,7 +88,6 @@ import {
   assertExternalAfterWaitWithinBudget,
   assertPoolFallbackEnableable,
   assertProviderEgressReleaseGate,
-  POOL_FALLBACK_DEFAULTS,
   poolFallbackChangeSource,
   recordPoolFallbackAudit,
 } from "../lib/pool-fallback-settings";
@@ -2209,15 +2208,13 @@ export const forwarderManagementRouter = {
             resourceId: pool.id,
           },
         });
-        // Attaching external members turns fallback on: audit it.
+        // Attaching external members turns fallback on: audit it. The other
+        // fallback fields keep their schema defaults (not a change).
         await recordPoolFallbackAudit(tx, {
           userId,
           poolId: pool.id,
-          before: POOL_FALLBACK_DEFAULTS,
-          after: {
-            ...POOL_FALLBACK_DEFAULTS,
-            fallbackEnabled: hasPublicOverflow,
-          },
+          before: null,
+          after: hasPublicOverflow ? { fallbackEnabled: true } : {},
           source: poolFallbackChangeSource(context),
         });
         guardedSetupTestFailure?.();
@@ -2533,8 +2530,11 @@ export const forwarderManagementRouter = {
           : {}),
         optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
-        fallbackEnabled: input.fallbackEnabled ?? false,
-        fallbackForGrantees: input.fallbackForGrantees ?? false,
+        // Fallback fields not given keep the schema defaults (forwarder.prisma).
+        ...(input.fallbackEnabled !== undefined ? { fallbackEnabled: input.fallbackEnabled } : {}),
+        ...(input.fallbackForGrantees !== undefined
+          ? { fallbackForGrantees: input.fallbackForGrantees }
+          : {}),
         ...(input.externalAfterWaitMs !== undefined
           ? { externalAfterWaitMs: input.externalAfterWaitMs }
           : {}),
@@ -2582,15 +2582,22 @@ export const forwarderManagementRouter = {
           data,
           select: poolSelect,
         });
-        // A create that sets non-default fallback values is a fallback change.
+        // Fallback values the creator set explicitly are recorded (from the
+        // stored row, before = null); schema defaults are not a change.
         await recordPoolFallbackAudit(tx, {
           userId,
           poolId: created.id,
-          before: POOL_FALLBACK_DEFAULTS,
+          before: null,
           after: {
-            fallbackEnabled: created.fallbackEnabled,
-            fallbackForGrantees: created.fallbackForGrantees,
-            externalAfterWaitMs: created.externalAfterWaitMs,
+            ...(input.fallbackEnabled !== undefined
+              ? { fallbackEnabled: created.fallbackEnabled }
+              : {}),
+            ...(input.fallbackForGrantees !== undefined
+              ? { fallbackForGrantees: created.fallbackForGrantees }
+              : {}),
+            ...(input.externalAfterWaitMs !== undefined
+              ? { externalAfterWaitMs: created.externalAfterWaitMs }
+              : {}),
           },
           source: poolFallbackChangeSource(context),
         });

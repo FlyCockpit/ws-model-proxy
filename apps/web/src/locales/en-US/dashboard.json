@@ -551,6 +551,24 @@
       "enableBlockedDeployment": "Turning fallback or grantee coverage on is unavailable while external providers are disabled for this deployment.",
       "granteesHint": "You pay provider charges for people you share this pool with. Their requests still need :external and a token that allows external providers."
     },
+    "fallbackHistory": {
+      "title": "Fallback change history",
+      "empty": "No fallback changes recorded yet.",
+      "failed": "Fallback change history could not be loaded.",
+      "sourceMcp": "Changed by an MCP client",
+      "sourceDashboard": "Changed in the dashboard",
+      "sourceUnknown": "Changed",
+      "change": "{{field}}: {{before}} → {{after}}",
+      "on": "on",
+      "off": "off",
+      "unset": "not set (new pool)",
+      "milliseconds": "{{value}} ms",
+      "fields": {
+        "fallbackEnabled": "External fallback",
+        "fallbackForGrantees": "Also for grantees",
+        "externalAfterWaitMs": "Wait before going external"
+      }
+    },
     "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment. You can still turn fallback and grantee coverage off and change wait times; turning them on is unavailable until providers are enabled.",
     "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
     "fallbackSteps": {

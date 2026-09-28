@@ -16,7 +16,8 @@
  * - VALUES under keys whose names carry credential/secret semantics
  *   (`secret`, `ciphertext`, `nonce`, `authTag`, token hashes, OAuth/JWT
  *   material, passwords, bearer/authorization material, a bare `token` or
- *   `credential` key, private keys, JWKs, API keys). Key matching is
+ *   `credential` key, private keys, JWKs, API keys, device-flow codes, 2FA
+ *   backup codes). Key matching is
  *   substring-on-normalized-key (case-insensitive, `_`/`-` equivalent) so
  *   spellings like `secretDigest`, `client_secret`, `auth-tag` all match;
  *   metadata fields that merely DESCRIBE a secret (`credentialType`,
@@ -63,6 +64,11 @@ const SECRET_KEY_FRAGMENTS: readonly string[] = [
   "jwt",
   "encryptionkey",
   "hmac",
+  // Device-flow and 2FA recovery material (DeviceCode.deviceCode /
+  // DeviceCode.userCode, TwoFactor.backupCodes).
+  "devicecode",
+  "usercode",
+  "backupcode",
 ];
 
 /** Exact key names (after lowercasing) that bear whole secrets. */

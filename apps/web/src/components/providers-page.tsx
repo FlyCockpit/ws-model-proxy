@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { isOpenRouterProviderType } from "@ws-model-proxy/api/lib/provider-type";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
@@ -269,7 +270,7 @@ function PoolChoice({ pool, enabled }: { pool: Pool; enabled: boolean }) {
             </>
           )}
           {models.isError && <InlineRetry onRetry={() => void models.refetch()} />}
-          {account?.providerType === "openrouter" && (
+          {account !== undefined && isOpenRouterProviderType(account.providerType) && (
             <>
               <form.Field name="modelId">
                 {(field) => (

@@ -12,6 +12,7 @@
  * renders alike. Other provider types never get the field.
  */
 
+import { isOpenRouterProviderType } from "@ws-model-proxy/api/lib/provider-type";
 import { openAiErrorBody } from "./openai-errors.js";
 
 /** The value WMP forces into `provider.data_collection`, or null to leave the body alone. */
@@ -25,7 +26,7 @@ export function openRouterDataCollectionPolicy(account: {
   providerType: string;
   allowDataCollection: boolean;
 }): OpenRouterDataCollectionPolicy {
-  if (account.providerType.trim().toLowerCase() !== "openrouter") return null;
+  if (!isOpenRouterProviderType(account.providerType)) return null;
   return account.allowDataCollection ? null : "deny";
 }
 
@@ -84,13 +85,21 @@ export function isOpenRouterDataPolicyRefusal(status: number, bodyText: string):
 /** Stable machine code for the mapped refusal. */
 export const OPENROUTER_DATA_POLICY_ERROR_CODE = "provider_data_policy_unavailable";
 
-/** The clear 503 WMP returns instead of OpenRouter's bare 404. */
+/** Client-facing reason for the mapped refusal (every surface uses this text). */
+export const OPENROUTER_DATA_POLICY_ERROR_MESSAGE =
+  'No OpenRouter provider for this model accepts the data policy data_collection: "deny". The OpenRouter account allows only providers that do not store or train on prompts. Choose another model, or allow providers that may collect data in the provider account settings.';
+
+/**
+ * The clear 503 WMP returns instead of OpenRouter's bare 404. The HTTP route
+ * layer re-renders it in the requested surface's error shape (it never
+ * forwards non-success provider bodies), keyed on the typed `refused` flag of
+ * {@link mapOpenRouterDataPolicyRefusal}, never on anything in this body.
+ */
 export function openRouterDataPolicyResponse(): Response {
   return new Response(
     JSON.stringify(
       openAiErrorBody({
-        message:
-          'No OpenRouter provider for this model accepts the data policy data_collection: "deny". The OpenRouter account allows only providers that do not store or train on prompts. Choose another model, or allow providers that may collect data in the provider account settings.',
+        message: OPENROUTER_DATA_POLICY_ERROR_MESSAGE,
         type: "server_error",
         code: OPENROUTER_DATA_POLICY_ERROR_CODE,
       }),
@@ -100,14 +109,18 @@ export function openRouterDataPolicyResponse(): Response {
 }
 
 /**
- * Map OpenRouter's data-policy 404 to {@link openRouterDataPolicyResponse}.
- * Other responses pass through unchanged: the inspected prefix (at most
- * {@link OPENROUTER_ERROR_INSPECT_MAX_BYTES}) is replayed ahead of the rest of
- * the body, so nothing is lost or reordered. Reading the body drives the
- * dispatcher's settlement exactly as a client read would.
+ * Map OpenRouter's data-policy 404 to {@link openRouterDataPolicyResponse}
+ * (`refused: true`). Other responses pass through unchanged (`refused:
+ * false`): the inspected prefix (at most {@link OPENROUTER_ERROR_INSPECT_MAX_BYTES})
+ * is replayed ahead of the rest of the body, so nothing is lost or reordered.
+ * Reading the body drives the dispatcher's settlement exactly as a client
+ * read would. `refused` is an in-process signal only: a provider cannot set
+ * it through a header or body field.
  */
-export async function mapOpenRouterDataPolicyRefusal(response: Response): Promise<Response> {
-  if (response.status !== 404 || response.body === null) return response;
+export async function mapOpenRouterDataPolicyRefusal(
+  response: Response,
+): Promise<{ response: Response; refused: boolean }> {
+  if (response.status !== 404 || response.body === null) return { response, refused: false };
   const reader = response.body.getReader();
   const prefix: Uint8Array[] = [];
   let bytes = 0;
@@ -135,7 +148,7 @@ export async function mapOpenRouterDataPolicyRefusal(response: Response): Promis
     offset += chunk.byteLength;
   }
   if (done && isOpenRouterDataPolicyRefusal(response.status, new TextDecoder().decode(merged)))
-    return openRouterDataPolicyResponse();
+    return { response: openRouterDataPolicyResponse(), refused: true };
   const replay = new ReadableStream<Uint8Array>({
     start(controller) {
       if (merged.byteLength > 0) controller.enqueue(merged);
@@ -151,9 +164,12 @@ export async function mapOpenRouterDataPolicyRefusal(response: Response): Promis
       await reader.cancel(reason);
     },
   });
-  return new Response(replay, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  return {
+    response: new Response(replay, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    refused: false,
+  };
 }

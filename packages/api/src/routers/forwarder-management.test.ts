@@ -877,7 +877,7 @@ describe("forwarderManagementRouter", () => {
         action: "POOL_FALLBACK_UPDATED",
         metadata: {
           source: "dashboard",
-          changes: { fallbackEnabled: { before: false, after: true } },
+          changes: { fallbackEnabled: { before: null, after: true } },
         },
       }),
     });
@@ -1948,6 +1948,32 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("G1-2: a create leaves omitted fallback fields to the schema defaults and audits only explicit ones", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow({ externalAfterWaitMs: 2000 }));
+    await client().createModelPool({ slug: "plain", name: "Plain" });
+    const plain = db.modelPool.create.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    for (const field of ["fallbackEnabled", "fallbackForGrantees", "externalAfterWaitMs"])
+      expect(plain.data).not.toHaveProperty(field);
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: "POOL_FALLBACK_UPDATED" }),
+      }),
+    );
+
+    db.modelPool.create.mockResolvedValue(poolRow({ externalAfterWaitMs: 500 }));
+    await client().createModelPool({ slug: "fast", name: "Fast", externalAfterWaitMs: 500 });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "POOL_FALLBACK_UPDATED",
+        metadata: {
+          source: "dashboard",
+          changes: { externalAfterWaitMs: { before: null, after: 500 } },
+        },
+      }),
+    });
   });
 
   it("defaults cache-affinity routing on for legacy creates while honoring an explicit opt-out", async () => {

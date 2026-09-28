@@ -41,6 +41,9 @@
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
     },
+    "./lib/provider-type": {
+      "default": "./src/lib/provider-type.ts"
+    },
     "./lib/effective-provider-egress": {
       "default": "./src/lib/effective-provider-egress.ts"
     },

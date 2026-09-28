@@ -86,7 +86,10 @@ describe("OpenRouter data-policy refusal mapping", () => {
   });
 
   it("maps the refusal to a 503 with a stable code", async () => {
-    const mapped = await mapOpenRouterDataPolicyRefusal(new Response(refusal, { status: 404 }));
+    const { response: mapped, refused } = await mapOpenRouterDataPolicyRefusal(
+      new Response(refusal, { status: 404 }),
+    );
+    expect(refused).toBe(true);
     expect(mapped.status).toBe(503);
     expect(mapped.headers.get("content-type")).toBe("application/json");
     const payload = (await mapped.json()) as { error: { code: string } };
@@ -95,7 +98,7 @@ describe("OpenRouter data-policy refusal mapping", () => {
 
   it("passes other statuses through untouched", async () => {
     const response = new Response("ok", { status: 200 });
-    expect(await mapOpenRouterDataPolicyRefusal(response)).toBe(response);
+    expect(await mapOpenRouterDataPolicyRefusal(response)).toEqual({ response, refused: false });
   });
 
   it("replays a large 404 body byte-for-byte without mapping it", async () => {
@@ -108,7 +111,10 @@ describe("OpenRouter data-policy refusal mapping", () => {
         controller.close();
       },
     });
-    const mapped = await mapOpenRouterDataPolicyRefusal(new Response(stream, { status: 404 }));
+    const { response: mapped, refused } = await mapOpenRouterDataPolicyRefusal(
+      new Response(stream, { status: 404 }),
+    );
+    expect(refused).toBe(false);
     expect(mapped.status).toBe(404);
     const text = await mapped.text();
     expect(text.length).toBeGreaterThan(OPENROUTER_ERROR_INSPECT_MAX_BYTES);
@@ -123,7 +129,10 @@ describe("OpenRouter data-policy refusal mapping", () => {
         controller.error(failure);
       },
     });
-    const mapped = await mapOpenRouterDataPolicyRefusal(new Response(stream, { status: 404 }));
+    const { response: mapped, refused } = await mapOpenRouterDataPolicyRefusal(
+      new Response(stream, { status: 404 }),
+    );
+    expect(refused).toBe(false);
     expect(mapped.status).toBe(404);
     await expect(mapped.text()).rejects.toThrow("stream failed");
   });

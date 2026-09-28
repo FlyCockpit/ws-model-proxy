@@ -551,6 +551,24 @@
       "enableBlockedDeployment": "No puedes activar el respaldo ni la cobertura para usuarios con acceso compartido mientras los proveedores externos estén desactivados en esta implementación.",
       "granteesHint": "Tú pagas los cargos del proveedor de las personas con quienes compartes este pool. Sus solicitudes aún necesitan :external y un token que permita proveedores externos."
     },
+    "fallbackHistory": {
+      "title": "Historial de cambios de respaldo",
+      "empty": "Aún no hay cambios de respaldo registrados.",
+      "failed": "No se pudo cargar el historial de cambios de respaldo.",
+      "sourceMcp": "Cambiado por un cliente MCP",
+      "sourceDashboard": "Cambiado en el panel",
+      "sourceUnknown": "Cambiado",
+      "change": "{{field}}: {{before}} → {{after}}",
+      "on": "activado",
+      "off": "desactivado",
+      "unset": "sin definir (pool nuevo)",
+      "milliseconds": "{{value}} ms",
+      "fields": {
+        "fallbackEnabled": "Respaldo externo",
+        "fallbackForGrantees": "También para usuarios con acceso compartido",
+        "externalAfterWaitMs": "Espera antes de usar proveedores externos"
+      }
+    },
     "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación. Aún puedes desactivar el respaldo y la cobertura para usuarios con acceso compartido y cambiar los tiempos de espera; activarlos no está disponible hasta que se habiliten los proveedores.",
     "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
     "fallbackSteps": {

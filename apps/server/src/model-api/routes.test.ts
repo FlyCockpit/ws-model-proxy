@@ -594,6 +594,7 @@ function externalProviderTarget(poolMemberId = "primary-provider-member") {
     endpointVersion: 1,
     concurrencyLimit: 4,
     providerVersion: null,
+    dataCollectionPolicy: null,
     baseUrl: "https://provider.example/v1",
     authType: "BEARER" as const,
     healthStatus: "HEALTHY" as const,
@@ -5375,6 +5376,53 @@ describe("model API routes", () => {
   });
 
   it.each([
+    ["WMP's mapped refusal (typed flag)", true, 503, "provider_data_policy_unavailable"],
+    ["a provider 503 that only claims the code in its body", false, 503, "upstream_error"],
+  ] as const)(
+    "D9: renders the OpenRouter data-policy refusal only for %s",
+    async (_label, flagged, status, code) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        ...externalDispatchResult(provider),
+        response: new Response(
+          JSON.stringify({
+            error: {
+              message: "provider-controlled text",
+              type: "server_error",
+              code: "provider_data_policy_unavailable",
+            },
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        ),
+        ...(flagged ? { dataPolicyRefusal: true as const } : {}),
+      });
+
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+
+      expect(response.status).toBe(status);
+      expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+      const payload = (await response.json()) as { error: { code: string; message: string } };
+      expect(payload.error.code).toBe(code);
+      expect(payload.error.message).not.toContain("provider-controlled text");
+      if (flagged) expect(payload.error.message).toContain('data_collection: "deny"');
+    },
+  );
+
+  it.each([
     ["the plain name", () => requestBody(externalPoolTarget.modelId), [externalPoolTarget.id]],
     ["a token without external consent", () => requestBody(EXTERNAL_MODEL_ID), [] as string[]],
   ])("never lists or dispatches external members for %s", async (_label, body, consentPoolIds) => {
@@ -8587,6 +8635,25 @@ describe("model API routes", () => {
         await recovered.text();
       },
     );
+
+    it("D9: a bound Responses follow-up renders the data-policy refusal with its code", async () => {
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        ...boundDispatch(),
+        response: new Response("{}", {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+        dataPolicyRefusal: true as const,
+      });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/responses",
+        boundRequest("POST", true),
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "provider_data_policy_unavailable" },
+      });
+    });
 
     it.each(boundOperations)(
       "%s answers 404 when the binding's grant is lost at the send boundary",

@@ -72,7 +72,9 @@ MCP tools can never grant it:
 - \`providerManagement.setAllowDataCollection\` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   \`provider_account_create\` / \`provider_account_update\` reject
-  \`allowDataCollection\` in their input schemas.
+  \`allowDataCollection\` in their input schemas; \`providerManagement.updateAccount\`
+  refuses an MCP session moving an OpenRouter account to another provider
+  type (the privacy preference is keyed on the type).
 
 The pool owner's fallback switches (\`fallbackEnabled\`,
 \`fallbackForGrantees\`, \`externalAfterWaitMs\`) are an ordinary
@@ -84,7 +86,8 @@ always seen:
 
 - \`forwarder_model_pool_create\` and \`forwarder_model_pool_update\` reject
   \`fallbackEnabled\` and \`fallbackForGrantees\` in their input schemas
-  (advertised as \`not: {}\`), whatever the value;
+  (advertised as \`not: {}\`), whatever the value; they still accept
+  \`externalAfterWaitMs\`, and their descriptions state its cost;
 - \`forwarder_guarded_pool_create\` rejects non-empty \`providerModels\`,
   because attaching external members there turns fallback on implicitly.
 
@@ -92,8 +95,9 @@ always seen:
 get the switches, the external members in fallback order and the own-key
 request count; grantees get provider types only and their own-key route.
 
-No tool result can carry a secret value (provider API keys, encrypted
-credential material, token secrets or hashes): pinned for every tool by
+No tool result can carry a secret value WMP holds (provider API keys,
+encrypted credential material, token secrets or hashes, device-flow and 2FA
+backup codes), in any encoding: pinned for every tool by
 \`apps/server/src/mcp/secret-output.test.ts\`. Pinned by \`apps/server/src/mcp/tool-manifest.test.ts\`.`;
 
 interface CoverageRow {

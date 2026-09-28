@@ -2,6 +2,7 @@ import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import type { GuardedPoolCreateFailureReason } from "./guarded-pool-create-reasons";
+import { isMcpSession } from "./mcp-session";
 
 /**
  * Owner external-fallback settings of a model pool (fallback redesign D-K,
@@ -14,13 +15,6 @@ export type PoolFallbackSettings = {
   fallbackEnabled: boolean;
   fallbackForGrantees: boolean;
   externalAfterWaitMs: number;
-};
-
-/** Column defaults of a new pool (packages/db/prisma/schema/forwarder.prisma). */
-export const POOL_FALLBACK_DEFAULTS: PoolFallbackSettings = {
-  fallbackEnabled: false,
-  fallbackForGrantees: false,
-  externalAfterWaitMs: 2000,
 };
 
 export const poolFallbackSettingsSelect = {
@@ -162,7 +156,7 @@ export type PoolFallbackChangeSource = "mcp" | "dashboard";
 export function poolFallbackChangeSource(context: {
   session: { session: { id: string } };
 }): PoolFallbackChangeSource {
-  return context.session.session.id.startsWith("mcp:") ? "mcp" : "dashboard";
+  return isMcpSession(context) ? "mcp" : "dashboard";
 }
 
 /**
@@ -171,7 +165,12 @@ export function poolFallbackChangeSource(context: {
  * before/after values of the fields that changed and the change source.
  * Writes nothing when no fallback field changed. Call it inside the write
  * transaction, after the pool row lock, so the event commits with the change.
- * `before` is null for a pool created in this transaction.
+ *
+ * For a pool created in this transaction pass `before: null` and, in
+ * `after`, only the fields the creator set explicitly (their stored values):
+ * each is recorded as `{ before: null, after }`. Fields left to the schema
+ * defaults (packages/db/prisma/schema/forwarder.prisma, the single source of
+ * those defaults) are not a change and are not recorded.
  */
 export async function recordPoolFallbackAudit(
   tx: Prisma.TransactionClient,
@@ -185,14 +184,16 @@ export async function recordPoolFallbackAudit(
     userId: string;
     poolId: string;
     before: PoolFallbackSettings | null;
-    after: PoolFallbackSettings;
+    after: PoolFallbackSettings | Partial<PoolFallbackSettings>;
     source: PoolFallbackChangeSource;
   },
 ): Promise<boolean> {
   const changes: Record<string, { before: boolean | number | null; after: boolean | number }> = {};
   for (const field of ["fallbackEnabled", "fallbackForGrantees", "externalAfterWaitMs"] as const) {
+    const next = after[field];
+    if (next === undefined) continue;
     const previous = before?.[field] ?? null;
-    if (previous !== after[field]) changes[field] = { before: previous, after: after[field] };
+    if (previous !== next) changes[field] = { before: previous, after: next };
   }
   if (Object.keys(changes).length === 0) return false;
   await tx.providerAuditEvent.create({

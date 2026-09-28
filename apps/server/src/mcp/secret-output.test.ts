@@ -16,7 +16,21 @@ import { describe, expect, it, vi } from "vitest";
  *   2. Every manifest tool, driven through the REAL wrapper chain
  *      (`runManifestTool`: projector -> redactor -> serializer -> cap), with
  *      its procedure or core returning rows that carry every secret column
- *      at several depths and shapes. No sentinel may reach the tool result.
+ *      at several depths and shapes. Detection is by VALUE, not key name:
+ *      every seeded secret (string or bytes, including bytes under innocuous
+ *      keys) is searched for in the tool result in every encoding a broken
+ *      layer could emit (text, base64, base64url, hex, byte lists, indexed
+ *      byte objects), so neither the key redactor nor the serializer's byte
+ *      elision can regress alone without failing here.
+ *
+ * Scope: secrets WMP holds (database credential material and product
+ * credentials). The CLI command tools (`forwarder_cli_command_*`) return the
+ * text a command printed on the user's own CLI device, behind the separate
+ * `allowCliCommands` PAT consent; WMP product credentials in that text are
+ * scrubbed by `redactCredentialSubstrings` (packages/config), but arbitrary
+ * device content is not WMP secret material and is out of this contract.
+ * Their runtime is mocked here so their output goes through the same
+ * wrapper chain as every other tool.
  */
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -88,7 +102,22 @@ const SECRET_COLUMNS = [
   "ciphertext",
   "nonce",
   "authTag",
+  // Device-flow polling / user codes and 2FA recovery codes.
+  "deviceCode",
+  "userCode",
+  "backupCodes",
 ] as const;
+
+/**
+ * Secret columns whose names are too generic for the key-name redactor
+ * (redacting every `value` key would blank ordinary tool output). They are
+ * protected by projection alone: no MCP tool projection or procedure output
+ * includes these rows. Listed so the schema check still forces a decision.
+ */
+const GENERIC_NAME_SECRET_COLUMNS: Readonly<Record<string, string>> = {
+  value:
+    "Verification.value (email, reset and OAuth code material). Read only inside mcpGrants.revokeMine, which returns a status, never the rows.",
+};
 
 /**
  * Columns whose names match the secret-looking pattern but hold no secret:
@@ -116,10 +145,13 @@ const NON_SECRET_COLUMNS: Readonly<Record<string, string>> = {
   displaySuffix: "Last characters of a key shown for recognition, by design.",
   credentialType: "Credential kind enum.",
   tokenLimit: "Numeric limit.",
+  authorizationCodeId: "Foreign key to an OAuth authorization code row, not the code.",
+  encodedModelId: "URL-safe encoding of a public model id.",
+  failureReasonCode: "Machine-readable failure reason.",
 };
 
 const SECRET_LOOKING =
-  /secret|password|token|ciphertext|nonce|authtag|privatekey|apikey|digest|hash|key$|^key/i;
+  /secret|password|token|ciphertext|nonce|authtag|privatekey|apikey|digest|hash|key$|^key|code|^value$/i;
 
 function schemaFieldNames(): string[] {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -141,25 +173,90 @@ function schemaFieldNames(): string[] {
 
 const SENTINEL = "SENTINEL-SECRET";
 
+/** Every secret value seeded into the poison, by label, as bytes. */
+const SEEDED = new Map<string, Uint8Array>();
+
+function seedText(label: string, value: string): string {
+  SEEDED.set(label, new TextEncoder().encode(value));
+  return value;
+}
+
+function seedBytes(label: string, value: string): Uint8Array {
+  const bytes = new TextEncoder().encode(value);
+  SEEDED.set(label, bytes);
+  return bytes;
+}
+
 /** One row carrying every secret column with a distinct sentinel value. */
 function secretRow(tag: string): Record<string, unknown> {
   const row: Record<string, unknown> = { id: `${tag}-id`, label: `${tag}-label` };
   for (const column of SECRET_COLUMNS) {
-    row[column] = `${SENTINEL}-${tag}-${column}`;
+    row[column] = seedText(`${tag}.${column}`, `${SENTINEL}-${tag}-${column}`);
   }
   // Byte-typed encrypted material, as Prisma returns it.
-  row.ciphertext = new TextEncoder().encode(`${SENTINEL}-${tag}-ciphertext-bytes`);
-  row.nonce = new TextEncoder().encode(`${SENTINEL}-${tag}-nonce-bytes`);
-  row.authTag = new TextEncoder().encode(`${SENTINEL}-${tag}-authtag-bytes`);
+  row.ciphertext = seedBytes(`${tag}.ciphertext`, `${SENTINEL}-${tag}-ciphertext-bytes`);
+  row.nonce = seedBytes(`${tag}.nonce`, `${SENTINEL}-${tag}-nonce-bytes`);
+  row.authTag = seedBytes(`${tag}.authTag`, `${SENTINEL}-${tag}-authtag-bytes`);
+  // Byte secrets under INNOCUOUS keys the key redactor does not match: only
+  // the serializer's byte elision stands between these and the output.
+  row.payload = seedBytes(`${tag}.payload`, `${SENTINEL}-${tag}-payload-bytes`);
+  row.data = Buffer.from(seedBytes(`${tag}.data`, `${SENTINEL}-${tag}-buffer-bytes`));
+  const backing = new TextEncoder().encode(`xx${SENTINEL}-${tag}-view-bytesxx`);
+  row.blob = backing.subarray(2, backing.byteLength - 2);
+  SEEDED.set(`${tag}.blob`, new Uint8Array(row.blob as Uint8Array));
+  row.chunks = [seedBytes(`${tag}.chunks`, `${SENTINEL}-${tag}-chunk-bytes`)];
+  row.material = seedBytes(
+    `${tag}.material`,
+    `${PRODUCT_CREDENTIAL_PREFIXES.cliToken}${SENTINEL}-${tag}-credential-bytes`,
+  );
   // Plaintext provider API key spellings a future select might leak.
-  row.apiKey = `${SENTINEL}-${tag}-apiKey`;
-  row.api_key = `${SENTINEL}-${tag}-api_key`;
-  row.providerApiKey = `${SENTINEL}-${tag}-providerApiKey`;
-  row.tokenHash = `${SENTINEL}-${tag}-tokenHash`;
-  row.authorization = `Bearer ${SENTINEL}-${tag}-authorization`;
-  // A raw product credential under an innocuous key.
-  row.note = `${PRODUCT_CREDENTIAL_PREFIXES.modelApiToken}${SENTINEL}-${tag}-raw`;
+  row.apiKey = seedText(`${tag}.apiKey`, `${SENTINEL}-${tag}-apiKey`);
+  row.api_key = seedText(`${tag}.api_key`, `${SENTINEL}-${tag}-api_key`);
+  row.providerApiKey = seedText(`${tag}.providerApiKey`, `${SENTINEL}-${tag}-providerApiKey`);
+  row.tokenHash = seedText(`${tag}.tokenHash`, `${SENTINEL}-${tag}-tokenHash`);
+  row.authorization = seedText(`${tag}.authorization`, `Bearer ${SENTINEL}-${tag}-authorization`);
+  // Raw product credentials under innocuous keys, including nested ones.
+  row.note = seedText(
+    `${tag}.note`,
+    `${PRODUCT_CREDENTIAL_PREFIXES.modelApiToken}${SENTINEL}-${tag}-raw`,
+  );
+  row.description = seedText(
+    `${tag}.description`,
+    `${PRODUCT_CREDENTIAL_PREFIXES.mcpToken}${SENTINEL}-${tag}-description`,
+  );
+  row.labels = [
+    seedText(
+      `${tag}.labels`,
+      `${PRODUCT_CREDENTIAL_PREFIXES.deviceCredential}${SENTINEL}-${tag}-l`,
+    ),
+  ];
+  row.meta = {
+    hint: seedText(
+      `${tag}.meta.hint`,
+      `${PRODUCT_CREDENTIAL_PREFIXES.cliToken}${SENTINEL}-${tag}-h`,
+    ),
+  };
   return row;
+}
+
+/**
+ * Every representation of a seeded secret a broken layer could emit: the
+ * text itself, base64 / base64url / hex, a JSON byte list (`Buffer#toJSON`
+ * or an array copy), and the indexed object `JSON.stringify` makes of a
+ * Uint8Array that reached a generic object arm.
+ */
+function encodings(bytes: Uint8Array): string[] {
+  const buffer = Buffer.from(bytes);
+  const list = Array.from(bytes).join(",");
+  return [
+    new TextDecoder().decode(bytes),
+    buffer.toString("base64").replace(/=+$/u, ""),
+    buffer.toString("base64url"),
+    buffer.toString("hex"),
+    `[${list}]`,
+    `"data":[${list}]`,
+    Array.from(bytes, (byte, index) => `"${index}":${byte}`).join(","),
+  ];
 }
 
 /** Secret rows at the top level, nested in relations, and inside wrappers. */
@@ -232,15 +329,15 @@ function argsFor(tool: (typeof MCP_TOOL_MANIFEST)[number]): Record<string, unkno
   };
 }
 
-function containsSentinel(value: unknown): string[] {
+/** Labels of the seeded secrets present in `value` in any encoding. */
+function leakedSecrets(value: unknown): string[] {
   const text = JSON.stringify(value);
-  const found: string[] = [];
-  let index = text.indexOf(SENTINEL);
-  while (index !== -1) {
-    found.push(text.slice(Math.max(0, index - 40), index + 60));
-    index = text.indexOf(SENTINEL, index + 1);
-  }
-  return found;
+  const leaked = [...SEEDED].flatMap(([label, bytes]) =>
+    encodings(bytes).some((encoded) => text.includes(encoded)) ? [label] : [],
+  );
+  // Catch-all for a sentinel that reached the output in a form not listed.
+  if (leaked.length === 0 && text.includes(SENTINEL)) leaked.push("sentinel-text");
+  return leaked;
 }
 
 describe("MCP secret-output contract (every tool)", () => {
@@ -249,11 +346,16 @@ describe("MCP secret-output contract (every tool)", () => {
     expect(fields.length).toBeGreaterThan(50);
     const secret = new Set<string>(SECRET_COLUMNS);
     const unclassified = fields.filter(
-      (name) => SECRET_LOOKING.test(name) && !secret.has(name) && !(name in NON_SECRET_COLUMNS),
+      (name) =>
+        SECRET_LOOKING.test(name) &&
+        !secret.has(name) &&
+        !(name in NON_SECRET_COLUMNS) &&
+        !(name in GENERIC_NAME_SECRET_COLUMNS),
     );
     expect(unclassified).toEqual([]);
     // Every listed secret column still exists (a rename must update the list).
-    for (const column of SECRET_COLUMNS) expect(fields).toContain(column);
+    for (const column of [...SECRET_COLUMNS, ...Object.keys(GENERIC_NAME_SECRET_COLUMNS)])
+      expect(fields).toContain(column);
   });
 
   it("no tool result carries a secret value, whatever its procedure or core returns", async () => {
@@ -285,20 +387,37 @@ describe("MCP secret-output contract (every tool)", () => {
         });
         // The poison must have reached the output stage, or the check is vacuous.
         expect(`${tool.name}: ${result.isError === true}`).toBe(`${tool.name}: false`);
-        expect(`${tool.name}: ${containsSentinel(result).join(" | ")}`).toBe(`${tool.name}: `);
+        expect(`${tool.name}: ${leakedSecrets(result).join(" | ")}`).toBe(`${tool.name}: `);
         checked += 1;
       }
     }
     expect(checked).toBe(MCP_TOOL_MANIFEST.length * poisonShapes().length);
   });
 
-  it("the poison is detectable: an unredacted copy would contain every sentinel", () => {
-    // Guards against a vacuous pass (e.g. a sentinel spelled differently).
-    const raw = containsSentinel(poisonOutput());
-    // The byte-typed columns hold Uint8Array values (not searchable as text).
-    const byteColumns = new Set(["ciphertext", "nonce", "authTag"]);
-    for (const column of SECRET_COLUMNS.filter((name) => !byteColumns.has(name))) {
-      expect(raw.some((snippet) => snippet.includes(`-${column}`))).toBe(true);
-    }
+  it("the poison is detectable: an unredacted copy leaks every seeded secret", () => {
+    // Guards against a vacuous pass: plain JSON of the raw poison (bytes
+    // become indexed objects or Buffer byte lists) must reveal every seeded
+    // value, strings and bytes alike, through leakedSecrets().
+    SEEDED.clear();
+    const raw = poisonShapes();
+    expect(SEEDED.size).toBeGreaterThan(SECRET_COLUMNS.length * 3);
+    expect(leakedSecrets(raw).sort()).toEqual([...SEEDED.keys()].sort());
+  });
+
+  it("the byte-elision layer is pinned on its own: bytes under innocuous keys", async () => {
+    // Bytes under keys the key redactor does not match reach the serializer.
+    // If it ever decoded or enumerated them, the contract test above would
+    // report the seeded label; prove the detector sees each such encoding.
+    const bytes = seedBytes("probe.payload", `${SENTINEL}-probe-bytes`);
+    const { toJsonSafe } = await import("./serialization");
+    expect(leakedSecrets(toJsonSafe({ payload: bytes }))).toEqual([]);
+    expect(leakedSecrets({ payload: Array.from(bytes) })).toContain("probe.payload");
+    expect(leakedSecrets({ payload: Buffer.from(bytes).toString("base64") })).toContain(
+      "probe.payload",
+    );
+    expect(leakedSecrets(JSON.parse(JSON.stringify({ payload: bytes })))).toContain(
+      "probe.payload",
+    );
+    SEEDED.delete("probe.payload");
   });
 });

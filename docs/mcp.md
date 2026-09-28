@@ -204,17 +204,28 @@ dashboard (deployment switch, audited protection policy on every external
 member, wait within the local budget), and every change, from MCP or the
 dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
 (`metadata.source` is `mcp` or `dashboard`), readable with
-`provider_audit_events_list`. The general pool tools reject the two switches and
-point to this tool.
+`provider_audit_events_list` (`poolId` filters one pool's history) and shown
+as the fallback change history on the pool's Fallback tab in the dashboard.
+The tool description also lists the preconditions an agent otherwise sees only
+as "Invalid input". The general pool tools reject the two switches and point to
+this tool; they still accept `externalAfterWaitMs`, and their descriptions
+state its cost.
 
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
-own-key preferences, the pool external-equivalent picker, catalog search, and
-the OpenRouter "providers that may collect data" account setting.
+own-key preferences, the pool external-equivalent picker, catalog search,
+the OpenRouter "providers that may collect data" account setting, and moving
+an OpenRouter account to another provider type (`provider_account_update`
+refuses it, since the privacy preference is keyed on the type).
 
-No tool output can contain a secret value (provider API keys, encrypted
-credential material, token secrets or hashes). Projections pick safe fields and
-a recursive redactor removes secret-bearing keys; a test drives every tool with
-secret-laden results to pin this.
+No tool output can contain a secret value WMP holds (provider API keys,
+encrypted credential material, token secrets or hashes, device-flow and 2FA
+backup codes). Projections pick safe fields, a recursive redactor removes
+secret-bearing keys and product credentials under any key, and the serializer
+elides byte values. A test drives every tool with secret-laden results and
+searches the output for every seeded secret value in every encoding. The CLI
+command tools return what a command printed on your own CLI device (behind the
+separate `allowCliCommands` consent); WMP credentials in that text are
+scrubbed, but other device content is returned as printed.
 
 ## Tool errors
 

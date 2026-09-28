@@ -214,6 +214,7 @@ integration("own-key preference integrity and requester capacity", () => {
         endpointVersion: account.endpointVersion,
         concurrencyLimit: 1,
         providerVersion: null,
+        dataCollectionPolicy: null,
         baseUrl: account.baseUrl,
         authType: "BEARER",
         healthStatus: "HEALTHY",

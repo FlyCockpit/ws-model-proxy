@@ -11,6 +11,7 @@ import {
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
 } from "../lib/capacity-policy-safety";
+import { isMcpSession } from "../lib/mcp-session";
 import {
   openAiCompatibleCapabilitiesSchema,
   parseOpenAiCompatibleCapabilities,
@@ -38,6 +39,7 @@ import {
   providerInventorySurfacesAllowed,
   providerProtocolForType,
 } from "../lib/provider-protocol";
+import { isOpenRouterProviderType, normalizeProviderType } from "../lib/provider-type";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
@@ -350,6 +352,8 @@ function page<T extends { id: string; createdAt: Date }>(rows: T[], limit: numbe
   };
 }
 const json = z.record(z.string(), z.unknown()).nullable().optional();
+const HUMAN_ONLY_OPENROUTER_TYPE_CHANGE_MESSAGE =
+  "Changing an OpenRouter account to another provider type removes its data-collection protection and can be done only by a person in the dashboard.";
 const accountInput = z.object({
   providerType: z
     .string()
@@ -552,7 +556,18 @@ export const providerManagementRouter = {
         // type it was granted for; a type change resets it to the private
         // default so it can never carry over to a new OpenRouter account.
         const typeChanged =
-          data.providerType !== undefined && data.providerType !== current.providerType;
+          data.providerType !== undefined &&
+          data.providerType !== normalizeProviderType(current.providerType);
+        // D9 is human-only: moving an OpenRouter account to another type
+        // would drop `data_collection: "deny"` from its requests (the policy
+        // is keyed on the type), so an MCP session may not do it.
+        if (
+          typeChanged &&
+          isOpenRouterProviderType(current.providerType) &&
+          !isOpenRouterProviderType(nextProviderType) &&
+          isMcpSession(context)
+        )
+          throw new ORPCError("FORBIDDEN", { message: HUMAN_ONLY_OPENROUTER_TYPE_CHANGE_MESSAGE });
         const updated = await tx.providerAccount.updateMany({
           where: { id: accountId, userId, deletedAt: null },
           data: {
@@ -655,7 +670,7 @@ export const providerManagementRouter = {
           select: { id: true, providerType: true, allowDataCollection: true },
         });
         if (!account) throw missing();
-        if (account.providerType !== "openrouter")
+        if (!isOpenRouterProviderType(account.providerType))
           throw new ORPCError("BAD_REQUEST", {
             message: "The data-collection setting applies only to OpenRouter accounts.",
           });
@@ -1377,17 +1392,30 @@ export const providerManagementRouter = {
     .input(
       z.object({
         providerAccountId: id.optional(),
+        /**
+         * One owned pool's external-fallback history (POOL_FALLBACK_UPDATED
+         * events, subject = pool id; they carry no provider account).
+         */
+        poolId: id.optional(),
         limit: z.number().int().min(1).max(200).default(50),
       }),
     )
     .handler(async ({ input, context }) => {
       readRevokeOrDeleteAllowed();
-      if (input.providerAccountId)
-        await historicalAccountFor(context.session.user.id, input.providerAccountId);
+      const userId = context.session.user.id;
+      if (input.providerAccountId) await historicalAccountFor(userId, input.providerAccountId);
+      if (input.poolId) {
+        const pool = await prisma.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: { id: true },
+        });
+        if (!pool) throw missing();
+      }
       return prisma.providerAuditEvent.findMany({
         where: {
-          userId: context.session.user.id,
+          userId,
           ...(input.providerAccountId ? { providerAccountId: input.providerAccountId } : {}),
+          ...(input.poolId ? { action: "POOL_FALLBACK_UPDATED", subjectId: input.poolId } : {}),
         },
         select: {
           id: true,

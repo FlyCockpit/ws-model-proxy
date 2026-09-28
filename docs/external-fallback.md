@@ -213,13 +213,18 @@ are kept and `data_collection` is overwritten, so a caller cannot relax it.
 Each OpenRouter account has the setting **Allow OpenRouter providers that may
 collect data** (off by default) on the Providers page. The owner sets it for
 owner-paid accounts; grantees set it on their own accounts. It is human-only:
-MCP cannot change it, and changing an account's provider type resets it to off.
-Changes are recorded as `ACCOUNT_UPDATED` provider audit events.
+MCP cannot change it, and MCP cannot move an OpenRouter account to another
+provider type either (that would drop the preference, which is keyed on the
+type). Changing an account's provider type in the dashboard resets the setting
+to off. Turning it off takes effect for requests not yet sent: the send step
+re-reads it under the account lock. Changes are recorded as `ACCOUNT_UPDATED`
+provider audit events.
 
 With `deny` on, some models (often `:free` ones) have no eligible provider.
 OpenRouter then answers 404 ("No endpoints found matching your data policy");
 WMP returns **503** with code `provider_data_policy_unavailable` and a message
-that names the cause, instead of the bare 404. Choose another model or allow
+that names the cause, instead of the bare 404 (an OpenAI error object, or an
+Anthropic `api_error` envelope on the Messages surface). Choose another model or allow
 data collection on that account.
 
 ## Own-key routing (BYOK)

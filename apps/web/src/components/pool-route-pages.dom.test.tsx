@@ -19,10 +19,11 @@ const state = vi.hoisted(() => ({
   capacities: [] as Array<Record<string, unknown>>,
   nextReject: null as { name: string; error: unknown } | null,
   mutationCalls: [] as Array<{ name: string; variables: unknown }>,
+  fallbackAudits: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -147,6 +148,9 @@ vi.mock("@/utils/orpc", () => {
         grantPoolAccessByEmail: mutation(),
         revokePoolAccessByEmail: mutation(),
       },
+      providerManagement: {
+        listAuditEvents: query("poolFallbackAudits", () => state.fallbackAudits),
+      },
       capacityManagement: {
         key: () => ["capacityManagement"],
         list: deferredQuery("capacities", () => state.capacities),
@@ -196,6 +200,7 @@ afterEach(() => {
   state.capacities = [];
   state.nextReject = null;
   state.mutationCalls = [];
+  state.fallbackAudits = [];
   vi.mocked(toast.error).mockClear();
 });
 
@@ -345,6 +350,43 @@ describe("dedicated pool pages", () => {
         ) as HTMLInputElement
       ).value,
     ).toBe("2000");
+  });
+
+  it("shows the pool's fallback change history with its source (C1b-3)", () => {
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.fallbackAudits = [
+      {
+        id: "audit-1",
+        createdAt: new Date("2026-09-28T12:00:00Z"),
+        action: "POOL_FALLBACK_UPDATED",
+        subjectId: "pool-1",
+        providerAccountId: null,
+        metadata: {
+          source: "mcp",
+          changes: { fallbackForGrantees: { before: false, after: true } },
+        },
+      },
+    ];
+    mount(<PoolDetailPage poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.fallbackHistory.title")).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.fallbackHistory\.sourceMcp/)).toBeTruthy();
+    expect(screen.getAllByText("dashboard:pools.fallbackHistory.change")).toHaveLength(1);
   });
 
   describe("fallback settings form", () => {

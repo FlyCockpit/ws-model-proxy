@@ -6,6 +6,7 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { PROVIDER_PRIVATE_NETWORK_REJECTED } from "@ws-model-proxy/api/lib/provider-egress";
 import { PROVIDER_PRESET_BASE_URL } from "@ws-model-proxy/api/lib/provider-protocol";
+import { isOpenRouterProviderType } from "@ws-model-proxy/api/lib/provider-type";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -958,7 +959,7 @@ export function ProviderOperationsSection() {
                 </div>
               </div>
 
-              {selected.providerType === "openrouter" ? (
+              {isOpenRouterProviderType(selected.providerType) ? (
                 <div className="rounded-xl border p-4">
                   <label className="flex min-h-11 items-center gap-3 text-sm font-medium">
                     <input
@@ -1207,7 +1208,7 @@ export function ProviderOperationsSection() {
                 ) : null}
               </div>
 
-              {providerEgressEnabled && selected.providerType === "openrouter" ? (
+              {providerEgressEnabled && isOpenRouterProviderType(selected.providerType) ? (
                 <ProviderCatalogImport providerAccountId={selected.id} />
               ) : null}
 

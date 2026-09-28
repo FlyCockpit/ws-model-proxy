@@ -147,6 +147,10 @@ import {
   relayFailureMessage,
 } from "./openai-errors.js";
 import {
+  OPENROUTER_DATA_POLICY_ERROR_CODE,
+  OPENROUTER_DATA_POLICY_ERROR_MESSAGE,
+} from "./openrouter-privacy.js";
+import {
   ADAPTER_VERSION,
   AdapterError,
   adaptNonstreamResponse,
@@ -943,6 +947,17 @@ const RESPONSE_ID_CAPTURE_MAX_CHARS = 1024 * 1024;
 
 function isPoolRelayFailureClass(failure: RelayFailure): failure is RelayFailureClass {
   return poolRelayFailureClassSet.has(failure);
+}
+
+/**
+ * D9: the client-facing error for OpenRouter's data-policy refusal, in the
+ * requested surface's shape (OpenAI error object or Anthropic envelope).
+ */
+function dataPolicyRefusalResponse(family: string): Response {
+  return externalRouteErrorResponse(family, {
+    code: OPENROUTER_DATA_POLICY_ERROR_CODE,
+    message: OPENROUTER_DATA_POLICY_ERROR_MESSAGE,
+  });
 }
 
 function transformerFailureResponse(failure: RelayFailure, message: string): Response {
@@ -4312,6 +4327,13 @@ async function relayPool({
         });
     };
     try {
+      // D9: WMP's own mapped refusal (typed, in-process flag), rendered in
+      // the requested surface's error shape with the route headers. Never
+      // derived from provider bytes, which stay sanitized below.
+      if (result.dataPolicyRefusal) {
+        await result.response.body?.cancel().catch(() => undefined);
+        return await commitAwareResponse(dataPolicyRefusalResponse(operation.family));
+      }
       if (
         result.nativeSurface === requestedSurface &&
         (result.response.status < 200 || result.response.status >= 300)
@@ -7519,7 +7541,10 @@ async function relayBoundProviderResponse(input: {
     .finally(releaseCallerLease);
   try {
     let response = result.response;
-    if (response.status < 200 || response.status >= 300) {
+    if (result.dataPolicyRefusal) {
+      await response.body?.cancel().catch(() => undefined);
+      response = dataPolicyRefusalResponse("responses");
+    } else if (response.status < 200 || response.status >= 300) {
       const sanitized = await readAdaptedNonstreamBody({
         body: response.body,
         source: "openai-responses",

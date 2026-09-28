@@ -535,6 +535,13 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         externalAfterWaitMs: 500,
       });
       expect(allowed).not.toHaveProperty("issues");
+      // K1-1: the external wait they still accept carries its cost statement.
+      for (const phrase of [
+        "externalAfterWaitMs",
+        "lower values spend more",
+        "POOL_FALLBACK_UPDATED",
+      ])
+        expect(byName.get(name)!.descriptionNote).toContain(phrase);
       const { toJSONSchema } = await import("zod");
       const json: unknown = toJSONSchema(schema as unknown as Parameters<typeof toJSONSchema>[0]);
       expect(json).toMatchObject({
@@ -567,6 +574,10 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
       "externalAfterWaitMs",
       "YOU pay",
       "POOL_FALLBACK_UPDATED",
+      // C1b-6: the preconditions an agent otherwise sees only as "Invalid input".
+      "PRECONDITIONS",
+      "concurrency policy",
+      "local wait budget",
     ])
       expect(update.descriptionNote).toContain(phrase);
     for (const value of [true, false]) {
@@ -605,6 +616,10 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         await schema["~standard"].validate({ id: "account", label: "OpenRouter" }),
       ).not.toHaveProperty("issues");
     }
+    // C1b-2: the type-change refusal (enforced in the procedure) is stated.
+    expect(byName.get("provider_account_update")!.descriptionNote).toContain(
+      "only a person can do that",
+    );
   });
 
   it("tools without runtime feature gates advertise none", () => {

@@ -68,6 +68,13 @@ const context: Context = {
   } as Session,
 };
 const client = () => createRouterClient(providerManagementRouter, { context });
+/** The synthetic session MCP tool calls run with (apps/server/src/mcp/context.ts). */
+const mcpClient = () =>
+  createRouterClient(providerManagementRouter, {
+    context: {
+      session: { ...context.session!, session: { ...context.session!.session, id: "mcp:owner" } },
+    } as Context,
+  });
 
 const surface = { source: "dashboard", confidence: "exact", operations: ["create"] } as const;
 const modelInput = (surfaces: Record<string, unknown>) => ({
@@ -207,6 +214,81 @@ describe("OpenRouter data-collection setting (D9)", () => {
     };
     expect(call.data.allowDataCollection).toBe(false);
     expect(call.data.providerType).toBe("openai-compatible");
+  });
+});
+
+describe("OpenRouter account type changes and legacy spellings (D9)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+    db.providerModel.findMany.mockResolvedValue([]);
+  });
+
+  const openRouterAccount = (providerType = "openrouter") => ({
+    id: "acct",
+    providerType,
+    baseUrl: "https://openrouter.ai/api",
+    authType: "BEARER",
+    allowDataCollection: false,
+  });
+
+  it.each(["openrouter", "OpenRouter "])(
+    "MCP may not move a %j account to another type (it would drop the deny)",
+    async (current) => {
+      db.providerAccount.findFirst.mockResolvedValueOnce(openRouterAccount(current));
+      await expect(
+        mcpClient().updateAccount({ id: "acct", providerType: "openai-compatible" }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it("MCP may still edit other fields and keep the OpenRouter type", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce(openRouterAccount("OpenRouter"))
+      .mockResolvedValueOnce({ id: "acct" });
+    await mcpClient().updateAccount({ id: "acct", providerType: "openrouter", label: "Renamed" });
+    const call = db.providerAccount.updateMany.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(call.data.label).toBe("Renamed");
+    // A spelling normalization is not a type change: nothing is reset.
+    expect(call.data.allowDataCollection).toBeUndefined();
+  });
+
+  it("MCP may change the type of a non-OpenRouter account", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({ ...openRouterAccount("openai"), baseUrl: "https://api.example" })
+      .mockResolvedValueOnce({ id: "acct" });
+    await mcpClient().updateAccount({ id: "acct", providerType: "openai-compatible" });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("a person may still move an OpenRouter account to another type (the opt-out resets)", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce(openRouterAccount())
+      .mockResolvedValueOnce({ id: "acct" });
+    await client().updateAccount({ id: "acct", providerType: "openai-compatible" });
+    const call = db.providerAccount.updateMany.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(call.data.allowDataCollection).toBe(false);
+  });
+
+  it("a legacy non-normalized OpenRouter row can use the opt-out", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({ id: "acct", providerType: "OpenRouter", allowDataCollection: false })
+      .mockResolvedValueOnce({ id: "acct", allowDataCollection: true });
+    await expect(
+      client().setAllowDataCollection({ id: "acct", allowDataCollection: true }),
+    ).resolves.toMatchObject({ allowDataCollection: true });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { allowDataCollection: true } }),
+    );
   });
 });
 

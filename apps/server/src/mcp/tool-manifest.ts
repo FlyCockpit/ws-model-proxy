@@ -359,7 +359,15 @@ function poolFallbackUpdateArgs(): StandardSchemaWithJSON {
 
 /** Cost statement carried by the fallback write tool's description (issue #67). */
 export const POOL_FALLBACK_COST_NOTICE =
-  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event.";
+  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event. PRECONDITIONS (otherwise the call fails with invalid input): turning fallbackEnabled on needs provider egress enabled on this deployment and, on every external member, an active LIMITED or UNLIMITED per-attempt concurrency policy with an activation audit trail; a new externalAfterWaitMs cannot exceed the pool's local wait budget.";
+
+/**
+ * Cost statement for the general pool tools, which still accept
+ * `externalAfterWaitMs` (K1-1: the owner decision requires the cost of every
+ * writable fallback field to be stated where it can be written).
+ */
+export const POOL_EXTERNAL_WAIT_COST_NOTICE =
+  "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update. COST: externalAfterWaitMs sets how long an owner/pool:external request waits for local capacity before it is sent to a paid external provider billed to YOUR provider accounts: lower values spend more. Changes are recorded as POOL_FALLBACK_UPDATED provider audit events.";
 
 /** Loose object that additionally requires the exact confirmation literal. */
 function confirmedArgs(confirmation: Exclude<McpToolConfirmation, null>): StandardSchemaWithJSON {
@@ -792,8 +800,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
     // passes through (audited). Token external consent is never an MCP arg.
     inputSchema: poolArgsWithoutFallbackSwitches(),
-    descriptionNote:
-      "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update.",
+    descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
   },
@@ -807,8 +814,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
     // passes through (audited). Capacity policy fields are always admitted.
     inputSchema: poolArgsWithoutFallbackSwitches(),
-    descriptionNote:
-      "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update.",
+    descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updateModelPool),
   },
@@ -959,6 +965,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "pure",
     inputSchema: providerAccountArgsWithoutDataCollection(),
+    descriptionNote:
+      "Changing an OpenRouter account to another providerType is refused (it would drop the account's data_collection: deny privacy routing); only a person can do that in the dashboard.",
     invokeProcedure: procedureInvoker((client) => client.providerManagement.updateAccount),
   },
   {

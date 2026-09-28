@@ -145,7 +145,19 @@ describe("poolFallback.get", () => {
         PoolMembers: [
           {
             tier: "PUBLIC_OVERFLOW",
-            ExecutionTarget: { ProviderModel: { ProviderAccount: { providerType: "openrouter" } } },
+            // What a wider select would return: the owner's account id and
+            // label must still never reach the grantee view.
+            id: "owner-member",
+            ExecutionTarget: {
+              ProviderModel: {
+                upstreamModelId: "owner/private-model",
+                ProviderAccount: {
+                  id: "owner-account",
+                  label: "Owner OpenRouter",
+                  providerType: "openrouter",
+                },
+              },
+            },
           },
         ],
       },
@@ -161,6 +173,9 @@ describe("poolFallback.get", () => {
     });
     const text = JSON.stringify(view);
     expect(text).not.toContain("Owner OpenRouter");
+    expect(text).not.toContain("owner-account");
+    expect(text).not.toContain("owner-member");
+    expect(text).not.toContain("owner/private-model");
     expect(text).not.toContain("members");
     expect(text).not.toContain("fallbackEnabled");
     expect(db.poolGrant.findFirst).toHaveBeenCalledWith(
@@ -170,6 +185,29 @@ describe("poolFallback.get", () => {
           granteeUserId: "grantee",
           ModelPool: { userId: { not: "grantee" } },
         },
+      }),
+    );
+    // The owner's accounts are read for their provider TYPE only.
+    expect(db.poolGrant.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({
+          ModelPool: {
+            select: expect.objectContaining({
+              PoolMembers: expect.objectContaining({
+                select: {
+                  tier: true,
+                  ExecutionTarget: {
+                    select: {
+                      ProviderModel: {
+                        select: { ProviderAccount: { select: { providerType: true } } },
+                      },
+                    },
+                  },
+                },
+              }),
+            }),
+          },
+        }),
       }),
     );
   });
