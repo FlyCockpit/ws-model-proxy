@@ -517,6 +517,8 @@ export type ParentDeletionDrainOptions = {
   batch?: number;
   maxRowsPerRun?: number;
   maxLoopIterations?: number;
+  /** Defaults to {@link PARENT_DELETION_MAX_PASSED_ADMISSIONS}. */
+  maxPassedAdmissions?: number;
   /** Required when the drained parents include a user row. */
   owner?: UserDeletionOwner;
 };
@@ -535,6 +537,7 @@ export async function drainParentDeletionHistory(
     batch = PARENT_DELETION_DRAIN_BATCH,
     maxRowsPerRun = PARENT_DELETION_MAX_DRAIN_ROWS_PER_RUN,
     maxLoopIterations = PARENT_DELETION_MAX_DRAIN_LOOP_ITERATIONS,
+    maxPassedAdmissions = PARENT_DELETION_MAX_PASSED_ADMISSIONS,
     owner,
   }: ParentDeletionDrainOptions = {},
 ): Promise<ParentDeletionDrainReport> {
@@ -658,7 +661,7 @@ export async function drainParentDeletionHistory(
         );
         passed.push(...busy);
         report["admission_request.passed"] = (report["admission_request.passed"] ?? 0) + busy.size;
-        if (passed.length > PARENT_DELETION_MAX_PASSED_ADMISSIONS) {
+        if (passed.length > maxPassedAdmissions) {
           throw new ParentDeletionDrainPendingError(
             "Parent deletion history drain passed too many busy admission requests; retry later.",
           );

@@ -885,7 +885,12 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   it("the drain reports pending once it has passed more busy admissions than its bound (g1-M1)", async () => {
     const { prisma, deletion } = required();
     const g = await graph("many-held-waiters");
-    const over = deletion.PARENT_DELETION_MAX_PASSED_ADMISSIONS + 1;
+    // A small bound keeps the exclusion-list scan cheap: at the default
+    // 10 000 its filter cost could outlast the statement bound on a loaded
+    // host and report the timeout instead of the cap (the same pending
+    // outcome, but not this test's discriminator).
+    const cap = 100;
+    const over = cap + 1;
     await terminalAdmissions(g, over);
     // Every waiter held by one other transaction: each request is passed.
     const held = await holdRowLock(
@@ -899,11 +904,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         userId: g.user.id,
         poolIds: [g.pool.id],
       });
-      const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
+      const outcome = await settle(
+        deletion.drainParentDeletionHistory(prisma, parents, { maxPassedAdmissions: cap }),
+      );
       expect(outcome.ok).toBe(false);
       if (outcome.ok) throw new Error("the drain carried an unbounded passed list");
       expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
       expect((outcome.error as Error).message).toContain("passed too many busy admission");
+      expect(outcome.error).toMatchObject({ timeout: undefined });
       // Nothing busy was deleted.
       expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(over);
     } finally {
@@ -4027,10 +4035,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         if (slowAbove >= deletion.PARENT_DELETION_DRAIN_MIN_BATCH) {
           expect(outcome.ok).toBe(true);
           if (!outcome.ok) throw outcome.error;
+          // 3 000 (all waiters), 2 500 and 1 250 were cancelled. (Slow-trigger
+          // observations are only reported: a loaded host can cancel a DELETE
+          // before its AFTER trigger runs.)
           expect(outcome.value["batch.halved"]).toBe(3);
-          // 3 000 (all waiters), 2 500 and 1 250 were cancelled.
-          expect(Number(slow?.attempts)).toBe(3);
-          expect(Number(slow?.lastSize)).toBe(1_250);
           expect(outcome.value["capacity_waiter.delete"]).toBe(waiters);
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
         } else {
