@@ -129,11 +129,11 @@ export function PoolFallbackBadge({
       {/* Focus stays on the badge when the hint opens on focus, so screen
           readers get the hint as the badge's description. */}
       <span id={descriptionId} hidden>
-        {[
-          t("dashboard:pools.fallbackBadge.intro"),
-          ...routeLines,
-          t("dashboard:pools.fallbackBadge.consent"),
-        ].join(" ")}
+        {t("dashboard:pools.fallbackBadge.description", {
+          intro: t("dashboard:pools.fallbackBadge.intro"),
+          routes: routeLines.join(t("dashboard:pools.fallbackBadge.routeSeparator")),
+          consent: t("dashboard:pools.fallbackBadge.consent"),
+        })}
       </span>
       <PopoverContent
         ref={popupRef}

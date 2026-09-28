@@ -394,7 +394,9 @@
       "routePoolFallback": "Los proveedores de respaldo del pool: {{providers}}",
       "routePoolFallbackUnnamed": "Los proveedores de respaldo del pool",
       "routeOwnKey": "Tu propia clave de proveedor, con cargo a tu cuenta",
-      "consent": "El token de API también debe permitir proveedores externos."
+      "consent": "El token de API también debe permitir proveedores externos.",
+      "description": "{{intro}} {{routes}}. {{consent}}",
+      "routeSeparator": "; "
     },
     "affinity": {
       "title": "Enrutamiento según caché",

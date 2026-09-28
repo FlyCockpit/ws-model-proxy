@@ -6,8 +6,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
-    t: (key: string, options?: { providers?: string }) =>
-      options?.providers ? `${key}: ${options.providers}` : key,
+    t: (
+      key: string,
+      options?: { providers?: string; intro?: string; routes?: string; consent?: string },
+    ) => {
+      if (options?.routes !== undefined)
+        return `${key}(${options.intro} | ${options.routes} | ${options.consent})`;
+      return options?.providers ? `${key}: ${options.providers}` : key;
+    },
   }),
 }));
 
@@ -110,12 +116,13 @@ describe("PoolFallbackBadge", () => {
     render(<PoolFallbackBadge routes={["pool-fallback", "own-key"]} providers={["openrouter"]} />);
     const badge = screen.getByRole("button", { name: LABEL });
     const description = document.getElementById(badge.getAttribute("aria-describedby") ?? "");
-    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.intro");
-    expect(description?.textContent).toContain(
-      "dashboard:pools.fallbackBadge.routePoolFallback: openrouter",
+    // One locale-owned sentence, route lines joined by the locale's separator.
+    expect(description?.textContent).toBe(
+      "dashboard:pools.fallbackBadge.description(dashboard:pools.fallbackBadge.intro | " +
+        "dashboard:pools.fallbackBadge.routePoolFallback: openrouter" +
+        "dashboard:pools.fallbackBadge.routeSeparator" +
+        "dashboard:pools.fallbackBadge.routeOwnKey | dashboard:pools.fallbackBadge.consent)",
     );
-    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.routeOwnKey");
-    expect(description?.textContent).toContain("dashboard:pools.fallbackBadge.consent");
   });
 
   it("reopens on focus after tabbing away and back", async () => {

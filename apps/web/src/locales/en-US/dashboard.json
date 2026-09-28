@@ -394,7 +394,9 @@
       "routePoolFallback": "The pool's fallback providers: {{providers}}",
       "routePoolFallbackUnnamed": "The pool's fallback providers",
       "routeOwnKey": "Your own provider key, billed to your account",
-      "consent": "The API token must also allow external providers."
+      "consent": "The API token must also allow external providers.",
+      "description": "{{intro}} {{routes}}. {{consent}}",
+      "routeSeparator": "; "
     },
     "affinity": {
       "title": "Cache-aware routing",
