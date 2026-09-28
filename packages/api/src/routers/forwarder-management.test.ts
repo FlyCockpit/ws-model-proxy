@@ -233,6 +233,10 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     transformerVideo: false,
     transformerCacheMode: "OFF",
     TransformerDiscoveredModel: null,
+    // Schema defaults of the fallback columns (forwarder.prisma).
+    fallbackEnabled: false,
+    fallbackForGrantees: false,
+    externalAfterWaitMs: 2000,
     User: { slug: "owner" },
     PoolMembers: [],
     PoolGrants: [],
@@ -525,6 +529,13 @@ describe("forwarderManagementRouter", () => {
 
     // `advanced` omitted entirely: affinity defaults ON with standard fallbacks.
     await client().createGuardedModelPool(base);
+    // No external members: fallback stays at its schema default, which is not
+    // a fallback change, so no POOL_FALLBACK_UPDATED event (G1-2).
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: "POOL_FALLBACK_UPDATED" }),
+      }),
+    );
     expect(db.modelPool.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -2140,7 +2151,7 @@ describe("forwarderManagementRouter", () => {
     );
 
     await expect(
-      client().updateModelPool({ id: "pool-id", externalAfterWaitMs: 2_000 }),
+      client().updateModelPool({ id: "pool-id", externalAfterWaitMs: 3_000 }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
   });

@@ -871,6 +871,10 @@ function PoolFallbackSettings({
     ...orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        // The save wrote a POOL_FALLBACK_UPDATED event: refresh the history.
+        void queryClient.invalidateQueries({
+          queryKey: orpc.providerManagement.listAuditEvents.key(),
+        });
         toast.success(t("dashboard:pools.fallbackSettings.saved"));
       },
       onError: (error) => {

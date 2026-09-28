@@ -173,17 +173,38 @@ function schemaFieldNames(): string[] {
 
 const SENTINEL = "SENTINEL-SECRET";
 
-/** Every secret value seeded into the poison, by label, as bytes. */
-const SEEDED = new Map<string, Uint8Array>();
+/**
+ * Every secret value seeded into the poison, by label: its bytes and, computed
+ * once at seeding, every encoding {@link leakedSecrets} searches for.
+ */
+const SEEDED = new Map<string, { bytes: Uint8Array; encoded: string[] }>();
+
+/**
+ * Encodings of the first {@link PREFIX_BYTES} bytes of every seeded value.
+ * Each full encoding starts with the matching prefix encoding (12 bytes is a
+ * whole number of base64 groups), so a text with none of these cannot hold
+ * any full encoding: a sound one-pass pre-filter before the per-label scan.
+ */
+const PREFIX_BYTES = 12;
+const SEEDED_PREFIXES = new Set<string>();
+
+function seed(label: string, bytes: Uint8Array): void {
+  const existing = SEEDED.get(label);
+  // Rows are rebuilt per tool with identical values: encode each value once.
+  if (existing && Buffer.compare(existing.bytes, bytes) === 0) return;
+  SEEDED.set(label, { bytes, encoded: encodings(bytes) });
+  for (const encoded of encodings(bytes.subarray(0, PREFIX_BYTES), { prefix: true }))
+    SEEDED_PREFIXES.add(encoded);
+}
 
 function seedText(label: string, value: string): string {
-  SEEDED.set(label, new TextEncoder().encode(value));
+  seed(label, new TextEncoder().encode(value));
   return value;
 }
 
 function seedBytes(label: string, value: string): Uint8Array {
   const bytes = new TextEncoder().encode(value);
-  SEEDED.set(label, bytes);
+  seed(label, bytes);
   return bytes;
 }
 
@@ -203,7 +224,7 @@ function secretRow(tag: string): Record<string, unknown> {
   row.data = Buffer.from(seedBytes(`${tag}.data`, `${SENTINEL}-${tag}-buffer-bytes`));
   const backing = new TextEncoder().encode(`xx${SENTINEL}-${tag}-view-bytesxx`);
   row.blob = backing.subarray(2, backing.byteLength - 2);
-  SEEDED.set(`${tag}.blob`, new Uint8Array(row.blob as Uint8Array));
+  seed(`${tag}.blob`, new Uint8Array(row.blob as Uint8Array));
   row.chunks = [seedBytes(`${tag}.chunks`, `${SENTINEL}-${tag}-chunk-bytes`)];
   row.material = seedBytes(
     `${tag}.material`,
@@ -245,7 +266,7 @@ function secretRow(tag: string): Record<string, unknown> {
  * or an array copy), and the indexed object `JSON.stringify` makes of a
  * Uint8Array that reached a generic object arm.
  */
-function encodings(bytes: Uint8Array): string[] {
+function encodings(bytes: Uint8Array, { prefix = false } = {}): string[] {
   const buffer = Buffer.from(bytes);
   const list = Array.from(bytes).join(",");
   return [
@@ -253,8 +274,8 @@ function encodings(bytes: Uint8Array): string[] {
     buffer.toString("base64").replace(/=+$/u, ""),
     buffer.toString("base64url"),
     buffer.toString("hex"),
-    `[${list}]`,
-    `"data":[${list}]`,
+    // A prefix of a byte list has no closing bracket.
+    prefix ? `[${list}` : `[${list}]`,
     Array.from(bytes, (byte, index) => `"${index}":${byte}`).join(","),
   ];
 }
@@ -331,12 +352,15 @@ function argsFor(tool: (typeof MCP_TOOL_MANIFEST)[number]): Record<string, unkno
 
 /** Labels of the seeded secrets present in `value` in any encoding. */
 function leakedSecrets(value: unknown): string[] {
-  const text = JSON.stringify(value);
-  const leaked = [...SEEDED].flatMap(([label, bytes]) =>
-    encodings(bytes).some((encoded) => text.includes(encoded)) ? [label] : [],
+  const text = JSON.stringify(value) ?? "";
+  const suspicious =
+    text.includes(SENTINEL) || [...SEEDED_PREFIXES].some((encoded) => text.includes(encoded));
+  if (!suspicious) return [];
+  const leaked = [...SEEDED].flatMap(([label, { encoded }]) =>
+    encoded.some((form) => text.includes(form)) ? [label] : [],
   );
   // Catch-all for a sentinel that reached the output in a form not listed.
-  if (leaked.length === 0 && text.includes(SENTINEL)) leaked.push("sentinel-text");
+  if (leaked.length === 0) leaked.push("sentinel-or-prefix");
   return leaked;
 }
 
@@ -392,7 +416,8 @@ describe("MCP secret-output contract (every tool)", () => {
       }
     }
     expect(checked).toBe(MCP_TOOL_MANIFEST.length * poisonShapes().length);
-  });
+    // Every tool x shape runs the real wrapper chain; allow for a loaded CI runner.
+  }, 60_000);
 
   it("the poison is detectable: an unredacted copy leaks every seeded secret", () => {
     // Guards against a vacuous pass: plain JSON of the raw poison (bytes

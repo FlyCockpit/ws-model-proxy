@@ -20,6 +20,7 @@ const state = vi.hoisted(() => ({
   nextReject: null as { name: string; error: unknown } | null,
   mutationCalls: [] as Array<{ name: string; variables: unknown }>,
   fallbackAudits: [] as Array<Record<string, unknown>>,
+  auditQueryInputs: [] as unknown[],
 }));
 
 vi.mock("react-i18next", () => ({
@@ -149,7 +150,13 @@ vi.mock("@/utils/orpc", () => {
         revokePoolAccessByEmail: mutation(),
       },
       providerManagement: {
-        listAuditEvents: query("poolFallbackAudits", () => state.fallbackAudits),
+        listAuditEvents: {
+          key: () => ["providerManagement", "listAuditEvents"],
+          queryOptions: (options?: { input?: unknown }) => {
+            state.auditQueryInputs.push(options?.input);
+            return query("poolFallbackAudits", () => state.fallbackAudits).queryOptions();
+          },
+        },
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
@@ -201,6 +208,7 @@ afterEach(() => {
   state.nextReject = null;
   state.mutationCalls = [];
   state.fallbackAudits = [];
+  state.auditQueryInputs = [];
   vi.mocked(toast.error).mockClear();
 });
 
@@ -387,6 +395,11 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackHistory.title")).toBeTruthy();
     expect(screen.getByText(/dashboard:pools\.fallbackHistory\.sourceMcp/)).toBeTruthy();
     expect(screen.getAllByText("dashboard:pools.fallbackHistory.change")).toHaveLength(1);
+    // Scoped to this pool: never the owner's whole audit trail.
+    expect(state.auditQueryInputs).toContainEqual({ poolId: "pool-1", limit: 20 });
+    expect(
+      state.auditQueryInputs.every((input) => (input as { poolId?: string }).poolId === "pool-1"),
+    ).toBe(true);
   });
 
   describe("fallback settings form", () => {
