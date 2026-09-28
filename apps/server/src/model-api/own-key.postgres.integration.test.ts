@@ -602,15 +602,24 @@ integration("own-key preference integrity and requester capacity", () => {
           .get(failedAttemptId)!
           .onError({ type: "relay.error", requestId: failedAttemptId, failure: "transport" });
         const restoredResponse = await restoreResponsePromise;
-        expect(restoredResponse.status).toBe(503);
-        await restoredResponse.text();
+        // Local members fix this request's failure contract: an uncommitted
+        // own-key 503 cannot replace the local transport error (502).
+        expect(restoredResponse.status).toBe(502);
+        await expect(restoredResponse.json()).resolves.toMatchObject({
+          error: { code: "transport" },
+        });
+        const intentIndex = updateSpy.mock.calls.findIndex(
+          ([args]) => args.data.fallbackRoute === "own-key",
+        );
+        expect(intentIndex).toBeGreaterThanOrEqual(0);
         const restoreIndex = updateSpy.mock.calls.findIndex(
-          ([args]) =>
+          ([args], index) =>
+            index > intentIndex &&
             args.data.fallbackRoute === "local" &&
             args.data.selectedDiscoveredModelId === localModel.id &&
             !args.data.status,
         );
-        expect(restoreIndex).toBeGreaterThanOrEqual(0);
+        expect(restoreIndex).toBeGreaterThan(intentIndex);
         expect(await updateSpy.mock.results[restoreIndex]!.value).toMatchObject({
           ...localTuple,
           userId: requester.id,
@@ -619,9 +628,16 @@ integration("own-key preference integrity and requester capacity", () => {
         const failedAttempt = await db.relayExecutionAttempt.findUniqueOrThrow({
           where: { attemptId: failedAttemptId },
         });
+        expect(failedAttempt).toMatchObject({ state: "FAILED", terminalState: "FAILED" });
         expect(
           await db.relayRequest.findUniqueOrThrow({ where: { id: failedAttempt.relayRequestId } }),
-        ).toMatchObject({ ...localTuple, status: "FAILED" });
+        ).toMatchObject({
+          ...localTuple,
+          status: "FAILED",
+          httpStatusCode: 502,
+          upstreamStatusCode: null,
+          errorClass: "transport",
+        });
         updateSpy.mockRestore();
 
         // Ownership enforcement still rejects foreign direct targets, wrong

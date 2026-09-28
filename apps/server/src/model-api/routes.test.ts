@@ -6049,6 +6049,99 @@ describe("model API routes", () => {
       },
     );
 
+    it.each(["disabled", "empty"] as const)(
+      "keeps the local transport failure after own-key precommit 503 with %s owner-paid fallback",
+      async (ownerPaid) => {
+        const { own } = ownKeyRouteFixture();
+        const member = localMember();
+        member.DiscoveredModel.userId = "pool-owner-id";
+        db.poolMember.findMany.mockResolvedValue([member]);
+        publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+          listedExternalTargets(ownKey ? [own] : [], {
+            enabled: Boolean(ownKey) || ownerPaid === "empty",
+            fallbackForGrantees: true,
+          }),
+        );
+        publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+          expect(request).toMatchObject({
+            userId: "user-id",
+            ownKeyProviderModelId: own.providerModelId,
+            reason: "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE",
+          });
+          await request.beforeProviderSend?.(own);
+          return {
+            dispatched: false,
+            reason: "PROVIDER_UNAVAILABLE",
+            providerIoStarted: true,
+            providerFailure: { target: own, status: 503 },
+          };
+        });
+        const { acquire, runtime } = scriptedRuntime({
+          local: ["ADMITTED"],
+          provider: "ADMITTED",
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        const attemptId = requireSent(manager).requestId;
+        manager.error(attemptId, "transport");
+
+        const response = await responsePromise;
+        expect(response.status).toBe(502);
+        expect(response.headers.get("x-wsmp-route")).toBe("local");
+        expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+        expect(response.headers.get("x-wsmp-served-model")).toBeNull();
+        await expect(response.json()).resolves.toMatchObject({ error: { code: "transport" } });
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+        expect(
+          acquire.mock.calls.map(([attempt]) => [attempt.ownerId, attempt.sourceKind]),
+        ).toEqual([
+          ["pool-owner-id", "POOL"],
+          ["user-id", "DIRECT"],
+        ]);
+        expect(runtime.release).toHaveBeenCalledTimes(2);
+        const localTuple = {
+          fallbackRoute: "local",
+          selectedExecutionTargetId: member.ExecutionTarget.id,
+          selectedDiscoveredModelId: member.discoveredModelId,
+          selectedPoolMemberId: member.id,
+        };
+        const updates = db.relayRequest.update.mock.calls.map(([arg]) => arg);
+        const intentIndex = updates.findIndex((arg) => arg.data.fallbackRoute === "own-key");
+        expect(intentIndex).toBeGreaterThanOrEqual(0);
+        const restoreIndex = updates.findIndex(
+          (arg, index) =>
+            index > intentIndex && arg.data.fallbackRoute === "local" && !arg.data.status,
+        );
+        expect(restoreIndex).toBeGreaterThan(intentIndex);
+        expect(updates[restoreIndex]).toMatchObject({ data: localTuple });
+        const terminalIndex = updates.findIndex((arg) => arg.data.status === "FAILED");
+        expect(terminalIndex).toBeGreaterThan(restoreIndex);
+        expect(updates[terminalIndex]).toMatchObject({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: {
+            ...localTuple,
+            status: "FAILED",
+            httpStatusCode: 502,
+            upstreamStatusCode: null,
+            errorClass: "transport",
+          },
+        });
+        expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ attemptId, state: "ACTIVE" }),
+            data: expect.objectContaining({ state: "FAILED", terminalState: "FAILED" }),
+          }),
+        );
+      },
+    );
+
     it("resumes the local wait for B - min(B, E) when the provider is saturated and serves locally", async () => {
       db.poolMember.findMany.mockResolvedValue([localMember()]);
       publicOverflow.list.mockResolvedValue(
