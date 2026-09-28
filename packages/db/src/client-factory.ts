@@ -22,9 +22,49 @@ import {
   withDbShutdownFence,
 } from "./shutdown-fence";
 
-export function createPrismaClient(connectionString: string) {
+export type SharedClientOptions = {
+  /**
+   * Test seam only (default false): keep a client-side read timeout
+   * (`query_timeout`) that the connection string sets, instead of switching
+   * it off. Lets a test show that the release guard alone keeps a connection
+   * with an open transaction out of the pool. Production callers never set it.
+   */
+  keepClientReadTimeoutForTest?: boolean;
+};
+
+/**
+ * The request-path Prisma client (the package's shared singleton, ./index.ts,
+ * and a few independent clients built the same way). Every connection is a
+ * {@link ReleaseGuardedClient}: pg's client-side read timeout
+ * (`query_timeout`, settable from `DATABASE_URL`) is switched off (logged
+ * once per pool), and a connection goes back to the pool only when idle, so
+ * a transaction whose `COMMIT` or `ROLLBACK` did not run never serves a later
+ * request. Statement bounds on this client are server-side: a deployment
+ * sets `statement_timeout` through the connection string's `options`, and
+ * the deletion and drain transactions set their own transaction-local bounds.
+ */
+export function createPrismaClient(
+  connectionString: string,
+  { keepClientReadTimeoutForTest = false }: SharedClientOptions = {},
+) {
+  const pool = new ReleaseGuardedPoolState({
+    normalizeReadTimeout: !keepClientReadTimeoutForTest,
+    readTimeoutNotice:
+      "[db] query_timeout from the connection string is ignored on the request client: a client-side read timeout leaves the statement running and could return a connection with an open transaction to the pool. Bound statements server-side instead (options=-c statement_timeout=...).",
+  });
+  // pg-pool builds every connection with `new Client(options)`: this class
+  // binds each connection to this pool's state.
+  class PoolConnection extends ReleaseGuardedClient {
+    constructor(config?: ClientConfig) {
+      super(config, pool);
+    }
+  }
   return new PrismaClient({
-    adapter: new PrismaPg({ connectionString, onConnect: enforceSessionSettings }),
+    adapter: new PrismaPg({
+      connectionString,
+      onConnect: enforceSessionSettings,
+      Client: PoolConnection,
+    }),
   });
 }
 
@@ -132,7 +172,7 @@ export type StatementBoundedPrismaClient = {
  * every new connection sets both at session level before the pool hands it
  * out ({@link enforceSessionSettings}); a session `SET` takes precedence over
  * every startup source. A `query_timeout` in the connection string is
- * switched off (logged once). The shared request client is not affected.
+ * switched off (logged once), as on the shared request client.
  *
  * The startup parameter and the session setting need a direct PostgreSQL
  * connection (the supported topology): PgBouncer in transaction mode rejects
@@ -196,18 +236,48 @@ export function createStatementBoundedPrismaClient(
 }
 
 /**
- * State shared by the connections of one statement-bounded pool: the live
- * connections (for {@link StatementBoundedPrismaClient.quarantine}), the
- * quarantine latch, and the read-timeout normalization.
+ * State shared by the connections of one release-guarded pool: whether the
+ * client-side read timeout is switched off, and its once-per-pool notice.
  */
-class BoundedPoolState {
+class ReleaseGuardedPoolState {
   readonly normalizeReadTimeout: boolean;
-  #connections = new Set<DispatchFencedClient>();
-  #quarantined = false;
+  readonly #readTimeoutNotice: string;
   #readTimeoutLogged = false;
 
-  constructor({ normalizeReadTimeout }: { normalizeReadTimeout: boolean }) {
+  constructor({
+    normalizeReadTimeout,
+    readTimeoutNotice,
+  }: {
+    normalizeReadTimeout: boolean;
+    readTimeoutNotice: string;
+  }) {
     this.normalizeReadTimeout = normalizeReadTimeout;
+    this.#readTimeoutNotice = readTimeoutNotice;
+  }
+
+  /** Logged once per pool: the deployment's setting is overridden, not dropped silently. */
+  readTimeoutDisabled(): void {
+    if (this.#readTimeoutLogged) return;
+    this.#readTimeoutLogged = true;
+    console.warn(this.#readTimeoutNotice);
+  }
+}
+
+/**
+ * State shared by the connections of one statement-bounded pool: besides the
+ * read-timeout normalization, the live connections (for
+ * {@link StatementBoundedPrismaClient.quarantine}) and the quarantine latch.
+ */
+class BoundedPoolState extends ReleaseGuardedPoolState {
+  #connections = new Set<DispatchFencedClient>();
+  #quarantined = false;
+
+  constructor({ normalizeReadTimeout }: { normalizeReadTimeout: boolean }) {
+    super({
+      normalizeReadTimeout,
+      readTimeoutNotice:
+        "[db] query_timeout from the connection string is ignored on a statement-bounded client; its server-side statement_timeout bounds statements instead.",
+    });
   }
 
   get quarantined(): boolean {
@@ -231,15 +301,6 @@ class BoundedPoolState {
     }
     this.#connections.clear();
     return destroyed;
-  }
-
-  /** Logged once per pool: the deployment's setting is overridden, not dropped silently. */
-  readTimeoutDisabled(): void {
-    if (this.#readTimeoutLogged) return;
-    this.#readTimeoutLogged = true;
-    console.warn(
-      "[db] query_timeout from the connection string is ignored on a statement-bounded client; its server-side statement_timeout bounds statements instead.",
-    );
   }
 }
 
@@ -282,26 +343,16 @@ function isSubmittable(config: string | QueryConfig | PgSubmittable): config is 
 }
 
 /**
- * A node-postgres client that dispatches no SQL and opens no connection once
- * the DB shutdown fence is armed, except the `COMMIT` / `ROLLBACK` that end a
- * transaction ({@link TRANSACTION_END_TEXTS}). Refusals fail with
- * {@link DbDispatchFenceError}. A statement already written to the wire and
- * a connect already started are not interrupted; the connection's
- * `statement_timeout` and the pool's connect timeout bound them.
- *
- * `query` builds pg's own `Query` ({@link PgInternalQuery}) for text and
- * config calls (as `Client#query` does) and gates its `submit`; submittables
- * passed in are gated the same way. The one difference from pg: a per-query
- * `query_timeout` in a config object is not read (pg reads it off the object
- * it is given); nothing here sets one.
- *
- * Two more rules keep a connection with unfinished work out of the pool:
+ * A node-postgres client that never returns a connection with unfinished
+ * work to its pool. Every Prisma pool of this package uses it (the shared
+ * request client through {@link createPrismaClient}, the statement-bounded
+ * clients through {@link DispatchFencedClient}). Two rules:
  *
  * - No client-side read timeout. pg's `query_timeout` (settable from the
  *   connection string) fails a query's callback without stopping it: the
  *   statement keeps running on the server, and a `ROLLBACK` queued behind it
  *   is dropped from the queue. The constructor switches it off (and the pool
- *   logs that once); the server-side `statement_timeout` is the bound.
+ *   logs that once); server-side timeouts are the bound.
  * - Release guard. The Prisma adapter releases a transaction's connection
  *   after `COMMIT` or `ROLLBACK` without checking that it ran (@prisma/
  *   adapter-pg `PgTransaction.commit` / `rollback`), and pg-pool returns a
@@ -311,19 +362,15 @@ function isSubmittable(config: string | QueryConfig | PgSubmittable): config is 
  *   open or failed) or a query is still on the wire. pg-pool then closes it,
  *   and PostgreSQL rolls back whatever it left open.
  */
-class DispatchFencedClient extends Client {
-  readonly #pool: BoundedPoolState;
+class ReleaseGuardedClient extends Client {
   #poolRelease: PgPoolRelease | undefined;
 
-  constructor(config: ClientConfig | undefined, pool: BoundedPoolState) {
+  constructor(config: ClientConfig | undefined, pool: ReleaseGuardedPoolState) {
     super(config);
-    this.#pool = pool;
     if (pool.normalizeReadTimeout && this.connectionParameters.query_timeout) {
       this.connectionParameters.query_timeout = false;
       pool.readTimeoutDisabled();
     }
-    pool.track(this);
-    this.once("end", () => pool.untrack(this));
   }
 
   /**
@@ -337,11 +384,11 @@ class DispatchFencedClient extends Client {
   get release(): PgPoolRelease {
     return (error?: Error | boolean) => {
       if (this.#poolRelease === undefined) {
-        throw new Error("A statement-bounded connection was released outside its pool.");
+        throw new Error("A pooled database connection was released outside its pool.");
       }
       if (!error && !this.#isIdle()) {
         console.warn(
-          "[db] a statement-bounded connection was released with an open transaction or a query in flight; closing it.",
+          "[db] a database connection was released with an open transaction or a query in flight; closing it.",
         );
         this.#poolRelease(new ConnectionNotIdleError());
         return;
@@ -350,9 +397,48 @@ class DispatchFencedClient extends Client {
     };
   }
 
-  /** Idle: the last ReadyForQuery said `I` and nothing is on the wire since. */
+  /**
+   * Idle: the last ReadyForQuery said `I` and nothing is on the wire since.
+   *
+   * Reads pg internals (`readyForQuery`, `getTransactionStatus()`; see
+   * ./pg-internals.ts; pg is pinned exactly in the pnpm catalog). If a pg
+   * upgrade changes them, the PostgreSQL tests in
+   * packages/api/src/lib/parent-deletion.postgres.integration.test.ts fail in
+   * either direction: a guard that sees a stranded transaction as idle fails
+   * "a DATABASE_URL query_timeout cannot strand a request transaction in the
+   * shared client's pool: the release guard alone" (the abandoned write is
+   * committed by a later transaction) and its sweep-client sibling (R1-19-1);
+   * a guard that never sees idle fails the same test's pool-reuse check (three
+   * ordinary transactions on one backend) and the sweep client's warm
+   * connection tests (F2-07d).
+   */
   #isIdle(): boolean {
     return this.readyForQuery === true && this.getTransactionStatus() === "I";
+  }
+}
+
+/**
+ * A {@link ReleaseGuardedClient} that dispatches no SQL and opens no
+ * connection once the DB shutdown fence is armed, except the `COMMIT` /
+ * `ROLLBACK` that end a transaction ({@link TRANSACTION_END_TEXTS}). Refusals
+ * fail with {@link DbDispatchFenceError}. A statement already written to the
+ * wire and a connect already started are not interrupted; the connection's
+ * `statement_timeout` and the pool's connect timeout bound them.
+ *
+ * `query` builds pg's own `Query` ({@link PgInternalQuery}) for text and
+ * config calls (as `Client#query` does) and gates its `submit`; submittables
+ * passed in are gated the same way. The one difference from pg: a per-query
+ * `query_timeout` in a config object is not read (pg reads it off the object
+ * it is given); nothing here sets one.
+ */
+class DispatchFencedClient extends ReleaseGuardedClient {
+  readonly #pool: BoundedPoolState;
+
+  constructor(config: ClientConfig | undefined, pool: BoundedPoolState) {
+    super(config, pool);
+    this.#pool = pool;
+    pool.track(this);
+    this.once("end", () => pool.untrack(this));
   }
 
   override connect(): Promise<Client>;

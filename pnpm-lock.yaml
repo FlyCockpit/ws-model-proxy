@@ -135,6 +135,9 @@ catalogs:
     openai:
       specifier: ^7.15.0
       version: 7.15.0
+    pg:
+      specifier: 8.23.0
+      version: 8.23.0
     postcss:
       specifier: ^8.5.28
       version: 8.5.28
@@ -637,7 +640,7 @@ importers:
         specifier: workspace:*
         version: link:../env
       pg:
-        specifier: ^8.23.0
+        specifier: 'catalog:'
         version: 8.23.0
       zod:
         specifier: 'catalog:'

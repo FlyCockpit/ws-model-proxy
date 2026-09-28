@@ -2612,6 +2612,39 @@ DROP TRIGGER IF EXISTS session_refuse_deleting_user ON session;
 CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session
 FOR EACH ROW EXECUTE FUNCTION refuse_session_for_deleting_user();
 
+-- DEL-STATE single writer of the deletion marker: only the user-deletion
+-- subsystem (packages/db/src/parent-deletion.ts abandonUserDeletion) clears
+-- "deletionRequestedAt" or rewrites the generation of a pending deletion.
+-- It does so inside a transaction that first sets the transaction-local
+-- setting wsmp.user_deletion_writer = 'on'; any other writer (a Better Auth
+-- admin route writing arbitrary user fields, a future dashboard write, an
+-- ad-hoc UPDATE) is refused with SQLSTATE WMPD2, so a pending deletion can
+-- never be silently withdrawn while its worker still runs. Setting the
+-- marker (requestUserDeletion, which also gives a marker left without a
+-- generation its first one) and moving its timestamp are not guarded: they
+-- never withdraw a deletion. A row DELETE is not an UPDATE.
+-- The check reads only NEW/OLD of the row being updated: no lock, so it adds
+-- nothing to any lock order.
+CREATE OR REPLACE FUNCTION refuse_user_deletion_marker_clear()
+RETURNS trigger LANGUAGE plpgsql AS $user_deletion_marker_guard$
+BEGIN
+  IF OLD."deletionRequestedAt" IS NOT NULL
+     AND (NEW."deletionRequestedAt" IS NULL
+          OR (OLD."deletionGeneration" IS NOT NULL
+              AND NEW."deletionGeneration" IS DISTINCT FROM OLD."deletionGeneration"))
+     AND current_setting('wsmp.user_deletion_writer', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'only the user deletion subsystem clears a pending deletion'
+      USING ERRCODE = 'WMPD2';
+  END IF;
+  RETURN NEW;
+END;
+$user_deletion_marker_guard$;
+
+DROP TRIGGER IF EXISTS user_deletion_marker_guard ON "user";
+CREATE TRIGGER user_deletion_marker_guard
+BEFORE UPDATE OF "deletionRequestedAt", "deletionGeneration" ON "user"
+FOR EACH ROW EXECUTE FUNCTION refuse_user_deletion_marker_clear();
+
 -- PR3: preferences are grantee-only configuration. The composite FKs bind
 -- the exact grant and requester-owned model; no nullable composite SET NULL.
 CREATE OR REPLACE FUNCTION enforce_pool_fallback_preference_grantee() RETURNS trigger AS $$

@@ -10,6 +10,7 @@ import {
   USER_DELETION_SWEEP_JOIN_TIMEOUT_MS,
 } from "./shutdown-timeouts.js";
 import {
+  getUserDeletionSweepHealth,
   shutDownUserDeletionSweep,
   startUserDeletionSweep,
   sweepPendingUserDeletions,
@@ -32,6 +33,7 @@ const prisma: SweepClient = client;
 const db = client as unknown as {
   user: { findMany: MockInstance };
   $executeRaw: MockInstance;
+  $transaction: MockInstance;
 };
 const NOW = new Date("2026-09-25T12:00:00.000Z");
 
@@ -71,6 +73,11 @@ describe("sweepPendingUserDeletions", () => {
     vi.clearAllMocks();
     disarmDbShutdownFence();
     db.$executeRaw.mockResolvedValue(1);
+    // abandonUserDeletion's batch: the marker guard's writer setting, then
+    // the UPDATE (packages/db/src/parent-deletion.ts).
+    db.$transaction.mockImplementation(async (operations: unknown) =>
+      Promise.all(operations as Promise<unknown>[]),
+    );
   });
   afterEach(() => disarmDbShutdownFence());
 
@@ -149,11 +156,25 @@ describe("sweepPendingUserDeletions", () => {
 
   it("a failed queue read keeps the loop's position", async () => {
     const queue = { after: { requestedAt: REQUESTED, userId: "b" } };
+    const complete = vi.fn(async () => false);
     db.user.findMany.mockRejectedValueOnce(new Error("connect timeout"));
-    await expect(sweepPendingUserDeletions({ prisma, now: NOW, queue })).rejects.toThrow(
+    await expect(sweepPendingUserDeletions({ prisma, now: NOW, queue, complete })).rejects.toThrow(
       "connect timeout",
     );
     expect(queue.after).toEqual({ requestedAt: REQUESTED, userId: "b" });
+    // The wrap read after a short first page fails too: the page already read
+    // is not half-applied (no user completed, position unchanged).
+    const later = new Date(REQUESTED.getTime() + 1_000);
+    db.user.findMany
+      .mockResolvedValueOnce([row("c", 0, later)])
+      .mockRejectedValueOnce(new Error("connection reset"));
+    await expect(sweepPendingUserDeletions({ prisma, now: NOW, queue, complete })).rejects.toThrow(
+      "connection reset",
+    );
+    expect(db.user.findMany).toHaveBeenCalledTimes(3);
+    expect(db.user.findMany.mock.calls[2]).toEqual([{ ...QUEUE_READ, where: ELIGIBLE }]);
+    expect(queue.after).toEqual({ requestedAt: REQUESTED, userId: "b" });
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it("completes each marked user, notifies deleted ones, and keeps transient failures", async () => {
@@ -209,8 +230,12 @@ describe("sweepPendingUserDeletions", () => {
       abandoned: 1,
       failed: 0,
     });
-    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
-    const [sql, ...values] = db.$executeRaw.mock.calls[0] ?? [];
+    // The writer setting the marker guard requires, then the abandon itself.
+    expect(db.$executeRaw).toHaveBeenCalledTimes(2);
+    const [settingSql, ...settingValues] = db.$executeRaw.mock.calls[0] ?? [];
+    expect((settingSql as string[]).join("?")).toContain("set_config(?");
+    expect(settingValues).toContain("wsmp.user_deletion_writer");
+    const [sql, ...values] = db.$executeRaw.mock.calls[1] ?? [];
     expect((sql as string[]).join("?")).toContain('"deletionGeneration" = ?');
     expect(values).toContain("generation-retained");
     expect(notify).not.toHaveBeenCalled();
@@ -503,29 +528,38 @@ describe("startUserDeletionSweep stop (SWEEPER-STOP)", () => {
     });
     const alerts = () =>
       errors.mock.calls.filter((call) => String(call[0]).includes("ALERT")).length;
+    expect(getUserDeletionSweepHealth()).toBe("not_running");
     const stop = startUserDeletionSweep({ prisma, intervalMs: 1_000, sweep });
     try {
       await vi.advanceTimersByTimeAsync(0);
       for (let tick = 1; tick < USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION; tick += 1) {
-        // Failures below the threshold log the plain line.
+        // Failures below the threshold log the plain line and keep the
+        // readiness health "ok".
         expect(alerts()).toBe(0);
+        expect(getUserDeletionSweepHealth()).toBe("ok");
         await vi.advanceTimersByTimeAsync(1_000);
       }
       expect(sweep).toHaveBeenCalledTimes(USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION);
-      // The escalation-th consecutive failure is the first alert.
+      // The escalation-th consecutive failure is the first alert, and the
+      // health signal turns "failing" at the same point.
       expect(alerts()).toBe(1);
+      expect(getUserDeletionSweepHealth()).toBe("failing");
       expect(errors.mock.calls.at(-1)?.[0]).toContain(
         `failed ${USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION} consecutive ticks`,
       );
       await vi.advanceTimersByTimeAsync(1_000); // ok: resets
+      expect(getUserDeletionSweepHealth()).toBe("ok");
       await vi.advanceTimersByTimeAsync(1_000); // one failure again: no alert
       expect(sweep).toHaveBeenCalledTimes(USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION + 2);
       expect(alerts()).toBe(1);
+      expect(getUserDeletionSweepHealth()).toBe("ok");
       expect(errors.mock.calls.at(-1)?.[0]).toBe("[auth] user deletion sweep failed:");
     } finally {
       await stop();
       errors.mockRestore();
     }
+    // A stopped loop reports no health of its own.
+    expect(getUserDeletionSweepHealth()).toBe("not_running");
   });
 
   // F2-07: a tick the shutdown fence stopped (its queue read refused) is not
@@ -545,6 +579,7 @@ describe("startUserDeletionSweep stop (SWEEPER-STOP)", () => {
       expect(sweep).toHaveBeenCalledTimes(USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION + 1);
       expect(errors).not.toHaveBeenCalled();
       expect(logs).toHaveBeenCalledWith(expect.stringContaining("stopped by shutdown"));
+      expect(getUserDeletionSweepHealth()).toBe("ok");
       // The count did not advance: once the fence is gone, a single failure
       // logs the plain line, not the alert.
       disarmDbShutdownFence();
@@ -585,9 +620,15 @@ describe("shutDownUserDeletionSweep", () => {
   type Handle = Parameters<typeof shutDownUserDeletionSweep>[0]["client"];
   function handle(disconnect: () => Promise<void>) {
     const events: string[] = [];
+    // Like the real pool (client-factory BoundedPoolState.quarantine): the
+    // first quarantine destroys the one live connection and latches; a later
+    // one finds none left (reconnects are refused) and destroys nothing.
+    let live = 1;
     const quarantine = vi.fn(() => {
       events.push("quarantine");
-      return 1;
+      const destroyed = live;
+      live = 0;
+      return destroyed;
     });
     const $disconnect = vi.fn(async () => {
       events.push("disconnect");
@@ -653,7 +694,8 @@ describe("shutDownUserDeletionSweep", () => {
     );
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    await expect(done).resolves.toEqual({ joined: false, quarantined: 2, disconnected: false });
+    // Two quarantine calls, one socket: the second finds the pool empty.
+    await expect(done).resolves.toEqual({ joined: false, quarantined: 1, disconnected: false });
     expect(h.events).toEqual(["quarantine", "disconnect", "quarantine"]);
   });
 

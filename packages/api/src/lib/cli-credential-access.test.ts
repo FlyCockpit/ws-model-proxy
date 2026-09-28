@@ -127,6 +127,40 @@ describe("cliCredentialAccess", () => {
     });
   });
 
+  // F-2: the owner's ban is judged at the caller's `now`, the same instant as
+  // the token expiry check, not at the wall clock. `now` is 2026-01-01; a ban
+  // that expires in 2026-06 still refuses at `now`, though the wall clock (a
+  // later date) is past it.
+  it("judges the owner's ban at the caller's now, not the wall clock (F-2)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2027-01-01T00:00:00.000Z"));
+    try {
+      const rawSecret = `${PRODUCT_CREDENTIAL_PREFIXES.cliToken}${"b".repeat(43)}`;
+      db.cliToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        cliDeviceId: "cli-device-id",
+        lookupPrefix: credentialLookupPrefix(rawSecret),
+        secretDigest: digestCliTokenSecret(rawSecret),
+        revokedAt: null,
+        expiresAt: null,
+      });
+      db.cliToken.updateMany.mockResolvedValue({ count: 1 });
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: new Date("2026-06-01T00:00:00.000Z"),
+        deletionRequestedAt: null,
+      });
+      await expect(authenticateCliWebsocketSecret(rawSecret, now)).resolves.toBeNull();
+      // Inverse: at a `now` past the expiry the same owner is admitted.
+      await expect(
+        authenticateCliWebsocketSecret(rawSecret, new Date("2026-07-01T00:00:00.000Z")),
+      ).resolves.toMatchObject({ kind: "cliToken", id: "token-id" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("verifies active wsmp_device_ credentials with the device HMAC context", async () => {
     const rawSecret = `${PRODUCT_CREDENTIAL_PREFIXES.deviceCredential}${"b".repeat(43)}`;
     const lookupPrefix = credentialLookupPrefix(rawSecret);
