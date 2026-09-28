@@ -27,6 +27,17 @@ and absence of state committed by failed attempts.
 - Time passing is not a release event and sends no notification: the runtime re-polls every
   100 ms and each poll re-runs admission, so a deferred waiter becomes grantable on the first
   poll at or after its `notBefore`.
+- A deferred waiter always gets one admission check after it becomes eligible. Each poll stamps
+  `AdmissionRequest.heartbeatAt`; when a poll is delayed past a deferred waiter's deadline (for
+  example by contended capacity locks) and the previous poll ran before its `notBefore`, that poll
+  runs admission for it once ("last chance") and expires it only afterwards. Other admitters'
+  deadline sweeps skip deferred waiters and leave them to their owner's poll; the request's
+  absolute deadline still applies.
+- A retry round (a new attempt after a pre-commit failure) may pass
+  `schedule: { anchorAttemptId, spillDelayMs }`: its `notBefore`, spill instant and budgets are
+  then computed from the first attempt's database-clock enqueue instant
+  (`AdmissionRequest.enqueuedAt`), not restarted, so lock waits before the retry's transaction
+  never extend the original external deadline. Instants already in the past are clamped to now.
 - At each admission pass (even while the capacity is full), waiters whose member is no longer
   routable (`routingStatus` not ACTIVE; for PRIMARY members also `weight <= 0` or UNHEALTHY with a future
   `nextRetryAt`; external members use provider health at dispatch)

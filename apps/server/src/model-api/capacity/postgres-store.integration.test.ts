@@ -2582,6 +2582,162 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
     }
   });
 
+  it("checks a deferred waiter once even when its owner's poll is delayed past its deadline", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-last-chance-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blocker = await store.acquire(fixture.attempt("blocker", [{ member: 0 }]));
+      if (blocker.state !== "ADMITTED") throw new Error("Expected blocker admission.");
+      // externalAfterWaitMs = 0: "go external unless a local member is free
+      // at the spill instant". The cold member stays free throughout.
+      const request = fixture.attempt("external", [
+        { member: 0, waitBudgetMs: 0 },
+        { member: 1, waitBudgetMs: 0, notBeforeMs: 300 },
+      ]);
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      const cold = await db.capacityWaiter.findFirstOrThrow({
+        where: { attemptId: request.attemptId, candidateOrder: 1 },
+      });
+      // The owner's next poll is delayed past the cold waiter's deadline (as
+      // by a contended capacity lock), while ANOTHER admitter's pass runs on
+      // the cold capacity after that deadline: neither may expire the waiter
+      // before it had one admission check.
+      await sleep(Math.max(0, cold.deadlineAt!.getTime() - (await dbNow(db)).getTime()) + 100);
+      await expect(
+        store.acquire(fixture.attempt("other", [{ member: 1, notBeforeMs: 20_000 }])),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      await expect(
+        db.capacityWaiter.findUniqueOrThrow({ where: { id: cold.id } }),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      const admitted = await poll(store, request);
+      expect(admitted.state).toBe("ADMITTED");
+      if (admitted.state !== "ADMITTED") throw new Error("Expected last-chance admission.");
+      expect(admitted.lease.poolMemberId).toBe(fixture.members[1]!.poolMemberId);
+      await store.release(admitted.lease);
+      await store.release(blocker.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("expires a deferred waiter after its last-chance check when nothing is free", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-last-chance-expiry-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blockers = [
+        await store.acquire(fixture.attempt("blocker-0", [{ member: 0 }])),
+        await store.acquire(fixture.attempt("blocker-1", [{ member: 1 }])),
+      ];
+      const request = fixture.attempt("external", [
+        { member: 0, waitBudgetMs: 0 },
+        { member: 1, waitBudgetMs: 0, notBeforeMs: 300 },
+      ]);
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      const cold = await db.capacityWaiter.findFirstOrThrow({
+        where: { attemptId: request.attemptId, candidateOrder: 1 },
+      });
+      await sleep(Math.max(0, cold.deadlineAt!.getTime() - (await dbNow(db)).getTime()) + 100);
+      // One check, nothing free: the request expires on this same poll.
+      await expect(poll(store, request)).resolves.toEqual({ state: "EXPIRED" });
+      await expect(
+        db.capacityWaiter.findUniqueOrThrow({ where: { id: cold.id } }),
+      ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "candidate_deadline" });
+      for (const blocker of blockers)
+        if (blocker.state === "ADMITTED") await store.release(blocker.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("re-anchors a retry round to the first attempt's database-clock schedule", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-anchor-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blockers = [
+        await store.acquire(fixture.attempt("blocker-0", [{ member: 0 }])),
+        await store.acquire(fixture.attempt("blocker-1", [{ member: 1 }])),
+      ];
+      const first = fixture.attempt("first", [
+        { member: 0, waitBudgetMs: 2_000 },
+        { member: 1, waitBudgetMs: 2_000, notBeforeMs: 1_000 },
+      ]);
+      await expect(store.acquire(first)).resolves.toMatchObject({ state: "WAITING" });
+      await store.terminalizeAttempt(first.attemptId, "CANCELLED");
+      const original = await db.capacityWaiter.findMany({
+        where: { attemptId: first.attemptId },
+        orderBy: { candidateOrder: "asc" },
+      });
+      // Time passes (a failed first dispatch, lock waits) before the retry.
+      await sleep(400);
+      const retry = {
+        ...fixture.attempt("retry", [
+          { member: 0, waitBudgetMs: 2_000 },
+          { member: 1, waitBudgetMs: 2_000, notBeforeMs: 1_000 },
+        ]),
+        schedule: { anchorAttemptId: first.attemptId, spillDelayMs: 1_000 },
+      };
+      await expect(store.acquire(retry)).resolves.toMatchObject({ state: "WAITING" });
+      const retried = await db.capacityWaiter.findMany({
+        where: { attemptId: retry.attemptId },
+        orderBy: { candidateOrder: "asc" },
+      });
+      // Same DB-clock instants as the first round, not restarted.
+      expect(retried.map(({ deadlineAt }) => deadlineAt)).toEqual(
+        original.map(({ deadlineAt }) => deadlineAt),
+      );
+      expect(retried[1]!.notBefore).toEqual(original[1]!.notBefore);
+      await store.terminalizeAttempt(retry.attemptId, "CANCELLED");
+
+      // Past the original external deadline, a retry only checks "free now".
+      await sleep(
+        Math.max(0, original[0]!.deadlineAt!.getTime() - (await dbNow(db)).getTime()) + 50,
+      );
+      const late = {
+        ...fixture.attempt("late", [
+          { member: 0, waitBudgetMs: 2_000 },
+          { member: 1, waitBudgetMs: 2_000, notBeforeMs: 1_000 },
+        ]),
+        schedule: { anchorAttemptId: first.attemptId, spillDelayMs: 1_000 },
+      };
+      await expect(store.acquire(late)).resolves.toEqual({ state: "EXPIRED" });
+
+      // An anchor of another owner is ignored: the schedule starts now.
+      const foreign = await spillFixture(db, 1);
+      try {
+        const unrelated = {
+          ...fixture.attempt("unrelated", [{ member: 0, waitBudgetMs: 2_000 }]),
+          schedule: { anchorAttemptId: `blocker-0-${foreign.suffix}`, spillDelayMs: 0 },
+        };
+        await store.acquire(foreign.attempt("blocker-0", [{ member: 0 }]));
+        const before = await dbNow(db);
+        await expect(store.acquire(unrelated)).resolves.toMatchObject({ state: "WAITING" });
+        const waiter = await db.capacityWaiter.findFirstOrThrow({
+          where: { attemptId: unrelated.attemptId },
+        });
+        expect(waiter.deadlineAt!.getTime()).toBeGreaterThanOrEqual(before.getTime() + 2_000);
+        await store.terminalizeAttempt(unrelated.attemptId, "CANCELLED");
+      } finally {
+        await cleanupCapacityFixture(db, foreign.user.id);
+      }
+      for (const blocker of blockers)
+        if (blocker.state === "ADMITTED") await store.release(blocker.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
   it("ignores a deferred higher-priority reservation owner when arbitrating borrowing", async () => {
     if (!databaseUrl) return;
     const db = createPrismaClient(databaseUrl);

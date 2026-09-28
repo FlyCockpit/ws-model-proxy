@@ -83,6 +83,9 @@ export async function planCacheHolderWait({
  * `elapsedMs` after the request's first local admission. Holders, rounds
  * without a holder among their candidates, and elapsed windows are not
  * deferred. Retry rounds therefore reuse the original window, never restart it.
+ * An `:external` caller's shortened retry round passes `elapsedMs = 0` and
+ * re-anchors to the first attempt's database-clock schedule instead
+ * (AdmissionAttempt.schedule), so the store subtracts the elapsed time exactly.
  */
 export function spillDelayMs(
   plan: CacheHolderPlan | null,
@@ -93,20 +96,6 @@ export function spillDelayMs(
   if (!plan || !holderInRound || plan.holderMemberIds.has(poolMemberId)) return undefined;
   const remaining = Math.ceil(plan.windowMs - Math.max(0, elapsedMs));
   return remaining > 0 ? remaining : undefined;
-}
-
-/**
- * Shortened (`:external`) local wait for a round started `elapsedMs` after the
- * first local admission: the ORIGINAL external deadline, first-spill-instant +
- * min(B, E), minus the time already spent past it. A retry round therefore
- * never waits another full E (no N x E total).
- */
-export function remainingShortenedWaitBudget(
-  shortenedBudgetMs: number,
-  spillWindowMs: number,
-  elapsedMs: number,
-): number {
-  return Math.max(0, Math.floor(shortenedBudgetMs - Math.max(0, elapsedMs - spillWindowMs)));
 }
 
 /** Telemetry outcome of the served member (extends PREDICTED_MATCH / NO_MATCH / DISABLED). */

@@ -718,7 +718,13 @@ describe("S-A provider-capacity wait cap", () => {
     expect(providerCapacityWaitBudget(null, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
     expect(providerCapacityWaitBudget(60_000, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
     expect(providerCapacityWaitBudget(3_000, true)).toBe(3_000);
+    // One cap per external phase: later provider rounds get what is left.
+    expect(providerCapacityWaitBudget(null, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(3_000, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(500, true, 9_000)).toBe(500);
+    expect(providerCapacityWaitBudget(null, true, 12_000)).toBe(0);
     // Provider-only pools keep the member budget (no local queue to return to).
+    expect(providerCapacityWaitBudget(60_000, false, 12_000)).toBe(60_000);
     expect(providerCapacityWaitBudget(null, false)).toBeNull();
     expect(providerCapacityWaitBudget(60_000, false)).toBe(60_000);
   });
@@ -1094,6 +1100,52 @@ describe("model API routes", () => {
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
     });
 
+    it("keeps the ordinary affinity outcome when a member serves after a pre-commit failover", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      const runtime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      // The holder is admitted at once, then fails before commit; member B
+      // serves the retry. No spill-over happened: not HOLDER_SPILLED.
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2), { timeout: 5_000 });
+      expect(requireSent(manager, 1).endpointSlug).toBe("member-b-endpoint");
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityOutcome: "NO_MATCH" }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+      expect(db.relayRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ affinityOutcome: "HOLDER_SPILLED" }),
+        }),
+      );
+    });
+
     it(":external retry rounds reuse the original external deadline", async () => {
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
         directModels: [],
@@ -1131,11 +1183,17 @@ describe("model API routes", () => {
       const response = await responsePromise;
 
       expect(response.status).toBe(200);
-      expect(acquire.mock.calls[0]?.[0].candidates[0]?.waitBudgetMs).toBe(2_000);
-      const retryBudget = acquire.mock.calls[1]?.[0].candidates[0]?.waitBudgetMs;
-      // Not a fresh 2 s: the 300 ms already spent count against the same deadline.
-      expect(retryBudget).toBeGreaterThanOrEqual(0);
-      expect(retryBudget).toBeLessThanOrEqual(1_700);
+      const first = acquire.mock.calls[0]?.[0];
+      const retry = acquire.mock.calls[1]?.[0];
+      expect(first?.candidates[0]?.waitBudgetMs).toBe(2_000);
+      expect(first?.schedule).toBeUndefined();
+      // Not a fresh 2 s: the retry re-anchors to the FIRST attempt's
+      // database-clock schedule, so the store counts the same 2 s from the
+      // original spill instant (the 300 ms already spent, plus any lock wait
+      // before the retry's transaction, count against the same deadline).
+      expect(retry?.attemptId).not.toBe(first?.attemptId);
+      expect(retry?.schedule).toEqual({ anchorAttemptId: first?.attemptId, spillDelayMs: 0 });
+      expect(retry?.candidates[0]?.waitBudgetMs).toBe(2_000);
     });
   });
 
@@ -7539,6 +7597,69 @@ describe("model API routes", () => {
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ fallbackRoute: "local" }) }),
       );
+    });
+
+    it("charges provider pre-commit retries against one external-phase capacity-wait cap", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          { ...externalProviderTarget("overflow-a"), capacityWaitBudgetMs: null },
+          { ...externalProviderTarget("overflow-b"), capacityWaitBudgetMs: null },
+        ]),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
+      });
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const scripted = acquire.getMockImplementation()!;
+      // The first provider slot arrives after 9 s (simulated monotonic time),
+      // then its dispatch fails before commit and the next member is tried.
+      let simulatedElapsedMs = 0;
+      const monotonic = performance.now.bind(performance);
+      const clock = vi
+        .spyOn(performance, "now")
+        .mockImplementation(() => monotonic() + simulatedElapsedMs);
+      acquire.mockImplementation(async (attempt) => {
+        if (attempt.candidates[0]?.poolMemberId?.startsWith("overflow-")) {
+          const first = !acquire.mock.calls
+            .slice(0, -1)
+            .some(([earlier]) => earlier.candidates[0]?.poolMemberId?.startsWith("overflow-"));
+          simulatedElapsedMs += first ? 9_000 : 1_000;
+          return first ? scripted(attempt) : { state: "EXPIRED" as const };
+        }
+        return scripted(attempt);
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      try {
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        const response = await responsePromise;
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-wsmp-route")).toBe("local");
+        const providerBudgets = acquire.mock.calls
+          .map(([attempt]) => attempt.candidates[0])
+          .filter((candidate) => candidate?.poolMemberId?.startsWith("overflow-"))
+          .map((candidate) => candidate?.waitBudgetMs);
+        // Not a fresh 10 s for the second member: 9 s of the cap are spent.
+        expect(providerBudgets).toHaveLength(2);
+        expect(providerBudgets[0]).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+        expect(providerBudgets[1]).toBeGreaterThanOrEqual(900);
+        expect(providerBudgets[1]).toBeLessThanOrEqual(1_000);
+      } finally {
+        clock.mockRestore();
+      }
     });
 
     it("bounds the owner-paid provider-capacity wait on a mixed pool and returns to the local queue", async () => {

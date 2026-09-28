@@ -84,6 +84,49 @@ describe("spill-over candidate schedules on the database clock", () => {
     ]);
   });
 
+  it("re-anchors a retry round to the original schedule instead of restarting it", () => {
+    // The first attempt was enqueued 1.2 s ago (anchor); the retry's own
+    // transaction runs now (after any lock wait). Its spill instant and
+    // budgets stay those of the original schedule.
+    const anchor = { at: at(-1_200), spillDelayMs: 1_500 };
+    const [holder, cold] = candidateSchedules(
+      [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }],
+      upper,
+      now,
+      anchor,
+    );
+    expect(cold).toEqual({ notBefore: at(300), deadlineAt: at(2_300) });
+    expect(holder).toEqual({ notBefore: null, deadlineAt: at(2_300) });
+    // A round without the holder defers nobody but keeps the original spill
+    // instant (anchor + spillDelayMs) for its budgets.
+    expect(candidateSchedules([{ waitBudgetMs: 2_000 }], upper, now, anchor)).toEqual([
+      { notBefore: null, deadlineAt: at(2_300) },
+    ]);
+  });
+
+  it("clamps an anchored schedule already in the past to 'admit only if free now'", () => {
+    const anchor = { at: at(-5_000), spillDelayMs: 1_500 };
+    expect(
+      candidateSchedules(
+        [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }, {}],
+        upper,
+        now,
+        anchor,
+      ),
+    ).toEqual([
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: upper },
+    ]);
+    // An anchor in the future (clock skew between clients) is treated as now.
+    expect(
+      candidateSchedules([{ waitBudgetMs: 2_000 }], upper, now, {
+        at: at(60_000),
+        spillDelayMs: 0,
+      }),
+    ).toEqual([{ notBefore: null, deadlineAt: at(2_000) }]);
+  });
+
   it("caps notBefore at 30 s and at the candidate's absolute bound", () => {
     expect(candidateSchedules([{ notBeforeMs: 90_000 }], upper, now)[0]?.notBefore).toEqual(
       at(30_000),

@@ -436,7 +436,7 @@
         "auto": "Automático (tiempo de reprocesamiento ahorrado, hasta 30 s)",
         "fixed": "Fijo (milisegundos; 0 lo desactiva)",
         "valueLabel": "Espera por el miembro con la caché en milisegundos",
-        "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms."
+        "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
     },
     "capacity": {
@@ -568,7 +568,7 @@
       "enabled": "Permitir respaldo externo",
       "forGrantees": "También para usuarios con acceso compartido",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
-      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre (después de cualquier espera por el miembro con la caché). Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",

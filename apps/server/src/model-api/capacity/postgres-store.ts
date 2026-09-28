@@ -287,12 +287,33 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         return { result: { state: "EXPIRED" } as const, notify: [] };
       }
 
+      // Saturation S-A: a deferred waiter (notBefore set) must get at least one
+      // admission check after it becomes eligible, even when this poll was
+      // delayed past its deadline (e.g. by contended capacity locks). Every
+      // poll and the creating pass run admission and stamp heartbeatAt on the
+      // request, so a deferred waiter whose notBefore is later than the
+      // previous poll has never been checked by its owner: it takes part in
+      // this poll's admission pass once ("last chance") and expires after it
+      // if not granted. The request's absolute deadline still applies above.
+      const previousPollAt = existing?.heartbeatAt;
+      const lastChanceWaiterIds = existing
+        ? existing.Waiters.filter(
+            (waiter) =>
+              waiter.state === "WAITING" &&
+              waiter.notBefore !== null &&
+              previousPollAt !== undefined &&
+              waiter.notBefore > previousPollAt &&
+              waiter.deadlineAt !== null &&
+              waiter.deadlineAt <= observedAt,
+          ).map((waiter) => waiter.id)
+        : [];
       if (existing) {
         await tx.capacityWaiter.updateMany({
           where: {
             admissionRequestId: existing.id,
             state: "WAITING",
             deadlineAt: { lte: observedAt },
+            ...(lastChanceWaiterIds.length ? { id: { notIn: lastChanceWaiterIds } } : {}),
           },
           data: {
             state: "EXPIRED",
@@ -304,7 +325,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: {
             admissionRequestId: existing.id,
             state: "WAITING",
-            OR: [{ deadlineAt: null }, { deadlineAt: { gt: observedAt } }],
+            OR: [
+              { deadlineAt: null },
+              { deadlineAt: { gt: observedAt } },
+              ...(lastChanceWaiterIds.length ? [{ id: { in: lastChanceWaiterIds } }] : []),
+            ],
           },
         });
         if (liveWaiters === 0) {
@@ -338,9 +363,25 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           >`SELECT nextval('admission_enqueue_sequence') AS value`;
       const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
       if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
+      // A retry round may re-anchor to an earlier attempt of the same relay
+      // request (plain read; the anchor row is never locked or written).
+      const anchorRow =
+        !existing && attempt.schedule
+          ? await tx.admissionRequest.findUnique({
+              where: { attemptId: attempt.schedule.anchorAttemptId },
+              select: { enqueuedAt: true, userId: true, relayRequestId: true },
+            })
+          : null;
+      const scheduleAnchor =
+        anchorRow &&
+        attempt.schedule &&
+        anchorRow.userId === attempt.ownerId &&
+        anchorRow.relayRequestId === (attempt.relayRequestId ?? null)
+          ? { at: anchorRow.enqueuedAt, spillDelayMs: attempt.schedule.spillDelayMs }
+          : undefined;
       const schedules = existing
         ? []
-        : candidateSchedules(resolvedCandidates, attempt.deadlineAt, now);
+        : candidateSchedules(resolvedCandidates, attempt.deadlineAt, now, scheduleAnchor);
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -357,6 +398,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 : undefined,
             basePriority: attempt.basePriority,
             enqueueSequence,
+            // The database-clock schedule anchor of this attempt (see
+            // AdmissionAttempt.schedule); never a process clock. The hardening
+            // check keeps deadlineAt >= enqueuedAt: an attempt already past
+            // its deadline expires at once, so its anchor is never used.
+            enqueuedAt: attempt.deadlineAt < now ? attempt.deadlineAt : now,
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
@@ -389,7 +435,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       // ("admit only if free now"), so the creating pass admits them before
       // the deadline sweep; afterwards they expire below.
       for (const capacityId of orderedCapacityIds)
-        await this.#admitOne(tx, capacityId, now, existing ? undefined : request.id);
+        await this.#admitOne(
+          tx,
+          capacityId,
+          now,
+          existing ? undefined : request.id,
+          lastChanceWaiterIds,
+        );
       const refreshed = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
         include: { Lease: true },
@@ -399,11 +451,12 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           result: { state: "ADMITTED", lease: leaseHandle(refreshed.Lease) } as const,
           notify: capacityIds,
         };
-      if (!existing)
-        await tx.capacityWaiter.updateMany({
-          where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
-          data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
-        });
+      // Zero budgets of a new attempt, and last-chance deferred waiters of a
+      // poll, had their one admission check in this pass: expire them now.
+      await tx.capacityWaiter.updateMany({
+        where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
+        data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
+      });
       // Every candidate of this request may have been terminalized in this
       // pass: zero budgets of a new attempt, or members that became
       // unroutable (grant-time re-check). Then the request moves on now
@@ -525,12 +578,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     now: Date,
     /** The attempt created in this transaction: its zero-budget waiters are still eligible. */
     creatingRequestId?: string,
+    /** The polling request's deferred waiters owed one check past their deadline. */
+    lastChanceWaiterIds: readonly string[] = [],
   ): Promise<boolean> {
     await tx.capacityWaiter.updateMany({
       where: {
         capacityId,
         state: "WAITING",
         deadlineAt: { lte: now },
+        // Deferred waiters are expired by their owner's poll, after the
+        // last-chance check it owes them (see acquire), never by another
+        // admitter's pass that may run before that check.
+        notBefore: null,
         ...(creatingRequestId ? { NOT: { admissionRequestId: creatingRequestId } } : {}),
       },
       data: {
@@ -591,6 +650,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           ...(creatingRequestId
             ? [{ admissionRequestId: creatingRequestId, deadlineAt: { gte: now } }]
             : []),
+          ...(lastChanceWaiterIds.length ? [{ id: { in: [...lastChanceWaiterIds] } }] : []),
         ],
         AdmissionRequest: {
           state: "WAITING",
@@ -1176,6 +1236,11 @@ function boundedNotBeforeMs(candidate: { notBeforeMs?: number }): number {
  * - The spill instant is the latest notBefore of the attempt. Every wait
  *   budget counts from it, so an `:external` caller's shortened budget E ends
  *   at max(notBefore) + E and a deadline never precedes its notBefore.
+ * - With an `anchor` (a retry round, see AdmissionAttempt.schedule) the same
+ *   schedule is computed from the anchor attempt's enqueue instant, the spill
+ *   instant is at least anchor + spillDelayMs, and instants already in the
+ *   past are clamped to `now` (no deferral; deadline now = "admit only if
+ *   free now"), so a retry never restarts or extends the original schedule.
  */
 export function candidateSchedules<
   C extends { deadlineAt?: Date; waitBudgetMs?: number | null; notBeforeMs?: number },
@@ -1183,20 +1248,30 @@ export function candidateSchedules<
   candidates: readonly C[],
   attemptDeadlineAt: Date,
   now: Date,
+  anchor?: { at: Date; spillDelayMs: number },
 ): Array<{ notBefore: Date | null; deadlineAt: Date }> {
-  const notBefores = candidates.map((candidate) => {
+  const base = anchor && anchor.at < now ? anchor.at : now;
+  const scheduledNotBefores = candidates.map((candidate) => {
     const delayMs = boundedNotBeforeMs(candidate);
     if (delayMs === 0) return null;
     const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
-    const notBefore = new Date(now.getTime() + delayMs);
+    const notBefore = new Date(base.getTime() + delayMs);
     return notBefore < upperBound ? notBefore : upperBound;
   });
+  const anchoredSpillMs = anchor
+    ? base.getTime() + boundedNotBeforeMs({ notBeforeMs: anchor.spillDelayMs })
+    : base.getTime();
   const spillAt = new Date(
-    Math.max(now.getTime(), ...notBefores.map((notBefore) => notBefore?.getTime() ?? 0)),
+    Math.max(anchoredSpillMs, ...scheduledNotBefores.map((notBefore) => notBefore?.getTime() ?? 0)),
   );
   return candidates.map((candidate, index) => {
-    const notBefore = notBefores[index] ?? null;
-    const deadlineAt = candidateDeadlineAt(candidate, attemptDeadlineAt, now, spillAt);
+    const scheduled = scheduledNotBefores[index] ?? null;
+    const notBefore = scheduled && scheduled > now ? scheduled : null;
+    let deadlineAt = candidateDeadlineAt(candidate, attemptDeadlineAt, base, spillAt);
+    if (deadlineAt < now) {
+      const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
+      deadlineAt = upperBound < now ? upperBound : now;
+    }
     return {
       notBefore,
       deadlineAt: notBefore && deadlineAt < notBefore ? notBefore : deadlineAt,

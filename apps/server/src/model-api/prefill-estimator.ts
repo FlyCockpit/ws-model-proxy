@@ -145,6 +145,9 @@ export class RelayHistoryPrefillEstimator implements PrefillSpeedSource {
         selectedExecutionTargetId: executionTargetId,
         status: "SUCCEEDED",
         publicEgress: false,
+        // One upstream attempt: a failed pre-commit attempt's time would
+        // otherwise count as prefill and understate the speed.
+        attemptCount: 1,
         createdAt: { gte: new Date(nowMs - PREFILL_SAMPLE_WINDOW_MS) },
         promptTokens: { gte: PREFILL_SAMPLE_MIN_PROMPT_TOKENS },
         cacheReadTokens: { not: null },

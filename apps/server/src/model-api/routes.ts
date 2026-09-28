@@ -54,7 +54,6 @@ import {
   type CacheHolderPlan,
   cacheHolderOutcome,
   planCacheHolderWait,
-  remainingShortenedWaitBudget,
   spillDelayMs,
 } from "./cache-holder-wait.js";
 import {
@@ -906,11 +905,17 @@ export const EXTERNAL_PROVIDER_WAIT_CAP_MS = 10_000;
 export function providerCapacityWaitBudget(
   memberBudgetMs: number | null,
   poolHasLocalMembers: boolean,
+  /** Provider-capacity wait already spent in this external phase (earlier pre-commit rounds). */
+  phaseElapsedMs = 0,
 ): number | null {
   if (!poolHasLocalMembers) return memberBudgetMs;
-  return memberBudgetMs === null
-    ? EXTERNAL_PROVIDER_WAIT_CAP_MS
-    : Math.min(memberBudgetMs, EXTERNAL_PROVIDER_WAIT_CAP_MS);
+  // One cap for the whole external phase: a pre-commit retry on the next
+  // provider member gets only what is left of it, never a fresh 10 s.
+  const capMs = Math.max(
+    0,
+    EXTERNAL_PROVIDER_WAIT_CAP_MS - Math.floor(Math.max(0, phaseElapsedMs)),
+  );
+  return memberBudgetMs === null ? capMs : Math.min(memberBudgetMs, capMs);
 }
 
 function poolAdmissionCandidate(
@@ -4323,6 +4328,9 @@ async function relayPool({
       if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
         return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
+      // Durations only (process monotonic clock): the store turns each
+      // round's remaining budget into a database-clock deadline.
+      const providerPhaseStartMs = performance.now();
       let remaining = compatible;
       let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
         dispatched: false,
@@ -4361,6 +4369,7 @@ async function relayPool({
                 : providerCapacityWaitBudget(
                     providerTarget.capacityWaitBudgetMs ?? null,
                     poolHasLocalMembers,
+                    performance.now() - providerPhaseStartMs,
                   ),
             })),
           },
@@ -5317,14 +5326,21 @@ async function relayPool({
   let localWaitMode: "shortened" | "remaining" | "full" =
     externalAfterWaitMs !== null ? "shortened" : "full";
   // Saturation S-A: the spill-over plan (cache-holder wait) and the local wait
-  // clock. The anchor is the start of the first local admission; every later
-  // round (resume after an external phase, pre-commit retry) measures the
-  // remaining spill window and the ORIGINAL external deadline from it, so
-  // neither restarts per round. Only durations use the process clock; the
-  // store turns them into database-clock notBefore/deadline instants.
+  // clock. A "shortened" round after the first (a pre-commit retry) re-anchors
+  // to the FIRST local attempt's database-clock schedule (AdmissionAttempt.
+  // schedule), so it reuses the original spill instant and external deadline
+  // exactly; lock waits before its transaction cannot extend them. Other
+  // later rounds ("remaining"/"full" budgets are fresh by design) measure the
+  // remaining spill window from the process-monotonic anchor below; only that
+  // duration uses the process clock, the store turns it into a DB instant.
   let cacheHolderPlan: CacheHolderPlan | null = null;
   let localWaitAnchorMs: number | null = null;
+  let firstLocalAttemptId: string | null = null;
   let cacheHolderWaitedMs: number | null = null;
+  // The member the planned (spill-over) admission granted. HOLDER_WAITED /
+  // HOLDER_SPILLED describe only that admission; a member serving after a
+  // pre-commit failover keeps the ordinary affinity outcome.
+  let cacheHolderAdmittedMemberId: string | null = null;
   const localWaitElapsedMs = () =>
     localWaitAnchorMs === null ? 0 : Math.floor(performance.now() - localWaitAnchorMs);
   const admissionCandidateForRoute = (
@@ -5336,7 +5352,10 @@ async function relayPool({
     if (!member) return null;
     const admission = poolAdmissionCandidate(member, candidateOrder, relayDeadlineMs);
     if (!admission) return null;
-    const elapsedMs = localWaitElapsedMs();
+    // Shortened rounds are scheduled from the first attempt's DB-clock anchor
+    // (see admitLocalCandidates), so they pass the ORIGINAL window and budget.
+    const anchored = externalAfterWaitMs !== null && localWaitMode === "shortened";
+    const elapsedMs = anchored ? 0 : localWaitElapsedMs();
     const notBeforeMs = spillDelayMs(
       cacheHolderPlan,
       candidate.poolMemberId,
@@ -5348,17 +5367,13 @@ async function relayPool({
     const memberBudgetMs = effectiveMemberWaitBudget(member);
     return {
       ...scheduled,
-      // The store counts this budget from the round's spill instant, so the
-      // external phase starts at max(notBefore) + min(B, E), never while a
-      // cold local member is free and eligible.
-      waitBudgetMs:
-        localWaitMode === "shortened"
-          ? remainingShortenedWaitBudget(
-              localAdmissionWaitBudget(memberBudgetMs, externalAfterWaitMs) ?? 0,
-              cacheHolderPlan?.windowMs ?? 0,
-              elapsedMs,
-            )
-          : resumedLocalWaitBudget(memberBudgetMs, externalAfterWaitMs),
+      // The store counts this budget from the (first round's) spill instant,
+      // so the external phase starts at max(notBefore) + min(B, E), never
+      // while a cold local member is free and eligible, and a retry round
+      // never waits another full E (no N x E total).
+      waitBudgetMs: anchored
+        ? (localAdmissionWaitBudget(memberBudgetMs, externalAfterWaitMs) ?? 0)
+        : resumedLocalWaitBudget(memberBudgetMs, externalAfterWaitMs),
     };
   };
   /** Admission candidates of one round, in route order (candidateOrder = index). */
@@ -5382,13 +5397,26 @@ async function relayPool({
     // the remaining members are re-admitted (each retry is a new attempt);
     // LEASE_LOST surfaces only when no member is left or the deadline passed.
     while (true) {
+      const attemptId = crypto.randomUUID();
+      // Every shortened attempt after the first (pre-commit and lease-loss
+      // retries alike) re-anchors to the FIRST local attempt's DB schedule.
+      const schedule =
+        firstLocalAttemptId !== null &&
+        externalAfterWaitMs !== null &&
+        localWaitMode === "shortened"
+          ? {
+              anchorAttemptId: firstLocalAttemptId,
+              spillDelayMs: cacheHolderPlan?.windowMs ?? 0,
+            }
+          : undefined;
+      firstLocalAttemptId ??= attemptId;
       const admission = await acquireCapacityWithTelemetry({
         runtime,
         relayRequestId,
         attempt: {
           requestId: crypto.randomUUID(),
           relayRequestId,
-          attemptId: crypto.randomUUID(),
+          attemptId,
           ownerId: target.ownerUserId,
           sourceKind: "POOL",
           poolId: target.id,
@@ -5396,6 +5424,7 @@ async function relayPool({
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
+          ...(schedule ? { schedule } : {}),
         },
         signal: request.signal,
       });
@@ -5578,8 +5607,10 @@ async function relayPool({
     // Telemetry: how long the local admission held this request for the cache
     // holder (the window's share of the wait; beyond it any wait is ordinary
     // saturation, not a holder wait).
-    if (cacheHolderPlan)
+    if (cacheHolderPlan) {
       cacheHolderWaitedMs = Math.round(Math.min(localWaitElapsedMs(), cacheHolderPlan.windowMs));
+      cacheHolderAdmittedMemberId = selectedPoolMemberId;
+    }
     try {
       await applyMemberContextCount(selectedPoolMemberId);
     } catch {
@@ -6367,7 +6398,9 @@ async function relayPool({
               localTerminal: terminal,
               affinity: {
                 outcome:
-                  cacheHolderOutcome(cacheHolderPlan, candidate.poolMemberId) ??
+                  (candidate.poolMemberId === cacheHolderAdmittedMemberId
+                    ? cacheHolderOutcome(cacheHolderPlan, candidate.poolMemberId)
+                    : null) ??
                   (affinityDecision &&
                   (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
                     ? "PREDICTED_MATCH"

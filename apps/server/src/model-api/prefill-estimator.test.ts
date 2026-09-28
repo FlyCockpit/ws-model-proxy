@@ -123,6 +123,8 @@ describe("relay-history prefill estimator", () => {
       where: {
         selectedExecutionTargetId: "target-a",
         status: "SUCCEEDED",
+        // Single-attempt rows only: a failed pre-commit attempt is not prefill.
+        attemptCount: 1,
         promptTokens: { gte: 2_000 },
         cacheReadTokens: { not: null },
         admissionWaitDurationMs: { not: null },

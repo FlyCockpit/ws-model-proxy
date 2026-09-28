@@ -631,6 +631,32 @@ describe("PoolForm affinity defaults", () => {
     ).toBe("1500");
   });
 
+  it("keeps a stored cache-holder wait of 0 (off) as a fixed value on save", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, cacheHolderWaitMs: 0 },
+    });
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.fields.cacheHolderWaitMs",
+        ) as HTMLSelectElement
+      ).value,
+    ).toBe("FIXED");
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.cacheHolderWait.valueLabel",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("0");
+    // Saving another routing field must not silently turn "off" into automatic.
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ cacheHolderWaitMs: 0 });
+  });
+
   it("loads the stored affinity value in edit mode", () => {
     // editablePool stores affinity disabled; the edit form must keep it off
     // instead of falling back to the create-mode ON default.

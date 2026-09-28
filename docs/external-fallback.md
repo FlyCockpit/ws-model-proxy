@@ -76,6 +76,8 @@ On a pool that also has local members, an owner-paid external phase waits for
 provider capacity at most `min(provider member budget, 10 s)`. If no provider
 slot frees by then, the attempt counts as "provider busy" and the request goes
 back to its local queue for the rest of the local budget (see the table below).
+The 10 s cap covers the whole external phase: a pre-commit retry on the next
+external member gets only what is left of it.
 Pools with only external members keep the provider member's own budget.
 
 ### Waiting for the cache holder
@@ -95,8 +97,14 @@ take the request if it frees in time. Without an affinity hit nothing waits.
   `forwarder_model_pool_update` MCP tool (`null` = automatic).
 
 Relay metadata records `affinityWaitMs` (how long the request was held for the
-warm member) and `affinityOutcome` `HOLDER_WAITED` (the warm member served) or
-`HOLDER_SPILLED` (another member served after the wait).
+warm member) and `affinityOutcome` `HOLDER_WAITED` (the warm member was granted
+by the held admission) or `HOLDER_SPILLED` (another member was granted after the
+wait). A member that serves only after a pre-commit failover keeps the ordinary
+affinity outcome (`PREDICTED_MATCH` / `NO_MATCH`).
+
+The hold also delays everything that counts from the spill instant: the local
+wait budgets of the request and, for `:external`, the external fallback wait
+both start counting after the hold.
 
 ### When the external attempt does not happen
 
