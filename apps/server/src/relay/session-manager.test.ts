@@ -3033,6 +3033,64 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  const waitingLoad = (waiting: number, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug: "vllm",
+      running: 4,
+      waiting,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+      ...extra,
+    });
+  const liveLoad = (manager: InstanceType<typeof RelaySessionManager>) =>
+    manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")?.endpointLoad[0];
+
+  it("counts consecutive accepted waiting frames; zero or a gap resets the streak (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, waitingLoad(2), now);
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A frame dropped by the 1 s limiter does not count.
+    await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    await manager.handleTextFrame(socket, waitingLoad(1), at(3_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(2);
+    await manager.handleTextFrame(socket, waitingLoad(3), at(6_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(3);
+    await manager.handleTextFrame(socket, waitingLoad(0), at(9_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(0);
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A gap longer than the staleness window restarts the count (fail open).
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000 + 16_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    manager.dispose();
+  });
+
+  it("accumulates prefix cache deltas per key, including those of rate-limited frames (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 10, prefixCacheQueriesDelta: 40 }),
+      now,
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 5, prefixCacheQueriesDelta: 5 }),
+      at(200),
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 1, prefixCacheQueriesDelta: 2 }),
+      at(3_000),
+    );
+    expect(liveLoad(manager)).toMatchObject({
+      prefixCacheHitsTotal: 16,
+      prefixCacheQueriesTotal: 47,
+    });
+    manager.dispose();
+  });
+
   it("bounds the endpoint load keys a session keeps", async () => {
     const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
     const { manager, socket } = await registered();

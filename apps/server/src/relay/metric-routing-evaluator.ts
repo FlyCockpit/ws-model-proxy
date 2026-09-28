@@ -11,10 +11,23 @@
  * plain, non-locking SELECT; this writer takes no capacity lock and the
  * table has no foreign keys, so it adds no lock-order edge (DL-1).
  *
+ * S-D: the same run also turns the member's live engine load (vLLM/SGLang
+ * waiting or KV pressure, llama.cpp busy slots or deferred requests) into a
+ * FULL verdict, OR-combined with the rules (engine load only ever adds FULL).
+ * A member without rules gets a row only while engine load holds it FULL, plus
+ * one clearing write, so a busy device with many members does not write on
+ * every frame.
+ *
  * The inputs are numbers, names and labels only; no prompt text reaches here.
  */
 
 import { randomUUID } from "node:crypto";
+import {
+  type EngineLoadFacts,
+  type EngineLoadVerdict,
+  engineKindFromDb,
+  evaluateEngineLoad,
+} from "@ws-model-proxy/api/lib/engine-load";
 import {
   type EndpointLoadSample,
   endpointLoadSeries,
@@ -22,6 +35,8 @@ import {
   type NodeMetricsSample,
   nodeMetricSeries,
   parseStoredRoutingRules,
+  pickEndpointLoad,
+  type RoutingEvaluation,
   type RoutingVerdict,
 } from "@ws-model-proxy/api/lib/metric-routing";
 import prisma from "@ws-model-proxy/db";
@@ -49,6 +64,19 @@ export type RoutingEvaluationState = {
   closed: boolean;
   written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
 };
+
+/** Rule verdict OR engine-load verdict: engine load only adds FULL. */
+export function combineWithEngineLoad(
+  rules: RoutingEvaluation,
+  engine: EngineLoadVerdict,
+): RoutingEvaluation {
+  if (!engine.full || !engine.expiresAt) return rules;
+  const expiresAt =
+    rules.verdict === "full" && rules.expiresAt.getTime() > engine.expiresAt.getTime()
+      ? rules.expiresAt
+      : engine.expiresAt;
+  return { verdict: "full", ruleStates: rules.ruleStates, expiresAt };
+}
 
 export function createRoutingEvaluationState(
   userId: string,
@@ -86,6 +114,7 @@ type VerdictData = {
   cliDeviceId: string;
   verdict: "NONE" | "AVOID" | "FULL";
   ruleStates: string[];
+  engineState: string | null;
   evaluatedAt: Date;
   expiresAt: Date;
 };
@@ -169,10 +198,13 @@ export class MetricRoutingEvaluator {
       select: {
         id: true,
         poolId: true,
+        engineLoadMode: true,
+        kvFullThreshold: true,
         ModelPool: { select: { routingRules: true } },
         DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
         ExecutionTarget: {
           select: {
+            InferenceCapacity: { select: { engineKind: true, engineSlots: true } },
             DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
           },
         },
@@ -187,22 +219,35 @@ export class MetricRoutingEvaluator {
     const published: Array<{ memberId: string; poolId: string; rulesKey: string }> = [];
     for (const member of members) {
       const rules = parseStoredRoutingRules(member.ModelPool.routingRules);
-      if (rules.length === 0) continue;
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
       if (!model) continue;
-      seen.add(member.id);
-      const series = [
-        ...nodeSeries,
-        ...endpointLoadSeries(
-          inputs.endpointLoad,
-          { endpointSlug: model.Endpoint.slug, modelSlug: model.slug ?? null },
-          now,
-        ),
-      ];
-      const evaluation = evaluateRoutingRules(rules, series, now);
-      // The rules are part of the key: an edited rule set is always re-written.
-      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${rulesKey(rules)}`;
+      const memberRef = { endpointSlug: model.Endpoint.slug, modelSlug: model.slug ?? null };
+      const capacity = member.ExecutionTarget?.InferenceCapacity ?? null;
+      const facts: EngineLoadFacts = {
+        engineKind: engineKindFromDb(capacity?.engineKind),
+        engineSlots: capacity?.engineSlots ?? null,
+        mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
+        kvFullThreshold: member.kvFullThreshold ?? null,
+      };
+      const reading = pickEndpointLoad(inputs.endpointLoad, memberRef);
+      const engine = evaluateEngineLoad(
+        facts,
+        reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
+        now,
+      );
       const previous = state.written.get(member.id);
+      // Nothing to say: no rules, no engine hold, and nothing to clear.
+      if (rules.length === 0 && !engine.full && !previous) continue;
+      seen.add(member.id);
+      const series = [...nodeSeries, ...endpointLoadSeries(inputs.endpointLoad, memberRef, now)];
+      const evaluation = combineWithEngineLoad(
+        rules.length === 0
+          ? { verdict: "none", ruleStates: [], expiresAt: now }
+          : evaluateRoutingRules(rules, series, now),
+        engine,
+      );
+      // The rules are part of the key: an edited rule set is always re-written.
+      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${rulesKey(rules)}`;
       if (
         previous &&
         previous.key === key &&
@@ -218,13 +263,17 @@ export class MetricRoutingEvaluator {
         cliDeviceId: state.cliDeviceId,
         verdict: VERDICT_TO_DB[evaluation.verdict],
         ruleStates: evaluation.ruleStates,
+        engineState: engine.state,
         evaluatedAt: now,
         expiresAt: evaluation.expiresAt,
       };
       // The session ended while an earlier write was in flight: publish nothing more.
       if (state.closed) break;
       if (await this.publish(member.id, data)) {
-        state.written.set(member.id, { key, writtenAtMs: nowMs, epoch: this.clearEpoch });
+        // A rule-less member's row only exists to hold FULL; once cleared it
+        // is not tracked (a NONE row never gates and needs no refresh).
+        if (rules.length === 0 && evaluation.verdict === "none") state.written.delete(member.id);
+        else state.written.set(member.id, { key, writtenAtMs: nowMs, epoch: this.clearEpoch });
         published.push({
           memberId: member.id,
           poolId: member.poolId,

@@ -18,16 +18,67 @@ function member(
 ): {
   id: string;
   poolId: string;
+  engineLoadMode: "AUTO" | "OFF";
+  kvFullThreshold: number | null;
   ModelPool: { routingRules: unknown };
   DiscoveredModel: null;
-  ExecutionTarget: { DiscoveredModel: { slug: string | null; Endpoint: { slug: string } } };
+  ExecutionTarget: {
+    InferenceCapacity: { engineKind: string; engineSlots: number | null } | null;
+    DiscoveredModel: { slug: string | null; Endpoint: { slug: string } };
+  };
 } {
   return {
     id,
     poolId: `pool-of-${id}`,
+    engineLoadMode: "AUTO",
+    kvFullThreshold: null,
     ModelPool: { routingRules: rules },
     DiscoveredModel: null,
-    ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: endpointSlug } } },
+    ExecutionTarget: {
+      InferenceCapacity: null,
+      DiscoveredModel: { slug: null, Endpoint: { slug: endpointSlug } },
+    },
+  };
+}
+
+/** A member on a vLLM (or other) engine, with no pool rules. */
+function engineMember(
+  id: string,
+  engineKind: string,
+  extra: Partial<ReturnType<typeof member>> = {},
+  engineSlots: number | null = null,
+  endpointSlug = "gpu",
+) {
+  const base = member(id, [], endpointSlug);
+  return {
+    ...base,
+    ...extra,
+    ExecutionTarget: {
+      ...base.ExecutionTarget,
+      InferenceCapacity: { engineKind, engineSlots },
+    },
+  };
+}
+
+function load(
+  overrides: Partial<{
+    endpointSlug: string;
+    waiting: number;
+    waitingStreak: number;
+    kvUsage: number;
+    slotsBusy: number;
+    deferred: number;
+    receivedAt: Date;
+  }> = {},
+) {
+  return {
+    endpointSlug: "gpu",
+    modelSlug: null,
+    running: 2,
+    waiting: 0,
+    waitingStreak: 0,
+    receivedAt: T0,
+    ...overrides,
   };
 }
 
@@ -146,6 +197,188 @@ function metrics(temperature: number, receivedAt: Date) {
     endpointLoad: [],
   };
 }
+
+describe("MetricRoutingEvaluator engine load (S-D)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function writes(h: ReturnType<typeof harness>) {
+    return h.db.poolMemberRoutingVerdict.upsert.mock.calls.map(
+      (call) =>
+        (
+          call as unknown as [
+            {
+              create: {
+                poolMemberId: string;
+                verdict: string;
+                engineState: string;
+                expiresAt: Date;
+              };
+            },
+          ]
+        )[0].create,
+    );
+  }
+
+  it("writes FULL for a rule-less vLLM member with sustained waiting, expiring with the reading", async () => {
+    const h = harness([engineMember("m1", "VLLM")]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ waiting: 3, waitingStreak: 2 })],
+    });
+    expect(writes(h)).toEqual([
+      expect.objectContaining({
+        poolMemberId: "m1",
+        verdict: "FULL",
+        engineState: "full_waiting",
+        expiresAt: new Date(T0.getTime() + 15_000),
+      }),
+    ]);
+  });
+
+  it("does not write for members without an engine signal, a single waiting frame or an idle engine", async () => {
+    const h = harness([
+      engineMember("ollama", "OLLAMA", {}, null, "a"),
+      engineMember("generic", "GENERIC", {}, null, "b"),
+      engineMember("once", "VLLM", {}, null, "c"),
+      engineMember("idle", "SGLANG", {}, null, "d"),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [
+        load({ endpointSlug: "a", waiting: 9, waitingStreak: 9, kvUsage: 1 }),
+        load({ endpointSlug: "b", waiting: 9, waitingStreak: 9, kvUsage: 1 }),
+        load({ endpointSlug: "c", waiting: 9, waitingStreak: 1 }),
+        load({ endpointSlug: "d", kvUsage: 0.2 }),
+      ],
+    });
+    expect(h.db.poolMemberRoutingVerdict.upsert).not.toHaveBeenCalled();
+  });
+
+  it("marks llama.cpp FULL on all slots busy or deferred requests", async () => {
+    const h = harness([
+      engineMember("busy", "LLAMA_CPP", {}, 2, "a"),
+      engineMember("deferred", "LLAMA_CPP", {}, 4, "b"),
+      engineMember("room", "LLAMA_CPP", {}, 4, "c"),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [
+        load({ endpointSlug: "a", slotsBusy: 2 }),
+        load({ endpointSlug: "b", slotsBusy: 1, deferred: 2 }),
+        load({ endpointSlug: "c", slotsBusy: 3 }),
+      ],
+    });
+    expect(writes(h).map((row) => [row.poolMemberId, row.verdict, row.engineState])).toEqual([
+      ["busy", "FULL", "full_slots"],
+      ["deferred", "FULL", "full_deferred"],
+    ]);
+  });
+
+  it("ignores a stale reading and an 'off' override", async () => {
+    const h = harness([
+      engineMember("stale", "VLLM", {}, null, "a"),
+      engineMember("off", "VLLM", { engineLoadMode: "OFF" }, null, "b"),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const hot = { waiting: 5, waitingStreak: 5, kvUsage: 1 };
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [
+        load({ endpointSlug: "a", ...hot, receivedAt: new Date(T0.getTime() - 16_000) }),
+        load({ endpointSlug: "b", ...hot }),
+      ],
+    });
+    expect(h.db.poolMemberRoutingVerdict.upsert).not.toHaveBeenCalled();
+  });
+
+  it("honours a per-member KV threshold", async () => {
+    const h = harness([engineMember("m1", "VLLM", { kvFullThreshold: 0.5 })]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ kvUsage: 0.6 })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "FULL", engineState: "full_kv" });
+  });
+
+  it("only adds to FULL: a triggered avoid rule becomes FULL, a FULL rule stays FULL with the later expiry", async () => {
+    const avoidHot = [
+      { metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect: "avoid" },
+    ];
+    const base = engineMember("m1", "VLLM");
+    const h = harness([{ ...base, ModelPool: { routingRules: avoidHot } }]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      ...metrics(90, T0),
+      endpointLoad: [load({ waiting: 1, waitingStreak: 2 })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "FULL", engineState: "full_waiting" });
+    const h2 = harness([{ ...base, ModelPool: { routingRules: hotRule } }]);
+    await h2.evaluator.evaluate(createRoutingEvaluationState("user-1", "device-1"), {
+      ...metrics(90, T0),
+      endpointLoad: [load({ waiting: 1, waitingStreak: 2 })],
+    });
+    // Rule expiry (90 s) is later than the engine's (15 s): the later one wins.
+    expect(writes(h2)[0]).toMatchObject({
+      verdict: "FULL",
+      expiresAt: new Date(T0.getTime() + 90_000),
+    });
+  });
+
+  it("a clear engine never relaxes a rule FULL", async () => {
+    const base = engineMember("m1", "VLLM");
+    const h = harness([{ ...base, ModelPool: { routingRules: hotRule } }]);
+    await h.evaluator.evaluate(createRoutingEvaluationState("user-1", "device-1"), {
+      ...metrics(90, T0),
+      endpointLoad: [load({ kvUsage: 0.1 })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "FULL", engineState: "clear" });
+  });
+
+  it("bounds writes: refresh at most every interval, one clearing write, then silence", async () => {
+    const h = harness([engineMember("m1", "VLLM")]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const hotLoad = () => load({ waiting: 2, waitingStreak: 3, receivedAt: h.now() });
+    // 20 frames one second apart: only the first plus the 5 s refreshes write.
+    for (let index = 0; index < 20; index += 1) {
+      await h.evaluator.evaluate(state, { nodeMetrics: null, endpointLoad: [hotLoad()] });
+      h.advance(1_000);
+    }
+    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(4);
+    // The engine calms down: one NONE write, then no more writes.
+    for (let index = 0; index < 10; index += 1) {
+      await h.evaluator.evaluate(state, {
+        nodeMetrics: null,
+        endpointLoad: [load({ receivedAt: h.now() })],
+      });
+      h.advance(1_000);
+    }
+    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(5);
+    expect(writes(h).at(-1)).toMatchObject({ verdict: "NONE", engineState: "clear" });
+  });
+
+  it("clears a FULL row when the reading goes stale (fail open)", async () => {
+    const h = harness([engineMember("m1", "VLLM")]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const hotLoad = load({ waiting: 2, waitingStreak: 3 });
+    await h.evaluator.evaluate(state, { nodeMetrics: null, endpointLoad: [hotLoad] });
+    h.advance(20_000);
+    await h.evaluator.evaluate(state, { nodeMetrics: null, endpointLoad: [hotLoad] });
+    expect(writes(h).map((row) => [row.verdict, row.engineState])).toEqual([
+      ["FULL", "full_waiting"],
+      ["NONE", "stale"],
+    ]);
+  });
+});
 
 describe("MetricRoutingEvaluator", () => {
   beforeEach(() => {

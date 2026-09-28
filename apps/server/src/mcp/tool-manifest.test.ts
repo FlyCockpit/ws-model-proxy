@@ -83,6 +83,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_model_pool_update",
   "forwarder_pool_fallback_update",
   "forwarder_pool_routing_rules_set",
+  "forwarder_pool_member_engine_load_set",
   "forwarder_device_metric_sources_set",
   "forwarder_model_pool_delete",
   "forwarder_pool_member_add",
@@ -154,6 +155,7 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_cli_command_run: "RUN",
   forwarder_cli_supervised_command_start: "RUN",
   forwarder_pool_routing_rules_set: "RUN",
+  forwarder_pool_member_engine_load_set: "RUN",
   forwarder_device_metric_sources_set: "RUN",
 });
 
@@ -165,6 +167,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
   forwarder_pool_routing_rules_set: "forwarderManagement.setPoolRoutingRules",
+  forwarder_pool_member_engine_load_set: "forwarderManagement.setPoolMemberEngineLoad",
   forwarder_device_metric_sources_set: "forwarderManagement.setCliDeviceMetricSources",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
   forwarder_pool_fallback_get: "poolFallback.get",

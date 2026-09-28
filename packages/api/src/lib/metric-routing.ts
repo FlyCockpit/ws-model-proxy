@@ -327,8 +327,31 @@ export type EndpointLoadSample = {
   kvUsage?: number;
   slotsBusy?: number;
   deferred?: number;
+  /** Consecutive accepted frames with `waiting > 0` (S-D; 0 when unknown). */
+  waitingStreak?: number;
+  /** Prefix cache totals accumulated by the session (S-D dashboard). */
+  prefixCacheHitsTotal?: number;
+  prefixCacheQueriesTotal?: number;
   receivedAt: Date;
 };
+
+/**
+ * The reading that speaks for one member: a model-specific `endpoint.load`
+ * wins over the endpoint-wide one.
+ */
+export function pickEndpointLoad<T extends EndpointLoadSample>(
+  loads: readonly T[],
+  member: { endpointSlug: string; modelSlug: string | null },
+): T | null {
+  const forEndpoint = loads.filter((load) => load.endpointSlug === member.endpointSlug);
+  return (
+    (member.modelSlug
+      ? forEndpoint.find((entry) => entry.modelSlug === member.modelSlug)
+      : undefined) ??
+    forEndpoint.find((entry) => entry.modelSlug === null) ??
+    null
+  );
+}
 
 /**
  * `endpoint.*` series for one member: the load of its own endpoint. A
@@ -339,11 +362,7 @@ export function endpointLoadSeries(
   member: { endpointSlug: string; modelSlug: string | null },
   now: Date,
 ): MetricSeries[] {
-  const forEndpoint = loads.filter((load) => load.endpointSlug === member.endpointSlug);
-  const load =
-    (member.modelSlug
-      ? forEndpoint.find((entry) => entry.modelSlug === member.modelSlug)
-      : undefined) ?? forEndpoint.find((entry) => entry.modelSlug === null);
+  const load = pickEndpointLoad(loads, member);
   if (!load) return [];
   const ageMs = Math.max(0, now.getTime() - load.receivedAt.getTime());
   const series: MetricSeries[] = [];

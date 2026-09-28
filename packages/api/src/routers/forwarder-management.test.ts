@@ -5889,6 +5889,170 @@ describe("metric routing procedures (S-B part 2)", () => {
     ]);
   });
 
+  it("reports live engine load, the override and the verdict state per member (S-D)", async () => {
+    const now = Date.now();
+    const model = (upstreamModelId: string) => ({
+      slug: null,
+      upstreamModelId,
+      Endpoint: {
+        slug: "gpu",
+        cliDeviceId: "cli-id",
+        CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+      },
+    });
+    const target = (engineKind: string) => ({
+      InferenceCapacity: { engineKind, engineSlots: 4 },
+      DiscoveredModel: model("a"),
+    });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      slug: "coder",
+      routingRules: [],
+      PoolMembers: [
+        {
+          id: "m1",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
+        {
+          id: "m2",
+          engineLoadMode: "OFF",
+          kvFullThreshold: 0.5,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
+        {
+          id: "m3",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("OLLAMA"),
+        },
+      ],
+    });
+    deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+      {
+        poolMemberId: "m1",
+        verdict: "FULL",
+        ruleStates: [],
+        engineState: "full_waiting",
+        evaluatedAt: new Date(now - 1_000),
+        expiresAt: new Date(now + 10_000),
+      },
+    ]);
+    deep.cliDevice.findMany.mockResolvedValue([]);
+    const fresh = new Date(now - 2_000);
+    const result = await client({
+      getLiveNodeTelemetry: (ids: readonly string[]) =>
+        new Map(
+          ids.map((id) => [
+            id,
+            {
+              nodeMetrics: null,
+              nodeMetricsReceivedAt: null,
+              endpointLoad: [
+                {
+                  endpointSlug: "gpu",
+                  modelSlug: null,
+                  running: 4,
+                  waiting: 2,
+                  kvUsage: 0.5,
+                  waitingStreak: 3,
+                  prefixCacheHitsTotal: 30,
+                  prefixCacheQueriesTotal: 60,
+                  source: "vllm-metrics",
+                  ts: fresh.toISOString(),
+                  receivedAt: fresh,
+                },
+              ],
+            },
+          ]),
+        ),
+    }).getPoolRoutingRules({ poolId: "pool-1" });
+    const byId = new Map(result.members.map((member) => [member.poolMemberId, member.engineLoad]));
+    expect(byId.get("m1")).toMatchObject({
+      mode: "auto",
+      engineKind: "VLLM",
+      hasSignal: true,
+      state: "full_waiting",
+      full: true,
+      snapshotState: "full_waiting",
+      live: {
+        running: 4,
+        waiting: 2,
+        kvUsage: 0.5,
+        waitingStreak: 3,
+        stale: false,
+        prefixCacheHits: 30,
+        prefixCacheQueries: 60,
+      },
+    });
+    // 'off' ignores the same reading; the threshold override is reported.
+    expect(byId.get("m2")).toMatchObject({
+      mode: "off",
+      state: "off",
+      full: false,
+      kvFullThreshold: 0.5,
+      effectiveKvFullThreshold: 0.5,
+    });
+    // Ollama has no engine signal.
+    expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
+  });
+
+  it("sets a member's engine load override, scoped to the owner, and clears its verdict (S-D)", async () => {
+    deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    deep.poolMemberRoutingVerdict.deleteMany.mockResolvedValue({ count: 1 });
+    deep.poolMember.findFirst.mockResolvedValue({
+      id: "m1",
+      engineLoadMode: "OFF",
+      kvFullThreshold: 0.8,
+    });
+    const result = await client().setPoolMemberEngineLoad({
+      poolMemberId: "m1",
+      mode: "off",
+      kvFullThreshold: 0.8,
+    });
+    expect(deep.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "m1", ModelPool: { userId: "user-id" } },
+      data: { engineLoadMode: "OFF", kvFullThreshold: 0.8 },
+    });
+    expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
+      where: { poolMemberId: "m1", userId: "user-id" },
+    });
+    expect(result).toMatchObject({ mode: "off", kvFullThreshold: 0.8 });
+  });
+
+  it("leaves the threshold alone when omitted and rejects foreign members and bad thresholds (S-D)", async () => {
+    deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    deep.poolMember.findFirst.mockResolvedValue({
+      id: "m1",
+      engineLoadMode: "AUTO",
+      kvFullThreshold: null,
+    });
+    await client().setPoolMemberEngineLoad({ poolMemberId: "m1", mode: "auto" });
+    expect(deep.poolMember.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "m1", ModelPool: { userId: "user-id" } },
+      data: { engineLoadMode: "AUTO" },
+    });
+    deep.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    deep.poolMemberRoutingVerdict.deleteMany.mockClear();
+    await expect(
+      client().setPoolMemberEngineLoad({ poolMemberId: "other", mode: "off" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+    for (const bad of [0, 1.5, -0.1]) {
+      await expect(
+        client().setPoolMemberEngineLoad({
+          poolMemberId: "m1",
+          mode: "auto",
+          kvFullThreshold: bad,
+        }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    }
+  });
+
   it("stores remote metric sources only while the device is unsupervised and pushes them", async () => {
     deep.cliDevice.findUnique.mockResolvedValue({
       id: "cli-id",

@@ -44,6 +44,11 @@ export type LiveEndpointLoad = {
   prefixCacheHitsDelta?: number;
   prefixCacheQueriesDelta?: number;
   source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics";
+  /** Consecutive accepted frames with `waiting > 0`; a gap or `waiting == 0` resets it. */
+  waitingStreak: number;
+  /** Prefix cache deltas summed over this session's frames (for the dashboard). */
+  prefixCacheHitsTotal: number;
+  prefixCacheQueriesTotal: number;
   /** The CLI's sample time. */
   ts: string;
   receivedAt: Date;
