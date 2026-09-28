@@ -203,23 +203,97 @@ describe("appendRollingTail", () => {
     }
   });
 
-  it("skips plain text without the per-byte parser (it runs on the server's event loop)", () => {
-    const feed = vi.spyOn(TerminalByteState.prototype, "feed");
-    try {
-      const text = bytes("plain ascii\tline, ünïcödé, € and 😀\r\n".repeat(20_000));
-      const view = capture(text, 64 * 1024);
-      expect(view.tail.length).toBeLessThanOrEqual(CLI_STREAM_TAIL_MAX_BYTES);
-      // Only a character that straddles the cut goes through it: at most a
-      // few bytes per append, against hundreds of KiB dropped.
-      expect(text.length - view.tail.length).toBeGreaterThan(500_000);
-      expect(feed.mock.calls.length).toBeLessThan(4 * Math.ceil(text.length / (64 * 1024)));
-      feed.mockClear();
-      // An escape sequence in the dropped part still goes through the parser.
-      capture(bytes(`${"x".repeat(50_000)}\u001b[31mred\u001b[0m${"y".repeat(50_000)}`), 4096);
-      expect(feed.mock.calls.length).toBeGreaterThan(0);
-      expect(feed.mock.calls.length).toBeLessThan(64);
-    } finally {
-      feed.mockRestore();
+  it.each([
+    ["plain text", "plain ascii\tline, ünïcödé, € and 😀\r\n"],
+    ["colored output", "\u001b[1;31mred\u001b[0m \u001b[38;5;208mé\u001b[m\n"],
+    ["an open DCS body", "sixel#0;2;0;0;0~~ïü😀-\n"],
+  ])(
+    "drops %s without a per-byte parser call (it runs on the server's event loop)",
+    (label, unit) => {
+      const feed = vi.spyOn(TerminalByteState.prototype, "feed");
+      try {
+        const prefix = label === "an open DCS body" ? "\u001bPq" : "";
+        const text = bytes(prefix + unit.repeat(Math.ceil(1_000_000 / unit.length)));
+        const view = capture(text, 64 * 1024);
+        expect(text.length - view.tail.length).toBeGreaterThan(900_000);
+        // Only a character that straddles an append seam goes through it.
+        expect(feed.mock.calls.length).toBeLessThan(4 * Math.ceil(text.length / (64 * 1024)));
+      } finally {
+        feed.mockRestore();
+      }
+    },
+  );
+
+  it("drops exactly what feeding every byte through the parser drops", () => {
+    const alphabet = [
+      ..."ab \n\t\u0007\u0018\u001a\u007f[]P_^X\\;0<?m@q",
+      ..."\u001b\u001b\u001b",
+    ].map((char) => char.charCodeAt(0));
+    const high = [
+      0xc2, 0x80, 0x9b, 0x9c, 0x9f, 0xa0, 0xc3, 0xa9, 0xe0, 0xed, 0xa0, 0xf0, 0x9f, 0x98, 0x80,
+      0xf4, 0x90, 0xff, 0xe2, 0x82, 0xac,
+    ];
+    // Whole valid characters: non-C1 ones take the fast path, C1 ones do not.
+    const characters = [
+      [0xc3, 0xa9],
+      [0xc2, 0xa0],
+      [0xe2, 0x82, 0xac],
+      [0xf0, 0x9f, 0x98, 0x80],
+      [0xc2, 0x9b],
+      [0xc2, 0x90],
+      [0xc2, 0x9c],
+    ];
+    let seed = 11;
+    const random = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+      return seed % n;
+    };
+    const reference = (stream: Uint8Array, chunks: number[], max: number) => {
+      const state = new TerminalByteState();
+      let tail: number[] = [];
+      let offset = 0;
+      for (const size of chunks) {
+        tail.push(...stream.subarray(offset, offset + size));
+        offset += size;
+        let drop = 0;
+        while (
+          drop < tail.length &&
+          (drop < tail.length - Math.min(tail.length, max) || !state.atBoundary)
+        ) {
+          state.feed(tail[drop] ?? 0);
+          drop += 1;
+        }
+        tail = tail.slice(drop);
+      }
+      return Uint8Array.from(tail);
+    };
+    for (let round = 0; round < 4000; round += 1) {
+      const parts: number[] = [];
+      while (parts.length < 1 + random(60)) {
+        const pick = random(6);
+        if (pick === 0) parts.push(high[random(high.length)] ?? 0);
+        else if (pick === 1) parts.push(...(characters[random(characters.length)] ?? []));
+        else parts.push(alphabet[random(alphabet.length)] ?? 0);
+      }
+      const stream = Uint8Array.from(parts);
+      const length = stream.length;
+      const chunks: number[] = [];
+      for (let left = length; left > 0; ) {
+        const size = Math.min(left, 1 + random(9));
+        chunks.push(size);
+        left -= size;
+      }
+      const max = 1 + random(16);
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      let offset = 0;
+      for (const size of chunks) {
+        tail = appendRollingTail(tail, stream.subarray(offset, offset + size), max, state);
+        offset += size;
+      }
+      expect(Array.from(tail), Array.from(stream).join(",")).toEqual(
+        Array.from(reference(stream, chunks, max)),
+      );
     }
   });
 

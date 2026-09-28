@@ -216,6 +216,15 @@ function nextState(state: number, code: number): number {
   return code >= 0xa0 ? nonAsciiTransition(state) : printableTransition(state, code);
 }
 
+/** `nextState` for every state and ASCII byte, at `(state << 7) | byte`. */
+const ASCII_TRANSITIONS = (() => {
+  const table = new Uint8Array((DCS_PASSTHROUGH + 1) * 0x80);
+  for (let state = 0; state <= DCS_PASSTHROUGH; state += 1) {
+    for (let byte = 0; byte < 0x80; byte += 1) table[(state << 7) | byte] = nextState(state, byte);
+  }
+  return table;
+})();
+
 /**
  * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms — CSI, OSC,
  * the control strings DCS, SOS, PM and APC, and other escapes — including a
@@ -309,6 +318,99 @@ export class TerminalByteState {
     }
   }
 
+  /**
+   * Feeds `bytes[from…]` while the index is below `dropUntil` or the parser is
+   * not at a boundary; returns the first index not fed. Same result as
+   * {@link feed} per byte, but it runs on the server's event loop for every
+   * byte of headless output, so it jumps over runs that cannot change the
+   * state with native `indexOf`: in the ground state only ESC or a C1 control
+   * (`C2 80..9F`) leaves it; inside an OSC, SOS/PM/APC or DCS body only ESC,
+   * CAN, SUB, a C1 control or (OSC) BEL ends it. Both ESC and `C2` always
+   * start a new character, so the UTF-8 decoder has nothing pending there.
+   * Escape and CSI headers are short and go through a lookup table.
+   */
+  consume(bytes: Uint8Array, from: number, dropUntil: number): number {
+    const length = bytes.length;
+    const next = new NextByte(bytes);
+    let index = from;
+    let state = this.state;
+    while (index < length) {
+      if (this.needed === 0) {
+        if (state === GROUND) {
+          if (index >= dropUntil) break;
+          // A short run is cheaper to scan here than through `indexOf`.
+          let stop = index;
+          const near = Math.min(length, index + 32);
+          while (stop < near && bytes[stop] !== 0x1b && bytes[stop] !== 0xc2) stop += 1;
+          if (stop === near && near < length) {
+            stop = Math.min(next.after(0x1b, near), next.after(0xc2, near));
+          }
+          stop = charStop(bytes, stop);
+          if (stop > index) {
+            if (stop < dropUntil) {
+              index = stop;
+              continue;
+            }
+            // Nothing leaves the ground state before the cut: jump to the
+            // start of the character that holds the cut (at most 3 bytes
+            // back; a continuation byte never starts one) and feed from there.
+            index = Math.max(index, characterStart(bytes, dropUntil));
+            if (index >= dropUntil) break;
+          }
+        } else if (state >= OSC_STRING && state !== DCS_ENTRY && state !== DCS_PARAM) {
+          if (state !== DCS_INTERMEDIATE) {
+            let stop = Math.min(
+              next.after(0x1b, index),
+              next.after(0xc2, index),
+              next.after(0x18, index),
+              next.after(0x1a, index),
+            );
+            if (state === OSC_STRING) stop = Math.min(stop, next.after(0x07, index));
+            stop = charStop(bytes, stop);
+            if (stop > index) {
+              index = stop;
+              continue;
+            }
+          }
+        }
+        let byte = bytes[index] as number;
+        if (byte < 0x80) {
+          state = ASCII_TRANSITIONS[(state << 7) | byte] as number;
+          index += 1;
+          // An escape or CSI header: step through its ASCII in one tight loop.
+          while (index < length && state !== GROUND && state < OSC_STRING) {
+            byte = bytes[index] as number;
+            if (byte >= 0x80) break;
+            state = ASCII_TRANSITIONS[(state << 7) | byte] as number;
+            index += 1;
+          }
+          continue;
+        }
+        if (byte === 0xc2) {
+          const second = bytes[index + 1];
+          if (second !== undefined && second >= 0x80 && second <= 0x9f) {
+            // A C1 control (U+0080..U+009F), which acts the same in every state.
+            state = anywhereTransition(second) ?? GROUND;
+            index += 2;
+            continue;
+          }
+        }
+        const size = nonC1CharacterLength(bytes, index);
+        if (size > 0) {
+          if (state !== GROUND) state = nonAsciiTransition(state);
+          index += size;
+          continue;
+        }
+      }
+      this.state = state;
+      this.feed(bytes[index] as number);
+      state = this.state;
+      index += 1;
+    }
+    this.state = state;
+    return index;
+  }
+
   private start(needed: number, bits: number): void {
     this.needed = needed;
     this.codePoint = bits;
@@ -335,49 +437,53 @@ export function appendRollingTail(
   max: number,
   state: TerminalByteState,
 ): Uint8Array {
-  const total = tail.length + chunk.length;
-  const mustDrop = Math.max(0, total - max);
-  let start = 0;
-  while (start < total && (start < mustDrop || !state.atBoundary)) {
-    if (state.atBoundary) {
-      // Fast path (runs on the server's event loop for every byte of
-      // headless output): in the ground state on a whole character, text
-      // that cannot leave it is skipped without the per-byte parser.
-      start =
-        start < tail.length
-          ? skipGroundText(tail, start, Math.min(mustDrop, tail.length))
-          : tail.length + skipGroundText(chunk, start - tail.length, mustDrop - tail.length);
-      if (start >= mustDrop) break;
-    }
-    state.feed(start < tail.length ? (tail[start] ?? 0) : (chunk[start - tail.length] ?? 0));
-    start += 1;
+  const mustDrop = Math.max(0, tail.length + chunk.length - max);
+  // The dropped prefix is fed in stream order: the old tail, then the chunk.
+  const fromTail = state.consume(tail, 0, mustDrop);
+  if (fromTail < tail.length) {
+    const out = new Uint8Array(tail.length - fromTail + chunk.length);
+    out.set(tail.subarray(fromTail), 0);
+    out.set(chunk, tail.length - fromTail);
+    return out;
   }
-  if (start >= tail.length) return chunk.slice(start - tail.length);
-  const out = new Uint8Array(total - start);
-  out.set(tail.subarray(start), 0);
-  out.set(chunk, tail.length - start);
-  return out;
+  return chunk.slice(state.consume(chunk, 0, mustDrop - tail.length));
+}
+
+/** Where the next occurrence of each byte value is, found once per value and position. */
+class NextByte {
+  private readonly found = new Int32Array(0x100).fill(-1);
+
+  constructor(private readonly bytes: Uint8Array) {}
+
+  /** The first index at or after `from` holding `value`, or the length. */
+  after(value: number, from: number): number {
+    const cached = this.found[value] as number;
+    if (cached >= from) return cached;
+    const at = this.bytes.indexOf(value, from);
+    const position = at < 0 ? this.bytes.length : at;
+    this.found[value] = position;
+    return position;
+  }
 }
 
 /**
- * The first index in `bytes[from, end)` at which the parser, in its ground
- * state on a whole character, might leave that state: an ESC, or a byte that
- * does not begin a complete, valid UTF-8 character other than a C1 control.
- * Every other ASCII byte keeps the ground state (CAN and SUB go to it, C0
- * controls execute, DEL is ignored), as does any non-C1 character.
+ * A jump target: an ESC or `C2` found by `indexOf` always starts a character,
+ * but the end of the bytes may fall inside one, whose bytes must then go
+ * through the decoder.
  */
-function skipGroundText(bytes: Uint8Array, from: number, end: number): number {
-  let index = from;
-  while (index < end) {
-    const byte = bytes[index] ?? 0;
-    if (byte < 0x80) {
-      if (byte === 0x1b) return index;
-      index += 1;
-      continue;
-    }
-    const length = nonC1CharacterLength(bytes, index);
-    if (length === 0 || index + length > end) return index;
-    index += length;
+function charStop(bytes: Uint8Array, stop: number): number {
+  return stop === bytes.length ? characterStart(bytes, stop) : stop;
+}
+
+/**
+ * The start of the character that holds `index`: the last byte in the three
+ * before it that is not a continuation byte, when the character it starts
+ * could reach `index`; otherwise `index` itself.
+ */
+function characterStart(bytes: Uint8Array, index: number): number {
+  for (let at = index - 1; at >= Math.max(0, index - 3); at -= 1) {
+    const byte = bytes[at] as number;
+    if (byte < 0x80 || byte > 0xbf) return byte >= 0xc2 ? at : index;
   }
   return index;
 }
