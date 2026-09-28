@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   appendRollingTail,
   CLI_OUTPUT_ELLIPSIS,
@@ -200,6 +200,26 @@ describe("appendRollingTail", () => {
         );
       }
       expect(Buffer.from(tail).toString("hex"), vector.streamHex).toBe(vector.tailHex);
+    }
+  });
+
+  it("skips plain text without the per-byte parser (it runs on the server's event loop)", () => {
+    const feed = vi.spyOn(TerminalByteState.prototype, "feed");
+    try {
+      const text = bytes("plain ascii\tline, ünïcödé, € and 😀\r\n".repeat(20_000));
+      const view = capture(text, 64 * 1024);
+      expect(view.tail.length).toBeLessThanOrEqual(CLI_STREAM_TAIL_MAX_BYTES);
+      // Only a character that straddles the cut goes through it: at most a
+      // few bytes per append, against hundreds of KiB dropped.
+      expect(text.length - view.tail.length).toBeGreaterThan(500_000);
+      expect(feed.mock.calls.length).toBeLessThan(4 * Math.ceil(text.length / (64 * 1024)));
+      feed.mockClear();
+      // An escape sequence in the dropped part still goes through the parser.
+      capture(bytes(`${"x".repeat(50_000)}\u001b[31mred\u001b[0m${"y".repeat(50_000)}`), 4096);
+      expect(feed.mock.calls.length).toBeGreaterThan(0);
+      expect(feed.mock.calls.length).toBeLessThan(64);
+    } finally {
+      feed.mockRestore();
     }
   });
 

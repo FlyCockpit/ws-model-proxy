@@ -339,6 +339,16 @@ export function appendRollingTail(
   const mustDrop = Math.max(0, total - max);
   let start = 0;
   while (start < total && (start < mustDrop || !state.atBoundary)) {
+    if (state.atBoundary) {
+      // Fast path (runs on the server's event loop for every byte of
+      // headless output): in the ground state on a whole character, text
+      // that cannot leave it is skipped without the per-byte parser.
+      start =
+        start < tail.length
+          ? skipGroundText(tail, start, Math.min(mustDrop, tail.length))
+          : tail.length + skipGroundText(chunk, start - tail.length, mustDrop - tail.length);
+      if (start >= mustDrop) break;
+    }
     state.feed(start < tail.length ? (tail[start] ?? 0) : (chunk[start - tail.length] ?? 0));
     start += 1;
   }
@@ -347,6 +357,60 @@ export function appendRollingTail(
   out.set(tail.subarray(start), 0);
   out.set(chunk, tail.length - start);
   return out;
+}
+
+/**
+ * The first index in `bytes[from, end)` at which the parser, in its ground
+ * state on a whole character, might leave that state: an ESC, or a byte that
+ * does not begin a complete, valid UTF-8 character other than a C1 control.
+ * Every other ASCII byte keeps the ground state (CAN and SUB go to it, C0
+ * controls execute, DEL is ignored), as does any non-C1 character.
+ */
+function skipGroundText(bytes: Uint8Array, from: number, end: number): number {
+  let index = from;
+  while (index < end) {
+    const byte = bytes[index] ?? 0;
+    if (byte < 0x80) {
+      if (byte === 0x1b) return index;
+      index += 1;
+      continue;
+    }
+    const length = nonC1CharacterLength(bytes, index);
+    if (length === 0 || index + length > end) return index;
+    index += length;
+  }
+  return index;
+}
+
+function isContinuation(byte: number | undefined): boolean {
+  return byte !== undefined && byte >= 0x80 && byte <= 0xbf;
+}
+
+/** Byte length of a valid UTF-8 character at `index` that is not a C1 control, else 0. */
+function nonC1CharacterLength(bytes: Uint8Array, index: number): number {
+  const lead = bytes[index] ?? 0;
+  const next = bytes[index + 1] ?? 0;
+  if (lead >= 0xc2 && lead <= 0xdf) {
+    // C2 80..9F encodes U+0080..U+009F, the C1 controls.
+    if (lead === 0xc2 && next < 0xa0) return 0;
+    return isContinuation(next) ? 2 : 0;
+  }
+  if (lead >= 0xe0 && lead <= 0xef) {
+    const low = lead === 0xe0 ? 0xa0 : 0x80;
+    const high = lead === 0xed ? 0x9f : 0xbf;
+    return next >= low && next <= high && isContinuation(bytes[index + 2]) ? 3 : 0;
+  }
+  if (lead >= 0xf0 && lead <= 0xf4) {
+    const low = lead === 0xf0 ? 0x90 : 0x80;
+    const high = lead === 0xf4 ? 0x8f : 0xbf;
+    return next >= low &&
+      next <= high &&
+      isContinuation(bytes[index + 2]) &&
+      isContinuation(bytes[index + 3])
+      ? 4
+      : 0;
+  }
+  return 0;
 }
 
 function dropLeadingTokenRun(text: string): string {
