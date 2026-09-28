@@ -145,9 +145,11 @@ follow-ups to locally served responses stay on their local member.
   grant procedures (oRPC and MCP) no longer take `publicEgressAcknowledged` or
   `publicEgressEnabled`; unknown arguments are stripped, so old clients
   silently lose them. Use `fallbackEnabled`, `fallbackForGrantees`, and
-  `externalAfterWaitMs` on the pool procedures. Over MCP, `fallbackEnabled` and
-  `fallbackForGrantees` are rejected (a person changes them in the dashboard),
-  and the guarded pool tool creates local-only pools. A new
+  `externalAfterWaitMs` on the pool procedures. Over MCP, the general pool
+  tools reject `fallbackEnabled` and `fallbackForGrantees`; change them with
+  `forwarder_pool_fallback_update` (literal `mcp:write`, no confirmation, cost
+  stated in its description, every change audited). The guarded pool tool
+  creates local-only pools. A new
   `externalAfterWaitMs` must not exceed the pool's local wait budget; a save
   that does not change it is never rejected because of it. The guarded pool wizard also strips the old arguments and rejects provider models
   at the PRIMARY tier.

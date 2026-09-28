@@ -460,6 +460,24 @@ describe("dedicated pool pages", () => {
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
     });
 
+    it("refreshes the fallback change history after a save (C2a-2)", async () => {
+      const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.forGrantees" }),
+      );
+      submit();
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({
+          queryKey: ["providerManagement", "listAuditEvents"],
+        }),
+      );
+      invalidate.mockRestore();
+    });
+
     it("enables fallback in one save without a grantee confirmation", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";

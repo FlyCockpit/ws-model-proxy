@@ -236,6 +236,65 @@ describe("poolFallback.get", () => {
     expect(view).toMatchObject({ poolFallback: { available: false, providerTypes: [] } });
   });
 
+  it("grantee route availability follows live token consent and an ACTIVE own key (CFb-1)", async () => {
+    db.modelPool.findFirst.mockResolvedValue(null);
+    const grant = (status: string) => ({
+      ModelPool: {
+        id: "pool",
+        slug: "pool",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalEquivalentModel: "vendor/model",
+        User: { slug: "owner" },
+        PoolMembers: [],
+      },
+      FallbackPreferences: [
+        {
+          providerModelId: "own-model",
+          protocolAdaptationEnabled: false,
+          ProviderModel: {
+            enabled: true,
+            deletedAt: null,
+            upstreamModelId: "vendor/model",
+            ProviderAccount: {
+              providerType: "openrouter",
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: { status },
+            },
+          },
+        },
+      ],
+    });
+    db.poolGrant.findFirst.mockResolvedValue(grant("REVOKED") as never);
+    db.modelApiToken.findMany.mockResolvedValue([
+      { scopeMode: "ALLOWLIST", AllowlistEntries: [] },
+    ] as never);
+    const revoked = await clientFor("grantee").get({ poolId: "pool" });
+    expect(revoked).toMatchObject({
+      ownKey: { configured: true, ready: false },
+      tokenAllowed: false,
+    });
+    // Only live tokens that allow external are considered.
+    expect(db.modelApiToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: "grantee",
+          revokedAt: null,
+          allowExternal: true,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }],
+        }),
+      }),
+    );
+
+    db.poolGrant.findFirst.mockResolvedValue(grant("ACTIVE") as never);
+    db.modelApiToken.findMany.mockResolvedValue([
+      { scopeMode: "ALLOWLIST", AllowlistEntries: [{ modelPoolId: "pool" }] },
+    ] as never);
+    const ready = await clientFor("grantee").get({ poolId: "pool" });
+    expect(ready).toMatchObject({ ownKey: { ready: true }, tokenAllowed: true });
+  });
+
   it("is NOT_FOUND for a pool the caller neither owns nor was granted", async () => {
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolGrant.findFirst.mockResolvedValue(null);
