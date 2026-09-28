@@ -323,6 +323,42 @@ describe("ProviderCatalogImport", () => {
     expect(Boolean(screen.queryByText("dashboard:providerCatalog.import.pricingTiered"))).toBe(
       pricing === "updated",
     );
+    expect(screen.queryByText(/dashboard:providerCatalog\.import\.pricingAsOf/)).toBeNull();
+  });
+
+  it("says when the catalog price it wrote was fetched", async () => {
+    state.respond = () => ({ status: "ok", items: [row("vendor/pick")], nextCursor: null });
+    const fetchedAt = new Date("2026-09-26T12:00:00Z");
+    state.importResult = {
+      created: true,
+      restored: false,
+      pricing: "created",
+      priceTiered: false,
+      catalogFetchedAt: fetchedAt,
+      contextWindowDrift: null,
+      model: {},
+      compatibility: { verdict: "ok", block: [], warn: [] },
+    };
+    wrap(<ProviderCatalogImport providerAccountId="acct-1" />);
+    fireEvent.click(await screen.findByText("Name vendor/pick"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "dashboard:providerCatalog.import.action" }),
+    );
+    const time = new Intl.DateTimeFormat("en-US", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(fetchedAt);
+    await screen.findByText(
+      `dashboard:providerCatalog.import.pricingAsOf|${JSON.stringify({ time })}`,
+    );
+  });
+
+  it("gives the catalog search input a 44px touch target", async () => {
+    wrap(<ProviderCatalogPicker onSelect={vi.fn()} />);
+    const input = screen.getByLabelText("dashboard:providerCatalog.picker.label");
+    expect(input.className).toContain("h-full");
+    expect(input.closest("[data-slot='input-group']")?.className).toMatch(/(^|\s)h-11(\s|$)/);
+    expect(input.closest("[data-slot='input-group']")?.className).not.toMatch(/(^|\s)h-8(\s|$)/);
   });
 });
 

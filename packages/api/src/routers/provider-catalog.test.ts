@@ -409,6 +409,7 @@ describe("providerCatalog.importModel", () => {
       restored: false,
       pricing: "created",
       priceTiered: false,
+      catalogFetchedAt: fetchedAt,
       contextWindowDrift: null,
       compatibility: { verdict: "ok" },
     });
@@ -503,6 +504,7 @@ describe("providerCatalog.importModel", () => {
       restored: false,
       pricing: "unchanged",
       priceTiered: false,
+      catalogFetchedAt: null,
     });
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.providerModel.update).not.toHaveBeenCalled();
@@ -568,7 +570,11 @@ describe("providerCatalog.importModel", () => {
     stored = storedModel();
     active = [activeRow({ id: "mine", version: "my-price" })];
     const result = await importQwen();
-    expect(result).toMatchObject({ pricing: "userPricingKept", priceTiered: false });
+    expect(result).toMatchObject({
+      pricing: "userPricingKept",
+      priceTiered: false,
+      catalogFetchedAt: null,
+    });
     expect(db.providerPricingVersion.updateMany).not.toHaveBeenCalled();
     expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
     expect(db.providerModel.updateMany).not.toHaveBeenCalled();

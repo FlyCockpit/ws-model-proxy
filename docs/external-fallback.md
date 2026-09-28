@@ -131,6 +131,9 @@ follow-ups to locally served responses stay on their local member.
 
 ## Breaking changes in this release
 
+The consolidated upgrade notes, including deploy requirements and the grantee
+local-member fix, are in [`release-notes/next.md`](release-notes/next.md).
+
 - Plain pool names never leave the deployment. Provider-backed PRIMARY members
   were moved to the external fallback tier, and fallback was enabled on those
   pools. Pools with only provider members must be called as

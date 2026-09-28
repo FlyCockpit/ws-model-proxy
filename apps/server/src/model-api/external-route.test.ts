@@ -51,6 +51,7 @@ const pool: VisibleModelPoolTarget = {
   effectiveProviderEgress: true,
   providerAccountLabels: [],
   providerTypes: [],
+  externalRoutes: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };

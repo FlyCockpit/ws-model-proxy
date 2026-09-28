@@ -105,6 +105,7 @@ function catalogRow(model: CatalogModel, profile: PoolCatalogProfile | null) {
 
 export type ProviderCatalogRow = ReturnType<typeof catalogRow>;
 
+/** The catalog entry plus when this server fetched the snapshot it came from. */
 async function catalogModelOrThrow(catalog: ProviderCatalog, modelId: string) {
   const result = await catalog.get();
   if (result.status === "disabled")
@@ -123,7 +124,7 @@ async function catalogModelOrThrow(catalog: ProviderCatalog, modelId: string) {
       message: "That model is not in the provider catalog.",
       data: { reason: providerCatalogReasons.modelNotFound },
     });
-  return model;
+  return { model, fetchedAt: result.fetchedAt };
 }
 
 function assertNotBlocked(model: CatalogModel) {
@@ -378,7 +379,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
           select: { id: true },
         });
         if (!owned) throw missing();
-        const model = await catalogModelOrThrow(catalog, input.modelId);
+        const { model, fetchedAt } = await catalogModelOrThrow(catalog, input.modelId);
         assertNotBlocked(model);
         const nativeCapabilities = catalogNativeCapabilities(model) as Prisma.InputJsonValue;
         const rates = catalogRatesPerMillion(model);
@@ -534,6 +535,10 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
           // Only when this import wrote/refreshed catalog pricing (not kept,
           // scheduled, unchanged, or unknown).
           priceTiered: catalogPricingWritten && rates !== null && model.pricing.tiers.length > 0,
+          // When this server fetched the catalog snapshot the written price
+          // came from; null when this import wrote no catalog price. The
+          // upstream listing itself can be older than this.
+          catalogFetchedAt: catalogPricingWritten && rates !== null ? fetchedAt : null,
           compatibility: catalogCompatibility(model, null),
         };
       }),
@@ -566,7 +571,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
         if (!pool) throw missing();
         let compatibility: ReturnType<typeof catalogCompatibility> | null = null;
         if (input.modelId !== null) {
-          const model = await catalogModelOrThrow(catalog, input.modelId);
+          const { model } = await catalogModelOrThrow(catalog, input.modelId);
           assertNotBlocked(model);
           compatibility = catalogCompatibility(
             model,

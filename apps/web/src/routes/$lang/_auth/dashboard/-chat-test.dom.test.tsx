@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ComponentType, ReactNode } from "react";
+import { type ComponentType, cloneElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -89,7 +89,10 @@ vi.mock("@ws-model-proxy/ui/components/popover", () => ({
       {children}
     </div>
   ),
-  PopoverTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  PopoverTrigger: ({ children, render }: { children: ReactNode; render?: ReactElement }) =>
+    render ? cloneElement(render, undefined, children) : children,
+  PopoverTitle: ({ children }: { children: ReactNode }) => <h2>{children}</h2>,
+  PopoverDescription: ({ children }: { children: ReactNode }) => <p>{children}</p>,
 }));
 
 vi.mock("@ws-model-proxy/ui/components/drawer", () => ({
@@ -234,18 +237,32 @@ describe("Chat Test quick wins", () => {
         effectiveProviderEgress: true,
         providerAccountLabels: [],
         providerTypes: ["openrouter"],
+        externalRoutes: ["pool-fallback", "own-key"],
       },
     ];
     await act(async () => {
       mount();
     });
 
-    expect(screen.getAllByText("dashboard:pools.privacyBadge.external").length).toBeGreaterThan(0);
-    expect(screen.queryByText("dashboard:pools.privacyBadge.private")).toBeNull();
+    expect(screen.queryByText("dashboard:pools.fallbackBadge.local")).toBeNull();
     expect(screen.getByText("pool/demo:external")).toBeTruthy();
+    // The direct model is selected first: no pool badge beside the picker.
     expect(
-      screen.getAllByTitle("dashboard:pools.privacyBadge.hint: openrouter").length,
-    ).toBeGreaterThan(0);
+      screen.queryByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeNull();
+    // List options carry a static badge; selecting the pool shows the details button.
+    expect(screen.getAllByText("dashboard:pools.fallbackBadge.label").length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByText("pool/demo:external"));
+    // The details open on tap/click, outside the model combobox (no nested button).
+    const badge = await screen.findByRole("button", {
+      name: "dashboard:pools.fallbackBadge.label",
+    });
+    expect(badge.closest("[role='combobox']")).toBeNull();
+    fireEvent.click(badge);
+    expect(
+      await screen.findByText("dashboard:pools.fallbackBadge.routePoolFallback: openrouter"),
+    ).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackBadge.routeOwnKey")).toBeTruthy();
   });
 
   it.each([true, false])(
@@ -257,7 +274,7 @@ describe("Chat Test quick wins", () => {
         mount();
       });
 
-      expect(screen.getAllByText("dashboard:pools.privacyBadge.private").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("dashboard:pools.fallbackBadge.local").length).toBeGreaterThan(0);
       expect(screen.queryByText("pool/demo:external")).toBeNull();
       expect(screen.queryByText("dashboard:pools.fallbackDisabledDeployment") !== null).toBe(
         !enabled,

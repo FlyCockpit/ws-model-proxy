@@ -132,9 +132,12 @@ vi.mock("@/utils/orpc", () => {
   });
   return {
     orpc: {
-      deploymentFlags: query("deploymentFlags", () => ({
-        providerEgressEnabled: state.providerEgressEnabled,
-      })),
+      deploymentFlags: {
+        ...query("deploymentFlags", () => ({
+          providerEgressEnabled: state.providerEgressEnabled,
+        })),
+        key: () => ["deploymentFlags"],
+      },
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
         listCliDevices: query("devices", () => []),
@@ -230,12 +233,16 @@ describe("dedicated pool pages", () => {
 
     mount(<PoolsListPage lang="en-US" />);
 
-    expect(screen.getByText("dashboard:pools.privacyBadge.private")).toBeTruthy();
-    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackBadge.local")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
 
     cleanup();
     mount(<PoolDetailPage poolId="pool-external" />);
-    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
   });
 
   it("links the list edit action to the pool detail route instead of opening a sheet", () => {
@@ -437,6 +444,85 @@ describe("dedicated pool pages", () => {
       await waitFor(() => expect(toast.error).toHaveBeenCalled());
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", externalAfterWaitMs: 500 });
     });
+  });
+
+  it("says fallback is unavailable when the server refuses enabling it after the switch turned off", async () => {
+    // The form loaded with the switch on; it turned off before the save.
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.nextReject = {
+      name: "updateModelPool",
+      error: {
+        code: "NOT_FOUND",
+        status: 404,
+        message: "Provider egress is not enabled for this deployment.",
+        data: { reason: "PROVIDER_EGRESS_DISABLED" },
+      },
+    };
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "dashboard:pools.fallbackSettings.enableBlockedDeployment",
+      ),
+    );
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(state.mutationCalls).toEqual([
+      { name: "updateModelPool", variables: { id: "pool-1", fallbackEnabled: true } },
+    ]);
+  });
+
+  it("keeps the generic save error for a NOT_FOUND without the switch reason", async () => {
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.nextReject = {
+      name: "updateModelPool",
+      error: { code: "NOT_FOUND", status: 404, message: "Model pool not found." },
+    };
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(toast.error).not.toHaveBeenCalledWith(
+      "dashboard:pools.fallbackSettings.enableBlockedDeployment",
+    );
   });
 
   it("allows fallback withdrawal and wait-time edits when provider egress is off", async () => {

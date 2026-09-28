@@ -57,11 +57,20 @@ function CommandDialog({
 
 function CommandInput({
   className,
+  groupClassName,
   ...props
-}: React.ComponentProps<typeof CommandPrimitive.Input>) {
+}: React.ComponentProps<typeof CommandPrimitive.Input> & {
+  /** Classes for the input's row, e.g. `h-11` for a 44px touch target. */
+  groupClassName?: string;
+}) {
   return (
     <div data-slot="command-input-wrapper" className="border-b pb-0">
-      <InputGroup className="h-8 border-none border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:pl-2!">
+      <InputGroup
+        className={cn(
+          "h-8 border-none border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:pl-2!",
+          groupClassName,
+        )}
+      >
         <CommandPrimitive.Input
           data-slot="command-input"
           className={cn(

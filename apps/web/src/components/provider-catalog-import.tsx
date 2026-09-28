@@ -34,7 +34,7 @@ const pricingNoteKey = {
  * context, capabilities and an ACTIVE catalog price.
  */
 export function ProviderCatalogImport({ providerAccountId }: { providerAccountId: string }) {
-  const { t } = useTranslation(["dashboard"]);
+  const { t, i18n } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<ProviderCatalogRow | null>(null);
   const [notes, setNotes] = useState<string[]>([]);
@@ -52,6 +52,16 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
         if (pricingNote) next.push(t(pricingNote));
         // `priceTiered` is only true when this import wrote catalog pricing.
         if (result.priceTiered) next.push(t("dashboard:providerCatalog.import.pricingTiered"));
+        // The written price is immutable; say how fresh the catalog copy was.
+        if (result.catalogFetchedAt)
+          next.push(
+            t("dashboard:providerCatalog.import.pricingAsOf", {
+              time: new Intl.DateTimeFormat(i18n.language, {
+                dateStyle: "medium",
+                timeStyle: "short",
+              }).format(new Date(result.catalogFetchedAt)),
+            }),
+          );
         if (result.contextWindowDrift)
           next.push(
             t("dashboard:providerCatalog.import.contextDrift", {

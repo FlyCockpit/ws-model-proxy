@@ -623,6 +623,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       effectiveProviderEgress: pool.effectiveProviderEgress,
       providerAccountLabels: pool.providerAccountLabels,
       providerTypes: pool.providerTypes,
+      externalRoutes: pool.externalRoutes,
       compatibility: serializedPools.get(pool.id)?.compatibility ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
@@ -2509,7 +2510,8 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
+      if (input.fallbackEnabled === true)
+        assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
       assertExternalAfterWaitWithinBudget({
         externalAfterWaitMs: input.externalAfterWaitMs,
         currentExternalAfterWaitMs: null,
@@ -2668,7 +2670,8 @@ export const forwarderManagementRouter = {
       // the runtime stops using them). Turning it ON needs the deployment
       // switch and audited protection policies on every external member. No
       // separate acknowledgement: callers opt in per request with `:external`.
-      if (input.fallbackEnabled === true) assertProviderEgressReleaseGate();
+      if (input.fallbackEnabled === true)
+        assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
       assertExternalAfterWaitWithinBudget({
         externalAfterWaitMs: input.externalAfterWaitMs,
         currentExternalAfterWaitMs: existing.externalAfterWaitMs,

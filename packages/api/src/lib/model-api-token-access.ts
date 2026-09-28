@@ -71,9 +71,17 @@ export type VisibleModelPoolTarget = {
   providerAccountLabels: string[];
   /** Coarse provider types only while this viewer is eligible. */
   providerTypes: string[];
+  /**
+   * External routes `owner/pool:external` can take for this viewer (display
+   * only; the send path re-checks everything): the pool's own fallback
+   * members, and for grantees their own provider key.
+   */
+  externalRoutes: ExternalRouteKind[];
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
+
+export type ExternalRouteKind = "pool-fallback" | "own-key";
 
 export type VisibleModelTargets = {
   directModels: VisibleDirectModelTarget[];
@@ -168,6 +176,18 @@ function serializeModelPool(
   viewerUserId: string,
   accessGrantId: string | null = null,
 ): VisibleModelPoolTarget {
+  const disclosure = poolProviderDisclosure({
+    isOwner: row.userId === viewerUserId,
+    hasLiveGrant: Boolean(accessGrantId),
+    providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+    fallbackEnabled: row.fallbackEnabled,
+    fallbackForGrantees: row.fallbackForGrantees,
+    members: (row.PoolMembers ?? []).map((member) => ({
+      tier: member.tier,
+      accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label,
+      providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
+    })),
+  });
   return {
     target: "MODEL_POOL",
     id: row.id,
@@ -185,18 +205,8 @@ function serializeModelPool(
     fallbackForGrantees: row.fallbackForGrantees,
     externalEquivalentModel: row.externalEquivalentModel,
     externalMemberCount: (row.PoolMembers ?? []).length,
-    ...poolProviderDisclosure({
-      isOwner: row.userId === viewerUserId,
-      hasLiveGrant: Boolean(accessGrantId),
-      providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
-      fallbackEnabled: row.fallbackEnabled,
-      fallbackForGrantees: row.fallbackForGrantees,
-      members: (row.PoolMembers ?? []).map((member) => ({
-        tier: member.tier,
-        accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label,
-        providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
-      })),
-    }),
+    ...disclosure,
+    externalRoutes: disclosure.effectiveProviderEgress ? ["pool-fallback"] : [],
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };
@@ -254,16 +264,16 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
   const grantedPools = grantedPoolRows.map((grant) => {
     const pool = serializeModelPool(grant.ModelPool, userId, grant.id);
     const ownKeyProviderModelId = grant.FallbackPreferences?.[0]?.providerModelId ?? null;
+    const ownKey = Boolean(
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+        pool.externalEquivalentModel &&
+        ownKeyProviderModelId,
+    );
     return {
       ...pool,
       ownKeyProviderModelId,
-      effectiveProviderEgress:
-        pool.effectiveProviderEgress ||
-        Boolean(
-          env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
-            pool.externalEquivalentModel &&
-            ownKeyProviderModelId,
-        ),
+      effectiveProviderEgress: pool.effectiveProviderEgress || ownKey,
+      externalRoutes: ownKey ? [...pool.externalRoutes, "own-key" as const] : pool.externalRoutes,
     };
   });
 

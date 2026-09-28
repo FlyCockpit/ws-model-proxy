@@ -276,7 +276,9 @@ describe("OverviewPage", () => {
     expect(document.body.textContent).not.toMatch(/\d pp\b/);
     // No shared-pool usage: the section is not rendered.
     expect(screen.queryByRole("heading", { name: "overview.shared.title" })).toBeNull();
-    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
   });
 
   it("shows the viewer's own usage of shared pools without owner member details", async () => {
@@ -311,7 +313,9 @@ describe("OverviewPage", () => {
     const shared = within(section).getByText("Team GPUs").closest("tr")!;
     expect(within(shared).getByText('overview.shared.owner:{"owner":"alice"}')).toBeTruthy();
     expect(within(shared).getByText("7")).toBeTruthy();
-    expect(within(shared).getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(
+      within(shared).getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
     expect(within(section).getByText("overview.shared.unavailable")).toBeTruthy();
     // Shared usage alone is traffic for the viewer: no empty-range message.
     expect(screen.queryByText("overview.empty.title")).toBeNull();
