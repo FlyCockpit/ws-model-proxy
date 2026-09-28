@@ -692,6 +692,24 @@ try {
        "selectedDiscoveredModelId", "selectedExecutionTargetId")
     VALUES ('invalid-preexisting-stickiness', NOW(), NOW(), 'owner-b', 'invalid',
       'model-b', 'preexisting-target-a', 'model-b', 'preexisting-target-a');
+    -- Local (v2) pool bindings predating the triggers: the owner without a
+    -- grant and a grantee with the exact grant are valid; a grantee without a
+    -- grant, or with a grant for another pool, is not.
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest", "routingVersion",
+       "targetModelPoolId", "poolGrantId", "selectedDiscoveredModelId",
+       "selectedExecutionTargetId", "expiresAt")
+    VALUES
+      ('pre-v2-owner-binding', NOW(), NOW(), 'owner-a', 'pre-v2-owner', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', NOW() + INTERVAL '1 hour'),
+      ('pre-v2-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-v2-grantee', 2,
+        'pre-provider-pool', 'pre-provider-grant', 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-ungranted-binding', NOW(), NOW(), 'owner-b', 'pre-v2-ungranted', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', NOW() + INTERVAL '1 hour'),
+      ('pre-v2-foreign-grant-binding', NOW(), NOW(), 'owner-b', 'pre-v2-foreign-grant', 2,
+        'conflict-pool', 'pre-provider-grant', 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour');
     INSERT INTO relay_request
       (id, "createdAt", "updatedAt", "userId", "requestedDiscoveredModelId",
        "requestedExecutionTargetId", "selectedDiscoveredModelId",
@@ -714,7 +732,10 @@ try {
         "invalid-preexisting-stickiness",
         "invalid-preexisting-relay",
         "pre-invalid-cross-wire",
-      ].every((id) => error?.detail?.includes(id))
+        "stickiness pool grant row=pre-v2-ungranted-binding",
+        "stickiness pool grant row=pre-v2-foreign-grant-binding",
+      ].every((id) => error?.detail?.includes(id)) ||
+      ["pre-v2-owner-binding", "pre-v2-grantee-binding"].some((id) => error?.detail?.includes(id))
     ) {
       throw error;
     }
@@ -744,11 +765,20 @@ try {
     DELETE FROM model_api_token_allowlist_entry WHERE id = 'invalid-preexisting-access'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'invalid-preexisting-stickiness'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-ungranted-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-foreign-grant-binding'; -- policy: bounded-delete
     DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay'; -- policy: bounded-delete
   `);
 
   await client.query(sql);
   await client.query(sql);
+  const preservedV2Bindings = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id IN ('pre-v2-owner-binding', 'pre-v2-grantee-binding')
+  `);
+  if (preservedV2Bindings.rows[0]?.count !== 2) {
+    throw new Error("Hardening did not keep valid pre-existing local pool bindings");
+  }
   const constraint = await client.query(`
     SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
      WHERE conrelid = 'execution_target'::regclass

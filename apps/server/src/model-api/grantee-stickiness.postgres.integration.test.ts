@@ -2,6 +2,7 @@ import type { VisibleModelPoolTarget } from "@ws-model-proxy/api/lib/model-api-t
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
+import type { StoreCapacityAdmissionRuntime } from "./capacity/runtime.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -31,6 +32,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
     process.env.DATABASE_URL = databaseUrl;
     const db = createPrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
+    let runtime: StoreCapacityAdmissionRuntime | undefined;
     const user = (label: string) =>
       db.user.create({ data: { name: label, email: `${label}-${suffix}@example.test` } });
     const owner = await user("stick-owner");
@@ -160,7 +162,36 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         poolGrantId: null,
         selectedExecutionTargetId: memberB.target.id,
       });
+      // Membership is checked when a selection is written, not re-checked on
+      // later writes: after the member is removed, re-writing the unchanged
+      // binding (the application's upsert) and an update that keeps its
+      // selection still succeed, while selecting that target anew fails.
+      await db.poolMember.delete({ where: { id: poolMembers.get(memberB.cli.id)! } });
+      await db.responseStickinessRecord.update({
+        where: { id: ownerBinding.id },
+        data: {
+          routingVersion: 2,
+          targetModelPoolId: pool.id,
+          poolGrantId: null,
+          selectedExecutionTargetId: memberB.target.id,
+        },
+      });
+      await db.responseStickinessRecord.update({
+        where: { id: ownerBinding.id },
+        data: { routingVersion: 1 },
+      });
+      await expect(
+        binding({
+          userId: owner.id,
+          poolGrantId: null,
+          selectedExecutionTargetId: memberB.target.id,
+        }),
+      ).rejects.toThrow(/stickiness selection must be a local member of its pool/);
       await db.responseStickinessRecord.delete({ where: { id: ownerBinding.id } });
+      const readdedB = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: memberB.target.id, healthStatus: "HEALTHY" },
+      });
+      poolMembers.set(memberB.cli.id, readdedB.id);
 
       vi.doMock("@ws-model-proxy/db", async () => {
         const actual =
@@ -213,6 +244,13 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       const { chatTestCompletionsHandler, responsesCreateHandler } = await import("./routes.js");
       const { ModelApiConcurrencyLimiter } = await import("./limits.js");
       const { RelaySessionManager } = await import("../relay/session-manager.js");
+      const { PostgresCapacityAdmissionStore } = await import("./capacity/postgres-store.js");
+      const { StoreCapacityAdmissionRuntime } = await import("./capacity/runtime.js");
+      // The production admission runtime: pool follow-ups must name their pool.
+      const capacityRuntime = new StoreCapacityAdmissionRuntime(
+        new PostgresCapacityAdmissionStore(db, `grantee-stickiness-${suffix}`),
+      );
+      runtime = capacityRuntime;
       const { reconcileStaleLocalRelayTelemetry } = await import("./relay-telemetry-recovery.js");
       const { prepareParentDeletion } = await import("@ws-model-proxy/db/parent-deletion");
       const { lockCapacityGraphForDelete, runCapacityOrderedTransaction } = await import(
@@ -249,7 +287,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         finishResponse(attemptId, body);
       };
       const nextSend = async () => {
-        await vi.waitFor(() => expect(sent).toHaveBeenCalledOnce());
+        await vi.waitFor(() => expect(sent).toHaveBeenCalledOnce(), { timeout: 10_000 });
         const call = sent.mock.calls[0]![0];
         sent.mockClear();
         const attempt = await db.relayExecutionAttempt.findUniqueOrThrow({
@@ -267,6 +305,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           manager,
           limiter,
           chatTestUserId: grantee.id,
+          capacityRuntime,
         });
       const servedMember = async (relayRequestId: string) =>
         (await db.relayRequest.findUniqueOrThrow({ where: { id: relayRequestId } }))
@@ -281,17 +320,16 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       const createResponse = await createPromise;
       expect(createResponse.status).toBe(200);
       await createResponse.text();
-      await vi.waitFor(async () =>
-        expect(
-          await db.responseStickinessRecord.findFirst({
-            where: { userId: grantee.id, routingVersion: 2, NOT: { id: accepted.id } },
-          }),
-        ).toMatchObject({
-          targetModelPoolId: pool.id,
-          poolGrantId: grant.id,
-          selectedExecutionTargetId: expect.any(String),
+      // The binding is durable before the client sees the end of the response.
+      expect(
+        await db.responseStickinessRecord.findFirst({
+          where: { userId: grantee.id, routingVersion: 2, NOT: { id: accepted.id } },
         }),
-      );
+      ).toMatchObject({
+        targetModelPoolId: pool.id,
+        poolGrantId: grant.id,
+        selectedExecutionTargetId: expect.any(String),
+      });
 
       // 2. Its follow-ups stick to the member (and backend) that stored it.
       for (const [index, previous] of ["resp_grantee_1", "resp_grantee_2"].entries()) {
@@ -311,18 +349,30 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
             await db.relayRequest.findUniqueOrThrow({ where: { id: follow.relayRequestId } }),
           ).toMatchObject({ status: "SUCCEEDED", resourceOwnerUserId: owner.id }),
         );
-        await vi.waitFor(async () =>
-          expect(
-            await db.responseStickinessRecord.count({
-              where: { userId: grantee.id, poolGrantId: grant.id },
-            }),
-          ).toBe(index + 3),
-        );
+        expect(
+          await db.responseStickinessRecord.count({
+            where: { userId: grantee.id, poolGrantId: grant.id },
+          }),
+        ).toBe(index + 3);
       }
 
-      // 3. Revoking the grant removes every binding it created; the follow-up
-      //    is then refused without reaching a member.
-      await db.poolGrant.delete({ where: { id: grant.id } });
+      // 3. Revoking the grant removes every binding it created. A follow-up
+      //    resolved before the revoke and admitted after it is refused at the
+      //    send boundary, without reaching a member.
+      const acquire = capacityRuntime.acquire.bind(capacityRuntime);
+      vi.spyOn(capacityRuntime, "acquire").mockImplementationOnce(async (attempt, signal) => {
+        const admitted = await acquire(attempt, signal);
+        expect(admitted.state).toBe("ADMITTED");
+        await db.poolGrant.delete({ where: { id: grant.id } });
+        return admitted;
+      });
+      const revokedInFlight = await responses({
+        previous_response_id: "resp_grantee_3",
+        input: "during admission",
+      });
+      expect(revokedInFlight.status).toBe(404);
+      await revokedInFlight.text();
+      expect(sent).not.toHaveBeenCalled();
       expect(
         await db.responseStickinessRecord.count({
           where: { userId: grantee.id, targetModelPoolId: pool.id },
@@ -337,14 +387,40 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       await revoked.text();
       expect(sent).not.toHaveBeenCalled();
 
-      // 4. P3C-2: a grantee request in flight when its pool is deleted.
+      // 4. P3C-2: a grantee request in flight when its pool is deleted. A
+      //    pool with capacity lease history cannot be deleted (it is retained
+      //    history), so this runs on a pool without admission history.
+      const inflightPool = await db.modelPool.create({
+        data: { userId: owner.id, name: "Inflight", slug: `inflight-${suffix}` },
+      });
+      const inflightGrant = await db.poolGrant.create({
+        data: { poolId: inflightPool.id, ownerUserId: owner.id, granteeUserId: grantee.id },
+      });
+      for (const local of [memberA, memberB])
+        await db.poolMember.create({
+          data: {
+            poolId: inflightPool.id,
+            executionTargetId: local.target.id,
+            healthStatus: "HEALTHY",
+          },
+        });
+      visiblePools = [
+        {
+          ...visiblePool,
+          id: inflightPool.id,
+          modelId: "owner/inflight",
+          name: inflightPool.name,
+          poolSlug: inflightPool.slug,
+          accessGrantId: inflightGrant.id,
+        },
+      ];
       const chat = () =>
         chatTestCompletionsHandler({
           request: new Request("https://proxy.example.test/chat/completions", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
-              model: "owner/shared",
+              model: "owner/inflight",
               messages: [{ role: "user", content: "test" }],
             }),
           }),
@@ -363,7 +439,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       });
       expect(pending).toMatchObject({
         userId: grantee.id,
-        requestedModelPoolId: pool.id,
+        requestedModelPoolId: inflightPool.id,
         resourceOwnerUserId: owner.id,
         status: "PENDING",
         selectedPoolMemberId: expect.any(String),
@@ -374,7 +450,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         data: {
           userId: grantee.id,
           source: "CHAT_TEST",
-          requestedModelPoolId: pool.id,
+          requestedModelPoolId: inflightPool.id,
           fallbackRoute: "local",
           status: "PENDING",
         },
@@ -396,7 +472,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         data: {
           userId: grantee.id,
           source: "CHAT_TEST",
-          requestedModelPoolId: pool.id,
+          requestedModelPoolId: inflightPool.id,
           fallbackRoute: "own-key",
           status: "PENDING",
         },
@@ -412,10 +488,10 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
 
       // The production delete path: drain (terminal rows only), then the
       // ordered final delete whose SET NULL cascade detaches the PENDING rows.
-      await prepareParentDeletion(db, { userId: owner.id, poolIds: [pool.id] });
+      await prepareParentDeletion(db, { userId: owner.id, poolIds: [inflightPool.id] });
       await runCapacityOrderedTransaction(db, async (tx) => {
-        await lockCapacityGraphForDelete(tx, { userId: owner.id, poolIds: [pool.id] });
-        await tx.modelPool.delete({ where: { id: pool.id } });
+        await lockCapacityGraphForDelete(tx, { userId: owner.id, poolIds: [inflightPool.id] });
+        await tx.modelPool.delete({ where: { id: inflightPool.id } });
       });
       expect(
         await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
@@ -496,7 +572,8 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           );
       // Pool deleted in flight (success) and crash-recovered (failure): owner.
       // Responses traffic before the delete also belongs to the owner.
-      expect(byOwner(owner.id)).toMatchObject({ successes: 4, errors: 1 });
+      // The follow-up refused at the send boundary is a failure on the owner.
+      expect(byOwner(owner.id)).toMatchObject({ successes: 4, errors: 2 });
       expect(
         rollups.find((row) => row.ownerUserId === owner.id && row.poolId === "")?.successes,
       ).toBe(1);
@@ -534,9 +611,126 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       });
       expect(await db.usageRollupMinute.count({ where: { ownerUserId: lateOwner.id } })).toBe(0);
     } finally {
-      await db.user.deleteMany({
-        where: { id: { in: [owner.id, grantee.id, stranger.id, secondGrantee.id] } },
+      await runtime?.close();
+      // Capacity lease rows keep immutable target history through RESTRICT
+      // foreign keys, so these users stay in the disposable validation
+      // database (as in the capacity PG suites); no live admission state leaks.
+      expect(await db.capacityLease.count({ where: { state: "ACTIVE" } })).toBe(0);
+      await db.$disconnect();
+    }
+  }, 60_000);
+
+  it("deletes a pool owner's account while a grantee binding and an in-flight grantee request remain", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = (label: string) =>
+      db.user.create({ data: { name: label, email: `${label}-${suffix}@example.test` } });
+    const owner = await user("delete-owner");
+    const grantee = await user("delete-grantee");
+    try {
+      const { requestUserDeletion, prepareParentDeletion } = await import(
+        "@ws-model-proxy/db/parent-deletion"
+      );
+      const { deleteUserInCapacityLockOrder } = await import(
+        "@ws-model-proxy/db/capacity-lock-order"
+      );
+      const pool = await db.modelPool.create({
+        data: { userId: owner.id, name: "Doomed", slug: `doomed-${suffix}` },
       });
+      const grant = await db.poolGrant.create({
+        data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: grantee.id },
+      });
+      const cli = await db.cliDevice.create({
+        data: { userId: owner.id, slug: `doomed-${suffix}`, status: "CONNECTED" },
+      });
+      const endpoint = await db.endpoint.create({
+        data: {
+          userId: owner.id,
+          cliDeviceId: cli.id,
+          slug: `doomed-${suffix}`,
+          label: "doomed",
+          status: "ONLINE",
+          capabilityMetadata: localCapabilities,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: owner.id,
+          endpointId: endpoint.id,
+          upstreamModelId: "doomed-model",
+          encodedModelId: "doomed-model",
+        },
+      });
+      const target = await db.executionTarget.findUniqueOrThrow({
+        where: { discoveredModelId: model.id },
+      });
+      const member = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: target.id, healthStatus: "HEALTHY" },
+      });
+      // A grantee request in flight, served by the owner's member.
+      const inflight = await db.relayRequest.create({
+        data: {
+          userId: grantee.id,
+          source: "CHAT_TEST",
+          requestedModelPoolId: pool.id,
+          fallbackRoute: "local",
+          status: "PENDING",
+          selectedDiscoveredModelId: model.id,
+          selectedExecutionTargetId: target.id,
+          selectedPoolMemberId: member.id,
+        },
+      });
+      expect(inflight.resourceOwnerUserId).toBe(owner.id);
+
+      // The production whole-account deletion: mark, drain, final delete. A
+      // grantee binding committed after the drain reaches the final cascade.
+      const mark = await requestUserDeletion(db, owner.id);
+      if (!mark) throw new Error("deletion mark was not taken");
+      await prepareParentDeletion(
+        db,
+        { userId: owner.id, wholeUser: true },
+        { owner: { userId: owner.id, generation: mark.generation } },
+      );
+      await db.responseStickinessRecord.create({
+        data: {
+          userId: grantee.id,
+          routingKeyDigest: `late-${suffix}`,
+          routingVersion: 2,
+          targetModelPoolId: pool.id,
+          poolGrantId: grant.id,
+          selectedExecutionTargetId: target.id,
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      });
+      expect(await deleteUserInCapacityLockOrder(db, owner.id, mark.generation)).toBe(true);
+      expect(await db.user.count({ where: { id: owner.id } })).toBe(0);
+      expect(await db.responseStickinessRecord.count({ where: { userId: grantee.id } })).toBe(0);
+
+      // The late finalizer re-writes the owner's (now deleted) selection: it is
+      // dropped, and the status commits with the durable owner kept.
+      await db.relayRequest.update({
+        where: { id: inflight.id },
+        data: {
+          status: "SUCCEEDED",
+          completedAt: new Date(),
+          selectedDiscoveredModelId: model.id,
+          selectedExecutionTargetId: target.id,
+          selectedPoolMemberId: member.id,
+        },
+      });
+      expect(await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.id } })).toMatchObject(
+        {
+          status: "SUCCEEDED",
+          requestedModelPoolId: null,
+          resourceOwnerUserId: owner.id,
+          selectedDiscoveredModelId: null,
+          selectedExecutionTargetId: null,
+          selectedPoolMemberId: null,
+        },
+      );
+    } finally {
+      await db.user.deleteMany({ where: { id: { in: [owner.id, grantee.id] } } });
       await db.$disconnect();
     }
   }, 60_000);

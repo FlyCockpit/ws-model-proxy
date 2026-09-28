@@ -1547,6 +1547,26 @@ BEGIN
     -- graph, like a pool relay_request: the requester is the owner (no grant)
     -- or holds the exact grant, whose deletion cascades the binding away.
     -- Without a pool the binding is direct and the requester owns the target.
+    -- These are write-time rules. An UPDATE that changes no identity column
+    -- and at most clears a reference (such as the SET NULL action of a
+    -- deleted discovered model while the pool owner's whole account is
+    -- deleted in one cascade, after its pool and grant rows are gone)
+    -- authorizes nothing new, so it is not re-checked.
+    IF TG_OP = 'UPDATE'
+       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+       AND NEW."routingVersion" IS NOT DISTINCT FROM OLD."routingVersion"
+       AND NEW."targetModelPoolId" IS NOT DISTINCT FROM OLD."targetModelPoolId"
+       AND NEW."poolGrantId" IS NOT DISTINCT FROM OLD."poolGrantId"
+       AND (NEW."targetExecutionTargetId" IS NULL
+            OR NEW."targetExecutionTargetId" IS NOT DISTINCT FROM OLD."targetExecutionTargetId")
+       AND (NEW."targetDiscoveredModelId" IS NULL
+            OR NEW."targetDiscoveredModelId" IS NOT DISTINCT FROM OLD."targetDiscoveredModelId")
+       AND (NEW."selectedExecutionTargetId" IS NULL
+            OR NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId")
+       AND (NEW."selectedDiscoveredModelId" IS NULL
+            OR NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId") THEN
+      RETURN NEW;
+    END IF;
     consumer_owner := NEW."userId";
     IF NEW."targetModelPoolId" IS NOT NULL THEN
       SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."targetModelPoolId";
@@ -1630,12 +1650,15 @@ BEGIN
        AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
        AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
        AND (NEW."selectedExecutionTargetId" IS NOT NULL OR NEW."selectedPoolMemberId" IS NOT NULL) THEN
+      -- A target that no longer exists (deleted with the owner's account or
+      -- device) can never be persisted either, so it is dropped the same way.
       target_owner := NULL;
       IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
         SELECT "userId" INTO target_owner
           FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
       END IF;
       IF NEW."selectedExecutionTargetId" IS NULL
+         OR target_owner IS NULL
          OR target_owner IS NOT DISTINCT FROM NEW."resourceOwnerUserId" THEN
         NEW."selectedExecutionTargetId" := NULL;
         NEW."selectedDiscoveredModelId" := NULL;
