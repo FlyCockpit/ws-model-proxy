@@ -85,6 +85,7 @@ describe("relay maintenance", () => {
     // Advance to the 60 s tick: the last stale sweep and the recheck are both
     // still running (the earlier stale sweeps shared the same pending promise).
     await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
+    expect(deps.relaySessions.checkStaleSessions).toHaveBeenCalled();
     expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
     let stopped = false;
     const stopping = stop().then(() => {
@@ -94,6 +95,7 @@ describe("relay maintenance", () => {
     await vi.advanceTimersByTimeAsync(10 * CLI_COMMAND_SWEEP_INTERVAL_MS);
     expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
     expect(stopped).toBe(false);
+    // Settling the stale sweep alone leaves the pending recheck holding stop.
     stale.resolve(undefined);
     await vi.advanceTimersByTimeAsync(0);
     expect(stopped).toBe(false);
@@ -102,6 +104,32 @@ describe("relay maintenance", () => {
     await stopping;
     expect(stopped).toBe(true);
     expect(errors).toHaveBeenCalledWith("[server] terminal session recheck failed", "TypeError");
+  });
+
+  it("stop stays pending while only the stale-session sweep is still running", async () => {
+    const deps = fakes();
+    const stale = Promise.withResolvers<undefined>();
+    const recheck = Promise.withResolvers<undefined>();
+    deps.relaySessions.checkStaleSessions.mockReturnValue(stale.promise);
+    deps.terminalHub.recheckSessions.mockReturnValue(recheck.promise);
+    const stop = startRelayMaintenance(deps);
+    // Advance to the 60 s tick: the last stale sweep and the recheck are both
+    // still running (the earlier stale sweeps shared the same pending promise).
+    await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
+    expect(deps.relaySessions.checkStaleSessions).toHaveBeenCalled();
+    expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
+    let stopped = false;
+    const stopping = stop().then(() => {
+      stopped = true;
+    });
+    // The recheck settling alone must not let stop resolve: the stale sweep is
+    // still using the database client, so it has to keep stop open too.
+    recheck.resolve(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopped).toBe(false);
+    stale.resolve(undefined);
+    await stopping;
+    expect(stopped).toBe(true);
   });
 
   it("a sweep that throws synchronously is logged and does not stall stop", async () => {
