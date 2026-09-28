@@ -16,8 +16,8 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   drain and relay close short. Use `docker stop -t 52`, compose
   `stop_grace_period: 52s`, or your platform's equivalent. See
   [README "Deployment requirements"](../../README.md#deployment-requirements).
-- **Database sessions are forced to UTC.** Every connection sets
-  `TimeZone=UTC` on connect. Raw-SQL clocks (`now()`, `clock_timestamp()`) are
+- **Database sessions are forced to UTC.** Every Prisma connection (all
+  application queries) sets `TimeZone=UTC` on connect. Raw-SQL clocks (`now()`, `clock_timestamp()`) are
   compared with JavaScript-written `timestamp without time zone` columns and
   depend on it.
 - **Transaction-mode poolers are unsupported.** PgBouncer

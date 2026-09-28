@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -41,14 +41,60 @@ describe("PoolFallbackBadge", () => {
     expect(screen.getByText("dashboard:pools.fallbackBadge.consent")).toBeTruthy();
   });
 
-  it("opens from the keyboard", async () => {
+  it("opens on keyboard focus alone and keeps focus on the badge", async () => {
     const user = userEvent.setup();
     render(<PoolFallbackBadge routes={["own-key"]} />);
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: LABEL }));
-    await user.keyboard("{Enter}");
+    const badge = screen.getByRole("button", { name: LABEL });
+    expect(document.activeElement).toBe(badge);
     expect(await screen.findByText("dashboard:pools.fallbackBadge.routeOwnKey")).toBeTruthy();
+    expect(badge.getAttribute("aria-expanded")).toBe("true");
+    expect(document.activeElement).toBe(badge);
     expect(screen.queryByText(/routePoolFallback/)).toBeNull();
+  });
+
+  it("closes on Escape without reopening from the returned focus", async () => {
+    const user = userEvent.setup();
+    render(<PoolFallbackBadge routes={["own-key"]} />);
+    await user.tab();
+    const badge = screen.getByRole("button", { name: LABEL });
+    await screen.findByText("dashboard:pools.fallbackBadge.routeOwnKey");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("false"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(badge.getAttribute("aria-expanded")).toBe("false");
+    // Enter still toggles it from the keyboard.
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
+  });
+
+  it("reopens on focus after tabbing away and back", async () => {
+    const user = userEvent.setup();
+    render(
+      <>
+        <PoolFallbackBadge routes={["own-key"]} />
+        <button type="button">next</button>
+      </>,
+    );
+    await user.tab();
+    const badge = screen.getByRole("button", { name: LABEL });
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("false"));
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "next" }));
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(badge);
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
+  });
+
+  it("opens once on a pointer press instead of focus-opening and click-closing", async () => {
+    const user = userEvent.setup();
+    render(<PoolFallbackBadge routes={["own-key"]} />);
+    const badge = screen.getByRole("button", { name: LABEL });
+    await user.click(badge);
+    await waitFor(() => expect(badge.getAttribute("aria-expanded")).toBe("true"));
+    expect(screen.getByText("dashboard:pools.fallbackBadge.routeOwnKey")).toBeTruthy();
   });
 
   it("names no provider when the viewer may not see any", async () => {

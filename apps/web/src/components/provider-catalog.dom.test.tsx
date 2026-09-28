@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   importResult: {} as Record<string, unknown>,
   equivalent: { externalEquivalentModel: null as string | null, providerEgressEnabled: true },
   sets: [] as Array<Record<string, unknown>>,
+  importGate: null as Promise<void> | null,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -33,6 +34,7 @@ vi.mock("@/utils/orpc", () => {
       ...options,
       mutationFn: async (input: Record<string, unknown>) => {
         state[sink].push(input);
+        if (sink === "imports" && state.importGate) await state.importGate;
         return result();
       },
     }),
@@ -126,6 +128,7 @@ afterEach(() => {
   state.searchCalls = [];
   state.imports = [];
   state.sets = [];
+  state.importGate = null;
   state.respond = () => ({ status: "ok", items: [], nextCursor: null });
   state.equivalent = { externalEquivalentModel: null, providerEgressEnabled: true };
 });
@@ -351,6 +354,43 @@ describe("ProviderCatalogImport", () => {
     await screen.findByText(
       `dashboard:providerCatalog.import.pricingAsOf|${JSON.stringify({ time })}`,
     );
+  });
+
+  it("does not show a late import's notes under a model picked while it was pending", async () => {
+    const { toast } = await import("@ws-model-proxy/ui/components/sileo");
+    let release: () => void = () => undefined;
+    state.importGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    state.respond = () => ({
+      status: "ok",
+      items: [row("vendor/first"), row("vendor/second")],
+      nextCursor: null,
+    });
+    state.importResult = {
+      created: true,
+      restored: false,
+      pricing: "created",
+      priceTiered: false,
+      catalogFetchedAt: new Date("2026-09-26T12:00:00Z"),
+      contextWindowDrift: null,
+      model: {},
+      compatibility: { verdict: "ok", block: [], warn: [] },
+    };
+    vi.mocked(toast.success).mockClear();
+    wrap(<ProviderCatalogImport providerAccountId="acct-1" />);
+    fireEvent.click(await screen.findByText("Name vendor/first"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "dashboard:providerCatalog.import.action" }),
+    );
+    await waitFor(() => expect(state.imports).toHaveLength(1));
+    fireEvent.click(screen.getByText("Name vendor/second"));
+    release();
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:providerCatalog.import.success"),
+    );
+    expect(state.imports).toEqual([{ providerAccountId: "acct-1", modelId: "vendor/first" }]);
+    expect(screen.queryByText(/dashboard:providerCatalog\.import\.pricingAsOf/)).toBeNull();
   });
 
   it("gives the catalog search input a 44px touch target", async () => {
