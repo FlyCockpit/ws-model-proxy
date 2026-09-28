@@ -685,7 +685,7 @@ fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> 
         });
         for (index, engine) in detected {
             // A failed re-detection keeps the facts the last probe found.
-            if engine.kind.is_none() && engine.model_max_len.is_empty() {
+            if !re_detection_replaces_stored(&engine) {
                 continue;
             }
             if let Some(probe) = refreshed.endpoints[index].last_probe.as_mut() {
@@ -694,6 +694,17 @@ fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> 
         }
     }
     inventory_snapshot_from_config(&refreshed)
+}
+
+/// Whether a fast-path re-detection should replace the stored engine facts.
+/// The `model_max_len` map is seeded from the stored snapshot (the fast path
+/// never fetches `/v1/models`), so its emptiness says nothing about the probe
+/// result. A re-detection that found no kind found no facts of its own and
+/// must not wipe what the last full probe stored. Mirrors
+/// [`crate::probe::apply_probe_report`], which keeps previous facts on an
+/// offline probe; stale facts stay bounded by the stored `engineFactsAt`.
+fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
+    engine.kind.is_some()
 }
 
 /// Probe a stable desired snapshot without holding the config lock across
@@ -3518,6 +3529,26 @@ mod tests {
             modified_at + Duration::from_secs(1),
             Some(&revision),
         ));
+    }
+
+    #[test]
+    fn a_re_detection_that_found_no_kind_keeps_the_stored_engine_facts() {
+        // The fast path seeds `model_max_len` from the stored snapshot, so a
+        // probe that found nothing still carries model-level facts. It must
+        // not be treated as a successful detection: that wiped kind/slots/
+        // kvTokens on the server for the rest of the session (G1b-1).
+        let found_nothing_but_seeded = crate::engine::DetectedEngine {
+            kind: None,
+            model_max_len: std::collections::BTreeMap::from([("m".to_string(), 32768)]),
+            ..crate::engine::DetectedEngine::default()
+        };
+        assert!(!re_detection_replaces_stored(&found_nothing_but_seeded));
+
+        let re_detected = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::Vllm),
+            ..crate::engine::DetectedEngine::default()
+        };
+        assert!(re_detection_replaces_stored(&re_detected));
     }
 
     #[test]

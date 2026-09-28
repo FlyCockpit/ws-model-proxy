@@ -36,13 +36,39 @@ pub const NODE_DISK_MAX: usize = 16;
 /// The fatal error for a `protocol.error` that arrives before `hello.ok`.
 /// An older server rejects the newer hello as malformed; say so plainly.
 pub fn hello_rejection_message(message: &str) -> String {
-    if message == OLDER_SERVER_HELLO_REJECTION {
+    // A pre-2.6 server answers "Malformed relay protocol message.". A 2.6
+    // server pre-checks the hello, answers its own upgrade-required text
+    // naming its (older) protocol, and never reaches its strict schema.
+    // Only the named version _older than_ ours means the server is behind;
+    // a future server naming a newer protocol leaves the message intact.
+    let server_too_old = message == OLDER_SERVER_HELLO_REJECTION
+        || named_relay_protocol_version(message)
+            .is_some_and(|version| version < local_relay_protocol_version());
+    if server_too_old {
         format!(
             "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
         )
     } else {
         format!("relay protocol error: {message}")
     }
+}
+
+/// The protocol version a rejection names in `(relay protocol X.Y)`, e.g. the
+/// `RELAY_UPGRADE_REQUIRED_MESSAGE` of a server older than this CLI.
+fn named_relay_protocol_version(message: &str) -> Option<(u32, u32)> {
+    const MARKER: &str = "(relay protocol ";
+    let rest = &message[message.find(MARKER)? + MARKER.len()..];
+    parse_relay_protocol_version(rest.get(..rest.find(')')?)?)
+}
+
+/// Numeric `major.minor` for a relay protocol version such as `2.7`.
+fn parse_relay_protocol_version(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+fn local_relay_protocol_version() -> (u32, u32) {
+    parse_relay_protocol_version(RELAY_PROTOCOL_VERSION).expect("RELAY_PROTOCOL_VERSION is X.Y")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -629,7 +655,11 @@ pub struct NodeGpuMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct NodeInterfaceMetrics {
     pub name: String,
+    /// Lifetime totals since boot, saturated at `Number.MAX_SAFE_INTEGER`
+    /// (see `telemetry::BYTE_COUNTER_MAX`) so the server's strict schema keeps
+    /// accepting the frame. Treat a value at the cap as "at least this much".
     pub rx_bytes: u64,
+    /// See [`Self::rx_bytes`].
     pub tx_bytes: u64,
 }
 
@@ -2166,6 +2196,31 @@ mod tests {
         assert_eq!(
             hello_rejection_message("access_denied"),
             "relay protocol error: access_denied"
+        );
+    }
+
+    #[test]
+    fn a_26_server_upgrade_required_reply_says_to_upgrade_the_server() {
+        // The exact text the released 2.6 server sends a 2.7 hello.
+        let message = hello_rejection_message(
+            "This server requires wsmp 0.4.0 or newer (relay protocol 2.6). Upgrade wsmp and restart it.",
+        );
+        assert!(
+            message.contains("upgrade the WS Model Proxy server"),
+            "{message}"
+        );
+        assert!(message.contains("relay protocol 2.6"), "{message}");
+    }
+
+    #[test]
+    fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
+        // A 2.8 server's genuine "upgrade wsmp" must pass through: the CLI is
+        // the one behind, so do not tell the person to upgrade the server.
+        let reply =
+            "This server requires a newer wsmp (relay protocol 2.8). Upgrade wsmp and restart it.";
+        assert_eq!(
+            hello_rejection_message(reply),
+            format!("relay protocol error: {reply}")
         );
     }
 

@@ -1025,7 +1025,12 @@ function PoolFallbackSettings({
 /** Relay 2.7 engine facts the CLI detected for this capacity, and their source. */
 function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
   const { t } = useTranslation(["dashboard"]);
-  if (!capacity.engineKind && capacity.engineSlots === null && capacity.kvBudgetTokens === null) {
+  if (
+    !capacity.engineKind &&
+    capacity.engineSlots === null &&
+    capacity.kvBudgetTokens === null &&
+    capacity.maxModelLen === null
+  ) {
     return null;
   }
   const facts = [

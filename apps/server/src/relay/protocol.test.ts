@@ -6,6 +6,7 @@ import {
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
   helloNeedsUpgrade,
+  NODE_METRIC_SOURCES_MAX,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   parseRelaySubprotocolHeader,
@@ -17,6 +18,7 @@ import {
   type RelayServerControlMessage,
   relayProtocolAtLeast,
   remoteMetricSourceSchema,
+  remoteMetricSourcesSchema,
 } from "./protocol.js";
 import { characterCount, RelayWireTextError, truncateCharacters } from "./wire-text.js";
 
@@ -795,6 +797,12 @@ describe("relay protocol 2.7 telemetry frames", () => {
     expect(JSON.parse(encodeRelayServerControlMessage(message))).toEqual(vector);
     expect(() => remoteMetricSourceSchema.parse({ ...sources[0], intervalSecs: 1 })).toThrow();
     expect(() => remoteMetricSourceSchema.parse({ ...sources[0], name: "bad name" })).toThrow();
+    expect(remoteMetricSourcesSchema.parse(sources)).toHaveLength(1);
+    expect(() =>
+      remoteMetricSourcesSchema.parse(
+        Array.from({ length: NODE_METRIC_SOURCES_MAX + 1 }, () => sources[0]),
+      ),
+    ).toThrow();
   });
 
   it("rejects extra fields anywhere in a telemetry frame", () => {

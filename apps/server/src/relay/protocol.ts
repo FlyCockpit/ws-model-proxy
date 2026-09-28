@@ -472,6 +472,11 @@ export const remoteMetricSourceSchema = z
   .strict();
 export type RemoteMetricSource = z.infer<typeof remoteMetricSourceSchema>;
 
+/** The `metrics.sources.set` payload, bounded like the CLI-side storage. */
+export const remoteMetricSourcesSchema = z
+  .array(remoteMetricSourceSchema)
+  .max(NODE_METRIC_SOURCES_MAX);
+
 const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   z
     .object({

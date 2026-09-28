@@ -46,3 +46,34 @@ fn run_bounded_kills_a_hung_program_and_discards_stderr() {
         Bounded::Unavailable
     );
 }
+
+#[test]
+fn run_bounded_kills_a_descendant_holding_the_stdout_pipe() {
+    // A tool that forks a helper sharing stdout: killing only the direct
+    // child would leave the helper running (and holding the pipe) until it
+    // exits. With the child in its own process group it is killed too.
+    let marker = std::env::temp_dir().join(format!(
+        "wsmp-bounded-descendant-{}.marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!("(sleep 1 && touch {}) & sleep 30", marker.display());
+
+    let result = run_bounded(
+        "sh",
+        &["-c".to_string(), script],
+        Duration::from_millis(200),
+        1024,
+    );
+    assert_eq!(result, Bounded::Failed);
+
+    // The descendant would touch the marker ~1s in; if it survived the group
+    // kill the marker appears.
+    std::thread::sleep(Duration::from_millis(1500));
+    let survived = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        !survived,
+        "the descendant was not reaped with its process group"
+    );
+}

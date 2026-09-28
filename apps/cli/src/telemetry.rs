@@ -91,10 +91,12 @@ impl Telemetry {
     }
 
     /// `metrics.sources.set`: remember the remote definitions. This CLI does
-    /// not run remote sources; each is reported as `unsupported`.
+    /// not run remote sources; each is reported as `unsupported`. More than
+    /// [`NODE_METRICS_SOURCES_MAX`] entries are dropped so a hostile or buggy
+    /// server cannot grow the status list past the server's own schema bound.
     pub fn set_remote_sources(&self, sources: Vec<RemoteMetricSource>) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.remote_sources = sources;
+            shared.remote_sources = bounded_remote_sources(&sources);
             shared.sources_changed = true;
         }
     }
@@ -242,7 +244,7 @@ fn sample_loads(
 fn counter_delta(previous: Option<f64>, current: Option<f64>) -> Option<u64> {
     let (previous, current) = (previous?, current?);
     // A reset (engine restart) is not a negative delta.
-    (current >= previous).then(|| (current - previous).round() as u64)
+    (current >= previous).then(|| saturating_byte_counter((current - previous).round() as u64))
 }
 
 /// Decide whether a reading goes out: on change, or every
@@ -316,6 +318,15 @@ pub fn remote_source_statuses(sources: &[RemoteMetricSource]) -> Vec<MetricSourc
             command_sha256: Some(sha256_hex(source.command.as_bytes())),
             error: None,
         })
+        .collect()
+}
+
+/// Cap a remotely defined source list at the server's schema bound.
+fn bounded_remote_sources(sources: &[RemoteMetricSource]) -> Vec<RemoteMetricSource> {
+    sources
+        .iter()
+        .take(NODE_METRICS_SOURCES_MAX)
+        .cloned()
         .collect()
 }
 
@@ -520,21 +531,30 @@ pub enum Bounded {
 
 /// Run a program with a scrubbed environment, no stdin, stderr discarded,
 /// stdout capped at `limit`, killed after `timeout`.
+///
+/// On Unix the child leads its own process group, and a timeout kills the
+/// whole group: `nvidia-smi` and similar tools may spawn helpers (NVIDIA's
+/// persistenced probes, vendor wrappers) that inherit the stdout pipe, and
+/// killing only the direct child would leave them holding it open.
 pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64) -> Bounded {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .envs(crate::child_env::scrub_parent_env(&[]))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = child else {
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
         return Bounded::Unavailable;
     };
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_child_group(&mut child);
         return Bounded::Failed;
     };
     let (done_tx, done_rx) = mpsc::channel();
@@ -551,8 +571,7 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_child_group(&mut child);
                 break None;
             }
         }
@@ -565,6 +584,30 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
         return Bounded::Failed;
     };
     String::from_utf8(buffer).map_or(Bounded::Failed, Bounded::Output)
+}
+
+/// Kill the child and, on Unix, every process that stayed in its group.
+#[cfg(unix)]
+fn kill_child_group(child: &mut std::process::Child) {
+    // `killpg` reaches helpers the child spawned into its group before the
+    // direct `kill` below reaps it.
+    if let Ok(raw) = i32::try_from(child.id())
+        && raw > 1
+    {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(raw),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kill the child (no process-group semantics off Unix).
+#[cfg(not(unix))]
+fn kill_child_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn node_kind(gpus: &[GpuRow]) -> (NodeKind, bool) {
@@ -642,6 +685,17 @@ fn sys_net_number(interface: &str, file: &str) -> Option<u64> {
         .parse::<i64>()
         .ok()
         .and_then(|value| u64::try_from(value).ok())
+        .map(saturating_byte_counter)
+}
+
+/// Kernel counters are u64 lifetime totals, but the server's strict schema
+/// caps them at `Number.MAX_SAFE_INTEGER` (a JS number loses precision above
+/// it and the frame is then rejected as malformed). Saturate to that ceiling;
+/// a saturated value reads as "monotonic since boot, capped here".
+pub const BYTE_COUNTER_MAX: u64 = 9_007_199_254_740_991;
+
+fn saturating_byte_counter(value: u64) -> u64 {
+    value.min(BYTE_COUNTER_MAX)
 }
 
 #[cfg(unix)]
@@ -806,6 +860,19 @@ mod tests {
     use crate::protocol::MetricSourceFormat;
 
     #[test]
+    fn byte_counters_saturate_at_the_json_safe_integer() {
+        assert_eq!(saturating_byte_counter(0), 0);
+        assert_eq!(saturating_byte_counter(BYTE_COUNTER_MAX), BYTE_COUNTER_MAX);
+        assert_eq!(saturating_byte_counter(u64::MAX), BYTE_COUNTER_MAX);
+        // A 10 Gbit/s box passes MAX_SAFE_INTEGER in ~83 days; the frame must
+        // stay parseable instead of being closed as malformed.
+        assert_eq!(
+            saturating_byte_counter(9_007_199_254_740_992),
+            BYTE_COUNTER_MAX
+        );
+    }
+
+    #[test]
     fn formats_rfc3339_utc() {
         assert_eq!(format_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_rfc3339(1_790_000_000, 7), "2026-09-21T14:13:20.007Z");
@@ -912,6 +979,32 @@ mod tests {
             reset.prefix_cache_hits_delta, None,
             "a counter reset is not a delta"
         );
+    }
+
+    #[test]
+    fn remote_sources_are_capped_at_the_schema_bound() {
+        // A server may not send more than NODE_METRICS_SOURCES_MAX; a buggy or
+        // hostile one must not grow the CLI's stored list (or the reported
+        // statuses) past the same bound.
+        let source = |index: usize| RemoteMetricSource {
+            name: format!("m{index}"),
+            command: "echo 1".to_string(),
+            interval_secs: 10,
+            timeout_secs: 5,
+            format: MetricSourceFormat::Number,
+        };
+        let many = (0..NODE_METRICS_SOURCES_MAX + 10)
+            .map(source)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bounded_remote_sources(&many).len(),
+            NODE_METRICS_SOURCES_MAX
+        );
+        assert_eq!(
+            remote_source_statuses(&many).len(),
+            NODE_METRICS_SOURCES_MAX
+        );
+        assert_eq!(bounded_remote_sources(&many[..2]).len(), 2);
     }
 
     #[test]

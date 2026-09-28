@@ -56,9 +56,12 @@ ships the server and wsmp together. Relay protocol 2.7 (engine facts,
 server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart
 it." and its device card shows "CLI upgrade required (protocol 2.6)"; a 2.7
 wsmp against a 2.6 server stops with its "upgrade the WS Model Proxy server"
-message. Release notes for the first wsmp that speaks 2.7 must say that the
-server and every CLI need upgrading together. Protocol 2.8 is reserved for
-model deployments.
+message (the CLI recognizes both the `Malformed relay protocol message.` of
+pre-2.6 servers and a 2.6 server's "This server requires wsmp ... (relay
+protocol 2.6)" reply, while a genuine future-server "upgrade wsmp" reply stays
+as the CLI's own upgrade error). Release notes for the first wsmp that speaks
+2.7 must say that the server and every CLI need upgrading together. Protocol
+2.8 is reserved for model deployments.
 
 ## One-time setup
 

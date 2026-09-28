@@ -81,7 +81,7 @@ An endpoint's `engine` defaults to `auto`: at probe time (connect, reconnect, `w
 After registration a sampling thread sends, never blocking the relay:
 
 - `node.info` once per connection: OS, kernel, architecture, CPU model and count, total RAM, GPUs from `nvidia-smi` (name, UUID, driver, VRAM), whether memory is unified (for example GB10), per-interface addresses, link speed and MTU, and how wsmp runs (foreground, systemd, launchd, container);
-- `node.metrics` every 20 seconds: CPU use and load averages, `MemAvailable` and swap from `/proc/meminfo`, free space on `/`, per-GPU VRAM, utilization, temperature, power and SM clock, and per-interface byte counters;
+- `node.metrics` every 20 seconds: CPU use and load averages, `MemAvailable` and swap from `/proc/meminfo`, free space on `/`, per-GPU VRAM, utilization, temperature, power and SM clock, and per-interface byte counters (lifetime totals since boot, reported at most as 9007199254740991, the largest integer JSON numbers carry without loss);
 - `endpoint.load` every 2 seconds when it changes (and every 5 seconds regardless) for llama.cpp (`/slots`, and `/metrics` when started with `--metrics`), vLLM and SGLang (`/metrics`): running and waiting requests, KV use and prefix-cache deltas.
 
 Linux reads `/proc` and `/sys`; other platforms send what they can. `nvidia-smi` runs with a 5-second timeout and its stderr is discarded; HTTP scrapes time out after 2 seconds. From llama.cpp `/slots` wsmp keeps only each slot's id, `n_ctx` and `is_processing`: prompt text and generated text in that response are never kept or sent. Remotely defined metric sources (`metrics.sources.set`) are not supported yet; wsmp reports each as `unsupported` and runs nothing.
