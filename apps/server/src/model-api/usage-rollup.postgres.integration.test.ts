@@ -73,6 +73,7 @@ integration("usage rollups with real PostgreSQL", () => {
       id: "unused",
       userId: "requester",
       status: "SUCCEEDED" as const,
+      fallbackRoute: null,
       source: "API_TOKEN" as const,
       startedAt: new Date("2026-09-24T10:15:29.000Z"),
       completedAt: new Date("2026-09-24T10:15:30.000Z"),

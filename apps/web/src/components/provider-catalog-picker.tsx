@@ -94,6 +94,7 @@ export function ProviderCatalogRowSummary({ row }: { row: ProviderCatalogRow }) 
           </Badge>
         ) : null}
       </span>
+      <span className="text-xs text-muted-foreground">{t("dashboard:byok.nonToken")}</span>
       {blocked || row.compatibility.warn.length > 0 ? (
         <span className="flex flex-wrap items-center gap-1.5">
           {row.compatibility.block.map((reason) => (
@@ -137,15 +138,17 @@ export function ProviderCatalogPicker({
   selectedId,
   onSelect,
   disabled = false,
+  initialQuery = "",
 }: {
   poolId?: string;
   selectedId?: string | null;
   onSelect: (row: ProviderCatalogRow) => void;
   disabled?: boolean;
+  initialQuery?: string;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const toolsId = useId();
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialQuery);
   const [toolsOnly, setToolsOnly] = useState(false);
   const search = useProviderCatalogSearch({ query, poolId, toolsOnly, enabled: !disabled });
 

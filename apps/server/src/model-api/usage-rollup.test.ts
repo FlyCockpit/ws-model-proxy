@@ -31,6 +31,7 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     id: "relay-1",
     userId: "user-1",
     status: "SUCCEEDED",
+    fallbackRoute: null,
     source: "API_TOKEN",
     startedAt,
     completedAt: new Date("2026-09-24T10:15:01.250Z"),
@@ -317,5 +318,18 @@ describe("transitionRelayRequestTerminal (exactly-once claim)", () => {
     expect(tx.relayRequest.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: { in: ["relay-1"] }, status: { not: "PENDING" } } }),
     );
+  });
+});
+
+it("own-key rollups belong to requester and omit owner pool/member identities", () => {
+  const increment = rollupIncrementForRequest(
+    row({ fallbackRoute: "own-key", SelectedExecutionTarget: { userId: "user-1" } }),
+  );
+  expect(increment).toMatchObject({
+    ownerUserId: "user-1",
+    requesterUserId: "user-1",
+    poolId: "",
+    poolMemberId: "",
+    executionTargetId: "target-1",
   });
 });

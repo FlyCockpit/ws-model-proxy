@@ -377,7 +377,8 @@
     "terminals": "Terminales",
     "openTerminals": "Terminales abiertas",
     "showTerminals": "Mostrar terminales abiertas",
-    "hideTerminals": "Ocultar terminales abiertas"
+    "hideTerminals": "Ocultar terminales abiertas",
+    "providers": "Proveedores"
   },
   "notices": {
     "dismiss": "Descartar"
@@ -1465,5 +1466,30 @@
       "failed": "No se pudo enviar la revisión. Intenta de nuevo.",
       "truncated": "El comando imprimió {{bytes}} bytes; solo se conservan el inicio y el final."
     }
+  },
+  "byok": {
+    "title": "Proveedores",
+    "description": "Administra tus claves y elige tu modelo de respaldo para los grupos compartidos contigo. Siempre se intenta usar primero la capacidad local.",
+    "keys": "Claves de proveedores",
+    "pools": "Grupos",
+    "media": "Tu proveedor recibe el contenido después de la transformación multimedia del grupo. Si el servicio local no está disponible, se intenta usar primero tu clave; si falla antes de iniciar la respuesta, puede usarse el respaldo del grupo cuando el propietario lo permita. Tu proveedor te cobra a ti.",
+    "disabled": "Los proveedores externos están deshabilitados. Puedes consultar y quitar elecciones, y revocar o eliminar claves.",
+    "empty": "Aún no se han compartido grupos contigo.",
+    "ownerMissing": "El propietario no ha declarado un modelo equivalente. No se puede usar tu propia clave.",
+    "unset": "Se usa el respaldo del grupo cuando está permitido. Elige un modelo para intentar usar primero tu propia clave.",
+    "ready": "Clave propia lista: {{model}}",
+    "unavailable": "Tu proveedor no está disponible. Revisa que su cuenta, modelo y clave estén habilitados.",
+    "tokenMissing": "Ningún token de API activo permite acceso externo a este grupo. Habilita los proveedores externos e incluye este grupo en los tokens con lista permitida.",
+    "clear": "Quitar elección de clave propia",
+    "account": "Tu cuenta de proveedor",
+    "chooseAccount": "Elige una cuenta habilitada",
+    "existing": "Usar un modelo existente",
+    "chooseModel": "Elige un modelo habilitado",
+    "nonToken": "Los proveedores pueden cobrar por separado las búsquedas web, imágenes y servicios de audio. Los precios y presupuestos por tokens no limitan esos cargos.",
+    "saving": "Guardando…",
+    "importUse": "Importar y usar este modelo",
+    "failed": "No se pudo guardar tu elección. Inténtalo de nuevo.",
+    "aggregate": "Solicitudes atendidas con claves propias de los usuarios invitados: {{count}}",
+    "adaptation": "Permitir la adaptación de protocolo para mi modelo"
   }
 }

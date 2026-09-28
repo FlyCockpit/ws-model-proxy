@@ -23,6 +23,7 @@ import { Prisma } from "@ws-model-proxy/db";
 export const relayRollupSelect = {
   id: true,
   userId: true,
+  fallbackRoute: true,
   status: true,
   source: true,
   startedAt: true,
@@ -51,7 +52,8 @@ export type RelayRequestSourceValue = RelayRollupRow["source"];
 
 /**
  * Rollup key. Two user columns:
- *  - `ownerUserId`: the RESOURCE owner - the requested pool's owner for pool
+ *  - `ownerUserId`: own-key uses the requester (empty pool/member keys).
+ *    Otherwise the RESOURCE owner - the requested pool's owner for pool
  *    traffic, else the execution target's owner for direct traffic, else
  *    (nothing resolved) the requester. Owners see every requester's traffic
  *    on what they own. FK to user, ON DELETE CASCADE: deleting the owner
@@ -135,8 +137,8 @@ export function rollupIncrementForRequest(
     bucketStart: truncateToMinute(completedAt),
     ownerUserId: resourceOwnerUserId(row),
     requesterUserId: row.userId,
-    poolId: row.requestedModelPoolId ?? "",
-    poolMemberId: row.selectedPoolMemberId ?? "",
+    poolId: row.fallbackRoute === "own-key" ? "" : (row.requestedModelPoolId ?? ""),
+    poolMemberId: row.fallbackRoute === "own-key" ? "" : (row.selectedPoolMemberId ?? ""),
     executionTargetId: row.selectedExecutionTargetId ?? row.requestedExecutionTargetId ?? "",
     source: row.source,
     requests: 1,
@@ -160,8 +162,9 @@ export function rollupIncrementForRequest(
   };
 }
 
-/** See UsageRollupKey: pool owner, else target owner, else the requester. */
+/** See UsageRollupKey: own-key requester, else pool/target owner or requester. */
 export function resourceOwnerUserId(row: RelayRollupRow): string {
+  if (row.fallbackRoute === "own-key") return row.userId;
   if (row.requestedModelPoolId && row.RequestedModelPool) return row.RequestedModelPool.userId;
   if (!row.requestedModelPoolId) {
     const target = row.selectedExecutionTargetId

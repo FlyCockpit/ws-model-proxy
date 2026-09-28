@@ -640,6 +640,17 @@ describe("public overflow compatibility", () => {
       },
     };
 
+    const mismatch = await withEgressEnabled(() =>
+      claimPublicProviderCredentialForSend({
+        userId: identity.userId,
+        target,
+        keyring,
+        consent: { ...GRANTEE_TOKEN_CONSENT, ownKeyProviderModelId: "different-model" },
+      }),
+    );
+    expect(mismatch).toEqual({ claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" });
+    expect(tx.providerCredential.update).not.toHaveBeenCalled();
+
     const claim = await withEgressEnabled(() =>
       claimPublicProviderCredentialForSend({
         userId: identity.userId,
@@ -1432,5 +1443,32 @@ describe("provider request path", () => {
     ["https://gateway.example/openai/v1", "/v1/messages", "/openai/v1/messages"],
   ])("joins %s with %s without doubling /v1", (baseUrl, path, expected) => {
     expect(joinProviderPath(baseUrl, path)).toBe(expected);
+  });
+});
+
+it("keeps unrecognized gateway cache/cost metadata conservative without changing common-provider billing", () => {
+  const usage = parseProviderUsage([
+    Buffer.from(
+      JSON.stringify({
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 10,
+          total_tokens: 30,
+          prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 4, audio_tokens: 5 },
+          completion_tokens_details: { reasoning_tokens: 2, audio_tokens: 1 },
+          cost: 0.01,
+          cost_details: { upstream_inference_cost: 0.01 },
+          is_byok: false,
+        },
+      }),
+    ),
+  ]);
+  expect(usage).toMatchObject({
+    inputTokens: 12n,
+    outputTokens: 7n,
+    cacheReadTokens: 3n,
+    reasoningTokens: 2n,
+    additionalBillableTokens: 6n,
+    categoriesComplete: false,
   });
 });

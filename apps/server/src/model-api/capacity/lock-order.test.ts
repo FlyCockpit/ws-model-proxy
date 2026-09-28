@@ -57,6 +57,8 @@ const REVIEWED_KEY_COLUMN_UPDATES: Record<string, string> = {
  * `<relative file>:<table>.FOR SHARE`.
  */
 const REVIEWED_SHARE_LOCKS: Record<string, string> = {
+  "packages/api/src/routers/pool-fallback-preferences.ts:model_pool.FOR SHARE":
+    "Own-key preference setter: first lock, then exact grant SHARE, requester account SHARE, model SHARE, preference upsert. No capacity locks. Writers/deletion serialize at the pool; provider writers serialize at the account before reaching model/preference. See capacity-lock-order.ts, preference setter transaction.",
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
     "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no capacity lock and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, an L7 user lock or a user writer is outside the capacity domain and closes no cycle.",
   "packages/db/src/parent-deletion.ts:user.FOR SHARE":

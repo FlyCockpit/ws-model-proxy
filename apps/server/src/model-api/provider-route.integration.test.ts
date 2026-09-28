@@ -1376,7 +1376,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         behavior: "json",
       });
       expect(result.response.status).toBe(200);
-      expect(result.response.headers.get("x-wsmp-route")).toBe("pool-external");
+      expect(result.response.headers.get("x-wsmp-route")).toBe("pool-fallback");
       expect(result.pool).toMatchObject({ fallbackEnabled: true });
       expect(result.attemptEvents).not.toHaveLength(0);
       expect(result.attemptEvents.every((event) => event.memberTier === "PUBLIC_OVERFLOW")).toBe(

@@ -8,7 +8,7 @@ caller asks for it in the model name and every party allows it.
 - `owner/pool` (plain name): served by the pool's local members only. It never
   leaves the deployment.
 - `owner/pool:external`: may use the pool's external (provider) fallback
-  members when the local pool is saturated.
+  members or your own-key model when local service is unavailable.
   - The variant is lowercase and used once. Unknown, uppercase, or stacked
     variants, and any suffix on a direct model id, return `404 model_not_found`
     with a message naming the correct id.
@@ -21,7 +21,7 @@ caller asks for it in the model name and every party allows it.
 
 ## When a request may go external
 
-All of these must hold:
+For owner-paid pool fallback, all of these must hold:
 
 1. The deployment switch `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` is on.
 2. The model name is `owner/pool:external`.
@@ -34,7 +34,9 @@ All of these must hold:
 5. The requester is the pool owner, or the owner enabled `fallbackForGrantees`
    (off by default for every pool).
 
-All five are checked when the request arrives, and checked again against
+Own-key routing shares conditions 1–3, plus the exact live grant, owner equivalent declaration, and requester-owned active provider resources; the owner-paid flags do not apply.
+
+These conditions are checked when the request arrives, and checked again against
 current database state immediately before any request data is sent (the
 switch, the owner's two settings, the token's consent and revocation or
 expiry, the requester's account (not banned, no pending deletion), and, for
@@ -70,6 +72,9 @@ If the attempt cannot send (no compatible external member, provider busy or
 unhealthy, a consent withdrawn since the request arrived), `:external` never
 gets worse local service than the plain name:
 
+The table describes owner-paid fallback. Own-key provider-only failures can
+preserve the upstream status as described under [Own-key failure and accounting](#own-key-failure-and-accounting).
+
 | Situation | Result |
 | --- | --- |
 | Local wait expired, pool has local members | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
@@ -78,12 +83,13 @@ gets worse local service than the plain name:
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
 | Pool has only external members, anything else (unhealthy, failure before the first byte, fallback or consent withdrawn) | `503 external_unavailable` |
+| Client cancels before a provider response is committed | `499 cancelled` (also recorded as 499, irrespective of a rejected upstream status) |
 
 All of these carry `x-wsmp-fallback: unavailable`.
 
 ## Responses and headers
 
-- `x-wsmp-route: local | pool-external`
+- `x-wsmp-route: local | pool-fallback | own-key`
 - `x-wsmp-fallback-reason` and `x-wsmp-served-model` on external responses.
   The response `model` field is the provider's served model id.
 - `x-wsmp-fallback: unavailable` when `:external` was requested, the response
@@ -100,7 +106,7 @@ All of these carry `x-wsmp-fallback: unavailable`.
   `400 external_required`, naming the `:external` id.
 
 `/v1/models` lists `owner/pool:external` only when this token could be served
-that way (switch, token, owner settings, at least one external member).
+that way (switch, token, owner consent, and a configured pool fallback or own-key route).
 
 Attempts that are refused before provider I/O settle their token and spend
 reservations at zero. If bytes may have reached the provider and no trustworthy
@@ -192,3 +198,70 @@ coverage; wait-time edits still save. Turning consent on or enabling fallback
 while the switch is off is blocked in the UI with feedback. Saved choices
 remain intact. While deployment flags load, the UI shows skeletons; a failed
 fetch shows a retry state. Secrets are never returned.
+
+
+## Own-key routing (BYOK)
+
+`/{lang}/dashboard/providers` manages your provider keys. Its **Pools** tab
+lets a grantee choose a model from their own account for each shared pool.
+The owner must declare `externalEquivalentModel`; it is the picker's initial
+suggestion, not a required upstream id. An owner uses their own keys as pool
+members, never through a grantee preference. Clearing a choice is always
+available, including while the deployment switch is off.
+
+Local members are always tried first. At the existing external triggers
+(no healthy compatible local member, wait budget, pre-first-byte local
+failure after other locals, or an oversized `:external` context), a grantee's
+own-key route is tried before owner-paid fallback. Only a failure before any
+client bytes permits another route, and owner-paid fallback still requires
+`fallbackEnabled` and `fallbackForGrantees`. Streams never switch midway.
+
+Own-key egress requires the deployment switch, the `:external` name, a valid
+requester, token `allowExternal` (and ALLOWLIST `includeExternal` for the pool),
+the exact live grant, the owner's equivalent declaration, and a requester-owned
+enabled model/account/current credential. Signed-in Chat Test follows the
+same explicit-name consent as other external requests. MCP cannot set these
+preferences. The send claim rechecks consent under the documented C1–C6 lock
+order after capacity and budget waits, with a fresh requester-validity read
+after the final lock wait. Revoking and replacing a grant never revives an old
+preference or Responses binding.
+
+Own-key dispatch uses **DIRECT admission on the requester's capacity**.
+Budgets, pricing, reservations, attempts and usage belong to the requester;
+the owner's pool budget is not charged. Cache affinity is skipped. Usage
+rollups omit the owner's pool/member keys. Owners receive only an aggregate
+own-key request count, with no grantee provider or target details. Raw counts
+follow RelayRequest retention. Durable own-key route identity is written
+before provider I/O, so crash repair retains requester ownership.
+
+**Media:** the pool's media transformer runs before routing. Your own provider
+receives that transformed payload, including any transformer results. Original
+media is not buffered for a separate external route. Protocol adaptation for
+your model is opt-in on your Pools choice; it does not inherit the owner's
+adaptation switch or lossy developer-role setting.
+
+Native Responses bindings store the route and exact provider endpoint tuple.
+Own-key follow-ups require `:external` and current own-key consent. Stored
+response operations revalidate consent too: withdrawals return 403, permanent
+identity/grant loss 404, and temporary provider unavailability 503. Bindings
+never fail over to another route. The HTTP route header uses `pool-fallback`;
+existing durable owner-paid records retain `pool-external` for additive schema
+compatibility. Own-key durable records and headers use `own-key`.
+
+Catalog pricing bounds include base and tiered one-hour cache writes and audio
+tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
+Audio rates bound both input/output and additional-token accounting. The shared
+usage parser supports existing token categories and direct cost, but does not
+normalize OpenRouter `cache_write_tokens`, `is_byok`, or `cost_details` metadata.
+Those unknown categories keep accounting on the conservative liability path.
+Complete OpenRouter usage normalization is deferred to a separate PR with
+provider-specific tests. Provider
+search, image and audio service charges can be non-token charges: token prices
+and token-based budgets are not a bound on the provider's total bill. The
+picker and import summary disclose this limitation.
+
+### Own-key failure and accounting
+
+Own-key capacity admission tries only capacity available now, preserving time for the owner-paid tier and any remaining local wait. A skipped own-key tier permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No tier changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the relay's cancellation status. Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
+
+Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted tier durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.

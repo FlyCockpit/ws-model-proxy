@@ -118,6 +118,8 @@ export type DrainEdge = readonly [column: string, parent: DeletedParentTable];
  * capacity_waiter -> admission_request, ...) are listed in `internal`: the
  * child goes with its drained history parent.
  */
+// pool_fallback_preference is bounded configuration (one per exact grant),
+// cascading through pool_grant/provider_model; it has no history drain.
 export const HISTORY_DRAIN_EDGES = {
   relay_request: {
     cascade: [["userId", "user"]],

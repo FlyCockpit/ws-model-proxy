@@ -34,6 +34,7 @@ import { Route as LangAuthDashboardCliTokensRouteImport } from './routes/$lang/_
 import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/dashboard/clis'
 import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$lang/_auth/dashboard/model-api-tokens'
 import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
+import { Route as LangAuthDashboardProvidersRouteImport } from './routes/$lang/_auth/dashboard/providers'
 import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
 import { Route as LangAuthDashboardTerminalsRouteImport } from './routes/$lang/_auth/dashboard/terminals'
 import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
@@ -177,6 +178,12 @@ const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
   path: '/pools',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
+const LangAuthDashboardProvidersRoute =
+  LangAuthDashboardProvidersRouteImport.update({
+    id: '/providers',
+    path: '/providers',
+    getParentRoute: () => LangAuthDashboardRoute,
+  } as any)
 const LangAuthDashboardRelayMetadataRoute =
   LangAuthDashboardRelayMetadataRouteImport.update({
     id: '/relay-metadata',
@@ -284,6 +291,7 @@ export interface FileRoutesByFullPath {
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
+  '/$lang/dashboard/providers': typeof LangAuthDashboardProvidersRoute
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
   '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
@@ -319,6 +327,7 @@ export interface FileRoutesByTo {
   '/$lang/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
+  '/$lang/dashboard/providers': typeof LangAuthDashboardProvidersRoute
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
   '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
@@ -360,6 +369,7 @@ export interface FileRoutesById {
   '/$lang/_auth/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/_auth/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
+  '/$lang/_auth/dashboard/providers': typeof LangAuthDashboardProvidersRoute
   '/$lang/_auth/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
   '/$lang/_auth/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
@@ -402,6 +412,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/clis'
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/pools'
+    | '/$lang/dashboard/providers'
     | '/$lang/dashboard/relay-metadata'
     | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
@@ -437,6 +448,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/cli-tokens'
     | '/$lang/dashboard/clis'
     | '/$lang/dashboard/model-api-tokens'
+    | '/$lang/dashboard/providers'
     | '/$lang/dashboard/relay-metadata'
     | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
@@ -477,6 +489,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/dashboard/clis'
     | '/$lang/_auth/dashboard/model-api-tokens'
     | '/$lang/_auth/dashboard/pools'
+    | '/$lang/_auth/dashboard/providers'
     | '/$lang/_auth/dashboard/relay-metadata'
     | '/$lang/_auth/dashboard/terminals'
     | '/$lang/_auth/settings/mcp'
@@ -676,6 +689,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardPoolsRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
+    '/$lang/_auth/dashboard/providers': {
+      id: '/$lang/_auth/dashboard/providers'
+      path: '/providers'
+      fullPath: '/$lang/dashboard/providers'
+      preLoaderRoute: typeof LangAuthDashboardProvidersRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
     '/$lang/_auth/dashboard/relay-metadata': {
       id: '/$lang/_auth/dashboard/relay-metadata'
       path: '/relay-metadata'
@@ -833,6 +853,7 @@ interface LangAuthDashboardRouteChildren {
   LangAuthDashboardClisRoute: typeof LangAuthDashboardClisRoute
   LangAuthDashboardModelApiTokensRoute: typeof LangAuthDashboardModelApiTokensRoute
   LangAuthDashboardPoolsRoute: typeof LangAuthDashboardPoolsRouteWithChildren
+  LangAuthDashboardProvidersRoute: typeof LangAuthDashboardProvidersRoute
   LangAuthDashboardRelayMetadataRoute: typeof LangAuthDashboardRelayMetadataRoute
   LangAuthDashboardTerminalsRoute: typeof LangAuthDashboardTerminalsRoute
   LangAuthDashboardIndexRoute: typeof LangAuthDashboardIndexRoute
@@ -845,6 +866,7 @@ const LangAuthDashboardRouteChildren: LangAuthDashboardRouteChildren = {
   LangAuthDashboardClisRoute: LangAuthDashboardClisRoute,
   LangAuthDashboardModelApiTokensRoute: LangAuthDashboardModelApiTokensRoute,
   LangAuthDashboardPoolsRoute: LangAuthDashboardPoolsRouteWithChildren,
+  LangAuthDashboardProvidersRoute: LangAuthDashboardProvidersRoute,
   LangAuthDashboardRelayMetadataRoute: LangAuthDashboardRelayMetadataRoute,
   LangAuthDashboardTerminalsRoute: LangAuthDashboardTerminalsRoute,
   LangAuthDashboardIndexRoute: LangAuthDashboardIndexRoute,

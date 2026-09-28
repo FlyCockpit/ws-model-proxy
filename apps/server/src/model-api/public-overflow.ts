@@ -83,6 +83,7 @@ export type PublicOverflowSkipReason =
   | "REQUESTER_ACCESS_BLOCKED"
   /** Durable provider admission did not admit within its wait budget. */
   | "PROVIDER_SATURATED"
+  | "OWN_KEY_CONSENT_WITHDRAWN"
   | "POOL_PRIVATE"
   | "GRANTEE_NOT_COVERED"
   | "ADAPTATION_GATE_DISABLED"
@@ -121,6 +122,7 @@ export function isExternalConsentDenialReason(reason: PublicOverflowSkipReason):
     reason === "CALLER_CONSENT_WITHDRAWN" ||
     reason === "REQUESTER_NOT_VISIBLE" ||
     reason === "REQUESTER_ACCESS_BLOCKED" ||
+    reason === "OWN_KEY_CONSENT_WITHDRAWN" ||
     reason === "POOL_PRIVATE" ||
     reason === "GRANTEE_NOT_COVERED"
   );
@@ -128,6 +130,11 @@ export function isExternalConsentDenialReason(reason: PublicOverflowSkipReason):
 
 export interface PublicOverflowRequest {
   userId: string;
+  /** Set only for requester-owned DIRECT dispatch; never a pool member. */
+  ownKeyProviderModelId?: string;
+  admittedExecutionTargetId?: string;
+  /** Persist route/target intent after setup and consent, before any transport I/O. */
+  beforeProviderSend?: (target: PublicProviderTarget) => Promise<void>;
   /** Requester and credential scopes remain distinct from the pool owner. */
   affinityTenantUserId?: string;
   affinitySecurityScope?: string;
@@ -202,6 +209,8 @@ export interface PublicOverflowRequest {
 }
 
 export interface PublicProviderTarget {
+  ownKey?: boolean;
+  ownKeyAdaptationEnabled?: boolean;
   poolMemberId: string;
   executionTargetId: string;
   inferenceCapacityId?: string | null;
@@ -372,8 +381,8 @@ function providerEventRouting(input: {
       input.nativeSurface && input.nativeSurface !== input.request.requestedSurface
         ? "1.0.0"
         : undefined,
-    poolId: input.request.poolId,
-    poolMemberId: input.target.poolMemberId,
+    poolId: input.target.ownKey ? undefined : input.request.poolId,
+    poolMemberId: input.target.ownKey ? undefined : input.target.poolMemberId,
     executionTargetId: input.target.executionTargetId,
     memberTier: "PUBLIC_OVERFLOW",
     triggerReason: input.request.reason,
@@ -391,6 +400,7 @@ export type ExternalSendConsentIdentity = {
   ownerUserId: string;
   /** The exact grant the request or its stored-response binding was resolved under; null for the owner. */
   accessGrantId: string | null;
+  ownKeyProviderModelId?: string;
 };
 
 type ExternalConsentSkipReason = Extract<
@@ -398,6 +408,7 @@ type ExternalConsentSkipReason = Extract<
   | "CALLER_CONSENT_WITHDRAWN"
   | "REQUESTER_NOT_VISIBLE"
   | "REQUESTER_ACCESS_BLOCKED"
+  | "OWN_KEY_CONSENT_WITHDRAWN"
   | "POOL_PRIVATE"
   | "GRANTEE_NOT_COVERED"
 >;
@@ -410,7 +421,11 @@ export type PublicProviderSendClaim =
   | { claimed: true; secret: string }
   | {
       claimed: false;
-      reason: "DEPLOYMENT_GATE_DISABLED" | ExternalConsentSkipReason;
+      reason:
+        | "DEPLOYMENT_GATE_DISABLED"
+        | "BOUND_TARGET_INVALID"
+        | "PROVIDER_UNAVAILABLE"
+        | ExternalConsentSkipReason;
     };
 
 /**
@@ -444,12 +459,52 @@ export async function claimPublicProviderCredentialForSend(input: {
 }): Promise<PublicProviderSendClaim> {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
+  if (
+    input.consent.ownKeyProviderModelId &&
+    input.target.providerModelId !== input.consent.ownKeyProviderModelId
+  )
+    return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
   return prisma.$transaction(
     async (tx): Promise<PublicProviderSendClaim> => {
       const denial = await lockExternalSendConsent(tx, input.consent);
       if (denial) return { claimed: false, reason: consentSkipReason(denial) };
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+      if (input.consent.ownKeyProviderModelId)
+        await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.target.providerModelId} AND "userId" = ${input.userId} FOR SHARE`;
       await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      if (input.consent.ownKeyProviderModelId) {
+        await tx.$queryRaw`SELECT id FROM pool_fallback_preference WHERE "poolId" = ${input.consent.poolId} AND "userId" = ${input.userId} FOR SHARE`;
+        const preference = await tx.poolFallbackPreference.findFirst({
+          where: {
+            poolId: input.consent.poolId,
+            userId: input.userId,
+            poolGrantId: input.consent.accessGrantId ?? "",
+            providerModelId: input.consent.ownKeyProviderModelId,
+          },
+          select: { id: true },
+        });
+        if (!preference) return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
+        const model = await tx.providerModel.findFirst({
+          where: {
+            id: input.target.providerModelId,
+            userId: input.userId,
+            deletedAt: null,
+            providerAccountId: input.target.providerAccountId,
+            upstreamModelId: input.target.upstreamModelId,
+            ExecutionTarget: { id: input.target.executionTargetId },
+            ProviderAccount: {
+              userId: input.userId,
+              deletedAt: null,
+              endpointIdentity: input.target.endpointIdentity,
+              endpointVersion: input.target.endpointVersion,
+            },
+          },
+          select: { enabled: true, ProviderAccount: { select: { enabled: true } } },
+        });
+        if (!model) return { claimed: false, reason: "BOUND_TARGET_INVALID" };
+        if (!model.enabled || !model.ProviderAccount.enabled)
+          return { claimed: false, reason: "PROVIDER_UNAVAILABLE" };
+      }
       // Nothing below waits on a lock: re-evaluate what time or an unlocked
       // row (the requester's account) can have changed while we waited.
       const lapsed = await recheckExternalSendRequesterValidity(tx, input.consent);
@@ -497,12 +552,12 @@ export async function claimPublicProviderCredentialForSend(input: {
 }
 
 export function resolvePublicProviderExecution(
-  target: Pick<PublicProviderTarget, "capabilityInventory">,
+  target: Pick<PublicProviderTarget, "capabilityInventory" | "ownKey" | "ownKeyAdaptationEnabled">,
   request: Pick<
     PublicOverflowRequest,
     "requestedSurface" | "stream" | "requiredFeatures" | "adaptationEnabled"
   > &
-    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method" | "exactResponsesBinding">>,
 ): ProviderSurfaceExecution | undefined {
   if (!target.capabilityInventory) return undefined;
   const requestedSurface = {
@@ -543,7 +598,11 @@ export function resolvePublicProviderExecution(
       protocolVersion: request.headers?.get("anthropic-version") ?? undefined,
       betaFeatures,
     },
-    adaptationEnabled: request.adaptationEnabled,
+    adaptationEnabled: request.exactResponsesBinding
+      ? false
+      : target.ownKey
+        ? target.ownKeyAdaptationEnabled === true
+        : request.adaptationEnabled,
   });
   if (resolved.mode === "unavailable" || !resolved.nativeSurface) return undefined;
   const nativeSurface =
@@ -562,6 +621,8 @@ export function resolvePublicProviderExecution(
 export function publicTargetCompatibility(
   target: Pick<
     PublicProviderTarget,
+    | "ownKey"
+    | "ownKeyAdaptationEnabled"
     | "contextWindow"
     | "maxOutputTokens"
     | "nativeProtocols"
@@ -585,7 +646,7 @@ export function publicTargetCompatibility(
     | "contextTokens"
     | "skipContextValidation"
   > &
-    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method" | "exactResponsesBinding">>,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
   if (!inventoryMatchesProtocol(target.capabilityInventory, target.protocol))
     return "PROTOCOL_UNAVAILABLE";
@@ -616,7 +677,8 @@ export function publicTargetCompatibility(
     return resolvePublicProviderExecution(target, request) ? "COMPATIBLE" : "PROTOCOL_UNAVAILABLE";
   }
   if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
-  return request.adaptationEnabled &&
+  return !request.exactResponsesBinding &&
+    (target.ownKey ? target.ownKeyAdaptationEnabled : request.adaptationEnabled) &&
     request.renderForTarget !== undefined &&
     target.nativeProtocols.includes(target.protocol) &&
     target.nativeSurfaces.some((surface) =>
@@ -653,7 +715,15 @@ export type PublicOverflowResult =
       markFirstClientByte: () => Promise<void>;
       affinity: PublicProviderTarget["affinity"];
     }
-  | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
+  | {
+      dispatched: false;
+      reason: PublicOverflowSkipReason;
+      detail?: string;
+      /** True if any transport invocation may have reached the provider. */
+      providerIoStarted?: true;
+      /** Retain the last rejected provider response when no later tier can serve. */
+      providerFailure?: { target: PublicProviderTarget; status?: number; retryAfter?: string };
+    };
 
 function targetProtocol(providerType: string): ProviderProtocol | null {
   return providerProtocolForType(providerType);
@@ -723,15 +793,62 @@ function supportedFeatures(value: unknown): string[] {
  * External fallback (PUBLIC_OVERFLOW) provider targets of an owned pool.
  * PRIMARY members are always local, so provider targets exist only here.
  */
+const providerTargetModelSelect = {
+  id: true,
+  userId: true,
+  upstreamModelId: true,
+  contextWindow: true,
+  maxOutputTokens: true,
+  concurrencyLimit: true,
+  nativeCapabilities: true,
+  healthStatus: true,
+  healthNextRetryAt: true,
+  healthHalfOpenAt: true,
+  enabled: true,
+  deletedAt: true,
+  ProviderAccount: {
+    select: {
+      id: true,
+      userId: true,
+      providerType: true,
+      providerVersion: true,
+      baseUrl: true,
+      endpointIdentity: true,
+      endpointVersion: true,
+      authType: true,
+      healthStatus: true,
+      healthNextRetryAt: true,
+      healthHalfOpenAt: true,
+      enabled: true,
+      deletedAt: true,
+      CurrentCredential: {
+        select: {
+          id: true,
+          credentialType: true,
+          aadVersion: true,
+          algorithm: true,
+          keyVersion: true,
+          ciphertext: true,
+          nonce: true,
+          authTag: true,
+          status: true,
+        },
+      },
+    },
+  },
+} satisfies Prisma.ProviderModelSelect;
+
 export async function listPublicOverflowTargets(
   userId: string,
   poolId: string,
+  ownKey?: { requesterUserId: string; providerModelId: string; accessGrantId: string | null },
 ): Promise<ListedPublicOverflowTargets> {
   const pool = await prisma.modelPool.findFirst({
     where: { id: poolId, userId },
     select: {
       fallbackEnabled: true,
       fallbackForGrantees: true,
+      externalEquivalentModel: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -757,50 +874,7 @@ export async function listPublicOverflowTargets(
               id: true,
               inferenceCapacityId: true,
               ProviderModel: {
-                select: {
-                  id: true,
-                  userId: true,
-                  upstreamModelId: true,
-                  contextWindow: true,
-                  maxOutputTokens: true,
-                  concurrencyLimit: true,
-                  nativeCapabilities: true,
-                  healthStatus: true,
-                  healthNextRetryAt: true,
-                  healthHalfOpenAt: true,
-                  enabled: true,
-                  deletedAt: true,
-                  ProviderAccount: {
-                    select: {
-                      id: true,
-                      userId: true,
-                      providerType: true,
-                      providerVersion: true,
-                      baseUrl: true,
-                      endpointIdentity: true,
-                      endpointVersion: true,
-                      authType: true,
-                      healthStatus: true,
-                      healthNextRetryAt: true,
-                      healthHalfOpenAt: true,
-                      enabled: true,
-                      deletedAt: true,
-                      CurrentCredential: {
-                        select: {
-                          id: true,
-                          credentialType: true,
-                          aadVersion: true,
-                          algorithm: true,
-                          keyVersion: true,
-                          ciphertext: true,
-                          nonce: true,
-                          authTag: true,
-                          status: true,
-                        },
-                      },
-                    },
-                  },
-                },
+                select: providerTargetModelSelect,
               },
             },
           },
@@ -826,6 +900,47 @@ export async function listPublicOverflowTargets(
       coolingDown: [],
       unavailable: [],
     };
+  let ownKeyAdaptationEnabled = false;
+  if (ownKey) {
+    const preference =
+      pool.externalEquivalentModel && ownKey.accessGrantId && ownKey.requesterUserId !== userId
+        ? await prisma.poolFallbackPreference.findFirst({
+            where: {
+              poolId,
+              userId: ownKey.requesterUserId,
+              poolGrantId: ownKey.accessGrantId,
+              providerModelId: ownKey.providerModelId,
+              PoolGrant: { ownerUserId: userId, granteeUserId: ownKey.requesterUserId, poolId },
+            },
+            select: {
+              protocolAdaptationEnabled: true,
+              ProviderModel: {
+                select: {
+                  ...providerTargetModelSelect,
+                  ExecutionTarget: { select: { id: true, inferenceCapacityId: true } },
+                },
+              },
+            },
+          })
+        : null;
+    ownKeyAdaptationEnabled = preference?.protocolAdaptationEnabled === true;
+    const model = preference?.ProviderModel;
+    pool.PoolMembers = model?.ExecutionTarget
+      ? [
+          {
+            id: "",
+            publicOrder: 0,
+            capacityWaitBudgetMs: null,
+            capacityWaitBudgetMode: "INHERIT",
+            ExecutionTarget: { ...model.ExecutionTarget, ProviderModel: model },
+          },
+        ]
+      : [];
+    pool.fallbackEnabled = Boolean(pool.externalEquivalentModel && preference);
+    pool.fallbackForGrantees = true;
+    pool.affinityEnabled = false;
+  }
+  const providerOwnerId = ownKey?.requesterUserId ?? userId;
   const now = new Date();
   const unavailable: ListedPublicOverflowTargets["unavailable"] = [];
   const listed = pool.PoolMembers.flatMap((member) => {
@@ -840,8 +955,8 @@ export async function listPublicOverflowTargets(
       !protocol ||
       !inventoryMatchesProtocol(capabilityInventory, protocol) ||
       member.publicOrder == null ||
-      model.userId !== userId ||
-      account.userId !== userId ||
+      model.userId !== providerOwnerId ||
+      account.userId !== providerOwnerId ||
       model.deletedAt ||
       account.deletedAt
     )
@@ -873,6 +988,8 @@ export async function listPublicOverflowTargets(
         coolingDown,
         target: {
           ...identity,
+          ownKey: Boolean(ownKey),
+          ownKeyAdaptationEnabled,
           poolMemberId: member.id,
           inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
           capacityWaitBudgetMs:
@@ -1800,7 +1917,10 @@ export async function dispatchPublicOverflow(
   if (
     !isIssuedExternalConsent(consent) ||
     consent.poolId !== request.poolId ||
-    consent.ownerUserId !== request.userId ||
+    (request.ownKeyProviderModelId ? consent.requesterUserId : consent.ownerUserId) !==
+      request.userId ||
+    (request.ownKeyProviderModelId !== undefined &&
+      consent.ownKeyProviderModelId !== request.ownKeyProviderModelId) ||
     consent.requesterUserId !== request.requesterUserId ||
     consent.modelApiTokenId !== request.requesterModelApiTokenId ||
     consent.requesterIsOwner !== (consent.requesterUserId === consent.ownerUserId) ||
@@ -1813,6 +1933,7 @@ export async function dispatchPublicOverflow(
     poolId: consent.poolId,
     ownerUserId: consent.ownerUserId,
     accessGrantId: consent.accessGrantId,
+    ownKeyProviderModelId: request.ownKeyProviderModelId,
   };
   // Owner and caller consent, re-read from the database at dispatch time
   // (the consent was minted at authentication, possibly minutes ago): the
@@ -1820,11 +1941,25 @@ export async function dispatchPublicOverflow(
   // exact grant, and the requester's account state. Nothing is decrypted or
   // sent unless all of them still hold.
   const [listed, callerDenial] = await Promise.all([
-    listPublicOverflowTargets(request.userId, request.poolId),
+    listPublicOverflowTargets(
+      consent.ownerUserId,
+      request.poolId,
+      request.ownKeyProviderModelId
+        ? {
+            requesterUserId: request.userId,
+            providerModelId: request.ownKeyProviderModelId,
+            accessGrantId: consent.accessGrantId,
+          }
+        : undefined,
+    ),
     readExternalConsentDenial(sendConsent),
   ]);
   if (callerDenial === "REQUESTER_NOT_VISIBLE") return { dispatched: false, reason: callerDenial };
-  if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
+  if (!listed.enabled)
+    return {
+      dispatched: false,
+      reason: request.ownKeyProviderModelId ? "OWN_KEY_CONSENT_WITHDRAWN" : "POOL_PRIVATE",
+    };
   if (!consent.requesterIsOwner && !listed.fallbackForGrantees)
     return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
   if (callerDenial) return { dispatched: false, reason: consentSkipReason(callerDenial) };
@@ -1850,6 +1985,11 @@ export async function dispatchPublicOverflow(
           )
         : memberEligible;
     return eligible.flatMap((target) => {
+      if (
+        request.admittedExecutionTargetId &&
+        target.executionTargetId !== request.admittedExecutionTargetId
+      )
+        return [];
       const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
       const resolvedTarget = { ...target, resolvedExecution };
       if (
@@ -1895,13 +2035,14 @@ export async function dispatchPublicOverflow(
 
   let ranked: Awaited<ReturnType<typeof rankPublicOverflowTargets>>;
   try {
-    ranked = binding
-      ? { decision: null, targets: compatible }
-      : await rankPublicOverflowTargets({
-          request,
-          policy: listed.affinityPolicy,
-          targets: compatible,
-        });
+    ranked =
+      binding || request.ownKeyProviderModelId
+        ? { decision: null, targets: compatible }
+        : await rankPublicOverflowTargets({
+            request,
+            policy: listed.affinityPolicy,
+            targets: compatible,
+          });
   } catch {
     ranked = {
       decision: null,
@@ -1919,6 +2060,8 @@ export async function dispatchPublicOverflow(
   let lastAdmission: ProviderBudgetAdmission | undefined;
   // The transient reason the last admitted attempt did not send, when it
   // reached the health claim or beyond (see the final return).
+  let anyProviderIoStarted = false;
+  let providerFailure: Extract<PublicOverflowResult, { dispatched: false }>["providerFailure"];
   let lastSendFailure:
     | "PROVIDER_UNHEALTHY"
     | "SEND_CLAIM_FAILED"
@@ -2054,7 +2197,7 @@ export async function dispatchPublicOverflow(
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
-        poolId: request.poolId,
+        poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -2114,7 +2257,7 @@ export async function dispatchPublicOverflow(
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
-        poolId: request.poolId,
+        poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -2226,7 +2369,7 @@ export async function dispatchPublicOverflow(
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
-        poolId: request.poolId,
+        poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -2275,7 +2418,7 @@ export async function dispatchPublicOverflow(
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
-        poolId: request.poolId,
+        poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -2302,7 +2445,12 @@ export async function dispatchPublicOverflow(
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
-      return { dispatched: false, reason: claim.reason };
+      return {
+        dispatched: false,
+        reason: claim.reason,
+        ...(anyProviderIoStarted ? { providerIoStarted: true as const } : {}),
+        providerFailure,
+      };
     }
     let providerIoStarted = false;
     try {
@@ -2320,7 +2468,10 @@ export async function dispatchPublicOverflow(
         ]),
       };
       const auth = providerAuth(target, claim.secret);
+      await request.beforeProviderSend?.(target);
       providerIoStarted = true;
+      anyProviderIoStarted = true;
+      providerFailure = { target };
       const response = await providerHttpsRequest(
         target.baseUrl,
         options,
@@ -2344,6 +2495,12 @@ export async function dispatchPublicOverflow(
         // bounded body before retry, retaining raw usage/cost when present;
         // ambiguous, truncated, or oversized bodies keep conservative liability.
         const retryUsage = await readRetryableProviderUsage(response, pricing);
+        const retryAfter = response.headers["retry-after"];
+        providerFailure = {
+          target,
+          status,
+          retryAfter: typeof retryAfter === "string" ? retryAfter : undefined,
+        };
         if (!response.complete) response.destroy();
         // Heartbeat loss means a successor may already own health state. Do
         // not let this orphan's retryable response mutate that state. The
@@ -2376,7 +2533,7 @@ export async function dispatchPublicOverflow(
           providerAccountId: target.providerAccountId,
           providerModelId: target.providerModelId,
           credentialId: target.credential.id,
-          poolId: request.poolId,
+          poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
           requestId: request.requestId,
           attemptId,
           fencingToken,
@@ -2532,7 +2689,7 @@ export async function dispatchPublicOverflow(
             providerAccountId: target.providerAccountId,
             providerModelId: target.providerModelId,
             credentialId: target.credential.id,
-            poolId: request.poolId,
+            poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
             requestId: request.requestId,
             attemptId,
             fencingToken,
@@ -2734,7 +2891,7 @@ export async function dispatchPublicOverflow(
         nativeSurface,
         attemptCount,
         terminal: terminal.then(async (outcome) => {
-          if (outcome.ok && target.affinityTarget) {
+          if (outcome.ok && !request.ownKeyProviderModelId && target.affinityTarget) {
             try {
               const parsed: unknown = JSON.parse(new TextDecoder().decode(request.body));
               if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
@@ -2806,7 +2963,7 @@ export async function dispatchPublicOverflow(
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
-        poolId: request.poolId,
+        poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -2845,6 +3002,8 @@ export async function dispatchPublicOverflow(
   // before any attempt).
   return {
     dispatched: false,
+    ...(anyProviderIoStarted ? { providerIoStarted: true as const } : {}),
+    providerFailure,
     reason:
       lastAdmission && !lastAdmission.admitted
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"

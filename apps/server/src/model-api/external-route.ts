@@ -8,9 +8,10 @@
  *   3. the caller's credential consents: an API token with `allowExternal`
  *      (ALLOWLIST tokens also need the pool entry's `includeExternal`), or the
  *      signed-in user's own Chat Test session choosing the `:external` name;
- *   4. the pool owner enabled fallback (`fallbackEnabled`);
+ *   4. for pool fallback, the owner enabled fallback (`fallbackEnabled`);
  *   5. the requester is the pool owner, or the owner pays for grantees
- *      (`fallbackForGrantees`).
+ *      (`fallbackForGrantees`). Own-key instead requires the owner equivalent
+ *      declaration and a grantee preference for a requester-owned provider.
  *
  * `evaluateExternalEgress` is the only way to obtain an
  * `ExternalEgressConsent`. Provider dispatch (`dispatchPublicOverflow`)
@@ -42,7 +43,7 @@ export const ROUTE_EXPOSE_HEADERS = [
 ] as const;
 
 /** Durable, prompt-free route values (RelayRequest / stickiness `fallbackRoute`). */
-export type FallbackRoute = "local" | "pool-external";
+export type FallbackRoute = "local" | "pool-external" | "own-key";
 
 export function externalModelId(poolModelId: string): string {
   return `${poolModelId}:${EXTERNAL_MODEL_VARIANT}`;
@@ -229,6 +230,7 @@ export type ExternalEgressConsent = {
    * same grant row, so a replacement grant never revives the request.
    */
   readonly accessGrantId: string | null;
+  readonly ownKeyProviderModelId?: string;
 };
 
 // Consents are minted only by evaluateExternalEgress. Provider dispatch
@@ -250,7 +252,13 @@ export type ExternalEgressRequester = {
 
 export type ExternalEgressPool = Pick<
   VisibleModelPoolTarget,
-  "id" | "ownerUserId" | "accessGrantId" | "fallbackEnabled" | "fallbackForGrantees"
+  | "id"
+  | "ownerUserId"
+  | "accessGrantId"
+  | "fallbackEnabled"
+  | "fallbackForGrantees"
+  | "externalEquivalentModel"
+  | "ownKeyProviderModelId"
 >;
 
 export type ExternalEgressDecision =
@@ -279,10 +287,15 @@ export function evaluateExternalEgress(input: {
   } else if (input.requester.source !== "CHAT_TEST") {
     return { granted: false, denial: "SOURCE_UNSUPPORTED" };
   }
-  if (input.pool.fallbackEnabled !== true)
+  const ownKey =
+    input.requester.userId !== input.pool.ownerUserId &&
+    input.pool.accessGrantId &&
+    input.pool.externalEquivalentModel &&
+    input.pool.ownKeyProviderModelId;
+  if (!ownKey && input.pool.fallbackEnabled !== true)
     return { granted: false, denial: "POOL_FALLBACK_DISABLED" };
   const requesterIsOwner = input.requester.userId === input.pool.ownerUserId;
-  if (!requesterIsOwner && input.pool.fallbackForGrantees !== true)
+  if (!ownKey && !requesterIsOwner && input.pool.fallbackForGrantees !== true)
     return { granted: false, denial: "GRANTEE_NOT_COVERED" };
   const consent: ExternalEgressConsent = Object.freeze({
     poolId: input.pool.id,
@@ -291,6 +304,7 @@ export function evaluateExternalEgress(input: {
     requesterIsOwner,
     modelApiTokenId: input.requester.modelApiTokenId,
     accessGrantId: requesterIsOwner ? null : input.pool.accessGrantId,
+    ...(ownKey ? { ownKeyProviderModelId: ownKey } : {}),
   });
   issuedConsents.add(consent);
   return { granted: true, consent };

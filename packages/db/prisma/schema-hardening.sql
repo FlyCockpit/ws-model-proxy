@@ -18,7 +18,7 @@ BEGIN;
 -- locks is included by the backfills below; one that starts after they are
 -- released sees the installed triggers.
 LOCK TABLE "user", discovered_model, execution_target, model_pool, model_api_token,
-  pool_member, pool_grant, model_api_token_allowlist_entry, response_stickiness_record,
+  pool_member, pool_grant, pool_fallback_preference, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
@@ -1175,7 +1175,12 @@ BEGIN
          OR model."upstreamModelId" IS DISTINCT FROM record."providerUpstreamModelId"
          OR target."userId" IS DISTINCT FROM model."userId"
          OR model."userId" IS DISTINCT FROM acct."userId"
-         OR pool."userId" IS DISTINCT FROM target."userId"
+         OR (record."fallbackRoute" = 'own-key' AND (
+           target."userId" IS DISTINCT FROM record."userId"
+           OR pool."userId" IS NOT DISTINCT FROM record."userId"
+           OR record."poolGrantId" IS NULL))
+         OR (record."fallbackRoute" IS DISTINCT FROM 'own-key' AND (
+         pool."userId" IS DISTINCT FROM target."userId"
          OR NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = record."targetModelPoolId"
@@ -1184,7 +1189,7 @@ BEGIN
                 'PRIMARY'::"PoolMemberTier",
                 'PUBLIC_OVERFLOW'::"PoolMemberTier"
               )
-         )
+         )))
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
@@ -1209,7 +1214,12 @@ BEGIN
     SELECT format('relay request selection row=%s', request.id)
       FROM relay_request request
       JOIN execution_target target ON target.id = request."selectedExecutionTargetId"
-     WHERE target."userId" <> request."userId"
+      LEFT JOIN model_pool pool ON pool.id = request."requestedModelPoolId"
+     WHERE target."userId" IS DISTINCT FROM CASE
+             WHEN request."fallbackRoute" = 'own-key' OR request."requestedModelPoolId" IS NULL
+               THEN request."userId"
+             ELSE pool."userId"
+           END
         OR (request."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM request."selectedDiscoveredModelId")
   ) invalid;
@@ -1240,12 +1250,12 @@ ALTER TABLE response_stickiness_record
     -- NULL-safe: a CHECK that evaluates to NULL passes, so a v3 row with a
     -- NULL route must compare FALSE here, not NULL.
     ("routingVersion" < 3 AND "fallbackRoute" IS NULL)
-    OR ("routingVersion" >= 3 AND "fallbackRoute" IS NOT DISTINCT FROM 'pool-external')
+    OR ("routingVersion" >= 3 AND "fallbackRoute" IS NOT NULL AND "fallbackRoute" IN ('pool-external', 'own-key'))
   );
 
 ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_fallback_route_check;
 ALTER TABLE relay_request ADD CONSTRAINT relay_request_fallback_route_check CHECK (
-  "fallbackRoute" IS NULL OR "fallbackRoute" IN ('local', 'pool-external')
+  "fallbackRoute" IS NULL OR "fallbackRoute" IN ('local', 'pool-external', 'own-key')
 );
 
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_external_after_wait_check;
@@ -1473,7 +1483,12 @@ BEGIN
          OR provider_upstream_model IS DISTINCT FROM NEW."providerUpstreamModelId"
          OR provider_endpoint_identity IS DISTINCT FROM NEW."providerEndpointIdentity"
          OR provider_endpoint_version IS DISTINCT FROM NEW."providerEndpointVersion"
-         OR pool_owner IS DISTINCT FROM target_owner
+         OR (NEW."fallbackRoute" = 'own-key' AND (
+           target_owner IS DISTINCT FROM NEW."userId"
+           OR pool_owner IS NOT DISTINCT FROM NEW."userId"
+           OR NEW."poolGrantId" IS NULL))
+         OR (NEW."fallbackRoute" IS DISTINCT FROM 'own-key' AND (
+         pool_owner IS DISTINCT FROM target_owner
          OR NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = NEW."targetModelPoolId"
@@ -1482,7 +1497,7 @@ BEGIN
                 'PRIMARY'::"PoolMemberTier",
                 'PUBLIC_OVERFLOW'::"PoolMemberTier"
               )
-         )
+         )))
          OR (NEW."userId" IS NOT DISTINCT FROM pool_owner AND NEW."poolGrantId" IS NOT NULL)
          OR (NEW."userId" IS DISTINCT FROM pool_owner AND (
            NEW."poolGrantId" IS NULL OR NOT EXISTS (
@@ -1542,7 +1557,35 @@ BEGIN
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      IF target_owner IS NULL OR target_owner <> NEW."userId"
+      -- userId is the caller. Local and owner-paid pool targets belong to the
+      -- pool owner; DIRECT and own-key targets belong to the caller. This is
+      -- historical identity, not a live-grant authorization check.
+      consumer_owner := NEW."userId";
+      IF NEW."requestedModelPoolId" IS NOT NULL AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key' THEN
+        SELECT "userId" INTO consumer_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+      END IF;
+      -- Both the app's terminal-history drain (before the pool is deleted)
+      -- and its SET NULL cascade remove the ownership anchor. Erase the
+      -- unchanged cross-tenant selection with it. This never authorizes a
+      -- new target, model, caller or route, nor changes a terminal state.
+      IF TG_OP = 'UPDATE' AND OLD."requestedModelPoolId" IS NOT NULL
+         AND NEW."requestedModelPoolId" IS NULL
+         AND NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId"
+         AND NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId"
+         AND (NEW."selectedPoolMemberId" IS NULL
+              OR NEW."selectedPoolMemberId" IS NOT DISTINCT FROM OLD."selectedPoolMemberId")
+         AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+         AND NEW."fallbackRoute" IS NOT DISTINCT FROM OLD."fallbackRoute"
+         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+         AND target_owner IS DISTINCT FROM NEW."userId"
+         AND ((OLD.status IN ('SUCCEEDED', 'FAILED', 'CANCELED') AND NEW.status = OLD.status)
+              OR NOT EXISTS (SELECT 1 FROM model_pool WHERE id = OLD."requestedModelPoolId")) THEN
+        NEW."selectedExecutionTargetId" := NULL;
+        NEW."selectedDiscoveredModelId" := NULL;
+        NEW."selectedPoolMemberId" := NULL;
+        RETURN NEW;
+      END IF;
+      IF target_owner IS NULL OR target_owner IS DISTINCT FROM consumer_owner
          OR (NEW."selectedDiscoveredModelId" IS NOT NULL
              AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
@@ -1574,7 +1617,7 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId" ON relay_request
+  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute" ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
@@ -2568,5 +2611,24 @@ $session_refuse_deleting_user$;
 DROP TRIGGER IF EXISTS session_refuse_deleting_user ON session;
 CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session
 FOR EACH ROW EXECUTE FUNCTION refuse_session_for_deleting_user();
+
+-- PR3: preferences are grantee-only configuration. The composite FKs bind
+-- the exact grant and requester-owned model; no nullable composite SET NULL.
+CREATE OR REPLACE FUNCTION enforce_pool_fallback_preference_grantee() RETURNS trigger AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pool_grant g JOIN model_pool p ON p.id = g."poolId"
+     WHERE g.id = NEW."poolGrantId" AND g."poolId" = NEW."poolId"
+       AND g."granteeUserId" = NEW."userId" AND p."userId" <> NEW."userId"
+       AND g."ownerUserId" = p."userId"
+  ) THEN
+    RAISE EXCEPTION 'own-key preference requires the exact non-owner grant' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS pool_fallback_preference_grantee ON pool_fallback_preference;
+CREATE TRIGGER pool_fallback_preference_grantee BEFORE INSERT OR UPDATE ON pool_fallback_preference
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_fallback_preference_grantee();
 
 COMMIT;

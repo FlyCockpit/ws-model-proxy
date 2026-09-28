@@ -186,6 +186,62 @@ describe("usage retention", () => {
     expect(candidateRound).toBe(2);
   });
 
+  it.each([
+    ["before-send", "local", "owner", "pool", ""],
+    ["send-intent", "own-key", "requester", "", "own-target"],
+    ["superseded-intent", "local", "owner", "pool", "local-target"],
+  ])(
+    "reaps %s using the durable route identity without attributing unsent own-key work",
+    async (_stage, route, owner, pool, target) => {
+      const { prisma, tx } = fakePrisma();
+      prisma.$queryRaw.mockResolvedValue([{ id: "request" }]);
+      tx.$queryRaw.mockResolvedValue([{ now: NOW }]);
+      tx.relayRequest.findMany.mockResolvedValue([
+        {
+          id: "request",
+          userId: "requester",
+          status: "FAILED",
+          source: "API_TOKEN",
+          fallbackRoute: route,
+          startedAt: new Date(NOW.getTime() - 3_600_000),
+          completedAt: NOW,
+          firstClientByteAt: null,
+          durationMs: null,
+          requestedModelPoolId: "pool",
+          selectedPoolMemberId: route === "local" && target ? "local-member" : null,
+          requestedExecutionTargetId: null,
+          selectedExecutionTargetId: target || null,
+          attemptCount: 0,
+          promptTokens: null,
+          completionTokens: null,
+          cacheReadTokens: null,
+          cacheWriteTokens: null,
+          usageKnown: false,
+          RequestedModelPool: { userId: "owner" },
+          SelectedExecutionTarget: target
+            ? { userId: route === "own-key" ? "requester" : "owner" }
+            : null,
+          RequestedExecutionTarget: null,
+        },
+      ]);
+      expect(await reapAbandonedPendingRequests({ prisma: prisma as never, now: NOW })).toBe(1);
+      expect(tx.relayRequest.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: "PENDING" }),
+          data: expect.objectContaining({ errorClass: "abandoned" }),
+        }),
+      );
+      const [sql] = tx.$executeRaw.mock.calls[0] as [Sql];
+      expect(sql.values.slice(1, 6)).toEqual([
+        owner,
+        "requester",
+        pool,
+        route === "local" && target ? "local-member" : "",
+        target,
+      ]);
+    },
+  );
+
   it("stops draining the abandoned backlog once the shutdown fence is armed", async () => {
     const { prisma, tx } = fakePrisma();
     prisma.$queryRaw.mockResolvedValue([{ id: "relay-1" }, { id: "relay-2" }]);

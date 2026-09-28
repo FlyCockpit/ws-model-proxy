@@ -14,7 +14,7 @@ import {
 import type { CapacityAdmissionStore } from "./capacity/types.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
-import type { PublicProviderTarget } from "./public-overflow.js";
+import type { PublicOverflowRequest, PublicProviderTarget } from "./public-overflow.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -95,6 +95,7 @@ const {
   localAdmissionWaitBudget,
   resumedLocalWaitBudget,
 } = await import("./routes.js");
+const retryPolicy = await import("./relay-retry-policy.js");
 const { contextCounterRegistry } = await import("./capacity/counter-registry.js");
 const { MODEL_API_MAX_REQUEST_BODY_BYTES, ModelApiConcurrencyLimiter, ModelApiLimitError } =
   await import("./limits.js");
@@ -4642,6 +4643,628 @@ describe("model API routes", () => {
     };
   }
 
+  it.each(["success", "precommit", "forbidden", "stream-failure"] as const)(
+    "own-key %s uses requester DIRECT capacity, with only permitted precommit failover",
+    async (mode) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant",
+            fallbackEnabled: mode !== "forbidden" && mode !== "success",
+            fallbackForGrantees: mode !== "forbidden" && mode !== "success",
+            externalEquivalentModel: "vendor/model",
+            ownKeyProviderModelId: "own-model",
+          },
+        ],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const own = {
+        ...externalProviderTarget("own"),
+        poolMemberId: "",
+        ownKey: true,
+        providerModelId: "own-model",
+      };
+      const paid = externalProviderTarget("paid");
+      publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+        ownKey
+          ? listedExternalTargets([own], { fallbackForGrantees: true })
+          : {
+              ...listedExternalTargets([paid], { fallbackForGrantees: mode !== "forbidden" }),
+              enabled: mode !== "forbidden",
+            },
+      );
+      if (mode === "precommit" || mode === "forbidden") {
+        publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+          if (mode === "precommit") await request.beforeProviderSend?.(own);
+          return {
+            dispatched: false,
+            reason: "PROVIDER_UNAVAILABLE",
+            ...(mode === "precommit" ? { providerIoStarted: true } : {}),
+          };
+        });
+        if (mode === "precommit")
+          publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(paid));
+      } else {
+        const result = externalDispatchResult(own);
+        publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+          await request.beforeProviderSend?.(own);
+          return mode === "stream-failure"
+            ? { ...result, terminal: Promise.resolve({ ok: false, responseBytes: 1 }) }
+            : result;
+        });
+      }
+      const capacity = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      await response.text();
+      expect(capacity.acquire).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          ownerId: "user-id",
+          sourceKind: "DIRECT",
+          poolId: undefined,
+          candidates: [
+            expect.objectContaining({
+              executionTargetId: own.executionTargetId,
+              poolMemberId: undefined,
+              waitBudgetMs: 0,
+            }),
+          ],
+        }),
+        expect.anything(),
+      );
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        userId: "user-id",
+        ownKeyProviderModelId: "own-model",
+      });
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(mode === "precommit" ? 2 : 1);
+      if (mode === "precommit") {
+        expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+        expect(publicOverflow.dispatch.mock.calls[1]?.[0]).toMatchObject({
+          userId: "pool-owner-id",
+        });
+      } else if (mode !== "forbidden") expect(response.headers.get("x-wsmp-route")).toBe("own-key");
+      const recorded = Object.assign(
+        {},
+        ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data),
+      );
+      expect(recorded).toMatchObject({
+        fallbackRoute:
+          mode === "precommit" ? "pool-external" : mode === "forbidden" ? null : "own-key",
+        ...(mode === "forbidden"
+          ? {}
+          : {
+              selectedExecutionTargetId:
+                mode === "precommit" ? paid.executionTargetId : own.executionTargetId,
+              selectedPoolMemberId: mode === "precommit" ? paid.poolMemberId : null,
+            }),
+      });
+      if (mode === "forbidden") {
+        expect(
+          db.relayRequest.update.mock.calls.some(([arg]) => arg.data.fallbackRoute === "own-key"),
+        ).toBe(false);
+      }
+      if (mode === "precommit") {
+        const releaseOrder = vi.mocked(capacity.release).mock.invocationCallOrder[0]!;
+        expect(releaseOrder).toBeLessThan(vi.mocked(capacity.acquire).mock.invocationCallOrder[1]!);
+        const restoreIndex = db.relayRequest.update.mock.calls.findIndex(
+          ([arg]) => arg.data.fallbackRoute === null && arg.data.selectedExecutionTargetId === null,
+        );
+        expect(restoreIndex).toBeGreaterThanOrEqual(0);
+        expect(db.relayRequest.update.mock.invocationCallOrder[restoreIndex]).toBeLessThan(
+          vi.mocked(capacity.acquire).mock.invocationCallOrder[1]!,
+        );
+      }
+    },
+  );
+
+  function ownKeyRouteFixture() {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [
+        {
+          ...externalPoolTarget,
+          ownerUserId: "pool-owner-id",
+          accessGrantId: "grant",
+          fallbackEnabled: true,
+          fallbackForGrantees: true,
+          externalEquivalentModel: "vendor/model",
+          ownKeyProviderModelId: "own-model",
+        },
+      ],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const own = {
+      ...externalProviderTarget("own"),
+      poolMemberId: "",
+      ownKey: true,
+      providerModelId: "own-model",
+    };
+    const paid = externalProviderTarget("paid");
+    publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+      listedExternalTargets([ownKey ? own : paid], { fallbackForGrantees: true }),
+    );
+    return { own, paid };
+  }
+
+  it.each([
+    "OWN_KEY_CONSENT_WITHDRAWN",
+    "NO_COMPATIBLE_PROVIDER",
+    "PROVIDER_SATURATED",
+    "PROVIDER_UNHEALTHY",
+    "BUDGET_EXCEEDED",
+  ] as const)(
+    "allows a non-retry-safe operation to use pool fallback after own-key %s without I/O",
+    async (reason) => {
+      const { paid } = ownKeyRouteFixture();
+      // Exercise the routing branch with the policy's never-retry decision.
+      const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+      try {
+        publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+        publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(paid));
+        const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+        await response.text();
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+        expect(publicOverflow.dispatch).toHaveBeenCalledTimes(2);
+        expect(publicOverflow.dispatch.mock.calls[0]?.[0].retrySafe).toBe(false);
+      } finally {
+        policy.mockRestore();
+      }
+    },
+  );
+
+  it("does not retry a non-retry-safe operation after possible own-key provider I/O", async () => {
+    const { own } = ownKeyRouteFixture();
+    const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+    try {
+      publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+        await request.beforeProviderSend?.(own);
+        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: true };
+      });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
+  it.each(["throw", "stream-failure"])(
+    "keeps correct identity when pool fallback ends in %s after an own-key send failure",
+    async (mode) => {
+      const { own, paid } = ownKeyRouteFixture();
+      publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+        await request.beforeProviderSend?.(own);
+        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: true };
+      });
+      if (mode === "throw")
+        publicOverflow.dispatch.mockRejectedValueOnce(
+          new Error("pool dispatch failed before send"),
+        );
+      else
+        publicOverflow.dispatch.mockResolvedValueOnce({
+          ...externalDispatchResult(paid),
+          terminal: Promise.resolve({ ok: false, responseBytes: 1 }),
+        });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      await response.text();
+      const recorded = Object.assign(
+        {},
+        ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data),
+      );
+      expect(recorded).toMatchObject({
+        fallbackRoute: mode === "throw" ? null : "pool-external",
+        selectedExecutionTargetId: mode === "throw" ? null : paid.executionTargetId,
+        selectedPoolMemberId: mode === "throw" ? null : paid.poolMemberId,
+        status: "FAILED",
+      });
+    },
+  );
+
+  it("retains own-key capacity saturation when the owner-paid plan is disabled", async () => {
+    const { own } = ownKeyRouteFixture();
+    publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+      listedExternalTargets(ownKey ? [own] : [], {
+        enabled: Boolean(ownKey),
+        fallbackForGrantees: true,
+      }),
+    );
+    const capacity = admittingCapacityRuntime();
+    vi.mocked(capacity.acquire).mockResolvedValue({ state: "EXPIRED" });
+    const response = await appWith(new FakeRelayManager(), capacity).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(["forbidden", "empty"])(
+    "preserves own-key 429 and Retry-After when pool fallback is %s",
+    async (mode) => {
+      const { own } = ownKeyRouteFixture();
+      publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+        ownKey
+          ? listedExternalTargets([own], { fallbackForGrantees: true })
+          : listedExternalTargets([], { enabled: mode !== "forbidden", fallbackForGrantees: true }),
+      );
+      publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+        await request.beforeProviderSend?.(own);
+        return {
+          dispatched: false,
+          reason: "PROVIDER_UNAVAILABLE",
+          providerIoStarted: true,
+          providerFailure: { target: own, status: 429, retryAfter: "17" },
+        };
+      });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(429);
+      expect(response.headers.get("retry-after")).toBe("17");
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+      const recorded = Object.assign(
+        {},
+        ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data),
+      );
+      expect(recorded).toMatchObject({
+        fallbackRoute: "own-key",
+        status: "FAILED",
+        selectedExecutionTargetId: own.executionTargetId,
+        selectedPoolMemberId: null,
+      });
+    },
+  );
+
+  describe.each(["owner", "grantee", "after-own-key"] as const)(
+    "%s owner-paid provider-only outcomes retain the existing contract",
+    (caller) => {
+      it.each([undefined, 408, 409, 429, 500, 502, 503, 504, "cancelled"] as const)(
+        "preserves status, error, headers and recorded status for provider failure %s",
+        async (outcome) => {
+          const { own, paid } = ownKeyRouteFixture();
+          if (caller !== "after-own-key") {
+            mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+              directModels: [],
+              modelPools: [
+                {
+                  ...externalPoolTarget,
+                  ownerUserId: caller === "owner" ? "user-id" : "pool-owner-id",
+                  accessGrantId: caller === "owner" ? null : "grant",
+                  fallbackForGrantees: true,
+                },
+              ],
+            });
+          } else {
+            publicOverflow.dispatch.mockImplementationOnce(
+              async (request: PublicOverflowRequest) => {
+                await request.beforeProviderSend?.(own);
+                return {
+                  dispatched: false,
+                  reason: "PROVIDER_UNAVAILABLE",
+                  providerIoStarted: true,
+                  providerFailure: { target: own, status: 429, retryAfter: "17" },
+                };
+              },
+            );
+          }
+          const controller = new AbortController();
+          publicOverflow.dispatch.mockImplementationOnce(async () => {
+            if (outcome === "cancelled") controller.abort();
+            return {
+              dispatched: false,
+              reason: "PROVIDER_UNAVAILABLE",
+              providerIoStarted: true,
+              providerFailure: {
+                target: paid,
+                status: outcome === "cancelled" ? 500 : outcome,
+                retryAfter: "17",
+              },
+            };
+          });
+          const response = await appWith(
+            new FakeRelayManager(),
+            admittingCapacityRuntime(),
+          ).request("/chat/completions", {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+            signal: controller.signal,
+          });
+          expect(response.status).toBe(outcome === "cancelled" ? 499 : 503);
+          expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+          expect(response.headers.get("x-wsmp-route")).toBeNull();
+          expect(response.headers.get("x-wsmp-served-model")).toBeNull();
+          expect(response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+          expect(response.headers.get("retry-after")).toBeNull();
+          await expect(response.json()).resolves.toMatchObject({
+            error: { code: outcome === "cancelled" ? "cancelled" : "external_unavailable" },
+          });
+          expect(
+            Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+          ).toMatchObject({
+            status: outcome === "cancelled" ? "CANCELED" : "FAILED",
+            httpStatusCode: outcome === "cancelled" ? 499 : 503,
+            upstreamStatusCode: null,
+            fallbackRoute: null,
+            selectedExecutionTargetId: null,
+            selectedPoolMemberId: null,
+          });
+          expect(publicOverflow.dispatch).toHaveBeenCalledTimes(caller === "after-own-key" ? 2 : 1);
+        },
+      );
+    },
+  );
+
+  it("keeps the owner-paid never-retry policy even when a member did no I/O", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([externalProviderTarget("first"), externalProviderTarget("second")]),
+    );
+    publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason: "BUDGET_EXCEEDED" });
+    const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+    try {
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
+  it.each(["owner-paid", "own-key"] as const)(
+    "keeps the decided %s failure if terminal telemetry fails",
+    async (tier) => {
+      const { own, paid } = ownKeyRouteFixture();
+      if (tier === "owner-paid") {
+        mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+          directModels: [],
+          modelPools: [externalPoolTarget],
+        });
+      } else {
+        publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+          listedExternalTargets(ownKey ? [own] : [], {
+            enabled: Boolean(ownKey),
+            fallbackForGrantees: true,
+          }),
+        );
+      }
+      publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+        if (tier === "own-key") await request.beforeProviderSend?.(own);
+        return {
+          dispatched: false,
+          reason: "PROVIDER_UNAVAILABLE",
+          providerIoStarted: true,
+          providerFailure: { target: tier === "own-key" ? own : paid, status: 502 },
+        };
+      });
+      // Route UPDATEs before terminalization succeed; only the final telemetry fails.
+      const update = db.relayRequest.update.getMockImplementation()!;
+      db.relayRequest.update.mockImplementation(async (args) => {
+        if (args.data.status === "FAILED") throw new Error("terminal telemetry unavailable");
+        return update(args);
+      });
+      const logged = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+        expect(response.status).toBe(tier === "own-key" ? 502 : 503);
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(logged).toHaveBeenCalled();
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
+
+  it("keeps own-key cancellation status after a rejected upstream response", async () => {
+    const { own } = ownKeyRouteFixture();
+    publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+      listedExternalTargets(ownKey ? [own] : [], {
+        enabled: Boolean(ownKey),
+        fallbackForGrantees: true,
+      }),
+    );
+    const controller = new AbortController();
+    publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+      await request.beforeProviderSend?.(own);
+      controller.abort();
+      return {
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
+        providerFailure: { target: own, status: 500 },
+      };
+    });
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      },
+    );
+    expect(response.status).toBe(499);
+    expect(response.headers.get("x-wsmp-route")).toBeNull();
+    expect(
+      Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+    ).toMatchObject({
+      status: "CANCELED",
+      httpStatusCode: 499,
+      upstreamStatusCode: 500,
+      fallbackRoute: "own-key",
+    });
+  });
+
+  it.each(["saturated", "missing-member", "disabled", "uncovered"] as const)(
+    "preserves owner-paid admission/listing outcome: %s",
+    async (outcome) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const paid = externalProviderTarget("paid");
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([paid], {
+          enabled: outcome !== "disabled",
+          fallbackForGrantees: outcome !== "uncovered",
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: outcome === "disabled" ? "POOL_PRIVATE" : "GRANTEE_NOT_COVERED",
+      });
+      const capacity = admittingCapacityRuntime();
+      if (outcome === "saturated")
+        vi.mocked(capacity.acquire).mockResolvedValue({ state: "EXPIRED" });
+      if (outcome === "missing-member")
+        vi.mocked(capacity.acquire).mockResolvedValue({
+          state: "ADMITTED",
+          lease: {
+            leaseId: "missing-member",
+            attemptId: "attempt",
+            capacityId: paid.inferenceCapacityId,
+            executionTargetId: paid.executionTargetId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        });
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(
+        outcome === "saturated" || outcome === "missing-member" ? 429 : 503,
+      );
+      expect(response.headers.get("retry-after")).toBeNull();
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      if (outcome === "disabled" || outcome === "uncovered")
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      if (outcome === "missing-member") expect(capacity.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("classifies a failed own-key restore and never admits another tier", async () => {
+    const { own } = ownKeyRouteFixture();
+    const update = db.relayRequest.update.getMockImplementation()!;
+    publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+      await request.beforeProviderSend?.(own);
+      db.relayRequest.update.mockImplementation(async (args) => {
+        if (args.data.fallbackRoute === null) throw new Error("restore unavailable");
+        return update(args);
+      });
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: true };
+    });
+    const logged = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const capacity = admittingCapacityRuntime();
+    try {
+      const response = await appWith(new FakeRelayManager(), capacity).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "disconnected" } });
+      expect(capacity.acquire).toHaveBeenCalledOnce();
+      expect(capacity.release).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(
+        Object.assign({}, ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data)),
+      ).toMatchObject({
+        status: "FAILED",
+        httpStatusCode: 503,
+        fallbackRoute: "own-key",
+        selectedExecutionTargetId: own.executionTargetId,
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   // R1-A: a grantee's consent carries the exact grant the request was
   // resolved under, which the send claim requires to still exist.
   it("binds a grantee's :external consent to the grant the request was resolved under", async () => {
@@ -4701,7 +5324,7 @@ describe("model API routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
     expect(response.headers.get("x-wsmp-fallback-reason")).toBe("no_local_member");
     expect(response.headers.get("x-wsmp-served-model")).toBe("provider-upstream");
     expect(response.headers.get("access-control-expose-headers")).toContain("x-wsmp-route");
@@ -5369,6 +5992,156 @@ describe("model API routes", () => {
       externalConsent.poolIds = [externalPoolTarget.id];
     });
 
+    it.each(["success", "wait-expiry", "local-failure"] as const)(
+      "supersedes own-key intent before local resume: %s",
+      async (mode) => {
+        const { own } = ownKeyRouteFixture();
+        db.poolMember.findMany.mockResolvedValue([localMember()]);
+        publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+          listedExternalTargets(ownKey ? [own] : [], {
+            enabled: Boolean(ownKey),
+            fallbackForGrantees: true,
+          }),
+        );
+        publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+          await request.beforeProviderSend?.(own);
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: true };
+        });
+        const { runtime } = scriptedRuntime({
+          local: ["EXPIRED", mode === "wait-expiry" ? "EXPIRED" : "ADMITTED"],
+          provider: "ADMITTED",
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        if (mode !== "wait-expiry") {
+          await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+          if (mode === "local-failure")
+            manager.error(requireSent(manager).requestId, "request_too_large");
+          else await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        }
+        const response = await responsePromise;
+        await response.text();
+        const recorded = Object.assign(
+          {},
+          ...db.relayRequest.update.mock.calls.map(([arg]) => arg.data),
+        );
+        expect(recorded).toMatchObject({
+          fallbackRoute: "local",
+          selectedExecutionTargetId:
+            mode === "wait-expiry" ? null : localMember().ExecutionTarget.id,
+          selectedPoolMemberId: mode === "wait-expiry" ? null : "local-primary",
+          status: mode === "success" ? "SUCCEEDED" : "FAILED",
+        });
+        const resumedAdmission = vi.mocked(runtime.acquire).mock.invocationCallOrder[2]!;
+        const restoreIndex = db.relayRequest.update.mock.calls.findIndex(
+          ([arg]) =>
+            arg.data.fallbackRoute === "local" && arg.data.selectedExecutionTargetId === null,
+        );
+        expect(restoreIndex).toBeGreaterThanOrEqual(0);
+        expect(db.relayRequest.update.mock.invocationCallOrder[restoreIndex]).toBeLessThan(
+          resumedAdmission,
+        );
+      },
+    );
+
+    it.each(["disabled", "empty"] as const)(
+      "keeps the local transport failure after own-key precommit 503 with %s owner-paid fallback",
+      async (ownerPaid) => {
+        const { own } = ownKeyRouteFixture();
+        const member = localMember();
+        member.DiscoveredModel.userId = "pool-owner-id";
+        db.poolMember.findMany.mockResolvedValue([member]);
+        publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+          listedExternalTargets(ownKey ? [own] : [], {
+            enabled: Boolean(ownKey) || ownerPaid === "empty",
+            fallbackForGrantees: true,
+          }),
+        );
+        publicOverflow.dispatch.mockImplementationOnce(async (request: PublicOverflowRequest) => {
+          expect(request).toMatchObject({
+            userId: "user-id",
+            ownKeyProviderModelId: own.providerModelId,
+            reason: "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE",
+          });
+          await request.beforeProviderSend?.(own);
+          return {
+            dispatched: false,
+            reason: "PROVIDER_UNAVAILABLE",
+            providerIoStarted: true,
+            providerFailure: { target: own, status: 503 },
+          };
+        });
+        const { acquire, runtime } = scriptedRuntime({
+          local: ["ADMITTED"],
+          provider: "ADMITTED",
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        const attemptId = requireSent(manager).requestId;
+        manager.error(attemptId, "transport");
+
+        const response = await responsePromise;
+        expect(response.status).toBe(502);
+        expect(response.headers.get("x-wsmp-route")).toBe("local");
+        expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+        expect(response.headers.get("x-wsmp-served-model")).toBeNull();
+        await expect(response.json()).resolves.toMatchObject({ error: { code: "transport" } });
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+        expect(
+          acquire.mock.calls.map(([attempt]) => [attempt.ownerId, attempt.sourceKind]),
+        ).toEqual([
+          ["pool-owner-id", "POOL"],
+          ["user-id", "DIRECT"],
+        ]);
+        expect(runtime.release).toHaveBeenCalledTimes(2);
+        const localTuple = {
+          fallbackRoute: "local",
+          selectedExecutionTargetId: member.ExecutionTarget.id,
+          selectedDiscoveredModelId: member.discoveredModelId,
+          selectedPoolMemberId: member.id,
+        };
+        const updates = db.relayRequest.update.mock.calls.map(([arg]) => arg);
+        const intentIndex = updates.findIndex((arg) => arg.data.fallbackRoute === "own-key");
+        expect(intentIndex).toBeGreaterThanOrEqual(0);
+        const restoreIndex = updates.findIndex(
+          (arg, index) =>
+            index > intentIndex && arg.data.fallbackRoute === "local" && !arg.data.status,
+        );
+        expect(restoreIndex).toBeGreaterThan(intentIndex);
+        expect(updates[restoreIndex]).toMatchObject({ data: localTuple });
+        const terminalIndex = updates.findIndex((arg) => arg.data.status === "FAILED");
+        expect(terminalIndex).toBeGreaterThan(restoreIndex);
+        expect(updates[terminalIndex]).toMatchObject({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: {
+            ...localTuple,
+            status: "FAILED",
+            httpStatusCode: 502,
+            upstreamStatusCode: null,
+            errorClass: "transport",
+          },
+        });
+        expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ attemptId, state: "ACTIVE" }),
+            data: expect.objectContaining({ state: "FAILED", terminalState: "FAILED" }),
+          }),
+        );
+      },
+    );
+
     it("resumes the local wait for B - min(B, E) when the provider is saturated and serves locally", async () => {
       db.poolMember.findMany.mockResolvedValue([localMember()]);
       publicOverflow.list.mockResolvedValue(
@@ -5451,7 +6224,7 @@ describe("model API routes", () => {
       // No route was ever decided for this request (M2).
       expect(db.relayRequest.update).toHaveBeenCalled();
       for (const [update] of db.relayRequest.update.mock.calls)
-        expect((update as { data: Record<string, unknown> }).data.fallbackRoute).toBeUndefined();
+        expect((update as { data: Record<string, unknown> }).data.fallbackRoute ?? null).toBeNull();
     });
 
     it("answers 400 with the header on a provider-only pool with no compatible external target", async () => {
@@ -5859,7 +6632,7 @@ describe("model API routes", () => {
     expect(response.headers.get("x-wsmp-route")).toBeNull();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
     for (const [update] of db.relayRequest.update.mock.calls)
-      expect((update as { data: Record<string, unknown> }).data.fallbackRoute).toBeUndefined();
+      expect((update as { data: Record<string, unknown> }).data.fallbackRoute ?? null).toBeNull();
   });
 
   it("rejects :external from MCP diagnostics without contacting a provider", async () => {
@@ -6959,7 +7732,7 @@ describe("model API routes", () => {
       body: JSON.stringify({ model: EXTERNAL_MODEL_ID, input: "hello", store: true }),
     });
     expect(create.status).toBe(200);
-    expect(create.headers.get("x-wsmp-route")).toBe("pool-external");
+    expect(create.headers.get("x-wsmp-route")).toBe("pool-fallback");
     await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
     const binding = db.responseStickinessRecord.upsert.mock.calls.at(-1)?.[0].create;
@@ -7474,6 +8247,77 @@ describe("model API routes", () => {
       ...overrides,
     };
   }
+
+  it.each([
+    ["CALLER_CONSENT_WITHDRAWN", 403],
+    ["OWN_KEY_CONSENT_WITHDRAWN", 403],
+    ["BOUND_TARGET_INVALID", 404],
+    ["REQUESTER_NOT_VISIBLE", 404],
+    ["PROVIDER_UNAVAILABLE", 503],
+  ] as const)(
+    "own-key bound follow-up preserves route and maps %s to %s",
+    async (reason, status) => {
+      const ownPool = {
+        ...externalPoolTarget,
+        ownerUserId: "pool-owner-id",
+        accessGrantId: "grant",
+        externalEquivalentModel: "vendor/model",
+        ownKeyProviderModelId: "provider-model",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+      };
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [ownPool],
+      });
+      externalConsent.poolIds = [ownPool.id];
+      db.responseStickinessRecord.findUnique.mockResolvedValue(
+        consentedProviderBinding({
+          fallbackRoute: "own-key",
+          poolGrantId: "grant",
+          PoolGrant: {
+            id: "grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      const target = {
+        ...externalProviderTarget(""),
+        ownKey: true,
+        executionTargetId: "provider-target",
+        providerModelId: "provider-model",
+        upstreamModelId: "gpt-response",
+        nativeSurfaces: ["openai-responses"] as PublicProviderTarget["nativeSurfaces"],
+      };
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([target], { fallbackForGrantees: true }),
+      );
+      publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason });
+      const capacity = admittingCapacityRuntime();
+      const response = await appWith(new FakeRelayManager(), capacity).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: EXTERNAL_MODEL_ID,
+          previous_response_id: "resp_provider",
+          input: "next",
+        }),
+      });
+      expect(response.status).toBe(status);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        userId: "user-id",
+        ownKeyProviderModelId: "provider-model",
+        retrySafe: false,
+      });
+      expect(capacity.acquire).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerId: "user-id", sourceKind: "DIRECT", poolId: undefined }),
+        expect.anything(),
+      );
+    },
+  );
 
   it("requires :external to continue an externally served response", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
