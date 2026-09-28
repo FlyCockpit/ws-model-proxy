@@ -185,6 +185,37 @@ ceremonial confirmation. The exact per-tool policy is in the
 [coverage artifact](./mcp-tool-coverage.md); the wrapper strips the
 confirmation field before the underlying procedure runs.
 
+## External fallback tools
+
+`forwarder_pool_fallback_get` (read) returns a pool's external-fallback state.
+Owners get `fallbackEnabled`, `fallbackForGrantees`, `externalAfterWaitMs`,
+`externalEquivalentModel`, the external members in fallback order and the
+aggregate own-key request count. Grantees get whether owner-paid fallback is
+available to them (provider types only, never the owner's account labels) and
+their own-key route.
+
+`forwarder_pool_fallback_update` (write, literal `mcp:write`, no confirmation
+literal) changes `fallbackEnabled`, `fallbackForGrantees` and
+`externalAfterWaitMs`. These settings cost money: turning fallback on sends
+`:external` requests to the owner's paid provider accounts, and
+`fallbackForGrantees` makes the owner pay for every grantee's external use.
+The tool description states this. The procedure applies the same checks as the
+dashboard (deployment switch, audited protection policy on every external
+member, wait within the local budget), and every change, from MCP or the
+dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
+(`metadata.source` is `mcp` or `dashboard`), readable with
+`provider_audit_events_list`. The general pool tools reject the two switches and
+point to this tool.
+
+Still human-only: token external consent (`allowExternal`, `includeExternal`),
+own-key preferences, the pool external-equivalent picker, catalog search, and
+the OpenRouter "providers that may collect data" account setting.
+
+No tool output can contain a secret value (provider API keys, encrypted
+credential material, token secrets or hashes). Projections pick safe fields and
+a recursive redactor removes secret-bearing keys; a test drives every tool with
+secret-laden results to pin this.
+
 ## Tool errors
 
 A failed tool call returns `isError: true`, a short stable text, and

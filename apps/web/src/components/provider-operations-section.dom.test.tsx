@@ -21,6 +21,7 @@ const state = vi.hoisted(() => ({
   testResult: undefined as Record<string, unknown> | undefined,
   pools: [] as Array<Record<string, unknown>>,
   mutationFailures: {} as Record<string, unknown>,
+  dataCollectionPayloads: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -39,6 +40,9 @@ vi.mock("react-i18next", () => ({
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
+
+// The OpenRouter catalog import has its own DOM test; stub it here.
+vi.mock("./provider-catalog-import", () => ({ ProviderCatalogImport: () => null }));
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: () => unknown) => ({
@@ -66,6 +70,7 @@ vi.mock("@/utils/orpc", () => {
           return { id: "created-account" };
         }
         if (name === "createBudgetPolicy") state.budgetPayload = input;
+        if (name === "setAllowDataCollection") state.dataCollectionPayloads.push(input);
         if (name === "testCredential") return state.testResult ?? {};
         if (name === "updateModel") {
           state.updateModelPayloads.push(input);
@@ -105,6 +110,7 @@ vi.mock("@/utils/orpc", () => {
     "retirePricingVersion",
     "revokeCredential",
     "setAccountEnabled",
+    "setAllowDataCollection",
     "testCredential",
     "updateAccount",
     "updateModel",
@@ -556,6 +562,49 @@ describe("provider pool member removal", () => {
       expect(toast.error).toHaveBeenCalledWith("t(dashboard:providers.feedback.failed)"),
     );
     expect(toast.error).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpenRouter data-collection setting (D9)", () => {
+  const account = (providerType: string, allowDataCollection = false) => ({
+    id: "account-a",
+    label: "Provider",
+    providerType,
+    baseUrl: "https://openrouter.ai/api",
+    authType: "BEARER",
+    enabled: false,
+    allowDataCollection,
+    healthStatus: "HEALTHY",
+    healthCheckedAt: null,
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+  });
+
+  it("is off by default on OpenRouter accounts and a person can allow it", async () => {
+    state.dataCollectionPayloads = [];
+    state.accounts = [account("openrouter")];
+    mount();
+    const toggle = (await screen.findByRole("checkbox", {
+      name: "dashboard:providers.dataCollection.label",
+    })) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    expect(screen.getByText("dashboard:providers.dataCollection.deniedHint")).toBeTruthy();
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(state.dataCollectionPayloads).toEqual([
+        { id: "account-a", allowDataCollection: true },
+      ]),
+    );
+  });
+
+  it("shows the allowed state and is absent for other provider types", async () => {
+    state.accounts = [account("openrouter", true)];
+    mount();
+    expect(await screen.findByText("dashboard:providers.dataCollection.allowedHint")).toBeTruthy();
+    cleanup();
+    state.accounts = [account("openai")];
+    mount();
+    await screen.findByRole("button", { name: /dashboard:providers\.actions\.test/u });
+    expect(screen.queryByText("dashboard:providers.dataCollection.label")).toBeNull();
   });
 });
 

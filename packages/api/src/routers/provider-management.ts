@@ -237,6 +237,7 @@ const accountSelect = {
   status: true,
   enabled: true,
   safeConfiguration: true,
+  allowDataCollection: true,
   healthStatus: true,
   healthCheckedAt: true,
   currentCredentialId: true,
@@ -547,10 +548,16 @@ export const providerManagementRouter = {
             });
         }
         const endpointChanged = data.baseUrl !== undefined && data.baseUrl !== current.baseUrl;
+        // D9: the OpenRouter data-collection opt-out belongs to the account
+        // type it was granted for; a type change resets it to the private
+        // default so it can never carry over to a new OpenRouter account.
+        const typeChanged =
+          data.providerType !== undefined && data.providerType !== current.providerType;
         const updated = await tx.providerAccount.updateMany({
           where: { id: accountId, userId, deletedAt: null },
           data: {
             ...(data as Prisma.ProviderAccountUpdateInput),
+            ...(typeChanged ? { allowDataCollection: false } : {}),
             ...(endpointChanged
               ? { endpointIdentity: data.baseUrl, endpointVersion: { increment: 1 } }
               : {}),
@@ -620,6 +627,50 @@ export const providerManagementRouter = {
               action: "ACCOUNT_UPDATED",
               subjectId: account.id,
               metadata: { enabled: input.enabled },
+            },
+          });
+        }
+        const row = await tx.providerAccount.findFirst({
+          where: { id: account.id, userId, deletedAt: null },
+          select: accountSelect,
+        });
+        if (!row) throw missing();
+        return row;
+      }, providerWriteTransaction);
+    }),
+  /**
+   * D9 human-only privacy switch: "Allow OpenRouter providers that may
+   * collect data". Off (the default) sends `provider.data_collection:
+   * "deny"` on every OpenRouter request of this account. Excluded from MCP.
+   */
+  setAllowDataCollection: protectedProcedure
+    .input(z.object({ id, allowDataCollection: z.boolean() }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
+        const account = await tx.providerAccount.findFirst({
+          where: { id: input.id, userId, deletedAt: null },
+          select: { id: true, providerType: true, allowDataCollection: true },
+        });
+        if (!account) throw missing();
+        if (account.providerType !== "openrouter")
+          throw new ORPCError("BAD_REQUEST", {
+            message: "The data-collection setting applies only to OpenRouter accounts.",
+          });
+        if (account.allowDataCollection !== input.allowDataCollection) {
+          await tx.providerAccount.updateMany({
+            where: { id: account.id, userId, deletedAt: null },
+            data: { allowDataCollection: input.allowDataCollection },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: account.id,
+              action: "ACCOUNT_UPDATED",
+              subjectId: account.id,
+              metadata: { allowDataCollection: input.allowDataCollection },
             },
           });
         }

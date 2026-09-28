@@ -200,6 +200,28 @@ remain intact. While deployment flags load, the UI shows skeletons; a failed
 fetch shows a retry state. Secrets are never returned.
 
 
+## OpenRouter privacy (`data_collection: "deny"`)
+
+Every request WMP sends to an **OpenRouter** provider account carries
+OpenRouter's provider-routing preference `provider: { data_collection: "deny" }`.
+OpenRouter then routes only to upstream providers that do not store or train
+on prompts. This covers owner-paid pool fallback and own-key (BYOK) traffic,
+native pass-through and adapted requests alike. Other provider types never get
+the field. If the rendered body already has a `provider` object, its other keys
+are kept and `data_collection` is overwritten, so a caller cannot relax it.
+
+Each OpenRouter account has the setting **Allow OpenRouter providers that may
+collect data** (off by default) on the Providers page. The owner sets it for
+owner-paid accounts; grantees set it on their own accounts. It is human-only:
+MCP cannot change it, and changing an account's provider type resets it to off.
+Changes are recorded as `ACCOUNT_UPDATED` provider audit events.
+
+With `deny` on, some models (often `:free` ones) have no eligible provider.
+OpenRouter then answers 404 ("No endpoints found matching your data policy");
+WMP returns **503** with code `provider_data_policy_unavailable` and a message
+that names the cause, instead of the bare 404. Choose another model or allow
+data collection on that account.
+
 ## Own-key routing (BYOK)
 
 `/{lang}/dashboard/providers` manages your provider keys. Its **Pools** tab

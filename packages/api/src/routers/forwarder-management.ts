@@ -85,6 +85,14 @@ import {
   poolIdsWithMembers,
 } from "../lib/pool-capability-impact";
 import {
+  assertExternalAfterWaitWithinBudget,
+  assertPoolFallbackEnableable,
+  assertProviderEgressReleaseGate,
+  POOL_FALLBACK_DEFAULTS,
+  poolFallbackChangeSource,
+  recordPoolFallbackAudit,
+} from "../lib/pool-fallback-settings";
+import {
   assertRecommendedSurfaceServable,
   discoveredModelSurfaceCapabilities,
   providerModelSurfaceCapabilities,
@@ -220,40 +228,6 @@ const poolFallbackFields = {
   /** How long an `:external` request waits for local capacity (0 = only if free now). */
   externalAfterWaitMs: z.number().int().min(0).max(600_000).optional(),
 };
-
-/**
- * A save that sets a NEW external-fallback wait must not exceed the pool's
- * resulting local wait budget (the value after this save). A save that does
- * not change the external wait is never rejected because of it: the stored
- * value may exceed a budget lowered later, and the runtime always waits
- * min(budget, externalAfterWaitMs), so an out-of-order pair is harmless.
- */
-function assertExternalAfterWaitWithinBudget({
-  externalAfterWaitMs,
-  currentExternalAfterWaitMs,
-  capacityWaitBudgetMs,
-}: {
-  externalAfterWaitMs: number | undefined;
-  /** Stored value, or null when creating a pool. */
-  currentExternalAfterWaitMs: number | null;
-  /** The pool's local wait budget after this save (null = unbounded). */
-  capacityWaitBudgetMs: number | null;
-}): void {
-  if (externalAfterWaitMs === undefined || externalAfterWaitMs === currentExternalAfterWaitMs)
-    return;
-  if (capacityWaitBudgetMs !== null && externalAfterWaitMs > capacityWaitBudgetMs)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "The external fallback wait cannot exceed the pool's local wait budget.",
-    });
-}
-
-function assertProviderEgressReleaseGate(reason?: GuardedPoolCreateFailureReason): void {
-  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
-    throw new ORPCError("NOT_FOUND", {
-      message: "Provider egress is not enabled for this deployment.",
-      ...(reason !== undefined ? { data: { reason } } : {}),
-    });
-}
 
 function isPrismaUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
@@ -2235,6 +2209,17 @@ export const forwarderManagementRouter = {
             resourceId: pool.id,
           },
         });
+        // Attaching external members turns fallback on: audit it.
+        await recordPoolFallbackAudit(tx, {
+          userId,
+          poolId: pool.id,
+          before: POOL_FALLBACK_DEFAULTS,
+          after: {
+            ...POOL_FALLBACK_DEFAULTS,
+            fallbackEnabled: hasPublicOverflow,
+          },
+          source: poolFallbackChangeSource(context),
+        });
         guardedSetupTestFailure?.();
         const created = await tx.modelPool.findUnique({
           where: { id: pool.id },
@@ -2597,6 +2582,18 @@ export const forwarderManagementRouter = {
           data,
           select: poolSelect,
         });
+        // A create that sets non-default fallback values is a fallback change.
+        await recordPoolFallbackAudit(tx, {
+          userId,
+          poolId: created.id,
+          before: POOL_FALLBACK_DEFAULTS,
+          after: {
+            fallbackEnabled: created.fallbackEnabled,
+            fallbackForGrantees: created.fallbackForGrantees,
+            externalAfterWaitMs: created.externalAfterWaitMs,
+          },
+          source: poolFallbackChangeSource(context),
+        });
         await tx.capacityAuditEvent.create({
           data: {
             userId,
@@ -2677,93 +2674,8 @@ export const forwarderManagementRouter = {
             ? input.capacityWaitBudgetMs
             : existing.capacityWaitBudgetMs,
       });
-      if (input.fallbackEnabled === true) {
-        const attachments = await prisma.poolMember.findMany({
-          where: { poolId: existing.id, tier: "PUBLIC_OVERFLOW" },
-          select: {
-            id: true,
-            ExecutionTarget: {
-              select: {
-                ProviderModel: { select: { id: true, providerAccountId: true } },
-              },
-            },
-          },
-        });
-        const targets = attachments.flatMap((attachment) => {
-          const model = attachment.ExecutionTarget?.ProviderModel;
-          return model ? [{ attachmentId: attachment.id, ...model }] : [];
-        });
-        if (targets.length !== attachments.length) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Every public overflow attachment must reference a provider model.",
-          });
-        }
-        const policies = await prisma.providerBudgetPolicy.findMany({
-          where: {
-            userId: context.session.user.id,
-            active: true,
-            scopeType: "POOL_PROVIDER_MODEL",
-            poolId: existing.id,
-            OR: targets.map(({ id, providerAccountId }) => ({
-              providerModelId: id,
-              providerAccountId,
-            })),
-          },
-          select: {
-            id: true,
-            providerModelId: true,
-            providerAccountId: true,
-            activatedAt: true,
-            Rules: {
-              where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
-              select: { mode: true, limitValue: true },
-            },
-          },
-        });
-        const validPolicies = new Map(
-          policies
-            .filter(
-              (policy) =>
-                policy.activatedAt &&
-                policy.Rules.length === 1 &&
-                policy.Rules.every(
-                  (rule) =>
-                    (rule.mode === "LIMITED" &&
-                      rule.limitValue !== null &&
-                      Number(rule.limitValue.toString()) > 0) ||
-                    (rule.mode === "UNLIMITED" && rule.limitValue === null),
-                ),
-            )
-            .map((policy) => [`${policy.providerAccountId}:${policy.providerModelId}`, policy]),
-        );
-        const selectedPolicies = targets.map((target) =>
-          validPolicies.get(`${target.providerAccountId}:${target.id}`),
-        );
-        if (selectedPolicies.some((policy) => !policy)) {
-          throw new ORPCError("BAD_REQUEST", {
-            message:
-              "Every public overflow attachment requires an active explicit LIMITED or UNLIMITED concurrency policy.",
-          });
-        }
-        const auditChecks = await Promise.all(
-          selectedPolicies.map((policy) =>
-            prisma.providerAuditEvent.findFirst({
-              where: {
-                userId: context.session.user.id,
-                providerAccountId: policy!.providerAccountId,
-                subjectId: policy!.id,
-                action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
-              },
-              select: { id: true },
-            }),
-          ),
-        );
-        if (auditChecks.some((audit) => !audit)) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Every public overflow protection policy must have an activation audit trail.",
-          });
-        }
-      }
+      if (input.fallbackEnabled === true)
+        await assertPoolFallbackEnableable(existing.id, context.session.user.id);
 
       await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
@@ -2785,6 +2697,8 @@ export const forwarderManagementRouter = {
             userId: true,
             name: true,
             fallbackEnabled: true,
+            fallbackForGrantees: true,
+            externalAfterWaitMs: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
@@ -2930,6 +2844,23 @@ export const forwarderManagementRouter = {
               : {}),
           },
           select: poolSelect,
+        });
+        // Every change of the external-fallback settings is audited, from
+        // the dashboard and from MCP alike (issue #67).
+        await recordPoolFallbackAudit(tx, {
+          userId,
+          poolId: input.id,
+          before: {
+            fallbackEnabled: current.fallbackEnabled,
+            fallbackForGrantees: current.fallbackForGrantees,
+            externalAfterWaitMs: current.externalAfterWaitMs,
+          },
+          after: {
+            fallbackEnabled: row.fallbackEnabled,
+            fallbackForGrantees: row.fallbackForGrantees,
+            externalAfterWaitMs: row.externalAfterWaitMs,
+          },
+          source: poolFallbackChangeSource(context),
         });
         return row;
       });

@@ -283,12 +283,14 @@ function anyArgs(): StandardSchemaWithJSON {
 }
 
 /**
- * Owner fallback switches that only a person may change (fallback redesign
- * D-K): turning external fallback on, or paying for grantees' external use.
- * Confirmed MCP writes for these arrive with the MCP fallback tools (PR4).
+ * The owner's external-fallback switches (`fallbackEnabled`,
+ * `fallbackForGrantees`) change who pays for external provider use, so MCP
+ * changes them ONLY through `forwarder_pool_fallback_update`, whose
+ * description states the cost effect and whose every change is audited
+ * (owner decision on issue #67). The general pool tools reject them.
  */
-const HUMAN_ONLY_POOL_FALLBACK_MESSAGE =
-  "External fallback switches can be changed only by a person in the dashboard.";
+const POOL_FALLBACK_TOOL_MESSAGE =
+  "External fallback switches are changed only with forwarder_pool_fallback_update.";
 
 /**
  * Loose pool-write args that can never carry `fallbackEnabled` or
@@ -298,8 +300,8 @@ const HUMAN_ONLY_POOL_FALLBACK_MESSAGE =
 function poolArgsWithoutFallbackSwitches(): StandardSchemaWithJSON {
   return withInputSizeBound(
     z.looseObject({
-      fallbackEnabled: z.never(HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
-      fallbackForGrantees: z.never(HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
+      fallbackEnabled: z.never(POOL_FALLBACK_TOOL_MESSAGE).optional(),
+      fallbackForGrantees: z.never(POOL_FALLBACK_TOOL_MESSAGE).optional(),
     }),
   );
 }
@@ -307,16 +309,57 @@ function poolArgsWithoutFallbackSwitches(): StandardSchemaWithJSON {
 /**
  * Guarded create turns fallback on implicitly when it attaches provider
  * (external) members, so MCP may use it only for local-only pools. External
- * members can still be attached with `forwarder_provider_member_add`,
- * which never turns fallback on.
+ * members can still be attached with `forwarder_provider_member_add` (which
+ * never turns fallback on) and fallback turned on with
+ * `forwarder_pool_fallback_update`.
  */
+const GUARDED_EXTERNAL_MEMBERS_MESSAGE =
+  "Attach external members with forwarder_provider_member_add, then turn fallback on with forwarder_pool_fallback_update.";
+
 function guardedPoolArgsWithoutExternalMembers(): StandardSchemaWithJSON {
   return withInputSizeBound(
     z.looseObject({
-      providerModels: z.array(z.unknown()).max(0, HUMAN_ONLY_POOL_FALLBACK_MESSAGE).optional(),
+      providerModels: z.array(z.unknown()).max(0, GUARDED_EXTERNAL_MEMBERS_MESSAGE).optional(),
     }),
   );
 }
+
+/**
+ * The OpenRouter data-collection opt-out (decision D9) is human-only: an
+ * agent must never relax the account's privacy routing. The account write
+ * procedures do not accept it either (it has its own excluded procedure);
+ * advertising it as forbidden makes the refusal explicit.
+ */
+const HUMAN_ONLY_DATA_COLLECTION_MESSAGE =
+  "The OpenRouter data-collection setting can be changed only by a person in the dashboard.";
+
+function providerAccountArgsWithoutDataCollection(): StandardSchemaWithJSON {
+  return withInputSizeBound(
+    z.looseObject({
+      allowDataCollection: z.never(HUMAN_ONLY_DATA_COLLECTION_MESSAGE).optional(),
+    }),
+  );
+}
+
+/**
+ * Pool fallback write args: exactly the three owner settings. Token external
+ * consent (`allowExternal`, `includeExternal`) stays dashboard-only (C1) and
+ * is not accepted here (the procedure input is strict).
+ */
+function poolFallbackUpdateArgs(): StandardSchemaWithJSON {
+  return withInputSizeBound(
+    z.looseObject({
+      poolId: z.string().min(1),
+      fallbackEnabled: z.boolean().optional(),
+      fallbackForGrantees: z.boolean().optional(),
+      externalAfterWaitMs: z.number().int().min(0).max(600_000).optional(),
+    }),
+  );
+}
+
+/** Cost statement carried by the fallback write tool's description (issue #67). */
+export const POOL_FALLBACK_COST_NOTICE =
+  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event.";
 
 /** Loose object that additionally requires the exact confirmation literal. */
 function confirmedArgs(confirmation: Exclude<McpToolConfirmation, null>): StandardSchemaWithJSON {
@@ -425,6 +468,17 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listModelPools),
+  },
+  {
+    name: "forwarder_pool_fallback_get",
+    target: "poolFallback.get",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    descriptionNote:
+      "Owners get the pool's external fallback switches, external members in fallback order, and the own-key request count. Grantees get whether owner-paid fallback is available to them (provider types only) and their own-key route.",
+    invokeProcedure: procedureInvoker((client) => client.poolFallback.get),
   },
   {
     name: "forwarder_affinity_stats_get",
@@ -664,7 +718,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     // D-K: no external members here, because attaching them turns fallback on.
     inputSchema: guardedPoolArgsWithoutExternalMembers(),
     descriptionNote:
-      "Local members only: attaching external (provider) members turns external fallback on, which only a person can do.",
+      "Local members only: attaching external (provider) members here would turn external fallback on implicitly. Attach them with forwarder_provider_member_add and turn fallback on with forwarder_pool_fallback_update.",
     // G8a: conditional provider-egress gate (providerModels.length > 0).
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker(
@@ -734,12 +788,12 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    // D-K: fallbackEnabled / fallbackForGrantees are human-only (confirmed MCP
-    // writes come with PR4); externalAfterWaitMs passes through. Token
-    // external consent is human-only and never an MCP arg.
+    // fallbackEnabled / fallbackForGrantees go through the dedicated,
+    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
+    // passes through (audited). Token external consent is never an MCP arg.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote:
-      "fallbackEnabled and fallbackForGrantees are rejected: only a person can change external fallback switches.",
+      "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update.",
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
   },
@@ -749,14 +803,27 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    // D-K: fallbackEnabled / fallbackForGrantees are human-only (confirmed MCP
-    // writes come with PR4); externalAfterWaitMs passes through. Capacity
-    // policy fields are always admitted; there is no capacity release flag.
+    // fallbackEnabled / fallbackForGrantees go through the dedicated,
+    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
+    // passes through (audited). Capacity policy fields are always admitted.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote:
-      "fallbackEnabled and fallbackForGrantees are rejected: only a person can change external fallback switches.",
+      "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update.",
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updateModelPool),
+  },
+  {
+    name: "forwarder_pool_fallback_update",
+    target: "poolFallback.update",
+    scope: "write",
+    // Owner decision (issue #67): an ordinary mcp:write tool, no per-change
+    // confirmation; the cost is stated here and every change is audited.
+    confirmation: null,
+    classification: "pure",
+    inputSchema: poolFallbackUpdateArgs(),
+    descriptionNote: POOL_FALLBACK_COST_NOTICE,
+    featureDependencies: [PROVIDER_EGRESS_FEATURE],
+    invokeProcedure: procedureInvoker((client) => client.poolFallback.update),
   },
   {
     name: "forwarder_model_pool_delete",
@@ -881,7 +948,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "pure",
-    inputSchema: anyArgs(),
+    inputSchema: providerAccountArgsWithoutDataCollection(),
     invokeProcedure: procedureInvoker((client) => client.providerManagement.createAccount),
   },
   {
@@ -891,7 +958,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "pure",
-    inputSchema: anyArgs(),
+    inputSchema: providerAccountArgsWithoutDataCollection(),
     invokeProcedure: procedureInvoker((client) => client.providerManagement.updateAccount),
   },
   {
@@ -1231,8 +1298,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly 23 read tools and 50 write tools
- * (45 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 26 read tools and 51 write tools
+ * (46 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
@@ -1352,8 +1419,20 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Human-only own-key egress consent.",
   },
   { target: "poolFallbackPreferences.clear", reason: "Human-only own-key preference management." },
-  { target: "poolFallbackPreferences.ownerAggregate", reason: "Dashboard aggregate count." },
-  { target: "poolFallbackPreferences.list", reason: "Private dashboard preferences." },
+  {
+    target: "poolFallbackPreferences.ownerAggregate",
+    reason: "Dashboard aggregate count; MCP reads it through forwarder_pool_fallback_get.",
+  },
+  {
+    target: "poolFallbackPreferences.list",
+    reason:
+      "Private dashboard preferences; MCP reads one pool through forwarder_pool_fallback_get.",
+  },
+  {
+    target: "providerManagement.setAllowDataCollection",
+    reason:
+      "Human-only OpenRouter privacy opt-out (D9): an agent must never relax an account's data_collection routing.",
+  },
   {
     target: "providerCatalog.search",
     reason:

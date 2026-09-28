@@ -394,4 +394,47 @@ describe("Chat Test quick wins", () => {
     await user.click(screen.getByRole("button", { name: "common:actions.copy" }));
     expect(clipboardWrite).toHaveBeenCalledWith("answer");
   });
+
+  it("shows the route chip for the turn from the response headers", async () => {
+    state.models = [directModel];
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string) => {
+        if (input.includes("/media/config")) {
+          return new Response(
+            JSON.stringify({ enabled: false, maxUploadBytes: 0, maxAttachmentBytes: 0 }),
+          );
+        }
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode('data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'),
+            );
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "x-wsmp-route": "pool-fallback",
+            "x-wsmp-fallback-reason": "no_local_member",
+            "x-wsmp-served-model": "openai/gpt-4o-mini",
+          },
+        });
+      }),
+    );
+    await act(async () => {
+      mount();
+    });
+
+    const composer = await screen.findByRole("textbox", { name: "dashboard:chatTest.inputLabel" });
+    await user.type(composer, "Hello");
+    await user.click(screen.getByRole("button", { name: "dashboard:chatTest.send" }));
+
+    const chip = await screen.findByTestId("chat-route");
+    expect(chip.getAttribute("data-route")).toBe("pool-fallback");
+    expect(chip.textContent).toContain("dashboard:chatTest.route.poolFallback");
+    expect(chip.textContent).toContain("dashboard:chatTest.route.reasonLabel");
+  });
 });

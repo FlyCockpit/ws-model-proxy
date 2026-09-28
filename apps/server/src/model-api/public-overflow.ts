@@ -37,6 +37,12 @@ import {
   rememberAffinity,
 } from "./cache-affinity.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
+import {
+  applyOpenRouterDataCollection,
+  mapOpenRouterDataPolicyRefusal,
+  type OpenRouterDataCollectionPolicy,
+  openRouterDataCollectionPolicy,
+} from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
@@ -226,6 +232,12 @@ export interface PublicProviderTarget {
   endpointVersion: number;
   concurrencyLimit: number | null;
   providerVersion: string | null;
+  /**
+   * OpenRouter privacy preference forced into every body sent to this
+   * target (`provider.data_collection`); null for other provider types and
+   * for OpenRouter accounts that allow data collection.
+   */
+  dataCollectionPolicy?: OpenRouterDataCollectionPolicy;
   baseUrl: string;
   authType: "API_KEY" | "BEARER";
   healthStatus: "UNKNOWN" | "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
@@ -812,6 +824,7 @@ const providerTargetModelSelect = {
       userId: true,
       providerType: true,
       providerVersion: true,
+      allowDataCollection: true,
       baseUrl: true,
       endpointIdentity: true,
       endpointVersion: true,
@@ -1003,6 +1016,7 @@ export async function listPublicOverflowTargets(
           maxOutputTokens: model.maxOutputTokens,
           concurrencyLimit: model.concurrencyLimit,
           providerVersion: account.providerVersion,
+          dataCollectionPolicy: openRouterDataCollectionPolicy(account),
           baseUrl: account.baseUrl,
           authType: account.authType,
           healthStatus: model.healthStatus,
@@ -1117,6 +1131,16 @@ function providerAuth(target: PublicProviderTarget, secret: string): ProviderEgr
   return target.authType === "API_KEY"
     ? { type: "API_KEY", apiKey: secret }
     : { type: "BEARER", token: secret };
+}
+
+/**
+ * D9: OpenRouter's "no endpoints match your data policy" 404 becomes a clear
+ * 503 only for targets that sent `data_collection: "deny"`.
+ */
+function mapDataPolicyRefusal(target: PublicProviderTarget, response: Response) {
+  return target.dataCollectionPolicy === "deny"
+    ? mapOpenRouterDataPolicyRefusal(response)
+    : Promise.resolve(response);
 }
 
 function replaceModel(body: Uint8Array, model: string): Uint8Array {
@@ -2118,6 +2142,13 @@ export async function dispatchPublicOverflow(
               body: replaceModel(request.body, target.upstreamModelId),
             }
           : await request.renderForTarget!(target, nativeSurface);
+      // D9: every body sent to an OpenRouter account carries the account's
+      // data-collection preference, whichever path rendered it. A body that
+      // cannot carry it is never sent (REQUEST_RENDER_FAILED below).
+      upstream = {
+        ...upstream,
+        body: applyOpenRouterDataCollection(upstream.body, target.dataCollectionPolicy ?? null),
+      };
     } catch {
       await recordProviderAttemptEvent({
         userId: request.userId,
@@ -2923,14 +2954,17 @@ export async function dispatchPublicOverflow(
         }),
         markFirstClientByte,
         affinity: target.affinity,
-        response: new Response(bodyForbidden ? null : heldBody, {
-          status,
-          headers: providerResponseHeaders(
-            response.headers,
-            nativeSurface === request.requestedSurface &&
-              target.resolvedExecution?.mode !== "adapted",
-          ),
-        }),
+        response: await mapDataPolicyRefusal(
+          target,
+          new Response(bodyForbidden ? null : heldBody, {
+            status,
+            headers: providerResponseHeaders(
+              response.headers,
+              nativeSurface === request.requestedSurface &&
+                target.resolvedExecution?.mode !== "adapted",
+            ),
+          }),
+        ),
       };
     } catch {
       stopHeartbeat();

@@ -747,6 +747,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
               ),
             );
           },
+          onRoute: (route) => updateAssistant(assistantId, { route }),
         });
         updateAssistant(assistantId, { status: "ready", metrics });
         setAnnouncement(t("dashboard:chatTest.announcements.completed"));
@@ -990,6 +991,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
                   thinking: undefined,
                   status: "streaming",
                   errorMessage: undefined,
+                  route: undefined,
                 }
               : message,
           ),

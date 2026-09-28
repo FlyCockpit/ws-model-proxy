@@ -870,7 +870,17 @@ describe("forwarderManagementRouter", () => {
       ]),
     );
     expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toHaveLength(7);
-    expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
+    // Two BUDGET_CREATED events plus the fallback turn-on (issue #67).
+    expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(3);
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "POOL_FALLBACK_UPDATED",
+        metadata: {
+          source: "dashboard",
+          changes: { fallbackEnabled: { before: false, after: true } },
+        },
+      }),
+    });
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
     expect(db.executionTarget.update).toHaveBeenCalledWith({
@@ -2015,7 +2025,13 @@ describe("forwarderManagementRouter", () => {
 
   it("enables fallback without any acknowledgement and stores the owner settings", async () => {
     db.modelPool.findUnique.mockResolvedValue(
-      poolRow({ userId: "user-id", fallbackEnabled: false, capacityWaitBudgetMs: 30_000 }),
+      poolRow({
+        userId: "user-id",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        capacityWaitBudgetMs: 30_000,
+      }),
     );
     db.poolMember.findMany.mockResolvedValue([]);
     db.providerBudgetPolicy.findMany.mockResolvedValue([]);
@@ -2042,6 +2058,38 @@ describe("forwarderManagementRouter", () => {
       externalAfterWaitMs: 500,
     });
     expect(update.data).not.toHaveProperty("publicEgressAcknowledged");
+    // Issue #67: every fallback change is audited, with its source.
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "user-id",
+        action: "POOL_FALLBACK_UPDATED",
+        subjectId: "pool-id",
+        metadata: {
+          source: "dashboard",
+          changes: {
+            fallbackEnabled: { before: false, after: true },
+            fallbackForGrantees: { before: false, after: true },
+            externalAfterWaitMs: { before: 2000, after: 500 },
+          },
+        },
+      },
+    });
+  });
+
+  it("writes no fallback audit event when a save leaves the fallback settings unchanged", async () => {
+    const settings = {
+      fallbackEnabled: true,
+      fallbackForGrantees: false,
+      externalAfterWaitMs: 2000,
+    };
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id", ...settings }));
+    db.modelPool.update.mockResolvedValue(poolRow({ name: "Renamed", ...settings }));
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: "POOL_FALLBACK_UPDATED" }),
+      }),
+    );
   });
 
   it("turns fallback off while external members stay configured, even with the switch off", async () => {

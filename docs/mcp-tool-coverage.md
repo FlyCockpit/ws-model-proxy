@@ -90,9 +90,11 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
+| `poolFallback.get` | `forwarder_pool_fallback_get` | read | — | pure | — | — | — |
+| `poolFallback.update` | `forwarder_pool_fallback_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `poolFallbackPreferences.clear` | — (excluded) | — | — | — | — | — | Human-only own-key preference management. |
-| `poolFallbackPreferences.list` | — (excluded) | — | — | — | — | — | Private dashboard preferences. |
-| `poolFallbackPreferences.ownerAggregate` | — (excluded) | — | — | — | — | — | Dashboard aggregate count. |
+| `poolFallbackPreferences.list` | — (excluded) | — | — | — | — | — | Private dashboard preferences; MCP reads one pool through forwarder_pool_fallback_get. |
+| `poolFallbackPreferences.ownerAggregate` | — (excluded) | — | — | — | — | — | Dashboard aggregate count; MCP reads it through forwarder_pool_fallback_get. |
 | `poolFallbackPreferences.set` | — (excluded) | — | — | — | — | — | Human-only own-key egress consent. |
 | `providerCatalog.getPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker. |
 | `providerCatalog.importModel` | — (excluded) | — | — | — | — | — | Human-only catalog import; agents use the confirmed provider model tools. |
@@ -127,6 +129,7 @@ fails the suite when a leaf is unclassified.
 | `providerManagement.revokeCredential` | `provider_credential_revoke` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.rotateCredential` | `provider_credential_reencrypt` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.setAccountEnabled` | `provider_account_enabled_set` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
+| `providerManagement.setAllowDataCollection` | — (excluded) | — | — | — | — | — | Human-only OpenRouter privacy opt-out (D9): an agent must never relax an account's data_collection routing. |
 | `providerManagement.testCredential` | `provider_credential_test` | write | RUN | cost | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.updateAccount` | `provider_account_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.updateModel` | `provider_model_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
@@ -177,18 +180,36 @@ token *revocation* and the settings page are deliberately NOT gated on
 authorization during an emergency MCP shutdown. Personal-token *creation*
 is gated on the flag. Normal browser authentication still applies.
 
-## Human-only external fallback settings
+## External fallback settings and consent
 
 Sending request data to external providers needs consent a person gave.
 MCP tools can never grant it:
 
 - `modelApiTokens.updateExternalAccess` (a token's `allowExternal` and
-  per-pool `includeExternal`) is excluded from the catalog;
+  per-pool `includeExternal`) is excluded from the catalog (decision C1);
+- `providerManagement.setAllowDataCollection` (the OpenRouter
+  "providers that may collect data" opt-out, decision D9) is excluded, and
+  `provider_account_create` / `provider_account_update` reject
+  `allowDataCollection` in their input schemas.
+
+The pool owner's fallback switches (`fallbackEnabled`,
+`fallbackForGrantees`, `externalAfterWaitMs`) are an ordinary
+`mcp:write` tool, `forwarder_pool_fallback_update`, with no per-change
+confirmation (owner decision on issue #67). Its description states the cost
+effect, and every change, from MCP or the dashboard, writes a
+`POOL_FALLBACK_UPDATED` provider audit event. So that the cost statement is
+always seen:
+
 - `forwarder_model_pool_create` and `forwarder_model_pool_update` reject
   `fallbackEnabled` and `fallbackForGrantees` in their input schemas
   (advertised as `not: {}`), whatever the value;
 - `forwarder_guarded_pool_create` rejects non-empty `providerModels`,
-  because attaching external members there turns fallback on.
+  because attaching external members there turns fallback on implicitly.
 
-Confirmed MCP writes for the fallback switches are planned together with the
-MCP fallback tools. Pinned by `apps/server/src/mcp/tool-manifest.test.ts`.
+`forwarder_pool_fallback_get` reads the same data as the dashboard: owners
+get the switches, the external members in fallback order and the own-key
+request count; grantees get provider types only and their own-key route.
+
+No tool result can carry a secret value (provider API keys, encrypted
+credential material, token secrets or hashes): pinned for every tool by
+`apps/server/src/mcp/secret-output.test.ts`. Pinned by `apps/server/src/mcp/tool-manifest.test.ts`.
