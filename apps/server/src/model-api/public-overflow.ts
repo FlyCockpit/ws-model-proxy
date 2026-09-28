@@ -1680,15 +1680,32 @@ export function retainProviderUsagePrefix(
  * (before the response exceeded the tail window) are preserved from the
  * prefix. Undefined in both windows stays undefined.
  */
+/** Drops a window's calculated cost; only the merged categories may be priced. */
+function withoutCalculatedCost({
+  calculatedCost: _cost,
+  calculatedCostCurrency: _currency,
+  calculatedCostPricingVersion: _version,
+  calculatedCostSource: _source,
+  calculatedCostConfidence: _confidence,
+  ...usage
+}: RawProviderUsage) {
+  return usage;
+}
+
 export function mergeProviderUsage(
   initial: RawProviderUsage | undefined,
   tail: RawProviderUsage | undefined,
   surface?: ProtocolSurface,
 ): RawProviderUsage | undefined {
   if (!initial || !tail) return tail ?? initial;
+  // A calculated cost describes only the window it was priced from. The merged
+  // categories must be priced again (the dispatcher does); keeping either
+  // window's cost could settle spend for an observation that is incomplete.
   return {
-    ...initial,
-    ...Object.fromEntries(Object.entries(tail).filter(([, value]) => value !== undefined)),
+    ...withoutCalculatedCost(initial),
+    ...Object.fromEntries(
+      Object.entries(withoutCalculatedCost(tail)).filter(([, value]) => value !== undefined),
+    ),
     inputTokens: tail.inputTokens ?? initial.inputTokens,
     outputTokens: tail.outputTokens ?? initial.outputTokens,
     categoriesComplete:

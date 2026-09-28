@@ -189,8 +189,8 @@ describe("OpenRouter usage dialect", () => {
       "a string completion detail container",
       (usage) => Object.assign(usage, { completion_tokens_details: "x" }),
     ],
-    ["a second prompt count spelling", (usage) => Object.assign(usage, { input_tokens: 10 })],
-    ["a second completion count spelling", (usage) => Object.assign(usage, { output_tokens: 1 })],
+    ["a second prompt count spelling", (usage) => Object.assign(usage, { input_tokens: 1200 })],
+    ["a second completion count spelling", (usage) => Object.assign(usage, { output_tokens: 80 })],
     ["a second cost spelling", (usage) => Object.assign(usage, { total_cost: 0 })],
     [
       "a second cache-read spelling",

@@ -2716,6 +2716,69 @@ describe("own-key dispatch and authoritative send claim", () => {
 });
 
 describe("OpenRouter owner-paid settlement", () => {
+  const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
+  async function settleOwnerStream(providerType: string, upstream: Buffer[]) {
+    reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+    providerHttpsRequest.mockReset();
+    db.modelPool.findFirst.mockResolvedValue(
+      dispatchPoolFixture("openai", "openai-chat", providerType),
+    );
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    providerHttpsRequest.mockResolvedValueOnce(
+      Object.assign(Readable.from(upstream), {
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream" },
+        complete: true,
+      }),
+    );
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: `request-openrouter-${providerType}`,
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(),
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: true,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+      signal: new AbortController().signal,
+      liability,
+      requestedOutputTokens: 10n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+    return reconcileProviderBudget.mock.calls[0]?.[0];
+  }
+
   it.each([
     { providerType: "openrouter", complete: true },
     { providerType: "openai", complete: false },
@@ -2723,69 +2786,9 @@ describe("OpenRouter owner-paid settlement", () => {
   ])(
     "settles $providerType usage to the pool owner (categoriesComplete $complete)",
     async ({ providerType, complete }) => {
-      reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
-      providerHttpsRequest.mockReset();
-      db.modelPool.findFirst.mockResolvedValue(
-        dispatchPoolFixture("openai", "openai-chat", providerType),
-      );
-      const tx = {
-        ...consentDelegates(),
-        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
-          mockRequesterValidityQuery(strings, values, consentDelegates()),
-        ),
-        providerCredential: {
-          findFirst: vi.fn().mockResolvedValue({
-            id: "credential-heartbeat",
-            credentialType: "BEARER",
-            aadVersion: 1,
-            algorithm: "AES-256-GCM",
-            keyVersion: "v1",
-            ciphertext: new Uint8Array(),
-            nonce: new Uint8Array(),
-            authTag: new Uint8Array(),
-          }),
-          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
-        },
-      };
-      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
-        callback(tx),
-      );
-      providerHttpsRequest.mockResolvedValueOnce(
-        Object.assign(
-          Readable.from([Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`)]),
-          {
-            statusCode: 200,
-            headers: { "content-type": "text/event-stream" },
-            complete: true,
-          },
-        ),
-      );
-      const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
-      const result = await dispatchPublicOverflow({
-        userId: "owner",
-        poolId: "pool",
-        requestId: `request-openrouter-${providerType}`,
-        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        ...ownerConsentFields(),
-        requestedProtocol: "openai",
-        requestedSurface: "openai-chat",
-        stream: true,
-        requiredFeatures: [],
-        path: "/v1/chat/completions",
-        headers: new Headers({ "content-type": "application/json" }),
-        body: new TextEncoder().encode('{"model":"pool","stream":true}'),
-        signal: new AbortController().signal,
-        liability,
-        requestedOutputTokens: 10n,
-        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
-        adaptationEnabled: false,
-        retrySafe: false,
-      });
-      if (!result.dispatched) throw new Error("expected dispatch");
-      await result.response.text();
-      await result.terminal;
-      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
-      const settled = reconcileProviderBudget.mock.calls[0]?.[0];
+      const settled = await settleOwnerStream(providerType, [
+        Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`),
+      ]);
       expect(settled).toMatchObject({
         userId: "owner",
         poolId: "pool",
@@ -2802,4 +2805,63 @@ describe("OpenRouter owner-paid settlement", () => {
       }
     },
   );
+
+  // Usage split across the retained prefix and the 1 MiB tail: a calculated
+  // cost priced from one complete window must not survive a merge with an
+  // incomplete one, in either order.
+  it.each([
+    { label: "complete prefix, incomplete tail", writes: [0, 1000], complete: false },
+    { label: "incomplete prefix, complete tail", writes: [1000, 0], complete: false },
+    { label: "complete prefix and tail", writes: [0, 0], complete: true },
+  ])("prices only the merged observation ($label)", async ({ writes, complete }) => {
+    db.providerPricingVersion.findFirst.mockResolvedValue({
+      id: "price",
+      version: "price-1",
+      currency: "USD",
+      accountingVersion: "provider-billable-v1",
+      confidence: "CALCULATED",
+      effectiveAt: new Date(0),
+      pricing: { ratesPerMillion: { input: "1", output: "4", cacheRead: "0.1" } },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+    });
+    try {
+      const usage = (cacheWrite: number) => ({
+        prompt_tokens: 1000,
+        completion_tokens: 1,
+        total_tokens: 1001,
+        is_byok: false,
+        prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: cacheWrite },
+      });
+      const frame = (data: unknown) => Buffer.from(`data: ${JSON.stringify(data)}\n\n`);
+      const settled = await settleOwnerStream("openrouter", [
+        frame({ usage: usage(writes[0]!) }),
+        ...Array.from({ length: 1100 }, () => Buffer.from(`: ${"x".repeat(1024)}\n\n`)),
+        frame({ usage: usage(writes[1]!) }),
+        Buffer.from("data: [DONE]\n\n"),
+      ]);
+      expect(settled.usage.categoriesComplete).toBe(complete);
+      if (complete) {
+        // 1000*1 + 1*4 per million, priced once from the merged categories.
+        expect(settled.usage.calculatedCost?.toString()).toBe("0.001004");
+        expect(providerBillableTokens(settled.usage)).toBe(1_001n);
+      } else {
+        expect(settled.usage.calculatedCost).toBeUndefined();
+        expect(settled.usage.calculatedCostSource).toBeUndefined();
+        expect(providerBillableTokens(settled.usage)).toBeUndefined();
+      }
+    } finally {
+      db.providerPricingVersion.findFirst.mockReset();
+    }
+  });
 });
