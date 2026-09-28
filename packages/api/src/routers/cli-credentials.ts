@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import {
+  CLI_DEVICE_CODE_WINDOW_MS,
   CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
   CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE,
   cliSlugFromDeviceLoginScope,
@@ -149,19 +150,28 @@ export const cliCredentialsRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      // The device code a pre-0.4.0 `wsmp login` got from /device/code (it
+      // sends no slug scope). Those releases print this message. This branch
+      // runs BEFORE the exchange limiter and must stay side-effect-free: it
+      // neither reads nor writes the database (a DB read here would reopen an
+      // unrate-limited path), and every old CLI polls with this same constant
+      // code, so charging the per-code bucket here would let one caller
+      // suppress the upgrade message for the whole fleet.
+      if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
+        throw new ORPCError("BAD_REQUEST", { message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE });
+      }
       // Per IP and per device code, before any database work. A refusal is
       // RFC 8628 `slow_down`, so a polling CLI backs off instead of failing.
       const limit = await context.services?.limitDeviceCodeExchange?.(input.deviceCode);
       if (limit && !limit.allowed) {
+        // RFC 8628 §3.5 `slow_down`, with the wait the limiter computed so a
+        // client can back off precisely. Clamped to the device-code window: an
+        // inflated value must not tell a client to wait past the code's expiry.
+        const retryAfterMs = Math.min(limit.retryAfterMs, CLI_DEVICE_CODE_WINDOW_MS);
         throw new ORPCError("TOO_MANY_REQUESTS", {
           message: "Device authorization polling too fast.",
-          data: deviceFlowErrorData("slow_down"),
+          data: { ...deviceFlowErrorData("slow_down"), retryAfterMs },
         });
-      }
-      // The device code a pre-0.4.0 `wsmp login` got from /device/code (it
-      // sends no slug scope). Those releases print this message.
-      if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
-        throw new ORPCError("BAD_REQUEST", { message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE });
       }
       const minted = await mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: input.deviceCode,
@@ -252,7 +262,22 @@ export const cliCredentialsRouter = {
         },
         data: { status: "approved", userId },
       });
-      if (approved.count !== 1) throw alreadyHandled();
+      if (approved.count !== 1) {
+        // The conditional write lost the race. When the winner was THIS
+        // account (a double-click or double-fired mutation of the same
+        // approval), the caller's own approval did happen: report the
+        // idempotent success. The re-read re-checks `userId`, so a different
+        // account's win is still CONFLICT — never misreported as this
+        // caller's success.
+        const current = await prisma.deviceCode.findFirst({
+          where: { id: row.id },
+          select: { userId: true, status: true },
+        });
+        if (current?.status === "approved" && current.userId === userId) {
+          return { status: "approved", slug };
+        }
+        throw alreadyHandled();
+      }
       return { status: "approved", slug };
     }),
 };

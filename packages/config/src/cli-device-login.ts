@@ -29,6 +29,15 @@ export function cliSlugFromDeviceLoginScope(scope: string | null | undefined): s
 export const WSMP_MIN_CLI_VERSION = "0.4.0";
 
 /**
+ * Lifetime of a `wsmp login` device code. Single source for the
+ * `deviceAuthorization` plugin's `expiresIn` (packages/auth/src/index.ts) and
+ * the exchange's `retryAfterMs` clamp, so a refusal never tells a client to
+ * wait past the code's expiry.
+ */
+export const CLI_DEVICE_CODE_EXPIRES_IN = "30m";
+export const CLI_DEVICE_CODE_WINDOW_MS = 30 * 60_000;
+
+/**
  * Device code handed to a `wsmp login` too old to send the `cli-slug:` scope.
  * Released 0.3.x CLIs print only "http status: 400" for a refused
  * `/device/code`, but they do print the message of a failed exchange, so the

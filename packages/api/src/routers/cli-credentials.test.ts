@@ -449,11 +449,65 @@ describe("cliCredentialsRouter", () => {
     if (!result.matched) return;
     expect(result.response.status).toBe(429);
     // apps/cli/src/auth.rs backs off on `slow_down` instead of ending the login.
+    // The refusal carries the computed wait so a client can back off precisely.
     expect(await result.response.json()).toMatchObject({
-      json: { code: "TOO_MANY_REQUESTS", data: { deviceFlowError: "slow_down" } },
+      json: {
+        code: "TOO_MANY_REQUESTS",
+        data: { deviceFlowError: "slow_down", retryAfterMs: 30_000 },
+      },
     });
     expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
     expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  });
+
+  it("clamps a refusal's retryAfterMs to the device-code window", async () => {
+    const { CLI_DEVICE_CODE_WINDOW_MS } = await import("@ws-model-proxy/config/cli-device-login");
+    const limitDeviceCodeExchange = vi.fn(async () => ({
+      allowed: false as const,
+      retryAfterMs: CLI_DEVICE_CODE_WINDOW_MS * 10,
+    }));
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(null, { limitDeviceCodeExchange }),
+    });
+
+    const error = await client
+      .exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ORPCError);
+    if (error instanceof ORPCError) {
+      expect(error.data).toEqual({
+        deviceFlowError: "slow_down",
+        retryAfterMs: CLI_DEVICE_CODE_WINDOW_MS,
+      });
+    }
+  });
+
+  it("never charges the exchange limiter for the pre-0.4.0 upgrade sentinel", async () => {
+    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE } = await import(
+      "@ws-model-proxy/config/cli-device-login"
+    );
+    // Saturate: the limiter refuses every call. The sentinel must short-circuit
+    // before it is charged, or one caller could starve the whole fleet's
+    // upgrade message.
+    const limitDeviceCodeExchange = vi.fn(async () => ({
+      allowed: false as const,
+      retryAfterMs: 60_000,
+    }));
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(null, { limitDeviceCodeExchange }),
+    });
+
+    await expect(
+      client.exchangeDeviceCode({
+        deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
+        cliSlug: "desk-01",
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      return true;
+    });
+    expect(limitDeviceCodeExchange).not.toHaveBeenCalled();
   });
 
   it("tells a pre-0.4.0 wsmp login to upgrade through the envelope 0.3.x prints", async () => {
@@ -704,6 +758,36 @@ describe("cliCredentialsRouter", () => {
 
     it("loses a race to another account with CONFLICT", async () => {
       db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+    });
+
+    it("is idempotent when the SAME account's double-submit loses the conditional write", async () => {
+      // Both requests read the row as pending; one updateMany wins (count 1),
+      // the other's matches 0 rows. The loser re-reads and finds it approved
+      // by its own account, so it reports the idempotent success.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(deviceCodeRow({ userId: "user-1", status: "approved" }));
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).resolves.toEqual({ status: "approved", slug: "desk-01" });
+      expect(db.deviceCode.findFirst).toHaveBeenCalledTimes(2);
+    });
+
+    it("still CONFLICTs when a DIFFERENT account won the same race", async () => {
+      // The inverse failure: the re-read must re-check userId. A status-only
+      // check would report another account's win as this caller's success.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(deviceCodeRow({ userId: "other-user", status: "approved" }));
       db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
       const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
 

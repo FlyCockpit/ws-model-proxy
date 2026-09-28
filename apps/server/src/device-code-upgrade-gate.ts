@@ -50,7 +50,9 @@ async function readCapped(request: Request, max: number): Promise<BodyRead> {
   return { kind: "text", text: new TextDecoder().decode(bytes) };
 }
 
-type ScopeRead = { kind: "scope"; read: boolean; scope: unknown } | { kind: "too_large" };
+type ScopeRead =
+  | { kind: "scope"; read: boolean; scope: unknown; text: string; contentType: string }
+  | { kind: "too_large" };
 
 async function requestScope(c: Context): Promise<ScopeRead> {
   const declared = c.req.header("content-length");
@@ -61,21 +63,70 @@ async function requestScope(c: Context): Promise<ScopeRead> {
   }
   const body = await readCapped(c.req.raw, DEVICE_CODE_BODY_MAX_BYTES);
   if (body.kind === "too_large") return body;
-  if (body.kind === "unreadable") return { kind: "scope", read: false, scope: undefined };
   const contentType = c.req.header("content-type") ?? "";
+  if (body.kind === "unreadable") {
+    return { kind: "scope", read: false, scope: undefined, text: "", contentType };
+  }
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const scope = new URLSearchParams(body.text).get("scope");
-    return { kind: "scope", read: true, scope: scope ?? undefined };
+    return { kind: "scope", read: true, scope: scope ?? undefined, text: body.text, contentType };
   }
   try {
     const parsed: unknown = JSON.parse(body.text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { kind: "scope", read: false, scope: undefined };
+      return { kind: "scope", read: false, scope: undefined, text: body.text, contentType };
     }
-    return { kind: "scope", read: true, scope: (parsed as Record<string, unknown>).scope };
+    return {
+      kind: "scope",
+      read: true,
+      scope: (parsed as Record<string, unknown>).scope,
+      text: body.text,
+      contentType,
+    };
   } catch {
-    return { kind: "scope", read: false, scope: undefined };
+    return { kind: "scope", read: false, scope: undefined, text: body.text, contentType };
   }
+}
+
+/**
+ * The device-code body field that pre-binds a created code to an account.
+ * Better Auth's `/device/code` schema accepts it and stores
+ * `userId: request.user_id || null`, but the endpoint is public and
+ * unauthenticated: any caller could otherwise create a code bound to an
+ * arbitrary account id before anyone approves anything. wsmp's own CLI never
+ * sends one, so stripping it only closes that gap. Returns the body with the
+ * key removed, or null when the body carries no `user_id` (pass it through
+ * byte-identically).
+ */
+function stripUserId(text: string, contentType: string): string | null {
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(text);
+    if (!params.has("user_id")) return null;
+    params.delete("user_id");
+    return params.toString();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (!("user_id" in record)) return null;
+  delete record.user_id;
+  return JSON.stringify(record);
+}
+
+/** A copy of `request` whose body is `body`, with `Content-Length` re-stated. */
+function withBody(request: Request, body: string): Request {
+  const headers = new Headers(request.headers);
+  // The body is now buffered, so state its exact length and drop a chunked
+  // framing header that would contradict it.
+  headers.set("content-length", String(new TextEncoder().encode(body).byteLength));
+  headers.delete("transfer-encoding");
+  const init: RequestInit & { duplex?: "half" } = { body, headers };
+  return new Request(request, init);
 }
 
 /**
@@ -88,7 +139,9 @@ async function requestScope(c: Context): Promise<ScopeRead> {
  *
  * The body also carries the RFC 8628 `error` / `error_description`, for any
  * client that reads them. A request with a scope (valid or not) goes on to
- * Better Auth unchanged. A body over {@link DEVICE_CODE_BODY_MAX_BYTES} is
+ * Better Auth with any caller-supplied `user_id` stripped, so a public,
+ * unauthenticated caller cannot pre-bind a code to an arbitrary account (see
+ * {@link stripUserId}). A body over {@link DEVICE_CODE_BODY_MAX_BYTES} is
  * refused with 413 before any of that.
  */
 export async function deviceCodeUpgradeGate(c: Context, next: Next) {
@@ -97,8 +150,15 @@ export async function deviceCodeUpgradeGate(c: Context, next: Next) {
   if (result.kind === "too_large") {
     return c.json({ error: "invalid_request", error_description: "Request body too large." }, 413);
   }
-  const { read, scope } = result;
-  if (!read || (typeof scope === "string" && scope.trim().length > 0)) return next();
+  const { read, scope, text, contentType } = result;
+  if (!read || (typeof scope === "string" && scope.trim().length > 0)) {
+    // Never pre-bind a code to a caller-chosen account. The CLI sends neither
+    // key, so this is a no-op for it; a body without the key is forwarded
+    // byte-identically.
+    const stripped = stripUserId(text, contentType);
+    if (stripped !== null) c.req.raw = withBody(c.req.raw, stripped);
+    return next();
+  }
   return c.json(
     {
       device_code: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,

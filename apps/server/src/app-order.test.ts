@@ -674,4 +674,43 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
       json: { code: "TOO_MANY_REQUESTS", data: { deviceFlowError: "slow_down" } },
     });
   });
+
+  it("answers the pre-0.4.0 upgrade sentinel even after the code bucket is saturated", async () => {
+    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE } =
+      await import("@ws-model-proxy/config/cli-device-login");
+    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "[IP_ADDRESS]" } });
+    // A real code saturates the shared per-code bucket first, as an
+    // unauthenticated caller flooding the known constant sentinel would.
+    const realExchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({ json: { deviceCode: "saturation-code", cliSlug: "desk-01" } }),
+      });
+    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
+      await realExchange();
+    }
+    expect((await realExchange()).status).toBe(429);
+
+    // Every sentinel poll must still get the upgrade message a 0.3.x CLI
+    // prints — never the 429 that its poll loop treats as retryable. Thirty
+    // polls keep the whole test inside the 60-point per-IP bucket.
+    const sentinelExchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({
+          json: { deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, cliSlug: "desk-01" },
+        }),
+      });
+    for (let call = 0; call < 30; call += 1) {
+      const res = await sentinelExchange();
+      expect(res.status, `sentinel call ${call}`).toBe(400);
+      expect(await res.json(), `sentinel call ${call}`).toMatchObject({
+        json: { code: "BAD_REQUEST", message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE },
+      });
+    }
+  });
 });
