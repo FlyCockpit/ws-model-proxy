@@ -66,6 +66,20 @@ function contrast(a: Rgb, b: Rgb): number {
 
 const AA = 4.5;
 
+const buttonSource = readFileSync(
+  resolve(import.meta.dirname, "../../../../packages/ui/src/components/button.tsx"),
+  "utf8",
+);
+
+/** Alpha of the default button's link hover fill (`<prefix>[a]:hover:bg-primary/NN`). */
+function linkHoverAlpha(prefix: "" | "dark:"): number {
+  const match = new RegExp(`(?:^|[\\s"])${prefix}\\[a\\]:hover:bg-primary/(\\d+)`).exec(
+    buttonSource,
+  );
+  if (!match) throw new Error(`no ${prefix}[a]:hover:bg-primary/NN in button.tsx`);
+  return Number(match[1]) / 100;
+}
+
 describe("theme token contrast (WCAG AA)", () => {
   it("keeps light-mode destructive text readable on every surface it sits on", () => {
     const destructive = token(":root", "destructive");
@@ -105,10 +119,30 @@ describe("theme token contrast (WCAG AA)", () => {
     ).toBeGreaterThanOrEqual(AA);
   });
 
+  it("keeps the default link-button label readable on its hover fill", () => {
+    // `[a]:hover:bg-primary/NN` lets the surface behind the button show through.
+    for (const [scope, prefix] of [
+      [":root", ""],
+      [".dark", "dark:"],
+    ] as const) {
+      const alpha = linkHoverAlpha(prefix);
+      const primary = token(scope, "primary");
+      const foreground = token(scope, "primary-foreground");
+      for (const surface of ["background", "card", "popover", "muted"]) {
+        const fill = over(primary, alpha, token(scope, surface));
+        expect(contrast(foreground, fill), `${scope} ${surface}`).toBeGreaterThanOrEqual(AA);
+      }
+    }
+  });
+
   it("measures the old tokens as failing, so the check discriminates", () => {
     const oldLight = oklchToSrgb(0.577, 0.245, 27.325);
     expect(contrast(oldLight, token(":root", "muted"))).toBeLessThan(AA);
     const oldDark = oklchToSrgb(0.437, 0.078, 188.216);
     expect(contrast(oldDark, token(".dark", "background"))).toBeLessThan(AA);
+    // The old 80% link hover fill under the new dark primary.
+    const darkPrimary = token(".dark", "primary");
+    const darkHover = over(darkPrimary, 0.8, token(".dark", "background"));
+    expect(contrast(token(".dark", "primary-foreground"), darkHover)).toBeLessThan(AA);
   });
 });
