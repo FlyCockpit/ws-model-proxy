@@ -16,6 +16,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
  */
 
 const signInEmailMock = vi.hoisted(() => vi.fn());
+const verifyTotpMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
 const state = vi.hoisted(() => ({
   authStatus: "anonymous" as string,
@@ -41,7 +42,7 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 vi.mock("@/lib/auth-client", () => ({
   authClient: {
     signIn: { email: signInEmailMock },
-    twoFactor: { verifyOtp: vi.fn(), verifyTotp: vi.fn(), sendOtp: vi.fn() },
+    twoFactor: { verifyOtp: vi.fn(), verifyTotp: verifyTotpMock, sendOtp: vi.fn() },
   },
 }));
 
@@ -67,6 +68,9 @@ vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => navigateMock,
 }));
 
+import { toast } from "@ws-model-proxy/ui/components/sileo";
+import i18n from "i18next";
+import enErrors from "@/locales/en-US/errors.json";
 import { SignInCard } from "./sign-in-card";
 
 function renderCard(props: Partial<Parameters<typeof SignInCard>[0]> = {}) {
@@ -210,6 +214,64 @@ describe("SignInCard mode parity", () => {
       expect(assignMock).toHaveBeenCalledWith(
         "https://app.example.com/en-US/mcp-login?client_id=c&sig=s",
       );
+    });
+  });
+
+  describe("sign-in refusal copy", () => {
+    // Better Auth's session-create hook refuses a user whose deletion is
+    // pending with this 403 (packages/auth/src/user-deletion-access-guard.ts).
+    const deletionPending = {
+      status: 403,
+      code: "USER_DELETION_PENDING",
+      message: "raw server message",
+    };
+
+    beforeAll(async () => {
+      // friendly() reads the default i18next instance (react-i18next is stubbed here).
+      await i18n.init({ lng: "en-US", resources: { "en-US": { errors: enErrors } } });
+    });
+
+    afterEach(() => {
+      vi.mocked(toast.error).mockClear();
+    });
+
+    it("shows the deletion copy, not invalid credentials, when the account is being deleted", async () => {
+      const user = userEvent.setup();
+      signInEmailMock.mockResolvedValueOnce({ data: null, error: deletionPending });
+      renderCard();
+      await submitCredentials(user);
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith(enErrors.deletionConflict.deletionInProgress);
+      });
+      expect(toast.error).not.toHaveBeenCalledWith("auth:errors.invalidCredentials");
+      expect(toast.error).not.toHaveBeenCalledWith("raw server message");
+    });
+
+    it("keeps the generic invalid-credentials copy for other refusals", async () => {
+      const user = userEvent.setup();
+      signInEmailMock.mockResolvedValueOnce({
+        data: null,
+        error: { status: 401, code: "INVALID_EMAIL_OR_PASSWORD", message: "raw" },
+      });
+      renderCard();
+      await submitCredentials(user);
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith("auth:errors.invalidCredentials");
+      });
+    });
+
+    it("shows the deletion copy when the 2FA step's session mint is refused", async () => {
+      const user = userEvent.setup();
+      signInEmailMock.mockResolvedValueOnce({ data: { twoFactorRedirect: true }, error: null });
+      verifyTotpMock.mockResolvedValueOnce({ data: null, error: deletionPending });
+      renderCard();
+      await submitCredentials(user);
+      await user.type(await screen.findByLabelText("auth:fields.verificationCode"), "123456");
+      await user.click(screen.getByRole("button", { name: "auth:twoFactor.verify" }));
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith(enErrors.deletionConflict.deletionInProgress);
+      });
+      expect(toast.error).not.toHaveBeenCalledWith("auth:errors.invalidTotp");
     });
   });
 });

@@ -78,6 +78,17 @@ export function isRateLimit(error: unknown): boolean {
 }
 
 /**
+ * True if Better Auth refused the request because the account's deletion is
+ * pending (`USER_DELETION_PENDING`: a 403 when a sign-in would mint a
+ * session, a 409 on admin restore routes). Only reachable after the
+ * credentials were accepted, so auth forms may show {@link friendly}'s
+ * specific copy instead of a generic "invalid credentials".
+ */
+export function isUserDeletionPending(error: unknown): boolean {
+  return asErrorShape(error)?.code === "USER_DELETION_PENDING";
+}
+
+/**
  * True if the error looks like a 409 / CONFLICT response from oRPC — e.g. an
  * active-token cap or a duplicate record.
  */
