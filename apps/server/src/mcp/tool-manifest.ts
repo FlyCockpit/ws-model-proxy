@@ -1228,7 +1228,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 28 read tools and 54 write tools
+ * The checked catalog: exactly 28 read tools and 55 write tools
  * (49 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
