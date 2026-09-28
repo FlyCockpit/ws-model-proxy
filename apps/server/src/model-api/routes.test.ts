@@ -9078,6 +9078,147 @@ describe("model API routes", () => {
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
 
+  describe("grantee local Responses bindings", () => {
+    const granteePool: VisibleModelPoolTarget = {
+      ...poolTarget,
+      ownerUserId: "pool-owner-id",
+      accessGrantId: "grant-id",
+    };
+    const granteeBinding = (overrides: Record<string, unknown> = {}) => ({
+      routingVersion: 2,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      poolGrantId: "grant-id",
+      PoolGrant: {
+        id: "grant-id",
+        poolId: "pool-id",
+        ownerUserId: "pool-owner-id",
+        granteeUserId: "user-id",
+      },
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      expiresAt: new Date(Date.now() + 60_000),
+      ...overrides,
+    });
+    const memberA = (overrides: { routingStatus?: "ACTIVE" | "DRAINING" | "DISABLED" } = {}) =>
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        ...overrides,
+      });
+    const followUp = (manager: FakeRelayManager) =>
+      appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: granteePool.modelId,
+          previous_response_id: "resp_local",
+          input: "next",
+        }),
+      });
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [granteePool],
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+      );
+    });
+
+    it("binds a grantee's locally served response to its exact grant", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_local", object: "response" }));
+      manager.complete(sent.requestId);
+      expect((await responsePromise).status).toBe(200);
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+      const upsert = db.responseStickinessRecord.upsert.mock.calls[0]?.[0];
+      expect(upsert).toMatchObject({
+        create: {
+          routingVersion: 2,
+          userId: "user-id",
+          targetModelPoolId: "pool-id",
+          poolGrantId: "grant-id",
+          selectedDiscoveredModelId: "model-a",
+        },
+        update: { targetModelPoolId: "pool-id", poolGrantId: "grant-id" },
+      });
+    });
+
+    it("sticks a grantee follow-up to its member and re-binds it to the same grant", async () => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      db.poolMember.findMany.mockResolvedValue([memberA({ routingStatus: "DRAINING" })]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = followUp(manager);
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.cliDeviceId).toBe("cli-a");
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_next", object: "response" }));
+      manager.complete(sent.requestId);
+      expect((await responsePromise).status).toBe(200);
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+      expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0]).toMatchObject({
+        create: { targetModelPoolId: "pool-id", poolGrantId: "grant-id" },
+      });
+    });
+
+    it.each([
+      ["a replaced grant", { poolGrantId: "old-grant", PoolGrant: null }],
+      [
+        "a grant for another grantee",
+        {
+          PoolGrant: {
+            id: "grant-id",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "someone-else",
+          },
+        },
+      ],
+      ["an owner-style binding without a grant", { poolGrantId: null, PoolGrant: null }],
+    ])("does not honor a grantee binding through %s", async (_name, overrides) => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding(overrides));
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await followUp(manager);
+      // access_denied: the binding is no longer reachable through this access.
+      expect(response.status).toBe(401);
+      expect(manager.sent).toEqual([]);
+    });
+
+    it.each([
+      ["removed from the pool", []],
+      ["disabled", [memberA({ routingStatus: "DISABLED" })]],
+    ])("does not route a follow-up to a member %s", async (_name, members) => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      db.poolMember.findMany.mockResolvedValue(members);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await followUp(manager);
+      expect(response.status).toBe(404);
+      expect(manager.sent).toEqual([]);
+    });
+  });
+
   describe("pool media transformer", () => {
     const transformerId = "transformer-model-id";
     const transformerUpstream = "vlm-upstream";

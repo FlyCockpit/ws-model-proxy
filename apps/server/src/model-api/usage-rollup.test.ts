@@ -47,6 +47,7 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     cacheReadTokens: 60,
     cacheWriteTokens: null,
     usageKnown: true,
+    resourceOwnerUserId: null,
     RequestedModelPool: { userId: "owner-1" },
     SelectedExecutionTarget: { userId: "owner-1" },
     RequestedExecutionTarget: null,
@@ -147,6 +148,44 @@ describe("rollupIncrementForRequest", () => {
     expect(unresolved.ownerUserId).toBe("user-1");
   });
 
+  it("prefers the durable resource owner, which survives the pool's deletion", () => {
+    // The pool was deleted in flight: its FK and the selection are gone, so the
+    // legacy derivation would fall back to the requester.
+    const orphaned = rollupIncrementForRequest(
+      row({
+        resourceOwnerUserId: "owner-1",
+        requestedModelPoolId: null,
+        RequestedModelPool: null,
+        selectedPoolMemberId: null,
+        selectedExecutionTargetId: null,
+        SelectedExecutionTarget: null,
+      }),
+    )!;
+    expect(orphaned).toMatchObject({
+      ownerUserId: "owner-1",
+      requesterUserId: "user-1",
+      poolId: "",
+      poolMemberId: "",
+      executionTargetId: "",
+    });
+    expect(
+      rollupIncrementForRequest(
+        row({ resourceOwnerUserId: "owner-1", RequestedModelPool: { userId: "other" } }),
+      )!.ownerUserId,
+    ).toBe("owner-1");
+    // Own-key traffic stays with the requester even though the stored owner
+    // is the pool owner.
+    expect(
+      rollupIncrementForRequest(
+        row({
+          resourceOwnerUserId: "owner-1",
+          fallbackRoute: "own-key",
+          SelectedExecutionTarget: { userId: "user-1" },
+        }),
+      )!.ownerUserId,
+    ).toBe("user-1");
+  });
+
   it("classifies failures, cancels, and retries", () => {
     expect(rollupIncrementForRequest(row({ status: "FAILED", attemptCount: 3 }))).toMatchObject({
       successes: 0,
@@ -212,6 +251,8 @@ describe("merge and SQL", () => {
       'ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId", "executionTargetId", "source") DO UPDATE SET',
     );
     expect(text).toContain('"requests" = usage_rollup_minute."requests" + EXCLUDED."requests"');
+    // The owner key is a plain durable id: a deleted owner's increment is skipped.
+    expect(text).toContain('WHERE EXISTS (SELECT 1 FROM "user" WHERE id = ');
     expect(text).toContain(
       'unnest(usage_rollup_minute."latencyHistogram", EXCLUDED."latencyHistogram")',
     );

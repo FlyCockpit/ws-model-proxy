@@ -956,8 +956,8 @@ integration("own-key preference integrity and requester capacity", () => {
         }
         expect(await db.modelPool.findUnique({ where: { id: pool.id } })).toBeNull();
         // PENDING rows are deliberately skipped by the drain; the final FK
-        // cascade still erases their cross-tenant selection. P3C-2's later
-        // in-flight finalizer/attribution policy is a separate deferred issue.
+        // cascade still erases their cross-tenant selection and keeps the
+        // durable owner for attribution (P3C-2, grantee-stickiness suite).
         expect(
           await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
         ).toMatchObject({
@@ -966,6 +966,7 @@ integration("own-key preference integrity and requester capacity", () => {
           selectedDiscoveredModelId: null,
           selectedPoolMemberId: null,
           status: "PENDING",
+          resourceOwnerUserId: owner.id,
         });
         expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
           {

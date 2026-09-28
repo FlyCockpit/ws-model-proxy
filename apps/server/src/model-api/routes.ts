@@ -613,6 +613,8 @@ type ResponseStickinessCapture = {
   requester: RelayRequester;
   targetDiscoveredModelId?: string;
   targetModelPoolId?: string;
+  /** Exact grant a grantee reached `targetModelPoolId` through; null for its owner. */
+  poolGrantId?: string | null;
 };
 
 type StickyRoute =
@@ -2664,6 +2666,7 @@ async function writeResponseStickiness({
   responseId,
   targetDiscoveredModelId,
   targetModelPoolId,
+  poolGrantId,
   selectedDiscoveredModelId,
 }: ResponseStickinessCapture & {
   responseId: string;
@@ -2671,6 +2674,10 @@ async function writeResponseStickiness({
 }) {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
   const expiresAt = new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS);
+  // A grantee's pool binding belongs to the owner's graph and is tied to the
+  // exact grant (its deletion cascades the binding away); see the database
+  // consistency trigger for the ownership rule.
+  const boundGrantId = targetModelPoolId ? (poolGrantId ?? null) : null;
   const [targetExecutionTarget, selectedExecutionTarget] = await Promise.all([
     targetDiscoveredModelId
       ? prisma.executionTarget.findUnique({
@@ -2698,6 +2705,7 @@ async function writeResponseStickiness({
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
+      poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
@@ -2708,6 +2716,7 @@ async function writeResponseStickiness({
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
+      poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
@@ -3041,7 +3050,20 @@ async function resolveStickyRoute({
   if (record.targetModelPoolId) {
     const visibleTarget =
       targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null;
-    if (!visibleTarget) {
+    // Honor a local pool binding only through the access that created it: the
+    // owner's own (no grant), or the grantee's same live exact grant. A
+    // replaced grant never resurrects an older binding.
+    const recordGrantId = record.poolGrantId ?? null;
+    const sameAccess =
+      visibleTarget !== null &&
+      visibleTarget.accessGrantId === recordGrantId &&
+      (recordGrantId === null
+        ? visibleTarget.ownerUserId === requester.userId
+        : record.PoolGrant?.id === recordGrantId &&
+          record.PoolGrant.poolId === visibleTarget.id &&
+          record.PoolGrant.ownerUserId === visibleTarget.ownerUserId &&
+          record.PoolGrant.granteeUserId === requester.userId);
+    if (!visibleTarget || !sameAccess) {
       return openAiFailureJsonResponse(
         "access_denied",
         "Response routing metadata is no longer accessible.",
@@ -5716,6 +5738,7 @@ async function relayPool({
                   ...operation.responseStickiness,
                   responseId,
                   targetModelPoolId: target.id,
+                  poolGrantId: target.accessGrantId,
                   selectedDiscoveredModelId: member.discoveredModelId,
                 }).catch(stickinessWriteError)
               : Promise.resolve(),
@@ -5907,6 +5930,17 @@ async function relaySelectedModelNoFailover({
         (member) => member.discoveredModelId === selectedDiscoveredModelId,
       )
     : undefined;
+  // A pool binding is honored only while its member is still a local member
+  // of that pool and not disabled; a removed member is no longer reachable
+  // through the pool (or its grant), even for a stored response.
+  if (
+    requestedModelPoolId &&
+    (!selectedPoolMember || selectedPoolMember.routingStatus === "DISABLED")
+  ) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
+    return operationFailureResponse(operation, "not_found");
+  }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
@@ -7763,6 +7797,8 @@ export async function responsesCreateHandler({
           stickyRoute.target === "DIRECT_MODEL" ? stickyRoute.visibleTarget.id : undefined,
         targetModelPoolId:
           stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.id : undefined,
+        poolGrantId:
+          stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.accessGrantId : null,
       },
     },
     manager,
