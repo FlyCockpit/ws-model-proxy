@@ -1,6 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
+  CapacityOrderedTransactionTimeoutError,
   isRetryableCapacityTransactionError,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
@@ -76,7 +77,10 @@ export async function runSerializableTransaction<T>(
  * `lockCapacityGraphForDelete` in `@ws-model-proxy/db/capacity-lock-order`).
  * Deadlock, serialization and lock-set-change failures are retried with a
  * fresh transaction; exhausting the retries surfaces as CONFLICT, like
- * `runSerializableTransaction`.
+ * `runSerializableTransaction`. Every statement is bounded server-side by
+ * the transaction's `lock_timeout` / `statement_timeout`; a timeout rolls it
+ * back and is the same `delete_contended` CONFLICT
+ * ({@link throwCapacityDeleteConflict}).
  */
 export async function runCapacityDeleteTransaction<T>(
   work: (tx: Prisma.TransactionClient) => Promise<T>,
@@ -84,8 +88,26 @@ export async function runCapacityDeleteTransaction<T>(
   try {
     return await runCapacityOrderedTransaction(prisma, work);
   } catch (error) {
-    throwParentDeletionPendingConflict(error);
-    if (!isRetryableCapacityTransactionError(error)) throw error;
+    throwCapacityDeleteConflict(error);
+    throw error;
+  }
+}
+
+/**
+ * Maps the failures of a capacity-ordered delete transaction that mean
+ * "nothing was deleted, retry" to their CONFLICT reasons: a residual above
+ * the final-phase bound is `delete_pending`; exhausted deadlock /
+ * serialization / lock-set-change retries and the transaction's own
+ * server-side timeouts (a lock wait or statement past its bound, live
+ * traffic holding the capacity locks) are `delete_contended`. Other errors
+ * pass.
+ */
+export function throwCapacityDeleteConflict(error: unknown): void {
+  throwParentDeletionPendingConflict(error);
+  if (
+    error instanceof CapacityOrderedTransactionTimeoutError ||
+    isRetryableCapacityTransactionError(error)
+  ) {
     throw deletionConflict(
       "delete_contended",
       "Configuration changed concurrently. Retry the request.",

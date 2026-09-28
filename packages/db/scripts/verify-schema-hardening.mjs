@@ -94,6 +94,9 @@ const requiredFragments = [
   // IMP-MARK: an impersonation session is refused for a pending or deleted impersonator.
   'WHERE u.id = NEW."impersonatedBy"\n       FOR SHARE;\n    IF NOT FOUND OR pending THEN',
   "RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';",
+  // Single writer of the deletion marker (parent-deletion.ts abandonUserDeletion).
+  'BEFORE UPDATE OF "deletionRequestedAt", "deletionGeneration" ON "user"',
+  "current_setting('wsmp.user_deletion_writer', true) IS DISTINCT FROM 'on'",
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);

@@ -885,19 +885,33 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   it("the drain reports pending once it has passed more busy admissions than its bound (g1-M1)", async () => {
     const { prisma, deletion } = required();
     const g = await graph("many-held-waiters");
-    const over = deletion.PARENT_DELETION_MAX_PASSED_ADMISSIONS + 1;
+    // A small bound keeps the exclusion-list scan cheap: at the default
+    // 10 000 its filter cost could outlast the statement bound on a loaded
+    // host and report the timeout instead of the cap (the same pending
+    // outcome, but not this test's discriminator).
+    const cap = 100;
+    const over = cap + 1;
     await terminalAdmissions(g, over);
     // Every waiter held by one other transaction: each request is passed.
     const held = await holdRowLock(
       `SELECT id FROM capacity_waiter WHERE "poolId" = '${g.pool.id}' FOR UPDATE`,
     );
     try {
+      // The drain itself, not prepareParentDeletion (C21-T1): its residual
+      // recount (requests plus waiters, above the final-phase bound) raises
+      // the same error, so it would pass without the passed-admission cap.
+      const parents = await deletion.resolveDeletedParents(prisma, {
+        userId: g.user.id,
+        poolIds: [g.pool.id],
+      });
       const outcome = await settle(
-        deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] }),
+        deletion.drainParentDeletionHistory(prisma, parents, { maxPassedAdmissions: cap }),
       );
       expect(outcome.ok).toBe(false);
       if (outcome.ok) throw new Error("the drain carried an unbounded passed list");
       expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
+      expect((outcome.error as Error).message).toContain("passed too many busy admission");
+      expect(outcome.error).toMatchObject({ timeout: undefined });
       // Nothing busy was deleted.
       expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(over);
     } finally {
@@ -1136,9 +1150,12 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const isHeld = new Promise<void>((resolve) => {
       held = resolve;
     });
-    // An abandon holding the user row (like a slow unarchive/ban writer).
+    // An abandon holding the user row (like a slow unarchive/ban writer). It
+    // clears the marker the way abandonUserDeletion does (the marker guard
+    // trigger admits only the deletion subsystem's writer setting).
     const abandoning = required().prisma.$transaction(
       async (tx) => {
+        await tx.$executeRaw`SELECT set_config(${deletion.USER_DELETION_WRITER_SETTING}, 'on', true)`;
         await tx.$executeRaw`
           UPDATE "user" SET "deletionRequestedAt" = NULL, "deletionGeneration" = NULL
            WHERE id = ${g.user.id}`;
@@ -1259,7 +1276,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     TIMEOUT * 2,
   );
 
-  it("sweep fairness: the eleventh marked user is attempted after transient failures on the first ten", async () => {
+  // No queue is passed, so each tick starts at the oldest: this covers the
+  // path where every failed user's backoff write succeeds (the backoff hides
+  // them from the next tick). The round-robin queue itself is covered by the
+  // G2-01 tests below.
+  it("sweep backoff: once the first ten marked users back off after transient failures, the eleventh is attempted", async () => {
     const { prisma, deletion } = required();
     const { sweepPendingUserDeletions } = await import(
       "../../../../apps/server/src/user-deletion-sweep.js"
@@ -2113,7 +2134,9 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       expect(elapsed).toBeGreaterThanOrEqual(
         deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS - 100,
       );
-      expect(elapsed).toBeLessThan(deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 1_000);
+      // +2 s of headroom for a loaded host (F22-1); a 2 s lock wait repeated
+      // would still be caught by the lower bound above.
+      expect(elapsed).toBeLessThan(deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 2_000);
       expect(elapsed).toBeLessThan(timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS);
       expect(outcome.ok).toBe(false);
       if (outcome.ok) throw new Error("the batch was not stopped");
@@ -2315,7 +2338,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       expect(cascadeMs).toBeGreaterThanOrEqual(
         deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS - 100,
       );
-      expect(cascadeMs).toBeLessThan(deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 1_000);
+      // +2 s of headroom for a loaded host (F22-1).
+      expect(cascadeMs).toBeLessThan(deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 2_000);
     } finally {
       await releasing;
       for (const holder of holders) await holder.release();
@@ -3061,7 +3085,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   // fence arms during the first wait; the second query must never be
   // dispatched, so the join waits for one statement, not two.
   it("an admitted Prisma call dispatches none of its later queries once the fence arms (F2-07e)", async () => {
-    const { prisma, timeouts } = required();
+    const { prisma, timeouts, order } = required();
     const user = await markedUser("relation-expansion");
     await hideOtherMarkers([user.id]);
     // A live admission of the user's pool: the final delete reads it with its
@@ -3104,9 +3128,15 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       const firstPid = await waitForBlocker("SELECT", new Set(holders.map((h) => h.pid)), 15_000);
       const first = holders.find((holder) => holder.pid === firstPid)!;
       const second = holders.find((holder) => holder.pid !== firstPid)!;
-      // It is released inside the statement bound, so that query completes
-      // after the fence arms; the other table stays held past the join.
-      const releaseFirstMs = timeouts.USER_DELETION_SWEEP_STATEMENT_TIMEOUT_MS - 300;
+      // It is released inside the ordered transaction's bounds (its
+      // lock_timeout is the tighter one for this lock wait), so that query
+      // completes after the fence arms; the other table stays held past the
+      // join.
+      const releaseFirstMs =
+        Math.min(
+          order.CAPACITY_ORDERED_LOCK_TIMEOUT_MS,
+          order.CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS,
+        ) - 300;
       releasing = Promise.all([
         sleep(releaseFirstMs).then(() => first.release()),
         sleep(timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500).then(() => second.release()),
@@ -3632,8 +3662,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await required().prisma.user.count({ where: { id: stuck.id } })).toBe(0);
   }, 60_000);
 
-  it("a capacity-ordered final delete cancelled by the sweep's statement bound backs off once, without retries or archiving (F2-07)", async () => {
-    const { prisma, deletion, timeouts } = required();
+  it("a capacity-ordered final delete cancelled by its server-side lock bound backs off once, without retries or archiving (F2-07, #79)", async () => {
+    const { prisma, deletion, order } = required();
     const g = await graph("final-timeout");
     const mark = await deletion.requestUserDeletion(prisma, g.user.id);
     await prisma.user.update({
@@ -3657,13 +3687,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       const elapsed = Date.now() - started;
       report(`sweep tick with the final delete cancelled: ${elapsed} ms`);
       expect(result).toEqual({ deleted: 0, abandoned: 0, failed: 1 });
-      // Cancelled at the statement bound (not a lock wait of 2 s), once: not
-      // retried (five attempts would take 15 s), not held to Prisma's 15 s
-      // transaction cap.
-      expect(elapsed).toBeGreaterThanOrEqual(
-        timeouts.USER_DELETION_SWEEP_STATEMENT_TIMEOUT_MS - 100,
-      );
-      expect(elapsed).toBeLessThan(2 * timeouts.USER_DELETION_SWEEP_STATEMENT_TIMEOUT_MS);
+      // Cancelled by the ordered transaction's own lock_timeout (the L0 wait),
+      // once: not retried (five attempts would take 10 s), not held to the
+      // sweep connection's statement bound or Prisma's 15 s transaction cap.
+      expect(elapsed).toBeGreaterThanOrEqual(order.CAPACITY_ORDERED_LOCK_TIMEOUT_MS - 100);
+      expect(elapsed).toBeLessThan(order.CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS + 1_000);
       expect(errors).toHaveBeenCalledWith(
         "[auth] user deletion sweep will retry:",
         expect.any(String),
@@ -3736,21 +3764,379 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await prisma.user.count({ where: { id: g.user.id } })).toBe(1);
   });
 
+  // ---------------------------------------------------------------------------
+  // #79: request-client release guard, server-side bounds of the ordered
+  // delete, adaptive drain batch, single writer of the deletion marker.
+  // ---------------------------------------------------------------------------
+
+  /** Backends of `applicationName` as pg_stat_activity shows them. */
+  async function backendsOf(applicationName: string) {
+    const rows = await required().observer.$queryRaw<
+      Array<{ pid: number; state: string | null; in_tx: boolean }>
+    >`
+      SELECT pid, state, xact_start IS NOT NULL AS in_tx
+        FROM pg_stat_activity
+       WHERE datname = current_database() AND application_name = ${applicationName}`;
+    return rows.map((row) => ({ ...row, pid: Number(row.pid) }));
+  }
+
+  // #79 item 1: pg's client-side read timeout (`query_timeout`, which
+  // DATABASE_URL can set) fails a query's callback while the statement keeps
+  // running and drops the ROLLBACK queued behind it; the adapter then
+  // released the connection with its transaction open, and the next checkout
+  // ran inside that stale transaction (its COMMIT committing the abandoned
+  // write too). The request client now switches the read timeout off and its
+  // release guard closes any connection that is not idle. Both are
+  // exercised: production (normalized), and the guard alone (the test seam
+  // keeps the read timeout). Guard-alone fails without the guard: the
+  // stranded write is committed by a later transaction, or a backend stays
+  // idle in transaction.
+  it.each([
+    ["the production request client (read timeout switched off)", false],
+    ["the release guard alone (read timeout kept)", true],
+  ])(
+    "a DATABASE_URL query_timeout cannot strand a request transaction in the shared client's pool: %s (#79)",
+    async (label, keepReadTimeout) => {
+      const { prisma, clientFactory } = required();
+      const tag = keepReadTimeout ? "guard" : "prod";
+      const stranded = await graph(`shared-read-timeout-${tag}`);
+      const next = await graph(`shared-read-timeout-next-${tag}`);
+      const applicationName = `wsmp-shared-guard-${tag}-${stranded.suffix.slice(-8)}`;
+      const url = new URL(databaseUrl!);
+      url.searchParams.set("query_timeout", "250");
+      url.searchParams.set("application_name", applicationName);
+      const warns = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const client = clientFactory.createPrismaClient(url.toString(), {
+        keepClientReadTimeoutForTest: keepReadTimeout,
+      });
+      try {
+        const outcome = await settle(
+          client.$transaction(
+            async (tx) => {
+              await tx.user.update({
+                where: { id: stranded.user.id },
+                data: { name: "stranded-write" },
+                select: { id: true },
+              });
+              // Past the read timeout: with it armed, the callback fails at
+              // 250 ms while the statement runs on for a second.
+              await tx.$queryRaw`SELECT pg_sleep(1)`;
+              throw new Error("abort the transaction");
+            },
+            { timeout: 10_000 },
+          ),
+        );
+        expect(outcome.ok).toBe(false);
+        // Let the abandoned statement end on the server.
+        await sleep(1_500);
+        // Later requests on the same client, sequential (pg-pool reuses the
+        // most recently released connection first).
+        for (let n = 0; n < 3; n += 1) {
+          await client.$transaction(async (tx) => {
+            await tx.user.update({
+              where: { id: next.user.id },
+              data: { name: `next-${n}` },
+              select: { id: true },
+            });
+          });
+        }
+        await sleep(200);
+        report(
+          `request-client read timeout (${label}): ${JSON.stringify(await backendsOf(applicationName))}`,
+        );
+        // No backend of this client is inside a transaction, and the
+        // abandoned write was never committed by a later transaction.
+        expect((await backendsOf(applicationName)).filter((row) => row.in_tx)).toEqual([]);
+        const rows = await prisma.user.findMany({
+          where: { id: { in: [stranded.user.id, next.user.id] } },
+          select: { id: true, name: true },
+        });
+        expect(rows.find((row) => row.id === stranded.user.id)?.name).not.toBe("stranded-write");
+        expect(rows.find((row) => row.id === next.user.id)?.name).toBe("next-2");
+        if (keepReadTimeout) {
+          expect(warns).toHaveBeenCalledWith(expect.stringContaining("released with an open"));
+        } else {
+          expect(warns).toHaveBeenCalledWith(expect.stringContaining("query_timeout"));
+          expect(warns).not.toHaveBeenCalledWith(expect.stringContaining("released with an open"));
+        }
+        // Inverse: an ordinary transaction's connection goes back to the pool
+        // and is reused (the guard does not close idle connections).
+        const pids = new Set<number>();
+        for (let n = 0; n < 3; n += 1) {
+          await client.$transaction(async (tx) => {
+            const [row] = await tx.$queryRaw<
+              Array<{ pid: number }>
+            >`SELECT pg_backend_pid() AS pid`;
+            pids.add(Number(row!.pid));
+          });
+        }
+        expect(pids.size).toBe(1);
+      } finally {
+        await client.$disconnect();
+        warns.mockRestore();
+      }
+    },
+    60_000,
+  );
+
+  it("a request-path ordered delete blocked on a capacity lock answers delete_contended at its lock bound and holds nothing afterwards (#79)", async () => {
+    const { prisma, order, forwarder } = required();
+    const g = await graph("request-lock-bound");
+    // L1: the ordered delete takes the pool FOR NO KEY UPDATE.
+    const held = await holdRowLock(
+      `SELECT id FROM model_pool WHERE id = '${g.pool.id}' FOR UPDATE`,
+    );
+    const client = createRouterClient(forwarder.forwarderManagementRouter, {
+      context: sessionFor(g.user),
+    });
+    const started = Date.now();
+    try {
+      await expect(client.deleteModelPool({ id: g.pool.id })).rejects.toMatchObject({
+        code: "CONFLICT",
+        data: { reason: "delete_contended" },
+      });
+      const elapsed = Date.now() - started;
+      report(`request-path ordered delete behind an L1 holder: ${elapsed} ms`);
+      // Cancelled server-side at the lock bound, once (not retried, not held
+      // to Prisma's client-side 15 s cap).
+      expect(elapsed).toBeGreaterThanOrEqual(order.CAPACITY_ORDERED_LOCK_TIMEOUT_MS - 100);
+      expect(elapsed).toBeLessThan(order.CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS + 1_000);
+      // Nothing is left waiting on the holder: the cancelled statement's
+      // transaction rolled back.
+      const waiters = await required().observer.$queryRaw<Array<{ pid: number }>>`
+        SELECT pid FROM pg_stat_activity
+         WHERE datname = current_database() AND ${held.pid}::int = ANY(pg_blocking_pids(pid))`;
+      expect(waiters).toEqual([]);
+    } finally {
+      await held.release();
+    }
+    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(1);
+    // Inverse: once the pool is free the same delete succeeds.
+    await expect(client.deleteModelPool({ id: g.pool.id })).resolves.toBeDefined();
+    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
+  }, 60_000);
+
+  it("a request-path ordered delete whose statement runs past its bound is cancelled server-side and answers delete_contended (#79)", async () => {
+    const { prisma, observer, order, forwarder } = required();
+    const g = await graph("request-statement-bound");
+    // The final DELETE itself outlasts the statement bound (no lock wait).
+    await observer.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION wsmp_test_slow_pool_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.id = '${g.pool.id}' THEN PERFORM pg_sleep(10); END IF;
+        RETURN OLD;
+      END $$`);
+    await observer.$executeRawUnsafe(`
+      CREATE TRIGGER wsmp_test_slow_pool_delete BEFORE DELETE ON model_pool
+        FOR EACH ROW EXECUTE FUNCTION wsmp_test_slow_pool_delete()`);
+    const client = createRouterClient(forwarder.forwarderManagementRouter, {
+      context: sessionFor(g.user),
+    });
+    try {
+      const started = Date.now();
+      await expect(client.deleteModelPool({ id: g.pool.id })).rejects.toMatchObject({
+        code: "CONFLICT",
+        data: { reason: "delete_contended" },
+      });
+      const elapsed = Date.now() - started;
+      report(`request-path ordered delete past its statement bound: ${elapsed} ms`);
+      // Without the transaction-local statement_timeout the 10 s DELETE ran
+      // to completion inside Prisma's 15 s cap.
+      expect(elapsed).toBeGreaterThanOrEqual(order.CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS - 100);
+      expect(elapsed).toBeLessThan(order.CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS + 2_000);
+      expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(1);
+    } finally {
+      await observer.$executeRawUnsafe(
+        "DROP TRIGGER IF EXISTS wsmp_test_slow_pool_delete ON model_pool",
+      );
+      await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_pool_delete()");
+    }
+    await expect(client.deleteModelPool({ id: g.pool.id })).resolves.toBeDefined();
+    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
+  }, 60_000);
+
+  // #79 item 4: a waiter drain batch that exceeds the drain statement bound
+  // (a 5 000-row DELETE right after a bulk insert on a loaded host) is
+  // retried at half the size down to the floor instead of reporting pending.
+  // A statement trigger makes a batch slow above a row threshold.
+  it.each([
+    ["completes at a smaller batch", 1_000],
+    ["reports pending when even the floor batch times out", 100],
+  ] as const)(
+    "a drain batch cancelled by its statement bound is retried smaller: %s (#79)",
+    async (label, slowAbove) => {
+      const { prisma, observer, deletion } = required();
+      const g = await graph(`adaptive-${slowAbove}`);
+      const waiters = 3_000;
+      await terminalAdmissions(g, waiters);
+      // Sequences are not transactional, so they record every attempt (a
+      // BEFORE STATEMENT trigger: counted even when something else makes the
+      // DELETE itself outlast its bound on a loaded host) and each slow one
+      // (count and size) although the cancelled batch rolls back.
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_waiter_attempts MINVALUE 0 START 0",
+      );
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_slow_attempts MINVALUE 0 START 0",
+      );
+      await observer.$executeRawUnsafe(
+        "CREATE SEQUENCE IF NOT EXISTS wsmp_test_last_slow_size MINVALUE 0 START 0",
+      );
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_waiter_attempts', 0)");
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_slow_attempts', 0)");
+      await observer.$executeRawUnsafe("SELECT setval('wsmp_test_last_slow_size', 0)");
+      await observer.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION wsmp_test_slow_waiter_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE n bigint;
+        BEGIN
+          SELECT count(*) INTO n FROM gone WHERE "poolId" = '${g.pool.id}';
+          IF n > ${slowAbove} THEN
+            PERFORM nextval('wsmp_test_slow_attempts');
+            PERFORM setval('wsmp_test_last_slow_size', n);
+            PERFORM pg_sleep(10);
+          END IF;
+          RETURN NULL;
+        END $$`);
+      await observer.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION wsmp_test_count_waiter_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM nextval('wsmp_test_waiter_attempts');
+          RETURN NULL;
+        END $$`);
+      await observer.$executeRawUnsafe(`
+        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON capacity_waiter
+          FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_count_waiter_batch()`);
+      await observer.$executeRawUnsafe(`
+        CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON capacity_waiter
+          REFERENCING OLD TABLE AS gone
+          FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_slow_waiter_batch()`);
+      try {
+        const parents = await deletion.resolveDeletedParents(prisma, {
+          userId: g.user.id,
+          poolIds: [g.pool.id],
+        });
+        const started = Date.now();
+        const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
+        const elapsed = Date.now() - started;
+        const [slow] = await observer.$queryRawUnsafe<
+          Array<{ tried: bigint; attempts: bigint; lastSize: bigint }>
+        >(
+          `SELECT (SELECT last_value FROM wsmp_test_waiter_attempts) AS tried,
+                  (SELECT last_value FROM wsmp_test_slow_attempts) AS attempts,
+                  (SELECT last_value FROM wsmp_test_last_slow_size) AS "lastSize"`,
+        );
+        report(
+          `adaptive drain (${label}): ${elapsed} ms, ${JSON.stringify(outcome)}, waiter DELETEs ${slow?.tried}, slow ${slow?.attempts} (last ${slow?.lastSize} rows)`,
+        );
+        // 5 000 -> 2 500 -> 1 250 -> 625 (the floor): three halvings.
+        expect(deletion.PARENT_DELETION_DRAIN_BATCH / 8).toBe(
+          deletion.PARENT_DELETION_DRAIN_MIN_BATCH,
+        );
+        if (slowAbove >= deletion.PARENT_DELETION_DRAIN_MIN_BATCH) {
+          expect(outcome.ok).toBe(true);
+          if (!outcome.ok) throw outcome.error;
+          // 3 000 (all waiters), 2 500 and 1 250 were cancelled. (Slow-trigger
+          // observations are only reported: a loaded host can cancel a DELETE
+          // before its AFTER trigger runs.)
+          expect(outcome.value["batch.halved"]).toBe(3);
+          expect(outcome.value["capacity_waiter.delete"]).toBe(waiters);
+          expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
+        } else {
+          expect(outcome.ok).toBe(false);
+          if (outcome.ok) throw new Error("a floor batch past its bound was not reported");
+          expect(outcome.error).toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
+          expect(outcome.error).toMatchObject({ timeout: "57014" });
+          // The floor itself was attempted (3 000, 2 500, 1 250, then 625)
+          // before pending: a drain without the retry stops after one. Counted
+          // at statement start, so a DELETE a loaded host slowed past its
+          // bound before the slow trigger ran still counts.
+          expect(Number(slow?.tried)).toBe(4);
+          // Every batch rolled back.
+          expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(waiters);
+        }
+        // Four statement bounds at most (three halvings, then the floor).
+        expect(elapsed).toBeLessThan(
+          4 * deletion.PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS + 3_000,
+        );
+      } finally {
+        await observer.$executeRawUnsafe(
+          "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON capacity_waiter",
+        );
+        await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_waiter_batch()");
+        await observer.$executeRawUnsafe(
+          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON capacity_waiter",
+        );
+        await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_count_waiter_batch()");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_waiter_attempts");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_slow_attempts");
+        await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_last_slow_size");
+      }
+    },
+    90_000,
+  );
+
+  it("only the deletion subsystem clears a pending deletion's marker (#79)", async () => {
+    const { prisma, deletion } = required();
+    const g = await graph("marker-guard");
+    const mark = await deletion.requestUserDeletion(prisma, g.user.id);
+    expect(mark?.created).toBe(true);
+    const refused = /only the user deletion subsystem clears a pending deletion/;
+    // A plain writer (an admin update route, an ad-hoc UPDATE) is refused,
+    // whether it clears the marker or rewrites the generation.
+    await expect(
+      prisma.user.update({
+        where: { id: g.user.id },
+        data: { deletionRequestedAt: null, deletionGeneration: null },
+        select: { id: true },
+      }),
+    ).rejects.toThrow(refused);
+    await expect(
+      prisma.$executeRaw`UPDATE "user" SET "deletionGeneration" = 'forged' WHERE id = ${g.user.id}`,
+    ).rejects.toThrow(refused);
+    let state = await deletionState(g.user.id);
+    expect(state.deletionGeneration).toBe(mark!.generation);
+    expect(state.deletionRequestedAt).not.toBeNull();
+    // Moving the timestamp (the sweep's ordering key) never withdraws it.
+    await prisma.user.update({
+      where: { id: g.user.id },
+      data: { deletionRequestedAt: new Date(0) },
+      select: { id: true },
+    });
+    // The subsystem's abandon clears it.
+    await expect(deletion.abandonUserDeletion(prisma, g.user.id, mark!.generation)).resolves.toBe(
+      true,
+    );
+    state = await deletionState(g.user.id);
+    expect(state.deletionRequestedAt).toBeNull();
+    expect(state.deletionGeneration).toBeNull();
+    // A marker left without a generation gets its first one from the mark.
+    await prisma.user.update({
+      where: { id: g.user.id },
+      data: { deletionRequestedAt: new Date() },
+      select: { id: true },
+    });
+    const legacy = await deletion.requestUserDeletion(prisma, g.user.id);
+    expect(legacy?.generation).toEqual(expect.any(String));
+    await expect(deletion.abandonUserDeletion(prisma, g.user.id, legacy!.generation)).resolves.toBe(
+      true,
+    );
+  });
+
   // F2-07 (process level): the database step is `disconnectDatabaseClients`
-  // (apps/server/src/graceful-shutdown.ts, called from index.ts
-  // `disconnectPrisma`). A request admitted before the fence (users.setRole on
-  // the real shared singleton) waits on the user row the sweep's final delete
-  // holds while that COMMIT runs a slow deferred trigger. pg-pool's end()
-  // waits for the request's checked-out client, so an unbounded shared
-  // disconnect waited on the sweep's COMMIT (18 s measured by the final
-  // review); the shared disconnect now ends at SHARED_DISCONNECT_TIMEOUT_MS.
-  // These two tests run last: the first abandons the shared client's
-  // disconnect (it finishes once the blocked request does).
+  // (apps/server/src/graceful-shutdown.ts, wired by server-shutdown.ts). A
+  // request admitted before the fence (a user-row write on a request client)
+  // waits on the user row the sweep's final delete holds while that COMMIT
+  // runs a slow deferred trigger. pg-pool's end() waits for the request's
+  // checked-out client, so an unbounded shared disconnect waited on the
+  // sweep's COMMIT (18 s measured by the final review); the shared disconnect
+  // now ends at SHARED_DISCONNECT_TIMEOUT_MS. Both tests use their own request
+  // client built by the shared client's factory (F22-2): disconnecting the
+  // package singleton would leave it closed for every later test.
   it("a shared disconnect waiting behind a quarantined sweep COMMIT is abandoned at its deadline: the database step takes at most J + D + D_shared (F2-07)", async () => {
-    const { prisma, observer, fence, deadline, timeouts, users } = required();
+    const { observer, fence, deadline, timeouts, clientFactory } = required();
     const user = await markedUser("shared-shutdown");
-    const admin = await graph("shared-shutdown-admin");
     await hideOtherMarkers([user.id]);
+    const requestClient = clientFactory.createPrismaClient(databaseUrl!);
     const stepBoundMs =
       timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
       timeouts.USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS +
@@ -3784,9 +4170,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         before,
       );
       slowPid = slow.pid;
-      // A request admitted before shutdown, on the shared singleton.
-      const client = createRouterClient(users.usersRouter, { context: sessionFor(admin.user) });
-      writer = settle(client.setRole({ userId: user.id, role: "user" }));
+      // A request admitted before shutdown, on a request client.
+      writer = settle(
+        requestClient.user.update({
+          where: { id: user.id },
+          data: { role: "user" },
+          select: { id: true },
+        }),
+      );
       await waitForBlocker("UPDATE", new Set([slowPid]));
 
       let stopping: Promise<void> | undefined;
@@ -3815,10 +4206,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
                 warn: (message) => warnings.push(message),
               }),
             shared: {
-              // The real shared singleton; the promise is kept only so the
-              // test can await the abandoned disconnect afterwards.
+              // The request client; the promise is kept only so the test can
+              // await the abandoned disconnect afterwards.
               $disconnect: () => {
-                sharedDisconnect = prisma.$disconnect();
+                sharedDisconnect = requestClient.$disconnect();
                 return sharedDisconnect;
               },
             },
@@ -3854,6 +4245,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       if (slowPid !== 0) await waitForBackendGone(slowPid, 30_000);
       await writer;
       await sharedDisconnect;
+      await requestClient.$disconnect();
       await observer.$executeRawUnsafe(
         `DROP TRIGGER IF EXISTS wsmp_test_shared_slow_commit ON "user"`,
       );
@@ -3870,10 +4262,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   }, 90_000);
 
   it("a healthy shared disconnect finishes at once without a warning (F2-07 inverse)", async () => {
-    const { prisma, deadline } = required();
+    const { deadline, clientFactory } = required();
+    const prisma = clientFactory.createPrismaClient(databaseUrl!);
     const handle = await productionSweepHandle();
     const stop = await startSweep(handle.prisma);
-    // The shared client holds live connections (a query ran on it).
+    // The request client holds live connections (a query ran on it).
     await prisma.user.count();
     const warnings: string[] = [];
     try {
@@ -3897,7 +4290,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       required().fence.disarmDbShutdownFence();
       await stop();
     }
-    // The shared client reconnects on its next query after the disconnect.
+    // The request client reconnects on its next query after the disconnect.
     expect(await prisma.user.count()).toBeGreaterThan(0);
+    await prisma.$disconnect();
   }, 60_000);
 });

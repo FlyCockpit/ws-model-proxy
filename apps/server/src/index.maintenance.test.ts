@@ -1,69 +1,76 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  CLI_COMMAND_SWEEP_INTERVAL_MS,
+  RELAY_STALE_SESSION_SWEEP_INTERVAL_MS,
+  startRelayMaintenance,
+  TERMINAL_SESSION_RECHECK_INTERVAL_MS,
+} from "./relay-maintenance.js";
 
-describe("relay maintenance wiring", () => {
-  it("starts the stale session sweep from index without sleeping", () => {
-    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-    expect(source).toMatch(/startUnrefInterval\(\(\) => \{[\s\S]*?checkStaleSessions\(/);
-    expect(source).toContain("sweepExpiredPendingTerminals");
-    expect(source).toContain("closeBrowserSockets");
-    expect(source).toContain("closeIdleRelaySessions");
-    expect(source).toContain("backfillDiscoveredInferenceCapacities()");
+// The shutdown wiring index.ts installs is tested in server-shutdown.test.ts;
+// this covers the relay maintenance timers it starts (relay-maintenance.ts).
+describe("relay maintenance", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
   });
-});
-
-// F2-07: the database step is the tested helper disconnectDatabaseClients
-// (sweep shutdown bounded by join + disconnect, then the shared disconnect
-// bounded by SHARED_DISCONNECT_TIMEOUT_MS; executed against PostgreSQL in
-// packages/api/src/lib/parent-deletion.postgres.integration.test.ts), and the
-// whole sequence runs under the process watchdog (runProcessShutdown, armed
-// before anything is awaited; unit-tested in graceful-shutdown.test.ts).
-// Supplementary: the behavior is covered by those tests, this pins the wiring.
-describe("shutdown wiring", () => {
-  const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  const code = source
-    .split("\n")
-    .filter((line) => !line.trim().startsWith("//"))
-    .join("\n");
-
-  it("stops only capacity maintenance before drain and closes both runtimes in the owner teardown step", () => {
-    const stop = code.match(/stopPeriodicJobs: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
-    expect(stop).toContain("await capacityLifecycle?.stopMaintenance()");
-    expect(stop).not.toContain("capacityLifecycle?.close()");
-    expect(stop).not.toContain("closeDiagnosticsCapacityRuntime()");
-    const close = code.match(/closeCapacityRuntimes: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
-    expect(close).toContain(
-      "await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()])",
-    );
-    expect(code.match(/capacityLifecycle\?\.close\(\)/g)).toHaveLength(1);
-    expect(code.match(/closeDiagnosticsCapacityRuntime\(\)/g)).toHaveLength(1);
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  it("disconnectPrisma runs disconnectDatabaseClients: the sweep's bounded shutdown, then the shared client", () => {
-    const step = code.match(/disconnectPrisma: async \(\) => \{([\s\S]*?)\n {4}\},/)?.[1];
-    expect(step).toBeDefined();
-    expect(step).toMatch(
-      /^\s*await disconnectDatabaseClients\(\{\s*shutDownSweep: \(\) =>\s*shutDownUserDeletionSweep\(\{\s*stopped: \(\) => userDeletionSweepStopped \?\? stopUserDeletionSweep\(\),\s*client: userDeletionSweepClient,\s*\}\),\s*shared: prisma,\s*\}\);\s*$/,
+  function fakes() {
+    return {
+      relaySessions: {
+        checkStaleSessions: vi.fn(async () => undefined),
+        sweepExpiredPendingTerminals: vi.fn(),
+      },
+      sweepExpiredTokenCommands: vi.fn(),
+      terminalHub: { recheckSessions: vi.fn(async () => undefined) },
+    };
+  }
+
+  it("runs each sweep on its interval without running any at start", async () => {
+    const deps = fakes();
+    const stop = startRelayMaintenance(deps);
+    expect(deps.relaySessions.checkStaleSessions).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(RELAY_STALE_SESSION_SWEEP_INTERVAL_MS);
+    expect(deps.relaySessions.checkStaleSessions).toHaveBeenCalledTimes(1);
+    expect(deps.relaySessions.sweepExpiredPendingTerminals).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(
+      Math.max(CLI_COMMAND_SWEEP_INTERVAL_MS, TERMINAL_SESSION_RECHECK_INTERVAL_MS) -
+        RELAY_STALE_SESSION_SWEEP_INTERVAL_MS,
     );
-    // Nothing else disconnects a client or waits on the sweep client.
-    expect(code.match(/\$disconnect\(/g)).toBeNull();
-    expect(source.match(/userDeletionSweepClient\b/g)).toHaveLength(3);
-    expect(source).toContain("startUserDeletionSweep({ prisma: userDeletionSweepClient.prisma })");
+    expect(deps.sweepExpiredTokenCommands).toHaveBeenCalledTimes(1);
+    expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
+    stop();
   });
 
-  it("shutdown arms the process watchdog before anything is awaited and exits only through it", () => {
-    const body = code.match(/\nfunction shutdown\(signal: string\) \{([\s\S]*?)\n\}\n/)?.[1];
-    expect(body).toBeDefined();
-    // Synchronous function: no await can precede the watchdog.
-    expect(body).not.toMatch(/\bawait\b[\s\S]*runProcessShutdown\(/);
-    expect(body).toMatch(
-      /isShuttingDown = true;\s*console\.log\([^\n]*\);\s*runProcessShutdown\(\{ sequence: runShutdownSequence \}\);\s*$/,
-    );
-    expect(code).not.toMatch(/async function shutdown\(/);
-    expect(code).toMatch(
-      /\nasync function runShutdownSequence\(\) \{\n {2}await runGracefulShutdownSequence\(\{/,
-    );
-    // The only exits on the shutdown path are runProcessShutdown's.
-    expect(body).not.toContain("process.exit");
+  it("stop clears every timer", async () => {
+    const deps = fakes();
+    startRelayMaintenance(deps)();
+    await vi.advanceTimersByTimeAsync(10 * CLI_COMMAND_SWEEP_INTERVAL_MS);
+    expect(deps.relaySessions.checkStaleSessions).not.toHaveBeenCalled();
+    expect(deps.sweepExpiredTokenCommands).not.toHaveBeenCalled();
+    expect(deps.terminalHub.recheckSessions).not.toHaveBeenCalled();
+  });
+
+  it("a failing sweep is logged by class and does not stop the others", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const deps = fakes();
+    deps.relaySessions.checkStaleSessions.mockRejectedValue(new TypeError("secret detail"));
+    deps.relaySessions.sweepExpiredPendingTerminals.mockImplementation(() => {
+      throw new RangeError("secret detail");
+    });
+    deps.sweepExpiredTokenCommands.mockImplementation(() => {
+      throw new Error("secret detail");
+    });
+    const stop = startRelayMaintenance(deps);
+    await vi.advanceTimersByTimeAsync(2 * CLI_COMMAND_SWEEP_INTERVAL_MS);
+    expect(deps.relaySessions.checkStaleSessions.mock.calls.length).toBeGreaterThan(1);
+    expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(2);
+    expect(errors).toHaveBeenCalledWith("[server] stale relay session sweep failed", "TypeError");
+    expect(errors).toHaveBeenCalledWith("[server] pending terminal sweep failed", "RangeError");
+    expect(errors).toHaveBeenCalledWith("[server] CLI command sweep failed", "Error");
+    expect(JSON.stringify(errors.mock.calls)).not.toContain("secret detail");
+    stop();
   });
 });

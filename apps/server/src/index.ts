@@ -10,12 +10,6 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
-import {
-  disconnectDatabaseClients,
-  drainHttpWithDeadline,
-  runGracefulShutdownSequence,
-  runProcessShutdown,
-} from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
@@ -32,14 +26,11 @@ import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
+import { startRelayMaintenance } from "./relay-maintenance.js";
+import { installServerShutdown } from "./server-shutdown.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
-import { HTTP_DRAIN_TIMEOUT_MS } from "./shutdown-timeouts.js";
-import {
-  createUserDeletionSweepClient,
-  shutDownUserDeletionSweep,
-  startUserDeletionSweep,
-} from "./user-deletion-sweep.js";
+import { createUserDeletionSweepClient, startUserDeletionSweep } from "./user-deletion-sweep.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -177,7 +168,7 @@ const stopSessionCleanup = startSessionCleanup();
 // resumed here until the user is gone (see user-deletion-sweep.ts). The sweep
 // runs on its own fenced client whose connections carry a server-side
 // statement_timeout; shutdown waits on it for a bounded time and quarantines
-// it past that (shutDownUserDeletionSweep below). Request paths keep the
+// it past that (shutDownUserDeletionSweep, via server-shutdown.ts). Request paths keep the
 // shared client.
 const userDeletionSweepClient = createUserDeletionSweepClient(env.DATABASE_URL);
 const stopUserDeletionSweep = startUserDeletionSweep({ prisma: userDeletionSweepClient.prisma });
@@ -188,200 +179,43 @@ const stopUsageRetention = startUsageRetention({
   retentionDays: env.RELAY_REQUEST_RETENTION_DAYS,
 });
 
-function startUnrefInterval(tick: () => void, intervalMs: number): () => void {
-  const timer = setInterval(tick, intervalMs);
-  timer.unref();
-  return () => clearInterval(timer);
-}
-
-const stopStaleRelaySessions = startUnrefInterval(() => {
-  void relaySessionManager.checkStaleSessions().catch((error: unknown) => {
-    console.error(
-      "[server] stale relay session sweep failed",
-      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-    );
-  });
-  try {
-    relaySessionManager.sweepExpiredPendingTerminals();
-  } catch (error) {
-    console.error(
-      "[server] pending terminal sweep failed",
-      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-    );
-  }
-}, 15_000);
-const stopCliCommandSweep = startUnrefInterval(() => {
-  try {
-    sweepExpiredTokenCommands();
-  } catch (error) {
-    console.error(
-      "[server] CLI command sweep failed",
-      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-    );
-  }
-}, 60_000);
-const stopTerminalSessionRecheck = startUnrefInterval(() => {
-  void terminalBrowserHub.recheckSessions().catch((error: unknown) => {
-    console.error(
-      "[server] terminal session recheck failed",
-      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-    );
-  });
-}, 60_000);
+// Relay maintenance: stale relay sessions and expired pending terminals
+// (15 s), expired token-scoped CLI commands (60 s), and browser terminal
+// session rechecks (60 s); see relay-maintenance.ts.
+const stopRelayMaintenance = startRelayMaintenance({
+  relaySessions: relaySessionManager,
+  sweepExpiredTokenCommands,
+  terminalHub: terminalBrowserHub,
+});
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
 // ---------------------------------------------------------------------------
 
-let isShuttingDown = false;
-let userDeletionSweepStopped: Promise<void> | null = null;
-// Every shutdown bound (drain, relay close, MCP close, sweep join and
-// disconnect, shared disconnect) and the process deadline that sums them live
-// in ./shutdown-timeouts.ts, with the invariants they enforce.
-
-function shutdown(signal: string) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  console.log(`[server] Received ${signal} — starting graceful shutdown…`);
-
-  // The process watchdog is armed here, before anything is awaited: the
-  // process exits with status 1 at PROCESS_SHUTDOWN_DEADLINE_MS whatever a
-  // step is still waiting on, and with status 0 once the sequence finished.
-  runProcessShutdown({ sequence: runShutdownSequence });
-}
-
-// The graceful sequence (graceful-shutdown.ts order is unit-tested).
-async function runShutdownSequence() {
-  await runGracefulShutdownSequence({
-    // Stop the periodic jobs so they can't fire mid-shutdown.
-    stopPeriodicJobs: async () => {
-      stopMediaCleanup?.();
-      stopCacheAffinityCleanup();
-      stopRelayTelemetryRecovery();
-      stopProviderBudgetRepair();
-      stopProviderAttemptExpiry?.();
-      stopOauthCleanup?.();
-      stopSessionCleanup();
-      // Sets the stop flag only (no await): the in-flight tick is joined
-      // after the DB fence arms, below.
-      userDeletionSweepStopped = stopUserDeletionSweep();
-      stopUsageRetention();
-      stopStaleRelaySessions();
-      stopCliCommandSweep();
-      stopTerminalSessionRecheck();
-      relaySessionManager.dispose();
-      await capacityLifecycle?.stopMaintenance();
-    },
-    closeBrowserSockets: () => {
-      terminalBrowserHub.closeAll();
-    },
-    closeRelaySessions: async () => {
-      await relaySessionManager.closeRelaySessions();
-    },
-    // 1. Stop accepting new connections and drain in-flight requests.
-    //    ORDER: admission stops first (relay drain flag makes terminal and
-    //    CLI upgrades return 503; server.close stops new connections), THEN
-    //    the drain deadline starts, THEN idle CLI sockets close and their DB
-    //    writes run inside that deadline. A locked device row can use up the
-    //    deadline but never extend it.
-    //    NORMAL drain: graceful — server.close waits for in-flight requests
-    //    to finish; busy CLI sockets stay until their request finishes.
-    //    DRAIN TIMEOUT (F8): forcibly terminate every lingering
-    //    connection so requests that are still reading their bodies ABORT
-    //    (their request signals fire, their body streams error) — the MCP
-    //    admission gate below then settles and the teardown sequence is
-    //    never held hostage by a stalled body. Without this, a request that
-    //    passed the body cap but never finished sending could proceed to
-    //    the MCP factory DURING/AFTER the Prisma disconnect.
-    drainHttp: () =>
-      drainHttpWithDeadline({
-        timeoutMs: HTTP_DRAIN_TIMEOUT_MS,
-        stopAdmission: () => {
-          relaySessionManager.beginDrain();
-          return new Promise<void>((resolve) => {
-            server.close((err) => {
-              if (err) {
-                // Sanitized (L19): constructor name only — close errors can
-                // carry arbitrary message content.
-                console.error(
-                  `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
-                );
-              }
-              resolve();
-            });
-          });
-        },
-        // Drop CLI sockets that are not carrying a model request.
-        closeIdleRelaySessions: () => relaySessionManager.closeIdleRelaySessions(),
-        forceCloseConnections: () => {
-          // Feature-detect for TYPE reasons, not runtime availability:
-          // serve() uses Node's default HTTP constructor here, so the
-          // runtime server always implements closeAllConnections() /
-          // closeIdleConnections() (Node >= 18.2) — but @hono/node-server's
-          // ServerType UNION (http | http2 | https variants) does not
-          // declare these methods on every member, so the cast stays.
-          const nodeServer = server as {
-            closeAllConnections?: () => void;
-            closeIdleConnections?: () => void;
-          };
-          nodeServer.closeAllConnections?.();
-          nodeServer.closeIdleConnections?.();
-        },
-      }),
-    // After HTTP drain, before the MCP gate arms the database fence. Owners
-    // must keep renewing and admitting requests throughout the drain window.
-    closeCapacityRuntimes: async () => {
-      await Promise.all([capacityLifecycle?.close(), closeDiagnosticsCapacityRuntime()]);
-    },
-    // 2. Close the admission gate AND the module-lifetime MCP handler —
-    //    AFTER the HTTP drain (normal-drain requests finished; nothing
-    //    admitted loses its exchange prematurely) and BEFORE the Prisma
-    //    disconnect. The SDK owns closing each request-created server; the
-    //    gate (F8 pass 4/5) additionally owns every ADMITTED exchange the
-    //    SDK does not track (including requests still awaiting body parse):
-    //    close() flips the gate closed — arming the AUTH DB-SEAM FENCE
-    //    synchronously (every NEW better-auth adapter DB operation rejects
-    //    from that instant: the installed requireMcpAuth continuation chain
-    //    drops the abort signal, so its stray verifier continuations would
-    //    otherwise open DB operations after teardown began) — then ABORTS
-    //    every outstanding admitted controller. The handler's abort race
-    //    settles it, its stage fences stop every continuation at its
-    //    current await, and (pass 5) the permit release SHADOW-AWAITS the
-    //    admitted promise (bounded by a 10s cap) so close() resolves only
-    //    when every admitted exchange has genuinely settled or the cap is
-    //    reached. New admissions get 503 from the moment close begins.
-    //    This is the ONLY application-side close() call site
-    //    (graceful-shutdown.ts order is unit-tested).
-    closeMcpHandler: async () => {
-      await Promise.all([mcpAdmissionGate.close(), mcpHandler?.close()]);
-    },
-    // 3. Close database connections last.
-    disconnectPrisma: async () => {
-      // The user-deletion sweep's client goes first, then the shared one.
-      // Once the fence armed by closeMcpHandler is on, the sweep's client
-      // dispatches no further statement or connect (only the COMMIT /
-      // ROLLBACK ending a transaction). shutDownUserDeletionSweep joins the
-      // tick in flight for at most the join deadline, quarantines the sweep's
-      // pool if it has not settled (a COMMIT can outlast every server-side
-      // bound), and disconnects it under a short deadline: this step waits on
-      // the sweep for at most USER_DELETION_SWEEP_JOIN_TIMEOUT_MS +
-      // USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS. The shared client then
-      // disconnects under SHARED_DISCONNECT_TIMEOUT_MS: a request operation
-      // admitted before the fence can wait on a row the quarantined sweep
-      // backend still holds, and the pool's end() waits for its client, so an
-      // unbounded disconnect would wait on sweep work indirectly. Past the
-      // deadline it is abandoned (warned) and the process exit closes it.
-      await disconnectDatabaseClients({
-        shutDownSweep: () =>
-          shutDownUserDeletionSweep({
-            stopped: () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
-            client: userDeletionSweepClient,
-          }),
-        shared: prisma,
-      });
-    },
-  });
-}
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+// SIGTERM / SIGINT arm the process watchdog and run the graceful sequence
+// (server-shutdown.ts; its wiring is unit-tested in server-shutdown.test.ts,
+// the step order in graceful-shutdown.test.ts). Every shutdown bound and the
+// process deadline that sums them live in ./shutdown-timeouts.ts.
+installServerShutdown({
+  periodicJobStops: [
+    stopMediaCleanup,
+    stopCacheAffinityCleanup,
+    stopRelayTelemetryRecovery,
+    stopProviderBudgetRepair,
+    stopProviderAttemptExpiry,
+    stopOauthCleanup,
+    stopSessionCleanup,
+    stopUsageRetention,
+    stopRelayMaintenance,
+  ],
+  stopUserDeletionSweep,
+  userDeletionSweepClient,
+  relaySessions: relaySessionManager,
+  terminalHub: terminalBrowserHub,
+  server,
+  capacityLifecycle,
+  closeDiagnosticsCapacityRuntime,
+  mcpAdmissionGate,
+  mcpHandler,
+  shared: prisma,
+});

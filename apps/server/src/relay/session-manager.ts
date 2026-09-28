@@ -493,7 +493,23 @@ export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
-  /** True once shutdown has started refusing new relay work and closing idle sockets. */
+  /**
+   * Shutdown drain flag, shared by the relay and the browser terminal hub.
+   * Set by {@link beginDrain} (the HTTP drain's `stopAdmission`, index.ts) and
+   * again by {@link closeIdleRelaySessions} / {@link closeRelaySessions};
+   * one-way: nothing clears it, because the process exits after shutdown.
+   * While set:
+   * - new CLI relay upgrades (./websocket.ts) and new browser terminal
+   *   upgrades (`createTerminalWebsocketMiddleware`, ./terminal-websocket.ts)
+   *   answer 503 before authentication;
+   * - no new model request is sent to a CLI (`sendRelayRequest` throws) and no
+   *   supervised command starts (`startSupervisedCommand` returns false);
+   * - a CLI socket closes once its last model request finishes
+   *   ({@link considerDrainClose}).
+   * It does not close sockets already upgraded: browser terminal sockets are
+   * closed by the hub's `closeAll` (the shutdown's `closeBrowserSockets`
+   * step) and CLI sockets by the close calls above.
+   */
   private relayDrain = false;
   private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
     getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
@@ -980,7 +996,10 @@ export class RelaySessionManager {
     );
   }
 
-  /** Refuse new relay and terminal sockets. Synchronous so shutdown can stop admission first. */
+  /**
+   * Refuse new relay and terminal sockets (see {@link relayDrain}). Synchronous
+   * so shutdown can stop admission first. Idempotent and never undone.
+   */
   beginDrain() {
     this.relayDrain = true;
   }

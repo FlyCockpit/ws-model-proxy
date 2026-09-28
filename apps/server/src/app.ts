@@ -95,6 +95,7 @@ import {
   signupLimiter,
   signupRecipientLimiter,
 } from "./rate-limit.js";
+import { readinessResponse } from "./readiness.js";
 import {
   cancelCommandsForToken,
   listPendingSupervised,
@@ -121,6 +122,7 @@ import { SIGNIN_FAILURE_PATH, signinFailureLimit } from "./signin-failure-limit.
 import { signupAccessGate } from "./signup-access-gate.js";
 import { getOrSetSsrCache } from "./ssr-cache.js";
 import { unhandledErrorLogArgs } from "./unhandled-error-log.js";
+import { getUserDeletionSweepHealth } from "./user-deletion-sweep.js";
 
 /**
  * Testable app factory (Part E pass 3, ledger L24; contract narrowed pass 4, L25).
@@ -633,18 +635,21 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.get("/health", (c) => c.json({ ok: true }));
 
   // Readiness probe — checks dependencies for deploy gates and manual diagnosis.
+  // Postgres decides the status; the user-deletion sweep's coarse health is
+  // reported alongside (`degraded`) without failing the probe (./readiness.ts).
   app.get("/ready", async (c) => {
-    const checks = {
-      postgres: false,
-    };
+    let postgres = false;
     try {
       await withTimeout(prisma.$queryRaw`SELECT 1`, 3000, "postgres readiness check");
-      checks.postgres = true;
-
-      return c.json({ ok: true, checks });
+      postgres = true;
     } catch {
-      return c.json({ ok: false, checks }, 503);
+      postgres = false;
     }
+    const { status, body } = readinessResponse({
+      postgres,
+      userDeletionSweep: getUserDeletionSweepHealth(),
+    });
+    return c.json(body, status);
   });
 
   // SEO / discoverability: /robots.txt, /sitemap.xml, /llms.txt. Registered here

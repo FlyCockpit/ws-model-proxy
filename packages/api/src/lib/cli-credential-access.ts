@@ -3,7 +3,6 @@ import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-l
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
-  isRetryableCapacityTransactionError,
   lockCapacityGraphForDelete,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
@@ -17,10 +16,7 @@ import {
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
 import { deletionConflict } from "./deletion-conflict";
-import {
-  drainBeforeParentDelete,
-  throwParentDeletionPendingConflict,
-} from "./serializable-transaction";
+import { drainBeforeParentDelete, throwCapacityDeleteConflict } from "./serializable-transaction";
 
 export type CliCredentialKind = "cliToken" | "deviceCredential";
 
@@ -92,7 +88,7 @@ async function authenticateCliToken(
     where: { id: token.userId },
     select: { banned: true, banExpires: true, deletionRequestedAt: true },
   });
-  if (!owner || userCredentialAccessBlocked(owner, new Date())) return null;
+  if (!owner || userCredentialAccessBlocked(owner, now)) return null;
   if (
     !verifyForwarderHmacDigest({
       purpose: "cliToken",
@@ -135,7 +131,7 @@ async function authenticateDeviceCredential(
     where: { id: credential.userId },
     select: { banned: true, banExpires: true, deletionRequestedAt: true },
   });
-  if (!owner || userCredentialAccessBlocked(owner, new Date())) return null;
+  if (!owner || userCredentialAccessBlocked(owner, now)) return null;
   if (
     !verifyForwarderHmacDigest({
       purpose: "deviceCredential",
@@ -334,16 +330,13 @@ export async function deleteCliDeviceAndCredentials({
   // into endpoints, models, execution targets, pool members and admission
   // rows, so it takes the capacity locks in order first (step 4). A residual
   // above the final-phase bound found by the in-transaction recount rolls it
-  // back and answers CONFLICT, like the pre-lock count.
+  // back and answers CONFLICT, like the pre-lock count; so does a lock wait
+  // or statement past the transaction's server-side bound (delete_contended).
   try {
     return await deleteCliDeviceInCapacityLockOrder({ cliDeviceId, userId, staleBefore, now });
   } catch (error) {
-    throwParentDeletionPendingConflict(error);
-    if (!isRetryableCapacityTransactionError(error)) throw error;
-    throw deletionConflict(
-      "delete_contended",
-      "Configuration changed concurrently. Retry the request.",
-    );
+    throwCapacityDeleteConflict(error);
+    throw error;
   }
 }
 
@@ -551,7 +544,7 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
          WHERE id = ${userId}
            FOR SHARE`;
       const owner = owners[0];
-      if (!owner || userCredentialAccessBlocked(owner, new Date())) throw inactiveOwnerRefusal();
+      if (!owner || userCredentialAccessBlocked(owner, now)) throw inactiveOwnerRefusal();
 
       const consumed = await tx.deviceCode.deleteMany({
         where: { id: row.id, status: "approved", userId, expiresAt: { gt: now } },

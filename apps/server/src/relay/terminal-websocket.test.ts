@@ -361,6 +361,35 @@ describe("terminal websocket admission", () => {
     ).toBe(200);
   });
 
+  // The shutdown drain flag (RelaySessionManager.relayDrain) refuses a new
+  // browser terminal upgrade with 503 before any session read, and stays set.
+  it("refuses a browser terminal upgrade once the relay drain began, before authenticating", async () => {
+    sessions.getSession.mockResolvedValue(browserSession());
+    const app = middlewareApp();
+    const headers = {
+      upgrade: "websocket",
+      cookie: "session=ok",
+      origin: "https://proxy.example.com",
+    };
+    expect((await app.request("/api/dashboard/terminal/ws", { headers })).status).toBe(200);
+    expect(relaySessionManager.isDraining()).toBe(false);
+    sessions.getSession.mockClear();
+    relaySessionManager.beginDrain();
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const refused = await app.request("/api/dashboard/terminal/ws", { headers });
+        expect(refused.status).toBe(503);
+        await expect(refused.json()).resolves.toEqual({ error: "Server is shutting down." });
+      }
+      // Refused before the session lookup, and the flag does not clear itself.
+      expect(sessions.getSession).not.toHaveBeenCalled();
+      expect(relaySessionManager.isDraining()).toBe(true);
+    } finally {
+      // Test hygiene only: production never clears the flag.
+      Reflect.set(relaySessionManager, "relayDrain", false);
+    }
+  });
+
   it("returns the limiter response instead of continuing the upgrade", async () => {
     limiterState.fail = true;
     sessions.getSession.mockResolvedValue(browserSession());

@@ -186,12 +186,18 @@ export const HISTORY_DRAIN_EDGES = {
   { cascade: readonly DrainEdge[]; setNull: readonly DrainEdge[]; internal: readonly string[] }
 >;
 
-/** Drain budget or residual bound exceeded; completion should return pending. */
+/**
+ * Drain budget or residual bound exceeded, or a drain batch hit its own
+ * timeout; completion should return pending. `timeout` is the SQLSTATE of a
+ * batch timeout (55P03 lock wait, 57014 statement), absent otherwise.
+ */
 export class ParentDeletionDrainPendingError extends Error {
   readonly code = "PARENT_DELETION_DRAIN_PENDING";
-  constructor(message: string) {
-    super(message);
+  readonly timeout: "55P03" | "57014" | undefined;
+  constructor(message: string, options?: { timeout?: "55P03" | "57014"; cause?: unknown }) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "ParentDeletionDrainPendingError";
+    this.timeout = options?.timeout;
   }
 }
 
