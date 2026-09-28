@@ -722,6 +722,14 @@ describe("terminal browser hub", () => {
     );
   }
 
+  function registrationCounts(): { bySocket: number; byId: number } {
+    const hub = terminalBrowserHub as unknown as {
+      bySocket: Map<unknown, unknown>;
+      byId: Map<unknown, unknown>;
+    };
+    return { bySocket: hub.bySocket.size, byId: hub.byId.size };
+  }
+
   it("refuses hub registration when the handshake straddles a deletion mark", async () => {
     const browser = new FakeSocket();
     db.session.findUnique.mockResolvedValueOnce(
@@ -953,9 +961,12 @@ describe("terminal browser hub", () => {
       user: { id: "user-id" },
       session: { id: "session-id" },
     } as unknown as Session);
+    const before = registrationCounts();
     events.onOpen?.(new Event("open"), ws);
     expect(socket.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
-    expect(registered(socket)).toBe(false);
+    // onOpen registers a RelaySocket wrapper, not the raw socket, so assert on the hub's
+    // maps: the refused registration must not be left behind.
+    expect(registrationCounts()).toEqual(before);
     // Closed without an admission read: the database may already be released.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(db.session.findUnique).not.toHaveBeenCalled();
