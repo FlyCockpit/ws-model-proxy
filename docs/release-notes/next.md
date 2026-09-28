@@ -32,9 +32,11 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   changes from #56–#61 are additive (`publicEgressEnabled` became
   `fallbackEnabled` on the same column). If you upgrade straight from v0.3.1,
   the same push also applies #51 and #53, which drop `cli_device.label` and
-  `cli_device_credential.name`; `dangerous` deletes those values. Run `safe`
-  first and read every warning it prints before switching to `dangerous`,
-  then go back to `APPLY_SCHEMA=off`. The schema deploy also re-applies the
+  `cli_device_credential.name`; `dangerous` deletes those values. It also
+  deletes CLI credentials whose device was deleted (their `cliDeviceId` is
+  now required), so those CLIs must log in again; `safe` stops on those rows
+  before Prisma lists its warnings. Run `safe` first and read every warning it
+  prints before switching to `dangerous`, then go back to `APPLY_SCHEMA=off`. The schema deploy also re-applies the
   schema hardening that carries the grantee trigger fix below; with
   `APPLY_SCHEMA=off` that fix is not installed.
 
