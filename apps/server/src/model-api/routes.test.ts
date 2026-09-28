@@ -60,6 +60,14 @@ vi.mock("./cache-affinity.js", async (importOriginal) => {
   };
 });
 
+// The prefill speed source is the auto-mode input to the cache-holder wait;
+// stub it at the routing seam so the tests never read relay history.
+const prefillSpeed = vi.hoisted(() => ({ tokensPerSecond: vi.fn() }));
+vi.mock("./prefill-estimator.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./prefill-estimator.js")>();
+  return { ...actual, prefillSpeedSource: prefillSpeed };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -963,6 +971,8 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
+      // Unmeasured speed: the automatic wait falls back to the 2 s default.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
     });
 
     it("defers the cold member by the default 2 s and records the spill", async () => {
@@ -993,6 +1003,23 @@ describe("model API routes", () => {
       );
     });
 
+    it("sizes the automatic wait from the holder prefix and measured prefill speed", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      // 6000-token holder prefix at 2000 tokens/s: 3 s re-prefill time.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(2_000);
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      expect(prefillSpeed.tokensPerSecond).toHaveBeenCalledWith("member-a-target");
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        { poolMemberId: "member-b", notBeforeMs: 3_000, waitBudgetMs: 30_000 },
+      ]);
+    });
+
     it("records a holder wait when the cache holder serves", async () => {
       db.poolMember.findMany.mockResolvedValue(affineMembers({ cacheHolderWaitMs: 750 }));
       affinity.rank.mockResolvedValue(holderDecision());
@@ -1003,6 +1030,7 @@ describe("model API routes", () => {
       expect(response.status).toBe(200);
       // A fixed pool override replaces the automatic estimate.
       expect(candidatesOf(acquire)?.[1]).toMatchObject({ notBeforeMs: 750 });
+      expect(prefillSpeed.tokensPerSecond).not.toHaveBeenCalled();
       await vi.waitFor(
         () =>
           expect(db.relayRequest.update).toHaveBeenCalledWith(

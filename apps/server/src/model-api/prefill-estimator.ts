@@ -46,8 +46,9 @@ export type PrefillSample = {
 /**
  * Cold prefill rate (tokens/second) of one relay row, or null when the row is
  * not a clean cold-prefill sample: a small prompt, an unreported or warm engine
- * cache, or no measurable time to first byte. TTFT excludes admission queueing:
- * `firstClientByteAt - (startedAt + admissionWaitDurationMs)`.
+ * cache, unreported admission queueing, or no measurable time to first byte.
+ * TTFT excludes admission queueing: `firstClientByteAt - (startedAt +
+ * admissionWaitDurationMs)`.
  */
 export function coldPrefillRate(sample: PrefillSample): number | null {
   const { promptTokens, cacheReadTokens, firstClientByteAt } = sample;
@@ -55,10 +56,13 @@ export function coldPrefillRate(sample: PrefillSample): number | null {
   // Unreported cache usage may hide a warm prefix: never count it as cold.
   if (cacheReadTokens === null || cacheReadTokens < 0) return null;
   if (cacheReadTokens > promptTokens * PREFILL_SAMPLE_MAX_CACHE_READ_RATIO) return null;
+  // A null queue wait cannot be separated from TTFT, so counting the row as
+  // zero wait would fold admission queueing into the prefill rate.
+  const admissionWaitDurationMs = sample.admissionWaitDurationMs;
+  if (admissionWaitDurationMs === null || admissionWaitDurationMs < 0) return null;
   if (!firstClientByteAt) return null;
   const ttftMs =
-    firstClientByteAt.getTime() -
-    (sample.startedAt.getTime() + Math.max(0, sample.admissionWaitDurationMs ?? 0));
+    firstClientByteAt.getTime() - (sample.startedAt.getTime() + admissionWaitDurationMs);
   if (!Number.isFinite(ttftMs) || ttftMs <= 0) return null;
   return ((promptTokens - cacheReadTokens) * 1000) / ttftMs;
 }
@@ -145,6 +149,7 @@ export class RelayHistoryPrefillEstimator implements PrefillSpeedSource {
         promptTokens: { gte: PREFILL_SAMPLE_MIN_PROMPT_TOKENS },
         cacheReadTokens: { not: null },
         firstClientByteAt: { not: null },
+        admissionWaitDurationMs: { not: null },
       },
       orderBy: { createdAt: "desc" },
       take: PREFILL_SAMPLE_LIMIT,

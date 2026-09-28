@@ -46,6 +46,13 @@ describe("cold prefill samples", () => {
     expect(coldPrefillRate(sample(10_000, 1_000, { cacheReadTokens: 500 }))).toBe(9_500);
   });
 
+  it("rejects rows with unreported admission queueing", () => {
+    // A null wait would silently fold queueing into TTFT.
+    expect(coldPrefillRate(sample(4_000, 1_000, { admissionWaitDurationMs: null }))).toBeNull();
+    expect(coldPrefillRate(sample(4_000, 1_000, { admissionWaitDurationMs: -1 }))).toBeNull();
+    expect(coldPrefillRate(sample(4_000, 2_000, { admissionWaitDurationMs: 0 }))).toBe(2_000);
+  });
+
   it("needs three clean samples and weights recent ones more", () => {
     expect(estimatePrefillTokensPerSecond([sample(4_000, 1_000), sample(4_000, 1_000)])).toBe(
       undefined,
@@ -118,6 +125,7 @@ describe("relay-history prefill estimator", () => {
         status: "SUCCEEDED",
         promptTokens: { gte: 2_000 },
         cacheReadTokens: { not: null },
+        admissionWaitDurationMs: { not: null },
       },
       take: 50,
     });
