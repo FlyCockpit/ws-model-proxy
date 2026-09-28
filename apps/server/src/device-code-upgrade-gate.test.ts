@@ -4,7 +4,7 @@ import {
 } from "@ws-model-proxy/config/cli-device-login";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
-import { deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
+import { DEVICE_CODE_BODY_MAX_BYTES, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 
 function app() {
   const reached = vi.fn();
@@ -61,6 +61,79 @@ describe("device-code upgrade gate", () => {
       body: form,
     });
     expect(reached).toHaveBeenLastCalledWith(form);
+  });
+
+  /** A body with no Content-Length that yields 1 KiB chunks on demand. */
+  function endlessBody(maxChunks: number) {
+    const chunk = new TextEncoder().encode(`{"scope":"${"x".repeat(1024 - 11)}`.slice(0, 1024));
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > maxChunks) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    return { stream, pulls: () => pulls };
+  }
+
+  it("refuses an unlength'd oversized body at the cap without reading the rest (f3-F2)", async () => {
+    const { hono, reached } = app();
+    // 10 MiB offered; the gate must stop just past 16 KiB.
+    const body = endlessBody(10 * 1024);
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: body.stream,
+      duplex: "half",
+    } as RequestInit);
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: "invalid_request" });
+    expect(reached).not.toHaveBeenCalled();
+    // 16 chunks fill the cap, the 17th crosses it; the stream queues read
+    // ahead by a few chunks. Buffering the whole body would pull all 10240.
+    expect(body.pulls()).toBeLessThanOrEqual(DEVICE_CODE_BODY_MAX_BYTES / 1024 + 4);
+  });
+
+  it("refuses a declared oversized body without reading it", async () => {
+    const { hono, reached } = app();
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(DEVICE_CODE_BODY_MAX_BYTES + 1),
+      },
+      body: "x".repeat(DEVICE_CODE_BODY_MAX_BYTES + 1),
+    });
+    expect(response.status).toBe(413);
+    expect(reached).not.toHaveBeenCalled();
+  });
+
+  it("passes an unlength'd body at the cap to Better Auth intact", async () => {
+    const { hono, reached } = app();
+    const text = JSON.stringify({ scope: "cli-slug:desk-01", pad: "" });
+    const padded = JSON.stringify({
+      scope: "cli-slug:desk-01",
+      pad: "p".repeat(DEVICE_CODE_BODY_MAX_BYTES - text.length),
+    });
+    expect(new TextEncoder().encode(padded).byteLength).toBe(DEVICE_CODE_BODY_MAX_BYTES);
+    const bytes = new TextEncoder().encode(padded);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < bytes.length; offset += 1000)
+          controller.enqueue(bytes.slice(offset, offset + 1000));
+        controller.close();
+      },
+    });
+    const response = await hono.request("/api/auth/device/code", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(await response.json()).toMatchObject({ device_code: "real" });
+    expect(reached).toHaveBeenLastCalledWith(padded);
   });
 
   it("uses an upgrade message that a 0.3.x login prints instead of retrying", () => {

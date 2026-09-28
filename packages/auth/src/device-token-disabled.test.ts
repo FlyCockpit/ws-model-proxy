@@ -122,3 +122,57 @@ describe("Better Auth /device/token", () => {
     await expect(approvedDeviceCode(setup)).resolves.toEqual(expect.any(String));
   });
 });
+
+async function pendingUserCode(setup: ReturnType<typeof buildAuth>) {
+  const started = await setup.auth.handler(
+    new Request(`${BASE_URL}/api/auth/device/code`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" }),
+    }),
+  );
+  expect(started.status).toBe(200);
+  const { user_code: userCode } = (await started.json()) as { user_code: string };
+  return userCode;
+}
+
+function deviceRequest(path: string, userCode: string) {
+  if (path === "/device") {
+    return new Request(
+      `${BASE_URL}/api/auth/device?${new URLSearchParams({ user_code: userCode })}`,
+      { method: "GET", headers: { accept: "application/json" } },
+    );
+  }
+  return new Request(`${BASE_URL}/api/auth${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: BASE_URL },
+    body: JSON.stringify({ userCode }),
+  });
+}
+
+describe("Better Auth device verification, approve and deny", () => {
+  it("serves GET /device when left enabled (control)", async () => {
+    const setup = buildAuth([]);
+    const userCode = await pendingUserCode(setup);
+
+    const response = await setup.auth.handler(deviceRequest("/device", userCode));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "pending" });
+  });
+
+  it.each(["/device", "/device/", "/device/approve", "/device/deny"])(
+    "%s is disabled, so nothing but cliCredentials.approveDeviceLogin claims a code",
+    async (path) => {
+      const setup = buildAuth([...DISABLED_DEVICE_AUTHORIZATION_PATHS]);
+      const userCode = await pendingUserCode(setup);
+
+      const response = await setup.auth.handler(deviceRequest(path, userCode));
+
+      expect(response.status).toBe(404);
+      const row = setup.db.deviceCode?.find((candidate) => candidate.userCode === userCode);
+      expect(row?.status).toBe("pending");
+      expect(row?.userId ?? null).toBeNull();
+    },
+  );
+});

@@ -649,3 +649,29 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
     }
   });
 });
+
+describe("createApp registration contract — device-code exchange limiter (CI-2)", () => {
+  it("binds exchangeDeviceCode to the per-code limiter: slow_down after the budget", async () => {
+    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "203.0.113.77" } });
+    const exchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({
+          json: { deviceCode: `wiring-${BASE}-code`, cliSlug: "desk-01" },
+        }),
+      });
+    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
+      const res = await exchange();
+      // The mocked database has no such code.
+      expect(res.status, `call ${call}`).toBe(404);
+    }
+    const limited = await exchange();
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({
+      json: { code: "TOO_MANY_REQUESTS", data: { deviceFlowError: "slow_down" } },
+    });
+  });
+});

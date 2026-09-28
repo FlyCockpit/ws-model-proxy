@@ -15,11 +15,13 @@ import { z } from "zod";
 import { protectedProcedure, publicProcedure } from "../index";
 import {
   closeRevokedCliCredentialSessions,
+  deviceFlowErrorData,
   digestCliTokenSecret,
   mintCliDeviceCredentialFromApprovedDeviceCode,
 } from "../lib/cli-credential-access";
 
 const credentialNameSchema = z.string().trim().min(1).max(120);
+const userCodeSchema = z.string().trim().min(1).max(191);
 const cliSlugSchema = z
   .string()
   .min(1)
@@ -147,6 +149,15 @@ export const cliCredentialsRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      // Per IP and per device code, before any database work. A refusal is
+      // RFC 8628 `slow_down`, so a polling CLI backs off instead of failing.
+      const limit = await context.services?.limitDeviceCodeExchange?.(input.deviceCode);
+      if (limit && !limit.allowed) {
+        throw new ORPCError("TOO_MANY_REQUESTS", {
+          message: "Device authorization polling too fast.",
+          data: deviceFlowErrorData("slow_down"),
+        });
+      }
       // The device code a pre-0.4.0 `wsmp login` got from /device/code (it
       // sends no slug scope). Those releases print this message.
       if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
@@ -162,27 +173,27 @@ export const cliCredentialsRouter = {
 
   /**
    * What approving a `wsmp login` request authorizes, for the approval page:
-   * the CLI slug bound to the request and the existing device it would take
-   * over, if any. Only the account that claimed the code (Better Auth's
-   * `GET /device`) sees it; everything else is NOT_FOUND.
+   * the CLI slug bound to the request and the signed-in user's existing device
+   * it would take over, if any. Reading claims nothing: a pending, unclaimed
+   * code is visible to any signed-in account holding its user code, so the
+   * wrong account opening the link leaves it for the right one. A code another
+   * account approved is NOT_FOUND.
    */
   deviceLoginRequest: protectedProcedure
-    .input(z.object({ userCode: z.string().trim().min(1).max(191) }))
+    .input(z.object({ userCode: userCodeSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       const row = await prisma.deviceCode.findFirst({
-        where: { userCode: { in: userCodeCandidates(input.userCode) }, userId },
+        where: {
+          userCode: { in: userCodeCandidates(input.userCode) },
+          OR: [{ userId: null, status: "pending" }, { userId }],
+        },
         select: { status: true, expiresAt: true, scope: true },
       });
       if (!row || row.expiresAt <= new Date()) {
         throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
       }
-      const slug = cliSlugFromDeviceLoginScope(row.scope);
-      if (slug === null) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "This device login request does not name a CLI slug; upgrade wsmp.",
-        });
-      }
+      const slug = requireDeviceLoginSlug(row.scope);
       const device = await prisma.cliDevice.findUnique({
         where: { userId_slug: { userId, slug } },
         select: { id: true, slug: true, name: true, reportedHostname: true },
@@ -195,4 +206,69 @@ export const cliCredentialsRouter = {
           : null,
       };
     }),
+
+  /**
+   * Approves a pending `wsmp login` for the signed-in account. The claim and
+   * the approval are one conditional write: it succeeds only while the code is
+   * pending, unexpired, and unclaimed (or already this account's), and only
+   * for the CLI slug the page showed. Of two accounts approving at once, one
+   * write matches and the other gets CONFLICT. Better Auth's own `/device`,
+   * `/device/approve` and `/device/deny` are disabled
+   * (`DISABLED_DEVICE_AUTHORIZATION_PATHS`), so nothing else claims a code.
+   */
+  approveDeviceLogin: protectedProcedure
+    .input(z.object({ userCode: userCodeSchema, slug: cliSlugSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const now = new Date();
+      const row = await prisma.deviceCode.findFirst({
+        where: { userCode: { in: userCodeCandidates(input.userCode) } },
+        select: { id: true, userId: true, status: true, expiresAt: true, scope: true },
+      });
+      if (!row || (row.userId !== null && row.userId !== userId)) {
+        throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
+      }
+      if (row.expiresAt <= now) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "This login request has expired. Run `wsmp login` again.",
+        });
+      }
+      const slug = requireDeviceLoginSlug(row.scope);
+      if (slug !== input.slug) {
+        throw new ORPCError("CONFLICT", {
+          message: "This login request is for a different CLI slug. Reload the page.",
+        });
+      }
+      if (row.status === "approved" && row.userId === userId) return { status: "approved", slug };
+      if (row.status !== "pending") throw alreadyHandled();
+
+      const approved = await prisma.deviceCode.updateMany({
+        where: {
+          id: row.id,
+          status: "pending",
+          expiresAt: { gt: now },
+          scope: row.scope,
+          OR: [{ userId: null }, { userId }],
+        },
+        data: { status: "approved", userId },
+      });
+      if (approved.count !== 1) throw alreadyHandled();
+      return { status: "approved", slug };
+    }),
 };
+
+function requireDeviceLoginSlug(scope: string | null): string {
+  const slug = cliSlugFromDeviceLoginScope(scope);
+  if (slug === null) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "This device login request does not name a CLI slug; upgrade wsmp.",
+    });
+  }
+  return slug;
+}
+
+function alreadyHandled(): ORPCError<"CONFLICT", undefined> {
+  return new ORPCError("CONFLICT", {
+    message: "This login request was already handled. Run `wsmp login` again if you need to.",
+  });
+}

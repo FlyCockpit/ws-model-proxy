@@ -17,6 +17,54 @@ describe("cleanText", () => {
     expect(cleanText("tab\tstays\u0085")).toBe("tab\tstays");
   });
 
+  it.each([
+    ["DCS", "\u001bP1$r0m\u001b\\"],
+    ["APC", "\u001b_Gf=100;AAAA\u001b\\"],
+    ["PM", "\u001b^private message\u001b\\"],
+    ["SOS", "\u001bXstart of string\u001b\\"],
+    ["DCS (8-bit)", "\u0090q#0;2;0;0;0\u009c"],
+    ["APC (8-bit)", "\u009fGpayload\u009c"],
+    ["PM (8-bit)", "\u009epm\u001b\\"],
+    ["CSI (8-bit)", "\u009b2J"],
+    ["OSC (8-bit)", "\u009d0;title\u0007"],
+    ["charset designation", "\u001b(B"],
+  ])("removes a whole %s sequence, payload included (f4-a)", (_label, sequence) => {
+    expect(cleanText(`before${sequence}after`)).toBe("beforeafter");
+  });
+
+  it("does not end DCS/APC/PM at BEL; only ST ends them", () => {
+    expect(cleanText("a\u001bPpayload\u0007still-payload\u001b\\b")).toBe("ab");
+    expect(cleanText("a\u001b_x\u0007y\u009cb")).toBe("ab");
+  });
+
+  it.each([
+    ["DCS", "\u001bPq#0;2;0;0;0#0~~"],
+    ["APC", "\u001b_Gf=100;AAAA"],
+    ["PM", "\u001b^secret"],
+    ["DCS (8-bit)", "\u0090partial"],
+    ["OSC", "\u001b]0;title"],
+    ["CSI", "\u001b[1;3"],
+    ["lone ESC", "\u001b"],
+    ["ESC before the terminator", "\u001bPpayload\u001b"],
+  ])("drops an unterminated %s at the end of the buffer", (_label, sequence) => {
+    expect(cleanText(`kept${sequence}`)).toBe("kept");
+  });
+
+  it("resumes after an ESC that aborts a control string", () => {
+    expect(cleanText("a\u001bPdcs\u001b[31mred\u001b[0m")).toBe("ared");
+  });
+
+  it("never lets a control string's payload through formatBoundedStream", () => {
+    const head = bytes("ok \u001bP+q544e\u001b\\ \u001b_evil\u001b\\ \u001b^pm\u001b\\ done");
+    const text = formatBoundedStream({
+      head,
+      tail: new Uint8Array(),
+      totalBytes: head.length,
+    }).text;
+    expect(text).toBe("ok    done");
+    expect(text).not.toMatch(/544e|evil|pm/);
+  });
+
   it("redacts every product prefix anywhere in the text", () => {
     expect(
       redactCredentialSubstrings(

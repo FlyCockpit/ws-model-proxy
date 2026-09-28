@@ -242,6 +242,39 @@ describe("sweepPendingUserDeletions", () => {
     errors.mockRestore();
   });
 
+  it.each([
+    ["terminal relay execution attempt is immutable", { abandoned: 0, failed: 1 }, "backoff"],
+    ["active relay execution ownership is immutable", { abandoned: 0, failed: 1 }, "backoff"],
+    ["provider budget rules are immutable", { abandoned: 1, failed: 0 }, "abandon"],
+  ] as const)("a 55000 (%s) during the delete: %j", async (message, outcome, write) => {
+    db.user.findMany.mockResolvedValue([row("attempt")]);
+    const complete = vi.fn(async () => {
+      throw Object.assign(new Error("Invalid `prisma.user.delete()` invocation"), {
+        code: "P2010",
+        meta: {
+          driverAdapterError: {
+            cause: { originalCode: "55000", originalMessage: message, kind: "postgres" },
+          },
+        },
+      });
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(sweepPendingUserDeletions({ prisma, now: NOW, complete })).resolves.toEqual({
+      deleted: 0,
+      ...outcome,
+    });
+    // One recovery write: the backoff (retry) or the abandon (archive).
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveBeenCalledWith(
+      write === "backoff"
+        ? "[auth] user deletion sweep will retry:"
+        : "[auth] user deletion refused; the user stays archived:",
+      "Error",
+    );
+    errors.mockRestore();
+  });
+
   it("does not count an abandon that matched no row (a newer generation replaced it)", async () => {
     db.user.findMany.mockResolvedValue([row("replaced")]);
     db.$executeRaw.mockResolvedValue(0);

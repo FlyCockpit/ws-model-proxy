@@ -101,33 +101,82 @@ function stripDisallowedControls(text: string): string {
   return out;
 }
 
+const ESC = 0x1b;
+const BEL = 0x07;
+/** 8-bit String Terminator (C1). */
+const ST = 0x9c;
+
+/**
+ * Index just past a control string's terminator, or the end of the text when
+ * it is unterminated (a sequence cut off at the end of a buffer is dropped
+ * whole). ST is `ESC \` or 8-bit 0x9c; OSC also ends at BEL, as xterm
+ * accepts. Any other ESC inside the string aborts it, and parsing resumes at
+ * that ESC so a following sequence is still recognized.
+ */
+function skipControlString(text: string, from: number, bellEnds: boolean): number {
+  for (let index = from; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === ST || (bellEnds && code === BEL)) return index + 1;
+    if (code === ESC) return text[index + 1] === "\\" ? index + 2 : index;
+  }
+  return text.length;
+}
+
+/** Index just past a CSI's final byte (0x40-0x7e), or the end of the text. */
+function skipCsi(text: string, from: number): number {
+  let index = from;
+  while (index < text.length && text.charCodeAt(index) < 0x40) index += 1;
+  return Math.min(index + 1, text.length);
+}
+
+/**
+ * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms:
+ * CSI (`ESC [`, 0x9b); OSC (`ESC ]`, 0x9d); the control strings DCS
+ * (`ESC P`, 0x90), SOS (`ESC X`, 0x98), PM (`ESC ^`, 0x9e) and APC
+ * (`ESC _`, 0x9f), each through its terminator or the end of the text; and
+ * other escapes (`ESC` + intermediates 0x20-0x2f + one final byte).
+ */
 function stripTerminalSequences(text: string): string {
   let out = "";
-  for (let index = 0; index < text.length; index += 1) {
-    if (text.charCodeAt(index) !== 0x1b) {
-      out += text[index] ?? "";
-      continue;
-    }
-    const next = text[index + 1];
-    if (next === "[") {
-      index += 2;
-      while (index < text.length && (text.charCodeAt(index) ?? 0) < 0x40) index += 1;
-      continue;
-    }
-    if (next === "]") {
-      index += 2;
-      while (index < text.length) {
-        const code = text.charCodeAt(index) ?? 0;
-        if (code === 0x07) break;
-        if (code === 0x1b && text[index + 1] === "\\") {
-          index += 1;
-          break;
-        }
-        index += 1;
+  let index = 0;
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    let introducer: number | null = null;
+    let bodyStart = index + 1;
+    if (code === ESC) {
+      const next = text.charCodeAt(index + 1);
+      if (Number.isNaN(next)) break;
+      bodyStart = index + 2;
+      if (next === 0x5b) introducer = 0x9b;
+      else if (next === 0x5d) introducer = 0x9d;
+      else if (next === 0x50) introducer = 0x90;
+      else if (next === 0x58) introducer = 0x98;
+      else if (next === 0x5e) introducer = 0x9e;
+      else if (next === 0x5f) introducer = 0x9f;
+      else {
+        let end = index + 1;
+        while (end < text.length && text.charCodeAt(end) >= 0x20 && text.charCodeAt(end) <= 0x2f)
+          end += 1;
+        index = Math.min(end + 1, text.length);
+        continue;
       }
+    } else if (
+      code === 0x9b ||
+      code === 0x9d ||
+      code === 0x90 ||
+      code === 0x98 ||
+      code === 0x9e ||
+      code === 0x9f
+    ) {
+      introducer = code;
+    }
+    if (introducer === null) {
+      out += text[index] ?? "";
+      index += 1;
       continue;
     }
-    if (next) index += 1;
+    if (introducer === 0x9b) index = skipCsi(text, bodyStart);
+    else index = skipControlString(text, bodyStart, introducer === 0x9d);
   }
   return out;
 }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { DeviceCodeExchangeLimit } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Next } from "hono";
@@ -89,6 +90,65 @@ export const rpcLimiter = new RateLimiterMemory({
   points: env.RATE_LIMIT_RPC_POINTS,
   duration: env.RATE_LIMIT_RPC_DURATION,
 });
+
+/**
+ * `cliCredentials.exchangeDeviceCode` limiters: the public device-flow
+ * redemption a `wsmp login` polls (every 5 s for up to 30 min). One bucket per
+ * client IP and one per device code; see {@link consumeDeviceCodeExchange}.
+ * A released CLI answers the refusal (`slow_down`) by polling more slowly, so
+ * the budgets sit well above an honest poller: 12/min per code, a few
+ * concurrent logins behind one address. Per process, like every limiter here.
+ */
+export const DEVICE_CODE_EXCHANGE_IP_POINTS = 60;
+export const DEVICE_CODE_EXCHANGE_CODE_POINTS = 20;
+export const DEVICE_CODE_EXCHANGE_DURATION_SECONDS = 60;
+
+export const deviceCodeExchangeIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:device-exchange-ip",
+  points: DEVICE_CODE_EXCHANGE_IP_POINTS,
+  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
+});
+
+export const deviceCodeExchangeCodeLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:device-exchange-code",
+  points: DEVICE_CODE_EXCHANGE_CODE_POINTS,
+  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
+});
+
+/**
+ * Charges one exchange to the client IP, then to the device code. The IP
+ * bucket comes first so a caller spraying made-up codes spends its own budget
+ * before creating code buckets. The device code is a secret only its CLI
+ * holds, so its bucket is no lockout lever for anyone else; it is keyed by a
+ * digest so limiter memory never holds the code and each key has a fixed size.
+ * No `blockDuration`: an honest CLI that polled too fast recovers within one
+ * window. An unexpected limiter error fails open, like the middleware.
+ */
+export async function consumeDeviceCodeExchange(
+  clientIp: string,
+  deviceCode: string,
+  limiters: { ip: RateLimiter; code: RateLimiter } = {
+    ip: deviceCodeExchangeIpLimiter,
+    code: deviceCodeExchangeCodeLimiter,
+  },
+): Promise<DeviceCodeExchangeLimit> {
+  const codeKey = createHash("sha256").update(deviceCode).digest("base64url");
+  try {
+    await limiters.ip.consume(clientIp);
+    await limiters.code.consume(codeKey);
+    return { allowed: true };
+  } catch (rejection: unknown) {
+    if (rejection instanceof RateLimiterRes) {
+      return { allowed: false, retryAfterMs: rejection.msBeforeNext };
+    }
+    console.error(
+      `[rate-limit] Unexpected device-code exchange limiter error, failing open: (${
+        rejection instanceof Error ? (rejection.constructor?.name ?? "Error") : typeof rejection
+      })`,
+    );
+    return { allowed: true };
+  }
+}
 
 /**
  * Email-recipient limiter — caps how much mail a single ADDRESS can be sent
