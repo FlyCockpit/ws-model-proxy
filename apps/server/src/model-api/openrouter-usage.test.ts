@@ -208,6 +208,45 @@ describe("OpenRouter usage dialect", () => {
     expect(withUsage(change)?.categoriesComplete).toBe(false);
   });
 
+  it.each([
+    [
+      "a usage object nested in usage",
+      (usage: Record<string, unknown>) => ({ usage: { ...usage, usage: { ...usage } } }),
+    ],
+    [
+      "a sibling response.usage",
+      (usage: Record<string, unknown>) => ({ usage, response: { usage } }),
+    ],
+    ["a sibling message", (usage: Record<string, unknown>) => ({ usage, message: { usage } })],
+  ])("fails closed on %s (a second usage container)", (_label, envelope) => {
+    const { usage } = structuredClone(openRouterFixture.nonStream) as {
+      usage: Record<string, unknown>;
+    };
+    expect(usageFromObject(envelope(usage), "openrouter")?.categoriesComplete).toBe(false);
+    expect(usageFromObject({ usage }, "openrouter")?.categoriesComplete).toBe(true);
+  });
+
+  it("does not let an unreadable later usage record leave an earlier one to settle", () => {
+    const frame = (usage: unknown) => encode(`data: ${JSON.stringify({ usage })}\n\n`);
+    const first = { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, cost: 0.000001 };
+    const usage = parseProviderUsage(
+      [frame(first), frame(null), frame({ future_tokens: 5000 }), encode("data: [DONE]\n\n")],
+      catalogPricing(fullRates),
+      "openrouter",
+    );
+    expect(usage?.categoriesComplete).toBe(false);
+    expect(usage?.reportedCost).toBeUndefined();
+    expect(usage?.calculatedCost).toBeUndefined();
+    // `usage: null` is absence, so a single observation still settles.
+    const single = parseProviderUsage(
+      [frame(null), frame(first), encode("data: [DONE]\n\n")],
+      catalogPricing(fullRates),
+      "openrouter",
+    );
+    expect(single?.categoriesComplete).toBe(true);
+    expect(single?.reportedCost).toBe(0.000001);
+  });
+
   it("accepts is_byok, cost_details and server_tool_use only as metadata", () => {
     const usage = withUsage((value) =>
       Object.assign(value, {

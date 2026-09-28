@@ -1374,6 +1374,10 @@ export function usageFromObject(
   const hasOpenRouterUnknown =
     openRouter &&
     (!openRouterMetadataValid(usage) ||
+      // Only one usage container is read: a second envelope container, or a
+      // `usage` nested inside the top-level one, would hide the other counts.
+      [root.usage, root.response, root.message].filter((item) => item != null).length > 1 ||
+      (root.usage != null && usage !== root.usage) ||
       // The generic parser reads only the first of two alias spellings and
       // ignores a non-object detail container. Both would let a second
       // representation hide counts or unknown keys, so the dialect rejects them.
@@ -1512,12 +1516,20 @@ export function parseProviderUsage(
   }
   let found: RawProviderUsage | undefined;
   let categoriesComplete = true;
+  // Every usage-bearing record counts, including one the parser cannot read:
+  // an unreadable later observation must not leave an earlier one to settle.
+  const openRouterEnvelopes = new Set<string>();
   const rawObservations: Prisma.InputJsonValue[] = [];
   const rawObservationKeys = new Set<string>();
   for (const candidate of candidates) {
     if (!candidate || candidate === "[DONE]") continue;
     try {
-      const observed = usageFromObject(JSON.parse(candidate), dialect);
+      const parsed: unknown = JSON.parse(candidate);
+      if (dialect === "openrouter") {
+        const envelope = openRouterUsageEnvelopeKey(parsed);
+        if (envelope !== undefined) openRouterEnvelopes.add(envelope);
+      }
+      const observed = usageFromObject(parsed, dialect);
       if (observed) {
         if (observed.categoriesComplete === false) categoriesComplete = false;
         if (observed.rawUsage !== undefined) {
@@ -1538,7 +1550,7 @@ export function parseProviderUsage(
     }
   }
   if (!found) return undefined;
-  if (dialect === "openrouter" && rawObservations.length > 1)
+  if (dialect === "openrouter" && (rawObservations.length > 1 || openRouterEnvelopes.size > 1))
     return unattributableUsage({ ...found, rawUsage: rawObservations });
   const normalized: RawProviderUsage = {
     ...found,
@@ -1674,6 +1686,23 @@ export function retainProviderUsagePrefix(
   if (prefix.byteLength === 0) return currentBytes;
   chunks.push(prefix);
   return currentBytes + prefix.byteLength;
+}
+
+/**
+ * Identity of the usage an OpenRouter response record carries (top-level
+ * `usage`, or a nested `response.usage` / `message.usage`), or undefined when
+ * it carries none. `usage: null` is absence: Chat streams send it in every
+ * intermediate chunk.
+ */
+export function openRouterUsageEnvelopeKey(value: unknown): string | undefined {
+  const root = usageRecord(value);
+  if (!root) return undefined;
+  const containers = [
+    root.usage ?? null,
+    usageRecord(root.response)?.usage ?? null,
+    usageRecord(root.message)?.usage ?? null,
+  ];
+  return containers.some((item) => item !== null) ? JSON.stringify(containers) : undefined;
 }
 
 /** Drops a window's calculated cost; only the merged categories may be priced. */
@@ -2766,6 +2795,21 @@ export async function dispatchPublicOverflow(
       let protocolFailed = false;
       let deliveredProtocolTerminal = false;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
+      // OpenRouter reports usage once. Distinct usage-bearing records are
+      // counted over the whole stream, not only the retained prefix and tail:
+      // a record between them could otherwise leave an earlier one to settle.
+      const openRouterUsageEnvelopes =
+        terminalDecoder && target.usageDialect === "openrouter" ? new Set<string>() : undefined;
+      const observeUsageEnvelope = (data: string) => {
+        if (!openRouterUsageEnvelopes || openRouterUsageEnvelopes.size > 1 || data === "[DONE]")
+          return;
+        try {
+          const envelope = openRouterUsageEnvelopeKey(JSON.parse(data));
+          if (envelope !== undefined) openRouterUsageEnvelopes.add(envelope);
+        } catch {
+          // Non-JSON records carry no usage.
+        }
+      };
       const reconcile = (streamComplete: boolean): Promise<void> => {
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
@@ -2833,12 +2877,16 @@ export async function dispatchPublicOverflow(
             responseBytes > 1024 * 1024
               ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
               : undefined;
-          const combinedUsage = mergeProviderUsage(
+          const mergedUsage = mergeProviderUsage(
             initialUsage,
             tailUsage,
             surface,
             target.usageDialect,
           );
+          const combinedUsage =
+            mergedUsage && openRouterUsageEnvelopes && openRouterUsageEnvelopes.size > 1
+              ? unattributableUsage(mergedUsage)
+              : mergedUsage;
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost
@@ -2941,6 +2989,7 @@ export async function dispatchPublicOverflow(
                 if (terminalDecoder && !protocolTerminal) {
                   const records = terminalDecoder.finish();
                   for (const record of records) {
+                    observeUsageEnvelope(record.data);
                     const outcome = classifyTerminalRecord(
                       record,
                       nativeSurface ?? request.requestedSurface,
@@ -2982,6 +3031,7 @@ export async function dispatchPublicOverflow(
               if (terminalDecoder) {
                 const records = terminalDecoder.push(chunk.value);
                 for (const record of records) {
+                  observeUsageEnvelope(record.data);
                   const outcome = classifyTerminalRecord(
                     record,
                     nativeSurface ?? request.requestedSurface,

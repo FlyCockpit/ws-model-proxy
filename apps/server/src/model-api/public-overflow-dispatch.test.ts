@@ -2855,6 +2855,17 @@ describe("OpenRouter owner-paid settlement", () => {
       first: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001 },
       second: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 },
     },
+    // A later observation the parser cannot read still counts.
+    ...[
+      { total_tokens: 100_000 },
+      { future_tokens: 5000 },
+      { completion_tokens: "100000" },
+      { completion_tokens_details: { image_tokens: 5000 } },
+    ].map((second) => ({
+      label: `a later unreadable ${JSON.stringify(second)}`,
+      first: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, cost: 0.000001 },
+      second,
+    })),
   ])(
     "keeps the liability for split observations with $label",
     async ({ first, second }) => {
@@ -2869,6 +2880,14 @@ describe("OpenRouter owner-paid settlement", () => {
           [frame(first), ...padding, frame(second), Buffer.from("data: [DONE]\n\n")],
           // Both observations inside one retained window.
           [...padding, frame(first), frame(second), Buffer.from("data: [DONE]\n\n")],
+          // The later observation is outside both retained windows.
+          [
+            frame(first),
+            ...padding.slice(0, 600),
+            frame(second),
+            ...padding,
+            Buffer.from("data: [DONE]\n\n"),
+          ],
         ]) {
           const settled = await settleOwnerStream("openrouter", upstream);
           expect(settled.observationComplete).toBe(true);
