@@ -1,0 +1,11 @@
+{
+  "type": "endpoint.load",
+  "endpointSlug": "vllm",
+  "running": 3,
+  "waiting": 2,
+  "kvUsage": 0.42,
+  "prefixCacheHitsDelta": 50,
+  "prefixCacheQueriesDelta": 200,
+  "source": "vllm-metrics",
+  "ts": "2026-09-28T12:00:01.000Z"
+}

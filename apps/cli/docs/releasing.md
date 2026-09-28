@@ -47,6 +47,19 @@ The workflow validates that it is running from `master` and that the requested
 that tag, uploads CLI artifacts, publishes the app container to GHCR, and pushes
 the generated Homebrew formula to the tap.
 
+## Relay protocol changes
+
+The server accepts exactly one relay protocol version, so a protocol bump
+ships the server and wsmp together. Relay protocol 2.7 (engine facts,
+`node.info`, `node.metrics`, `endpoint.load`, `metrics.sources.set`) replaced
+2.6: a 2.6 wsmp (0.4.x) connecting to a 2.7 server is refused with "This
+server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart
+it." and its device card shows "CLI upgrade required (protocol 2.6)"; a 2.7
+wsmp against a 2.6 server stops with its "upgrade the WS Model Proxy server"
+message. Release notes for the first wsmp that speaks 2.7 must say that the
+server and every CLI need upgrading together. Protocol 2.8 is reserved for
+model deployments.
+
 ## One-time setup
 
 1. **Repos must be public** for `curl | sh`, `brew install`, and unauthenticated

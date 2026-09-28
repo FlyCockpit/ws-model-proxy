@@ -131,6 +131,8 @@ const INVENTORY_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// while also preventing a large configuration from opening unbounded local
 /// connections.
 const INVENTORY_PROBE_CONCURRENCY: usize = 4;
+/// How often the relay loop hands the live endpoint list to the telemetry thread.
+const TELEMETRY_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// The async handoff owns one request chunk after a credit is returned. The
 /// ingress queue must still accept the whole advertised window before the new
 /// worker has had a chance to run.
@@ -622,9 +624,76 @@ fn reconnect_inventory_candidate(
         desired_modified_at,
         revision,
     ) {
-        return Ok((active.clone(), inventory_snapshot_from_config(active)));
+        return Ok((active.clone(), inventory_with_fresh_engine_facts(active)));
     }
     prepare_inventory_candidate(active)
+}
+
+/// The reconnect inventory for an unchanged, acknowledged snapshot, with
+/// engine facts re-detected (an engine may have restarted with other slots).
+/// Facts are digest-excluded, so this never changes the acknowledged
+/// identity, and nothing is written to the config file.
+fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> {
+    let mut refreshed = active.clone();
+    let targets = refreshed
+        .endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, endpoint)| {
+            endpoint.enabled
+                && endpoint.engine != crate::config::EndpointEngine::Generic
+                && endpoint
+                    .last_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.status == crate::config::ProbeStatus::Online)
+        })
+        .map(|(index, endpoint)| (index, endpoint.clone()))
+        .collect::<Vec<_>>();
+    for batch in targets.chunks(INVENTORY_PROBE_CONCURRENCY) {
+        let detected = thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|(index, endpoint)| {
+                    (
+                        *index,
+                        scope.spawn(move || {
+                            let previous = endpoint
+                                .last_probe
+                                .as_ref()
+                                .and_then(|probe| probe.engine.as_ref());
+                            let models = endpoint
+                                .last_probe
+                                .as_ref()
+                                .map(|probe| probe.models.clone())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|id| {
+                                    let limit = previous
+                                        .and_then(|engine| engine.model_max_len.get(&id).copied());
+                                    (id, limit)
+                                })
+                                .collect::<Vec<_>>();
+                            crate::engine::detect_engine(endpoint, &models)
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|(index, handle)| handle.join().ok().map(|engine| (index, engine)))
+                .collect::<Vec<_>>()
+        });
+        for (index, engine) in detected {
+            // A failed re-detection keeps the facts the last probe found.
+            if engine.kind.is_none() && engine.model_max_len.is_empty() {
+                continue;
+            }
+            if let Some(probe) = refreshed.endpoints[index].last_probe.as_mut() {
+                probe.engine = Some(engine);
+            }
+        }
+    }
+    inventory_snapshot_from_config(&refreshed)
 }
 
 /// Probe a stable desired snapshot without holding the config lock across
@@ -776,6 +845,9 @@ fn run_relay_session(
     let mut reload_preparing = false;
 
     let mut registered = false;
+    // 2.7 telemetry starts after `hello.ok` and stops with this session.
+    let mut telemetry: Option<crate::telemetry::Telemetry> = None;
+    let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
     let result = loop {
@@ -858,6 +930,21 @@ fn run_relay_session(
             break Err(error);
         }
 
+        if registered && Instant::now() >= next_telemetry_sync {
+            // Follow acknowledged reloads: the sampled endpoints are the live
+            // routing map's.
+            match telemetry.as_ref() {
+                Some(telemetry) => telemetry.set_endpoints(&config.endpoints),
+                None => {
+                    telemetry = Some(crate::telemetry::Telemetry::start(
+                        worker_tx.clone(),
+                        &config.endpoints,
+                    ));
+                }
+            }
+            next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
+        }
+
         if Instant::now() >= next_heartbeat {
             let heartbeat = ClientControlMessage::Heartbeat {
                 id: next_id("heartbeat"),
@@ -889,6 +976,7 @@ fn run_relay_session(
                 &mut terminals,
                 &mut execs,
                 &mut registered,
+                telemetry.as_ref(),
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
@@ -965,6 +1053,8 @@ fn run_relay_session(
             },
         );
     }
+    // Stops the sampling thread; a scrape in flight finishes on its own.
+    drop(telemetry);
     let _ = send_outbound_frames(&mut socket, terminals.kill_all());
     let _ = send_outbound_frames(&mut socket, execs.kill_all());
     abort_all_workers(workers);
@@ -1063,6 +1153,11 @@ where
             }
             Ok(FromWorker::ExecEof { command_id, stderr }) => {
                 send_outbound_frames(socket, execs.on_eof(&command_id, stderr))?;
+            }
+            Ok(FromWorker::Telemetry(text)) => {
+                socket
+                    .send(Message::Text(text.into()))
+                    .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
             }
             #[cfg(unix)]
             Ok(FromWorker::InventoryPrepared { candidate }) => {
@@ -1422,6 +1517,7 @@ fn handle_text<S>(
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
     registered: &mut bool,
+    telemetry: Option<&crate::telemetry::Telemetry>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -1709,6 +1805,19 @@ where
             if_waiting,
         } => {
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
+        }
+        ServerControlMessage::MetricsSourcesSet { id, sources } => {
+            // Remote metric sources need a local opt-in and hash approval
+            // (S-B part 2). This CLI runs none and reports each `unsupported`
+            // in its next `node.metrics`.
+            tracing::info!(
+                id,
+                sources = sources.len(),
+                "remote metric sources are not supported by this wsmp; reporting them unsupported"
+            );
+            if let Some(telemetry) = telemetry {
+                telemetry.set_remote_sources(sources);
+            }
         }
     }
     Ok(())
@@ -2565,7 +2674,10 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::SupervisedDone { .. }
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }
-        | ClientControlMessage::ExecDone { .. } => {
+        | ClientControlMessage::ExecDone { .. }
+        | ClientControlMessage::NodeInfo(_)
+        | ClientControlMessage::NodeMetrics(_)
+        | ClientControlMessage::EndpointLoad(_) => {
             anyhow::bail!("worker emitted non-request relay control")
         }
     };
@@ -2736,6 +2848,7 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                             suggested_default_capabilities: endpoint.default_capabilities,
                             model_suggestions: Vec::new(),
                             error: Some("endpoint probe worker panicked".to_string()),
+                            engine: None,
                         }
                     }
                 })
@@ -2837,6 +2950,7 @@ mod tests {
                 status: crate::config::ProbeStatus::Online,
                 models: vec!["model-a".to_string()],
                 suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: None,
             }),
             ..Default::default()
         });

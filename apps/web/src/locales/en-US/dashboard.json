@@ -73,7 +73,11 @@
       "saved": "CLI renamed",
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
-    }
+    },
+    "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
+    "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
+    "upgradeUnknownProtocol": "unknown",
+    "upgradeUnknownVersion": "(unknown version)"
   },
   "chatTest": {
     "announcements": {
@@ -491,6 +495,33 @@
         "template": "Use a matching registered tokenizer and template",
         "engineRequirement": "Requires count-token support on the selected target. WSMP uses a conservative estimate when that support is unavailable.",
         "registeredRequirement": "Requires a registered counter matching this runtime identity. WSMP uses a conservative estimate when no match is available."
+      },
+      "engineFacts": {
+        "engine": "Engine: {{engine}}",
+        "slots_one": "{{count}} slot",
+        "slots_other": "{{count}} slots",
+        "kvBudget": "KV budget: {{value}} tokens",
+        "maxModelLen": "Max context: {{value}} tokens",
+        "preset": "Preset: {{preset}}",
+        "kinds": {
+          "GENERIC": "Generic",
+          "LLAMA_CPP": "llama.cpp",
+          "VLLM": "vLLM",
+          "SGLANG": "SGLang",
+          "OLLAMA": "Ollama",
+          "LM_STUDIO": "LM Studio"
+        },
+        "presets": {
+          "llama.cpp": "llama.cpp (full at its slot count)",
+          "vllm-sglang": "vLLM / SGLang (your cap, then engine load)",
+          "ollama-lm-studio": "Ollama / LM Studio (your parallel setting)",
+          "generic": "Generic (your cap)"
+        },
+        "sources": {
+          "PROBE": "detected by the CLI",
+          "CONFIG": "from the CLI config",
+          "MIXED": "detected and configured"
+        }
       }
     },
     "noneAvailable": "None available",

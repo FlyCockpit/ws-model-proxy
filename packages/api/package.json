@@ -59,6 +59,9 @@
     "./lib/discovered-inference-capacity": {
       "default": "./src/lib/discovered-inference-capacity.ts"
     },
+    "./lib/engine-facts": {
+      "default": "./src/lib/engine-facts.ts"
+    },
     "./lib/reasoning-contract": {
       "default": "./src/lib/reasoning-contract.ts"
     },

@@ -3,7 +3,6 @@ import {
   openAiCompatibleCapabilitiesSchema,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
-import { WSMP_MIN_CLI_VERSION } from "@ws-model-proxy/config/cli-device-login";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
 import { stringifyWellFormed } from "./wire-text.js";
@@ -11,22 +10,22 @@ import { stringifyWellFormed } from "./wire-text.js";
 export { relayProtocolAtLeast };
 
 /**
- * The only relay protocol this server speaks. 2.6 adds supervised (agent
- * requested) terminals and the MCP command mode; it is also the minimum: an
- * older CLI is refused at hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`.
+ * The only relay protocol this server speaks. 2.7 adds engine facts in the
+ * inventory, `node.info`, `node.metrics`, `endpoint.load` and
+ * `metrics.sources.set`; it is also the minimum: an older CLI is refused at
+ * hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`. 2.8 is reserved for model
+ * deployments.
  */
-export const RELAY_PROTOCOL_VERSIONS = ["2.6"] as const;
+export const RELAY_PROTOCOL_VERSIONS = ["2.7"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
-export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.6";
-/** First wsmp release that speaks relay protocol 2.6. */
-export const RELAY_MIN_CLI_VERSION = WSMP_MIN_CLI_VERSION;
+export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.7";
 /**
- * Sent as `protocol.error` to a CLI whose hello is older than 2.6. Every
- * released wsmp prints `relay protocol error: <message>` and exits (0.3.x), or
- * retries once with protocol 2.4 and then does the same (pre-release 2.5
- * builds), so this text is what the person sees.
+ * Sent as `protocol.error` to a CLI whose hello is older than 2.7. Every
+ * released wsmp prints `relay protocol error: <message>` and exits, so this
+ * text is what the person sees. It names the protocol rather than a wsmp
+ * version: the first release that speaks 2.7 is cut separately.
  */
-export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires wsmp ${RELAY_MIN_CLI_VERSION} or newer (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
+export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -130,23 +129,29 @@ const terminalIdentitySchema = z
 
 const mcpCommandModeSchema = z.enum(["off", "supervised", "unsupervised"]);
 
-const v26FeatureSchema = z
+const v27FeatureSchema = z
   .object({
     humanTerminal: z.boolean(),
     /** The CLI's own MCP command policy (`wsmp config set-mcp-commands`). */
     mcpCommandMode: mcpCommandModeSchema,
     terminalApproval: z.boolean(),
     terminalSupported: z.boolean(),
+    /**
+     * 2.7: the CLI accepts remotely defined metric sources
+     * (`metrics.sources.set`): its local opt-in is on. False until S-B part 2.
+     */
+    remoteMetricSources: z.boolean(),
   })
   .strict();
 
 /**
  * 2.6: multi-viewer terminals (server-minted viewer ids, broadcast output),
- * CLI identity proof, and supervised terminals (`term.spawn`).
+ * CLI identity proof, and supervised terminals (`term.spawn`). 2.7: node
+ * telemetry.
  */
-const v26CliCapabilitiesSchema = z
+const v27CliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.literal("2.6"),
+    protocolVersion: z.literal("2.7"),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -159,12 +164,54 @@ const v26CliCapabilitiesSchema = z
     standardizedMetrics: z.literal(true),
     terminal: z.literal(true),
     exec: z.literal(true),
-    features: v26FeatureSchema,
+    features: v27FeatureSchema,
     terminalPublicKey: uncompressedP256PublicKeySchema,
     terminalViewers: z.literal(true),
     supervisedCommands: z.literal(true),
+    /** 2.7: the CLI sends `node.info`, `node.metrics` and `endpoint.load`. */
+    nodeTelemetry: z.literal(true),
     /** Absent when the CLI could not load its identity; browsers then refuse it. */
     terminalIdentity: cliTerminalIdentitySchema.optional(),
+  })
+  .strict();
+
+export const ENGINE_KINDS = [
+  "generic",
+  "llama.cpp",
+  "vllm",
+  "sglang",
+  "ollama",
+  "lm-studio",
+] as const;
+const engineFactSourceSchema = z.enum(["probe", "config"]);
+
+function engineFact<T extends z.ZodType>(value: T) {
+  return z.object({ value, source: engineFactSourceSchema }).strict();
+}
+
+const TOKEN_COUNT_MAX = 1_000_000_000_000;
+const engineTokenCountSchema = z.number().int().min(1).max(TOKEN_COUNT_MAX);
+
+/**
+ * 2.7 static engine facts, per endpoint and per model (a model's fields
+ * override its endpoint's). Every fact names its source. Digest-excluded,
+ * like `concurrencyLimit`.
+ */
+export const engineFactsSchema = z
+  .object({
+    engine: engineFact(z.enum(ENGINE_KINDS)).optional(),
+    /** Concurrent sequences: llama.cpp `total_slots`, SGLang `max_running_requests`. */
+    slots: engineFact(z.number().int().min(1).max(10_000)).optional(),
+    ctxPerSlot: engineFact(engineTokenCountSchema).optional(),
+    /** Total KV capacity in tokens (vLLM blocks × block size, SGLang max tokens). */
+    kvTokens: engineFact(engineTokenCountSchema).optional(),
+    maxModelLen: engineFact(engineTokenCountSchema).optional(),
+    /** llama.cpp `--cache-ram`. */
+    hostPromptCacheMiB: engineFact(z.number().int().min(0).max(100_000_000)).optional(),
+    /** Model ids one engine process serves. */
+    servedModelAliases: engineFact(
+      z.array(z.string().trim().min(1).max(512)).min(1).max(64),
+    ).optional(),
   })
   .strict();
 
@@ -178,6 +225,7 @@ const discoveredModelSchema = z
     // Optional per-model hard concurrency. Absent means the registration
     // default. Omitted from the inventory digest: an existing capacity is kept.
     concurrencyLimit: z.number().int().min(1).max(10_000).optional(),
+    engineFacts: engineFactsSchema.optional(),
   })
   .strict();
 
@@ -190,6 +238,7 @@ const endpointInventorySchema = z
     defaultCapabilities: openAiCompatibleCapabilitiesSchema,
     probeSuggestions: openAiCompatibleCapabilitiesSchema.optional(),
     models: z.array(discoveredModelSchema).max(1000).default([]),
+    engineFacts: engineFactsSchema.optional(),
   })
   .strict()
   .superRefine((endpoint, context) => {
@@ -221,12 +270,214 @@ const endpointInventorySchema = z
 
 export type EndpointInventory = z.infer<typeof endpointInventorySchema>;
 
+/** Custom metric names, label keys and label values (S-B part 2). */
+export const METRIC_NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
+const metricNameSchema = z.string().regex(METRIC_NAME_PATTERN);
+export const NODE_METRICS_CUSTOM_MAX = 50;
+export const NODE_METRIC_SOURCES_MAX = 50;
+const MIB_MAX = 1_000_000_000;
+const mibSchema = z.number().int().min(0).max(MIB_MAX);
+const shortTextSchema = z.string().trim().min(1).max(256);
+const percentSchema = z.number().min(0).max(100);
+const nonNegativeCountSchema = z.number().int().min(0).max(1_000_000);
+const byteCounterSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const finiteNumberSchema = z.number().finite();
+/** nvidia-smi `[N/A]` becomes an omitted field or null. */
+const gpuReadingSchema = (schema: z.ZodNumber) => schema.nullable().optional();
+const interfaceNameSchema = z.string().regex(/^[A-Za-z0-9_.:@-]{1,64}$/);
+
+const nodeInfoSchema = z
+  .object({
+    type: z.literal("node.info"),
+    os: z
+      .object({
+        name: shortTextSchema.optional(),
+        version: shortTextSchema.optional(),
+        kernel: shortTextSchema.optional(),
+        arch: z.string().trim().min(1).max(32).optional(),
+      })
+      .strict()
+      .optional(),
+    cpu: z
+      .object({
+        model: shortTextSchema.optional(),
+        cores: z.number().int().min(1).max(65_536).optional(),
+      })
+      .strict()
+      .optional(),
+    memoryTotalMiB: mibSchema.optional(),
+    gpus: z
+      .array(
+        z
+          .object({
+            index: z.number().int().min(0).max(255),
+            name: shortTextSchema.optional(),
+            uuid: z.string().trim().min(1).max(128).optional(),
+            driverVersion: z.string().trim().min(1).max(64).optional(),
+            vramTotalMiB: mibSchema.nullable().optional(),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
+    unifiedMemory: z.boolean().optional(),
+    nodeKind: z.enum(["unified", "discrete", "cpu"]).optional(),
+    interfaces: z
+      .array(
+        z
+          .object({
+            name: interfaceNameSchema,
+            addresses: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
+            linkSpeedMbps: z.number().int().min(0).max(10_000_000).optional(),
+            mtu: z.number().int().min(0).max(1_000_000).optional(),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
+    executionMechanism: z.enum(["foreground", "systemd", "launchd", "container"]).optional(),
+    cliVersion: z.string().trim().min(1).max(80).optional(),
+  })
+  .strict();
+export type NodeInfoMessage = z.infer<typeof nodeInfoSchema>;
+
+const metricSourceStatusSchema = z
+  .object({
+    name: metricNameSchema,
+    origin: z.enum(["local", "remote"]),
+    state: z.enum(["active", "pending_approval", "refused", "unsupported", "disabled", "failing"]),
+    commandSha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .optional(),
+    /** A reason code only: command output and stderr never leave the CLI. */
+    error: z.enum(["spawn", "timeout", "exit_status", "output_too_large", "parse"]).optional(),
+  })
+  .strict();
+
+const customMetricSchema = z
+  .object({
+    source: metricNameSchema,
+    name: metricNameSchema,
+    labels: z
+      .record(metricNameSchema, metricNameSchema)
+      .refine((labels) => Object.keys(labels).length <= 16, {
+        message: "At most 16 labels per series.",
+      })
+      .optional(),
+    value: finiteNumberSchema,
+    ts: z.string().datetime(),
+  })
+  .strict();
+
+const nodeMetricsSchema = z
+  .object({
+    type: z.literal("node.metrics"),
+    ts: z.string().datetime(),
+    cpu: z
+      .object({
+        usagePercent: percentSchema.optional(),
+        load1: z.number().min(0).max(1_000_000).optional(),
+        load5: z.number().min(0).max(1_000_000).optional(),
+        load15: z.number().min(0).max(1_000_000).optional(),
+      })
+      .strict()
+      .optional(),
+    memory: z
+      .object({
+        totalMiB: mibSchema.optional(),
+        availableMiB: mibSchema.optional(),
+        swapTotalMiB: mibSchema.optional(),
+        swapFreeMiB: mibSchema.optional(),
+      })
+      .strict()
+      .optional(),
+    disks: z
+      .array(
+        z
+          .object({
+            mount: z.string().min(1).max(256),
+            totalMiB: mibSchema.optional(),
+            freeMiB: mibSchema.optional(),
+          })
+          .strict(),
+      )
+      .max(16)
+      .optional(),
+    gpus: z
+      .array(
+        z
+          .object({
+            index: z.number().int().min(0).max(255),
+            vramUsedMiB: gpuReadingSchema(mibSchema),
+            vramTotalMiB: gpuReadingSchema(mibSchema),
+            utilizationPercent: gpuReadingSchema(percentSchema),
+            temperatureC: gpuReadingSchema(z.number().min(-100).max(300)),
+            powerW: gpuReadingSchema(z.number().min(0).max(100_000)),
+            smClockMHz: gpuReadingSchema(z.number().min(0).max(100_000)),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
+    interfaces: z
+      .array(
+        z
+          .object({
+            name: interfaceNameSchema,
+            rxBytes: byteCounterSchema,
+            txBytes: byteCounterSchema,
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
+    /** S-B part 2 custom series. */
+    custom: z.array(customMetricSchema).max(NODE_METRICS_CUSTOM_MAX).optional(),
+    /** Per-source status, local and remote (S-B part 2). */
+    sources: z.array(metricSourceStatusSchema).max(NODE_METRIC_SOURCES_MAX).optional(),
+  })
+  .strict();
+export type NodeMetricsMessage = z.infer<typeof nodeMetricsSchema>;
+
+const endpointLoadSchema = z
+  .object({
+    type: z.literal("endpoint.load"),
+    endpointSlug: z.string().trim().min(1).max(63),
+    modelSlug: z.string().trim().min(1).max(128).optional(),
+    running: nonNegativeCountSchema,
+    /** 0 from llama.cpp `/slots`, which cannot see the queue. */
+    waiting: nonNegativeCountSchema,
+    kvUsage: z.number().min(0).max(1).optional(),
+    slotsBusy: nonNegativeCountSchema.optional(),
+    /** llama.cpp `requests_deferred` (`--metrics`). */
+    deferred: nonNegativeCountSchema.optional(),
+    prefixCacheHitsDelta: byteCounterSchema.optional(),
+    prefixCacheQueriesDelta: byteCounterSchema.optional(),
+    source: z.enum(["llama.cpp-slots", "llama.cpp-metrics", "vllm-metrics", "sglang-metrics"]),
+    ts: z.string().datetime(),
+  })
+  .strict();
+export type EndpointLoadMessage = z.infer<typeof endpointLoadSchema>;
+
+/** Server to CLI (2.7): a remotely defined custom metric source (S-B part 2). */
+export const remoteMetricSourceSchema = z
+  .object({
+    name: metricNameSchema,
+    command: z.string().min(1).max(4096),
+    intervalSecs: z.number().int().min(5).max(86_400),
+    timeoutSecs: z.number().int().min(1).max(300),
+    format: z.enum(["number", "json", "prometheus"]),
+  })
+  .strict();
+export type RemoteMetricSource = z.infer<typeof remoteMetricSourceSchema>;
+
 const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.literal("2.6"),
+      protocolVersion: z.literal("2.7"),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -234,7 +485,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
           version: z.string().trim().max(80).optional(),
-          capabilities: v26CliCapabilitiesSchema,
+          capabilities: v27CliCapabilitiesSchema,
         })
         .strict(),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
@@ -433,6 +684,9 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       timedOut: z.boolean(),
     })
     .strict(),
+  nodeInfoSchema,
+  nodeMetricsSchema,
+  endpointLoadSchema,
 ]);
 export type RelayClientControlMessage = z.infer<typeof relayClientControlMessageSchema>;
 
@@ -536,6 +790,16 @@ export type RelayServerControlMessage =
        * it declines a request still waiting, and an Enter it took first wins.
        */
       reason?: "expire" | "decline";
+    }
+  | {
+      /**
+       * 2.7: replace the CLI's remotely defined metric sources. The CLI may
+       * refuse (local opt-in off, hash not approved) and reports each
+       * source's state in `node.metrics.sources`.
+       */
+      type: "metrics.sources.set";
+      id: string;
+      sources: RemoteMetricSource[];
     };
 
 const relayBodyMetadataFields = {
@@ -636,7 +900,7 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello from a CLI older than protocol 2.6: another protocol
+ * True for a hello from a CLI older than protocol 2.7: another protocol
  * version, or the pre-naming `cli.label` field. Checked before the strict
  * schema so such a CLI gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an
  * opaque "malformed message".
@@ -662,6 +926,39 @@ export function helloNeedsUpgrade(frame: string): boolean {
     return false;
   }
   return (capabilities as Record<string, unknown>).protocolVersion !== RELAY_MIN_PROTOCOL_VERSION;
+}
+
+const REJECTED_VERSION_PATTERN = /^[0-9A-Za-z.+-]{1,32}$/;
+
+function rejectedVersionField(value: unknown): string | null {
+  return typeof value === "string" && REJECTED_VERSION_PATTERN.test(value) ? value : null;
+}
+
+/**
+ * The protocol and CLI versions a refused hello claimed, for the device card
+ * ("CLI upgrade required") and the relay log. Anything that is not a short
+ * version-shaped string is dropped.
+ */
+export function rejectedHelloFacts(frame: string): {
+  protocolVersion: string | null;
+  cliVersion: string | null;
+} {
+  const none = { protocolVersion: null, cliVersion: null };
+  if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return none;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(frame);
+  } catch {
+    return none;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return none;
+  const record = parsed as Record<string, unknown>;
+  const cli = record.cli;
+  const cliVersion =
+    cli && typeof cli === "object" && !Array.isArray(cli)
+      ? rejectedVersionField((cli as Record<string, unknown>).version)
+      : null;
+  return { protocolVersion: rejectedVersionField(record.protocolVersion), cliVersion };
 }
 
 function utf8Length(text: string): number {
