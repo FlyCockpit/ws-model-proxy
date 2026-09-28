@@ -897,6 +897,23 @@ impl SurfaceInventory {
         if let Some(surface) = &self.anthropic_messages {
             validate("anthropicMessages", &surface.common, true)?;
         }
+        // The server schema accepts `streamUsage` on the Chat surface only.
+        for (name, common) in [
+            (
+                "openaiResponses",
+                self.openai_responses.as_ref().map(|s| &s.common),
+            ),
+            (
+                "anthropicMessages",
+                self.anthropic_messages.as_ref().map(|s| &s.common),
+            ),
+        ] {
+            if common.is_some_and(|surface| surface.stream_usage.is_some()) {
+                return Err(format!(
+                    "surface `{name}` cannot declare streamUsage; it applies to openaiChatCompletions only"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -942,6 +959,10 @@ pub struct SurfaceCapabilities {
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
+    /// Chat Completions only: `false` marks an endpoint that rejects
+    /// `stream_options.include_usage`, so adapted streams omit it. Absent means true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1722,6 +1743,79 @@ mod tests {
         assert_eq!(
             capabilities["surfaces"]["openaiChatCompletions"]["operations"][0],
             "create"
+        );
+    }
+
+    #[test]
+    fn accepts_stream_usage_on_the_chat_surface_only() {
+        let inventory = |surfaces: serde_json::Value, protocol: &str| {
+            serde_json::from_value::<OpenAiCompatibleCapabilities>(serde_json::json!({
+                "version": 4, "protocol": protocol, "surfaces": surfaces
+            }))
+        };
+        for stream_usage in [false, true] {
+            let parsed = inventory(
+                serde_json::json!({ "openaiChatCompletions": {
+                    "source": "declared", "confidence": "exact",
+                    "operations": ["create"], "streamUsage": stream_usage
+                }}),
+                "openai-compatible",
+            )
+            .expect("chat streamUsage");
+            let chat = parsed
+                .surfaces
+                .as_ref()
+                .and_then(|surfaces| surfaces.openai_chat_completions.as_ref())
+                .expect("chat surface");
+            assert_eq!(chat.stream_usage, Some(stream_usage));
+            let written = serde_json::to_value(&parsed).expect("serialize");
+            assert_eq!(
+                written["surfaces"]["openaiChatCompletions"]["streamUsage"],
+                stream_usage
+            );
+        }
+        let absent = inventory(
+            serde_json::json!({ "openaiChatCompletions": {
+                "source": "declared", "confidence": "exact", "operations": ["create"]
+            }}),
+            "openai-compatible",
+        )
+        .expect("chat without streamUsage");
+        let written = serde_json::to_value(&absent).expect("serialize");
+        assert!(
+            written["surfaces"]["openaiChatCompletions"]
+                .get("streamUsage")
+                .is_none()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "openaiResponses": {
+                    "source": "declared", "confidence": "exact",
+                    "operations": ["create"], "streamUsage": false
+                }}),
+                "openai-compatible",
+            )
+            .is_err()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "anthropicMessages": {
+                    "source": "declared", "confidence": "exact", "operations": ["create"],
+                    "protocolVersions": [{ "version": "2023-06-01" }], "streamUsage": false
+                }}),
+                "anthropic-compatible",
+            )
+            .is_err()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "anthropicMessages": {
+                    "source": "declared", "confidence": "exact", "operations": ["create"],
+                    "protocolVersions": [{ "version": "2023-06-01" }]
+                }}),
+                "anthropic-compatible",
+            )
+            .is_ok()
         );
     }
 

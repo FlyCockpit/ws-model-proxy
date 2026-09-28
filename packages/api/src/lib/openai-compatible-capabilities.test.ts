@@ -295,6 +295,78 @@ describe("reasoning capability contract", () => {
   });
 });
 
+describe("streamUsage capability (#77)", () => {
+  const surface = (version: 3 | 4, extra: Record<string, unknown> = {}) => ({
+    source: "declared",
+    confidence: "exact",
+    ...(version === 3 ? { supported: true } : { operations: ["create"] }),
+    ...extra,
+  });
+  const inventory = (
+    version: 3 | 4,
+    surfaces: Record<string, unknown>,
+    protocol = "openai-compatible",
+  ) => ({ version, protocol, surfaces });
+
+  it.each([3, 4] as const)("accepts streamUsage only on the v%i Chat surface", (version) => {
+    for (const streamUsage of [true, false, undefined]) {
+      const parsed = parseOpenAiCompatibleCapabilities(
+        inventory(version, {
+          openaiChatCompletions: surface(version, streamUsage === undefined ? {} : { streamUsage }),
+        }),
+      );
+      expect(parsed).not.toBeNull();
+      expect(
+        parsed?.version === version && "surfaces" in parsed
+          ? parsed.surfaces?.openaiChatCompletions
+          : undefined,
+      ).toMatchObject(streamUsage === undefined ? {} : { streamUsage });
+    }
+    expect(
+      parseOpenAiCompatibleCapabilities(
+        inventory(version, { openaiChatCompletions: surface(version, { streamUsage: "no" }) }),
+      ),
+    ).toBeNull();
+    // Other surfaces parse without the field and reject it (strict objects).
+    const otherSurfaces = (extra: Record<string, unknown>) => [
+      inventory(version, { openaiResponses: surface(version, extra) }),
+      inventory(
+        version,
+        {
+          anthropicMessages: {
+            ...surface(version, extra),
+            ...(version === 4 ? { protocolVersions: [{ version: "2023-06-01" }] } : {}),
+          },
+        },
+        "anthropic-compatible",
+      ),
+    ];
+    for (const value of otherSurfaces({}))
+      expect(parseOpenAiCompatibleCapabilities(value)).not.toBeNull();
+    for (const value of otherSurfaces({ streamUsage: false }))
+      expect(parseOpenAiCompatibleCapabilities(value)).toBeNull();
+  });
+
+  it("rejects streamUsage in v1 and v2 inventories", () => {
+    for (const version of [1, 2]) {
+      expect(
+        parseOpenAiCompatibleCapabilities({
+          version,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, streaming: true, streamUsage: false },
+        }),
+      ).toBeNull();
+      expect(
+        parseOpenAiCompatibleCapabilities({
+          version,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, streaming: true },
+        }),
+      ).not.toBeNull();
+    }
+  });
+});
+
 describe("openAiCapabilitiesFromCoarse", () => {
   it("preserves embeddings and responses while enabling vision", () => {
     const caps = openAiCapabilitiesFromCoarse([

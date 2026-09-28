@@ -56,6 +56,7 @@ export class CanonicalStreamParser {
   #nextResponseOutputIndex = 0;
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
+  #pendingChatFinishReason?: unknown;
   #chatUsageSeen = false;
   /** Anthropic input counts seen so far; later events update only what they carry. */
   #anthropicInput: ProtocolUsageCounts = { inputParts: {} };
@@ -314,7 +315,13 @@ export class CanonicalStreamParser {
       this.#terminal = true;
       return [{ type: "error", error: this.#streamError(value.error) }];
     }
-    if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
+    const terminalUsageRepeat = this.#isChatTerminalUsageRepeat(value);
+    if (
+      this.#pendingChatStop &&
+      Array.isArray(value.choices) &&
+      value.choices.length > 0 &&
+      !terminalUsageRepeat
+    )
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
     acceptChatEnvelopeExtras(value, "stream.data", "chunk", this.#seenEnvelopeFields);
     if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
@@ -335,7 +342,14 @@ export class CanonicalStreamParser {
         "Multiple stream candidates are not adaptable.",
       );
     const usage = usageEvent(value.usage, "openai-chat", "both");
-    if (choices[0] !== undefined)
+    if (terminalUsageRepeat)
+      acceptChatChoiceExtras(
+        object(choices[0], "choices[0]"),
+        "choices[0]",
+        "delta",
+        this.#seenEnvelopeFields,
+      );
+    else if (choices[0] !== undefined)
       events.push(...this.#chatChoice(object(choices[0], "choices[0]")));
     // One usage site for both the choice and the `choices: []` shapes: a chunk
     // emits usage at most once, and a second usage-bearing chunk is an error.
@@ -346,6 +360,26 @@ export class CanonicalStreamParser {
       events.push(usage);
     }
     return events;
+  }
+
+  /**
+   * OpenRouter documents its terminal usage chunk as a non-empty `choices`
+   * array: one choice whose delta carries no content and repeats the stream's
+   * finish_reason. Only that exact shape, carrying the stream's first usage,
+   * may follow finish_reason; anything else stays `event_after_stop`.
+   */
+  #isChatTerminalUsageRepeat(value: Record<string, unknown>): boolean {
+    if (this.#pendingChatStop === undefined || this.#chatUsageSeen || value.usage == null)
+      return false;
+    const choices = value.choices;
+    if (!Array.isArray(choices) || choices.length !== 1) return false;
+    const choice = choices[0];
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) return false;
+    const fields = choice as Record<string, unknown>;
+    if (fields.index !== undefined && fields.index !== 0) return false;
+    if (fields.finish_reason !== this.#pendingChatFinishReason || fields.logprobs != null)
+      return false;
+    return chatDeltaCarriesNothing(fields.delta);
   }
 
   #chatChoice(choice: Record<string, unknown>): CanonicalEvent[] {
@@ -426,6 +460,7 @@ export class CanonicalStreamParser {
       if (this.#pendingChatStop)
         throw new AdapterError("duplicate_stop", "Chat emitted more than one finish_reason.");
       this.#pendingChatStop = stopReason(choice.finish_reason);
+      this.#pendingChatFinishReason = choice.finish_reason;
     }
     return events;
   }
@@ -1054,6 +1089,28 @@ export class CanonicalStreamParser {
       ...(this.#errorMetadata.retryReset ? { retryReset: this.#errorMetadata.retryReset } : {}),
     };
   }
+}
+
+/** A Chat delta that is absent or holds only an assistant role and empty fields. */
+function chatDeltaCarriesNothing(delta: unknown): boolean {
+  if (delta === undefined || delta === null) return true;
+  if (typeof delta !== "object" || Array.isArray(delta)) return false;
+  const emptyFields = new Set([
+    "content",
+    "refusal",
+    "tool_calls",
+    "annotations",
+    "audio",
+    "function_call",
+    "reasoning",
+    "reasoning_content",
+  ]);
+  return Object.entries(delta).every(([key, value]) =>
+    key === "role"
+      ? value === null || value === "assistant"
+      : emptyFields.has(key) &&
+        (value === null || value === "" || (Array.isArray(value) && value.length === 0)),
+  );
 }
 
 function usageEvent(

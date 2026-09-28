@@ -16,6 +16,9 @@ aligned with the exact protocol properties the tests consume.
 published `ResponseUsage` type and usage-accounting example recorded in its
 `provenance.sources`. It is not an upstream capture. It carries every key the
 OpenRouter usage dialect accepts (`is_byok`, `cost_details`, `server_tool_use`,
-`cache_write_tokens`, zero `video_tokens` / `image_tokens`) in non-stream and
-stream (`stream` lines joined with blank lines) form. Replace it with a
-redacted live capture when one is available.
+zero `cache_write_tokens` / `video_tokens` / `image_tokens`) in non-stream and
+stream (`stream` lines joined with blank lines) form. The stream ends with the
+documented usage chunk whose single content-free choice repeats the
+`finish_reason`. Replace it with a redacted live capture when one is available;
+a capture that confirms the `cache_write_tokens` subset of `prompt_tokens` is
+the precondition for settling positive cache-write counts (#62).

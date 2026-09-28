@@ -252,14 +252,17 @@ Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
 Audio rates bound both input/output and additional-token accounting.
 Usage from `openrouter` provider accounts is parsed with an OpenRouter-specific
-dialect: `prompt_tokens_details.cache_write_tokens` is settled as cache-write
-tokens (a subset of `prompt_tokens`, like `cached_tokens`) and priced at the
-imported cache-write rate; a missing cache-write rate leaves the calculated cost
-unknown. `is_byok`, `cost_details` (finite non-negative numbers or null) and
+dialect. `is_byok`, `cost_details` (finite non-negative numbers or null) and
 `server_tool_use` are accepted as metadata only and never add tokens; `cost`
-stays the reported cost. `video_tokens` and `image_tokens` are accepted only
-when zero. Any other unrecognized or malformed field still keeps that response
-on the conservative liability path. Other provider types do not accept this
+stays the reported cost. `prompt_tokens_details.cache_write_tokens`,
+`video_tokens` and `image_tokens` are accepted only when zero: the cache-write
+subset of `prompt_tokens` is documented but not yet verified against a live
+response, so a positive cache-write count keeps that response on the
+conservative liability path until a redacted capture confirms it. Two spellings
+of the same count (for example `prompt_tokens_details` and
+`input_tokens_details`), a non-object detail container, and any other
+unrecognized or malformed field also keep that response on the conservative
+liability path. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices

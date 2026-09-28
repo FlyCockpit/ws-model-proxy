@@ -1194,6 +1194,23 @@ const OPENROUTER_COST_DETAIL_KEYS = new Set([
   "upstream_inference_completions_cost",
   "server_tool_cost",
 ]);
+/**
+ * Usage spellings the generic parser merges with `??`. In the OpenRouter
+ * dialect two present spellings are ambiguous: only the first would be read.
+ */
+const OPENROUTER_ALIAS_PAIRS = [
+  ["prompt_tokens_details", "input_tokens_details"],
+  ["completion_tokens_details", "output_tokens_details"],
+  ["input_tokens", "prompt_tokens"],
+  ["output_tokens", "completion_tokens"],
+  ["cost", "total_cost"],
+] as const;
+const OPENROUTER_DETAIL_CONTAINERS = [
+  "prompt_tokens_details",
+  "input_tokens_details",
+  "completion_tokens_details",
+  "output_tokens_details",
+] as const;
 /** OpenRouter `usage.server_tool_use` counters: non-token charges outside token budgets. */
 const OPENROUTER_SERVER_TOOL_KEYS = new Set(["web_search_requests"]);
 
@@ -1340,7 +1357,12 @@ export function usageFromObject(
   // OpenRouter always emits `video_tokens` / `image_tokens` breakdowns. They
   // have no priced category here, so only an explicit zero is accepted; a
   // positive count keeps the observation incomplete (fail closed).
+  // `cache_write_tokens` is documented as a subset of `prompt_tokens`, but #62
+  // requires that subset to be verified against a live response before it is
+  // settled; until a redacted capture confirms it, a positive count is an
+  // unknown category too (fail closed for that field only).
   const openRouterZeroOnlyDetails = [
+    [promptDetails, "cache_write_tokens"],
     [promptDetails, "video_tokens"],
     [completionDetails, "image_tokens"],
   ] as const;
@@ -1352,6 +1374,16 @@ export function usageFromObject(
   const hasOpenRouterUnknown =
     openRouter &&
     (!openRouterMetadataValid(usage) ||
+      // The generic parser reads only the first of two alias spellings and
+      // ignores a non-object detail container. Both would let a second
+      // representation hide counts or unknown keys, so the dialect rejects them.
+      OPENROUTER_ALIAS_PAIRS.some(
+        ([first, second]) => usage[first] != null && usage[second] != null,
+      ) ||
+      OPENROUTER_DETAIL_CONTAINERS.some(
+        (key) => usage[key] != null && usageRecord(usage[key]) === undefined,
+      ) ||
+      (usage.cache_read_input_tokens != null && promptDetails?.cached_tokens != null) ||
       // Two cache-write spellings in one observation are ambiguous.
       (promptDetails !== undefined &&
         Object.hasOwn(promptDetails, "cache_write_tokens") &&

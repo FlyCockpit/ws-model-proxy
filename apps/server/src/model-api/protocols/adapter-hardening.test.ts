@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
+import openRouterFixture from "../fixtures/openrouter-usage.json";
 import {
   adaptNonstreamResponse,
   CanonicalStreamParser,
@@ -810,6 +811,120 @@ describe("adapter follow-ups (#77)", () => {
       expect(events.at(-1)?.type).toBe("complete");
     },
   );
+
+  it.each([
+    ["anthropic-messages", "event: message_stop"],
+    ["openai-responses", "response.completed"],
+  ] as const)(
+    "adapts the documented OpenRouter terminal usage chunk to %s",
+    async (target, terminal) => {
+      const output = await new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes(`${openRouterFixture.stream.join("\n\n")}\n\n`));
+            controller.close();
+          },
+        }).pipeThrough(
+          createProtocolAdaptationTransform({
+            source: "openai-chat",
+            target,
+            recoverProtocolErrors: true,
+            recoverBeforeOutput: true,
+            request: parseAnthropicMessagesRequest({
+              model: "vendor/model",
+              max_tokens: 8,
+              stream: true,
+              messages: [{ role: "user", content: "hello" }],
+            }),
+          }),
+        ),
+      ).text();
+      expect(output).not.toMatch(/event: (?:error|response\.failed)/u);
+      expect(output).toContain(terminal);
+      expect(output).toContain('"output_tokens":80');
+    },
+  );
+
+  describe("after finish_reason", () => {
+    const usage = { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 };
+    const finished = () => {
+      const parser = new CanonicalStreamParser("openai-chat");
+      parser.push(chatChunk([{ index: 0, delta: { content: "pong" }, finish_reason: null }]));
+      parser.push(chatChunk([{ index: 0, delta: {}, finish_reason: "stop" }]));
+      return parser;
+    };
+
+    it.each([
+      ["no delta", { index: 0, finish_reason: "stop" }],
+      [
+        "an empty assistant delta",
+        { delta: { role: "assistant", content: "" }, finish_reason: "stop" },
+      ],
+      [
+        "null delta fields",
+        { index: 0, delta: { content: null, tool_calls: [] }, finish_reason: "stop" },
+      ],
+    ])("accepts one usage chunk repeating the finish with %s", (_label, choice) => {
+      const parser = finished();
+      const events = [
+        ...parser.push(chatChunk([choice], { usage })),
+        ...parser.push(bytes("data: [DONE]\n\n")),
+      ];
+      expect(events.map((event) => event.type)).toEqual([
+        "usage",
+        "item_complete",
+        "stop",
+        "complete",
+      ]);
+    });
+
+    it.each([
+      ["a different finish_reason", [{ index: 0, delta: {}, finish_reason: "length" }], usage],
+      ["no finish_reason", [{ index: 0, delta: {}, finish_reason: null }], usage],
+      ["content", [{ index: 0, delta: { content: "x" }, finish_reason: "stop" }], usage],
+      [
+        "a tool call",
+        [{ index: 0, delta: { tool_calls: [{ index: 0 }] }, finish_reason: "stop" }],
+        usage,
+      ],
+      [
+        "an unknown delta key",
+        [{ index: 0, delta: { vendor: "x" }, finish_reason: "stop" }],
+        usage,
+      ],
+      ["no usage", [{ index: 0, delta: {}, finish_reason: "stop" }], undefined],
+      [
+        "two choices",
+        [
+          { index: 0, delta: {}, finish_reason: "stop" },
+          { index: 1, delta: {}, finish_reason: "stop" },
+        ],
+        usage,
+      ],
+    ])("rejects a repeated finish chunk with %s", (_label, choices, chunkUsage) => {
+      const parser = finished();
+      expect(
+        thrownBy(() => parser.push(chatChunk(choices, chunkUsage ? { usage: chunkUsage } : {}))),
+      ).toMatchObject({ code: "event_after_stop" });
+    });
+
+    it("rejects choice-level text and a second repeat", () => {
+      expect(
+        thrownBy(() =>
+          finished().push(
+            chatChunk([{ index: 0, delta: {}, text: "hidden", finish_reason: "stop" }], { usage }),
+          ),
+        ),
+      ).toMatchObject({ parameter: "choices[0].text" });
+      const parser = finished();
+      parser.push(chatChunk([{ index: 0, delta: {}, finish_reason: "stop" }], { usage }));
+      expect(
+        thrownBy(() =>
+          parser.push(chatChunk([{ index: 0, delta: {}, finish_reason: "stop" }], { usage })),
+        ),
+      ).toMatchObject({ code: "event_after_stop" });
+    });
+  });
 
   it("rejects legacy text beside a non-stream Chat message", () => {
     expect(() =>

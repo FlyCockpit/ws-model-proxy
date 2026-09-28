@@ -72,10 +72,10 @@ describe("OpenRouter usage dialect", () => {
     const pricing = catalogPricing(fullRates);
     const usage = parseProviderUsage(body(), pricing, "openrouter");
     expect(usage).toMatchObject({
-      inputTokens: 200n,
+      inputTokens: 600n,
       outputTokens: 50n,
       cacheReadTokens: 600n,
-      cacheWriteTokens: 400n,
+      cacheWriteTokens: 0n,
       reasoningTokens: 30n,
       additionalBillableTokens: 0n,
       reportedTotalTokens: 1280n,
@@ -83,20 +83,21 @@ describe("OpenRouter usage dialect", () => {
       categoriesComplete: true,
     });
     expect(providerBillableTokens(usage!)).toBe(1280n);
-    // 200*1 + 50*4 + 600*0.1 + 400*1.25 + 30*4 = 1080 per million.
-    expect(usage?.calculatedCost?.toString()).toBe("0.00108");
+    // 600*1 + 50*4 + 600*0.1 + 30*4 = 980 per million.
+    expect(usage?.calculatedCost?.toString()).toBe("0.00098");
   });
 
-  it("keeps the calculated cost unknown when the imported cache-write rate is missing", () => {
-    const { cacheWrite: _omitted, ...withoutCacheWrite } = fullRates;
+  it("keeps positive cache writes unknown until a live capture verifies the subset (#62)", () => {
+    const payload = structuredClone(openRouterFixture.nonStream);
+    payload.usage.prompt_tokens_details.cache_write_tokens = 400;
     const usage = parseProviderUsage(
-      nonStreamBody(),
-      catalogPricing(withoutCacheWrite),
+      [encode(JSON.stringify(payload))],
+      catalogPricing(fullRates),
       "openrouter",
     );
-    expect(usage?.categoriesComplete).toBe(true);
-    expect(usage?.cacheWriteTokens).toBe(400n);
+    expect(usage?.categoriesComplete).toBe(false);
     expect(usage?.calculatedCost).toBeUndefined();
+    expect(providerBillableTokens(usage!)).toBeUndefined();
   });
 
   it.each([
@@ -161,6 +162,41 @@ describe("OpenRouter usage dialect", () => {
       (usage) => Object.assign(usage, { cache_creation_input_tokens: 400 }),
     ],
     [
+      "a second prompt detail container hiding cache writes",
+      (usage) => Object.assign(usage, { input_tokens_details: { cache_write_tokens: 1000 } }),
+    ],
+    [
+      "a second prompt detail container hiding an unknown key",
+      (usage) => Object.assign(usage, { input_tokens_details: { future_tokens: 999 } }),
+    ],
+    [
+      "a second completion detail container",
+      (usage) => Object.assign(usage, { output_tokens_details: { reasoning_tokens: 0 } }),
+    ],
+    [
+      "a first-read detail container shadowing the real one",
+      (usage) =>
+        Object.assign(usage, {
+          input_tokens_details: usage.prompt_tokens_details,
+          prompt_tokens_details: { cached_tokens: 0 },
+        }),
+    ],
+    [
+      "an array prompt detail container",
+      (usage) => Object.assign(usage, { prompt_tokens_details: [] }),
+    ],
+    [
+      "a string completion detail container",
+      (usage) => Object.assign(usage, { completion_tokens_details: "x" }),
+    ],
+    ["a second prompt count spelling", (usage) => Object.assign(usage, { input_tokens: 10 })],
+    ["a second completion count spelling", (usage) => Object.assign(usage, { output_tokens: 1 })],
+    ["a second cost spelling", (usage) => Object.assign(usage, { total_cost: 0 })],
+    [
+      "a second cache-read spelling",
+      (usage) => Object.assign(usage, { cache_read_input_tokens: 0 }),
+    ],
+    [
       "positive video tokens",
       (usage) => Object.assign(usage.prompt_tokens_details as object, { video_tokens: 5 }),
     ],
@@ -181,7 +217,7 @@ describe("OpenRouter usage dialect", () => {
       }),
     );
     expect(usage).toMatchObject({
-      inputTokens: 200n,
+      inputTokens: 600n,
       outputTokens: 50n,
       categoriesComplete: true,
       reportedCost: 0.0021,
@@ -231,13 +267,28 @@ describe("OpenRouter usage dialect", () => {
       { usage: { prompt_tokens: 3, completion_tokens: 1, unknown_key: 1 } },
       { usage: { prompt_tokens: -1, completion_tokens: 1 } },
     ];
+    // Parser output at c689d6e (before #62), pinned so a change to the shared
+    // generic parser cannot pass by moving both dialects together.
+    const preDialectOutputs = [
+      '{"inputTokens":"20n","outputTokens":"10n","reportedTotalTokens":"30n","categoriesComplete":true,"rawUsage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"12n","outputTokens":"7n","cacheReadTokens":"3n","reasoningTokens":"2n","additionalBillableTokens":"6n","reportedTotalTokens":"30n","categoriesComplete":true,"rawUsage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":3,"audio_tokens":5},"completion_tokens_details":{"reasoning_tokens":2,"audio_tokens":1},"cost":0.01},"reportedCost":0.01,"reportedCostSource":"provider-runtime","accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"5n","outputTokens":"3n","cacheReadTokens":"2n","reasoningTokens":"1n","reportedTotalTokens":"11n","categoriesComplete":true,"rawUsage":{"input_tokens":7,"output_tokens":4,"total_tokens":11,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"12n","outputTokens":"1n","cacheReadTokens":"3n","cacheWriteTokens":"4n","categoriesComplete":true,"rawUsage":{"input_tokens":12,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":1},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"outputTokens":"7n","rawUsage":{"output_tokens":7},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"rawUsage":{"cost":"1.25","currency":"usd","pricing_version":"v2"},"reportedCost":"1.25","reportedCostCurrency":"USD","reportedCostPricingVersion":"v2","reportedCostSource":"provider-runtime","accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"10n","outputTokens":"5n","authoritativeBillableTokens":"40n","rawUsage":{"billable_tokens":40,"input_tokens":10,"output_tokens":5},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"3n","outputTokens":"1n","reportedTotalTokens":"9n","categoriesComplete":false,"rawUsage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":9},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"3n","outputTokens":"1n","categoriesComplete":false,"rawUsage":{"prompt_tokens":3,"completion_tokens":1,"unknown_key":1},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"outputTokens":"1n","categoriesComplete":false,"rawUsage":{"prompt_tokens":-1,"completion_tokens":1},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+    ];
     const dialects: ProviderUsageDialect[] = ["generic", "openrouter"];
-    for (const payload of payloads) {
+    for (const [index, payload] of payloads.entries()) {
       const [generic, openRouter] = dialects.map((dialect) =>
         JSON.stringify(usageFromObject(payload, dialect), (_key, value) =>
           typeof value === "bigint" ? `${value}n` : value,
         ),
       );
+      expect(generic).toBe(preDialectOutputs[index]);
       expect(openRouter).toBe(generic);
       // The default parameter is the generic dialect.
       expect(

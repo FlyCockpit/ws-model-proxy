@@ -2623,7 +2623,7 @@ describe("own-key dispatch and authoritative send claim", () => {
       userId: "grantee",
       poolId: undefined,
       observationComplete: true,
-      usage: { categoriesComplete: true, cacheWriteTokens: 400n },
+      usage: { categoriesComplete: true, cacheReadTokens: 600n, cacheWriteTokens: 0n },
     });
     expect(providerBillableTokens(settled.usage)).toBe(1_280n);
     expect(providerBillableTokens(settled.usage)! < liability.tokens).toBe(true);

@@ -399,6 +399,7 @@ fn reasoning_capabilities(
                 hosted_tools: None,
                 protocol_version: None,
                 beta_features: Vec::new(),
+                stream_usage: None,
             }),
             ..SurfaceInventory::default()
         }),
