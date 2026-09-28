@@ -242,3 +242,41 @@ it("keeps external consent keys in sync and removes obsolete pool notices", () =
     /publicEgressAcknowledged|granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
   );
 });
+
+it("uses external-fallback wording, not egress or overflow, on the fallback surfaces", () => {
+  // Display text only: the PUBLIC_OVERFLOW enum value and key names stay.
+  const surfaces = (bundle: typeof enDashboard) => [
+    bundle.pools.tabs,
+    bundle.pools.fallbackBadge,
+    bundle.pools.fallbackSettings,
+    bundle.pools.fallbackEmpty,
+    bundle.pools.fallbackDisabledDeployment,
+    bundle.pools.memberTiers,
+    bundle.pools.affinity.description,
+    bundle.pools.wizard,
+    bundle.overview.pools.tier,
+    bundle.tokens,
+  ];
+  for (const [bundle, banned] of [
+    [enDashboard, /egress|overflow|public (provider|target)/i],
+    [esDashboard, /desbord|salida (a|pública)|(proveedor|destino)(es)? públic/i],
+  ] as const) {
+    // Values only (key names such as PUBLIC_OVERFLOW stay), minus the env var name.
+    const text = leafValues(surfaces(bundle))
+      .join("\n")
+      .replaceAll("WMP_PUBLIC_PROVIDER_EGRESS_ENABLED", "");
+    expect(text).not.toMatch(banned);
+  }
+  expect(enDashboard.pools.fallbackBadge.label).toBe("Fallback available");
+  expect(enDashboard).not.toHaveProperty("pools.privacyBadge");
+  expect(enDashboard.tokens.externalAccess.savedPoolsHint).not.toMatch(/first time/i);
+  expect(keyTree(esDashboard.pools.fallbackBadge)).toEqual(
+    keyTree(enDashboard.pools.fallbackBadge),
+  );
+});
+
+function leafValues(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (typeof value !== "object" || value === null) return [];
+  return Object.values(value).flatMap(leafValues);
+}

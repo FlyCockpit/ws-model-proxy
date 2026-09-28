@@ -131,6 +131,9 @@ follow-ups to locally served responses stay on their local member.
 
 ## Breaking changes in this release
 
+The consolidated upgrade notes, including deploy requirements and the grantee
+local-member fix, are in [`release-notes/next.md`](release-notes/next.md).
+
 - Plain pool names never leave the deployment. Provider-backed PRIMARY members
   were moved to the external fallback tier, and fallback was enabled on those
   pools. Pools with only provider members must be called as
@@ -179,9 +182,13 @@ leave this deployment for third-party providers when the request uses
 the separate permission save cannot be confirmed, the secret remains visible;
 check the token’s permissions before using it.
 
-The **external** badge describes availability for the viewer, based on the
-deployment switch, pool settings, and configured provider members. It does not
-promise current provider health or imply that plain-name requests go external.
+The **Fallback available** badge (a static **Local only** chip otherwise)
+describes availability for the viewer, based on the deployment switch, pool
+settings, configured provider members and, for grantees, their own provider
+key. Tapping, clicking, hovering or keyboard-focusing it opens a hint that lists
+the routes open to this viewer: the pool's fallback providers and/or the
+viewer's own provider key (billed to them). It does not promise current provider
+health or imply that plain-name requests go external.
 Owners see their provider account labels. Eligible grantees see only coarse provider
 types, never the owner's account labels, identifiers, URLs or credential metadata;
 ineligible grantees receive neither labels nor types. Shared request history also

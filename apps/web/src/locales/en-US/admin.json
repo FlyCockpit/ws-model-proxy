@@ -212,9 +212,9 @@
       "ready": "Ready",
       "notReady": "Not ready",
       "flags": {
-        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Direct public-provider egress.",
+        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "External providers: requests to a pool's :external name may use third-party provider fallback.",
         "keyringConfigured": "Whether WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS is set. The key itself is never shown.",
-        "ready": "Egress is enabled and the credential keyring is configured.",
+        "ready": "External providers are enabled and the credential keyring is configured.",
         "WMP_MCP_ENABLED": "MCP server and OAuth provider surface.",
         "WMP_MCP_PAT_ALLOW_NO_EXPIRY": "Allow minting MCP personal tokens with no expiry.",
         "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS": "Allow private and loopback provider URLs.",

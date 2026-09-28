@@ -119,6 +119,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
         effectiveProviderEgress: pool.effectiveProviderEgress,
         providerAccountLabels: pool.providerAccountLabels,
         providerTypes: pool.providerTypes,
+        externalRoutes: pool.externalRoutes,
       };
       return pool.effectiveProviderEgress
         ? [option, { ...option, modelId: `${pool.modelId}:external` }]

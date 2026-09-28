@@ -295,6 +295,19 @@ describe("forwarderManagementRouter", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
+  it("refuses turning pool fallback on with a machine-readable reason when the switch is off", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    db.modelPool.findUnique.mockResolvedValueOnce(poolRow({ userId: "user-id" }));
+    await expect(
+      client().updateModelPool({ id: "pool-id", fallbackEnabled: true }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", data: { reason: "PROVIDER_EGRESS_DISABLED" } });
+    await expect(
+      client().createModelPool({ slug: "fresh-pool", name: "Fresh", fallbackEnabled: true }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", data: { reason: "PROVIDER_EGRESS_DISABLED" } });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
   it("denies guessed provider attachments and public-egress mutations over HTTP", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.modelPool.findFirst.mockResolvedValue(null);

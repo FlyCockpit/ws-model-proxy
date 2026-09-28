@@ -33,10 +33,10 @@ import {
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
-import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
+import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
-
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
+import { poolMutationFailureReason } from "@/lib/pool-mutation-failure-reason";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -189,8 +189,8 @@ export function PoolsListPage({ lang }: { lang: string }) {
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                       <h3 className="font-medium">{pool.name}</h3>
-                      <PoolPrivacyBadge
-                        external={pool.effectiveProviderEgress}
+                      <PoolFallbackBadge
+                        routes={ownerFallbackRoutes(pool.effectiveProviderEgress)}
                         providers={pool.members.flatMap((member) =>
                           member.tier === "PUBLIC_OVERFLOW" &&
                           member.providerModel?.ProviderAccount.label
@@ -359,8 +359,8 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
           title={pool.name}
           description={pool.description || pool.slug}
           badge={
-            <PoolPrivacyBadge
-              external={pool.effectiveProviderEgress}
+            <PoolFallbackBadge
+              routes={ownerFallbackRoutes(pool.effectiveProviderEgress)}
               providers={pool.members.flatMap((member) =>
                 member.tier === "PUBLIC_OVERFLOW" && member.providerModel?.ProviderAccount.label
                   ? [member.providerModel.ProviderAccount.label]
@@ -776,6 +776,13 @@ function PoolFallbackSettings({
         toast.success(t("dashboard:pools.fallbackSettings.saved"));
       },
       onError: (error) => {
+        // The deployment switch turned off after this form loaded: the server
+        // refuses turning fallback on. Say so, and refresh the switch state.
+        if (poolMutationFailureReason(error) === "PROVIDER_EGRESS_DISABLED") {
+          toast.error(t("dashboard:pools.fallbackSettings.enableBlockedDeployment"));
+          void queryClient.invalidateQueries({ queryKey: orpc.deploymentFlags.key() });
+          return;
+        }
         toast.error(friendly(error, t("dashboard:pools.fallbackSettings.failed")));
       },
     }),

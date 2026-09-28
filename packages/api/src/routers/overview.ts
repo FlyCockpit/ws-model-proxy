@@ -31,6 +31,7 @@ import {
   externalFallbackMemberWhere,
   poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
+import { readyOwnKeyPreferenceWhere } from "../lib/model-api-token-access";
 import {
   type Accumulator,
   type AggregateRow,
@@ -403,12 +404,17 @@ export const overviewRouter = {
             where: { granteeUserId: userId, poolId: { in: sharedPoolIds } },
             select: {
               poolId: true,
+              FallbackPreferences: {
+                where: readyOwnKeyPreferenceWhere,
+                select: { providerModelId: true },
+              },
               ModelPool: {
                 select: {
                   name: true,
                   slug: true,
                   fallbackEnabled: true,
                   fallbackForGrantees: true,
+                  externalEquivalentModel: true,
                   PoolMembers: {
                     where: externalFallbackMemberWhere,
                     select: {
@@ -434,21 +440,33 @@ export const overviewRouter = {
           (key) => shared.identities.get(key)?.poolId === poolId,
         );
         const grant = grantByPool.get(poolId);
+        const disclosure = poolProviderDisclosure({
+          isOwner: false,
+          hasLiveGrant: grant !== undefined,
+          providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+          fallbackEnabled: grant?.ModelPool.fallbackEnabled ?? false,
+          fallbackForGrantees: grant?.ModelPool.fallbackForGrantees ?? false,
+          members: (grant?.ModelPool.PoolMembers ?? []).map((member) => ({
+            tier: member.tier,
+            providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
+          })),
+        });
+        // Own-key route: the same inputs the token/chat-test surfaces use.
+        const ownKey = Boolean(
+          env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+            grant?.ModelPool.externalEquivalentModel &&
+            grant?.FallbackPreferences?.[0]?.providerModelId,
+        );
         return {
           poolId,
           // Labelled only while the pool is still shared with you.
           available: grant !== undefined,
-          ...poolProviderDisclosure({
-            isOwner: false,
-            hasLiveGrant: grant !== undefined,
-            providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
-            fallbackEnabled: grant?.ModelPool.fallbackEnabled ?? false,
-            fallbackForGrantees: grant?.ModelPool.fallbackForGrantees ?? false,
-            members: (grant?.ModelPool.PoolMembers ?? []).map((member) => ({
-              tier: member.tier,
-              providerType: member.ExecutionTarget?.ProviderModel?.ProviderAccount.providerType,
-            })),
-          }),
+          ...disclosure,
+          effectiveProviderEgress: disclosure.effectiveProviderEgress || ownKey,
+          externalRoutes: [
+            ...(disclosure.effectiveProviderEgress ? (["pool-fallback"] as const) : []),
+            ...(ownKey ? (["own-key"] as const) : []),
+          ],
           name: grant?.ModelPool.name ?? null,
           slug: grant?.ModelPool.slug ?? null,
           ownerSlug: grant?.Owner.slug ?? null,

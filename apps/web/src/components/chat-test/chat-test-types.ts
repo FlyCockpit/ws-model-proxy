@@ -1,3 +1,4 @@
+import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 
 import type { AttachmentModalities, AttachmentModality } from "@/lib/image-attachments";
@@ -19,6 +20,8 @@ export type ModelOption = {
   effectiveProviderEgress?: boolean;
   providerAccountLabels?: readonly string[];
   providerTypes?: readonly string[];
+  /** External routes `:external` can take for this viewer. */
+  externalRoutes?: readonly ExternalRouteKind[];
 };
 
 export type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";

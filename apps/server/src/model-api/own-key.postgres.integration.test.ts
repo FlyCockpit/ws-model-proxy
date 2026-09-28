@@ -180,6 +180,7 @@ integration("own-key preference integrity and requester capacity", () => {
         effectiveProviderEgress: true,
         providerAccountLabels: [],
         providerTypes: [],
+        externalRoutes: [],
         allowLossyDeveloperRoleCollapse: false,
         recommendedSurfaceOverride: null,
         externalEquivalentModel: pool.externalEquivalentModel,

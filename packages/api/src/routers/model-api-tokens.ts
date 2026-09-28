@@ -101,6 +101,7 @@ function serializeTargets(targets: VisibleModelTargets) {
       effectiveProviderEgress: pool.effectiveProviderEgress,
       providerAccountLabels: pool.providerAccountLabels,
       providerTypes: pool.providerTypes,
+      externalRoutes: pool.externalRoutes,
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,

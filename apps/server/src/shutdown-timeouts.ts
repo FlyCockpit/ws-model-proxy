@@ -207,12 +207,12 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * must not keep the process alive. `shutdown-timeouts.test.ts` pins the
  * arithmetic.
  *
- * Container stop grace: the repository sets none (Dockerfile, entrypoint and
- * compose files have none), and Docker's default is 10 s, after which SIGKILL
- * can land anywhere in the sequence (for the sweep, the same uncertain-outcome
- * case as a quarantine; the durable marker and generation make it
- * recoverable). A deployment that wants every step to finish sets its
- * platform's stop grace to at least this deadline plus a margin, 52 s
- * (`docker stop -t 52`, compose `stop_grace_period: 52s`).
+ * Container stop grace: a Dockerfile cannot set one, and Docker's default is
+ * 10 s, after which SIGKILL can land anywhere in the sequence (for the sweep,
+ * the same uncertain-outcome case as a quarantine; the durable marker and
+ * generation make it recoverable). Deployments must set their platform's stop
+ * grace to at least this deadline plus a margin, 52 s (`docker stop -t 52`,
+ * compose `stop_grace_period: 52s`). The shipped compose app services set it,
+ * and README.md "Deployment requirements" documents it.
  */
 export const PROCESS_SHUTDOWN_DEADLINE_MS = 47_000;

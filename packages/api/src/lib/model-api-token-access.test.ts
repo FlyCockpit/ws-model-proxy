@@ -708,6 +708,98 @@ describe("static external availability for each viewer", () => {
       }
     },
   );
+
+  it.each([
+    // grantees, own key declared + chosen, switch -> routes
+    [true, false, true, ["pool-fallback"]],
+    [false, true, true, ["own-key"]],
+    [true, true, true, ["pool-fallback", "own-key"]],
+    [false, false, true, []],
+    [true, true, false, []],
+  ] as const)(
+    "grantee routes: owner pays %s own key %s switch %s -> %j",
+    async (fallbackForGrantees, ownKey, enabled, expected) => {
+      const { env } = await import("@ws-model-proxy/env/server");
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
+      try {
+        const row = {
+          ...modelPoolRow({
+            id: "pool",
+            userId: "owner",
+            userSlug: "owner",
+            slug: "pool",
+            name: "Pool",
+          }),
+          fallbackEnabled: true,
+          fallbackForGrantees,
+          externalEquivalentModel: "vendor/model",
+          PoolMembers: [{ tier: "PUBLIC_OVERFLOW" }],
+        };
+        db.discoveredModel.findMany.mockResolvedValue([]);
+        db.modelPool.findMany.mockResolvedValue([]);
+        db.poolGrant.findMany.mockResolvedValue([
+          {
+            id: "grant",
+            ModelPool: row,
+            FallbackPreferences: ownKey ? [{ providerModelId: "own-provider-model" }] : [],
+          },
+        ]);
+        const result = await listVisibleModelTargetsForToken({
+          id: "token",
+          userId: "grantee",
+          scopeMode: "ALL_VISIBLE",
+        });
+        expect(result.modelPools[0]?.externalRoutes).toEqual(expected);
+        expect(result.modelPools[0]?.effectiveProviderEgress).toBe(expected.length > 0);
+        // Only a ready preference counts: live model and account, ACTIVE credential.
+        expect(db.poolGrant.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            select: expect.objectContaining({
+              FallbackPreferences: {
+                where: {
+                  ProviderModel: {
+                    enabled: true,
+                    deletedAt: null,
+                    ProviderAccount: {
+                      enabled: true,
+                      deletedAt: null,
+                      CurrentCredential: { status: "ACTIVE" },
+                    },
+                  },
+                },
+                select: { providerModelId: true },
+              },
+            }),
+          }),
+        );
+      } finally {
+        env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+      }
+    },
+  );
+
+  it("gives the owner the pool-fallback route only", async () => {
+    const row = {
+      ...modelPoolRow({
+        id: "pool",
+        userId: "owner",
+        userSlug: "owner",
+        slug: "pool",
+        name: "Pool",
+      }),
+      fallbackEnabled: true,
+      PoolMembers: [{ tier: "PUBLIC_OVERFLOW" }],
+    };
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.modelPool.findMany.mockResolvedValue([row]);
+    db.poolGrant.findMany.mockResolvedValue([]);
+    const result = await listVisibleModelTargetsForToken({
+      id: "token",
+      userId: "owner",
+      scopeMode: "ALL_VISIBLE",
+    });
+    expect(result.modelPools[0]?.externalRoutes).toEqual(["pool-fallback"]);
+  });
 });
 
 it("discloses only recognized coarse types, deduplicated, and never grantee account labels", async () => {

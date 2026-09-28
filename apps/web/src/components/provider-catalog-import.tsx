@@ -34,13 +34,16 @@ const pricingNoteKey = {
  * context, capabilities and an ACTIVE catalog price.
  */
 export function ProviderCatalogImport({ providerAccountId }: { providerAccountId: string }) {
-  const { t } = useTranslation(["dashboard"]);
+  const { t, i18n } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<ProviderCatalogRow | null>(null);
-  const [notes, setNotes] = useState<string[]>([]);
+  // Notes belong to the model they were imported for; a late result must not
+  // show under a model picked while it was pending.
+  const [notes, setNotes] = useState<{ modelId: string; lines: string[] } | null>(null);
+  const visibleNotes = notes && notes.modelId === selected?.id ? notes.lines : [];
   const importModel = useMutation({
     ...orpc.providerCatalog.importModel.mutationOptions({
-      onSuccess: (result) => {
+      onSuccess: (result, variables) => {
         void queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() });
         toast.success(
           result.created
@@ -52,6 +55,16 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
         if (pricingNote) next.push(t(pricingNote));
         // `priceTiered` is only true when this import wrote catalog pricing.
         if (result.priceTiered) next.push(t("dashboard:providerCatalog.import.pricingTiered"));
+        // The written price is immutable; say how fresh the catalog copy was.
+        if (result.catalogFetchedAt)
+          next.push(
+            t("dashboard:providerCatalog.import.pricingAsOf", {
+              time: new Intl.DateTimeFormat(i18n.language, {
+                dateStyle: "medium",
+                timeStyle: "short",
+              }).format(new Date(result.catalogFetchedAt)),
+            }),
+          );
         if (result.contextWindowDrift)
           next.push(
             t("dashboard:providerCatalog.import.contextDrift", {
@@ -59,7 +72,7 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
               current: result.contextWindowDrift.current ?? "—",
             }),
           );
-        setNotes(next);
+        setNotes({ modelId: variables.modelId, lines: next });
       },
     }),
     meta: { errorFallbackKey: "dashboard:providerCatalog.import.failed" },
@@ -83,7 +96,7 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
         selectedId={selected?.id ?? null}
         onSelect={(row) => {
           setSelected(row);
-          setNotes([]);
+          setNotes(null);
         }}
       />
       {selected ? (
@@ -107,9 +120,9 @@ export function ProviderCatalogImport({ providerAccountId }: { providerAccountId
           ? t("dashboard:providerCatalog.import.pending")
           : t("dashboard:providerCatalog.import.action")}
       </Button>
-      {notes.length > 0 ? (
+      {visibleNotes.length > 0 ? (
         <ul className="space-y-1 text-xs text-muted-foreground" aria-live="polite">
-          {notes.map((note) => (
+          {visibleNotes.map((note) => (
             <li key={note}>{note}</li>
           ))}
         </ul>

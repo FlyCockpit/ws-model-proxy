@@ -224,6 +224,9 @@ export function ProviderCatalogPicker({
     <div className="min-w-0 space-y-2">
       <Command shouldFilter={false} className="rounded-md border">
         <CommandInput
+          // 44px touch target on this input only; the shared Input stays compact.
+          groupClassName="h-11"
+          className="h-full"
           aria-label={t("dashboard:providerCatalog.picker.label")}
           placeholder={t("dashboard:providerCatalog.picker.placeholder")}
           value={query}

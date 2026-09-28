@@ -212,9 +212,9 @@
       "ready": "Listo",
       "notReady": "No listo",
       "flags": {
-        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Salida directa a proveedores publicos.",
+        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Proveedores externos: las solicitudes al nombre :external de un pool pueden usar el respaldo de proveedores externos.",
         "keyringConfigured": "Si WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS esta definido. La clave nunca se muestra.",
-        "ready": "La salida esta activada y el llavero de credenciales esta configurado.",
+        "ready": "Los proveedores externos están activados y el llavero de credenciales está configurado.",
         "WMP_MCP_ENABLED": "Servidor MCP y superficie de proveedor OAuth.",
         "WMP_MCP_PAT_ALLOW_NO_EXPIRY": "Permitir tokens personales MCP sin caducidad.",
         "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS": "Permitir URL de proveedor privadas y de loopback.",

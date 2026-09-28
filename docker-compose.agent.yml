@@ -25,6 +25,9 @@ services:
     profiles: [dev, prod]
 
   app-dev:
+    # Shutdown can take up to 47 s (apps/server/src/shutdown-timeouts.ts);
+    # Docker's 10 s default would cut the HTTP drain and relay close short.
+    stop_grace_period: 52s
     build:
       context: .
       dockerfile: Dockerfile.dev
@@ -83,6 +86,9 @@ services:
     profiles: [dev]
 
   app-prod:
+    # Shutdown can take up to 47 s (apps/server/src/shutdown-timeouts.ts);
+    # Docker's 10 s default would cut the HTTP drain and relay close short.
+    stop_grace_period: 52s
     build:
       context: .
       dockerfile: Dockerfile

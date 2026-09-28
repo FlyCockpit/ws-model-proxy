@@ -11,7 +11,7 @@ import { ArrowRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
-import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
+import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { WideContent } from "@/components/wide-content";
 import {
   chartRows,
@@ -96,8 +96,8 @@ export function OverviewPoolCard({
               {pool.name}
             </h3>
             {pool.effectiveProviderEgress ? (
-              <PoolPrivacyBadge
-                external
+              <PoolFallbackBadge
+                routes={ownerFallbackRoutes(true)}
                 providers={pool.members.flatMap((member) =>
                   member.kind === "PROVIDER" && member.location ? [member.location] : [],
                 )}
