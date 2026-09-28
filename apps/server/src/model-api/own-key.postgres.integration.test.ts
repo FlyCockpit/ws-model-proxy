@@ -474,7 +474,12 @@ integration("own-key preference integrity and requester capacity", () => {
           },
         });
         const paidMember = await db.poolMember.create({
-          data: { poolId: pool.id, executionTargetId: ownerTarget.id, tier: "PUBLIC_OVERFLOW" },
+          data: {
+            poolId: pool.id,
+            executionTargetId: ownerTarget.id,
+            tier: "PUBLIC_OVERFLOW",
+            publicOrder: 0,
+          },
         });
         const paid: PublicProviderTarget = {
           ...provider,
@@ -625,7 +630,7 @@ integration("own-key preference integrity and requester capacity", () => {
         await expect(
           db.relayRequest.update({
             where: { id: granteeRowId },
-            data: { requestedModelPoolId: null },
+            data: { requestedModelPoolId: null, selectedExecutionTargetId: ownerTarget.id },
           }),
         ).rejects.toThrow(/relay request selection must match/);
         await expect(
@@ -691,27 +696,15 @@ integration("own-key preference integrity and requester capacity", () => {
       expect(
         await db.responseStickinessRecord.findUnique({ where: { id: binding.id } }),
       ).toBeNull();
-      // Pool deletion detaches owner selections whose ownership anchor vanished;
-      // requester-owned own-key history retains its target. Rollups are already
-      // durable and parent-deletion handling preserves their existing semantics.
-      await db.modelPool.delete({ where: { id: pool.id } });
-      expect(
-        await db.relayRequest.findMany({ where: { userId: requester.id, fallbackRoute: "local" } }),
-      ).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            requestedModelPoolId: null,
-            selectedExecutionTargetId: null,
-            selectedDiscoveredModelId: null,
-            selectedPoolMemberId: null,
-          }),
-        ]),
+      // Real admissions above retain RESTRICT-protected capacity leases. The
+      // app must refuse deleting this graph; deletion behavior is exercised
+      // below with history that has no retained leases or provider accounting.
+      const { prepareParentDeletion, RetainedHistoryError } = await import(
+        "@ws-model-proxy/db/parent-deletion"
       );
-      expect(
-        await db.relayRequest.findFirstOrThrow({
-          where: { userId: requester.id, fallbackRoute: "own-key", status: "SUCCEEDED" },
-        }),
-      ).toMatchObject({ requestedModelPoolId: null, selectedExecutionTargetId: target.id });
+      await expect(
+        prepareParentDeletion(db, { userId: owner.id, poolIds: [pool.id] }),
+      ).rejects.toBeInstanceOf(RetainedHistoryError);
       // Immutable capacity history intentionally remains in the disposable CI database.
     } finally {
       vi.doUnmock("@ws-model-proxy/db");
@@ -721,4 +714,252 @@ integration("own-key preference integrity and requester capacity", () => {
       await db.$disconnect();
     }
   });
+
+  it.each(["pool", "owner"] as const)(
+    "drains grantee local and owner-paid history before deleting its %s through the app path",
+    async (parent) => {
+      if (!databaseUrl) return;
+      const db = createPrismaClient(databaseUrl);
+      const { prepareParentDeletion, requestUserDeletion, completeUserDeletion } = await import(
+        "@ws-model-proxy/db/parent-deletion"
+      );
+      const { lockCapacityGraphForDelete, runCapacityOrderedTransaction } = await import(
+        "@ws-model-proxy/db/capacity-lock-order"
+      );
+      const suffix = crypto.randomUUID();
+      try {
+        // No admissions/leases or provider accounting: those correctly block
+        // parent deletion before the drain, as the route fixture above proves.
+        const owner = await db.user.create({
+          data: { name: "History owner", email: `history-owner-${suffix}@example.test` },
+        });
+        const requester = await db.user.create({
+          data: { name: "History grantee", email: `history-grantee-${suffix}@example.test` },
+        });
+        const pool = await db.modelPool.create({
+          data: { userId: owner.id, name: "History", slug: `history-${suffix}` },
+        });
+        const scope = { userId: owner.id, poolIds: [pool.id] };
+        // Empty/default history is a no-op, including repeated preparation.
+        expect((await prepareParentDeletion(db, scope))["relay_request.detach"]).toBe(0);
+        const grant = await db.poolGrant.create({
+          data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: requester.id },
+        });
+        const cli = await db.cliDevice.create({ data: { userId: owner.id, slug: "history" } });
+        const endpoint = await db.endpoint.create({
+          data: { userId: owner.id, cliDeviceId: cli.id, slug: "history", label: "History" },
+        });
+        const localModel = await db.discoveredModel.create({
+          data: {
+            userId: owner.id,
+            endpointId: endpoint.id,
+            upstreamModelId: "history-local",
+            encodedModelId: "history-local",
+          },
+        });
+        const localTarget = await db.executionTarget.findUniqueOrThrow({
+          where: { discoveredModelId: localModel.id },
+        });
+        const localMember = await db.poolMember.create({
+          data: { poolId: pool.id, executionTargetId: localTarget.id, tier: "PRIMARY" },
+        });
+        const providerTarget = async (userId: string) => {
+          const account = await db.providerAccount.create({
+            data: {
+              userId,
+              providerType: "openai",
+              label: "History provider",
+              baseUrl: "https://provider.example",
+              endpointIdentity: "https://provider.example",
+              authType: "BEARER",
+              enabled: false,
+            },
+          });
+          const model = await db.providerModel.create({
+            data: { userId, providerAccountId: account.id, upstreamModelId: "history-paid" },
+          });
+          // Production backfill supplies a same-owner capacity on insert.
+          return db.executionTarget.create({
+            data: { userId, kind: "PROVIDER_MODEL", providerModelId: model.id },
+          });
+        };
+        const paidTarget = await providerTarget(owner.id);
+        const ownTarget = await providerTarget(requester.id);
+        const paidMember = await db.poolMember.create({
+          data: {
+            poolId: pool.id,
+            executionTargetId: paidTarget.id,
+            tier: "PUBLIC_OVERFLOW",
+            publicOrder: 0,
+          },
+        });
+        const selections = [
+          {
+            fallbackRoute: "local",
+            selectedExecutionTargetId: localTarget.id,
+            selectedPoolMemberId: localMember.id,
+          },
+          {
+            fallbackRoute: "pool-external",
+            selectedExecutionTargetId: paidTarget.id,
+            selectedPoolMemberId: paidMember.id,
+          },
+        ];
+        const history = [];
+        for (const selection of selections) {
+          for (const status of ["SUCCEEDED", "FAILED", "CANCELED"] as const) {
+            history.push(
+              await db.relayRequest.create({
+                data: { userId: requester.id, requestedModelPoolId: pool.id, ...selection, status },
+              }),
+            );
+          }
+        }
+        const ownerRow = await db.relayRequest.create({
+          data: {
+            userId: owner.id,
+            requestedModelPoolId: pool.id,
+            ...selections[0]!,
+            status: "SUCCEEDED",
+          },
+        });
+        const ownRow = await db.relayRequest.create({
+          data: {
+            userId: requester.id,
+            requestedModelPoolId: pool.id,
+            fallbackRoute: "own-key",
+            selectedExecutionTargetId: ownTarget.id,
+            status: "SUCCEEDED",
+          },
+        });
+        const pending = await db.relayRequest.create({
+          data: { userId: requester.id, requestedModelPoolId: pool.id, ...selections[0]! },
+        });
+        // No grant is needed to detach historical identity after revocation.
+        await db.poolGrant.delete({ where: { id: grant.id } });
+        for (const data of [
+          { requestedModelPoolId: null, selectedExecutionTargetId: paidTarget.id },
+          { requestedModelPoolId: null, selectedPoolMemberId: paidMember.id },
+          { requestedModelPoolId: null, fallbackRoute: "pool-external" },
+          { requestedModelPoolId: null, status: "PENDING" as const },
+        ]) {
+          await expect(
+            db.relayRequest.update({ where: { id: history[0]!.id }, data }),
+          ).rejects.toThrow(/relay request selection must match/);
+        }
+        await expect(
+          db.relayRequest.update({
+            where: { id: history[3]!.id },
+            data: { requestedModelPoolId: null, selectedDiscoveredModelId: localModel.id },
+          }),
+        ).rejects.toThrow(/relay request selection must match/);
+        await expect(
+          db.relayRequest.update({
+            where: { id: pending.id },
+            data: { requestedModelPoolId: null },
+          }),
+        ).rejects.toThrow(/relay request selection must match/);
+        await expect(
+          db.relayRequest.create({
+            data: { userId: requester.id, selectedExecutionTargetId: paidTarget.id },
+          }),
+        ).rejects.toThrow(/relay request selection must match/);
+
+        const mark = parent === "owner" ? await requestUserDeletion(db, owner.id) : null;
+        const deleteScope = parent === "owner" ? { userId: owner.id, wholeUser: true } : scope;
+        const options = {
+          batch: 1,
+          ...(mark ? { owner: { userId: owner.id, generation: mark.generation } } : {}),
+        };
+        // Same prepare/drain used by drainBeforeParentDelete and the user
+        // sweeper. Crucially the pool still exists when every batch runs.
+        const report = await prepareParentDeletion(db, deleteScope, options);
+        expect(report["relay_request.detach"]).toBeGreaterThanOrEqual(history.length + 1);
+        expect(await db.modelPool.findUnique({ where: { id: pool.id } })).not.toBeNull();
+        for (const row of history) {
+          expect(await db.relayRequest.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+            requestedModelPoolId: null,
+            selectedExecutionTargetId: null,
+            selectedDiscoveredModelId: null,
+            selectedPoolMemberId: null,
+            userId: requester.id,
+            status: row.status,
+            fallbackRoute: row.fallbackRoute,
+          });
+        }
+        expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
+          {
+            requestedModelPoolId: null,
+            selectedExecutionTargetId: ownTarget.id,
+          },
+        );
+        expect(
+          await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
+        ).toMatchObject({
+          requestedModelPoolId: pool.id,
+          selectedExecutionTargetId: localTarget.id,
+          status: "PENDING",
+        });
+        if (parent === "pool") {
+          expect(
+            await db.relayRequest.findUniqueOrThrow({ where: { id: ownerRow.id } }),
+          ).toMatchObject({
+            requestedModelPoolId: null,
+            selectedExecutionTargetId: localTarget.id,
+            selectedDiscoveredModelId: localModel.id,
+            selectedPoolMemberId: null,
+          });
+        }
+        // A retry after a partial drain must be safe; detached rows cannot
+        // be used to reattach a foreign target once their pool anchor is gone.
+        expect(
+          (await prepareParentDeletion(db, deleteScope, options))["relay_request.detach"],
+        ).toBe(0);
+        await expect(
+          db.relayRequest.update({
+            where: { id: history[0]!.id },
+            data: { selectedExecutionTargetId: localTarget.id },
+          }),
+        ).rejects.toThrow(/relay request selection must match/);
+        if (parent === "owner") {
+          expect(mark).not.toBeNull();
+          expect(await completeUserDeletion(db, owner.id, mark!.generation, { batch: 1 })).toBe(
+            true,
+          );
+          expect(await db.user.findUnique({ where: { id: owner.id } })).toBeNull();
+          expect(await db.relayRequest.findUnique({ where: { id: ownerRow.id } })).toBeNull();
+        } else {
+          // Exact final transaction used by deleteModelPool, after preparation.
+          await runCapacityOrderedTransaction(db, async (tx) => {
+            await lockCapacityGraphForDelete(tx, scope);
+            await tx.modelPool.delete({ where: { id: pool.id } });
+          });
+          expect(
+            await db.executionTarget.findUnique({ where: { id: localTarget.id } }),
+          ).not.toBeNull();
+        }
+        expect(await db.modelPool.findUnique({ where: { id: pool.id } })).toBeNull();
+        // PENDING rows are deliberately skipped by the drain; the final FK
+        // cascade still erases their cross-tenant selection. P3C-2's later
+        // in-flight finalizer/attribution policy is a separate deferred issue.
+        expect(
+          await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
+        ).toMatchObject({
+          requestedModelPoolId: null,
+          selectedExecutionTargetId: null,
+          selectedDiscoveredModelId: null,
+          selectedPoolMemberId: null,
+          status: "PENDING",
+        });
+        expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
+          {
+            requestedModelPoolId: null,
+            selectedExecutionTargetId: ownTarget.id,
+          },
+        );
+      } finally {
+        await db.$disconnect();
+      }
+    },
+  );
 });

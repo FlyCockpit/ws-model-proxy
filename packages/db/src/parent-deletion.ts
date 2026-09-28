@@ -699,8 +699,10 @@ export async function drainParentDeletionHistory(
   }
 
   // relay_request rows that reference a deleted parent through a SET NULL
-  // edge: detach them the way the cascade would, columns of surviving
-  // parents unchanged. Setting a foreign key to NULL takes no parent lock.
+  // edge: detach them the way the cascade would. The relay ownership trigger
+  // also clears an unchanged cross-tenant selection when its pool anchor is
+  // removed, even if the selected target survives. Other surviving-parent
+  // columns stay unchanged. Setting a foreign key to NULL takes no parent lock.
   const relayEdges = HISTORY_DRAIN_EDGES.relay_request.setNull.filter(
     ([, parent]) => parents[parent].length > 0,
   );

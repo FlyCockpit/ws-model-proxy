@@ -1564,17 +1564,22 @@ BEGIN
       IF NEW."requestedModelPoolId" IS NOT NULL AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key' THEN
         SELECT "userId" INTO consumer_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
       END IF;
-      -- A pool's SET NULL cascade removes the ownership anchor. Detach its
-      -- cross-tenant selection as well, rather than retaining an unverifiable
-      -- target or blocking parent deletion. No terminal state is changed.
+      -- Both the app's terminal-history drain (before the pool is deleted)
+      -- and its SET NULL cascade remove the ownership anchor. Erase the
+      -- unchanged cross-tenant selection with it. This never authorizes a
+      -- new target, model, caller or route, nor changes a terminal state.
       IF TG_OP = 'UPDATE' AND OLD."requestedModelPoolId" IS NOT NULL
          AND NEW."requestedModelPoolId" IS NULL
          AND NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId"
+         AND NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId"
+         AND (NEW."selectedPoolMemberId" IS NULL
+              OR NEW."selectedPoolMemberId" IS NOT DISTINCT FROM OLD."selectedPoolMemberId")
          AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
          AND NEW."fallbackRoute" IS NOT DISTINCT FROM OLD."fallbackRoute"
          AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
          AND target_owner IS DISTINCT FROM NEW."userId"
-         AND NOT EXISTS (SELECT 1 FROM model_pool WHERE id = OLD."requestedModelPoolId") THEN
+         AND ((OLD.status IN ('SUCCEEDED', 'FAILED', 'CANCELED') AND NEW.status = OLD.status)
+              OR NOT EXISTS (SELECT 1 FROM model_pool WHERE id = OLD."requestedModelPoolId")) THEN
         NEW."selectedExecutionTargetId" := NULL;
         NEW."selectedDiscoveredModelId" := NULL;
         NEW."selectedPoolMemberId" := NULL;
