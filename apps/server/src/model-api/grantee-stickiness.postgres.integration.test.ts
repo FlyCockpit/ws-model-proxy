@@ -36,6 +36,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
     const owner = await user("stick-owner");
     const grantee = await user("stick-grantee");
     const stranger = await user("stick-stranger");
+    const secondGrantee = await user("stick-grantee-2");
     try {
       const pool = await db.modelPool.create({
         data: { userId: owner.id, name: "Shared", slug: `shared-${suffix}` },
@@ -48,6 +49,9 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       });
       const otherGrant = await db.poolGrant.create({
         data: { poolId: otherPool.id, ownerUserId: owner.id, granteeUserId: grantee.id },
+      });
+      const secondGrant = await db.poolGrant.create({
+        data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: secondGrantee.id },
       });
       const localModel = async (userId: string, label: string) => {
         const cli = await db.cliDevice.create({
@@ -117,6 +121,19 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       await expect(binding({ userId: owner.id })).rejects.toThrow(
         /stickiness pool binding requires the pool owner or the exact grant/,
       );
+      // Another grantee's grant on the same pool is not the requester's grant.
+      await expect(binding({ poolGrantId: secondGrant.id })).rejects.toThrow(
+        /stickiness pool binding requires the pool owner or the exact grant/,
+      );
+      await expect(binding({ userId: secondGrantee.id })).rejects.toThrow(
+        /stickiness pool binding requires the pool owner or the exact grant/,
+      );
+      // A live grantee binding cannot be re-homed to another requester, with
+      // or without a grant of their own on the pool.
+      for (const userId of [stranger.id, secondGrantee.id])
+        await expect(
+          db.responseStickinessRecord.update({ where: { id: accepted.id }, data: { userId } }),
+        ).rejects.toThrow(/stickiness pool binding requires the pool owner or the exact grant/);
       // A foreign target without a pool (or grant) is still rejected.
       await expect(binding({ targetModelPoolId: null, poolGrantId: null })).rejects.toThrow(
         /stickiness selection must match its owner and discovered model/,
@@ -517,7 +534,9 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       });
       expect(await db.usageRollupMinute.count({ where: { ownerUserId: lateOwner.id } })).toBe(0);
     } finally {
-      await db.user.deleteMany({ where: { id: { in: [owner.id, grantee.id, stranger.id] } } });
+      await db.user.deleteMany({
+        where: { id: { in: [owner.id, grantee.id, stranger.id, secondGrantee.id] } },
+      });
       await db.$disconnect();
     }
   }, 60_000);

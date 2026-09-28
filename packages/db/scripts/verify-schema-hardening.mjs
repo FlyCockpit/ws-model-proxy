@@ -579,10 +579,14 @@ try {
       'pre-model', NULL, 'OPENAI_RESPONSES',
       'fghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcde',
       NOW() + INTERVAL '1 hour'),
+    -- Cross-wired graph: the target serves a different provider model than
+    -- the binding records. (A target that is merely not, or no longer, a
+    -- member of the pool is not an audit failure: membership is checked when
+    -- a binding is written, and follow-ups re-list the members live.)
     ('pre-invalid-cross-wire', NOW(), NOW(), 'owner-b', 'pre-provider-token',
       'pre-invalid-cross-wire-digest', 3, 'pre-provider-pool', 'pre-other-provider-target',
-      'pre-provider-account', 'pre-other-provider-model', 'https://pre.example.test/v1', 1,
-      'pre-other-model', NULL, 'OPENAI_RESPONSES',
+      'pre-provider-account', 'pre-provider-model', 'https://pre.example.test/v1', 1,
+      'pre-model', NULL, 'OPENAI_RESPONSES',
       'ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdef',
       NOW() + INTERVAL '1 hour');
 
@@ -995,6 +999,18 @@ try {
     invalidatedBinding.rows[0]?.current_version !== 2
   ) {
     throw new Error("Provider endpoint change did not preserve an invalidated binding snapshot");
+  }
+  // Pool membership is a write-time invariant of a v3 binding: removing the
+  // member it was written against is a normal operation (follow-ups re-list
+  // members live), so it must not block the next hardening apply.
+  await client.query(`DELETE FROM pool_member WHERE id = 'sticky-provider-member'`); // policy: bounded-delete
+  await client.query(sql);
+  const bindingsAfterMemberRemoval = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id IN ('sticky-provider-binding', 'grantee-provider-binding')
+  `);
+  if (bindingsAfterMemberRemoval.rows[0]?.count !== 2) {
+    throw new Error("Re-applied hardening changed v3 bindings after their member was removed");
   }
   await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`); // policy: bounded-delete
   const deletedTokenBinding = await client.query(`

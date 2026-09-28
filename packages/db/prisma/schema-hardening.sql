@@ -1204,17 +1204,12 @@ BEGIN
            target."userId" IS DISTINCT FROM record."userId"
            OR pool."userId" IS NOT DISTINCT FROM record."userId"
            OR record."poolGrantId" IS NULL))
-         OR (record."fallbackRoute" IS DISTINCT FROM 'own-key' AND (
-         pool."userId" IS DISTINCT FROM target."userId"
-         OR NOT EXISTS (
-           SELECT 1 FROM pool_member member
-            WHERE member."poolId" = record."targetModelPoolId"
-              AND member."executionTargetId" = record."selectedExecutionTargetId"
-              AND member.tier IN (
-                'PRIMARY'::"PoolMemberTier",
-                'PUBLIC_OVERFLOW'::"PoolMemberTier"
-              )
-         )))
+         -- Membership is checked only when the binding is written (the row
+         -- is immutable afterwards, and follow-up routing re-lists the pool's
+         -- members live). Removing a member or changing its tier is a normal
+         -- operation, so it is not re-audited here.
+         OR (record."fallbackRoute" IS DISTINCT FROM 'own-key'
+           AND pool."userId" IS DISTINCT FROM target."userId")
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
