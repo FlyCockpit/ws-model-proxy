@@ -7,6 +7,7 @@ import { AttachmentStrip } from "./attachment-strip";
 import type { ChatMessage } from "./chat-test-types";
 import { MessageActions } from "./message-actions";
 import { MetricsRow } from "./metrics-row";
+import { RouteChip } from "./route-chip";
 import { ThinkingPanel } from "./thinking-panel";
 import { TransformDebugPanel } from "./transform-debug-panel";
 
@@ -61,6 +62,7 @@ export function ChatMessageView({
       {isAssistant && message.thinking ? (
         <ThinkingPanel thinking={message.thinking} streaming={message.status === "streaming"} />
       ) : null}
+      {isAssistant && message.route ? <RouteChip route={message.route} /> : null}
       {isAssistant && message.metrics ? <MetricsRow metrics={message.metrics} /> : null}
       {isAssistant && message.transformDebug ? (
         <TransformDebugPanel debug={message.transformDebug} />

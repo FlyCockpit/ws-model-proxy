@@ -589,6 +589,7 @@ describe("public overflow compatibility", () => {
         return [];
       }),
       ...consentTx(order),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn(async () => ({
           id: identity.credentialId,
@@ -621,6 +622,7 @@ describe("public overflow compatibility", () => {
       endpointVersion: 1,
       concurrencyLimit: null,
       providerVersion: null,
+      dataCollectionPolicy: null,
       baseUrl: "https://provider.example",
       authType: "BEARER" as const,
       healthStatus: "HEALTHY" as const,
@@ -661,7 +663,7 @@ describe("public overflow compatibility", () => {
     );
     order.push("network-may-start");
 
-    expect(claim).toEqual({ claimed: true, secret: "provider-secret" });
+    expect(claim).toEqual({ claimed: true, secret: "provider-secret", dataCollectionPolicy: null });
     // E0 send boundary: consent rows FOR SHARE in the canonical order, read
     // under those locks, then the provider account/credential lifecycle locks,
     // the durable claim, and commit, all before any network I/O.
@@ -732,6 +734,7 @@ describe("public overflow compatibility", () => {
           return [];
         }),
         ...consentTx(order, change),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
         providerCredential: { findFirst: vi.fn(), update: vi.fn() },
       };
       db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
@@ -812,6 +815,7 @@ describe("public overflow compatibility", () => {
             return [];
           }),
           ...consent,
+          providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
           providerCredential: { findFirst: vi.fn(), update: vi.fn() },
         };
         db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
@@ -879,6 +883,7 @@ describe("public overflow compatibility", () => {
             if (strings.join("").includes("FROM provider_account")) banned = true;
             return mockRequesterValidityQuery(strings, values, rows);
           }),
+          providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
           providerCredential: {
             findFirst: vi
               .fn()
@@ -927,6 +932,7 @@ describe("public overflow compatibility", () => {
         mockRequesterValidityQuery(strings, values, tx),
       ),
       ...consentTx([]),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(null),
         update: vi.fn(),
@@ -956,6 +962,7 @@ describe("public overflow compatibility", () => {
             endpointVersion: 1,
             concurrencyLimit: null,
             providerVersion: null,
+            dataCollectionPolicy: null,
             baseUrl: "https://provider.example",
             authType: "BEARER",
             healthStatus: "HEALTHY",
@@ -1408,6 +1415,7 @@ function claimTarget() {
     endpointVersion: 1,
     concurrencyLimit: null,
     providerVersion: null,
+    dataCollectionPolicy: null,
     baseUrl: "https://provider.example",
     authType: "BEARER" as const,
     healthStatus: "HEALTHY" as const,
@@ -1472,3 +1480,8 @@ it("keeps unrecognized gateway cache/cost metadata conservative without changing
     categoriesComplete: false,
   });
 });
+
+/** The provider account row the send claim re-reads for the D9 policy. */
+function claimPrivacyAccount() {
+  return { providerType: "openai", allowDataCollection: false };
+}

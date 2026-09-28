@@ -148,9 +148,11 @@ local-member fix, are in [`release-notes/next.md`](release-notes/next.md).
   grant procedures (oRPC and MCP) no longer take `publicEgressAcknowledged` or
   `publicEgressEnabled`; unknown arguments are stripped, so old clients
   silently lose them. Use `fallbackEnabled`, `fallbackForGrantees`, and
-  `externalAfterWaitMs` on the pool procedures. Over MCP, `fallbackEnabled` and
-  `fallbackForGrantees` are rejected (a person changes them in the dashboard),
-  and the guarded pool tool creates local-only pools. A new
+  `externalAfterWaitMs` on the pool procedures. Over MCP, the general pool
+  tools reject `fallbackEnabled` and `fallbackForGrantees`; change them with
+  `forwarder_pool_fallback_update` (literal `mcp:write`, no confirmation, cost
+  stated in its description, every change audited). The guarded pool tool
+  creates local-only pools. A new
   `externalAfterWaitMs` must not exceed the pool's local wait budget; a save
   that does not change it is never rejected because of it. The guarded pool wizard also strips the old arguments and rejects provider models
   at the PRIMARY tier.
@@ -206,6 +208,33 @@ while the switch is off is blocked in the UI with feedback. Saved choices
 remain intact. While deployment flags load, the UI shows skeletons; a failed
 fetch shows a retry state. Secrets are never returned.
 
+
+## OpenRouter privacy (`data_collection: "deny"`)
+
+Every request WMP sends to an **OpenRouter** provider account carries
+OpenRouter's provider-routing preference `provider: { data_collection: "deny" }`.
+OpenRouter then routes only to upstream providers that do not store or train
+on prompts. This covers owner-paid pool fallback and own-key (BYOK) traffic,
+native pass-through and adapted requests alike. Other provider types never get
+the field. If the rendered body already has a `provider` object, its other keys
+are kept and `data_collection` is overwritten, so a caller cannot relax it.
+
+Each OpenRouter account has the setting **Allow OpenRouter providers that may
+collect data** (off by default) on the Providers page. The owner sets it for
+owner-paid accounts; grantees set it on their own accounts. It is human-only:
+MCP cannot change it, and MCP cannot move an OpenRouter account to another
+provider type either (that would drop the preference, which is keyed on the
+type). Changing an account's provider type in the dashboard resets the setting
+to off. Turning it off takes effect for requests not yet sent: the send step
+re-reads it under the account lock. Changes are recorded as `ACCOUNT_UPDATED`
+provider audit events.
+
+With `deny` on, some models (often `:free` ones) have no eligible provider.
+OpenRouter then answers 404 ("No endpoints found matching your data policy");
+WMP returns **503** with code `provider_data_policy_unavailable` and a message
+that names the cause, instead of the bare 404 (an OpenAI error object, or an
+Anthropic `api_error` envelope on the Messages surface). Choose another model or allow
+data collection on that account.
 
 ## Own-key routing (BYOK)
 

@@ -24,6 +24,7 @@ import {
   searchCatalog,
   stableJson,
 } from "../lib/provider-catalog-model";
+import { isOpenRouterProviderType } from "../lib/provider-type";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 /**
@@ -32,7 +33,6 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
  * procedure is excluded from MCP (see MCP_TOOL_EXCLUSIONS).
  */
 
-const OPENROUTER_PROVIDER_TYPE = "openrouter";
 const CATALOG_SOURCE = "OPENROUTER_CATALOG";
 const CATALOG_ACCOUNTING_VERSION = "provider-billable-v1";
 
@@ -416,7 +416,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
             select: { id: true, providerType: true },
           });
           if (!account) throw missing();
-          if (account.providerType !== OPENROUTER_PROVIDER_TYPE)
+          if (!isOpenRouterProviderType(account.providerType))
             throw new ORPCError("BAD_REQUEST", {
               message: "Catalog import needs an OpenRouter provider account.",
               data: { reason: providerCatalogReasons.notOpenRouter },

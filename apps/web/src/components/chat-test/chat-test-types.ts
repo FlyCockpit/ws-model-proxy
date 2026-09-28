@@ -61,6 +61,17 @@ export type TransformDebug = {
   error: string | null;
 };
 
+/** Which route served one assistant turn (from the `x-wsmp-*` response headers). */
+export type ChatRouteInfo = {
+  route: "local" | "pool-fallback" | "own-key" | null;
+  /** Provider model that answered; external routes only. */
+  servedModel: string | null;
+  /** Why the request left the local members, e.g. `local_wait_expired`. */
+  fallbackReason: string | null;
+  /** `:external` was asked for but no external route could serve it. */
+  externalUnavailable: boolean;
+};
+
 export type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -71,6 +82,7 @@ export type ChatMessage = {
   attachments?: ChatAttachment[];
   metrics?: ChatTimingMetrics;
   transformDebug?: TransformDebug;
+  route?: ChatRouteInfo;
   thinking?: string;
 };
 

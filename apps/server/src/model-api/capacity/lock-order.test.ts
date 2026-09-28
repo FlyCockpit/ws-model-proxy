@@ -96,10 +96,12 @@ const PROVIDER_WRITER_INVENTORY = {
     // take budget advisories. createModel uses a fresh id; updateModel takes
     // L0 -> account -> model -> L2/L5. deleteAccount/Model are account-first.
     // Five pricing procedures use lockPricingParents. Repair-request audit
-    // is an autocommit INSERT, holding no other lock.
+    // is an autocommit INSERT, holding no other lock. setAllowDataCollection
+    // (D9) holds the account FOR UPDATE before its write and audit, exactly
+    // like setAccountEnabled.
     "providerAccount.create": 1,
     "providerAccount.update": 2,
-    "providerAccount.updateMany": 4,
+    "providerAccount.updateMany": 5,
     "providerModel.create": 1,
     "providerModel.update": 2,
     "providerModel.updateMany": 3,
@@ -107,7 +109,14 @@ const PROVIDER_WRITER_INVENTORY = {
     "providerPricingVersion.update": 3,
     "providerPricingVersion.updateMany": 1,
     "providerPricingVersion.delete": 1,
-    "providerAuditEvent.create": 21,
+    "providerAuditEvent.create": 22,
+  },
+  "packages/api/src/lib/pool-fallback-settings.ts": {
+    // POOL_FALLBACK_UPDATED (issue #67): written inside the pool write
+    // transaction after the model_pool row lock (L1). providerAccountId is
+    // null, so the insert's only FK lock is KEY SHARE on the owner's user row,
+    // after L1, matching the L1 -> L7 order; no provider row is touched.
+    "providerAuditEvent.create": 1,
   },
   "packages/api/src/routers/provider-catalog.ts": {
     // Existing/restore: L0 -> account -> advisory -> model -> pricing;

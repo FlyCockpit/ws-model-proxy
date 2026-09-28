@@ -144,6 +144,21 @@
         "xhigh": "Muy alto",
         "max": "Máximo"
       }
+    },
+    "route": {
+      "local": "Local",
+      "poolFallback": "Respaldo del pool · {{model}}",
+      "ownKey": "Tu clave · {{model}}",
+      "unknownModel": "modelo desconocido",
+      "externalUnavailable": "Externo no disponible",
+      "reasonLabel": "Motivo: {{reason}}",
+      "reasons": {
+        "local_wait_expired": "los miembros locales siguieron ocupados después del límite de espera",
+        "no_local_member": "no había un miembro local compatible disponible",
+        "local_context_ceiling": "la solicitud superó el límite de contexto local",
+        "local_failure": "el intento local falló",
+        "other": "{{reason}}"
+      }
     }
   },
   "clis": {
@@ -522,6 +537,24 @@
       "failed": "No se pudieron guardar los ajustes de respaldo. Inténtalo de nuevo.",
       "enableBlockedDeployment": "No puedes activar el respaldo ni la cobertura para usuarios con acceso compartido mientras los proveedores externos estén desactivados en esta implementación.",
       "granteesHint": "Tú pagas los cargos del proveedor de las personas con quienes compartes este pool. Sus solicitudes aún necesitan :external y un token que permita proveedores externos."
+    },
+    "fallbackHistory": {
+      "title": "Historial de cambios de respaldo",
+      "empty": "Aún no hay cambios de respaldo registrados.",
+      "failed": "No se pudo cargar el historial de cambios de respaldo.",
+      "sourceMcp": "Cambiado por un cliente MCP",
+      "sourceDashboard": "Cambiado en el panel",
+      "sourceUnknown": "Cambiado",
+      "change": "{{field}}: {{before}} → {{after}}",
+      "on": "activado",
+      "off": "desactivado",
+      "unset": "sin definir (pool nuevo)",
+      "milliseconds": "{{value}} ms",
+      "fields": {
+        "fallbackEnabled": "Respaldo externo",
+        "fallbackForGrantees": "También para usuarios con acceso compartido",
+        "externalAfterWaitMs": "Espera antes de usar proveedores externos"
+      }
     },
     "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación. Aún puedes desactivar el respaldo y la cobertura para usuarios con acceso compartido y cambiar los tiempos de espera; activarlos no está disponible hasta que se habiliten los proveedores.",
     "fallbackEmpty": "Aún no hay proveedores de respaldo. Sin ellos, las solicitudes fallan cuando los miembros locales están a capacidad máxima o no son saludables, incluso con :external.",
@@ -1011,7 +1044,8 @@
       "PRICING_ACTIVATED": "Precios activados",
       "PRICING_RETIRED": "Precios retirados",
       "PRICING_DELETED": "Precios eliminados",
-      "ACCOUNTING_REPAIR_REQUESTED": "Reparación contable solicitada"
+      "ACCOUNTING_REPAIR_REQUESTED": "Reparación contable solicitada",
+      "POOL_FALLBACK_UPDATED": "Respaldo del grupo actualizado"
     },
     "table": {
       "time": "Hora",
@@ -1023,7 +1057,12 @@
     "disabledDeployment": "Los proveedores externos están deshabilitados en esta implementación. Las cuentas guardadas y los detalles de las claves siguen disponibles; puedes revocar claves y eliminar configuración. La creación, edición y pruebas de credenciales están deshabilitadas.",
     "externalFallbackHint": "Habilita “Permitir respaldo externo” en la configuración de respaldo del pool antes de agregar un proveedor. Los modelos de proveedores nunca atienden nombres simples de pools.",
     "externalRequestHint": "Solo las solicitudes <pool>:external con permiso del token pueden usar estos proveedores cuando los miembros locales no pueden atenderlas. Se aplican cargos del proveedor.",
-    "accessSummary": "Accesos compartidos al pool: {{grants}}. Tokens que incluyen este pool: {{tokens}}. El acceso externo también requiere el consentimiento del token y la configuración del pool para usuarios con acceso compartido."
+    "accessSummary": "Accesos compartidos al pool: {{grants}}. Tokens que incluyen este pool: {{tokens}}. El acceso externo también requiere el consentimiento del token y la configuración del pool para usuarios con acceso compartido.",
+    "dataCollection": {
+      "label": "Permitir proveedores de OpenRouter que pueden recopilar datos",
+      "deniedHint": "Desactivado: las solicitudes llevan data_collection: \"deny\", así que OpenRouter solo usa proveedores que no guardan los prompts ni entrenan con ellos. Algunos modelos pueden quedarse sin proveedor.",
+      "allowedHint": "Activado: OpenRouter puede enviar solicitudes a proveedores que guardan los prompts o entrenan con ellos."
+    }
   },
   "publication": {
     "unpublished": "Sin publicar"
@@ -1151,7 +1190,7 @@
       "NO_IMAGE_INPUT": "No acepta imágenes, pero este pool sí",
       "NO_REASONING": "Sin razonamiento, pero este pool lo admite",
       "UNKNOWN_PRICE": "Precio desconocido o variable",
-      "FREE_MODEL": "Modelo gratuito: los prompts pueden registrarse o usarse para entrenamiento, y tiene sus propios límites de uso",
+      "FREE_MODEL": "Modelo gratuito: los prompts pueden registrarse o usarse para entrenamiento, y tiene sus propios límites de uso. Con la recopilación de datos denegada (el valor predeterminado), OpenRouter puede no encontrar proveedor.",
       "EXPIRING": "Programado para retirarse",
       "MODERATED": "Moderado: las respuestas pueden filtrarse"
     },

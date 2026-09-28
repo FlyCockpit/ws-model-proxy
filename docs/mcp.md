@@ -185,6 +185,48 @@ ceremonial confirmation. The exact per-tool policy is in the
 [coverage artifact](./mcp-tool-coverage.md); the wrapper strips the
 confirmation field before the underlying procedure runs.
 
+## External fallback tools
+
+`forwarder_pool_fallback_get` (read) returns a pool's external-fallback state.
+Owners get `fallbackEnabled`, `fallbackForGrantees`, `externalAfterWaitMs`,
+`externalEquivalentModel`, the external members in fallback order and the
+aggregate own-key request count. Grantees get whether owner-paid fallback is
+available to them (provider types only, never the owner's account labels) and
+their own-key route.
+
+`forwarder_pool_fallback_update` (write, literal `mcp:write`, no confirmation
+literal) changes `fallbackEnabled`, `fallbackForGrantees` and
+`externalAfterWaitMs`. These settings cost money: turning fallback on sends
+`:external` requests to the owner's paid provider accounts, and
+`fallbackForGrantees` makes the owner pay for every grantee's external use.
+The tool description states this. The procedure applies the same checks as the
+dashboard (deployment switch, audited protection policy on every external
+member, wait within the local budget), and every change, from MCP or the
+dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
+(`metadata.source` is `mcp` or `dashboard`), readable with
+`provider_audit_events_list` (`poolId` filters one pool's history) and shown
+as the fallback change history on the pool's Fallback tab in the dashboard.
+The tool description also lists the preconditions an agent otherwise sees only
+as "Invalid input". The general pool tools reject the two switches and point to
+this tool; they still accept `externalAfterWaitMs`, and their descriptions
+state its cost.
+
+Still human-only: token external consent (`allowExternal`, `includeExternal`),
+own-key preferences, the pool external-equivalent picker, catalog search,
+the OpenRouter "providers that may collect data" account setting, and moving
+an OpenRouter account to another provider type (`provider_account_update`
+refuses it, since the privacy preference is keyed on the type).
+
+No tool output can contain a secret value WMP holds (provider API keys,
+encrypted credential material, token secrets or hashes, device-flow and 2FA
+backup codes). Projections pick safe fields, a recursive redactor removes
+secret-bearing keys and product credentials under any key, and the serializer
+elides byte values. A test drives every tool with secret-laden results and
+searches the output for every seeded secret value in every encoding. The CLI
+command tools return what a command printed on your own CLI device (behind the
+separate `allowCliCommands` consent); WMP credentials in that text are
+scrubbed, but other device content is returned as printed.
+
 ## Tool errors
 
 A failed tool call returns `isError: true`, a short stable text, and

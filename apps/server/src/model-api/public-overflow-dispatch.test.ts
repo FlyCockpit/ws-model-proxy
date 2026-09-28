@@ -779,6 +779,7 @@ describe("consent withdrawn between the dispatch-entry read and the send claim",
         lockedSql.push(strings.join("?").replace(/\s+/g, " "));
         return [];
       }),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(credential),
         update: vi.fn().mockResolvedValue({ id: credential.id }),
@@ -916,6 +917,7 @@ describe("requester validity lapsing during the send claim's provider-lock wait"
         if (strings.join("?").includes("FROM provider_account")) onAccountLock();
         return [];
       }),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(credential),
         update: vi.fn().mockResolvedValue({ id: credential.id }),
@@ -1029,6 +1031,7 @@ describe("send-claim failures before provider I/O", () => {
           throw new Error("canceling statement due to lock timeout");
         return [];
       }),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi
           .fn()
@@ -1395,6 +1398,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1529,6 +1533,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1628,6 +1633,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -1713,6 +1719,7 @@ describe("public overflow terminal response dispatch", () => {
         $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
           mockRequesterValidityQuery(strings, values, consentDelegates()),
         ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -1888,6 +1895,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential",
@@ -1993,6 +2001,7 @@ describe("public overflow terminal response dispatch", () => {
         $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
           mockRequesterValidityQuery(strings, values, consentDelegates()),
         ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -2079,6 +2088,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-heartbeat",
@@ -2200,6 +2210,7 @@ describe("public overflow terminal response dispatch", () => {
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, consentDelegates()),
       ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue({
           id: "credential-cancel",
@@ -2263,6 +2274,7 @@ describe("public overflow terminal response dispatch", () => {
         $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
           mockRequesterValidityQuery(strings, values, consentDelegates()),
         ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -2339,6 +2351,7 @@ describe("public overflow terminal response dispatch", () => {
         $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
           mockRequesterValidityQuery(strings, values, consentDelegates()),
         ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
         providerCredential: {
           findFirst: vi.fn().mockResolvedValue({
             id: "credential-heartbeat",
@@ -2474,6 +2487,7 @@ describe("own-key dispatch and authoritative send claim", () => {
         if (sql.includes("FOR ")) locks.push(sql);
         return mockRequesterValidityQuery(strings, values, consentDelegates());
       }),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
       providerCredential: {
         findFirst: vi.fn().mockResolvedValue(model.ProviderAccount.CurrentCredential),
         update: vi.fn().mockResolvedValue({}),
@@ -2682,3 +2696,239 @@ describe("own-key dispatch and authoritative send claim", () => {
     expect(providerHttpsRequest).not.toHaveBeenCalled();
   });
 });
+
+describe("OpenRouter data_collection privacy (D9)", () => {
+  function poolFor(providerType: string, allowDataCollection: boolean) {
+    const pool = dispatchPoolFixture("openai", "openai-chat", providerType);
+    const model = pool.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+    Object.assign(model, { healthStatus: "HEALTHY", healthNextRetryAt: null });
+    Object.assign(model.ProviderAccount, {
+      allowDataCollection,
+      healthStatus: "HEALTHY",
+      healthNextRetryAt: null,
+    });
+    return pool;
+  }
+
+  async function dispatchWith({
+    providerType,
+    allowDataCollection,
+    claimAllowDataCollection = allowDataCollection,
+    body,
+    status = 200,
+    responseBody = '{"choices":[]}',
+  }: {
+    providerType: string;
+    allowDataCollection: boolean;
+    /** The account's setting when the send claim re-reads it under its lock. */
+    claimAllowDataCollection?: boolean;
+    body: string;
+    status?: number;
+    responseBody?: string;
+  }) {
+    providerHttpsRequest.mockReset();
+    db.modelPool.findFirst.mockResolvedValue(poolFor(providerType, allowDataCollection));
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: {
+        findFirst: vi
+          .fn()
+          .mockResolvedValue({ providerType, allowDataCollection: claimAllowDataCollection }),
+      },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from(responseBody)]);
+    Object.assign(upstream, {
+      statusCode: status,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(),
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode(body),
+      signal: new AbortController().signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    const sent = providerHttpsRequest.mock.calls[0]?.[1] as { body?: Uint8Array } | undefined;
+    const sentBody = sent?.body
+      ? (JSON.parse(new TextDecoder().decode(sent.body)) as Record<string, unknown>)
+      : undefined;
+    return { result, sentBody };
+  }
+
+  it("sends provider.data_collection deny to OpenRouter by default", async () => {
+    const { result, sentBody } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: false,
+      body: '{"model":"pool","messages":[]}',
+    });
+    expect(result.dispatched).toBe(true);
+    expect(sentBody).toMatchObject({
+      model: "upstream-model",
+      provider: { data_collection: "deny" },
+    });
+  });
+
+  it("keeps the caller's other provider keys but never lets it relax deny", async () => {
+    const { sentBody } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: false,
+      body: '{"model":"pool","provider":{"order":["a"],"data_collection":"allow"}}',
+    });
+    expect(sentBody?.provider).toEqual({ order: ["a"], data_collection: "deny" });
+  });
+
+  it("leaves the body alone when the account allows data collection", async () => {
+    const { sentBody } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: true,
+      body: '{"model":"pool","messages":[]}',
+    });
+    expect(sentBody).toEqual({ model: "upstream-model", messages: [] });
+  });
+
+  it("never adds the field for other provider types", async () => {
+    for (const providerType of ["openai", "openai-compatible"]) {
+      const { sentBody } = await dispatchWith({
+        providerType,
+        allowDataCollection: false,
+        body: '{"model":"pool","messages":[]}',
+      });
+      expect(sentBody).toEqual({ model: "upstream-model", messages: [] });
+    }
+  });
+
+  it("maps OpenRouter's data-policy 404 to a clear 503", async () => {
+    const { result } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: false,
+      body: '{"model":"pool"}',
+      status: 404,
+      responseBody:
+        '{"error":{"message":"No endpoints found matching your data policy (Free model training). Configure: https://openrouter.ai/settings/privacy","code":404}}',
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(result.dataPolicyRefusal).toBe(true);
+    expect(result.response.status).toBe(503);
+    const payload = (await result.response.json()) as { error: { code: string; message: string } };
+    expect(payload.error.code).toBe("provider_data_policy_unavailable");
+    expect(payload.error.message).toContain('data_collection: "deny"');
+    await result.terminal;
+  });
+
+  it("passes other OpenRouter 404s through unchanged", async () => {
+    const original = '{"error":{"message":"Model not found","code":404}}';
+    const { result } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: false,
+      body: '{"model":"pool"}',
+      status: 404,
+      responseBody: original,
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(result.dataPolicyRefusal).toBeUndefined();
+    expect(result.response.status).toBe(404);
+    expect(await result.response.text()).toBe(original);
+  });
+
+  it("applies an opt-out withdrawn after listing, read under the send-claim lock", async () => {
+    const { result, sentBody } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: true,
+      claimAllowDataCollection: false,
+      body: '{"model":"pool","provider":{"order":["a"],"data_collection":"allow"}}',
+    });
+    expect(result.dispatched).toBe(true);
+    expect(sentBody?.provider).toEqual({ order: ["a"], data_collection: "deny" });
+  });
+
+  it("maps the data-policy 404 for a deny added at the send claim", async () => {
+    const { result } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: true,
+      claimAllowDataCollection: false,
+      body: '{"model":"pool"}',
+      status: 404,
+      responseBody: '{"error":{"message":"No endpoints found matching your data policy"}}',
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(result.dataPolicyRefusal).toBe(true);
+    expect(result.response.status).toBe(503);
+    await result.terminal;
+  });
+
+  it("never sends when a deny added at the send claim cannot be carried", async () => {
+    const { result } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: true,
+      claimAllowDataCollection: false,
+      body: "[1,2,3]",
+    });
+    expect(result.dispatched).toBe(false);
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+  });
+
+  it("never relaxes a deny rendered at listing when the account opts in before the claim", async () => {
+    const { sentBody } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: false,
+      claimAllowDataCollection: true,
+      body: '{"model":"pool","messages":[]}',
+    });
+    expect(sentBody?.provider).toEqual({ data_collection: "deny" });
+  });
+
+  it("does not map a data-policy 404 when the account allows data collection", async () => {
+    const original =
+      '{"error":{"message":"No endpoints found matching your data policy","code":404}}';
+    const { result } = await dispatchWith({
+      providerType: "openrouter",
+      allowDataCollection: true,
+      body: '{"model":"pool"}',
+      status: 404,
+      responseBody: original,
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(result.response.status).toBe(404);
+    expect(await result.response.text()).toBe(original);
+  });
+});
+
+/** The provider account row the send claim re-reads for the D9 policy. */
+function claimPrivacyAccount() {
+  return { providerType: "openai", allowDataCollection: false };
+}

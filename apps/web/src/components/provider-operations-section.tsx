@@ -6,6 +6,7 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { PROVIDER_PRIVATE_NETWORK_REJECTED } from "@ws-model-proxy/api/lib/provider-egress";
 import { PROVIDER_PRESET_BASE_URL } from "@ws-model-proxy/api/lib/provider-protocol";
+import { isOpenRouterProviderType } from "@ws-model-proxy/api/lib/provider-type";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -561,6 +562,12 @@ export function ProviderOperationsSection() {
       onError: () => toast.error(t("dashboard:providers.feedback.enableFailed")),
     }),
   );
+  const setAllowDataCollection = useMutation(
+    orpc.providerManagement.setAllowDataCollection.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
   const updateModel = useMutation(
     orpc.providerManagement.updateModel.mutationOptions({
       onSuccess: () => invalidate(),
@@ -952,6 +959,37 @@ export function ProviderOperationsSection() {
                 </div>
               </div>
 
+              {isOpenRouterProviderType(selected.providerType) ? (
+                <div className="rounded-xl border p-4">
+                  <label className="flex min-h-11 items-center gap-3 text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      className="size-5"
+                      checked={selected.allowDataCollection}
+                      disabled={!providerEgressEnabled || setAllowDataCollection.isPending}
+                      aria-describedby={`data-collection-${selected.id}`}
+                      onChange={(event) =>
+                        setAllowDataCollection.mutate({
+                          id: selected.id,
+                          allowDataCollection: event.target.checked,
+                        })
+                      }
+                    />
+                    {t("dashboard:providers.dataCollection.label")}
+                  </label>
+                  <p
+                    id={`data-collection-${selected.id}`}
+                    className="mt-1 text-xs text-muted-foreground"
+                  >
+                    {t(
+                      selected.allowDataCollection
+                        ? "dashboard:providers.dataCollection.allowedHint"
+                        : "dashboard:providers.dataCollection.deniedHint",
+                    )}
+                  </p>
+                </div>
+              ) : null}
+
               {providerEgressEnabled ? (
                 <UpdateAccountForm
                   key={`account-${selected.id}-${selected.updatedAt.toString()}`}
@@ -1170,7 +1208,7 @@ export function ProviderOperationsSection() {
                 ) : null}
               </div>
 
-              {providerEgressEnabled && selected.providerType === "openrouter" ? (
+              {providerEgressEnabled && isOpenRouterProviderType(selected.providerType) ? (
                 <ProviderCatalogImport providerAccountId={selected.id} />
               ) : null}
 

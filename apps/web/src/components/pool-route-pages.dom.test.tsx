@@ -19,10 +19,12 @@ const state = vi.hoisted(() => ({
   capacities: [] as Array<Record<string, unknown>>,
   nextReject: null as { name: string; error: unknown } | null,
   mutationCalls: [] as Array<{ name: string; variables: unknown }>,
+  fallbackAudits: [] as Array<Record<string, unknown>>,
+  auditQueryInputs: [] as unknown[],
 }));
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -150,6 +152,15 @@ vi.mock("@/utils/orpc", () => {
         grantPoolAccessByEmail: mutation(),
         revokePoolAccessByEmail: mutation(),
       },
+      providerManagement: {
+        listAuditEvents: {
+          key: () => ["providerManagement", "listAuditEvents"],
+          queryOptions: (options?: { input?: unknown }) => {
+            state.auditQueryInputs.push(options?.input);
+            return query("poolFallbackAudits", () => state.fallbackAudits).queryOptions();
+          },
+        },
+      },
       capacityManagement: {
         key: () => ["capacityManagement"],
         list: deferredQuery("capacities", () => state.capacities),
@@ -199,6 +210,8 @@ afterEach(() => {
   state.capacities = [];
   state.nextReject = null;
   state.mutationCalls = [];
+  state.fallbackAudits = [];
+  state.auditQueryInputs = [];
   vi.mocked(toast.error).mockClear();
 });
 
@@ -354,6 +367,48 @@ describe("dedicated pool pages", () => {
     ).toBe("2000");
   });
 
+  it("shows the pool's fallback change history with its source (C1b-3)", () => {
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.fallbackAudits = [
+      {
+        id: "audit-1",
+        createdAt: new Date("2026-09-28T12:00:00Z"),
+        action: "POOL_FALLBACK_UPDATED",
+        subjectId: "pool-1",
+        providerAccountId: null,
+        metadata: {
+          source: "mcp",
+          changes: { fallbackForGrantees: { before: false, after: true } },
+        },
+      },
+    ];
+    mount(<PoolDetailPage poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.fallbackHistory.title")).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.fallbackHistory\.sourceMcp/)).toBeTruthy();
+    expect(screen.getAllByText("dashboard:pools.fallbackHistory.change")).toHaveLength(1);
+    // Scoped to this pool: never the owner's whole audit trail.
+    expect(state.auditQueryInputs).toContainEqual({ poolId: "pool-1", limit: 20 });
+    expect(
+      state.auditQueryInputs.every((input) => (input as { poolId?: string }).poolId === "pool-1"),
+    ).toBe(true);
+  });
+
   describe("fallback settings form", () => {
     const fallbackPool = () => ({
       id: "pool-1",
@@ -410,6 +465,24 @@ describe("dedicated pool pages", () => {
       await waitFor(() => expect(updateCalls()).toHaveLength(1));
       // The stored external wait is not re-sent, so it can never fail this save.
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
+    });
+
+    it("refreshes the fallback change history after a save (C2a-2)", async () => {
+      const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.forGrantees" }),
+      );
+      submit();
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({
+          queryKey: ["providerManagement", "listAuditEvents"],
+        }),
+      );
+      invalidate.mockRestore();
     });
 
     it("enables fallback in one save without a grantee confirmation", async () => {

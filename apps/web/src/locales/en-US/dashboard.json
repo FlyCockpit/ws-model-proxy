@@ -206,7 +206,22 @@
     "stop": "Stop",
     "title": "Chat Test",
     "transcript": "Chat transcript",
-    "user": "User"
+    "user": "User",
+    "route": {
+      "local": "Local",
+      "poolFallback": "Pool fallback · {{model}}",
+      "ownKey": "Your key · {{model}}",
+      "unknownModel": "unknown model",
+      "externalUnavailable": "External unavailable",
+      "reasonLabel": "Reason: {{reason}}",
+      "reasons": {
+        "local_wait_expired": "local members stayed busy past the wait limit",
+        "no_local_member": "no compatible local member was available",
+        "local_context_ceiling": "the request exceeded the local context limit",
+        "local_failure": "the local attempt failed",
+        "other": "{{reason}}"
+      }
+    }
   },
   "deploymentFeatures": {
     "unavailable": "Not available on this deployment.",
@@ -522,6 +537,24 @@
       "failed": "Could not save fallback settings. Try again.",
       "enableBlockedDeployment": "Turning fallback or grantee coverage on is unavailable while external providers are disabled for this deployment.",
       "granteesHint": "You pay provider charges for people you share this pool with. Their requests still need :external and a token that allows external providers."
+    },
+    "fallbackHistory": {
+      "title": "Fallback change history",
+      "empty": "No fallback changes recorded yet.",
+      "failed": "Fallback change history could not be loaded.",
+      "sourceMcp": "Changed by an MCP client",
+      "sourceDashboard": "Changed in the dashboard",
+      "sourceUnknown": "Changed",
+      "change": "{{field}}: {{before}} → {{after}}",
+      "on": "on",
+      "off": "off",
+      "unset": "not set (new pool)",
+      "milliseconds": "{{value}} ms",
+      "fields": {
+        "fallbackEnabled": "External fallback",
+        "fallbackForGrantees": "Also for grantees",
+        "externalAfterWaitMs": "Wait before going external"
+      }
     },
     "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment. You can still turn fallback and grantee coverage off and change wait times; turning them on is unavailable until providers are enabled.",
     "fallbackEmpty": "No fallback providers yet. Without them, requests fail when your local members are at capacity or unhealthy, even with :external.",
@@ -1100,7 +1133,8 @@
       "PRICING_ACTIVATED": "Pricing activated",
       "PRICING_RETIRED": "Pricing retired",
       "PRICING_DELETED": "Pricing deleted",
-      "ACCOUNTING_REPAIR_REQUESTED": "Accounting repair requested"
+      "ACCOUNTING_REPAIR_REQUESTED": "Accounting repair requested",
+      "POOL_FALLBACK_UPDATED": "Pool fallback updated"
     },
     "table": {
       "time": "Time",
@@ -1112,7 +1146,12 @@
     "disabledDeployment": "External providers are disabled on this deployment. Stored accounts and key details remain available; you can revoke keys and delete configuration. Creation, edits, and credential tests are disabled.",
     "externalFallbackHint": "Enable “Allow external fallback” in the pool’s Fallback settings before attaching a provider. Provider models never serve plain pool names.",
     "externalRequestHint": "Only <pool>:external requests with token permission can use these providers when local members cannot serve the request. Provider charges apply.",
-    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting."
+    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting.",
+    "dataCollection": {
+      "label": "Allow OpenRouter providers that may collect data",
+      "deniedHint": "Off: requests carry data_collection: \"deny\", so OpenRouter uses only providers that do not store or train on prompts. Some models may then have no provider.",
+      "allowedHint": "On: OpenRouter may route requests to providers that store or train on prompts."
+    }
   },
   "providerCatalog": {
     "presets": {
@@ -1151,7 +1190,7 @@
       "NO_IMAGE_INPUT": "No image input, but this pool accepts images",
       "NO_REASONING": "No reasoning, but this pool supports it",
       "UNKNOWN_PRICE": "Price unknown or variable",
-      "FREE_MODEL": "Free model: prompts may be logged or used for training, and it has its own rate limits",
+      "FREE_MODEL": "Free model: prompts may be logged or used for training, and it has its own rate limits. With data collection denied (the default), OpenRouter may find no provider for it.",
       "EXPIRING": "Scheduled for removal",
       "MODERATED": "Moderated: responses may be filtered"
     },
