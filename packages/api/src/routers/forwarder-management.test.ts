@@ -5930,6 +5930,13 @@ describe("metric routing procedures (S-B part 2)", () => {
           DiscoveredModel: null,
           ExecutionTarget: target("OLLAMA"),
         },
+        {
+          id: "m4",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
       ],
     });
     deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
@@ -5940,6 +5947,14 @@ describe("metric routing procedures (S-B part 2)", () => {
         engineState: "full_waiting",
         evaluatedAt: new Date(now - 1_000),
         expiresAt: new Date(now + 10_000),
+      },
+      {
+        poolMemberId: "m4",
+        verdict: "FULL",
+        ruleStates: [],
+        engineState: "full_kv",
+        evaluatedAt: new Date(now - 60_000),
+        expiresAt: new Date(now - 30_000),
       },
     ]);
     deep.cliDevice.findMany.mockResolvedValue([]);
@@ -5997,6 +6012,8 @@ describe("metric routing procedures (S-B part 2)", () => {
       kvFullThreshold: 0.5,
       effectiveKvFullThreshold: 0.5,
     });
+    // An expired snapshot row is not reported as the shared state.
+    expect(byId.get("m4")?.snapshotState).toBeNull();
     // Ollama has no engine signal.
     expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
   });

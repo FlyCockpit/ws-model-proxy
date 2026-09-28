@@ -366,6 +366,21 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
     expect(writes(h).at(-1)).toMatchObject({ verdict: "NONE", engineState: "clear" });
   });
 
+  it("rewrites at once when the reason changes although the verdict stays FULL", async () => {
+    const h = harness([engineMember("m1", "VLLM")]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ waiting: 2, waitingStreak: 2 })],
+    });
+    h.advance(1_000);
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ kvUsage: 0.99, receivedAt: h.now() })],
+    });
+    expect(writes(h).map((row) => row.engineState)).toEqual(["full_waiting", "full_kv"]);
+  });
+
   it("clears a FULL row when the reading goes stale (fail open)", async () => {
     const h = harness([engineMember("m1", "VLLM")]);
     const state = createRoutingEvaluationState("user-1", "device-1");

@@ -122,6 +122,13 @@ describe("evaluateEngineLoad", () => {
       full: false,
     },
     {
+      name: "llama with zero deferred and free slots is clear",
+      facts: { engineKind: "LLAMA_CPP", engineSlots: 4 },
+      reading: { slotsBusy: 1, deferred: 0 },
+      state: "clear",
+      full: false,
+    },
+    {
       name: "llama deferred > 0 is FULL",
       facts: { engineKind: "LLAMA_CPP", engineSlots: 4 },
       reading: { slotsBusy: 1, deferred: 1 },
