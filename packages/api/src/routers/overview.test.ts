@@ -471,6 +471,52 @@ describe("overviewRouter.metrics", () => {
     }
   });
 
+  it.each([
+    ["no saved own-key preference", true, []],
+    ["the provider egress switch off", false, [{ providerModelId: "pm-own" }]],
+  ])("omits the own-key route with %s", async (_label, egressEnabled, preferences) => {
+    const { env } = await import("@ws-model-proxy/env/server");
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = egressEnabled;
+    db.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        aggregate({
+          poolId: "byok-pool",
+          poolMemberId: "",
+          executionTargetId: "",
+          requests: 1n,
+        }),
+      ])
+      .mockResolvedValueOnce([]);
+    db.poolGrant.findMany.mockResolvedValue([
+      {
+        poolId: "byok-pool",
+        FallbackPreferences: preferences,
+        ModelPool: {
+          name: "BYOK GPUs",
+          slug: "byok-gpus",
+          fallbackEnabled: false,
+          fallbackForGrantees: false,
+          externalEquivalentModel: "qwen/qwen3-coder",
+          PoolMembers: [],
+        },
+        Owner: { slug: "bob" },
+      },
+    ]);
+    try {
+      const result = await client().metrics({ range: "24h" });
+      expect(result.sharedPools[0]).toMatchObject({
+        poolId: "byok-pool",
+        effectiveProviderEgress: false,
+        externalRoutes: [],
+      });
+    } finally {
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    }
+  });
+
   it("omits the own-key route when the pool declares no external equivalent", async () => {
     const { env } = await import("@ws-model-proxy/env/server");
     env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
