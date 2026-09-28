@@ -7,6 +7,7 @@ import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  cacheHolderWaitMsSchema,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
@@ -520,6 +521,7 @@ export const capacityManagementRouter = {
       z.object({
         modelPoolId: id,
         ...modelPoolCapacityPolicyFields,
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
         protocolAdaptationEnabled: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
       }),
@@ -546,6 +548,7 @@ export const capacityManagementRouter = {
               capacityWaitBudgetMs: true,
               capacityContextCeiling: true,
               capacityContextMargin: true,
+              cacheHolderWaitMs: true,
               protocolAdaptationEnabled: true,
               allowLossyDeveloperRoleCollapse: true,
               recommendedSurfaceOverride: true,

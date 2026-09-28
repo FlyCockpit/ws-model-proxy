@@ -13,6 +13,8 @@ import {
 import {
   allocateReservationSlots,
   candidateDeadlineAt,
+  candidateSchedules,
+  DEFERRED_MIN_ELIGIBLE_WINDOW_MS,
   isRetryableCapacityTransactionError,
   PostgresCapacityAdmissionStore,
   runCapacitySerializable,
@@ -41,6 +43,62 @@ describe("candidate wait budgets on the database clock", () => {
     expect(candidateDeadlineAt({ waitBudgetMs: 0 }, upper, now)).toEqual(now);
     expect(candidateDeadlineAt({ waitBudgetMs: null }, upper, now)).toEqual(upper);
     expect(candidateDeadlineAt({}, upper, now)).toEqual(upper);
+  });
+});
+
+describe("spill-over candidate schedules on the database clock", () => {
+  const now = new Date("2026-09-26T12:00:00.000Z");
+  const upper = new Date("2026-09-26T12:15:00.000Z");
+  const at = (ms: number) => new Date(now.getTime() + ms);
+
+  it("is identical to plain budgets when no candidate is deferred", () => {
+    expect(
+      candidateSchedules([{ waitBudgetMs: 0 }, { waitBudgetMs: 2_000 }, {}], upper, now),
+    ).toEqual([
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: at(2_000) },
+      { notBefore: null, deadlineAt: upper },
+    ]);
+  });
+
+  it("counts every budget from the latest notBefore and never ends before it", () => {
+    const [holder, cold] = candidateSchedules(
+      [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }],
+      upper,
+      now,
+    );
+    expect(cold).toEqual({ notBefore: at(1_500), deadlineAt: at(3_500) });
+    // The holder is eligible from now; its budget also ends spill + budget.
+    expect(holder).toEqual({ notBefore: null, deadlineAt: at(3_500) });
+  });
+
+  it("keeps a zero budget checkable for a short window at the spill instant", () => {
+    const schedules = candidateSchedules(
+      [{ waitBudgetMs: 0 }, { waitBudgetMs: 0, notBeforeMs: 1_000 }],
+      upper,
+      now,
+    );
+    expect(schedules.map(({ deadlineAt }) => deadlineAt)).toEqual([
+      at(1_000 + DEFERRED_MIN_ELIGIBLE_WINDOW_MS),
+      at(1_000 + DEFERRED_MIN_ELIGIBLE_WINDOW_MS),
+    ]);
+  });
+
+  it("caps notBefore at 30 s and at the candidate's absolute bound", () => {
+    expect(candidateSchedules([{ notBeforeMs: 90_000 }], upper, now)[0]?.notBefore).toEqual(
+      at(30_000),
+    );
+    const bound = at(500);
+    expect(candidateSchedules([{ notBeforeMs: 5_000, deadlineAt: bound }], upper, now)).toEqual([
+      { notBefore: bound, deadlineAt: bound },
+    ]);
+    // Garbage delays are treated as "not deferred".
+    expect(
+      candidateSchedules([{ notBeforeMs: Number.NaN }, { notBeforeMs: -5 }], upper, now),
+    ).toEqual([
+      { notBefore: null, deadlineAt: upper },
+      { notBefore: null, deadlineAt: upper },
+    ]);
   });
 });
 

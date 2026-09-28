@@ -90,6 +90,9 @@ export async function waitWithCapacityPolling({
   return { state: signal?.aborted ? "CANCELLED" : "EXPIRED" };
 }
 
+/** Terminal reason of a waiter whose member became unroutable while it queued. */
+export const MEMBER_UNROUTABLE_REASON = "member_unroutable";
+
 export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   constructor(
     private readonly db: Db = prisma,
@@ -310,7 +313,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             data: {
               state: "EXPIRED",
               terminalAt: observedAt,
-              terminalReason: "candidate_deadlines",
+              terminalReason: await noLiveCandidateReason(tx, existing.id),
             },
           });
           if (existing.relayRequestId)
@@ -335,6 +338,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           >`SELECT nextval('admission_enqueue_sequence') AS value`;
       const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
       if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
+      const schedules = existing
+        ? []
+        : candidateSchedules(resolvedCandidates, attempt.deadlineAt, now);
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -355,7 +361,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
             Waiters: {
-              create: resolvedCandidates.map((candidate) => ({
+              create: resolvedCandidates.map((candidate, index) => ({
                 userId: attempt.ownerId,
                 requestId: attempt.requestId,
                 attemptId: attempt.attemptId,
@@ -365,7 +371,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 poolId: attempt.poolId,
                 poolMemberId: candidate.poolMemberId,
                 candidateOrder: candidate.candidateOrder,
-                deadlineAt: candidateDeadlineAt(candidate, attempt.deadlineAt, now),
+                deadlineAt: schedules[index]!.deadlineAt,
+                notBefore: schedules[index]!.notBefore,
                 effectivePriority: candidate.priority,
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
                 effectiveConcurrencyScope: candidate.concurrencyScope,
@@ -392,28 +399,33 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           result: { state: "ADMITTED", lease: leaseHandle(refreshed.Lease) } as const,
           notify: capacityIds,
         };
-      if (!existing) {
-        const expiredNow = await tx.capacityWaiter.updateMany({
+      if (!existing)
+        await tx.capacityWaiter.updateMany({
           where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
           data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
         });
-        if (expiredNow.count > 0) {
-          const liveWaiters = await tx.capacityWaiter.count({
-            where: { admissionRequestId: request.id, state: "WAITING" },
+      // Every candidate of this request may have been terminalized in this
+      // pass: zero budgets of a new attempt, or members that became
+      // unroutable (grant-time re-check). Then the request moves on now
+      // instead of polling a request that can never be granted.
+      const liveWaiters = await tx.capacityWaiter.count({
+        where: { admissionRequestId: request.id, state: "WAITING" },
+      });
+      if (liveWaiters === 0) {
+        await tx.admissionRequest.update({
+          where: { id: request.id },
+          data: {
+            state: "EXPIRED",
+            terminalAt: now,
+            terminalReason: await noLiveCandidateReason(tx, request.id),
+          },
+        });
+        if (request.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: request.relayRequestId, admissionAttemptId: attempt.attemptId },
+            data: { admissionTerminalState: "EXPIRED" },
           });
-          if (liveWaiters === 0) {
-            await tx.admissionRequest.update({
-              where: { id: request.id },
-              data: { state: "EXPIRED", terminalAt: now, terminalReason: "candidate_deadlines" },
-            });
-            if (request.relayRequestId)
-              await tx.relayRequest.updateMany({
-                where: { id: request.relayRequestId, admissionAttemptId: attempt.attemptId },
-                data: { admissionTerminalState: "EXPIRED" },
-              });
-            return { result: { state: "EXPIRED" } as const, notify: capacityIds };
-          }
-        }
+        return { result: { state: "EXPIRED" } as const, notify: capacityIds };
       }
       return {
         result: { state: "WAITING", requestId: refreshed.id } as const,
@@ -527,6 +539,40 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         terminalReason: "candidate_deadline",
       },
     });
+    // Grant-time routability re-check (DB state only). The policy snapshot on
+    // a waiter is frozen at enqueue, but its member may have been drained,
+    // disabled, or (local members) zero-weighted or put into an UNHEALTHY
+    // cooldown while it
+    // queued. Such a waiter must neither be granted nor wait forever: it is
+    // terminalized here, even while the capacity is full, and its request
+    // expires on its own next poll when no live candidate remains (the other
+    // candidates keep waiting). The pool_member read is a plain subquery (no
+    // row lock), so it adds no lock-order edge; waiter rows are written under
+    // this capacity's L4 lock, like the deadline sweep above. CLI connection
+    // state is per process and stays a candidate-build / dispatch check.
+    await tx.capacityWaiter.updateMany({
+      where: {
+        capacityId,
+        state: "WAITING",
+        PoolMember: {
+          is: {
+            // Weight and pool-member health route PRIMARY (local) members
+            // only: external members are ordered by publicOrder with weight 0
+            // and use provider health, checked at dispatch.
+            OR: [
+              { routingStatus: { not: "ACTIVE" } },
+              { tier: "PRIMARY", weight: { lte: 0 } },
+              { tier: "PRIMARY", healthStatus: "UNHEALTHY", nextRetryAt: { gt: now } },
+            ],
+          },
+        },
+      },
+      data: {
+        state: "CANCELLED",
+        stateChangedAt: now,
+        terminalReason: MEMBER_UNROUTABLE_REASON,
+      },
+    });
     const capacity = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } });
     const activeLeases = await tx.capacityLease.findMany({
       where: { capacityId, state: "ACTIVE" },
@@ -617,7 +663,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     }
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
+    // Spill-over (saturation S-A): a waiter whose notBefore is still in the
+    // future (database clock) is not grantable yet, and it must not hold back
+    // anyone else either (the borrowing check below ignores it). Time passing
+    // is not a release event: the runtime re-polls every 100 ms and each poll
+    // re-runs this pass, so a deferred waiter becomes grantable on the first
+    // poll at or after its notBefore. The DRR scheduler only ever sees
+    // eligible waiters, so its cursor/deficits never advance for a deferred one.
+    const grantable = (entry: { notBefore: Date | null }) =>
+      !entry.notBefore || entry.notBefore <= now;
     for (const waiter of waiters) {
+      if (!grantable(waiter)) continue;
       const memberLimit = waiter.effectiveConcurrencyLimit;
       if (memberLimit !== null && memberLimit !== undefined) {
         const memberActive =
@@ -654,6 +710,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           : `direct:${entry.executionTargetId}`;
         return (
           entry.id !== waiter.id &&
+          grantable(entry) &&
           entry.effectivePriority > waiter.effectivePriority &&
           queuedOwner !== ownerKey &&
           (reservationsByOwner.get(queuedOwner) ?? 0) > (activeByOwner.get(queuedOwner) ?? 0) &&
@@ -1093,22 +1150,96 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 }
 
+/** Upper bound of one spill-over delay; matches the S4 cache-holder wait cap. */
+export const MAX_CANDIDATE_NOT_BEFORE_MS = 30_000;
+/**
+ * A deferred attempt's candidates stay eligible at least this long after the
+ * spill instant, so a zero budget ("admit only if free at the spill instant")
+ * is checked by at least one runtime poll (100 ms) instead of expiring at the
+ * very instant it becomes eligible.
+ */
+export const DEFERRED_MIN_ELIGIBLE_WINDOW_MS = 250;
+
+function boundedNotBeforeMs(candidate: { notBeforeMs?: number }): number {
+  const value = candidate.notBeforeMs;
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.min(MAX_CANDIDATE_NOT_BEFORE_MS, Math.max(0, Math.floor(value)));
+}
+
+/**
+ * Durable schedule of every candidate of a NEW attempt on the database clock
+ * (`now` is the in-transaction clock_timestamp()). Process clocks never decide
+ * a wait budget or a spill-over instant.
+ *
+ * - `notBefore` = now + notBeforeMs (null when not deferred), never later than
+ *   the candidate's absolute upper bound.
+ * - The spill instant is the latest notBefore of the attempt. Every wait
+ *   budget counts from it, so an `:external` caller's shortened budget E ends
+ *   at max(notBefore) + E and a deadline never precedes its notBefore.
+ */
+export function candidateSchedules<
+  C extends { deadlineAt?: Date; waitBudgetMs?: number | null; notBeforeMs?: number },
+>(
+  candidates: readonly C[],
+  attemptDeadlineAt: Date,
+  now: Date,
+): Array<{ notBefore: Date | null; deadlineAt: Date }> {
+  const notBefores = candidates.map((candidate) => {
+    const delayMs = boundedNotBeforeMs(candidate);
+    if (delayMs === 0) return null;
+    const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
+    const notBefore = new Date(now.getTime() + delayMs);
+    return notBefore < upperBound ? notBefore : upperBound;
+  });
+  const spillAt = new Date(
+    Math.max(now.getTime(), ...notBefores.map((notBefore) => notBefore?.getTime() ?? 0)),
+  );
+  return candidates.map((candidate, index) => {
+    const notBefore = notBefores[index] ?? null;
+    const deadlineAt = candidateDeadlineAt(candidate, attemptDeadlineAt, now, spillAt);
+    return {
+      notBefore,
+      deadlineAt: notBefore && deadlineAt < notBefore ? notBefore : deadlineAt,
+    };
+  });
+}
+
 /**
  * Effective candidate deadline on the database clock (`now` is the in-
  * transaction clock_timestamp()). Process clocks never decide a wait budget.
+ * `spillAt` (default `now`) is the attempt's latest notBefore; the budget
+ * counts from it (see {@link candidateSchedules}).
  */
 export function candidateDeadlineAt(
   candidate: { deadlineAt?: Date; waitBudgetMs?: number | null },
   attemptDeadlineAt: Date,
   now: Date,
+  spillAt: Date = now,
 ): Date {
   const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
   if (candidate.waitBudgetMs === undefined || candidate.waitBudgetMs === null) return upperBound;
   const budgetMs = Number.isFinite(candidate.waitBudgetMs)
     ? Math.max(0, Math.floor(candidate.waitBudgetMs))
     : 0;
-  const relative = new Date(now.getTime() + budgetMs);
+  const deferred = spillAt.getTime() > now.getTime();
+  const relative = new Date(
+    spillAt.getTime() + (deferred ? Math.max(budgetMs, DEFERRED_MIN_ELIGIBLE_WINDOW_MS) : budgetMs),
+  );
   return relative < upperBound ? relative : upperBound;
+}
+
+/**
+ * Request-level terminal reason once no candidate is live: `member_unroutable`
+ * when a grant-time re-check removed a candidate, else `candidate_deadlines`.
+ */
+async function noLiveCandidateReason(
+  tx: Prisma.TransactionClient,
+  admissionRequestId: string,
+): Promise<string> {
+  const unroutable = await tx.capacityWaiter.count({
+    where: { admissionRequestId, terminalReason: MEMBER_UNROUTABLE_REASON },
+  });
+  return unroutable > 0 ? MEMBER_UNROUTABLE_REASON : "candidate_deadlines";
 }
 
 function schedulerDeficits(value: Prisma.JsonValue): number[] {

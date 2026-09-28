@@ -2391,3 +2391,368 @@ integration("model API routes with real PostgreSQL capacity", () => {
     }
   }, 20_000);
 });
+
+/**
+ * Saturation S-A: spill-over `notBefore`, deadlines from the spill instant,
+ * and the grant-time routability re-check, all on the database clock.
+ */
+integration("PostgreSQL cache-holder spill-over and grant-time routability", () => {
+  type Db = ReturnType<typeof createPrismaClient>;
+  type Store = import("./postgres-store.js").PostgresCapacityAdmissionStore;
+
+  /** One pool whose members each sit on their own single-slot capacity. */
+  async function spillFixture(db: Db, memberCount: number) {
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Spill proof", email: `spill-${suffix}@example.test`, slug: `spill-${suffix}` },
+    });
+    const device = await db.cliDevice.create({
+      data: { userId: user.id, slug: `device-${suffix}` },
+    });
+    const endpoint = await db.endpoint.create({
+      data: { userId: user.id, cliDeviceId: device.id, slug: `endpoint-${suffix}`, label: "Spill" },
+    });
+    const pool = await db.modelPool.create({
+      data: { userId: user.id, slug: `pool-${suffix}`, name: "Spill pool" },
+    });
+    const members: Array<{ capacityId: string; executionTargetId: string; poolMemberId: string }> =
+      [];
+    for (let index = 0; index < memberCount; index++) {
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `spill-${index}-${suffix}`,
+          runtimeIdentityKey: `spill-${index}-${suffix}`,
+          runtimeModel: "spill-proof",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: user.id,
+          endpointId: endpoint.id,
+          upstreamModelId: `spill-${index}`,
+          encodedModelId: `spill-${index}-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const member = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: target.id },
+      });
+      members.push({
+        capacityId: capacity.id,
+        executionTargetId: target.id,
+        poolMemberId: member.id,
+      });
+    }
+    const attempt = (
+      name: string,
+      candidates: Array<{ member: number; notBeforeMs?: number; waitBudgetMs?: number | null }>,
+    ) => ({
+      requestId: `${name}-${suffix}`,
+      attemptId: `${name}-${suffix}`,
+      ownerId: user.id,
+      sourceKind: "POOL" as const,
+      poolId: pool.id,
+      basePriority: 16,
+      connectionOwner: "spill-proof",
+      deadlineAt: new Date(Date.now() + 10 * 60_000),
+      candidates: candidates.map((candidate, candidateOrder) => ({
+        ...members[candidate.member]!,
+        candidateOrder,
+        ...(candidate.notBeforeMs !== undefined ? { notBeforeMs: candidate.notBeforeMs } : {}),
+        ...(candidate.waitBudgetMs !== undefined ? { waitBudgetMs: candidate.waitBudgetMs } : {}),
+      })),
+    });
+    return { suffix, user, pool, members, attempt };
+  }
+
+  const poll = (store: Store, attempt: Parameters<Store["acquire"]>[0]) =>
+    store.acquire({ ...attempt, candidates: [] });
+  const dbNow = async (db: Db) =>
+    (await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`)[0]!.now;
+  const sleep = (milliseconds: number) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  it("keeps a free cold member ineligible until notBefore, then spills to it", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blocker = await store.acquire(fixture.attempt("blocker", [{ member: 0 }]));
+      expect(blocker.state).toBe("ADMITTED");
+      const before = await dbNow(db);
+      const request = fixture.attempt("continuation", [
+        { member: 0 },
+        { member: 1, notBeforeMs: 1_200 },
+      ]);
+      // Member 1 is FREE, but it is not the cache holder: no grant yet.
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      await expect(poll(store, request)).resolves.toMatchObject({ state: "WAITING" });
+      const waiters = await db.capacityWaiter.findMany({
+        where: { attemptId: request.attemptId },
+        orderBy: { candidateOrder: "asc" },
+      });
+      expect(waiters[0]!.notBefore).toBeNull();
+      const notBefore = waiters[1]!.notBefore!;
+      // Database clock: notBefore = clock_timestamp() + 1200 ms at enqueue.
+      expect(notBefore.getTime() - before.getTime()).toBeGreaterThanOrEqual(1_200);
+      expect(notBefore.getTime() - before.getTime()).toBeLessThan(1_200 + 5_000);
+      for (const waiter of waiters)
+        expect(waiter.deadlineAt!.getTime()).toBeGreaterThanOrEqual(notBefore.getTime());
+
+      await sleep(Math.max(0, notBefore.getTime() - (await dbNow(db)).getTime()) + 50);
+      const spilled = await poll(store, request);
+      expect(spilled.state).toBe("ADMITTED");
+      if (spilled.state !== "ADMITTED") throw new Error("Expected spill admission.");
+      expect(spilled.lease.poolMemberId).toBe(fixture.members[1]!.poolMemberId);
+      if (blocker.state === "ADMITTED") await store.release(blocker.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("grants the cache holder when it frees inside the window, never the deferred member", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-holder-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blocker = await store.acquire(fixture.attempt("blocker", [{ member: 0 }]));
+      if (blocker.state !== "ADMITTED") throw new Error("Expected blocker admission.");
+      const request = fixture.attempt("continuation", [
+        { member: 0 },
+        { member: 1, notBeforeMs: 20_000 },
+      ]);
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      // The holder frees: release's fill admits the continuation on it.
+      await store.release(blocker.lease);
+      const admitted = await poll(store, request);
+      expect(admitted.state).toBe("ADMITTED");
+      if (admitted.state !== "ADMITTED") throw new Error("Expected holder admission.");
+      expect(admitted.lease.poolMemberId).toBe(fixture.members[0]!.poolMemberId);
+      await store.release(admitted.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("counts every budget from the spill instant and keeps a zero budget checkable once", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { DEFERRED_MIN_ELIGIBLE_WINDOW_MS, PostgresCapacityAdmissionStore } = await import(
+      "./postgres-store.js"
+    );
+    const store = new PostgresCapacityAdmissionStore(db, "spill-budget-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blockers = [
+        await store.acquire(fixture.attempt("blocker-0", [{ member: 0 }])),
+        await store.acquire(fixture.attempt("blocker-1", [{ member: 1 }])),
+      ];
+      const request = fixture.attempt("external", [
+        { member: 0, waitBudgetMs: 0 },
+        { member: 1, waitBudgetMs: 400, notBeforeMs: 800 },
+      ]);
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      const [holder, cold] = await db.capacityWaiter.findMany({
+        where: { attemptId: request.attemptId },
+        orderBy: { candidateOrder: "asc" },
+      });
+      const spillAt = cold!.notBefore!.getTime();
+      // External deadline = max(notBefore) + E for every candidate; a zero
+      // budget still gets one short eligible window at the spill instant.
+      expect(cold!.deadlineAt!.getTime()).toBe(spillAt + 400);
+      expect(holder!.deadlineAt!.getTime()).toBe(spillAt + DEFERRED_MIN_ELIGIBLE_WINDOW_MS);
+      await sleep(Math.max(0, spillAt + 400 - (await dbNow(db)).getTime()) + 50);
+      await expect(poll(store, request)).resolves.toEqual({ state: "EXPIRED" });
+      for (const blocker of blockers)
+        if (blocker.state === "ADMITTED") await store.release(blocker.lease);
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("ignores a deferred higher-priority reservation owner when arbitrating borrowing", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "spill-borrow-proof");
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Spill borrow", email: `spill-borrow-${suffix}@example.test`, slug: suffix },
+    });
+    try {
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: suffix,
+          runtimeIdentityKey: suffix,
+          runtimeModel: "spill-borrow",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const device = await db.cliDevice.create({ data: { userId: user.id, slug: `d-${suffix}` } });
+      const endpoint = await db.endpoint.create({
+        data: { userId: user.id, cliDeviceId: device.id, slug: `e-${suffix}`, label: "Borrow" },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: user.id,
+          endpointId: endpoint.id,
+          upstreamModelId: "borrow",
+          encodedModelId: `borrow-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const reserved = await db.modelPool.create({
+        data: {
+          userId: user.id,
+          slug: `reserved-${suffix}`,
+          name: "Reserved",
+          capacityPriority: 20,
+          capacityReservedSlots: 1,
+        },
+      });
+      const borrower = await db.modelPool.create({
+        data: {
+          userId: user.id,
+          slug: `borrower-${suffix}`,
+          name: "Borrower",
+          capacityPriority: 16,
+          capacityBorrowPolicy: "WHEN_IDLE",
+        },
+      });
+      const reservedMember = await db.poolMember.create({
+        data: { poolId: reserved.id, executionTargetId: target.id },
+      });
+      const borrowerMember = await db.poolMember.create({
+        data: { poolId: borrower.id, executionTargetId: target.id },
+      });
+      const attempt = (name: string, pool: { id: string }, member: { id: string }, delay = 0) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "POOL" as const,
+        poolId: pool.id,
+        basePriority: 16,
+        connectionOwner: "spill-borrow",
+        deadlineAt: new Date(Date.now() + 60_000),
+        candidates: [
+          {
+            capacityId: capacity.id,
+            executionTargetId: target.id,
+            poolMemberId: member.id,
+            candidateOrder: 0,
+            ...(delay ? { notBeforeMs: delay } : {}),
+          },
+        ],
+      });
+      const deficitsBefore = (
+        await db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } })
+      ).schedulerDeficits;
+      // The reservation owner is deferred: it neither takes the free slot nor
+      // blocks the lower-priority borrower from borrowing it.
+      await expect(
+        store.acquire(attempt("reserved", reserved, reservedMember, 20_000)),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      const borrowed = await store.acquire(attempt("borrower", borrower, borrowerMember));
+      expect(borrowed.state).toBe("ADMITTED");
+      if (borrowed.state !== "ADMITTED") throw new Error("Expected borrowed admission.");
+      expect(borrowed.lease.borrowed).toBe(true);
+      // DRR state advanced only for the class that was actually granted.
+      const after = await db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } });
+      const deficits = after.schedulerDeficits as number[];
+      expect(deficitsBefore === null || Array.isArray(deficitsBefore)).toBe(true);
+      expect(deficits[20] ?? 0).toBe(0);
+      expect(after.schedulerCursor).not.toBe(20);
+      await store.release(borrowed.lease);
+    } finally {
+      await cleanupCapacityFixture(db, user.id);
+      await db.$disconnect();
+    }
+  });
+
+  it("terminalizes a queued waiter whose member is drained or disabled, without hanging", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const { MEMBER_UNROUTABLE_REASON, PostgresCapacityAdmissionStore } = await import(
+      "./postgres-store.js"
+    );
+    const store = new PostgresCapacityAdmissionStore(db, "spill-route-proof");
+    const fixture = await spillFixture(db, 2);
+    try {
+      const blockers = [
+        await store.acquire(fixture.attempt("blocker-0", [{ member: 0 }])),
+        await store.acquire(fixture.attempt("blocker-1", [{ member: 1 }])),
+      ];
+      if (blockers.some((blocker) => blocker.state !== "ADMITTED"))
+        throw new Error("Expected blockers to be admitted.");
+      const request = fixture.attempt("queued", [{ member: 0 }, { member: 1 }]);
+      await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+
+      // Member 1 drains while queued; its slot frees: the drained member must
+      // not be granted, and the request keeps waiting on member 0.
+      await db.poolMember.update({
+        where: { id: fixture.members[1]!.poolMemberId },
+        data: { routingStatus: "DRAINING" },
+      });
+      if (blockers[1]!.state === "ADMITTED") await store.release(blockers[1]!.lease);
+      await expect(poll(store, request)).resolves.toMatchObject({ state: "WAITING" });
+      const drained = await db.capacityWaiter.findFirstOrThrow({
+        where: { attemptId: request.attemptId, candidateOrder: 1 },
+      });
+      expect(drained).toMatchObject({
+        state: "CANCELLED",
+        terminalReason: MEMBER_UNROUTABLE_REASON,
+      });
+      expect(
+        await db.capacityLease.count({ where: { attemptId: request.attemptId, state: "ACTIVE" } }),
+      ).toBe(0);
+
+      // Member 0 is disabled while its capacity is still FULL: the request
+      // does not hang until its deadline; it expires on the next poll.
+      await db.poolMember.update({
+        where: { id: fixture.members[0]!.poolMemberId },
+        data: { routingStatus: "DISABLED" },
+      });
+      await expect(poll(store, request)).resolves.toEqual({ state: "EXPIRED" });
+      const terminal = await db.admissionRequest.findUniqueOrThrow({
+        where: { attemptId: request.attemptId },
+      });
+      expect(terminal).toMatchObject({
+        state: "EXPIRED",
+        terminalReason: MEMBER_UNROUTABLE_REASON,
+      });
+
+      // A member in an UNHEALTHY cooldown is likewise not granted.
+      await db.poolMember.update({
+        where: { id: fixture.members[0]!.poolMemberId },
+        data: {
+          routingStatus: "ACTIVE",
+          healthStatus: "UNHEALTHY",
+          nextRetryAt: new Date(Date.now() + 60_000),
+        },
+      });
+      if (blockers[0]!.state === "ADMITTED") await store.release(blockers[0]!.lease);
+      await expect(store.acquire(fixture.attempt("cooldown", [{ member: 0 }]))).resolves.toEqual({
+        state: "EXPIRED",
+      });
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  });
+});

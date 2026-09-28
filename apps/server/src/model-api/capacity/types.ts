@@ -9,12 +9,22 @@ export type AdmissionCandidate = {
   deadlineAt?: Date;
   /**
    * Candidate wait budget in milliseconds, measured on the DATABASE clock
-   * when the attempt is first persisted: the effective deadline is
-   * min(deadlineAt ?? attempt.deadlineAt, db_now + waitBudgetMs). 0 means
-   * "admit only if free in the creating transaction, else expire". Undefined
-   * or null means no budget (only the absolute bound applies).
+   * from the attempt's spill instant: the latest `notBefore` among its
+   * candidates (db_now when no candidate is deferred). The effective deadline
+   * is min(deadlineAt ?? attempt.deadlineAt, spillAt + waitBudgetMs). 0 means
+   * "admit only if free at the spill instant, else expire" (with no deferral:
+   * free in the creating transaction). Undefined or null means no budget
+   * (only the absolute bound applies).
    */
   waitBudgetMs?: number | null;
+  /**
+   * Spill-over delay (saturation S-A) in milliseconds, converted by the store
+   * to `notBefore = db_now + notBeforeMs` when the attempt is first persisted.
+   * The waiter is not granted (and does not take part in reservation-borrowing
+   * arbitration) before then. Undefined or 0 = eligible at once (the cache
+   * holder's own candidate, and every candidate without an affinity hit).
+   */
+  notBeforeMs?: number;
 };
 
 export type AdmissionAttempt = {

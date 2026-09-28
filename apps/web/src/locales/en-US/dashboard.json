@@ -429,7 +429,14 @@
         "affinityMaxRecords": "Maximum records per target",
         "affinityPrefixWeight": "Conversation prefix-depth weight",
         "affinityConversationWeight": "Conversation weight",
-        "affinityLoadPenaltyWeight": "Active-load penalty"
+        "affinityLoadPenaltyWeight": "Active-load penalty",
+        "cacheHolderWaitMs": "Wait for the cache holder"
+      },
+      "cacheHolderWait": {
+        "auto": "Automatic (re-prefill time saved, up to 30 s)",
+        "fixed": "Fixed (milliseconds; 0 turns it off)",
+        "valueLabel": "Cache-holder wait in milliseconds",
+        "hint": "When a continuation's prefix is warm on a busy member, other members are held back for this long so the warm member can take it. Automatic uses the member's measured prefill speed (2 s until it is measured). Maximum 30000 ms."
       }
     },
     "capacity": {
@@ -862,6 +869,7 @@
     "responseBytes": "Response bytes",
     "attempts": "Attempts",
     "affinity": "Affinity / score / depth",
+    "affinityWait": "waited {{ms}} ms for the cache holder",
     "status": "Status",
     "title": "Relay Metadata",
     "tokenPrefix": "Token prefix",

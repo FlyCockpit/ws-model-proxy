@@ -13,6 +13,27 @@ detection timing based on server configuration, making such a test nondeterminis
 shared CI. The injected proof deterministically verifies the same driver error codes, retry bound,
 and absence of state committed by failed attempts.
 
+## Spill-over `notBefore` and grant-time routability (saturation S-A)
+
+- A pool request whose prefix is warm on one member (the cache holder: best continuation
+  prefix depth, or a conversation match) defers every other candidate: the store sets
+  `CapacityWaiter.notBefore = clock_timestamp() + notBeforeMs` at enqueue (database clock,
+  capped at 30 s). A waiter before its `notBefore` is neither granted nor counted in the
+  reservation-borrowing arbitration, and the DRR scheduler never sees it.
+- Every wait budget of an attempt counts from its spill instant (the latest `notBefore`), so a
+  deadline never precedes `notBefore` and an `:external` caller leaves the local queue only at
+  `max(notBefore) + externalAfterWaitMs`. A deferred attempt keeps at least 250 ms of eligibility
+  so a zero budget is still checked once at the spill instant.
+- Time passing is not a release event and sends no notification: the runtime re-polls every
+  100 ms and each poll re-runs admission, so a deferred waiter becomes grantable on the first
+  poll at or after its `notBefore`.
+- At each admission pass (even while the capacity is full), waiters whose member is no longer
+  routable (`routingStatus` not ACTIVE; for PRIMARY members also `weight <= 0` or UNHEALTHY with a future
+  `nextRetryAt`; external members use provider health at dispatch)
+  are cancelled with `terminalReason = member_unroutable`; the request expires with that reason
+  once no candidate is left. The `pool_member` read is a plain subquery (no row lock), so it adds
+  no lock-order edge. CLI connection state is per process and remains a candidate-build and
+  dispatch check only.
 
 ## Lease ownership from admission to release (F2-CAP-1)
 

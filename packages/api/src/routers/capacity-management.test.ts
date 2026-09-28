@@ -363,6 +363,21 @@ describe("capacityManagementRouter", () => {
       };
     }
 
+    it("stores the cache-holder wait override and rejects values above 30 s", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ cacheHolderWaitMs: 1_500 }));
+      const client = createRouterClient(capacityManagementRouter, { context });
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", cacheHolderWaitMs: 1_500 }),
+      ).resolves.toBeTruthy();
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ cacheHolderWaitMs: 1_500 }) }),
+      );
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", cacheHolderWaitMs: 60_000 }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    });
+
     it("rejects disabling adaptation when the override only stays servable through it", async () => {
       db.modelPool.findUnique.mockResolvedValue(
         surfacePoolRow({ protocolAdaptationEnabled: true }),
