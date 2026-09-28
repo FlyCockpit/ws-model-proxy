@@ -944,6 +944,14 @@ escaped{v="a\"b"} 1
             Err(MetricSourceError::OutputTooLarge)
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+        // A command that keeps running after printing too much is stopped as
+        // soon as the limit is crossed, not at its timeout.
+        let started = Instant::now();
+        assert_eq!(
+            run_command("head -c 70000 /dev/zero; sleep 30", Duration::from_secs(20)),
+            Err(MetricSourceError::OutputTooLarge)
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[cfg(unix)]

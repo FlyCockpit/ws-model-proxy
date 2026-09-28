@@ -173,6 +173,15 @@ describe("evaluateRoutingRules", () => {
     expect(evaluation.verdict === "full").toBe(expected);
   });
 
+  it("keeps full until the freshest triggering full rule goes stale, whatever the rule order", () => {
+    const evaluation = evaluateRoutingRules(
+      [rule({ metric: "other" }), rule({})],
+      [series({ name: "other", value: 90, ageMs: 0 }), series({ value: 90, ageMs: 25_000 })],
+      NOW,
+    );
+    expect(evaluation.expiresAt).toEqual(at(30_000));
+  });
+
   it("keeps full while any triggering full rule is fresh", () => {
     const evaluation = evaluateRoutingRules(
       [rule({}), rule({ metric: "other" })],
