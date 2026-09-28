@@ -1171,7 +1171,7 @@
       "pricingUserKept": "Your own price stays active, so the catalog price was not applied.",
       "pricingUpdated": "The catalog price changed: the earlier catalog price was retired and the new one is active.",
       "pricingTiered": "Tiered pricing: imported the maximum rate for each parsed token category across the base price and override tiers. Non-token charges (such as web search) and unparsed token types (such as 1-hour cache writes and audio) are not covered.",
-      "pricingAsOf": "Catalog price as of {{time}}, when this server last fetched the OpenRouter catalog. OpenRouter's listing can lag its live prices by a few hours; check the price before relying on spend limits.",
+      "pricingAsOf": "Catalog price as of {{time}}, when this server last fetched the OpenRouter catalog. OpenRouter's listing can lag its live prices by up to about six hours; check the price before relying on spend limits.",
       "pricingScheduled": "A scheduled price already exists, so the catalog price was not applied.",
       "contextDrift": "The catalog lists a context window of {{catalog}} tokens; this model is set to {{current}}. Edit the model to change it."
     },

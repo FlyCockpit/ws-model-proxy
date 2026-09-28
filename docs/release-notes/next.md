@@ -89,4 +89,4 @@ observed on a real deployment. After deploying:
       `x-wsmp-route: pool-fallback`.
 - [ ] Both `relay_request` rows reach a terminal state (not `PENDING`), and
       their selected execution target belongs to the pool owner.
-- [ ] Record the result on issue #63.
+- [ ] Record the result on issue #92.

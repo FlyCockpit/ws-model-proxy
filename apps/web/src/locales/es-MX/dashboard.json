@@ -1171,7 +1171,7 @@
       "pricingUserKept": "Tu propio precio sigue activo, así que no se aplicó el precio del catálogo.",
       "pricingUpdated": "El precio del catálogo cambió: se retiró el precio anterior del catálogo y el nuevo está activo.",
       "pricingTiered": "Precios por niveles: se importó la tarifa máxima de cada categoría de tokens analizada entre el precio base y los niveles alternativos. No se cubren los cargos que no son por tokens (como búsquedas web) ni los tipos de tokens no analizados (como escrituras en caché de 1 hora y audio).",
-      "pricingAsOf": "Precio del catálogo al {{time}}, cuando este servidor obtuvo por última vez el catálogo de OpenRouter. El listado de OpenRouter puede ir unas horas por detrás de sus precios reales; revisa el precio antes de confiar en los límites de gasto.",
+      "pricingAsOf": "Precio del catálogo al {{time}}, cuando este servidor obtuvo por última vez el catálogo de OpenRouter. El listado de OpenRouter puede ir hasta unas seis horas por detrás de sus precios reales; revisa el precio antes de confiar en los límites de gasto.",
       "pricingScheduled": "Ya existe un precio programado, así que no se aplicó el precio del catálogo.",
       "contextDrift": "El catálogo indica una ventana de contexto de {{catalog}} tokens; este modelo tiene {{current}}. Edita el modelo para cambiarla."
     },

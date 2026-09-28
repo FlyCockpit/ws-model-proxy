@@ -290,6 +290,7 @@ describe("OverviewPage", () => {
           poolId: "shared-pool",
           available: true,
           effectiveProviderEgress: true,
+          externalRoutes: ["pool-fallback", "own-key"],
           name: "Team GPUs",
           slug: "team-gpus",
           ownerSlug: "alice",
@@ -316,9 +317,46 @@ describe("OverviewPage", () => {
     expect(
       within(shared).getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
     ).toBeTruthy();
+    // The shared-pool badge lists every route this viewer actually has.
+    await userEvent.click(
+      within(shared).getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    );
+    expect(
+      await screen.findByText("dashboard:pools.fallbackBadge.routePoolFallbackUnnamed"),
+    ).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackBadge.routeOwnKey")).toBeTruthy();
     expect(within(section).getByText("overview.shared.unavailable")).toBeTruthy();
     // Shared usage alone is traffic for the viewer: no empty-range message.
     expect(screen.queryByText("overview.empty.title")).toBeNull();
+  });
+
+  it("lists only the viewer's own-key route for a shared pool without pool fallback", async () => {
+    state.health = health({ clis: { total: 1, online: 1, offline: [] } });
+    state.metrics = metrics({
+      setup: { hasPools: true, hasDirectTargets: false },
+      sharedPools: [
+        {
+          poolId: "own-key-pool",
+          available: true,
+          effectiveProviderEgress: true,
+          externalRoutes: ["own-key"],
+          name: "BYOK GPUs",
+          slug: "byok-gpus",
+          ownerSlug: "bob",
+          current: stats({ requests: 3 }),
+          previous: stats(),
+        },
+      ],
+    });
+    renderPage();
+    const heading = await screen.findByRole("heading", { level: 2, name: "overview.shared.title" });
+    const section = heading.closest("section")!;
+    const row = within(section).getByText("BYOK GPUs").closest("tr")!;
+    await userEvent.click(
+      within(row).getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    );
+    expect(await screen.findByText("dashboard:pools.fallbackBadge.routeOwnKey")).toBeTruthy();
+    expect(screen.queryByText(/routePoolFallback/)).toBeNull();
   });
 
   it("persists the chosen range per viewer and refetches with it", async () => {

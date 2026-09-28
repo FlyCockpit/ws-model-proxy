@@ -380,11 +380,13 @@ describe("overviewRouter.metrics", () => {
     db.poolGrant.findMany.mockResolvedValue([
       {
         poolId: "shared-pool",
+        FallbackPreferences: [{ providerModelId: "pm-own" }],
         ModelPool: {
           name: "Team GPUs",
           slug: "team-gpus",
           fallbackEnabled: true,
           fallbackForGrantees: true,
+          externalEquivalentModel: "qwen/qwen3-coder",
           PoolMembers: [
             {
               tier: "PUBLIC_OVERFLOW",
@@ -408,6 +410,7 @@ describe("overviewRouter.metrics", () => {
         poolId: "shared-pool",
         available: true,
         effectiveProviderEgress: true,
+        externalRoutes: ["pool-fallback", "own-key"],
         name: "Team GPUs",
         ownerSlug: "alice",
         current: expect.objectContaining({ requests: 7, errors: 1 }),
@@ -416,12 +419,99 @@ describe("overviewRouter.metrics", () => {
         poolId: "revoked-pool",
         available: false,
         effectiveProviderEgress: false,
+        externalRoutes: [],
         name: null,
       }),
     ]);
     // Shared-pool usage is not traffic you serve.
     expect(result.totals.current.requests).toBe(0);
     expect(result.pools).toEqual([]);
+  });
+
+  it("lists a grantee's own-key route on shared pools even without pool fallback", async () => {
+    const { env } = await import("@ws-model-proxy/env/server");
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    db.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        aggregate({
+          poolId: "byok-pool",
+          poolMemberId: "",
+          executionTargetId: "",
+          requests: 1n,
+        }),
+      ])
+      .mockResolvedValueOnce([]);
+    db.poolGrant.findMany.mockResolvedValue([
+      {
+        poolId: "byok-pool",
+        FallbackPreferences: [{ providerModelId: "pm-own" }],
+        ModelPool: {
+          name: "BYOK GPUs",
+          slug: "byok-gpus",
+          fallbackEnabled: false,
+          fallbackForGrantees: false,
+          externalEquivalentModel: "qwen/qwen3-coder",
+          PoolMembers: [],
+        },
+        Owner: { slug: "bob" },
+      },
+    ]);
+    try {
+      const result = await client().metrics({ range: "24h" });
+      expect(result.sharedPools[0]).toMatchObject({
+        poolId: "byok-pool",
+        effectiveProviderEgress: true,
+        externalRoutes: ["own-key"],
+      });
+    } finally {
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    }
+  });
+
+  it("omits the own-key route when the pool declares no external equivalent", async () => {
+    const { env } = await import("@ws-model-proxy/env/server");
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    db.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        aggregate({
+          poolId: "no-equivalent-pool",
+          poolMemberId: "",
+          executionTargetId: "",
+          requests: 1n,
+        }),
+      ])
+      .mockResolvedValueOnce([]);
+    db.poolGrant.findMany.mockResolvedValue([
+      {
+        poolId: "no-equivalent-pool",
+        FallbackPreferences: [{ providerModelId: "pm-own" }],
+        ModelPool: {
+          name: "No Equivalent",
+          slug: "no-equivalent",
+          fallbackEnabled: false,
+          fallbackForGrantees: false,
+          externalEquivalentModel: null,
+          PoolMembers: [],
+        },
+        Owner: { slug: "bob" },
+      },
+    ]);
+    try {
+      const result = await client().metrics({ range: "24h" });
+      expect(result.sharedPools[0]).toMatchObject({
+        poolId: "no-equivalent-pool",
+        effectiveProviderEgress: false,
+        externalRoutes: [],
+      });
+    } finally {
+      env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    }
   });
 
   it.each([
