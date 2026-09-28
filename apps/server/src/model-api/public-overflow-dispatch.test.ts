@@ -110,8 +110,10 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 }));
 
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
+import openRouterUsageFixture from "./fixtures/openrouter-usage.json";
 import { claimProviderHealthTrial } from "./provider-attempt-runtime.js";
 import { admitProviderBudget } from "./provider-budget.js";
+import { providerBillableTokens } from "./provider-budget-accounting.js";
 import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
@@ -2596,6 +2598,36 @@ describe("own-key dispatch and authoritative send claim", () => {
       "pool_fallback_preference",
     ]);
   });
+  it("settles OpenRouter own-key usage to the requester below the reservation", async () => {
+    const { request, model } = setup();
+    model.ProviderAccount.providerType = "openrouter";
+    reconcileProviderBudget.mockClear();
+    providerHttpsRequest.mockReset().mockResolvedValue(
+      Object.assign(
+        Readable.from([Buffer.from(JSON.stringify(openRouterUsageFixture.nonStream))]),
+        {
+          statusCode: 200,
+          headers: { "content-type": "application/json" },
+          complete: true,
+        },
+      ),
+    );
+    const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
+    const result = await dispatchPublicOverflow({ ...request, liability });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+    const settled = reconcileProviderBudget.mock.calls[0]?.[0];
+    expect(settled).toMatchObject({
+      userId: "grantee",
+      poolId: undefined,
+      observationComplete: true,
+      usage: { categoriesComplete: true, cacheWriteTokens: 400n },
+    });
+    expect(providerBillableTokens(settled.usage)).toBe(1_280n);
+    expect(providerBillableTokens(settled.usage)! < liability.tokens).toBe(true);
+  });
   it.each([
     "token",
     "allowlist",
@@ -2681,4 +2713,93 @@ describe("own-key dispatch and authoritative send claim", () => {
     expect((await dispatchPublicOverflow(request)).dispatched).toBe(false);
     expect(providerHttpsRequest).not.toHaveBeenCalled();
   });
+});
+
+describe("OpenRouter owner-paid settlement", () => {
+  it.each([
+    { providerType: "openrouter", complete: true },
+    { providerType: "openai", complete: false },
+    { providerType: "openai-compatible", complete: false },
+  ])(
+    "settles $providerType usage to the pool owner (categoriesComplete $complete)",
+    async ({ providerType, complete }) => {
+      reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+      providerHttpsRequest.mockReset();
+      db.modelPool.findFirst.mockResolvedValue(
+        dispatchPoolFixture("openai", "openai-chat", providerType),
+      );
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      providerHttpsRequest.mockResolvedValueOnce(
+        Object.assign(
+          Readable.from([Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`)]),
+          {
+            statusCode: 200,
+            headers: { "content-type": "text/event-stream" },
+            complete: true,
+          },
+        ),
+      );
+      const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: `request-openrouter-${providerType}`,
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: true,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+        signal: new AbortController().signal,
+        liability,
+        requestedOutputTokens: 10n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      if (!result.dispatched) throw new Error("expected dispatch");
+      await result.response.text();
+      await result.terminal;
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      const settled = reconcileProviderBudget.mock.calls[0]?.[0];
+      expect(settled).toMatchObject({
+        userId: "owner",
+        poolId: "pool",
+        observationComplete: true,
+        usage: { categoriesComplete: complete },
+      });
+      const billed = providerBillableTokens(settled.usage);
+      if (complete) {
+        expect(billed).toBe(1_280n);
+        expect(billed! < liability.tokens).toBe(true);
+      } else {
+        // Fail closed: settlement keeps the full reservation (liability path).
+        expect(billed).toBeUndefined();
+      }
+    },
+  );
 });

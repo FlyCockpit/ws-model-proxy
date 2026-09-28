@@ -1,0 +1,53 @@
+{
+  "provenance": {
+    "kind": "synthetic-from-published-docs",
+    "derivedAt": "2026-09-28",
+    "sources": [
+      "https://openrouter.ai/docs/api-reference/overview",
+      "https://openrouter.ai/docs/use-cases/usage-accounting"
+    ],
+    "assertions": [
+      "ResponseUsage.total_tokens is documented as the sum of prompt_tokens and completion_tokens.",
+      "prompt_tokens_details.cached_tokens and cache_write_tokens are breakdowns of prompt_tokens (the usage-accounting example reports prompt_tokens 194 with cache_write_tokens 100 and total_tokens 196).",
+      "completion_tokens_details.reasoning_tokens is a breakdown of completion_tokens.",
+      "is_byok, cost_details and server_tool_use are metadata; cost is the charged credit amount."
+    ]
+  },
+  "nonStream": {
+    "id": "gen-fixture",
+    "object": "chat.completion",
+    "model": "vendor/model",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "stop",
+        "message": { "role": "assistant", "content": "fixture" }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 80,
+      "total_tokens": 1280,
+      "cost": 0.0021,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 600,
+        "cache_write_tokens": 400,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": null,
+        "upstream_inference_prompt_cost": 0.0015,
+        "upstream_inference_completions_cost": 0.0006
+      },
+      "completion_tokens_details": { "reasoning_tokens": 30, "image_tokens": 0 }
+    }
+  },
+  "stream": [
+    "data: {\"id\":\"gen-fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"vendor/model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"fixture\"},\"finish_reason\":null}]}",
+    "data: {\"id\":\"gen-fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"vendor/model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}",
+    "data: {\"id\":\"gen-fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"vendor/model\",\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":80,\"total_tokens\":1280,\"cost\":0.0021,\"is_byok\":true,\"prompt_tokens_details\":{\"cached_tokens\":600,\"cache_write_tokens\":400,\"audio_tokens\":0,\"video_tokens\":0},\"cost_details\":{\"upstream_inference_cost\":0.0019,\"upstream_inference_prompt_cost\":0.0014,\"upstream_inference_completions_cost\":0.0005,\"server_tool_cost\":null},\"completion_tokens_details\":{\"reasoning_tokens\":30,\"image_tokens\":0},\"server_tool_use\":{\"web_search_requests\":0}}}",
+    "data: [DONE]"
+  ]
+}

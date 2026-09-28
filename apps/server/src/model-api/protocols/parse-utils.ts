@@ -32,11 +32,17 @@ export function rejectUnknown(
 
 const MAX_LOGGED_FIELDS = 10;
 const MAX_LOGGED_FIELD_CHARS = 64;
+/** Distinct ignored names a stream's `seen` set records and logs. */
+export const MAX_LOGGED_FIELDS_PER_STREAM = 16;
+const STREAM_CAP_NOTICE = "\0capped";
 
 /**
  * Drop envelope keys that are not allowlisted. Log names only, and only when
  * one was ignored. Names come from upstream, so the log holds at most
  * MAX_LOGGED_FIELDS names of MAX_LOGGED_FIELD_CHARS each plus an omitted count.
+ * With a per-stream `seen` set, each distinct name is logged once, and only the
+ * first MAX_LOGGED_FIELDS_PER_STREAM names are recorded: after that one line
+ * notes the cap and later names are neither stored nor logged.
  */
 export function ignoreUnknownEnvelopeFields(
   value: Record<string, unknown>,
@@ -48,20 +54,28 @@ export function ignoreUnknownEnvelopeFields(
   const fields = Object.keys(value)
     .filter((key) => !set.has(key))
     .map((key) => key.slice(0, MAX_LOGGED_FIELD_CHARS));
+  let overflow = 0;
   const fresh = [...new Set(fields)].filter((field) => {
     if (!seen) return true;
     const key = `${path}\0${field}`;
     if (seen.has(key)) return false;
+    if (seen.size - (seen.has(STREAM_CAP_NOTICE) ? 1 : 0) >= MAX_LOGGED_FIELDS_PER_STREAM) {
+      overflow += 1;
+      return false;
+    }
     seen.add(key);
     return true;
   });
-  if (fresh.length === 0) return;
+  const capNotice = overflow > 0 && seen !== undefined && !seen.has(STREAM_CAP_NOTICE);
+  if (capNotice) seen.add(STREAM_CAP_NOTICE);
+  if (fresh.length === 0 && !capNotice) return;
   const logged = fresh.slice(0, MAX_LOGGED_FIELDS);
-  const omitted = fresh.length - logged.length;
+  const omitted = fresh.length - logged.length + (capNotice ? overflow : 0);
   console.debug("[model-api] ignored upstream envelope fields", {
     path,
     fields: logged,
     ...(omitted > 0 ? { omitted } : {}),
+    ...(capNotice ? { streamCapReached: MAX_LOGGED_FIELDS_PER_STREAM } : {}),
   });
 }
 
@@ -110,9 +124,33 @@ export function acceptChatEnvelopeExtras(
 }
 
 /**
+ * Choice-level keys that carry answer content in some Chat dialect (legacy
+ * completions `text`, a misplaced message body, or the other container). The
+ * adapter never reads them, so a non-empty value would silently drop answer
+ * text: reject it instead of ignoring it as envelope.
+ */
+const chatChoiceContentKeys = [
+  "text",
+  "content",
+  "refusal",
+  "tool_calls",
+  "function_call",
+  "message",
+  "delta",
+] as const;
+
+function carriesContent(value: unknown): boolean {
+  if (value === undefined || value === null || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+/**
  * `stop_reason` on a chat choice is an internal token id, not a protocol stop
  * reason, so any value is ignored. `token_ids` and `routed_experts` are absent
- * only when null. Other unknown choice keys are ignored.
+ * only when null. Content-bearing keys outside `contentKey` are rejected when
+ * non-empty (strict on content). Other unknown choice keys are ignored.
  */
 export function acceptChatChoiceExtras(
   choice: Record<string, unknown>,
@@ -120,6 +158,9 @@ export function acceptChatChoiceExtras(
   contentKey: "message" | "delta",
   seen?: Set<string>,
 ) {
+  for (const key of chatChoiceContentKeys)
+    if (key !== contentKey && carriesContent(choice[key]))
+      unsupported(`${path}.${key}`, `carries answer content outside ${contentKey}`);
   ignoreUnknownEnvelopeFields(
     choice,
     ["index", contentKey, "finish_reason", "logprobs", "stop_reason", ...chatChoiceNullFields],
@@ -191,6 +232,12 @@ type UsageFields = {
   nullable: readonly string[];
   /** Known detail objects (null means absent) and the counts validated inside. */
   details: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Where the surface reports cache reads and writes. `[key]` is a top-level
+   * count (an input part); `[detail, key]` is a count inside a detail object.
+   */
+  cacheRead?: readonly [string] | readonly [string, string];
+  cacheWrite?: readonly [string] | readonly [string, string];
 };
 
 const usageFields: Record<ProtocolSurface, UsageFields> = {
@@ -209,6 +256,7 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
         "rejected_prediction_tokens",
       ],
     },
+    cacheRead: ["prompt_tokens_details", "cached_tokens"],
   },
   "openai-responses": {
     input: "input_tokens",
@@ -220,6 +268,7 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
       input_tokens_details: ["cached_tokens"],
       output_tokens_details: ["reasoning_tokens"],
     },
+    cacheRead: ["input_tokens_details", "cached_tokens"],
   },
   "anthropic-messages": {
     // Anthropic `input_tokens` excludes cache reads and writes.
@@ -229,6 +278,8 @@ const usageFields: Record<ProtocolSurface, UsageFields> = {
     // Streamed `message_delta` usage may carry null input and cache counts.
     nullable: ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
     details: { cache_creation: ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] },
+    cacheRead: ["cache_read_input_tokens"],
+    cacheWrite: ["cache_creation_input_tokens"],
   },
 };
 
@@ -261,6 +312,15 @@ export type ProtocolUsageCounts = {
   output?: number;
   /** The surface's separately reported input counts, by field name. */
   inputParts: Record<string, number | undefined>;
+  /**
+   * Where cache reads and writes live among `inputParts` (Anthropic) or the
+   * validated detail counts (OpenAI). They are a subset of canonical input.
+   */
+  cacheRead?: number;
+  cacheWrite?: number;
+  /** Input-part names that carry the cache counts; merged stream counts use them. */
+  cacheReadPart?: string;
+  cacheWritePart?: string;
 };
 
 /**
@@ -287,11 +347,22 @@ export function parseProtocolUsageCounts(
   for (const key of fields.inputParts)
     inputParts[key] = usageCount(usage, key, path, nullable.has(key));
   if (fields.total) usageCount(usage, fields.total, path, false);
+  const detailCounts: Record<string, Record<string, number | undefined>> = {};
   for (const [key, counts] of Object.entries(fields.details)) {
     if (usage[key] === undefined || usage[key] === null) continue;
     const details = usageObject(usage[key], `${path}.${key}`);
-    for (const count of counts) usageCount(details, count, `${path}.${key}`, false);
+    detailCounts[key] = {};
+    for (const count of counts)
+      detailCounts[key][count] = usageCount(details, count, `${path}.${key}`, false);
   }
+  const cacheCount = (location: UsageFields["cacheRead"]) =>
+    location === undefined
+      ? undefined
+      : location.length === 1
+        ? inputParts[location[0]]
+        : detailCounts[location[0]]?.[location[1]];
+  const cacheRead = cacheCount(fields.cacheRead);
+  const cacheWrite = cacheCount(fields.cacheWrite);
   if (
     (required === "both" && (input === undefined || output === undefined)) ||
     (input === undefined && output === undefined)
@@ -301,13 +372,20 @@ export function parseProtocolUsageCounts(
     ...(input !== undefined ? { input } : {}),
     ...(output !== undefined ? { output } : {}),
     inputParts,
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    ...(fields.cacheRead?.length === 1 ? { cacheReadPart: fields.cacheRead[0] } : {}),
+    ...(fields.cacheWrite?.length === 1 ? { cacheWritePart: fields.cacheWrite[0] } : {}),
   };
 }
 
 /**
  * Canonical usage from validated counts: input is every input token processed
  * (the surface's input plus its separate input parts; an absent part is 0).
- * Undefined input stays undefined.
+ * Undefined input stays undefined. Cache reads and writes are carried as a
+ * subset of that input, only alongside it; counts naming an input part take the
+ * (possibly merged) part value. A split larger than the input is inconsistent
+ * and is dropped rather than rendered, so the inclusive input stays intact.
  */
 export function canonicalUsageFromCounts(
   counts: ProtocolUsageCounts,
@@ -327,9 +405,18 @@ export function canonicalUsageFromCounts(
       !Number.isSafeInteger(input + counts.output))
   )
     throw new AdapterError("invalid_usage", `${path} token counts overflow.`, path);
+  const cacheRead =
+    counts.cacheReadPart !== undefined ? counts.inputParts[counts.cacheReadPart] : counts.cacheRead;
+  const cacheWrite =
+    counts.cacheWritePart !== undefined
+      ? counts.inputParts[counts.cacheWritePart]
+      : counts.cacheWrite;
+  const splitConsistent = input !== undefined && (cacheRead ?? 0) + (cacheWrite ?? 0) <= input;
   return {
     ...(input !== undefined ? { inputTokens: input } : {}),
     ...(counts.output !== undefined ? { outputTokens: counts.output } : {}),
+    ...(splitConsistent && cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {}),
+    ...(splitConsistent && cacheWrite !== undefined ? { cacheWriteTokens: cacheWrite } : {}),
   };
 }
 

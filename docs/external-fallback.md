@@ -250,12 +250,18 @@ compatibility. Own-key durable records and headers use `own-key`.
 
 Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
-Audio rates bound both input/output and additional-token accounting. The shared
-usage parser supports existing token categories and direct cost, but does not
-normalize OpenRouter `cache_write_tokens`, `is_byok`, or `cost_details` metadata.
-Those unknown categories keep accounting on the conservative liability path.
-Complete OpenRouter usage normalization is deferred to a separate PR with
-provider-specific tests. Provider
+Audio rates bound both input/output and additional-token accounting.
+Usage from `openrouter` provider accounts is parsed with an OpenRouter-specific
+dialect: `prompt_tokens_details.cache_write_tokens` is settled as cache-write
+tokens (a subset of `prompt_tokens`, like `cached_tokens`) and priced at the
+imported cache-write rate; a missing cache-write rate leaves the calculated cost
+unknown. `is_byok`, `cost_details` (finite non-negative numbers or null) and
+`server_tool_use` are accepted as metadata only and never add tokens; `cost`
+stays the reported cost. `video_tokens` and `image_tokens` are accepted only
+when zero. Any other unrecognized or malformed field still keeps that response
+on the conservative liability path. Other provider types do not accept this
+vocabulary: the same payload from an `openai` or `*-compatible` account still
+fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices
 and token-based budgets are not a bound on the provider's total bill. The
 picker and import summary disclose this limitation.

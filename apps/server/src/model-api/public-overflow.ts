@@ -234,6 +234,8 @@ export interface PublicProviderTarget {
   supportsStreaming: boolean;
   supportedFeatures: readonly string[];
   capabilityInventory?: OpenAiCompatibleCapabilities | null;
+  /** Provider usage vocabulary for settlement; absent means the generic parser. */
+  usageDialect?: ProviderUsageDialect;
   /** Exact operation-aware resolver result carried through ranking and send. */
   resolvedExecution?: ProviderSurfaceExecution;
   credential: {
@@ -1007,6 +1009,7 @@ export async function listPublicOverflowTargets(
           authType: account.authType,
           healthStatus: model.healthStatus,
           nativeProtocols: nativeProtocols(model.nativeCapabilities),
+          usageDialect: providerUsageDialect(account.providerType),
           supportsStreaming: supportsStreaming(model.nativeCapabilities),
           supportedFeatures: supportedFeatures(model.nativeCapabilities),
           credential,
@@ -1170,7 +1173,67 @@ function exclusiveMany(
   return represented <= total ? total - represented : undefined;
 }
 
-export function usageFromObject(value: unknown): RawProviderUsage | undefined {
+/**
+ * Provider-specific usage vocabulary. `generic` is the shared parser every
+ * provider type uses; a dialect only widens the accepted vocabulary for the
+ * provider type that documents it, so other providers keep failing closed on
+ * the same keys (#62; a generic relaxation changed billing for all providers).
+ */
+export type ProviderUsageDialect = "generic" | "openrouter";
+
+export function providerUsageDialect(
+  providerType: string | null | undefined,
+): ProviderUsageDialect {
+  return providerType?.trim().toLowerCase() === "openrouter" ? "openrouter" : "generic";
+}
+
+/** OpenRouter `usage.cost_details` keys (credits/USD metadata, never tokens). */
+const OPENROUTER_COST_DETAIL_KEYS = new Set([
+  "upstream_inference_cost",
+  "upstream_inference_prompt_cost",
+  "upstream_inference_completions_cost",
+  "server_tool_cost",
+]);
+/** OpenRouter `usage.server_tool_use` counters: non-token charges outside token budgets. */
+const OPENROUTER_SERVER_TOOL_KEYS = new Set(["web_search_requests"]);
+
+function openRouterMetadataValid(usage: Record<string, unknown>): boolean {
+  if (
+    Object.hasOwn(usage, "is_byok") &&
+    usage.is_byok !== null &&
+    typeof usage.is_byok !== "boolean"
+  )
+    return false;
+  if (Object.hasOwn(usage, "cost_details") && usage.cost_details !== null) {
+    const details = usageRecord(usage.cost_details);
+    if (
+      !details ||
+      Object.entries(details).some(
+        ([key, item]) =>
+          !OPENROUTER_COST_DETAIL_KEYS.has(key) ||
+          (item !== null && (typeof item !== "number" || !Number.isFinite(item) || item < 0)),
+      )
+    )
+      return false;
+  }
+  if (Object.hasOwn(usage, "server_tool_use") && usage.server_tool_use !== null) {
+    const counters = usageRecord(usage.server_tool_use);
+    if (
+      !counters ||
+      Object.entries(counters).some(
+        ([key, item]) => !OPENROUTER_SERVER_TOOL_KEYS.has(key) || usageInteger(item) === undefined,
+      )
+    )
+      return false;
+  }
+  return true;
+}
+
+export function usageFromObject(
+  value: unknown,
+  dialect: ProviderUsageDialect = "generic",
+): RawProviderUsage | undefined {
+  const openRouter = dialect === "openrouter";
   if (!value || typeof value !== "object") return undefined;
   const root = value as Record<string, unknown>;
   // Responses terminal stream events nest the authoritative usage object in
@@ -1186,7 +1249,15 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   const cacheReadTokens = usageInteger(
     usage.cache_read_input_tokens ?? promptDetails?.cached_tokens,
   );
-  const cacheWriteTokens = usageInteger(usage.cache_creation_input_tokens);
+  // OpenRouter reports cache writes inside `prompt_tokens` (its documented
+  // `total_tokens` is the sum of prompt and completion tokens), exactly like
+  // `cached_tokens`, so they are subtracted from input below.
+  const openRouterCacheWriteTokens = openRouter
+    ? usageInteger(promptDetails?.cache_write_tokens)
+    : undefined;
+  const cacheWriteTokens = openRouter
+    ? (openRouterCacheWriteTokens ?? usageInteger(usage.cache_creation_input_tokens))
+    : usageInteger(usage.cache_creation_input_tokens);
   const reasoningTokens = usageInteger(completionDetails?.reasoning_tokens);
   const inputAudioTokens = usageInteger(promptDetails?.audio_tokens);
   const outputAudioTokens = usageInteger(completionDetails?.audio_tokens);
@@ -1201,9 +1272,8 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     usage.output_tokens_details !== undefined ||
     usage.prompt_tokens_details !== undefined ||
     usage.completion_tokens_details !== undefined;
-  const inputTokens = openAiShape
-    ? exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens])
-    : promptTotal;
+  const promptSubsets = [cacheReadTokens, inputAudioTokens, openRouterCacheWriteTokens];
+  const inputTokens = openAiShape ? exclusiveMany(promptTotal, promptSubsets) : promptTotal;
   const outputTokens = openAiShape
     ? exclusiveMany(completionTotal, [
         reasoningTokens,
@@ -1258,6 +1328,8 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     "currency",
     "pricing_version",
   ]);
+  if (openRouter)
+    for (const key of ["is_byok", "cost_details", "server_tool_use"]) knownUsageKeys.add(key);
   const knownPromptDetailKeys = new Set(["cached_tokens", "audio_tokens"]);
   const knownCompletionDetailKeys = new Set([
     "reasoning_tokens",
@@ -1265,6 +1337,32 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     "accepted_prediction_tokens",
     "rejected_prediction_tokens",
   ]);
+  // OpenRouter always emits `video_tokens` / `image_tokens` breakdowns. They
+  // have no priced category here, so only an explicit zero is accepted; a
+  // positive count keeps the observation incomplete (fail closed).
+  const openRouterZeroOnlyDetails = [
+    [promptDetails, "video_tokens"],
+    [completionDetails, "image_tokens"],
+  ] as const;
+  if (openRouter) {
+    knownPromptDetailKeys.add("cache_write_tokens");
+    knownPromptDetailKeys.add("video_tokens");
+    knownCompletionDetailKeys.add("image_tokens");
+  }
+  const hasOpenRouterUnknown =
+    openRouter &&
+    (!openRouterMetadataValid(usage) ||
+      // Two cache-write spellings in one observation are ambiguous.
+      (promptDetails !== undefined &&
+        Object.hasOwn(promptDetails, "cache_write_tokens") &&
+        Object.hasOwn(usage, "cache_creation_input_tokens")) ||
+      (promptDetails !== undefined &&
+        Object.hasOwn(promptDetails, "cache_write_tokens") &&
+        openRouterCacheWriteTokens === undefined) ||
+      openRouterZeroOnlyDetails.some(
+        ([details, key]) =>
+          details !== undefined && Object.hasOwn(details, key) && details[key] !== 0,
+      ));
   const hasUnknownUsageCategory = Object.keys(usage).some((key) => !knownUsageKeys.has(key));
   const hasUnknownPromptDetail =
     promptDetails !== undefined &&
@@ -1301,8 +1399,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     (key) => Object.hasOwn(usage, key) && usageInteger(usage[key]) === undefined,
   );
   const impossibleBreakdown =
-    (promptTotal !== undefined &&
-      exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens]) === undefined) ||
+    (promptTotal !== undefined && exclusiveMany(promptTotal, promptSubsets) === undefined) ||
     (completionTotal !== undefined &&
       exclusiveMany(completionTotal, [
         reasoningTokens,
@@ -1311,6 +1408,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
         rejectedPredictionTokens,
       ]) === undefined);
   const hasUnknownCategories =
+    hasOpenRouterUnknown ||
     hasUnknownUsageCategory ||
     hasUnknownPromptDetail ||
     hasUnknownCompletionDetail ||
@@ -1360,6 +1458,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
 export function parseProviderUsage(
   chunks: readonly Uint8Array[],
   pricing?: ProviderPricingSchedule,
+  dialect: ProviderUsageDialect = "generic",
 ) {
   if (chunks.length === 0) return undefined;
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
@@ -1386,7 +1485,7 @@ export function parseProviderUsage(
   for (const candidate of candidates) {
     if (!candidate || candidate === "[DONE]") continue;
     try {
-      const observed = usageFromObject(JSON.parse(candidate));
+      const observed = usageFromObject(JSON.parse(candidate), dialect);
       if (observed) {
         if (observed.categoriesComplete === false) categoriesComplete = false;
         if (observed.rawUsage !== undefined) {
@@ -1640,6 +1739,7 @@ const MAX_RETRYABLE_PROVIDER_BODY_BYTES = 1024 * 1024;
 async function readRetryableProviderUsage(
   response: AsyncIterable<Uint8Array> & { complete: boolean; destroy(error?: Error): void },
   pricing?: ProviderPricingSchedule,
+  dialect: ProviderUsageDialect = "generic",
 ): Promise<RawProviderUsage | undefined> {
   const chunks: Uint8Array[] = [];
   let retainedBytes = 0;
@@ -1671,7 +1771,7 @@ async function readRetryableProviderUsage(
   } catch {
     return undefined;
   }
-  const usage = parseProviderUsage(chunks, pricing);
+  const usage = parseProviderUsage(chunks, pricing, dialect);
   return usage ? { ...usage, observationComplete: true } : undefined;
 }
 
@@ -2494,7 +2594,7 @@ export async function dispatchPublicOverflow(
         // Failed/rate-limited calls may still be billed. Consume only a strict
         // bounded body before retry, retaining raw usage/cost when present;
         // ambiguous, truncated, or oversized bodies keep conservative liability.
-        const retryUsage = await readRetryableProviderUsage(response, pricing);
+        const retryUsage = await readRetryableProviderUsage(response, pricing, target.usageDialect);
         const retryAfter = response.headers["retry-after"];
         providerFailure = {
           target,
@@ -2648,10 +2748,11 @@ export async function dispatchPublicOverflow(
           const tailUsage = parseProviderUsage(
             !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
             pricing,
+            target.usageDialect,
           );
           const initialUsage =
             responseBytes > 1024 * 1024
-              ? parseProviderUsage(initialUsageChunks, pricing)
+              ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
               : undefined;
           const combinedUsage = mergeProviderUsage(initialUsage, tailUsage, surface);
           const combinedCost =

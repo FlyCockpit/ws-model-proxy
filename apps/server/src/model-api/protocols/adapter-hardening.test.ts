@@ -1,9 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
+  adaptNonstreamResponse,
   CanonicalStreamParser,
+  CanonicalStreamRenderer,
   capabilityInventoryAcceptsTopK,
+  createProtocolAdaptationTransform,
   executionTargetAcceptsTopK,
+  executionTargetSupportsStreamUsage,
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
   type ReasoningRenderControl,
@@ -13,6 +17,7 @@ import {
   renderOpenAiResponsesRequest,
   renderProtocolResponse,
 } from "./index.js";
+import { ignoreUnknownEnvelopeFields, MAX_LOGGED_FIELDS_PER_STREAM } from "./parse-utils.js";
 
 describe("strict cross-surface rendering", () => {
   it("requires an explicit single-call policy whenever OpenAI tools are adapted", () => {
@@ -755,5 +760,259 @@ describe("Claude Code Anthropic request adaptation", () => {
         service_tier: "auto",
       }),
     ).toThrow(/service_tier/u);
+  });
+});
+
+describe("adapter follow-ups (#77)", () => {
+  const chatChunk = (choices: unknown[], extra: Record<string, unknown> = {}) =>
+    sse({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices, ...extra });
+  const thrownBy = (run: () => unknown) => {
+    try {
+      run();
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected a rejection");
+  };
+
+  it("rejects a delta-less finish chunk that carries legacy text", () => {
+    const parser = new CanonicalStreamParser("openai-chat");
+    parser.push(chatChunk([{ index: 0, delta: { content: "po" }, finish_reason: null }]));
+    expect(
+      thrownBy(() => parser.push(chatChunk([{ index: 0, text: "ng", finish_reason: "stop" }]))),
+    ).toMatchObject({ code: "unsupported_feature", parameter: "choices[0].text" });
+  });
+
+  it.each([
+    ["legacy text beside a delta", { delta: {}, text: "answer" }, "choices[0].text"],
+    [
+      "a message body in a stream chunk",
+      { delta: {}, message: { content: "x" } },
+      "choices[0].message",
+    ],
+    ["choice-level tool calls", { tool_calls: [{ id: "t" }] }, "choices[0].tool_calls"],
+  ])("rejects %s", (_label, choice, parameter) => {
+    const parser = new CanonicalStreamParser("openai-chat");
+    expect(
+      thrownBy(() => parser.push(chatChunk([{ index: 0, finish_reason: "stop", ...choice }]))),
+    ).toMatchObject({ parameter });
+  });
+
+  it.each([{ text: "" }, { text: null }, { message: null }, { tool_calls: [] }])(
+    "still completes a finish chunk with empty content-bearing key %j",
+    (extra) => {
+      const parser = new CanonicalStreamParser("openai-chat");
+      const events = [
+        ...parser.push(chatChunk([{ index: 0, delta: { content: "pong" }, finish_reason: null }])),
+        ...parser.push(chatChunk([{ index: 0, finish_reason: "stop", ...extra }])),
+        ...parser.push(bytes("data: [DONE]\n\n")),
+      ];
+      expect(events.at(-1)?.type).toBe("complete");
+    },
+  );
+
+  it("rejects legacy text beside a non-stream Chat message", () => {
+    expect(() =>
+      adaptNonstreamResponse({
+        source: "openai-chat",
+        target: "anthropic-messages",
+        status: 200,
+        body: {
+          id: "c",
+          object: "chat.completion",
+          created: 0,
+          model: "m",
+          choices: [
+            {
+              index: 0,
+              text: "hidden answer",
+              message: { role: "assistant", content: null },
+              finish_reason: "stop",
+            },
+          ],
+        },
+      }),
+    ).toThrow(/choices\[0\]\.text/u);
+  });
+
+  it("caps ignored-field logging per stream at the first distinct names", () => {
+    const parser = new CanonicalStreamParser("openai-chat");
+    const names = Array.from({ length: 40 }, (_, index) => `vendor_${index}`);
+    const debug = withDebug(() => {
+      // Four fresh names per chunk, ten chunks.
+      for (let chunk = 0; chunk < 10; chunk += 1)
+        parser.push(
+          chatChunk(
+            [{ index: 0, delta: { content: "a" }, finish_reason: null }],
+            Object.fromEntries(names.slice(chunk * 4, chunk * 4 + 4).map((name) => [name, 1])),
+          ),
+        );
+    });
+    const logged = debug.flatMap((call) => (call[1] as { fields: string[] }).fields);
+    expect(logged).toEqual(names.slice(0, MAX_LOGGED_FIELDS_PER_STREAM));
+    // Four logs of four names, then exactly one cap notice; later chunks are silent.
+    expect(debug).toHaveLength(5);
+    expect(debug[4]).toEqual([
+      ignoredEnvelopeLog,
+      { path: "stream.data", fields: [], omitted: 4, streamCapReached: 16 },
+    ]);
+  });
+
+  it("keeps the per-line cap without a per-stream set", () => {
+    const debug = withDebug(() => {
+      ignoreUnknownEnvelopeFields(
+        Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`k${index}`, 1])),
+        [],
+        "x",
+      );
+    });
+    expect(debug).toEqual([
+      [
+        ignoredEnvelopeLog,
+        { path: "x", fields: Array.from({ length: 10 }, (_, i) => `k${i}`), omitted: 2 },
+      ],
+    ]);
+  });
+
+  it("names a stable parameter for duplicate usage and a missing delta", () => {
+    const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+    const parser = new CanonicalStreamParser("openai-chat");
+    parser.push(
+      chatChunk([{ index: 0, delta: { content: "a" }, finish_reason: "stop" }], { usage }),
+    );
+    expect(thrownBy(() => parser.push(chatChunk([], { usage })))).toMatchObject({
+      code: "duplicate_usage",
+      parameter: "usage",
+    });
+    expect(
+      thrownBy(() =>
+        new CanonicalStreamParser("openai-chat").push(
+          chatChunk([{ index: 0, finish_reason: null }]),
+        ),
+      ),
+    ).toMatchObject({ code: "invalid_stream_event", parameter: "choices[0].delta" });
+    const renderer = new CanonicalStreamRenderer("openai-chat");
+    renderer.push({ type: "message_start", id: "m", model: "m" });
+    renderer.push({ type: "usage", usage: { inputTokens: 1, outputTokens: 1 } });
+    expect(
+      thrownBy(() => renderer.push({ type: "usage", usage: { inputTokens: 1, outputTokens: 1 } })),
+    ).toMatchObject({ code: "duplicate_usage", parameter: "usage" });
+  });
+
+  it("adds relay and target ids (never content) to adapter rejection logs", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const logContext = {
+        relayRequestId: "relay-1",
+        poolMemberId: "member-1",
+        executionTargetId: "target-1",
+      };
+      expect(() =>
+        adaptNonstreamResponse({
+          source: "openai-chat",
+          target: "anthropic-messages",
+          status: 200,
+          body: { id: "c", choices: "DO_NOT_LOG" },
+          logContext,
+        }),
+      ).toThrow();
+      const readable = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chatChunk([{ index: 0, finish_reason: null }]));
+          controller.close();
+        },
+      }).pipeThrough(
+        createProtocolAdaptationTransform({
+          source: "openai-chat",
+          target: "openai-responses",
+          logContext: { relayRequestId: "relay-2", poolMemberId: "member-2" },
+        }),
+      );
+      await expect(new Response(readable).text()).rejects.toThrow();
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("DO_NOT_LOG");
+      expect(warn.mock.calls).toEqual([
+        [
+          "[model-api] adapter rejected upstream reply",
+          expect.objectContaining({ source: "openai-chat", ...logContext }),
+        ],
+        [
+          "[model-api] adapter rejected upstream reply",
+          {
+            source: "openai-chat",
+            target: "openai-responses",
+            code: "invalid_stream_event",
+            parameter: "choices[0].delta",
+            relayRequestId: "relay-2",
+            poolMemberId: "member-2",
+          },
+        ],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("ends a committed stream with a terminal error even before any output", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const run = (recoverBeforeOutput: boolean) =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(chatChunk([{ index: 0, finish_reason: null }]));
+              controller.close();
+            },
+          }).pipeThrough(
+            createProtocolAdaptationTransform({
+              source: "openai-chat",
+              target: "anthropic-messages",
+              recoverProtocolErrors: true,
+              recoverBeforeOutput,
+            }),
+          ),
+        ).text();
+      await expect(run(false)).rejects.toThrow();
+      const output = await run(true);
+      expect(output).toContain("event: error");
+      expect(output).toContain("violated the adapted protocol");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("omits include_usage only for a Chat surface that declares streamUsage false", () => {
+    const canonical = parseAnthropicMessagesRequest({
+      model: "m",
+      max_tokens: 8,
+      stream: true,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const inventory = (streamUsage?: boolean) => ({
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared" as const,
+          confidence: "exact" as const,
+          streaming: true,
+          operations: ["create" as const],
+          ...(streamUsage === undefined ? {} : { streamUsage }),
+        },
+      },
+    });
+    expect(executionTargetSupportsStreamUsage(null)).toBe(true);
+    expect(executionTargetSupportsStreamUsage(inventory())).toBe(true);
+    expect(executionTargetSupportsStreamUsage(inventory(true))).toBe(true);
+    expect(executionTargetSupportsStreamUsage(inventory(false))).toBe(false);
+    const render = (streamUsage: boolean) =>
+      renderCanonicalRequest({
+        request: canonical,
+        target: "openai-chat",
+        model: "upstream",
+        streamUsage,
+      });
+    expect(render(true)).toMatchObject({ stream: true, stream_options: { include_usage: true } });
+    expect(render(false)).toMatchObject({ stream: true });
+    expect(render(false)).not.toHaveProperty("stream_options");
   });
 });
