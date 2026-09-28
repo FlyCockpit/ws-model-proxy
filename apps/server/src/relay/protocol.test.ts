@@ -952,3 +952,23 @@ describe("relay protocol 2.7 telemetry frames", () => {
     }
   });
 });
+
+describe("remoteMetricSourcesSchema (outbound metrics.sources.set)", () => {
+  const source = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json",
+  };
+  it("caps the list and rejects extra fields", async () => {
+    const { remoteMetricSourcesSchema, NODE_METRIC_SOURCES_MAX } = await import("./protocol.js");
+    const list = (length: number) =>
+      Array.from({ length }, (_, index) => ({ ...source, name: `s${index}` }));
+    expect(remoteMetricSourcesSchema.safeParse(list(NODE_METRIC_SOURCES_MAX)).success).toBe(true);
+    expect(remoteMetricSourcesSchema.safeParse(list(NODE_METRIC_SOURCES_MAX + 1)).success).toBe(
+      false,
+    );
+    expect(remoteMetricSourcesSchema.safeParse([{ ...source, stderr: "x" }]).success).toBe(false);
+  });
+});

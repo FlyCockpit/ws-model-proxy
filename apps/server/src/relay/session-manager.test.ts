@@ -2405,6 +2405,22 @@ describe("relay 2.7 telemetry", () => {
     supervised.manager.dispose();
   });
 
+  it("never sends an oversized remote source list: the CLI gets an empty one", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: Array.from({ length: 51 }, (_, index) => ({
+        ...fansSource,
+        name: `source-${index}`,
+      })),
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
   it("withdraws remote metric sources when the MCP command mode is lowered", async () => {
     const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
       .findUnique;

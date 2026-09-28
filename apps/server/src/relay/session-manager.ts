@@ -58,6 +58,7 @@ import {
   type RelayServerControlMessage,
   rejectedHelloFacts,
   relayProtocolAtLeast,
+  remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
   type TerminalSealedMetadata,
 } from "./protocol.js";
@@ -1433,10 +1434,19 @@ export class RelaySessionManager {
       if (!device || device.userId !== session.identity.userId) return;
       if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return;
       if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
-      const sources =
+      // The outbound list is validated against the relay 2.7 wire schema
+      // (strict entries, at most NODE_METRIC_SOURCES_MAX). Anything that
+      // fails is withheld: the CLI gets an empty list, which stops every
+      // remote source, never a malformed or oversized frame.
+      const wire = remoteMetricSourcesSchema.safeParse(
         device.mcpCommandMode === "UNSUPERVISED"
           ? parseStoredRemoteMetricSources(device.remoteMetricSources)
-          : [];
+          : [],
+      );
+      if (!wire.success) {
+        console.error("[relay] stored remote metric sources failed the wire schema; sending none");
+      }
+      const sources = wire.success ? wire.data : [];
       session.socket.send(
         encodeRelayServerControlMessage({
           type: "metrics.sources.set",
