@@ -439,6 +439,28 @@
         "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
     },
+    "protection": {
+      "title": "Proteger conversaciones activas",
+      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras personas cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
+      "enabled": "Proteger conversaciones activas",
+      "windowSeconds": "Ventana de protección (segundos)",
+      "minTokens": "Tamaño mínimo de la conversación (tokens)",
+      "share": "Reparto entre usuarios",
+      "shareModes": {
+        "EQUAL_SHARE": "Parte igual por usuario activo",
+        "FIRST_COME": "Por orden de llegada (sin límite por usuario)",
+        "FIXED_PERCENT": "Porcentaje fijo por usuario"
+      },
+      "fixedPercent": "Porcentaje que cada usuario puede mantener protegido",
+      "ownerShare": "Tu propia parte",
+      "override": {
+        "INHERIT": "Usar la parte del pool",
+        "PERCENT": "Porcentaje fijo",
+        "UNPROTECTED": "Sin protección"
+      },
+      "percentLabel": "Porcentaje de la capacidad de un miembro (1 a 100)",
+      "hint": "El calor se estima con los registros de enrutamiento de este pool (solo tamaños y tiempos, nunca el contenido del prompt). Solo cuentan las conversaciones usadas dentro de la ventana y con al menos el tamaño mínimo. Por encima de su parte, las conversaciones más antiguas de un usuario pierden la protección primero."
+    },
     "capacity": {
       "title": "Capacidad local compartida",
       "description": "Mantén los pools dentro de los límites reales de concurrencia y contexto del runtime que comparten.",
@@ -847,7 +869,24 @@
     "transformerTimeoutMs": "Tiempo de espera del transformador (ms)",
     "transformerMaxAssets": "Máximo de adjuntos por solicitud",
     "updated": "Pool actualizado",
-    "weight": "Peso"
+    "weight": "Peso",
+    "grantRouting": {
+      "edit": "Enrutamiento",
+      "editFor": "Ajustes de enrutamiento de {{email}}",
+      "title": "Enrutamiento para esta persona",
+      "description": "Ajustes que se aplican solo a las solicitudes de {{email}}.",
+      "protection": "Parte protegida",
+      "protectionHint": "Cuánta capacidad de un miembro pueden mantener protegida frente a conversaciones nuevas las conversaciones recientes de esta persona. Sin protección: sus conversaciones nunca se resguardan.",
+      "queuePriority": "Prioridad en la cola",
+      "prioritySet": "Fijar una prioridad",
+      "priorityValue": "Prioridad en la cola (0 a 31)",
+      "priorityHint": "Sustituye la prioridad de cola del pool y del miembro para las solicitudes en espera de esta persona. Los números más altos reciben una parte mayor de los espacios liberados.",
+      "inherit": "Valor del pool",
+      "percentValue": "{{percent}} %",
+      "summary": "Parte protegida: {{protection}} · Prioridad en la cola: {{priority}}",
+      "saved": "Ajustes de enrutamiento guardados.",
+      "failed": "No se pudieron guardar los ajustes de enrutamiento."
+    }
   },
   "providers": {
     "title": "Proveedores externos",

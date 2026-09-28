@@ -230,6 +230,17 @@ enum CapacityCountStrategy {
   CONSERVATIVE_ESTIMATE
 }
 
+/// How warm-session protection splits one member's KV pool between users
+/// (saturation S-C). A per-grant override replaces it for that grantee.
+enum PoolProtectionShare {
+  /// Each active user may keep max(1 slot, pool / active users) protected.
+  EQUAL_SHARE
+  /// No per-user cap: every eligible session is protected.
+  FIRST_COME
+  /// Each user may keep `protectionFixedPercent` % protected.
+  FIXED_PERCENT
+}
+
 enum CapacityBorrowPolicy {
   NEVER
   WHEN_IDLE
@@ -1047,6 +1058,23 @@ model ModelPool {
   /// prefill speed is not measured yet, capped at 30 s); 0 = off (no
   /// spill-over delay); 1..30000 = fixed milliseconds.
   cacheHolderWaitMs               Int?
+  /// Warm-session protection (saturation S-C): a new session is routed away
+  /// from a member whose idle capacity holds other users' recently used,
+  /// large prompt caches when another member (or, for `:external`, an
+  /// external route) can take it. Redirect-only: it never blocks or queues.
+  protectionEnabled               Boolean                       @default(true)
+  /// A session is protected only when used within this many seconds.
+  protectionWindowSeconds         Int                           @default(300)
+  /// A session is protected only when its prompt is at least this many tokens.
+  protectMinTokens                Int                           @default(8192)
+  /// How the protected share of one member's KV pool is split between users.
+  protectionShare                 PoolProtectionShare           @default(EQUAL_SHARE)
+  /// Percent of the member's KV pool each user may keep protected
+  /// (FIXED_PERCENT only; 1..100).
+  protectionFixedPercent          Int?
+  /// The owner's own protection share, since the owner has no grant. Null =
+  /// the pool's share mode; 0 = unprotected; 1..100 = percent.
+  ownerProtectionPercent          Int?
   /// Owner-declared external equivalent: a verbatim OpenRouter catalog id
   /// (for example "qwen/qwen3-coder" or the floating alias "~vendor/x-latest"),
   /// picked from the public catalog. Declaring it is the owner's consent that
@@ -1110,6 +1138,8 @@ model CacheAffinityRecord {
   @@index([tenantUserId, poolId, conversationDigest, expiresAt])
   @@index([userId, poolId, expiresAt])
   @@index([executionTargetId, expiresAt])
+  // Warm-session protection (S-C): recent sessions per member KV pool.
+  @@index([executionTargetId, lastUsedAt])
   @@map("cache_affinity_record")
 }
 
@@ -1223,6 +1253,11 @@ model AdmissionRequest {
   poolId                  String?
   directExecutionTargetId String?
   basePriority            Int
+  /// Saturation S-C: the grantee's pool grant whose `queuePriority` set
+  /// `basePriority` and every waiter's effective priority. Null = the
+  /// pool/member capacity priority applies. No foreign key: a grant revoke
+  /// must never write admission rows (capacity lock order).
+  priorityGrantId         String?
   enqueueSequence         BigInt
   enqueuedAt              DateTime              @default(now())
   deadlineAt              DateTime?
@@ -1344,6 +1379,13 @@ model PoolGrant {
   poolId                    String
   ownerUserId               String
   granteeUserId             String
+  /// Warm-session protection override (S-C, owner-set). Null = the pool's
+  /// share mode; 0 = unprotected (this grantee's sessions are never
+  /// shielded); 1..100 = percent of a member's KV pool.
+  protectionOverridePercent Int?
+  /// Queue priority (0..31) of this grantee's pool admissions. Replaces the
+  /// pool/member capacity priority for them; null inherits it.
+  queuePriority             Int?
   ModelPool                 ModelPool                  @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Owner                     User                       @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Grantee                   User                       @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)

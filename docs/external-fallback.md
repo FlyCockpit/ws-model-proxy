@@ -122,6 +122,14 @@ The request goes external only after local routing could not serve it:
   wait then counts from the end of that hold, so a request never goes external
   while a cold local member is free. Pre-commit retry rounds keep the original
   external deadline instead of waiting another `externalAfterWaitMs` each;
+- no local member is free for a new conversation because the members with an
+  idle slot hold other people's protected warm sessions (see
+  [Warm-session protection](#warm-session-protection)). A pool is saturated
+  for a request when no member is free for it, and "protected" counts as not
+  free: a new `:external` conversation may go external at once while a local
+  slot is technically idle but holds protected sessions. The reason is
+  `local_saturated_protected`. A continuation of a conversation is never
+  sent away by protection;
 - no healthy, compatible local member exists;
 - a retryable local failure happened before the first response byte, after the
   other local members were tried;
@@ -169,6 +177,63 @@ The hold also delays everything that counts from the spill instant: the local
 wait budgets of the request and, for `:external`, the external fallback wait
 both start counting after the hold.
 
+### Warm-session protection
+
+A new conversation should not evict someone else's recently used, large prompt
+cache when another member, or an external provider, can take it. No engine
+reports how old its cached prefixes are, so WSMP estimates "warm" from its own
+routing records (sizes and times only, never prompt content). Traffic that
+bypasses WSMP is not seen.
+
+A session is protected when it was used within the pool's protection window
+(default 5 minutes) and is at least the minimum size (default 8192 tokens).
+For each request, every local member that has no affinity hit for it is:
+
+- **full** when all its slots are busy;
+- **protected** when it is not full but every idle slot holds a protected
+  session of someone else (slot mode; token mode, which compares the protected
+  tokens plus the request with the engine's KV budget, needs engine facts from
+  protocol 2.7);
+- **free** otherwise.
+
+Then:
+
+1. The cache holder or any free member serves as usual; protected members are
+   tried last.
+2. With only protected members, or protected and full ones, a new `:external`
+   conversation goes external now (`local_saturated_protected`). Without an
+   external route (plain name, or the attempt does not dispatch), the request is
+   admitted on the protected member whose protected sessions are oldest (then
+   smallest), with the full local wait budget: protection never makes a request
+   wait or queue behind full members.
+3. With only full members, the request queues as before.
+
+With an external route, protected members sit out only the first local
+admission; after the external attempt they are ordinary (last) candidates.
+
+Protection is on by default. The pool's routing tab ("Protect active
+conversations"), `forwarderManagement.updateModelPool` and the
+`forwarder_model_pool_update` MCP tool set `protectionEnabled`,
+`protectionWindowSeconds` (1–3600), `protectMinTokens`, and how one member's
+capacity is shared between the people whose sessions are warm
+(`protectionShare`):
+
+- `EQUAL_SHARE` (default): each active user may keep `max(1, slots / active
+  users)` sessions protected. An active user has at least one session inside the
+  window and above the minimum size; small or idle sessions do not dilute
+  anyone's share.
+- `FIXED_PERCENT`: each user may keep `protectionFixedPercent` % of the slots.
+- `FIRST_COME`: no per-user cap.
+
+Over the share, a user's oldest sessions lose protection first. The owner has
+no grant, so `ownerProtectionPercent` sets the owner's own share (null = the
+share mode, 0 = unprotected, 1–100 = percent). Each grant has the same override
+(`protectionOverridePercent`) plus a queue priority (`queuePriority`, 0–31)
+that replaces the pool and member capacity priority for that grantee's waiting
+requests (null inherits). Only the pool owner sets them: the pool's access tab,
+`forwarderManagement.updatePoolGrant`, or the `forwarder_pool_grant_update` MCP
+tool.
+
 ### When the external attempt does not happen
 
 If the attempt cannot send (no compatible external member, provider busy or
@@ -196,6 +261,8 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 
 - `x-wsmp-route: local | pool-fallback | own-key`
 - `x-wsmp-fallback-reason` and `x-wsmp-served-model` on external responses.
+  The reason is `local_wait_expired`, `local_saturated_protected`,
+  `no_local_member`, `local_context_ceiling` or `local_failure`.
   The response `model` field is the provider's served model id.
 - `x-wsmp-fallback: unavailable` when `:external` was requested, the response
   did not come from an external provider, and either no external route exists

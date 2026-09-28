@@ -70,6 +70,14 @@ vi.mock("./prefill-estimator.js", async (importOriginal) => {
   return { ...actual, prefillSpeedSource: prefillSpeed };
 });
 
+// Warm-session protection (S-C) reads active leases and the warm set through
+// this source; stub it at the routing seam (unset = protection sees nothing).
+const warmProtection = vi.hoisted(() => ({ load: vi.fn() }));
+vi.mock("./warm-protection.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./warm-protection.js")>();
+  return { ...actual, warmProtectionSource: warmProtection };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -514,6 +522,11 @@ function poolMemberRow({
       capacityWaitBudgetMs: 30_000,
       externalAfterWaitMs,
       cacheHolderWaitMs,
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE" as const,
+      protectionFixedPercent: null,
       affinityEnabled,
       affinityTtlSeconds: 3600,
       affinityMaxRecords: 10_000,
@@ -1276,6 +1289,273 @@ describe("model API routes", () => {
       expect(retry?.attemptId).not.toBe(first?.attemptId);
       expect(retry?.schedule).toEqual({ anchorAttemptId: first?.attemptId, spillDelayMs: 0 });
       expect(retry?.candidates[0]?.waitBudgetMs).toBe(2_000);
+    });
+  });
+
+  describe("S-C: warm-session protection (redirect-only)", () => {
+    const members = (count = 2) =>
+      ["a", "b", "c"].slice(0, count).map((suffix) =>
+        poolMemberRow({
+          id: `member-${suffix}`,
+          discoveredModelId: `model-${suffix}`,
+          upstreamModelId: `upstream-${suffix}`,
+          cliDeviceId: `cli-${suffix}`,
+          affinityEnabled: true,
+        }),
+      );
+    /** Affinity ran; `affineA` gives member A a continuation prefix hit. */
+    const decision = (affineA = false) => ({
+      orderedTargetIds: ["member-a-target", "member-b-target", "member-c-target"],
+      scores: {},
+      prefixDepths: { "member-a-target": affineA ? 2 : 0 },
+      conversationMatches: {},
+      reasons: {},
+      matchedPrefixDepth: affineA ? 2 : 0,
+      prefixTokens: affineA ? { "member-a-target": 20_000 } : {},
+    });
+    /**
+     * Member KV pools (hardConcurrencyLimit 4 in the fixture). PROTECTED:
+     * 3 active + 1 warm session of another user (the one idle slot holds it).
+     * FULL: 4 active. FREE: idle, nothing warm.
+     */
+    const kvPools = (states: Record<string, "FREE" | "FULL" | "PROTECTED">, ageSeconds = {}) => {
+      const ages = ageSeconds as Record<string, number>;
+      warmProtection.load.mockResolvedValue({
+        activeByCapacity: new Map(
+          Object.entries(states).map(([member, state]) => [
+            `member-${member}-capacity`,
+            state === "FREE" ? 0 : state === "FULL" ? 4 : 3,
+          ]),
+        ),
+        sessionsByCapacity: new Map(
+          Object.entries(states).map(([member, state]) => [
+            `member-${member}-capacity`,
+            state === "PROTECTED"
+              ? [
+                  {
+                    userId: "other-user",
+                    ageMs: (ages[member] ?? 30) * 1000,
+                    tokens: 20_000,
+                    overridePercent: null,
+                  },
+                ]
+              : [],
+          ]),
+        ),
+      });
+    };
+    /** Admits `grants[call]` (a member id) on that acquire call, else EXPIRED. */
+    const scripted = (grants: Array<string | null>) => {
+      let call = 0;
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const grant = grants[call++] ?? null;
+        const candidate = attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant);
+        if (!candidate) return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      return { acquire, runtime };
+    };
+    /** Local admission rounds (the provider tier admits through the same runtime). */
+    const rounds = (acquire: ReturnType<typeof scripted>["acquire"]) =>
+      acquire.mock.calls
+        .flatMap(([attempt]) =>
+          attempt.candidates.some(({ poolMemberId }) => poolMemberId === "overflow-member")
+            ? []
+            : [attempt],
+        )
+        .map((attempt) =>
+          attempt.candidates.map((candidate) => ({
+            member: candidate.poolMemberId,
+            notBeforeMs: candidate.notBeforeMs,
+            waitBudgetMs: candidate.waitBudgetMs,
+          })),
+        );
+    const request = (runtime: CapacityAdmissionRuntime, model: string) => {
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
+      const response = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(model),
+      });
+      return { manager, response };
+    };
+    const serveLocal = async (runtime: CapacityAdmissionRuntime, model: string) => {
+      const { manager, response } = request(runtime, model);
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      return { manager, response: await response };
+    };
+    const useExternalPlan = () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      return provider;
+    };
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+      affinity.rank.mockResolvedValue(decision());
+    });
+    afterEach(() => {
+      warmProtection.load.mockReset();
+      externalConsent.poolIds = [];
+    });
+
+    it("a new session avoids a member whose idle capacity is all protected when another is FREE", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FREE" });
+      const { acquire, runtime } = scripted(["member-b"]);
+
+      const { response, manager } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // Affinity order was A, B: protection moves the PROTECTED member last.
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-b", "member-a"]);
+      expect(warmProtection.load).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerId: poolTarget.ownerUserId,
+          capacityIds: ["member-a-capacity", "member-b-capacity"],
+        }),
+      );
+    });
+
+    it.each([
+      ["only PROTECTED members", { a: "PROTECTED", b: "PROTECTED" }],
+      ["PROTECTED and FULL members", { a: "PROTECTED", b: "FULL" }],
+    ] as const)(":external with a plan and %s goes external now", async (_label, states) => {
+      const provider = useExternalPlan();
+      publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools(states);
+      // The only admission is the provider tier's.
+      const { acquire, runtime } = scripted(["overflow-member"]);
+
+      const { response } = request(runtime, EXTERNAL_MODEL_ID);
+      const served = await response;
+
+      expect(served.status).toBe(200);
+      expect(served.headers.get("x-wsmp-fallback-reason")).toBe("local_saturated_protected");
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        reason: "LOCAL_SATURATED_PROTECTED",
+      });
+      // No local wait first: protection is part of saturation (S1).
+      expect(acquire).toHaveBeenCalledTimes(1);
+      expect(rounds(acquire)).toEqual([]);
+    });
+
+    it("without a plan it admits on the oldest protected member, never queueing behind FULL", async () => {
+      db.poolMember.findMany.mockResolvedValue(members(3));
+      // A is FULL; B's protected session is 200 s old, C's 10 s.
+      kvPools({ a: "FULL", b: "PROTECTED", c: "PROTECTED" }, { b: 200, c: 10 });
+      const { acquire, runtime } = scripted(["member-b"]);
+
+      const { response, manager } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // One admission over every member: the protected ones have an idle slot,
+      // so the store grants them at once; nothing is deferred.
+      expect(rounds(acquire)).toEqual([
+        [
+          { member: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-b", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-c", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        ],
+      ]);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it("when the protected external attempt does not dispatch, it admits locally with the full budget", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      // The provider tier finds no provider slot (PROVIDER_SATURATED).
+      const { acquire, runtime } = scripted([null, "member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      // The one external phase is used up: full local budget, every member.
+      expect(rounds(acquire)).toEqual([
+        [
+          { member: "member-b", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        ],
+      ]);
+    });
+
+    it("with a plan, a PROTECTED member sits out only the first admission", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FREE" });
+      // B is taken before this request gets it: the shortened wait expires,
+      // the provider tier finds no slot, and the resumed wait may use A.
+      const { acquire, runtime } = scripted([null, null, "member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(rounds(acquire).map((round) => round.map(({ member }) => member))).toEqual([
+        ["member-b"],
+        ["member-b", "member-a"],
+      ]);
+    });
+
+    it("a continuation (affinity hit) is never blocked by protection", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue(decision(true));
+      // A's capacity looks PROTECTED for anyone else; this request continues
+      // a session on A, and B is FULL.
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
+    });
+
+    it("changes nothing when the warm-set read fails", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      warmProtection.load.mockRejectedValue(new Error("database unavailable"));
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-a", "member-b"]);
     });
   });
 

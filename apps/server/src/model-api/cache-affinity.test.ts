@@ -534,6 +534,75 @@ describe("cache affinity", () => {
     );
   });
 
+  it("stamps every record of one call with the same lastUsedAt (S-C session grouping)", async () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(2);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
+  it("scores a single target so protection can tell a continuation from a new session", async () => {
+    const only = target("target-a", "runtime-a");
+    const continuation = {
+      ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "secret answer" }],
+    };
+    const material = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      runtimeIdentity: only.targetIdentity,
+    });
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      material.digests.map((prefixDigest, index) => ({
+        executionTargetId: only.executionTargetId,
+        targetIdentity: only.targetIdentity,
+        bindingDigest: material.bindingDigest,
+        prefixDigest,
+        conversationDigest: null,
+        prefixDepth: index + 1,
+        digestVersion: 4,
+        engineCacheConfirmed: false,
+        estimatedTokens: 9_000,
+      })),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      targets: [only],
+      scoreSingleTarget: true,
+    });
+    expect(material.isContinuation).toBe(true);
+    expect(ranked.prefixDepths["target-a"]).toBeGreaterThan(0);
+  });
+
   it("persists digests only, refreshes TTL, and enforces the row bound", async () => {
     db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "old" }]);
     const now = new Date("2026-08-25T12:00:00.000Z");

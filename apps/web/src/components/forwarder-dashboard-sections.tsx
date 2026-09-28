@@ -1602,6 +1602,38 @@ export function ProtocolCompatibilityRadio({
   );
 }
 
+/** Owner/grant protection override: null = share mode, 0 = unprotected, N = percent. */
+export function ownerProtectionModeOf(
+  percent: number | null,
+): "INHERIT" | "PERCENT" | "UNPROTECTED" {
+  return percent === null ? "INHERIT" : percent === 0 ? "UNPROTECTED" : "PERCENT";
+}
+
+function protectionSettingsFromForm(value: {
+  protectionEnabled: boolean;
+  protectionWindowSeconds: number;
+  protectMinTokens: number;
+  protectionShare: "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
+  protectionFixedPercent: number;
+  ownerProtectionMode: "INHERIT" | "PERCENT" | "UNPROTECTED";
+  ownerProtectionPercent: number;
+}) {
+  return {
+    protectionEnabled: value.protectionEnabled,
+    protectionWindowSeconds: value.protectionWindowSeconds,
+    protectMinTokens: value.protectMinTokens,
+    protectionShare: value.protectionShare,
+    protectionFixedPercent:
+      value.protectionShare === "FIXED_PERCENT" ? value.protectionFixedPercent : null,
+    ownerProtectionPercent:
+      value.ownerProtectionMode === "INHERIT"
+        ? null
+        : value.ownerProtectionMode === "UNPROTECTED"
+          ? 0
+          : value.ownerProtectionPercent,
+  };
+}
+
 export function PoolForm({
   mode,
   pool,
@@ -1686,6 +1718,13 @@ export function PoolForm({
     affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
     cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
     cacheHolderWaitMs: z.number().int().min(0).max(30_000),
+    protectionEnabled: z.boolean(),
+    protectionWindowSeconds: z.number().int().min(1).max(3600),
+    protectMinTokens: z.number().int().min(0).max(10_000_000),
+    protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
+    protectionFixedPercent: z.number().int().min(1).max(100),
+    ownerProtectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
+    ownerProtectionPercent: z.number().int().min(1).max(100),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1772,6 +1811,17 @@ export function PoolForm({
       // S-A cache-holder wait: null = automatic; 0 = off; N = fixed ms.
       cacheHolderWaitMode: (pool?.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
       cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
+      // S-C warm-session protection ("Protect active conversations").
+      protectionEnabled: pool?.protection.enabled ?? true,
+      protectionWindowSeconds: pool?.protection.windowSeconds ?? 300,
+      protectMinTokens: pool?.protection.minTokens ?? 8192,
+      protectionShare: (pool?.protection.share ?? "EQUAL_SHARE") as
+        | "EQUAL_SHARE"
+        | "FIRST_COME"
+        | "FIXED_PERCENT",
+      protectionFixedPercent: pool?.protection.fixedPercent ?? 50,
+      ownerProtectionMode: ownerProtectionModeOf(pool?.protection.ownerPercent ?? null),
+      ownerProtectionPercent: pool?.protection.ownerPercent || 50,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1865,6 +1915,7 @@ export function PoolForm({
             affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
             cacheHolderWaitMs:
               value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
+            ...protectionSettingsFromForm(value),
           }
         : {};
       if (mode === "create") {
@@ -1889,6 +1940,7 @@ export function PoolForm({
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
           cacheHolderWaitMs: value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
+          ...protectionSettingsFromForm(value),
         });
         toast.success(t("dashboard:pools.created"));
         onSuccess();
@@ -2154,6 +2206,159 @@ export function PoolForm({
               </Button>
             </div>
           ) : null}
+        </details>
+      ) : null}
+
+      {show("routing") ? (
+        <details className="rounded-md border p-3">
+          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+            {t("dashboard:pools.protection.title")}
+          </summary>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.protection.description")}
+          </p>
+          <form.Field name="protectionEnabled">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.protection.enabled")}
+              </label>
+            )}
+          </form.Field>
+          <div className="mt-3 grid gap-4 sm:grid-cols-2">
+            <form.Field name="protectionWindowSeconds">
+              {(field) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor="protectionWindowSeconds">
+                    {t("dashboard:pools.protection.windowSeconds")}
+                  </Label>
+                  <Input
+                    id="protectionWindowSeconds"
+                    className="min-h-11"
+                    type="number"
+                    min={1}
+                    max={3600}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                  />
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="protectMinTokens">
+              {(field) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor="protectMinTokens">
+                    {t("dashboard:pools.protection.minTokens")}
+                  </Label>
+                  <Input
+                    id="protectMinTokens"
+                    className="min-h-11"
+                    type="number"
+                    min={0}
+                    max={10000000}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                  />
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="protectionShare">
+              {(shareField) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor="protectionShare">{t("dashboard:pools.protection.share")}</Label>
+                  <select
+                    id="protectionShare"
+                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                    value={shareField.state.value}
+                    onChange={(event) =>
+                      shareField.handleChange(
+                        event.target.value as "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT",
+                      )
+                    }
+                  >
+                    <option value="EQUAL_SHARE">
+                      {t("dashboard:pools.protection.shareModes.EQUAL_SHARE")}
+                    </option>
+                    <option value="FIRST_COME">
+                      {t("dashboard:pools.protection.shareModes.FIRST_COME")}
+                    </option>
+                    <option value="FIXED_PERCENT">
+                      {t("dashboard:pools.protection.shareModes.FIXED_PERCENT")}
+                    </option>
+                  </select>
+                  {shareField.state.value === "FIXED_PERCENT" ? (
+                    <form.Field name="protectionFixedPercent">
+                      {(field) => (
+                        <Input
+                          id="protectionFixedPercent"
+                          className="min-h-11"
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={field.state.value}
+                          onChange={(event) => field.handleChange(Number(event.target.value))}
+                          aria-label={t("dashboard:pools.protection.fixedPercent")}
+                        />
+                      )}
+                    </form.Field>
+                  ) : null}
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="ownerProtectionMode">
+              {(modeField) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor="ownerProtectionMode">
+                    {t("dashboard:pools.protection.ownerShare")}
+                  </Label>
+                  <select
+                    id="ownerProtectionMode"
+                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                    value={modeField.state.value}
+                    onChange={(event) =>
+                      modeField.handleChange(
+                        event.target.value as "INHERIT" | "PERCENT" | "UNPROTECTED",
+                      )
+                    }
+                  >
+                    <option value="INHERIT">
+                      {t("dashboard:pools.protection.override.INHERIT")}
+                    </option>
+                    <option value="PERCENT">
+                      {t("dashboard:pools.protection.override.PERCENT")}
+                    </option>
+                    <option value="UNPROTECTED">
+                      {t("dashboard:pools.protection.override.UNPROTECTED")}
+                    </option>
+                  </select>
+                  {modeField.state.value === "PERCENT" ? (
+                    <form.Field name="ownerProtectionPercent">
+                      {(field) => (
+                        <Input
+                          id="ownerProtectionPercent"
+                          className="min-h-11"
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={field.state.value}
+                          onChange={(event) => field.handleChange(Number(event.target.value))}
+                          aria-label={t("dashboard:pools.protection.percentLabel")}
+                        />
+                      )}
+                    </form.Field>
+                  ) : null}
+                </div>
+              )}
+            </form.Field>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.protection.hint")}
+          </p>
         </details>
       ) : null}
 

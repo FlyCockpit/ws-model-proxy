@@ -807,7 +807,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     classification: "pure",
     // fallbackEnabled / fallbackForGrantees go through the dedicated,
     // cost-described forwarder_pool_fallback_update; externalAfterWaitMs and
-    // cacheHolderWaitMs pass through (audited). Token external consent is
+    // cacheHolderWaitMs and the warm-session protection settings (S-C) pass through (audited). Token external consent is
     // never an MCP arg.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
@@ -822,7 +822,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     classification: "pure",
     // fallbackEnabled / fallbackForGrantees go through the dedicated,
     // cost-described forwarder_pool_fallback_update; externalAfterWaitMs and
-    // cacheHolderWaitMs pass through (audited). Capacity policy fields are
+    // cacheHolderWaitMs and the warm-session protection settings (S-C) pass through (audited). Capacity policy fields are
     // always admitted.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
@@ -945,6 +945,17 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.grantPoolAccessByEmail,
     ),
+  },
+  {
+    // S-C per-grant routing: warm-session protection override and queue
+    // priority. Owner-only through the procedure (owned pool + owned grant).
+    name: "forwarder_pool_grant_update",
+    target: "forwarderManagement.updatePoolGrant",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updatePoolGrant),
   },
   {
     name: "forwarder_pool_grant_revoke",
@@ -1317,8 +1328,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly 26 read tools and 51 write tools
- * (46 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 27 read tools and 52 write tools
+ * (47 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
