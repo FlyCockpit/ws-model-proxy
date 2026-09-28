@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { auth } from "@ws-model-proxy/auth";
+import { SIGNUP_DISABLED_CODE } from "@ws-model-proxy/auth/signup-policy";
 import {
   notifyUserDeleted,
   notifyUserDeletionMarked,
@@ -60,6 +61,39 @@ const USER_SELECT = {
   createdAt: true,
   updatedAt: true,
 } as const;
+
+/** Better Auth (admin plugin) codes for an email that is already taken. */
+const DUPLICATE_USER_AUTH_CODES: ReadonlySet<string> = new Set([
+  "USER_ALREADY_EXISTS",
+  "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+]);
+
+/**
+ * Classifies an `auth.api.createUser` failure by its codes only, never its
+ * message: a Better Auth `APIError` body code, the user-create policy's
+ * `SIGNUP_DISABLED` code, or a unique violation (Prisma P2002 / SQLSTATE
+ * 23505) from a concurrent invite of the same email.
+ */
+function inviteFailureCode(err: unknown): "duplicate" | "signup_disabled" | null {
+  const pending: unknown[] = [err];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    for (const key of ["code", "originalCode"]) {
+      const code = Reflect.get(candidate, key);
+      if (typeof code !== "string") continue;
+      if (code === SIGNUP_DISABLED_CODE) return "signup_disabled";
+      if (DUPLICATE_USER_AUTH_CODES.has(code) || code === "P2002" || code === "23505") {
+        return "duplicate";
+      }
+    }
+    for (const key of ["body", "meta", "driverAdapterError", "cause"])
+      pending.push(Reflect.get(candidate, key));
+  }
+  return null;
+}
 
 export const usersRouter = {
   list: adminOr404Procedure
@@ -138,13 +172,13 @@ export const usersRouter = {
         });
         recipientLocale = fresh?.locale ?? "en-US";
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to invite user";
-        if (/already exists|already in use|duplicate/i.test(message)) {
+        const code = inviteFailureCode(err);
+        if (code === "duplicate") {
           throw new ORPCError("CONFLICT", {
             message: "A user with that email already exists.",
           });
         }
-        if (/sign-?up.*disabled|disabled.*sign-?up/i.test(message)) {
+        if (code === "signup_disabled") {
           throw new ORPCError("BAD_REQUEST", {
             message:
               "Account creation is disabled by the auth configuration. Ask an admin to check the invite setup.",
@@ -313,12 +347,10 @@ export const usersRouter = {
           ),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to delete user";
-      if (
-        err instanceof RetainedHistoryError ||
-        isPermanentParentDeletionFailure(err) ||
-        /foreign key|constraint|restrict/i.test(message)
-      ) {
+      // Classified by error class and SQLSTATE / Prisma code only
+      // (RETAINED_HISTORY, P2003, P2014, 23503, 23514, 55000), never by
+      // message text.
+      if (err instanceof RetainedHistoryError || isPermanentParentDeletionFailure(err)) {
         throw deletionConflict(
           "retained_history",
           "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",

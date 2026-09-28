@@ -22,7 +22,9 @@
   --muted-foreground: oklch(0.56 0.021 213.5);
   --accent: oklch(0.963 0.002 197.1);
   --accent-foreground: oklch(0.218 0.008 223.9);
-  --destructive: oklch(0.577 0.245 27.325);
+  /* Red 700: AA (4.5:1) as text on the background, muted and card, and on
+     the destructive button's 10% tint. The 600 step failed on muted. */
+  --destructive: oklch(0.505 0.213 27.518);
   --state-success: oklch(0.52 0.17 152);
   --state-success-foreground: oklch(0.985 0 0);
   --state-success-bg: color-mix(in oklch, oklch(0.52 0.17 152) 12%, transparent);
@@ -101,8 +103,11 @@
   --card-foreground: oklch(0.987 0.002 197.1);
   --popover: oklch(0.218 0.008 223.9);
   --popover-foreground: oklch(0.987 0.002 197.1);
-  --primary: oklch(0.437 0.078 188.216);
-  --primary-foreground: oklch(0.984 0.014 180.72);
+  /* Light teal with a dark foreground (the sidebar's dark pair): the old
+     dark teal was 2.6:1 as text (`text-primary`) on the background. Now AA
+     as text on background, card and muted, and under its foreground. */
+  --primary: oklch(0.704 0.14 182.503);
+  --primary-foreground: oklch(0.277 0.046 192.524);
   --secondary: oklch(0.274 0.006 286.033);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.275 0.011 216.9);

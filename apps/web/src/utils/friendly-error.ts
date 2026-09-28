@@ -2,47 +2,67 @@ import {
   type DeletionConflictReason,
   isDeletionConflictReason,
 } from "@ws-model-proxy/config/deletion-conflict";
+// The default i18next instance, which `@/i18n` initializes for the app. Not
+// imported from there, so this helper stays usable where that module is not
+// loaded (tests that stub react-i18next).
+import i18n from "i18next";
 
 /**
- * Map an unknown error (oRPC ORPCError, fetch error, thrown Error) to safe
- * user-facing copy. Never returns `error.message` — that may contain raw
- * Prisma / auth.api / third-party SDK strings.
+ * Map an unknown error (oRPC ORPCError, Better Auth client error, fetch
+ * error, thrown Error) to safe, localized user-facing copy (the `errors`
+ * namespace, keyed by error code). Never returns `error.message` — that may
+ * contain raw Prisma / auth.api / third-party SDK strings.
  *
  * Pass an optional `fallback` for context-specific copy ("Couldn't update
- * that user. Try again."). It is used only when we have no specific code
- * mapping; known codes (CONFLICT, FORBIDDEN, …) still return their mapped
- * copy.
+ * that user. Try again."), already translated. It is used only when we have
+ * no specific code mapping; known codes (CONFLICT, FORBIDDEN, …) still return
+ * their mapped copy.
+ *
+ * A structured deletion reason (oRPC `data.reason`, or a Better Auth user
+ * deletion code) that does not depend on what was deleted gets its specific
+ * copy. `retained_history` names the entity's own off switch, so it needs the
+ * mutation's `deletionEntity` (see `deletionConflictMessageKey`); without one
+ * it keeps the generic conflict copy.
  */
 export function friendly(error: unknown, fallback?: string): string {
   const e = asErrorShape(error);
-  const generic = fallback ?? "Something didn't work. Try again.";
+  const generic = fallback ?? i18n.t("errors:friendly.generic");
 
   if (!e) return generic;
 
   if (e.code === "TOO_MANY_REQUESTS" || e.status === 429) {
     const retryAfter = getRetryAfter(e);
     return retryAfter !== null
-      ? `Too many attempts. Try again in ${retryAfter} seconds.`
-      : "Too many attempts. Please wait a few minutes and try again.";
+      ? i18n.t("errors:friendly.rateLimitedRetryAfter", { count: retryAfter })
+      : i18n.t("errors:friendly.rateLimited");
+  }
+
+  const reason = deletionReasonOf(e);
+  if (reason === "retained_history" && betterAuthDeletionReason(e.code) !== null) {
+    // Better Auth's RETAINED_HISTORY only comes from deleting a user.
+    return i18n.t("errors:deletionConflict.retainedHistory.user");
+  }
+  if (reason !== null && reason !== "retained_history") {
+    return i18n.t(neutralDeletionConflictKey(reason));
   }
 
   if (e.code === "UNAUTHORIZED" || e.status === 401) {
-    return "Your session has ended. Sign in again.";
+    return i18n.t("errors:friendly.unauthorized");
   }
   if (e.code === "FORBIDDEN" || e.status === 403) {
-    return "You don't have access to this.";
+    return i18n.t("errors:friendly.forbidden");
   }
   if (e.code === "NOT_FOUND" || e.status === 404) {
-    return "That wasn't found.";
+    return i18n.t("errors:friendly.notFound");
   }
   if (e.code === "CONFLICT" || e.status === 409) {
-    return "That conflicts with an existing record.";
+    return i18n.t("errors:friendly.conflict");
   }
   if (e.code === "BAD_REQUEST" || e.status === 400) {
-    return "That request wasn't valid.";
+    return i18n.t("errors:friendly.badRequest");
   }
   if (e.code === "INTERNAL_SERVER_ERROR" || (typeof e.status === "number" && e.status >= 500)) {
-    return fallback ?? "Something didn't work on our end. Try again in a moment.";
+    return fallback ?? i18n.t("errors:friendly.serverError");
   }
 
   return generic;
@@ -73,11 +93,56 @@ export function isConflict(error: unknown): boolean {
  * CONFLICT without a known reason. Reads only the code, never the message.
  */
 export function deletionConflictReason(error: unknown): DeletionConflictReason | null {
-  if (!isConflict(error)) return null;
-  const data = asErrorShape(error)?.data;
+  const e = asErrorShape(error);
+  if (!e || !isConflict(error)) return null;
+  return deletionReasonOf(e);
+}
+
+/**
+ * Better Auth's delete and restore routes answer with their own `{ code,
+ * message }` body, not an oRPC `data.reason`. These codes mean the same thing
+ * as the dashboard's reasons, so they share its copy.
+ */
+const BETTER_AUTH_DELETION_REASONS: Readonly<Record<string, DeletionConflictReason>> = {
+  USER_DELETION_PENDING: "deletion_in_progress",
+  RETAINED_HISTORY: "retained_history",
+};
+
+function betterAuthDeletionReason(code: unknown): DeletionConflictReason | null {
+  if (typeof code !== "string" || !Object.hasOwn(BETTER_AUTH_DELETION_REASONS, code)) return null;
+  return BETTER_AUTH_DELETION_REASONS[code] ?? null;
+}
+
+/**
+ * The deletion reason an error carries: an oRPC CONFLICT's `data.reason`, or
+ * a Better Auth user-deletion code (a CONFLICT on delete / restore routes, a
+ * FORBIDDEN on sign-in). Reads codes only, never the message.
+ */
+function deletionReasonOf(e: ErrorShape): DeletionConflictReason | null {
+  const fromBetterAuth = betterAuthDeletionReason(e.code);
+  if (fromBetterAuth) return fromBetterAuth;
+  if (!(e.status === 409 || e.code === "CONFLICT")) return null;
+  const data = e.data;
   if (!data || typeof data !== "object" || !("reason" in data)) return null;
   const reason = (data as { reason?: unknown }).reason;
   return isDeletionConflictReason(reason) ? reason : null;
+}
+
+function neutralDeletionConflictKey(
+  reason: Exclude<DeletionConflictReason, "retained_history">,
+): string {
+  switch (reason) {
+    case "delete_pending":
+      return "errors:deletionConflict.deletePending";
+    case "delete_contended":
+      return "errors:deletionConflict.deleteContended";
+    case "still_attached":
+      return "errors:deletionConflict.stillAttached";
+    case "not_stale":
+      return "errors:deletionConflict.notStale";
+    case "deletion_in_progress":
+      return "errors:deletionConflict.deletionInProgress";
+  }
 }
 
 /** What a delete mutation removes; picks the "do this instead" copy. */
@@ -99,20 +164,8 @@ export type DeletionEntity =
 export function deletionConflictMessageKey(error: unknown, entity: DeletionEntity): string | null {
   const reason = deletionConflictReason(error);
   if (!reason) return null;
-  switch (reason) {
-    case "retained_history":
-      return `errors:deletionConflict.retainedHistory.${entity}`;
-    case "delete_pending":
-      return "errors:deletionConflict.deletePending";
-    case "delete_contended":
-      return "errors:deletionConflict.deleteContended";
-    case "still_attached":
-      return "errors:deletionConflict.stillAttached";
-    case "not_stale":
-      return "errors:deletionConflict.notStale";
-    case "deletion_in_progress":
-      return "errors:deletionConflict.deletionInProgress";
-  }
+  if (reason === "retained_history") return `errors:deletionConflict.retainedHistory.${entity}`;
+  return neutralDeletionConflictKey(reason);
 }
 
 /** True if the error looks like a 404 / NOT_FOUND response from oRPC. */

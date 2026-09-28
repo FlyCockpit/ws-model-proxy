@@ -280,22 +280,50 @@ describe("usersRouter", () => {
       expect(res.userId).toBe("new-user-id");
     });
 
-    it("translates a duplicate-email error into a CONFLICT", async () => {
-      authApi.api.createUser.mockRejectedValue(new Error("User already exists"));
-
-      const client = createRouterClient(usersRouter, { context: buildContext() });
-      await expect(client.invite({ email: "dup@example.com", name: "Dup" })).rejects.toSatisfy(
-        (e: ORPCError) => {
-          expect(e.code).toBe("CONFLICT");
-          return true;
-        },
-      );
+    it("translates a duplicate-email error code into a CONFLICT", async () => {
+      // Better Auth's APIError carries its code in `body`.
+      for (const failure of [
+        Object.assign(new Error("opaque"), {
+          body: { code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL", message: "opaque" },
+        }),
+        Object.assign(new Error("opaque"), { body: { code: "USER_ALREADY_EXISTS" } }),
+        // A concurrent invite of the same email loses the unique index.
+        Object.assign(new Error("opaque"), { code: "P2002" }),
+        Object.assign(new Error("opaque"), { cause: { originalCode: "23505" } }),
+      ]) {
+        authApi.api.createUser.mockRejectedValueOnce(failure);
+        const client = createRouterClient(usersRouter, { context: buildContext() });
+        await expect(client.invite({ email: "dup@example.com", name: "Dup" })).rejects.toSatisfy(
+          (e: ORPCError) => {
+            expect(e.code).toBe("CONFLICT");
+            return true;
+          },
+        );
+      }
       expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+
+    it("never classifies an invite failure by message text", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        for (const message of [
+          "User already exists",
+          "Sign-up is currently disabled. Contact an admin if you need access.",
+        ]) {
+          authApi.api.createUser.mockRejectedValueOnce(new Error(message));
+          const client = createRouterClient(usersRouter, { context: buildContext() });
+          await expect(
+            client.invite({ email: "new@example.com", name: "New User" }),
+          ).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+        }
+      } finally {
+        consoleError.mockRestore();
+      }
     });
 
     it("surfaces a clear error if auth configuration blocks account creation", async () => {
       authApi.api.createUser.mockRejectedValue(
-        new Error("Sign-up is currently disabled. Contact an admin if you need access."),
+        Object.assign(new Error("opaque"), { code: "SIGNUP_DISABLED" }),
       );
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
@@ -531,10 +559,10 @@ describe("usersRouter", () => {
       expect(db.user.delete).not.toHaveBeenCalled();
     });
 
-    it("converts a Prisma FK constraint error into a CONFLICT with archive guidance", async () => {
+    it("converts a Prisma FK error code (P2003) into a CONFLICT with archive guidance", async () => {
       db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
       db.user.delete.mockRejectedValue(
-        new Error("Foreign key constraint violated on the field: `Post_authorId_fkey`"),
+        Object.assign(new Error("opaque"), { code: "P2003", meta: { modelName: "User" } }),
       );
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
@@ -544,6 +572,38 @@ describe("usersRouter", () => {
         expect(e.data).toEqual({ reason: "retained_history" });
         return true;
       });
+    });
+
+    it("converts a driver SQLSTATE 23503 (wrapped) into a CONFLICT", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      db.user.delete.mockRejectedValue(
+        Object.assign(new Error("opaque"), {
+          code: "P2010",
+          meta: { driverAdapterError: { cause: { originalCode: "23503" } } },
+        }),
+      );
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.remove({ userId: "other-user-id" })).rejects.toMatchObject({
+        code: "CONFLICT",
+        data: { reason: "retained_history" },
+      });
+    });
+
+    it("never classifies by message text: an FK-sounding message without a code is an internal error", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      db.user.delete.mockRejectedValue(
+        new Error("Foreign key constraint violated on the field: `Post_authorId_fkey`"),
+      );
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const client = createRouterClient(usersRouter, { context: buildContext() });
+        await expect(client.remove({ userId: "other-user-id" })).rejects.toMatchObject({
+          code: "INTERNAL_SERVER_ERROR",
+        });
+      } finally {
+        consoleError.mockRestore();
+      }
     });
   });
 

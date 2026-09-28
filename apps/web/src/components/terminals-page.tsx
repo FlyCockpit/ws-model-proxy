@@ -392,7 +392,7 @@ function Banner({ tone = "info", children }: { tone?: "info" | "problem"; childr
 
 /** Notices about the connection, identities, and the active tab. */
 function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
-  const { t } = useTranslation(["dashboard"]);
+  const { t } = useTranslation(["dashboard", "common"]);
   const workspace = useTerminalWorkspace();
   const active = workspace.tabs.find((tab) => tab.localId === workspace.activeLocalId) ?? null;
   const activeUnverified =
@@ -401,7 +401,16 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
 
   return (
     <>
-      {workspace.status !== "open" ? (
+      {workspace.status === "unauthorized" ? (
+        <Banner tone="problem">
+          <p className="min-w-0 flex-1" role="alert">
+            {t("dashboard:terminals.signedOut")}
+          </p>
+          <ChromeTextButton onClick={() => window.location.reload()}>
+            {t("common:actions.reload")}
+          </ChromeTextButton>
+        </Banner>
+      ) : workspace.status !== "open" ? (
         <Banner>
           <p className="min-w-0 text-(--term-muted)">{t("dashboard:terminals.reconnecting")}</p>
         </Banner>

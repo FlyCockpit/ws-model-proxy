@@ -275,6 +275,7 @@
     "cliSearch": "Buscar CLIs",
     "cliSearchEmpty": "Ningún CLI coincide con tu búsqueda.",
     "reconnecting": "Reconectando con el servicio de terminal…",
+    "signedOut": "Se cerró tu sesión o se revocó tu acceso a la terminal. Recarga para iniciar sesión de nuevo.",
     "exited": "El shell terminó.",
     "gone": "Esta terminal terminó mientras estabas desconectado.",
     "rejected": "El CLI rechazó esta terminal ({{reason}}).",

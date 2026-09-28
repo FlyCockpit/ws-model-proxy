@@ -3,6 +3,18 @@
   "couldNotCopy": "Couldn't copy — please select and copy manually.",
   "pageDescription": "{{appName}} is a web application",
   "rootError": "This page didn't load. Try again, or reload.",
+  "friendly": {
+    "generic": "Something didn't work. Try again.",
+    "rateLimited": "Too many attempts. Please wait a few minutes and try again.",
+    "rateLimitedRetryAfter_one": "Too many attempts. Try again in {{count}} second.",
+    "rateLimitedRetryAfter_other": "Too many attempts. Try again in {{count}} seconds.",
+    "unauthorized": "Your session has ended. Sign in again.",
+    "forbidden": "You don't have access to this.",
+    "notFound": "That wasn't found.",
+    "conflict": "That conflicts with an existing record.",
+    "badRequest": "That request wasn't valid.",
+    "serverError": "Something didn't work on our end. Try again in a moment."
+  },
   "deletionConflict": {
     "deletePending": "This still has requests in flight, so nothing was deleted. Try again in a moment.",
     "deleteContended": "This was busy with live traffic, so nothing was deleted. Try again in a moment.",

@@ -5,6 +5,18 @@ export const SIGNUP_ENABLED_SETTING_KEY = "signupEnabled";
 export const SIGNUP_DISABLED_MESSAGE =
   "Sign-up is currently disabled. Contact an admin if you need access.";
 
+/** Stable code of {@link SignupDisabledError}; callers classify by it, not the message. */
+export const SIGNUP_DISABLED_CODE = "SIGNUP_DISABLED";
+
+/** The user-create policy refused a new account because sign-up is disabled. */
+export class SignupDisabledError extends Error {
+  readonly code = SIGNUP_DISABLED_CODE;
+  constructor() {
+    super(SIGNUP_DISABLED_MESSAGE);
+    this.name = "SignupDisabledError";
+  }
+}
+
 function parseBooleanSetting(value: string | null | undefined): boolean | null {
   if (value === "true") return true;
   if (value === "false") return false;

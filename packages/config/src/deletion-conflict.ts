@@ -1,9 +1,11 @@
 /**
  * Stable reasons the oRPC API attaches (as ORPCError `data.reason`) to
- * deletion-related CONFLICT responses the dashboard consumes. MCP tool errors
- * currently expose only `{ code: "CONFLICT" }` (reason not forwarded yet).
+ * deletion-related CONFLICT responses. The dashboard localizes them; MCP tool
+ * errors forward them as `{ error: { code: "CONFLICT", reason } }` (docs/mcp.md).
  * Better Auth delete/restore routes return Better Auth's own `{ code, message
- * }` body, not these reasons. The HTTP/oRPC code stays CONFLICT.
+ * }` body (`USER_DELETION_PENDING`, `RETAINED_HISTORY`); the dashboard maps
+ * those codes to `deletion_in_progress` / `retained_history` copy. The
+ * HTTP/oRPC code stays CONFLICT.
  *
  * - `retained_history`: capacity or provider history must be kept, so the
  *   item (or user) can never be deleted; archive or disable it instead.

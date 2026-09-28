@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   capacityEnabled: true,
@@ -157,6 +157,15 @@ vi.mock("@/utils/orpc", () => {
 });
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import i18next from "i18next";
+import enErrors from "@/locales/en-US/errors.json";
+
+// `friendly()` reads the default i18next instance, which the app's i18n
+// module initializes; this test does not load that module.
+beforeAll(async () => {
+  await i18next.init({ lng: "en-US", resources: { "en-US": { errors: enErrors } } });
+});
+
 import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import {
   InferenceCapacityPage,
@@ -717,8 +726,6 @@ describe("delete conflicts on pool pages", () => {
       screen.getByRole("button", { name: "confirm dashboard:pools.capacity.deleteTitle" }),
     );
 
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("That conflicts with an existing record."),
-    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(enErrors.friendly.conflict));
   });
 });

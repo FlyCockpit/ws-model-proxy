@@ -1,6 +1,6 @@
 import { DELETION_CONFLICT_REASONS } from "@ws-model-proxy/config/deletion-conflict";
-import { describe, expect, it } from "vitest";
-
+import { afterEach, describe, expect, it } from "vitest";
+import i18n from "../i18n";
 import enErrors from "../locales/en-US/errors.json";
 import esErrors from "../locales/es-MX/errors.json";
 import {
@@ -110,10 +110,102 @@ describe("deletionConflictMessageKey", () => {
   });
 });
 
+function keyTree(value: unknown, prefix = ""): string[] {
+  if (typeof value !== "object" || value === null) return [prefix];
+  return Object.entries(value).flatMap(([key, nested]) =>
+    keyTree(nested, prefix === "" ? key : `${prefix}.${key}`),
+  );
+}
+
 describe("friendly", () => {
-  it("keeps the generic CONFLICT copy even when a deletion reason is present", () => {
+  afterEach(async () => {
+    await i18n.changeLanguage("en-US");
+  });
+
+  it("keeps the generic CONFLICT copy for retained history without an entity", () => {
     expect(friendly(conflict({ reason: "retained_history" }))).toBe(
       "That conflicts with an existing record.",
     );
+  });
+
+  it("gives an entity-neutral deletion reason its specific copy without an entity", () => {
+    expect(friendly(conflict({ reason: "delete_pending" }))).toBe(
+      enErrors.deletionConflict.deletePending,
+    );
+    expect(friendly(conflict({ reason: "deletion_in_progress" }))).toBe(
+      enErrors.deletionConflict.deletionInProgress,
+    );
+  });
+
+  it("maps every code and status to its errors.friendly copy, never the message", () => {
+    const cases: Array<[unknown, string]> = [
+      [{ code: "UNAUTHORIZED", message: "raw" }, enErrors.friendly.unauthorized],
+      [{ status: 401 }, enErrors.friendly.unauthorized],
+      [{ code: "FORBIDDEN", message: "raw" }, enErrors.friendly.forbidden],
+      [{ code: "NOT_FOUND", message: "raw" }, enErrors.friendly.notFound],
+      [{ status: 404 }, enErrors.friendly.notFound],
+      [conflict(), enErrors.friendly.conflict],
+      [{ code: "BAD_REQUEST", message: "raw" }, enErrors.friendly.badRequest],
+      [{ code: "INTERNAL_SERVER_ERROR", message: "raw" }, enErrors.friendly.serverError],
+      [{ status: 503 }, enErrors.friendly.serverError],
+      [{ code: "TOO_MANY_REQUESTS" }, enErrors.friendly.rateLimited],
+      [{ code: "SOMETHING_ELSE", message: "raw" }, enErrors.friendly.generic],
+      [null, enErrors.friendly.generic],
+    ];
+    for (const [error, expected] of cases) expect(friendly(error)).toBe(expected);
+    expect(friendly({ status: 429, data: { retryAfter: 30 } })).toBe(
+      "Too many attempts. Try again in 30 seconds.",
+    );
+    expect(friendly({ status: 429, data: { retryAfter: 1 } })).toBe(
+      "Too many attempts. Try again in 1 second.",
+    );
+  });
+
+  it("uses the caller's fallback only where no code maps", () => {
+    expect(friendly({ code: "SOMETHING_ELSE" }, "ctx")).toBe("ctx");
+    expect(friendly({ code: "INTERNAL_SERVER_ERROR" }, "ctx")).toBe("ctx");
+    expect(friendly({ code: "NOT_FOUND" }, "ctx")).toBe(enErrors.friendly.notFound);
+  });
+
+  it("localizes every copy in es-MX, with no English left", async () => {
+    i18n.addResourceBundle("es-MX", "errors", esErrors, true, true);
+    await i18n.changeLanguage("es-MX");
+    expect(friendly({ code: "BAD_REQUEST" })).toBe(esErrors.friendly.badRequest);
+    expect(friendly({ code: "NOT_FOUND" })).toBe(esErrors.friendly.notFound);
+    expect(friendly({ status: 429, data: { retryAfter: 5 } })).toBe(
+      "Demasiados intentos. Inténtalo de nuevo en 5 segundos.",
+    );
+    expect(friendly(null)).toBe(esErrors.friendly.generic);
+    for (const key of keyTree(enErrors.friendly)) {
+      const en = lookup(enErrors, `errors:friendly.${key}`);
+      const es = lookup(esErrors, `errors:friendly.${key}`);
+      expect(typeof es, key).toBe("string");
+      expect(es, key).not.toBe(en);
+    }
+  });
+
+  it("has the same friendly keys in both locale bundles", () => {
+    expect(keyTree(esErrors.friendly).sort()).toEqual(keyTree(enErrors.friendly).sort());
+  });
+
+  it("maps Better Auth user-deletion codes to the dashboard's deletion copy", () => {
+    const pending = { status: 409, code: "USER_DELETION_PENDING", message: "raw" };
+    const retained = { status: 409, code: "RETAINED_HISTORY", message: "raw" };
+    const signIn = { status: 403, code: "USER_DELETION_PENDING", message: "raw" };
+    expect(deletionConflictReason(pending)).toBe("deletion_in_progress");
+    expect(deletionConflictReason(retained)).toBe("retained_history");
+    // Not a CONFLICT: no deletion conflict, but the copy still says why.
+    expect(deletionConflictReason(signIn)).toBeNull();
+    expect(deletionConflictMessageKey(pending, "user")).toBe(
+      "errors:deletionConflict.deletionInProgress",
+    );
+    expect(deletionConflictMessageKey(retained, "user")).toBe(
+      "errors:deletionConflict.retainedHistory.user",
+    );
+    expect(friendly(pending)).toBe(enErrors.deletionConflict.deletionInProgress);
+    expect(friendly(signIn)).toBe(enErrors.deletionConflict.deletionInProgress);
+    expect(friendly(retained)).toBe(enErrors.deletionConflict.retainedHistory.user);
+    // Inherited property names are not codes.
+    expect(friendly({ status: 409, code: "toString" })).toBe(enErrors.friendly.conflict);
   });
 });
