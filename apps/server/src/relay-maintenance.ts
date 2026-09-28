@@ -8,7 +8,12 @@
  * - every 60 s: browser terminal session rechecks (`recheckSessions`).
  *
  * Each tick logs a failure by error class only (L19) and never throws, so one
- * failing sweep does not stop the others. Returns one stop for all timers.
+ * failing sweep does not stop the others. Returns one stop for all timers: it
+ * clears them synchronously, then resolves once every sweep already running
+ * has settled, so none of them is still using the database client when
+ * shutdown releases it. The stop has no bound of its own; shutdown awaits it
+ * inside the periodic-job step, under `PERIODIC_JOBS_STOP_TIMEOUT_MS`
+ * (./shutdown-timeouts.ts).
  */
 
 export const RELAY_STALE_SESSION_SWEEP_INTERVAL_MS = 15_000;
@@ -28,7 +33,25 @@ function errorClass(error: unknown): string {
   return error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
 }
 
-export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => void {
+export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise<void> {
+  // The asynchronous sweeps still running (the synchronous ones finish inside
+  // their tick). Each removes itself when it settles; it never rejects.
+  const inFlight = new Set<Promise<void>>();
+  const track = (run: () => Promise<unknown>, failure: string) => {
+    // Called synchronously; the executor also turns a synchronous throw into
+    // a logged failure.
+    const settled: Promise<void> = new Promise<unknown>((resolve) => resolve(run()))
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          console.error(failure, errorClass(error));
+        },
+      )
+      .finally(() => {
+        inFlight.delete(settled);
+      });
+    inFlight.add(settled);
+  };
   const schedule = (tick: () => void, ms: number) => {
     const timer = setInterval(tick, ms);
     timer.unref();
@@ -36,9 +59,10 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => void {
   };
   const timers = [
     schedule(() => {
-      void deps.relaySessions.checkStaleSessions().catch((error: unknown) => {
-        console.error("[server] stale relay session sweep failed", errorClass(error));
-      });
+      track(
+        () => deps.relaySessions.checkStaleSessions(),
+        "[server] stale relay session sweep failed",
+      );
       try {
         deps.relaySessions.sweepExpiredPendingTerminals();
       } catch (error) {
@@ -53,12 +77,11 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => void {
       }
     }, CLI_COMMAND_SWEEP_INTERVAL_MS),
     schedule(() => {
-      void deps.terminalHub.recheckSessions().catch((error: unknown) => {
-        console.error("[server] terminal session recheck failed", errorClass(error));
-      });
+      track(() => deps.terminalHub.recheckSessions(), "[server] terminal session recheck failed");
     }, TERMINAL_SESSION_RECHECK_INTERVAL_MS),
   ];
-  return () => {
+  return async () => {
     for (const timer of timers) clearInterval(timer);
+    await Promise.all([...inFlight]);
   };
 }
