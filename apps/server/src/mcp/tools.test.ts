@@ -198,6 +198,7 @@ const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  "forwarder_cli_activity_list",
 ]);
 
 function catalogNames(includeCliCommands: boolean): string[] {
@@ -1313,6 +1314,32 @@ describe("CLI command tools", () => {
     expect(flagged).toContain("forwarder_cli_command_run");
     expect(flagged).toContain("forwarder_cli_supervised_command_start");
     expect(flagged).toContain("forwarder_cli_command_result");
+    expect(flagged).toContain("forwarder_cli_activity_list");
+  });
+
+  it("the read-only activity tool follows the same PAT-only rule under mcp:read", async () => {
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      await expect(listedNames(credential, ["mcp:read"])).resolves.not.toContain(
+        "forwarder_cli_activity_list",
+      );
+    }
+    await expect(listedNames(PAT_WITH_CLI, ["mcp:read"])).resolves.toContain(
+      "forwarder_cli_activity_list",
+    );
+  });
+
+  it("the activity tool call fails closed as not-found for OAuth and a PAT without the flag", async () => {
+    const tool = requireDescriptor("forwarder_cli_activity_list");
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      const result = await runManifestTool(tool, {
+        dispatch: cliDispatch(credential),
+        scopes: ["mcp:read"],
+        client: undefined,
+        args: {},
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Tool forwarder_cli_activity_list not found");
+    }
   });
 
   it("tells the model that other secrets in command output are NOT redacted", async () => {

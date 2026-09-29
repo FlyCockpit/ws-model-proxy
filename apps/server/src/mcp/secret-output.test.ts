@@ -138,6 +138,7 @@ const NON_SECRET_COLUMNS: Readonly<Record<string, string>> = {
   tokenizer: "Tokenizer name.",
   tokenizerVersion: "Tokenizer version.",
   modelApiTokenId: "Foreign key to a token row.",
+  mcpTokenId: "Id of the personal MCP token that acted (agent audit log), not its secret.",
   modelApiTokenLookupPrefix: "Public lookup prefix of a token (display metadata).",
   lookupPrefix: "Public lookup prefix of a token (display metadata).",
   keyVersion: "Keyring version label for encrypted credentials.",

@@ -7,6 +7,7 @@ import {
   PARENT_DELETE_TRIGGER_WORK,
   RETAINED_HISTORY_EDGES,
   resolveDeletedParents,
+  USER_PLAIN_ID_HISTORY_TABLES,
 } from "@ws-model-proxy/db/parent-deletion";
 import { describe, expect, it } from "vitest";
 
@@ -117,6 +118,62 @@ const GRAPH_TABLES: Record<string, string> = {
 
 /** Tables whose rows make the delete fail; the preflight refuses first. */
 const RETAINED_TABLES = new Set<string>(["capacity_lease", ...OWNER_RETAINED_HISTORY_TABLES]);
+
+/**
+ * Tables with an owner `userId` column that is NOT a foreign key: the cascade
+ * never reaches them, so each must be drained (USER_PLAIN_ID_HISTORY_TABLES)
+ * or listed here with the reason a user delete may leave the rows.
+ */
+const PLAIN_USER_ID_EXEMPT: Record<string, string> = {};
+
+/** Tables with a plain `userId` column (owner) and no relation on it. */
+function plainUserIdTables(): Array<{ table: string; column: string }> {
+  const found: Array<{ table: string; column: string }> = [];
+  for (const file of readdirSync(schemaDir).filter((name) => name.endsWith(".prisma"))) {
+    const source = readFileSync(join(schemaDir, file), "utf8");
+    for (const match of source.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)) {
+      const [, name = "", body = ""] = match;
+      const table = /@@map\("([^"]+)"\)/.exec(body)?.[1] ?? name;
+      const related = new Set<string>();
+      for (const line of body.split("\n")) {
+        const fields = /fields:\s*\[([^\]]*)\]/.exec(line)?.[1];
+        for (const field of (fields ?? "").split(",")) related.add(field.trim());
+      }
+      for (const line of body.split("\n")) {
+        const [column = "", type = ""] = line.trim().split(/\s+/);
+        if (column === "userId" && type.startsWith("String") && !related.has(column))
+          found.push({ table, column });
+      }
+    }
+  }
+  return found;
+}
+
+describe("plain user-id tables", () => {
+  it("classifies every table with a user id column that has no foreign key", () => {
+    const unclassified = plainUserIdTables().filter(
+      ({ table }) => !(table in USER_PLAIN_ID_HISTORY_TABLES) && !(table in PLAIN_USER_ID_EXEMPT),
+    );
+    expect(unclassified).toEqual([]);
+  });
+
+  it("drains cli_agent_action_event by its userId column", () => {
+    expect(USER_PLAIN_ID_HISTORY_TABLES.cli_agent_action_event.userColumn).toBe("userId");
+    expect(plainUserIdTables()).toContainEqual({
+      table: "cli_agent_action_event",
+      column: "userId",
+    });
+  });
+
+  it("has no stale classification", () => {
+    const actual = new Set(plainUserIdTables().map(({ table }) => table));
+    for (const table of [
+      ...Object.keys(USER_PLAIN_ID_HISTORY_TABLES),
+      ...Object.keys(PLAIN_USER_ID_EXEMPT),
+    ])
+      expect(actual.has(table), table).toBe(true);
+  });
+});
 
 describe("parent-deletion contract against the Prisma schema", () => {
   it("classifies every table a user delete cascades into or rewrites", () => {

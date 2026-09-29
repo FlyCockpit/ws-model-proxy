@@ -492,6 +492,29 @@ starts an immediate sweep that will remove artifacts already past eligibility
 - Automatic CIMD-client deletion and JWKS key deletion are deliberately
   deferred pending a separately reviewed policy.
 
+## Agent audit log
+
+Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
+`forwarder_cli_supervised_command_start`), including refused ones, is recorded
+in `cli_agent_action_event` (file operations join it with the file tools). The
+log is **metadata only**: who (user, device, token), what (kind, and for a
+command a SHA-256 of the command text plus its program name — never the command
+text itself), when, and how it ended (`completed`, `refused`, `failed`,
+`cancelled`, `declined`, `expired`, `unknown`, with a stable reason such as
+`exit:1` or `limit`). The reason is a stable machine code: a CLI rejection frame
+(`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
+stored as `rejected`, so CLI-supplied text never reaches the column. File
+content, diffs and command output are never stored, and the command's arguments
+are never stored: the server reduces the command text to its program (the
+basename of the first word that is not a leading `NAME=value` assignment, so a
+secret-bearing assignment is skipped) and hashes the whole text. Writing an
+event never blocks or fails the operation (a bounded in-process queue, dropped
+and counted when the database cannot keep up). Rows are deleted after **90
+days** by the hourly retention sweep, and with the user on account deletion.
+The owner reads them under `Dashboard → CLIs → Agent activity` and through
+`forwarder_cli_activity_list` (read scope; visible only to a personal token
+minted with CLI commands, like the other CLI tools).
+
 ## Rate limits (process-local)
 
 - `/mcp`: an unconditional, pre-authentication IP-keyed bucket

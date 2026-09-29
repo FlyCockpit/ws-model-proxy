@@ -1,0 +1,59 @@
+/// What an agent did on a CLI device through MCP (commands and file
+/// operations). Metadata only: never file content, diffs, command output or
+/// command text.
+/// Kind and outcome codes are mirrored in packages/config/src/cli-agent-audit.ts.
+enum CliAgentActionKind {
+  command
+  supervised_command
+  file_read
+  file_stat
+  file_list
+  file_search
+  file_edit
+  file_write
+  file_rename
+  file_mkdir
+  file_delete
+  supervised_file_write
+}
+
+enum CliAgentActionOutcome {
+  completed
+  refused
+  failed
+  cancelled
+  declined
+  expired
+  unknown
+}
+
+/// Plain id columns and NO foreign keys, on purpose: this is owner history
+/// outside the user-deletion lock graph. A user delete drains the user's rows
+/// (packages/db/src/parent-deletion.ts); a device delete keeps them until the
+/// 90-day retention sweep (apps/server/src/model-api/usage-retention.ts).
+model CliAgentActionEvent {
+  id          String                @id @default(cuid(2))
+  createdAt   DateTime              @default(now())
+  userId      String
+  cliDeviceId String
+  /// The personal MCP token that acted; null when it is unknown.
+  mcpTokenId  String?
+  kind        CliAgentActionKind
+  /// Files: the requested path. Commands: `sha256:<hex of the command text>
+  /// <program>` (packages/config/src/cli-agent-audit.ts) — never any command
+  /// text; the program is the basename of the first non-assignment word.
+  path        String
+  etagBefore  String?
+  etagAfter   String?
+  bytes       BigInt?
+  outcome     CliAgentActionOutcome
+  /// Stable machine code (refusal code, exit status, file error code).
+  reason      String?
+  startedAt   DateTime
+  finishedAt  DateTime?
+
+  @@index([userId, createdAt])
+  @@index([cliDeviceId, createdAt])
+  @@index([createdAt])
+  @@map("cli_agent_action_event")
+}

@@ -94,6 +94,7 @@ import {
   ParentDeletionOwnerRequiredError,
   type ParentDeletionScope,
   resolveDeletedParents,
+  USER_PLAIN_ID_HISTORY_TABLES,
 } from "./parent-deletion-residual";
 import { isDbShutdownFenceArmed } from "./shutdown-fence";
 import { drainRequesterUsageRollupsBatch } from "./usage-rollup-requester-drain";
@@ -132,6 +133,7 @@ export {
   ParentDeletionOwnerRequiredError,
   type ParentDeletionScope,
   resolveDeletedParents,
+  USER_PLAIN_ID_HISTORY_TABLES,
 } from "./parent-deletion-residual";
 
 /** Max rows processed in one drain invocation; further work returns pending. */
@@ -826,6 +828,25 @@ export async function drainParentDeletionHistory(
     await drainLoop(report, "usage_rollup_requester", budget, size, () =>
       inBatch((tx) => drainRequesterUsageRollupsBatch(tx, userId, size.limit)),
     );
+  }
+
+  // History tables keyed by a plain user id (no foreign key, so no cascade).
+  for (const userId of parents.user) {
+    for (const [table, { userColumn }] of Object.entries(USER_PLAIN_ID_HISTORY_TABLES)) {
+      const from = Prisma.raw(`"${table}"`);
+      const column = Prisma.raw(`"${userColumn}"`);
+      await drainLoop(report, `${table}.delete`, budget, size, () =>
+        inBatch(
+          (tx) => tx.$executeRaw`
+          DELETE FROM ${from}
+           WHERE ctid IN (
+             SELECT ctid FROM ${from}
+              WHERE ${column} = ${userId}
+              LIMIT ${size.limit}
+                FOR UPDATE SKIP LOCKED)`,
+        ),
+      );
+    }
   }
   return report;
 }

@@ -188,6 +188,21 @@ export const HISTORY_DRAIN_EDGES = {
 >;
 
 /**
+ * History tables that carry a user id as a PLAIN column (no foreign key): the
+ * cascade never reaches them, so a whole-user delete drains them by this
+ * column in bounded batches (`drainParentDeletionHistory`) and the residual
+ * count ignores them (they are not part of the locked cascade). The catalog
+ * test requires every table with a `userId`-like column and no foreign key to
+ * be listed here or in `PLAIN_USER_ID_EXEMPT` there, so a new plain-id table
+ * cannot ship unclassified. Rows written after the drain (a refusal recorded
+ * for a user whose deletion is already marked) are removed by the retention
+ * sweep of the same table.
+ */
+export const USER_PLAIN_ID_HISTORY_TABLES = {
+  cli_agent_action_event: { userColumn: "userId" },
+} as const satisfies Record<string, { userColumn: string }>;
+
+/**
  * Drain budget or residual bound exceeded, or a drain batch hit its own
  * timeout; completion should return pending. `timeout` is the SQLSTATE of a
  * batch timeout (55P03 lock wait, 57014 statement), absent otherwise.

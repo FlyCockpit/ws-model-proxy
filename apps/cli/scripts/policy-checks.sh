@@ -13,10 +13,11 @@ fail=0
 # Where to look. We scan tracked source/config, not build output or git internals.
 SCAN_DIRS=(src xtask/src tests scripts .github docs)
 
-# check <regex> <human message>
-# Fails if the (extended) regex matches anywhere in SCAN_DIRS.
+# check <regex> <human message> [excluded-path-prefix]
+# Fails if the (extended) regex matches anywhere in SCAN_DIRS, ignoring hits whose
+# path starts with the optional prefix.
 check() {
-  local pattern="$1" message="$2"
+  local pattern="$1" message="$2" skip="${3:-}"
   # -I skips binary files; -n shows line numbers; || true so no-match isn't an error.
   local hits
   hits="$(grep -rInE \
@@ -24,6 +25,9 @@ check() {
     --include='*.md' --include='*.json' \
     --exclude='policy-checks.sh' \
     -- "$pattern" "${SCAN_DIRS[@]}" 2>/dev/null || true)"
+  if [[ -n "$skip" && -n "$hits" ]]; then
+    hits="$(awk -v p="$skip" 'index($0, p) != 1' <<<"$hits")"
+  fi
   if [[ -n "$hits" ]]; then
     echo "POLICY VIOLATION: $message"
     echo "$hits"

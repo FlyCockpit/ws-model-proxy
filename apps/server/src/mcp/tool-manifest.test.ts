@@ -44,6 +44,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
+  "forwarder_cli_activity_list",
   "forwarder_device_metrics_get",
   "forwarder_model_pools_list",
   "forwarder_pool_fallback_get",
@@ -156,6 +157,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
+  forwarder_cli_activity_list: "cliAgentActivity.list",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
   forwarder_pool_fallback_get: "poolFallback.get",
@@ -260,13 +262,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 27 read + 51 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 28 read + 51 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(27);
+    expect(PLAN_READ_TOOLS).toHaveLength(28);
     expect(PLAN_WRITE_TOOLS).toHaveLength(51);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(78);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(79);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -464,9 +466,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 78 catalog entries − 5 extracted cores = 73 procedure dispatches.
-    expect(dispatched).toBe(73);
-    expect(invoked).toHaveLength(73);
+    // 79 catalog entries − 5 extracted cores = 74 procedure dispatches.
+    expect(dispatched).toBe(74);
+    expect(invoked).toHaveLength(74);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

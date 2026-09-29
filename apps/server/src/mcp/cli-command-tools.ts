@@ -52,6 +52,10 @@ const CLI_REJECTION_MESSAGES = {
     "This MCP token was revoked, has expired, or no longer allows CLI commands, or the account no longer allows CLI effects (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP, or check the account)",
 } as const;
 
+/** Shown on `forwarder_cli_activity_list`: what the audit log holds. */
+export const CLI_AGENT_ACTIVITY_NOTICE =
+  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a SHA-256 of the command text plus the program name, never the command text itself), sizes and timestamps. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
+
 /** Shown on the supervised tool: what the agent can and cannot learn. */
 export const CLI_SUPERVISED_COMMAND_NOTICE =
   "Opens a terminal on the CLI that shows the person your reason and the exact command; nothing runs until they press Enter there, and they may decline. Poll forwarder_cli_command_result with the commandId (statuses: awaiting_user, running, awaiting_output_review, exited, declined, expired, cancelled, rejected; declined, expired and rejected never ran, and an ended request reports started: true, false, or null when not known yet). Output is returned only with shareOutput: true, and the person may review, edit, or redact it first; output.mode says which (shared, reviewed, redacted, private). Waiting for the person expires after 15 minutes.";

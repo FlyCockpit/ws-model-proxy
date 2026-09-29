@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +20,11 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
+vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: vi.fn() }));
+
 const { default: prisma } = await import("@ws-model-proxy/db");
+const { recordCliAgentAction } = await import("./cli-agent-audit.js");
+const audit = recordCliAgentAction as unknown as MockInstance;
 const { relaySessionManager } = await import("./session-manager.js");
 const {
   cancelCommandsForToken,
@@ -817,5 +822,195 @@ describe("cli commands", () => {
         (send) => typeof send === "string" && JSON.parse(String(send)).type === "exec.cancel",
       ),
     ).toBe(true);
+  });
+
+  describe("agent audit events", () => {
+    const base = {
+      userId: "user-id",
+      tokenId: "token-audit",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+    };
+
+    function events() {
+      return audit.mock.calls.map(([event]) => event as Record<string, unknown>);
+    }
+
+    it("records each refusal once with its code, without starting anything", async () => {
+      db.cliDevice.findUnique.mockResolvedValue({
+        id: "desktop",
+        userId: "user-id",
+        mcpCommandMode: "OFF",
+      });
+      await connect();
+      await startCliCommand({ ...base, command: "pwd" });
+      db.cliDevice.findUnique.mockResolvedValue(null);
+      await startCliCommand({ ...base, command: "pwd" });
+      db.cliDevice.findUnique.mockResolvedValue({
+        id: "desktop",
+        userId: "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+      });
+      await startCliCommand({ ...base, command: "bad\0command" });
+      expect(events().map((event) => [event.kind, event.outcome, event.reason])).toEqual([
+        ["command", "refused", "grant_disabled"],
+        ["command", "refused", "not_found"],
+        ["command", "refused", "invalid_command"],
+      ]);
+      expect(events()[0]).toMatchObject({
+        userId: "user-id",
+        cliDeviceId: "desktop",
+        mcpTokenId: "token-audit",
+        path: expect.stringMatching(/^sha256:[0-9a-f]{64} pwd$/),
+      });
+    });
+
+    it("records a failed internal_error once and rethrows when admission throws", async () => {
+      await connect();
+      const boom = new TypeError("admission read failed");
+      db.cliDevice.findUnique.mockRejectedValueOnce(boom);
+      await expect(startCliCommand({ ...base, command: "pwd" })).rejects.toBe(boom);
+      expect(events().map((event) => [event.kind, event.outcome, event.reason])).toEqual([
+        ["command", "failed", "internal_error"],
+      ]);
+      expect(events()[0]).toMatchObject({
+        userId: "user-id",
+        cliDeviceId: "desktop",
+        mcpTokenId: "token-audit",
+        path: expect.stringMatching(/^sha256:[0-9a-f]{64} pwd$/),
+      });
+    });
+
+    it("records a refusal for a token that is no longer live", async () => {
+      await connect();
+      db.mcpPersonalToken.findFirst.mockResolvedValue(null);
+      await startCliCommand({ ...base, command: "pwd" });
+      expect(events()).toEqual([
+        expect.objectContaining({ outcome: "refused", reason: "token_inactive" }),
+      ]);
+    });
+
+    it("records one completed event with the exit status and no output", async () => {
+      const socket = await connect();
+      const result = await startCliCommand({ ...base, command: "run --api-key sk-secret-9 x" });
+      if (!result.ok) throw new Error("expected start");
+      expect(events()).toEqual([]);
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: result.commandId,
+          timedOut: false,
+          exitCode: 3,
+        }),
+      );
+      // A second terminal frame for the same command adds nothing.
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: result.commandId,
+          timedOut: false,
+          exitCode: 0,
+        }),
+      );
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "command",
+        outcome: "completed",
+        reason: "exit:3",
+        mcpTokenId: "token-audit",
+      });
+      const path = String(events()[0]?.path);
+      expect(path).toMatch(/^sha256:[0-9a-f]{64} run$/);
+      expect(JSON.stringify(events())).not.toContain("sk-secret-9");
+      // No stored field of the row may contain any argument text.
+      expect(path.split(" ").slice(1).join(" ")).toBe("run");
+    });
+
+    it("stores the hash of the command text and its program, never a preview", async () => {
+      const socket = await connect();
+      const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz tool run";
+      const result = await startCliCommand({ ...base, command });
+      if (!result.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: result.commandId,
+          timedOut: false,
+          exitCode: 0,
+        }),
+      );
+      const path = String(events()[0]?.path ?? "");
+      // The first word is a secret-bearing assignment: it is skipped, never stored.
+      expect(path).not.toContain("abcdefghij");
+      expect(path.split(" ").slice(1).join(" ")).toBe("tool");
+      expect(path.slice(0, path.indexOf(" "))).toBe(
+        `sha256:${createHash("sha256").update(command).digest("hex")}`,
+      );
+    });
+
+    it("never stores raw argument text for a secret-bearing command", async () => {
+      const socket = await connect();
+      const command = "FOO=secret curl --api-key sk-secret-9 https://x";
+      const result = await startCliCommand({ ...base, command });
+      if (!result.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: result.commandId,
+          timedOut: false,
+          exitCode: 0,
+        }),
+      );
+      const serialized = JSON.stringify(events());
+      for (const leak of ["secret", "sk-secret-9", "https://x", "--api-key", "FOO="])
+        expect(serialized, `row leaks ${leak}`).not.toContain(leak);
+      expect(String(events()[0]?.path)).toMatch(/^sha256:[0-9a-f]{64} curl$/);
+    });
+
+    it("records a command the session loss cancelled and one the CLI rejected", async () => {
+      const socket = await connect();
+      const rejected = await startCliCommand({ ...base, command: "first" });
+      if (!rejected.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.rejected",
+          commandId: rejected.commandId,
+          reason: "bad_command",
+        }),
+      );
+      const cancelled = await startCliCommand({ ...base, command: "sleep 100" });
+      if (!cancelled.ok) throw new Error("expected start");
+      await relaySessionManager.closeRelaySessions();
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["refused", "bad_command"],
+        ["cancelled", null],
+      ]);
+    });
+
+    it("maps an unknown CLI rejection reason to the fallback", async () => {
+      const socket = await connect();
+      // `reason` is a stable machine code, never free text: a conforming CLI
+      // sends a REASON_* constant, but the wire accepts any string. Storing it
+      // verbatim would put agent-supplied free text in the audit column.
+      const rejected = await startCliCommand({ ...base, command: "first" });
+      if (!rejected.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.rejected",
+          commandId: rejected.commandId,
+          reason: "unknown-code-9f3a",
+        }),
+      );
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["refused", "rejected"],
+      ]);
+      expect(JSON.stringify(events())).not.toContain("unknown-code-9f3a");
+    });
   });
 });

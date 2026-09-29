@@ -16,6 +16,9 @@
  *     drop them (move = DELETE ... RETURNING + additive hourly upsert in ONE
  *     transaction, so a crash rolls both back and nothing is lost or doubled).
  *  4. Delete hourly rollups older than 13 months.
+ *  5. Delete agent audit events (cli_agent_action_event, plain ids, no FKs)
+ *     older than CLI_AGENT_ACTION_RETENTION_DAYS, in `FOR UPDATE SKIP LOCKED`
+ *     batches ordered by the (createdAt) index.
  *
  * Multi-replica safety: every batch selects its rows with
  * `FOR UPDATE SKIP LOCKED`, so concurrent sweepers work on disjoint rows; the
@@ -30,6 +33,7 @@
  * next run.
  */
 
+import { CLI_AGENT_ACTION_RETENTION_DAYS } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   USAGE_ROLLUP_HOUR_RETENTION_DAYS,
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
@@ -66,6 +70,7 @@ export type UsageRetentionResult = {
   relayRequestsDeleted: number;
   minuteRowsCompacted: number;
   hourRowsDeleted: number;
+  agentActionsDeleted: number;
 };
 
 async function databaseNow(prisma: Pick<typeof defaultPrisma, "$queryRaw">): Promise<Date> {
@@ -291,6 +296,34 @@ export async function deleteExpiredHourRollups({
   }
 }
 
+export async function deleteExpiredCliAgentActions({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  retentionDays = CLI_AGENT_ACTION_RETENTION_DAYS,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  retentionDays?: number;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM cli_agent_action_event
+       WHERE ctid IN (
+         SELECT ctid FROM cli_agent_action_event
+          WHERE "createdAt" < ${cutoff}
+          ORDER BY "createdAt"
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function runUsageRetention({
   prisma = defaultPrisma as RetentionPrisma,
   retentionDays,
@@ -314,7 +347,14 @@ export async function runUsageRetention({
   });
   const minuteRowsCompacted = await compactMinuteRollups({ prisma, now, batch });
   const hourRowsDeleted = await deleteExpiredHourRollups({ prisma, now, batch });
-  return { abandonedReaped, relayRequestsDeleted, minuteRowsCompacted, hourRowsDeleted };
+  const agentActionsDeleted = await deleteExpiredCliAgentActions({ prisma, now, batch });
+  return {
+    abandonedReaped,
+    relayRequestsDeleted,
+    minuteRowsCompacted,
+    hourRowsDeleted,
+    agentActionsDeleted,
+  };
 }
 
 let activeUsageRetentionStop: (() => void) | null = null;
@@ -339,10 +379,11 @@ export function startUsageRetention({
         result.abandonedReaped +
         result.relayRequestsDeleted +
         result.minuteRowsCompacted +
-        result.hourRowsDeleted;
+        result.hourRowsDeleted +
+        result.agentActionsDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

@@ -17,6 +17,8 @@ const CLI_COMMAND_TOOL_NAMES: ReadonlySet<string> = new Set([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  // Read-only audit log of what agents did on CLI devices: same visibility rule.
+  "forwarder_cli_activity_list",
 ]);
 
 export function isCliCommandTool(name: string): boolean {

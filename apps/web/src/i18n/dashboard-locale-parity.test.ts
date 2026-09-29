@@ -1,4 +1,8 @@
 import { modelApiSurfaces } from "@ws-model-proxy/api/lib/surface-capabilities";
+import {
+  CLI_AGENT_ACTION_KINDS,
+  CLI_AGENT_ACTION_OUTCOMES,
+} from "@ws-model-proxy/config/cli-agent-audit";
 import { describe, expect, it } from "vitest";
 import enDashboard from "../locales/en-US/dashboard.json";
 import esDashboard from "../locales/es-MX/dashboard.json";
@@ -46,6 +50,18 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esDashboard.terminals)).toEqual(keyTree(enDashboard.terminals));
     expect(keyTree(esDashboard.nav)).toEqual(keyTree(enDashboard.nav));
     expect(keyTree(esDashboard.clis.features)).toEqual(keyTree(enDashboard.clis.features));
+  });
+
+  it("has identical agent activity keys, covering every audit kind and outcome", () => {
+    expect(keyTree(esDashboard.clis.activity)).toEqual(keyTree(enDashboard.clis.activity));
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(Object.keys(bundle.clis.activity.kinds).sort()).toEqual(
+        [...CLI_AGENT_ACTION_KINDS].sort(),
+      );
+      expect(Object.keys(bundle.clis.activity.outcomes).sort()).toEqual(
+        [...CLI_AGENT_ACTION_OUTCOMES].sort(),
+      );
+    }
   });
 
   it("contains the terminals and CLI feature keys in both bundles", () => {

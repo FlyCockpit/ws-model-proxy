@@ -37,6 +37,7 @@ import {
   adaptCliCommandResultInput,
   adaptCliCommandRunInput,
   adaptCliSupervisedStartInput,
+  CLI_AGENT_ACTIVITY_NOTICE,
   CLI_COMMAND_OUTPUT_NOTICE,
   CLI_SUPERVISED_COMMAND_NOTICE,
   runForwarderCliCommand,
@@ -406,6 +407,15 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     descriptionNote:
       "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A token also needs mcp:write and allowCliCommands.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
+  },
+  {
+    name: "forwarder_cli_activity_list",
+    target: "cliAgentActivity.list",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote: CLI_AGENT_ACTIVITY_NOTICE,
+    invokeProcedure: procedureInvoker((client) => client.cliAgentActivity.list),
   },
   {
     name: "forwarder_device_metrics_get",
@@ -1172,8 +1182,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 26 read tools and 51 write tools
- * (46 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 28 read tools and 51 write tools
+ * (74 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
   buildDescriptor,
