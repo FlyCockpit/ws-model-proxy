@@ -750,7 +750,6 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: "RUN",
     // Engine-load FULL can send `:external` callers to paid external providers.
     classification: "cost",
-    inputSchema: confirmedArgs("RUN"),
     descriptionNote:
       "{poolMemberId, mode: 'auto'|'off', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. Read the live load with forwarder_pool_routing_rules_get.",
     invokeProcedure: procedureInvoker(

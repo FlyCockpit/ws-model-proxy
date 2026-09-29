@@ -85,7 +85,8 @@ export type ContextServices = {
    */
   onRemoteMetricSourcesChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
   /**
-   * A pool's metric routing rules were replaced (committed). The relay clears
+   * A pool's metric routing rules or one of its members' engine-load override
+   * were replaced (committed). The relay clears
    * the pool's stored verdicts: they are hot-path (H) rows, which a management
    * (M) writer must not write, so the clearing runs in the H module after
    * the rules commit.

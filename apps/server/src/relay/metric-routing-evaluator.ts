@@ -107,6 +107,18 @@ function rulesKey(rules: unknown): string {
   return JSON.stringify(rules);
 }
 
+/** The member's engine-load override an evaluation used, compared by value. */
+function overrideKey(mode: string, kvFullThreshold: number | null): string {
+  return `${mode}:${kvFullThreshold ?? ""}`;
+}
+
+type PublishedEntry = {
+  memberId: string;
+  poolId: string;
+  rulesKey: string;
+  overrideKey: string;
+};
+
 type VerdictData = {
   publisherId: string;
   userId: string;
@@ -114,7 +126,7 @@ type VerdictData = {
   cliDeviceId: string;
   verdict: "NONE" | "AVOID" | "FULL";
   ruleStates: string[];
-  engineState: string | null;
+  engineState: string;
   evaluatedAt: Date;
   expiresAt: Date;
 };
@@ -216,7 +228,7 @@ export class MetricRoutingEvaluator {
       ? nodeMetricSeries(inputs.nodeMetrics.sample, inputs.nodeMetrics.receivedAt, now)
       : [];
     const seen = new Set<string>();
-    const published: Array<{ memberId: string; poolId: string; rulesKey: string }> = [];
+    const published: PublishedEntry[] = [];
     for (const member of members) {
       const rules = parseStoredRoutingRules(member.ModelPool.routingRules);
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
@@ -278,6 +290,7 @@ export class MetricRoutingEvaluator {
           memberId: member.id,
           poolId: member.poolId,
           rulesKey: rulesKey(rules),
+          overrideKey: overrideKey(facts.mode, facts.kvFullThreshold),
         });
       }
     }
@@ -325,8 +338,9 @@ export class MetricRoutingEvaluator {
   }
 
   /**
-   * A rule edit can commit between the rules this evaluation read and its
-   * write. After the write is committed, re-read the pools: any whose rules
+   * A rule edit or engine-load override change can commit between what this
+   * evaluation read and its write. After the write is committed, re-read the
+   * pools and members: any whose rules or override
    * differ had their rows cleared before or will not see ours, so delete
    * exactly the rows this evaluation wrote (a newer evaluation's row has a
    * different `evaluatedAt` and is kept). A row committed before the
@@ -335,7 +349,7 @@ export class MetricRoutingEvaluator {
    */
   private async retractIfRulesChanged(
     state: RoutingEvaluationState,
-    published: readonly { memberId: string; poolId: string; rulesKey: string }[],
+    published: readonly PublishedEntry[],
     evaluatedAt: Date,
   ): Promise<void> {
     if (published.length === 0) return;
@@ -347,7 +361,21 @@ export class MetricRoutingEvaluator {
     const current = new Map(
       pools.map((pool) => [pool.id, rulesKey(parseStoredRoutingRules(pool.routingRules))]),
     );
-    const stale = published.filter((entry) => current.get(entry.poolId) !== entry.rulesKey);
+    const members = await this.db.poolMember.findMany({
+      where: { id: { in: published.map((entry) => entry.memberId) } },
+      select: { id: true, engineLoadMode: true, kvFullThreshold: true },
+    });
+    const currentOverride = new Map(
+      members.map((member) => [
+        member.id,
+        overrideKey(member.engineLoadMode === "OFF" ? "OFF" : "AUTO", member.kvFullThreshold),
+      ]),
+    );
+    const stale = published.filter(
+      (entry) =>
+        current.get(entry.poolId) !== entry.rulesKey ||
+        currentOverride.get(entry.memberId) !== entry.overrideKey,
+    );
     if (stale.length === 0) return;
     await this.db.poolMemberRoutingVerdict.deleteMany({
       where: {

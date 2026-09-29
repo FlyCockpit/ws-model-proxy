@@ -90,6 +90,7 @@ type Row = {
   publisherId: string;
   verdict: string;
   ruleStates: string[];
+  engineState?: string;
   evaluatedAt: Date;
   expiresAt: Date;
   poolId: string;
@@ -103,11 +104,19 @@ type Row = {
 function harness(members: ReturnType<typeof member>[]) {
   let now = T0;
   const rows = new Map<string, Row>();
+  const written: Row[] = [];
   const pools = new Map<string, unknown>(
     members.map((entry) => [entry.poolId, entry.ModelPool.routingRules]),
   );
   const db = {
-    poolMember: { findMany: vi.fn(async () => members) },
+    poolMember: {
+      // The retraction re-read filters by id; the evaluation read does not.
+      findMany: vi.fn(async (args?: { where?: { id?: { in: string[] } } }) =>
+        args?.where?.id
+          ? members.filter((entry) => args.where?.id?.in.includes(entry.id))
+          : members,
+      ),
+    },
     modelPool: {
       findMany: vi.fn(async () =>
         [...pools.entries()].map(([id, routingRules]) => ({ id, routingRules })),
@@ -131,6 +140,7 @@ function harness(members: ReturnType<typeof member>[]) {
               row.publisherId === samePublisher.publisherId);
           if (!replaceable) return { count: 0 };
           rows.set(row.poolMemberId, { ...row, ...args.data });
+          written.push({ ...row, ...args.data });
           return { count: 1 };
         },
       ),
@@ -139,6 +149,7 @@ function harness(members: ReturnType<typeof member>[]) {
           throw Object.assign(new Error("unique"), { code: "P2002" });
         }
         rows.set(args.data.poolMemberId, { ...args.data });
+        written.push({ ...args.data });
         return {};
       }),
       deleteMany: vi.fn(
@@ -172,6 +183,12 @@ function harness(members: ReturnType<typeof member>[]) {
   return {
     db,
     rows,
+    written,
+    /** Evaluation reads of the member list (the retraction re-read filters by id). */
+    evaluations: () =>
+      db.poolMember.findMany.mock.calls.filter(
+        (call) => !(call as unknown as [{ where?: { id?: unknown } }?])[0]?.where?.id,
+      ).length,
     evaluator,
     /** Replace a pool's rules, as `setPoolRoutingRules` does (rules, then clear its verdicts). */
     editRules: (poolId: string, rules: unknown) => {
@@ -207,22 +224,9 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
     vi.useRealTimers();
   });
 
+  /** Every stored verdict write (a conditional update that hit, or a create), in order. */
   function writes(h: ReturnType<typeof harness>) {
-    return h.db.poolMemberRoutingVerdict.upsert.mock.calls.map(
-      (call) =>
-        (
-          call as unknown as [
-            {
-              create: {
-                poolMemberId: string;
-                verdict: string;
-                engineState: string;
-                expiresAt: Date;
-              };
-            },
-          ]
-        )[0].create,
-    );
+    return h.written;
   }
 
   it("writes FULL for a rule-less vLLM member with sustained waiting, expiring with the reading", async () => {
@@ -259,7 +263,7 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
         load({ endpointSlug: "d", kvUsage: 0.2 }),
       ],
     });
-    expect(h.db.poolMemberRoutingVerdict.upsert).not.toHaveBeenCalled();
+    expect(writes(h)).toEqual([]);
   });
 
   it("marks llama.cpp FULL on all slots busy or deferred requests", async () => {
@@ -297,7 +301,7 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
         load({ endpointSlug: "b", ...hot }),
       ],
     });
-    expect(h.db.poolMemberRoutingVerdict.upsert).not.toHaveBeenCalled();
+    expect(writes(h)).toEqual([]);
   });
 
   it("honours a per-member KV threshold", async () => {
@@ -353,7 +357,7 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
       await h.evaluator.evaluate(state, { nodeMetrics: null, endpointLoad: [hotLoad()] });
       h.advance(1_000);
     }
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(4);
+    expect(writes(h)).toHaveLength(4);
     // The engine calms down: one NONE write, then no more writes.
     for (let index = 0; index < 10; index += 1) {
       await h.evaluator.evaluate(state, {
@@ -362,7 +366,7 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
       });
       h.advance(1_000);
     }
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(5);
+    expect(writes(h)).toHaveLength(5);
     expect(writes(h).at(-1)).toMatchObject({ verdict: "NONE", engineState: "clear" });
   });
 
@@ -604,6 +608,24 @@ describe("MetricRoutingEvaluator", () => {
     expect(h.rows.size).toBe(0);
   });
 
+  it("retracts an engine FULL written under an override that was changed during the evaluation (S-D)", async () => {
+    const members = [engineMember("m1", "VLLM")];
+    const h = harness(members);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const publish = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
+    h.db.poolMemberRoutingVerdict.create.mockImplementationOnce(async (args) => {
+      const result = await (publish ? publish(args) : Promise.resolve({}));
+      // The override edit committed (and its clearing already ran) before this write landed.
+      members[0] = { ...members[0], engineLoadMode: "OFF" } as (typeof members)[number];
+      return result;
+    });
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ waiting: 3, waitingStreak: 2 })],
+    });
+    expect(h.rows.size).toBe(0);
+  });
+
   it("stops publishing the remaining members once its session is cancelled between writes", async () => {
     const h = harness([member("m1", hotRule), member("m2", hotRule)]);
     const state = createRoutingEvaluationState("user-1", "device-1");
@@ -643,19 +665,19 @@ describe("MetricRoutingEvaluator", () => {
     const inputs = () => metrics(90, h.now());
     h.evaluator.schedule(state, inputs);
     await vi.advanceTimersByTimeAsync(0);
-    expect(h.db.poolMember.findMany).toHaveBeenCalledTimes(1);
+    expect(h.evaluations()).toBe(1);
     h.evaluator.schedule(state, inputs);
     h.evaluator.schedule(state, inputs);
     h.evaluator.schedule(state, inputs);
     await vi.advanceTimersByTimeAsync(ROUTING_EVALUATION_MIN_INTERVAL_MS - 10);
-    expect(h.db.poolMember.findMany).toHaveBeenCalledTimes(1);
+    expect(h.evaluations()).toBe(1);
     h.advance(ROUTING_EVALUATION_MIN_INTERVAL_MS);
     await vi.advanceTimersByTimeAsync(20);
-    expect(h.db.poolMember.findMany).toHaveBeenCalledTimes(2);
+    expect(h.evaluations()).toBe(2);
     h.evaluator.schedule(state, inputs);
     h.evaluator.cancel(state);
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(h.db.poolMember.findMany).toHaveBeenCalledTimes(2);
+    expect(h.evaluations()).toBe(2);
   });
 
   it("logs only the error class when an evaluation fails", async () => {

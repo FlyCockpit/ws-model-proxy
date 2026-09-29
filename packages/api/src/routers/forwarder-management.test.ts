@@ -6018,15 +6018,16 @@ describe("metric routing procedures (S-B part 2)", () => {
     expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
   });
 
-  it("sets a member's engine load override, scoped to the owner, and clears its verdict (S-D)", async () => {
+  it("sets a member's engine load override, scoped to the owner, and has the relay clear the pool's verdicts (S-D)", async () => {
     deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
-    deep.poolMemberRoutingVerdict.deleteMany.mockResolvedValue({ count: 1 });
+    const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
     deep.poolMember.findFirst.mockResolvedValue({
       id: "m1",
+      poolId: "pool-1",
       engineLoadMode: "OFF",
       kvFullThreshold: 0.8,
     });
-    const result = await client().setPoolMemberEngineLoad({
+    const result = await client({ onPoolRoutingRulesChanged }).setPoolMemberEngineLoad({
       poolMemberId: "m1",
       mode: "off",
       kvFullThreshold: 0.8,
@@ -6035,9 +6036,9 @@ describe("metric routing procedures (S-B part 2)", () => {
       where: { id: "m1", ModelPool: { userId: "user-id" } },
       data: { engineLoadMode: "OFF", kvFullThreshold: 0.8 },
     });
-    expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
-      where: { poolMemberId: "m1", userId: "user-id" },
-    });
+    expect(onPoolRoutingRulesChanged).toHaveBeenCalledWith("pool-1");
+    // The H-class verdict table is never written by this M writer.
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "off", kvFullThreshold: 0.8 });
   });
 
@@ -6045,6 +6046,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
     deep.poolMember.findFirst.mockResolvedValue({
       id: "m1",
+      poolId: "pool-1",
       engineLoadMode: "AUTO",
       kvFullThreshold: null,
     });

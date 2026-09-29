@@ -283,8 +283,8 @@ export const metricRoutingProcedures = {
    * Per-member live engine load override (S-D). `auto` lets the engine's live
    * load (`endpoint.load`) mark the member FULL; `off` ignores it. The optional
    * `kvFullThreshold` (0-1) overrides the 0.95 default for vLLM/SGLang; null
-   * clears it. The member's stored verdict is cleared so the change applies at
-   * the device's next `endpoint.load` frame.
+   * clears it. The pool's stored verdicts are cleared by the relay (H) so the
+   * change applies at the device's next `endpoint.load` frame.
    */
   setPoolMemberEngineLoad: protectedProcedure
     .input(
@@ -296,8 +296,9 @@ export const metricRoutingProcedures = {
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // Single statements (non-key columns; the verdict table has no FKs): no
-      // capacity lock is held or taken.
+      // One graph statement (non-key columns): no capacity lock is held or
+      // taken. The stored verdicts are H-class rows: the relay clears them
+      // afterwards (`onPoolRoutingRulesChanged`), never this M writer.
       const updated = await prisma.poolMember.updateMany({
         where: { id: input.poolMemberId, ModelPool: { userId } },
         data: {
@@ -310,13 +311,11 @@ export const metricRoutingProcedures = {
       if (updated.count === 0) {
         throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
       }
-      await prisma.poolMemberRoutingVerdict.deleteMany({
-        where: { poolMemberId: input.poolMemberId, userId },
-      });
       const member = await prisma.poolMember.findFirst({
         where: { id: input.poolMemberId, ModelPool: { userId } },
-        select: { id: true, engineLoadMode: true, kvFullThreshold: true },
+        select: { id: true, poolId: true, engineLoadMode: true, kvFullThreshold: true },
       });
+      if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
       return {
         poolMemberId: input.poolMemberId,
         mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),

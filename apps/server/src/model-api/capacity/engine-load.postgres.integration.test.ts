@@ -1,4 +1,4 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 import type { AdmissionAttempt, AdmissionResult, CapacityLeaseHandle } from "./types.js";
 
@@ -15,7 +15,7 @@ if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   );
 const integration = databaseUrl ? describe : describe.skip;
 
-type Db = ReturnType<typeof createPrismaClient>;
+type Db = ReturnType<typeof createFixturePrismaClient>;
 
 async function fixture(db: Db) {
   // The store module imports the default client, which validates the env.
@@ -161,7 +161,7 @@ async function verdictOf(db: Db, poolMemberId: string) {
 integration("PostgreSQL live engine load at candidate build and grant time", () => {
   it("a sustained-waiting vLLM member is FULL: a queued waiter is not granted on it, only elsewhere", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -216,7 +216,7 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
 
   it("a single waiting frame, a stale reading and the 'off' override do not make a member FULL", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -257,7 +257,7 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
 
   it("fails open when every candidate is load-FULL, and logs it", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -304,7 +304,7 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
 
   it("clears the row when load calms down and expires it when the readings stop", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -337,13 +337,14 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
     }
   });
 
-  it("bounds writes: many frames from many endpoints upsert only on change or refresh", async () => {
+  it("bounds writes: many frames from many endpoints write only on change or refresh", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { evaluator, state } = await evaluatorFor(db, f.user.id, f.device.id);
-      const upsert = vi.spyOn(db.poolMemberRoutingVerdict, "upsert");
+      const create = vi.spyOn(db.poolMemberRoutingVerdict, "create");
+      const update = vi.spyOn(db.poolMemberRoutingVerdict, "updateMany");
       for (let frame = 0; frame < 30; frame += 1) {
         await evaluator.evaluate(state, {
           nodeMetrics: null,
@@ -353,8 +354,10 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
           ],
         });
       }
-      // 30 frames inside one refresh window: one write for A, none for B.
-      expect(upsert).toHaveBeenCalledTimes(1);
+      // 30 frames inside one refresh window: one write for A (the fenced
+      // publish tries the conditional update once, then creates), none for B.
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(update).toHaveBeenCalledTimes(1);
     } finally {
       await f.cleanup();
       await db.$disconnect();
