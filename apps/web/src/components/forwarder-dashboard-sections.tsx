@@ -755,7 +755,7 @@ export function CliEndpointsModelsSection() {
       ) : (
         <div className="space-y-4">
           {matchingDevices.map((device) => (
-            <div key={device.id} className="rounded-md border">
+            <div key={device.id} id={`cli-${device.id}`} className="scroll-mt-20 rounded-md border">
               <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -766,23 +766,33 @@ export function CliEndpointsModelsSection() {
                     ) : null}
                     {device.upgradeRequired ? (
                       <StatusPill status="OFFLINE">
-                        {t("dashboard:clis.upgradeRequired", {
-                          protocol:
-                            device.upgradeRequired.protocolVersion ??
-                            t("dashboard:clis.upgradeUnknownProtocol"),
-                        })}
+                        {t(
+                          device.upgradeRequired.reason === "cli_too_new"
+                            ? "dashboard:clis.serverUpgradeRequired"
+                            : "dashboard:clis.upgradeRequired",
+                          {
+                            protocol:
+                              device.upgradeRequired.protocolVersion ??
+                              t("dashboard:clis.upgradeUnknownProtocol"),
+                          },
+                        )}
                       </StatusPill>
                     ) : null}
                   </div>
                   <p className="mt-1 font-mono text-xs text-muted-foreground">{device.slug}</p>
                   {device.upgradeRequired ? (
                     <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
-                      {t("dashboard:clis.upgradeRequiredDetail", {
-                        version:
-                          device.upgradeRequired.cliVersion ??
-                          t("dashboard:clis.upgradeUnknownVersion"),
-                        value: formatDate(device.upgradeRequired.rejectedAt),
-                      })}
+                      {t(
+                        device.upgradeRequired.reason === "cli_too_new"
+                          ? "dashboard:clis.serverUpgradeRequiredDetail"
+                          : "dashboard:clis.upgradeRequiredDetail",
+                        {
+                          version:
+                            device.upgradeRequired.cliVersion ??
+                            t("dashboard:clis.upgradeUnknownVersion"),
+                          value: formatDate(device.upgradeRequired.rejectedAt),
+                        },
+                      )}
                     </p>
                   ) : null}
                   <p className="mt-2 text-xs text-muted-foreground">

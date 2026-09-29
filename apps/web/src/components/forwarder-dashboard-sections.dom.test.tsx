@@ -872,6 +872,7 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
           protocolVersion: "2.6",
           cliVersion: "0.4.0",
           rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_old",
         },
       },
       { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", upgradeRequired: null },
@@ -886,6 +887,29 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     expect(screen.getByText(/^dashboard:clis\.upgradeRequiredDetail\|/).textContent).toContain(
       '"version":"0.4.0"',
     );
+  });
+
+  it("says the server must be upgraded when the refused CLI is newer", () => {
+    state.cliDevices = [
+      {
+        ...cliDeviceWithModel,
+        upgradeRequired: {
+          protocolVersion: "2.8",
+          cliVersion: "0.9.0",
+          rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_new",
+        },
+      },
+    ];
+    mountModelsSection();
+
+    expect(screen.queryByText(/^dashboard:clis\.upgradeRequired/)).toBeNull();
+    expect(screen.getByText(/^dashboard:clis\.serverUpgradeRequired\|/).textContent).toBe(
+      `dashboard:clis.serverUpgradeRequired|${JSON.stringify({ protocol: "2.8" })}`,
+    );
+    expect(
+      screen.getByText(/^dashboard:clis\.serverUpgradeRequiredDetail\|/).textContent,
+    ).toContain('"version":"0.9.0"');
   });
 
   it("keeps the plain success toast on clean responses", async () => {
@@ -1003,6 +1027,30 @@ describe("CliEndpointsModelsSection device names", () => {
       fireEvent.change(search, { target: { value: query } });
       expect(screen.getByRole("heading", { name: "Work laptop" })).toBeTruthy();
       expect(screen.queryByRole("heading", { name: "desk-01.local" })).toBeNull();
+    }
+  });
+
+  it("anchors each device card with cli-<deviceId> matching the token form's link", () => {
+    state.cliDevices = [
+      cliDeviceWithModel,
+      {
+        ...cliDeviceWithModel,
+        id: "cli-2",
+        slug: "tower",
+        name: "Work laptop",
+        reportedHostname: "tower.lan",
+        displayName: "Work laptop",
+        endpoints: [],
+      },
+    ];
+    mountDevices();
+
+    // The token form links to `#cli-<id>` (cli-command-devices.tsx), so each
+    // card must carry a matching id for the browser to scroll to it.
+    for (const id of ["cli-1", "cli-2"]) {
+      const anchor = document.getElementById(`cli-${id}`);
+      expect(anchor).toBeTruthy();
+      expect(anchor?.id).toBe(`cli-${id}`);
     }
   });
 

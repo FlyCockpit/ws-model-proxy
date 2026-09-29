@@ -101,6 +101,47 @@ function modeRadio(mode: string, { hidden = false }: { hidden?: boolean } = {}) 
   });
 }
 
+describe("effective command mode", () => {
+  const terminal = {
+    granted: false,
+    deviceAllows: true,
+    supported: true,
+    live: true,
+    available: false,
+  };
+  const cases = [
+    ["grant off", "off", { headless: "grant_disabled", supervised: "grant_disabled" }],
+    ["supervised only", "supervised", { headless: "cli_supervised_only", supervised: null }],
+    ["offline", "off", { headless: "offline", supervised: "offline" }],
+    ["config off", "off", { headless: "feature_disabled", supervised: "feature_disabled" }],
+    ["no PTY", "unsupervised", { headless: null, supervised: "unsupported" }],
+  ] as const;
+  it.each(cases)("names each command kind's refusal: %s", (_name, effective, refusals) => {
+    renderSwitches({ terminal, commands: commands({ effectiveMode: effective, refusals }) });
+    const box = screen.getByTestId("command-effective");
+    expect(box.textContent).toContain(`dashboard:clis.features.commandModes.${effective}`);
+    for (const kind of ["headless", "supervised"] as const) {
+      const line = screen.getByTestId(`command-${kind}`).textContent ?? "";
+      expect(line).toContain(`dashboard:clis.features.commandKind.${kind}`);
+      const refusal = refusals[kind];
+      if (refusal) {
+        expect(line).toContain(`dashboard:clis.features.commandRefusal.${refusal}`);
+        expect(line).not.toContain("commandAllowed");
+      } else {
+        expect(line).toContain("dashboard:clis.features.commandAllowed");
+        expect(line).not.toContain("commandRefusal");
+      }
+    }
+  });
+
+  it("renders no per-kind line when the API omits the refusals", () => {
+    renderSwitches({ terminal, commands: commands({ effectiveMode: "unsupervised" }) });
+    expect(screen.getByTestId("command-effective")).toBeTruthy();
+    expect(screen.queryByTestId("command-headless")).toBeNull();
+    expect(screen.queryByTestId("command-supervised")).toBeNull();
+  });
+});
+
 describe("CLI feature switches", () => {
   it("disables the terminal switch on Windows and explains why", () => {
     renderSwitches({
