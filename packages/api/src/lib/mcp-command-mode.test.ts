@@ -54,6 +54,13 @@ describe("MCP command mode", () => {
     },
   );
 
+  it("treats a live CLI with no reported mode as off", () => {
+    expect(mcpCommandLimit({ grant: "supervised", live: true, cliMode: null })).toBe("cliConfig");
+    expect(mcpCommandLimit({ grant: "unsupervised", live: true, cliMode: undefined })).toBe(
+      "cliConfig",
+    );
+  });
+
   it("names the connection when the grant allows commands but the CLI is not live", () => {
     expect(mcpCommandLimit({ grant: "supervised", live: false, cliMode: "unsupervised" })).toBe(
       "offline",

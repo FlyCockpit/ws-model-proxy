@@ -267,6 +267,13 @@ describe("MCP tool manifest — exact catalog", () => {
     expect(MCP_TOOL_MANIFEST).toHaveLength(77);
   });
 
+  it("the CLI device list explains effectiveMode and which switch limits it", () => {
+    const tool = MCP_TOOL_MANIFEST.find((entry) => entry.name === "forwarder_cli_devices_list");
+    for (const phrase of ["effectiveMode", "limitedBy", "cliConfig", "allowCliCommands"]) {
+      expect(tool?.descriptionNote).toContain(phrase);
+    }
+  });
+
   it("every descriptor carries its catalog target", () => {
     for (const tool of MCP_TOOL_MANIFEST) {
       expect(PLAN_TARGETS[tool.name]).toBe(tool.target);
