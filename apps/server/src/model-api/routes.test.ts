@@ -1240,6 +1240,81 @@ describe("model API routes", () => {
     },
   );
 
+  it("omits include_usage for a Chat member whose inventory declares streamUsage false", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "strict-chat-member",
+        discoveredModelId: "chat-model",
+        upstreamModelId: "upstream-chat",
+        cliDeviceId: "cli-chat",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              streamUsage: false,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-chat"];
+    const responsePromise = appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        max_tokens: 8,
+        stream: true,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    const upstreamBody = JSON.parse(await relayBodyText(sent));
+    expect(upstreamBody).toMatchObject({ stream: true });
+    expect(upstreamBody).not.toHaveProperty("stream_options");
+    const chunk = (value: Record<string, unknown>) =>
+      `data: ${JSON.stringify({
+        id: "chatcmpl-strict",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "upstream-chat",
+        ...value,
+      })}\n\n`;
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    manager.body(
+      sent.requestId,
+      chunk({
+        choices: [{ index: 0, delta: { role: "assistant", content: "pong" }, finish_reason: null }],
+      }),
+    );
+    const response = await responsePromise;
+    manager.body(
+      sent.requestId,
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+    );
+    manager.body(sent.requestId, "data: [DONE]\n\n");
+    manager.complete(sent.requestId);
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).not.toContain("event: error");
+    expect(text).toContain("event: message_stop");
+  });
+
   it("adapts Claude Code top_k onto a CLI Chat member and drops cache metadata", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -5379,6 +5454,85 @@ describe("model API routes", () => {
         }),
       ),
     );
+  });
+
+  it("ends an adapted provider stream with a terminal error when a trailing usage chunk deviates", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...externalPoolTarget, protocolAdaptationEnabled: true }],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    const chunk = (value: Record<string, unknown>) =>
+      `data: ${JSON.stringify({
+        id: "chatcmpl-provider",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "provider-upstream",
+        ...value,
+      })}\n\n`;
+    const upstream = [
+      chunk({
+        choices: [{ index: 0, delta: { role: "assistant", content: "pong" }, finish_reason: null }],
+      }),
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      // A deviating trailing usage chunk: a string count is not a usage count.
+      chunk({ choices: [], usage: { prompt_tokens: "9", completion_tokens: 3 } }),
+      "data: [DONE]\n\n",
+    ];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        ...externalDispatchResult(provider),
+        response: new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of upstream) controller.enqueue(new TextEncoder().encode(part));
+              controller.close();
+            },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          },
+        ),
+      });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/messages",
+        {
+          method: "POST",
+          headers: {
+            authorization: "Bearer wsmp_model_test",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: EXTERNAL_MODEL_ID,
+            max_tokens: 8,
+            stream: true,
+            messages: [{ role: "user", content: "ping" }],
+          }),
+        },
+      );
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain("event: message_start");
+      expect(text.trimEnd().split("\n\n").at(-1)).toMatch(/^event: error\n/u);
+      expect(text).not.toContain("event: message_stop");
+      expect(warn).toHaveBeenCalledWith(
+        "[model-api] adapter rejected upstream reply",
+        expect.objectContaining({
+          code: "invalid_usage",
+          relayRequestId: "relay-request-id",
+          poolMemberId: "overflow-member",
+          executionTargetId: "overflow-member-target",
+        }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it.each([

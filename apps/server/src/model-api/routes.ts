@@ -153,11 +153,13 @@ import {
 import {
   ADAPTER_VERSION,
   AdapterError,
+  type AdapterLogContext,
   adaptNonstreamResponse,
   type CanonicalRequest,
   CanonicalStreamRenderer,
   createProtocolAdaptationTransform,
   executionTargetAcceptsTopK,
+  executionTargetSupportsStreamUsage,
   type ProtocolSurface,
   parseCanonicalRequest,
   reasoningControlForSurface,
@@ -1435,7 +1437,9 @@ function adaptedResponseBody({
   headers,
   signal,
   onProtocolError,
+  recoverBeforeOutput,
   request,
+  logContext,
 }: {
   body: ReadableStream<Uint8Array>;
   source: ProtocolSurface;
@@ -1445,7 +1449,10 @@ function adaptedResponseBody({
   headers: Headers;
   signal: AbortSignal;
   onProtocolError?: (error: unknown) => void;
+  /** With `onProtocolError`: headers are committed, so always end with a terminal error. */
+  recoverBeforeOutput?: boolean;
   request?: CanonicalRequest;
+  logContext?: AdapterLogContext;
 }): ReadableStream<Uint8Array> {
   if (stream)
     return body.pipeThrough(
@@ -1455,7 +1462,9 @@ function adaptedResponseBody({
         signal,
         request,
         recoverProtocolErrors: onProtocolError !== undefined,
+        recoverBeforeOutput,
         onProtocolError,
+        logContext,
       }),
       { signal },
     );
@@ -1480,7 +1489,14 @@ function adaptedResponseBody({
           offset += chunk.byteLength;
         }
         const parsed = JSON.parse(new TextDecoder().decode(merged)) as unknown;
-        const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+        const adapted = adaptNonstreamResponse({
+          source,
+          target,
+          body: parsed,
+          status,
+          headers,
+          logContext,
+        });
         const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
         controller.enqueue(new TextEncoder().encode(JSON.stringify(output)));
         controller.close();
@@ -1501,6 +1517,7 @@ async function readAdaptedNonstreamBody({
   status,
   headers,
   signal,
+  logContext,
 }: {
   body: ReadableStream<Uint8Array> | null;
   source: ProtocolSurface;
@@ -1508,9 +1525,17 @@ async function readAdaptedNonstreamBody({
   status: number;
   headers: Headers;
   signal: AbortSignal;
+  logContext?: AdapterLogContext;
 }): Promise<Uint8Array> {
   if (!body) {
-    const adapted = adaptNonstreamResponse({ source, target, body: null, status, headers });
+    const adapted = adaptNonstreamResponse({
+      source,
+      target,
+      body: null,
+      status,
+      headers,
+      logContext,
+    });
     const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
     return new TextEncoder().encode(JSON.stringify(output));
   }
@@ -1552,7 +1577,14 @@ async function readAdaptedNonstreamBody({
         // equivalent to an absent body at this trust boundary.
       }
     }
-    const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+    const adapted = adaptNonstreamResponse({
+      source,
+      target,
+      body: parsed,
+      status,
+      headers,
+      logContext,
+    });
     const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
     return new TextEncoder().encode(JSON.stringify(output));
   } finally {
@@ -1732,6 +1764,7 @@ function renderForExecutionTarget({
     model,
     allowLossyDeveloperRoleCollapse,
     acceptsTopK: executionTargetAcceptsTopK({ capabilityInventory: capabilities }),
+    streamUsage: executionTargetSupportsStreamUsage(capabilities),
     reasoning: reasoningControlForSurface(capabilities ?? null, target),
   });
 }
@@ -4462,6 +4495,11 @@ async function relayPool({
           : committed;
       return withResponseHeaders(held, routeHeaders);
     };
+    const adapterLogContext: AdapterLogContext = {
+      relayRequestId,
+      poolMemberId: result.target.poolMemberId,
+      executionTargetId: result.target.executionTargetId,
+    };
     const releaseAfterPrecommitThrow = async () => {
       releaseCallerLease();
       if (providerCapacityLease && capacityRuntime)
@@ -4489,6 +4527,7 @@ async function relayPool({
           status: result.response.status,
           headers: result.response.headers,
           signal: request.signal,
+          logContext: adapterLogContext,
         });
         return await commitAwareResponse(
           new Response(sanitized, {
@@ -4546,6 +4585,7 @@ async function relayPool({
           status: result.response.status,
           headers: result.response.headers,
           signal: request.signal,
+          logContext: adapterLogContext,
         });
         const adaptedHeaders = adaptedProviderResponseHeaders(
           source,
@@ -4582,7 +4622,14 @@ async function relayPool({
               status: result.response.status,
               headers: result.response.headers,
               signal: request.signal,
+              logContext: adapterLogContext,
               request: canonical ?? undefined,
+              // Headers are already committed and a provider stream cannot be
+              // retried elsewhere, so a rejected upstream event (for example a
+              // deviating trailing usage chunk) must still end the client
+              // stream with the target protocol's terminal error event.
+              onProtocolError: () => undefined,
+              recoverBeforeOutput: true,
             }),
             {
               status: result.response.status,
@@ -4608,6 +4655,7 @@ async function relayPool({
         status: result.response.status,
         headers: result.response.headers,
         signal: request.signal,
+        logContext: adapterLogContext,
       });
       return await commitAwareResponse(
         new Response(adapted, {
@@ -5617,6 +5665,7 @@ async function relayPool({
             status: started.status,
             headers: started.headers,
             signal: request.signal,
+            logContext: { relayRequestId, poolMemberId: candidate.poolMemberId },
           });
         } catch {
           attempt.cancel("protocol_error");
@@ -5655,6 +5704,7 @@ async function relayPool({
               status: started.status,
               headers: started.headers,
               signal: request.signal,
+              logContext: { relayRequestId, poolMemberId: candidate.poolMemberId },
               request: canonicalAdaptationRequest ?? undefined,
               onProtocolError: () => {
                 protocolFailureObserved = true;
@@ -5751,6 +5801,7 @@ async function relayPool({
             status: started.status,
             headers: responseHeaders,
             signal: request.signal,
+            logContext: { relayRequestId, poolMemberId: candidate.poolMemberId },
             request: canonicalAdaptationRequest ?? undefined,
           });
         responseHeaders = new Headers();
@@ -7816,6 +7867,7 @@ async function relayBoundProviderResponse(input: {
         status: response.status,
         headers: response.headers,
         signal: input.request.signal,
+        logContext: { relayRequestId, executionTargetId: result.target.executionTargetId },
       });
       response = new Response(sanitized, {
         status: response.status >= 400 && response.status <= 599 ? response.status : 502,

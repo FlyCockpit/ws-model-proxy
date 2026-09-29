@@ -1,6 +1,6 @@
-import type { CanonicalEvent, ProtocolSurface } from "./canonical.js";
+import type { CanonicalEvent, CanonicalUsage, ProtocolSurface } from "./canonical.js";
 import { AdapterError, unsupported } from "./errors.js";
-import { renderProtocolError } from "./nonstream.js";
+import { anthropicInputUsage, renderProtocolError } from "./nonstream.js";
 import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
@@ -56,6 +56,7 @@ export class CanonicalStreamParser {
   #nextResponseOutputIndex = 0;
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
+  #pendingChatFinishReason?: unknown;
   #chatUsageSeen = false;
   /** Anthropic input counts seen so far; later events update only what they carry. */
   #anthropicInput: ProtocolUsageCounts = { inputParts: {} };
@@ -314,7 +315,13 @@ export class CanonicalStreamParser {
       this.#terminal = true;
       return [{ type: "error", error: this.#streamError(value.error) }];
     }
-    if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
+    const terminalUsageRepeat = this.#isChatTerminalUsageRepeat(value);
+    if (
+      this.#pendingChatStop &&
+      Array.isArray(value.choices) &&
+      value.choices.length > 0 &&
+      !terminalUsageRepeat
+    )
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
     acceptChatEnvelopeExtras(value, "stream.data", "chunk", this.#seenEnvelopeFields);
     if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
@@ -335,17 +342,44 @@ export class CanonicalStreamParser {
         "Multiple stream candidates are not adaptable.",
       );
     const usage = usageEvent(value.usage, "openai-chat", "both");
-    if (choices[0] !== undefined)
+    if (terminalUsageRepeat)
+      acceptChatChoiceExtras(
+        object(choices[0], "choices[0]"),
+        "choices[0]",
+        "delta",
+        this.#seenEnvelopeFields,
+      );
+    else if (choices[0] !== undefined)
       events.push(...this.#chatChoice(object(choices[0], "choices[0]")));
     // One usage site for both the choice and the `choices: []` shapes: a chunk
     // emits usage at most once, and a second usage-bearing chunk is an error.
     if (usage) {
       if (this.#chatUsageSeen)
-        throw new AdapterError("duplicate_usage", "Chat stream emitted usage twice.");
+        throw new AdapterError("duplicate_usage", "Chat stream emitted usage twice.", "usage");
       this.#chatUsageSeen = true;
       events.push(usage);
     }
     return events;
+  }
+
+  /**
+   * OpenRouter documents its terminal usage chunk as a non-empty `choices`
+   * array: one choice whose delta carries no content and repeats the stream's
+   * finish_reason. Only that exact shape, carrying the stream's first usage,
+   * may follow finish_reason; anything else stays `event_after_stop`.
+   */
+  #isChatTerminalUsageRepeat(value: Record<string, unknown>): boolean {
+    if (this.#pendingChatStop === undefined || this.#chatUsageSeen || value.usage == null)
+      return false;
+    const choices = value.choices;
+    if (!Array.isArray(choices) || choices.length !== 1) return false;
+    const choice = choices[0];
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) return false;
+    const fields = choice as Record<string, unknown>;
+    if (fields.index !== undefined && fields.index !== 0) return false;
+    if (fields.finish_reason !== this.#pendingChatFinishReason || fields.logprobs != null)
+      return false;
+    return chatDeltaCarriesNothing(fields.delta);
   }
 
   #chatChoice(choice: Record<string, unknown>): CanonicalEvent[] {
@@ -355,7 +389,11 @@ export class CanonicalStreamParser {
     // Only a finish chunk may omit `delta`; elsewhere a missing delta could
     // hide answer text under an ignored key and complete silently empty.
     if (choice.delta == null && choice.finish_reason == null)
-      throw new AdapterError("invalid_stream_event", "Chat stream choice requires delta.");
+      throw new AdapterError(
+        "invalid_stream_event",
+        "Chat stream choice requires delta.",
+        "choices[0].delta",
+      );
     acceptChatChoiceExtras(choice, "choices[0]", "delta", this.#seenEnvelopeFields);
     if (choice.logprobs != null) unsupported("choices[0].logprobs");
     const delta = object(choice.delta ?? {}, "choices[0].delta");
@@ -422,6 +460,7 @@ export class CanonicalStreamParser {
       if (this.#pendingChatStop)
         throw new AdapterError("duplicate_stop", "Chat emitted more than one finish_reason.");
       this.#pendingChatStop = stopReason(choice.finish_reason);
+      this.#pendingChatFinishReason = choice.finish_reason;
     }
     return events;
   }
@@ -892,7 +931,11 @@ export class CanonicalStreamParser {
     }
     const initialUsage = type === "message_start" ? this.#anthropicUsage(message.usage) : undefined;
     if (type === "message_start" && initialUsage?.usage.inputTokens === undefined)
-      throw new AdapterError("invalid_usage", "Anthropic message_start requires input_tokens.");
+      throw new AdapterError(
+        "invalid_usage",
+        "Anthropic message_start requires input_tokens.",
+        "message.usage.input_tokens",
+      );
     const events =
       type === "message_start" ? this.#start(message.id, message.model, initialUsage) : [];
     if (!this.#started && type !== "error" && type !== "ping")
@@ -1014,6 +1057,8 @@ export class CanonicalStreamParser {
         ...(carriesInput && seen.input !== undefined ? { input: seen.input } : {}),
         ...(counts.output !== undefined ? { output: counts.output } : {}),
         inputParts: seen.inputParts,
+        ...(counts.cacheReadPart !== undefined ? { cacheReadPart: counts.cacheReadPart } : {}),
+        ...(counts.cacheWritePart !== undefined ? { cacheWritePart: counts.cacheWritePart } : {}),
       },
       "stream.usage",
     );
@@ -1044,6 +1089,28 @@ export class CanonicalStreamParser {
       ...(this.#errorMetadata.retryReset ? { retryReset: this.#errorMetadata.retryReset } : {}),
     };
   }
+}
+
+/** A Chat delta that is absent or holds only an assistant role and empty fields. */
+function chatDeltaCarriesNothing(delta: unknown): boolean {
+  if (delta === undefined || delta === null) return true;
+  if (typeof delta !== "object" || Array.isArray(delta)) return false;
+  const emptyFields = new Set([
+    "content",
+    "refusal",
+    "tool_calls",
+    "annotations",
+    "audio",
+    "function_call",
+    "reasoning",
+    "reasoning_content",
+  ]);
+  return Object.entries(delta).every(([key, value]) =>
+    key === "role"
+      ? value === null || value === "assistant"
+      : emptyFields.has(key) &&
+        (value === null || value === "" || (Array.isArray(value) && value.length === 0)),
+  );
 }
 
 function usageEvent(
@@ -1172,17 +1239,23 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     );
 }
 
-function validateCanonicalUsage(usage: { inputTokens?: number; outputTokens?: number }) {
+function validateCanonicalUsage(usage: CanonicalUsage) {
+  const cacheCounts = [usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+    (count): count is number => count !== undefined,
+  );
   if (
     !Number.isSafeInteger(usage.inputTokens) ||
     !Number.isSafeInteger(usage.outputTokens) ||
     (usage.inputTokens as number) < 0 ||
     (usage.outputTokens as number) < 0 ||
-    !Number.isSafeInteger((usage.inputTokens as number) + (usage.outputTokens as number))
+    !Number.isSafeInteger((usage.inputTokens as number) + (usage.outputTokens as number)) ||
+    cacheCounts.some((count) => !Number.isSafeInteger(count) || count < 0) ||
+    cacheCounts.reduce((sum, count) => sum + count, 0) > (usage.inputTokens as number)
   )
     throw new AdapterError(
       "invalid_usage",
       "Canonical usage requires complete non-negative safe integer token counts.",
+      "usage",
     );
 }
 
@@ -1497,7 +1570,7 @@ export class CanonicalStreamRenderer {
       this.#stopEvent = event;
     } else if (event.type === "usage") {
       if (this.#usageEvent)
-        throw new AdapterError("duplicate_usage", "Canonical stream emitted usage twice.");
+        throw new AdapterError("duplicate_usage", "Canonical stream emitted usage twice.", "usage");
       validateCanonicalUsage(event.usage);
       this.#usageEvent = event;
     } else if (event.type === "complete") {
@@ -1866,7 +1939,11 @@ export class CanonicalStreamRenderer {
     if (event.type === "message_start") {
       const inputTokens = event.usage?.inputTokens;
       if (inputTokens === undefined)
-        throw new AdapterError("invalid_usage", "Anthropic message_start requires input_tokens.");
+        throw new AdapterError(
+          "invalid_usage",
+          "Anthropic message_start requires input_tokens.",
+          "message.usage.input_tokens",
+        );
       return [
         named("message_start", {
           message: {
@@ -1878,7 +1955,7 @@ export class CanonicalStreamRenderer {
             stop_reason: null,
             stop_sequence: null,
             usage: {
-              input_tokens: inputTokens,
+              ...anthropicInputUsage(event.usage),
               output_tokens: event.usage?.outputTokens ?? 0,
             },
           },
@@ -1942,7 +2019,7 @@ export class CanonicalStreamRenderer {
           delta: { stop_reason: anthropicStopReason(event.reason), stop_sequence: null },
           usage:
             inputTokens !== undefined && outputTokens !== undefined
-              ? { input_tokens: inputTokens, output_tokens: outputTokens }
+              ? { ...anthropicInputUsage(seen), output_tokens: outputTokens }
               : { output_tokens: 0 },
         }),
       ];

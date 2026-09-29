@@ -134,9 +134,17 @@ const baseSurfaceFeatureSchema = z
   })
   .strict();
 
-const surfaceFeatureSchema = baseSurfaceFeatureSchema.superRefine((value, context) =>
-  validateSurfaceReasoningConfig(value, "openaiChatCompletions", context),
-);
+/**
+ * `streamUsage: false` marks a Chat endpoint that rejects
+ * `stream_options.include_usage`; adapted streams then omit it. Absent means true.
+ */
+const chatStreamUsageShape = { streamUsage: booleanSupportSchema } as const;
+
+const surfaceFeatureSchema = baseSurfaceFeatureSchema
+  .extend(chatStreamUsageShape)
+  .superRefine((value, context) =>
+    validateSurfaceReasoningConfig(value, "openaiChatCompletions", context),
+  );
 
 const anthropicSurfaceFeatureSchema = baseSurfaceFeatureSchema
   .extend({ countTokens: booleanSupportSchema })
@@ -236,6 +244,7 @@ const v4CapabilitiesSchema = z
         openaiChatCompletions: z
           .object({
             ...v4SurfaceFeatureShape,
+            ...chatStreamUsageShape,
             operations: uniqueOperations(capabilityOperationSchema.openaiChatCompletions),
           })
           .strict()

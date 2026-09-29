@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
@@ -110,8 +111,10 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 }));
 
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
+import openRouterUsageFixture from "./fixtures/openrouter-usage.json";
 import { claimProviderHealthTrial } from "./provider-attempt-runtime.js";
 import { admitProviderBudget } from "./provider-budget.js";
+import { providerBillableTokens } from "./provider-budget-accounting.js";
 import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
@@ -2610,6 +2613,36 @@ describe("own-key dispatch and authoritative send claim", () => {
       "pool_fallback_preference",
     ]);
   });
+  it("settles OpenRouter own-key usage to the requester below the reservation", async () => {
+    const { request, model } = setup();
+    model.ProviderAccount.providerType = "openrouter";
+    reconcileProviderBudget.mockClear();
+    providerHttpsRequest.mockReset().mockResolvedValue(
+      Object.assign(
+        Readable.from([Buffer.from(JSON.stringify(openRouterUsageFixture.nonStream))]),
+        {
+          statusCode: 200,
+          headers: { "content-type": "application/json" },
+          complete: true,
+        },
+      ),
+    );
+    const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
+    const result = await dispatchPublicOverflow({ ...request, liability });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+    const settled = reconcileProviderBudget.mock.calls[0]?.[0];
+    expect(settled).toMatchObject({
+      userId: "grantee",
+      poolId: undefined,
+      observationComplete: true,
+      usage: { categoriesComplete: true, cacheReadTokens: 600n, cacheWriteTokens: 0n },
+    });
+    expect(providerBillableTokens(settled.usage)).toBe(1_280n);
+    expect(providerBillableTokens(settled.usage)! < liability.tokens).toBe(true);
+  });
   it.each([
     "token",
     "allowlist",
@@ -2695,6 +2728,384 @@ describe("own-key dispatch and authoritative send claim", () => {
     expect((await dispatchPublicOverflow(request)).dispatched).toBe(false);
     expect(providerHttpsRequest).not.toHaveBeenCalled();
   });
+});
+
+describe("OpenRouter owner-paid settlement", () => {
+  const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
+  async function settleOwnerStream(
+    providerType: string,
+    upstream: Buffer[],
+    requester: "owner" | "grantee" = "owner",
+    surface: "openai-chat" | "openai-responses" | "anthropic-messages" = "openai-chat",
+  ) {
+    const protocol = surface === "anthropic-messages" ? "anthropic" : "openai";
+    reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+    providerHttpsRequest.mockReset();
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture(protocol, surface, providerType),
+      fallbackForGrantees: requester === "grantee",
+    });
+    if (requester === "grantee") {
+      consentState.token = { ...consentState.token, userId: "grantee" };
+      consentState.grant = currentGrant();
+    }
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: {
+        findFirst: vi.fn().mockResolvedValue({ providerType, allowDataCollection: false }),
+      },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    providerHttpsRequest.mockResolvedValueOnce(
+      Object.assign(Readable.from(upstream), {
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream" },
+        complete: true,
+      }),
+    );
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: `request-openrouter-${providerType}`,
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(requester),
+      requestedProtocol: protocol,
+      requestedSurface: surface,
+      stream: true,
+      requiredFeatures: [],
+      path:
+        surface === "anthropic-messages"
+          ? "/v1/messages"
+          : surface === "openai-responses"
+            ? "/v1/responses"
+            : "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+      signal: new AbortController().signal,
+      liability,
+      requestedOutputTokens: 10n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+    return reconcileProviderBudget.mock.calls[0]?.[0];
+  }
+
+  const pricingRow = () => ({
+    id: "price",
+    version: "price-1",
+    currency: "USD",
+    accountingVersion: "provider-billable-v1",
+    confidence: "CALCULATED",
+    effectiveAt: new Date(0),
+    pricing: { ratesPerMillion: { input: "1", output: "4", cacheRead: "0.1" } },
+    chargeRules: {
+      inputIncludesCacheRead: false,
+      inputIncludesCacheWrite: false,
+      outputIncludesReasoning: false,
+      outputIncludesTool: false,
+      reasoningAllowanceTokens: 0,
+      toolAllowanceTokens: 0,
+      cacheReadAllowanceTokens: 0,
+      cacheWriteAllowanceTokens: 0,
+      additionalAllowanceTokens: 0,
+      unknownCategories: "FAIL_CLOSED",
+    },
+  });
+
+  // #62 AC: pool fallback settles against the pool owner's budget even when a
+  // grantee made the request (own-key settles against the requester, above).
+  it("settles a grantee's OpenRouter pool fallback against the owner's budget", async () => {
+    try {
+      const settled = await settleOwnerStream(
+        "openrouter",
+        [Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`)],
+        "grantee",
+      );
+      expect(settled).toMatchObject({
+        userId: "owner",
+        poolId: "pool",
+        observationComplete: true,
+        usage: { categoriesComplete: true },
+      });
+      expect(providerBillableTokens(settled.usage)).toBe(1_280n);
+      expect(vi.mocked(admitProviderBudget)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ userId: "owner", poolId: "pool" }),
+      );
+    } finally {
+      resetConsentState();
+    }
+  });
+
+  // Live captures: the dispatcher's whole-stream collector is keyed by the
+  // upstream surface (Messages: message_delta; Responses: response.completed).
+  it.each([
+    ["messages-stream-write", "anthropic-messages", "0.0096115"],
+    ["responses-stream", "openai-responses", "0.00008"],
+    ["chat-stream-write", "openai-chat", "0.0096115"],
+  ] as const)("settles the live %s capture through the dispatcher", async (name, surface, cost) => {
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [readFileSync(new URL(`./fixtures/openrouter-live/${name}.raw`, import.meta.url))],
+      "owner",
+      surface,
+    );
+    expect(settled).toMatchObject({
+      userId: "owner",
+      poolId: "pool",
+      usage: { categoriesComplete: true },
+    });
+    expect(settled.usage.reportedCost?.toString()).toBe(cost);
+    // OpenRouter's Responses stream sends no `event:` lines, so the native
+    // Responses terminal is not recognised and the observation stays
+    // incomplete (liability). OpenRouter accounts claim only Chat Completions,
+    // so Responses clients reach OpenRouter adapted to Chat.
+    expect(settled.observationComplete).toBe(surface !== "openai-responses");
+  });
+
+  it.each([
+    { providerType: "openrouter", complete: true },
+    { providerType: "openai", complete: false },
+    { providerType: "openai-compatible", complete: false },
+  ])(
+    "settles $providerType usage to the pool owner (categoriesComplete $complete)",
+    async ({ providerType, complete }) => {
+      // Catalog-import-shaped rates (the import always writes reasoning).
+      db.providerPricingVersion.findFirst.mockResolvedValue({
+        ...pricingRow(),
+        pricing: {
+          ratesPerMillion: {
+            input: "1",
+            output: "4",
+            cacheRead: "0.1",
+            cacheWrite: "1.25",
+            reasoning: "4",
+          },
+        },
+      });
+      let settled: Awaited<ReturnType<typeof settleOwnerStream>>;
+      try {
+        settled = await settleOwnerStream(providerType, [
+          Buffer.from(`${openRouterUsageFixture.stream.join("\n\n")}\n\n`),
+        ]);
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
+      }
+      expect(settled).toMatchObject({
+        userId: "owner",
+        poolId: "pool",
+        observationComplete: true,
+        usage: { categoriesComplete: complete },
+      });
+      const billed = providerBillableTokens(settled.usage);
+      if (complete) {
+        expect(billed).toBe(1_280n);
+        expect(billed! < liability.tokens).toBe(true);
+        // 600*1 + 50*4 + 600*0.1 + 30*4 per million: real prices, not the reservation.
+        expect(settled.usage.calculatedCost?.toString()).toBe("0.00098");
+        expect(settled.usage.calculatedCostPricingVersion).toBe("price-1");
+      } else {
+        // Fail closed: settlement keeps the full reservation (liability path).
+        expect(billed).toBeUndefined();
+      }
+    },
+  );
+
+  // OpenRouter reports usage once. A second distinct observation (split
+  // across the windows) cannot be attributed to one snapshot, so an earlier
+  // charge or authoritative total must not settle below the liability.
+  it.each([
+    {
+      label: "an earlier reported cost",
+      first: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001, cost: 0.000001 },
+      second: {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        prompt_tokens_details: { cache_write_tokens: 1000 },
+      },
+    },
+    {
+      label: "an earlier authoritative total",
+      first: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, billable_tokens: 1 },
+      second: { output_tokens: 100 },
+    },
+    {
+      label: "two complete observations",
+      first: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001 },
+      second: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 },
+    },
+    // A later observation the parser cannot read still counts.
+    ...[
+      { total_tokens: 100_000 },
+      { future_tokens: 5000 },
+      { completion_tokens: "100000" },
+      { completion_tokens_details: { image_tokens: 5000 } },
+    ].map((second) => ({
+      label: `a later unreadable ${JSON.stringify(second)}`,
+      first: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, cost: 0.000001 },
+      second,
+    })),
+  ])(
+    "keeps the liability for split observations with $label",
+    async ({ first, second }) => {
+      db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+      try {
+        const frame = (usage: Record<string, unknown>) =>
+          Buffer.from(`data: ${JSON.stringify({ usage: { ...usage, is_byok: false } })}\n\n`);
+        const padding = Array.from({ length: 1100 }, () =>
+          Buffer.from(`: ${"x".repeat(1024)}\n\n`),
+        );
+        for (const upstream of [
+          [frame(first), ...padding, frame(second), Buffer.from("data: [DONE]\n\n")],
+          // Both observations inside one retained window.
+          [...padding, frame(first), frame(second), Buffer.from("data: [DONE]\n\n")],
+          // The later observation is outside both retained windows.
+          [
+            frame(first),
+            ...padding.slice(0, 600),
+            frame(second),
+            ...padding,
+            Buffer.from("data: [DONE]\n\n"),
+          ],
+        ]) {
+          const settled = await settleOwnerStream("openrouter", upstream);
+          expect(settled.observationComplete).toBe(true);
+          expect(settled.usage.categoriesComplete).toBe(false);
+          expect(settled.usage.reportedCost).toBeUndefined();
+          expect(settled.usage.calculatedCost).toBeUndefined();
+          expect(settled.usage.authoritativeBillableTokens).toBeUndefined();
+          expect(providerBillableTokens(settled.usage)).toBeUndefined();
+        }
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
+      }
+    },
+    60_000,
+  );
+
+  it("settles only the usage record the stream itself carried", async () => {
+    db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+    try {
+      const small = {
+        prompt_tokens: 1,
+        completion_tokens: 0,
+        total_tokens: 1,
+        cost: 0.000001,
+        is_byok: false,
+      };
+      const big = {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        is_byok: false,
+      };
+      const data = (value: unknown) => Buffer.from(`data: ${JSON.stringify(value)}\n\n`);
+      const comment = (text: string) => Buffer.from(`: ${text}\n\n`);
+      const padding = (count: number) =>
+        Array.from({ length: count }, () => comment("x".repeat(1024)));
+      const done = Buffer.from("data: [DONE]\n\n");
+      // A record whose usage sits in a root `response`, outside both windows.
+      const responseContainer = await settleOwnerStream("openrouter", [
+        data({ choices: [], usage: small }),
+        ...padding(600),
+        data({ choices: [], response: big }),
+        ...padding(1100),
+        done,
+      ]);
+      // Usage text inside an SSE comment is not a record.
+      const commentOnly = await settleOwnerStream("openrouter", [
+        comment(JSON.stringify({ usage: small })),
+        ...padding(1200),
+        done,
+      ]);
+      // A later record the stream cannot read (non-JSON data) may hide usage.
+      const unreadableLater = await settleOwnerStream("openrouter", [
+        data({ choices: [], usage: small }),
+        Buffer.from(`data: ${JSON.stringify({ choices: [], usage: big })} trailing\n\n`),
+        done,
+      ]);
+      expect(unreadableLater.usage.categoriesComplete).toBe(false);
+      for (const settled of [responseContainer, commentOnly, unreadableLater]) {
+        expect(settled.usage?.reportedCost).toBeUndefined();
+        expect(settled.usage?.calculatedCost).toBeUndefined();
+        if (settled.usage) expect(providerBillableTokens(settled.usage)).toBeUndefined();
+      }
+      // One honest record held by both the prefix and the tail still settles.
+      const overlap = await settleOwnerStream("openrouter", [
+        ...padding(40),
+        data({ choices: [], usage: big }),
+        ...padding(1000),
+        done,
+      ]);
+      expect(overlap.usage.categoriesComplete).toBe(true);
+      expect(providerBillableTokens(overlap.usage)).toBe(1_100n);
+    } finally {
+      db.providerPricingVersion.findFirst.mockReset();
+    }
+  }, 60_000);
+
+  it.each([
+    { label: "complete prefix, incomplete tail", writes: [0, 1000], complete: false },
+    { label: "incomplete prefix, complete tail", writes: [1000, 0], complete: false },
+    { label: "complete prefix and tail", writes: [0, 0], complete: true },
+  ])(
+    "prices only the merged observation ($label)",
+    async ({ writes, complete }) => {
+      db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+      try {
+        const usage = (cacheWrite: number) => ({
+          prompt_tokens: 1000,
+          completion_tokens: 1,
+          total_tokens: 1001,
+          is_byok: false,
+          prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: cacheWrite },
+        });
+        const frame = (data: unknown) => Buffer.from(`data: ${JSON.stringify(data)}\n\n`);
+        const settled = await settleOwnerStream("openrouter", [
+          frame({ usage: usage(writes[0]!) }),
+          ...Array.from({ length: 1100 }, () => Buffer.from(`: ${"x".repeat(1024)}\n\n`)),
+          frame({ usage: usage(writes[1]!) }),
+          Buffer.from("data: [DONE]\n\n"),
+        ]);
+        expect(settled.usage.categoriesComplete).toBe(complete);
+        if (complete) {
+          // 1000*1 + 1*4 per million, priced once from the merged categories.
+          expect(settled.usage.calculatedCost?.toString()).toBe("0.001004");
+          expect(providerBillableTokens(settled.usage)).toBe(1_001n);
+        } else {
+          expect(settled.usage.calculatedCost).toBeUndefined();
+          expect(settled.usage.calculatedCostSource).toBeUndefined();
+          expect(providerBillableTokens(settled.usage)).toBeUndefined();
+        }
+      } finally {
+        db.providerPricingVersion.findFirst.mockReset();
+      }
+    },
+    60_000,
+  );
 });
 
 describe("OpenRouter data_collection privacy (D9)", () => {
