@@ -5,7 +5,10 @@
  * id, with no foreign key (./capacity-lock-order.ts). A graph delete therefore
  * leaves their rows behind; these sweepers (writer class S) clean them up.
  * Every statement takes its rows with SKIP LOCKED and none takes a fence, so
- * a sweep never waits on a lock: a busy row is left for the next run.
+ * a sweep does not wait on a lock: a busy row is left for the next run. The
+ * one bounded exception is the purge's requester-rollup merge, which can wait
+ * up to PURGE_MERGE_LOCK_TIMEOUT_MS on a destination row a hot writer holds
+ * (INSERT ... ON CONFLICT has no SKIP LOCKED); the batch then rolls back.
  *
  * - {@link purgeDeletedUsersHistory}: the rest of a deleted user's own
  *   history (the user-deletion drain removes the bulk before the user row is
@@ -263,7 +266,11 @@ export async function purgeDeletedUserHistory(
 /** Bound on the purge's wait for a rollup merge destination held by a hot writer. */
 const PURGE_MERGE_LOCK_TIMEOUT_MS = 100;
 
-/** Most queue entries one {@link purgeDeletedUsersHistory} call examines (a clean entry costs one EXISTS probe). */
+/**
+ * Most queue entries one {@link purgeDeletedUsersHistory} call examines. A clean
+ * entry still costs a few dozen cheap statements, so the bound keeps a run
+ * short; entries past it wait for a later run (the queue is oldest first).
+ */
 const PURGE_QUEUE_SCAN_LIMIT = 500;
 
 /**
