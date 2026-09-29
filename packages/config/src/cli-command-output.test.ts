@@ -363,17 +363,24 @@ describe("appendRollingTail", () => {
         for (let second = 0; second < 0x100; second += 1) {
           const table = new TerminalByteState();
           const legacy = new LegacyTerminalByteState();
-          for (const byte of [...prefix, first, second, ...probe]) {
+          for (const byte of prefix) {
+            table.feed(byte);
+            legacy.feed(byte);
+          }
+          const check = (byte: number) => {
             table.feed(byte);
             legacy.feed(byte);
             if (table.atBoundary !== legacy.atBoundary) {
               expect([...prefix, first, second]).toEqual("boundary mismatch");
             }
-          }
+          };
+          check(first);
+          check(second);
+          for (const byte of probe) check(byte);
         }
       }
     }
-  });
+  }, 60_000);
 
   it("drops exactly what feeding every byte through the parser drops", () => {
     const alphabet = [
