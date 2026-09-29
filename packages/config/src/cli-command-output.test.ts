@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   appendRollingTail,
   CLI_OUTPUT_ELLIPSIS,
@@ -7,9 +7,73 @@ import {
   CLI_STREAM_TAIL_MAX_BYTES,
   cleanText,
   formatBoundedStream,
+  nextState,
   redactCredentialSubstrings,
   TerminalByteState,
 } from "./cli-command-output";
+
+/**
+ * The per-byte WHATWG UTF-8 decoder + parser that TerminalByteState's byte
+ * table replaced (verbatim logic from before the table), kept as the
+ * reference the table must reproduce.
+ */
+class LegacyTerminalByteState {
+  private state = 0;
+  private needed = 0;
+  private seen = 0;
+  private codePoint = 0;
+  private lower = 0x80;
+  private upper = 0xbf;
+
+  get atBoundary(): boolean {
+    return this.state === 0 && this.needed === 0;
+  }
+
+  feed(byte: number): void {
+    if (this.needed === 0) {
+      if (byte <= 0x7f) this.state = nextState(this.state, byte);
+      else if (byte >= 0xc2 && byte <= 0xdf) this.start(1, byte & 0x1f);
+      else if (byte >= 0xe0 && byte <= 0xef) {
+        if (byte === 0xe0) this.lower = 0xa0;
+        if (byte === 0xed) this.upper = 0x9f;
+        this.start(2, byte & 0x0f);
+      } else if (byte >= 0xf0 && byte <= 0xf4) {
+        if (byte === 0xf0) this.lower = 0x90;
+        if (byte === 0xf4) this.upper = 0x8f;
+        this.start(3, byte & 0x07);
+      } else this.state = nextState(this.state, 0xfffd);
+      return;
+    }
+    if (byte < this.lower || byte > this.upper) {
+      this.reset();
+      this.state = nextState(this.state, 0xfffd);
+      this.feed(byte);
+      return;
+    }
+    this.lower = 0x80;
+    this.upper = 0xbf;
+    this.codePoint = (this.codePoint << 6) | (byte & 0x3f);
+    this.seen += 1;
+    if (this.seen === this.needed) {
+      const codePoint = this.codePoint;
+      this.reset();
+      this.state = nextState(this.state, codePoint);
+    }
+  }
+
+  private start(needed: number, bits: number): void {
+    this.needed = needed;
+    this.codePoint = bits;
+  }
+
+  private reset(): void {
+    this.needed = 0;
+    this.seen = 0;
+    this.codePoint = 0;
+    this.lower = 0x80;
+    this.upper = 0xbf;
+  }
+}
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
@@ -203,26 +267,92 @@ describe("appendRollingTail", () => {
     }
   });
 
-  it.each([
-    ["plain text", "plain ascii\tline, ünïcödé, € and 😀\r\n"],
-    ["colored output", "\u001b[1;31mred\u001b[0m \u001b[38;5;208mé\u001b[m\n"],
-    ["an open DCS body", "sixel#0;2;0;0;0~~ïü😀-\n"],
-  ])(
-    "drops %s without a per-byte parser call (it runs on the server's event loop)",
-    (label, unit) => {
-      const feed = vi.spyOn(TerminalByteState.prototype, "feed");
-      try {
-        const prefix = label === "an open DCS body" ? "\u001bPq" : "";
-        const text = bytes(prefix + unit.repeat(Math.ceil(1_000_000 / unit.length)));
-        const view = capture(text, 64 * 1024);
-        expect(text.length - view.tail.length).toBeGreaterThan(900_000);
-        // Only a character that straddles an append seam goes through it.
-        expect(feed.mock.calls.length).toBeLessThan(4 * Math.ceil(text.length / (64 * 1024)));
-      } finally {
-        feed.mockRestore();
+  // The tracker runs on the server's event loop for every byte of headless
+  // output: its cost per byte must not depend on what the output looks like
+  // (C3b-1/C4-1/C5-1 found shapes 10-40x slower than plain text).
+  it("costs the same work per byte for every output shape", () => {
+    const shape = (prefix: string, unit: number[]) => {
+      const body = new Uint8Array(1 << 20);
+      for (let at = 0; at < body.length; at += 1) body[at] = unit[at % unit.length] ?? 0;
+      return { prefix: bytes(prefix), body };
+    };
+    const shapes = {
+      ascii: shape("", [...bytes("plain ascii text line 0123456789\n")]),
+      utf8: shape("", [...bytes("ünïcödé € 😀 текст\n")]),
+      sgr: shape("", [...bytes("\u001b[31mred\u001b[0m text\n")]),
+      csiParams: shape("", [...bytes("\u001b[1;2;3;4;5;6;7;8;9m")]),
+      c1Csi: shape("", [0xc2, 0x9b, 0x31, 0x3b, 0x32, 0x6d]),
+      nbspInOsc: shape("\u001b]", [0xc2, 0xa0]),
+      nbspInDcs: shape("\u001bP", [0xc2, 0xa0]),
+      c2Pairs: shape("", [0xc2, 0x41]),
+      escInvalid: shape("", [0x1b, 0xff]),
+      binary: shape(
+        "",
+        Array.from({ length: 251 }, (_, n) => (n * 37) & 0xff),
+      ),
+    };
+    const nsPerByte = (value: { prefix: Uint8Array; body: Uint8Array }) => {
+      const runs: number[] = [];
+      for (let run = 0; run < 5; run += 1) {
+        const state = new TerminalByteState();
+        state.consume(value.prefix, 0, value.prefix.length);
+        const started = performance.now();
+        state.consume(value.body, 0, value.body.length);
+        runs.push(((performance.now() - started) * 1e6) / value.body.length);
       }
-    },
-  );
+      return runs.sort((a, b) => a - b)[2] ?? 0;
+    };
+    // Warm up, then measure every shape in the same conditions.
+    for (const value of Object.values(shapes)) nsPerByte(value);
+    const costs = Object.fromEntries(
+      Object.entries(shapes).map(([name, value]) => [name, nsPerByte(value)]),
+    );
+    const cheapest = Math.min(...Object.values(costs));
+    for (const [name, cost] of Object.entries(costs)) {
+      // One table load per byte: every shape within a small factor of the
+      // cheapest, and far above the event-loop-blocking rates measured before.
+      expect(cost, `${name} ${JSON.stringify(costs)}`).toBeLessThan(Math.max(4 * cheapest, 2));
+      expect(cost, name).toBeLessThan(50);
+    }
+  });
+
+  it("matches the per-byte parser it replaced, byte for byte after every state", () => {
+    // Every parser state (reached by a prefix) × every two-byte sequence,
+    // followed by probes that tell the states apart: the boundary flag after
+    // each byte must match the legacy per-byte decoder + parser.
+    const prefixes = [
+      "",
+      "\u001b",
+      "\u001b(",
+      "\u001b[",
+      "\u001b[1",
+      "\u001b[1 ",
+      "\u001b[1<",
+      "\u001b]",
+      "\u001b_",
+      "\u001bP",
+      "\u001bP1",
+      "\u001bP ",
+      "\u001bP1<",
+      "\u001bPq",
+    ].map(bytes);
+    const probe = bytes("x\u0007m\\\u001b\\y");
+    for (const prefix of prefixes) {
+      for (let first = 0; first < 0x100; first += 1) {
+        for (let second = 0; second < 0x100; second += 1) {
+          const table = new TerminalByteState();
+          const legacy = new LegacyTerminalByteState();
+          for (const byte of [...prefix, first, second, ...probe]) {
+            table.feed(byte);
+            legacy.feed(byte);
+            if (table.atBoundary !== legacy.atBoundary) {
+              expect([...prefix, first, second]).toEqual("boundary mismatch");
+            }
+          }
+        }
+      }
+    }
+  });
 
   it("drops exactly what feeding every byte through the parser drops", () => {
     const alphabet = [
@@ -243,13 +373,13 @@ describe("appendRollingTail", () => {
       [0xc2, 0x90],
       [0xc2, 0x9c],
     ];
-    let seed = 11;
+    let seed = 11; // fixed: the corpus is the same on every run
     const random = (n: number) => {
       seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
       return seed % n;
     };
     const reference = (stream: Uint8Array, chunks: number[], max: number) => {
-      const state = new TerminalByteState();
+      const state = new LegacyTerminalByteState();
       let tail: number[] = [];
       let offset = 0;
       for (const size of chunks) {

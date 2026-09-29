@@ -205,8 +205,11 @@ function nonAsciiTransition(state: number): number {
   return GROUND;
 }
 
-/** The parser state after one code point (or UTF-16 code unit of one). */
-function nextState(state: number, code: number): number {
+/**
+ * The parser state after one code point (or UTF-16 code unit of one).
+ * Exported for the byte-table equivalence test only.
+ */
+export function nextState(state: number, code: number): number {
   const anywhere = anywhereTransition(code);
   if (anywhere !== null) return anywhere;
   if (isExecutable(code)) return state === OSC_STRING && code === 0x07 ? GROUND : state;
@@ -215,15 +218,6 @@ function nextState(state: number, code: number): number {
   if (state === GROUND) return GROUND;
   return code >= 0xa0 ? nonAsciiTransition(state) : printableTransition(state, code);
 }
-
-/** `nextState` for every state and ASCII byte, at `(state << 7) | byte`. */
-const ASCII_TRANSITIONS = (() => {
-  const table = new Uint8Array((DCS_PASSTHROUGH + 1) * 0x80);
-  for (let state = 0; state <= DCS_PASSTHROUGH; state += 1) {
-    for (let byte = 0; byte < 0x80; byte += 1) table[(state << 7) | byte] = nextState(state, byte);
-  }
-  return table;
-})();
 
 /**
  * Removes terminal escape sequences, 7-bit and 8-bit (C1) forms — CSI, OSC,
@@ -259,6 +253,94 @@ function stripTerminalSequences(text: string): string {
 }
 
 /**
+ * UTF-8 decoder substates (WHATWG, as TextDecoder decodes): what the next
+ * byte must be. `DEC_C2` is after a `C2` lead, whose continuation 80..9F
+ * makes a C1 control (U+0080..U+009F).
+ */
+const DEC_NONE = 0;
+const DEC_C2 = 1;
+/** One more continuation byte (80..BF) completes a non-C1 character. */
+const DEC_NEED1 = 2;
+const DEC_NEED2 = 3;
+const DEC_NEED3 = 4;
+/** After E0 (next A0..BF), ED (80..9F), F0 (90..BF), F4 (80..8F). */
+const DEC_E0 = 5;
+const DEC_ED = 6;
+const DEC_F0 = 7;
+const DEC_F4 = 8;
+const DECODER_STATES = 9;
+/** Any complete non-ASCII, non-C1 character, including U+FFFD for invalid input. */
+const NON_ASCII = 0xfffd;
+
+/** The decoder substate after a lead byte, or null when the byte is a whole character. */
+function decoderAfterLead(byte: number): number | null {
+  if (byte === 0xc2) return DEC_C2;
+  if (byte >= 0xc3 && byte <= 0xdf) return DEC_NEED1;
+  if (byte === 0xe0) return DEC_E0;
+  if (byte === 0xed) return DEC_ED;
+  if (byte >= 0xe1 && byte <= 0xef) return DEC_NEED2;
+  if (byte === 0xf0) return DEC_F0;
+  if (byte === 0xf4) return DEC_F4;
+  if (byte >= 0xf1 && byte <= 0xf3) return DEC_NEED3;
+  return null;
+}
+
+/** One byte from a combined (parser, decoder) state: the reference the table is built from. */
+function stepByte(parser: number, decoder: number, byte: number): [number, number] {
+  if (decoder === DEC_NONE) {
+    if (byte < 0x80) return [nextState(parser, byte), DEC_NONE];
+    const lead = decoderAfterLead(byte);
+    // A stray continuation or a byte no character starts with is U+FFFD.
+    return lead === null ? [nextState(parser, NON_ASCII), DEC_NONE] : [parser, lead];
+  }
+  const [low, high, after] =
+    decoder === DEC_C2 || decoder === DEC_NEED1
+      ? [0x80, 0xbf, DEC_NONE]
+      : decoder === DEC_NEED2
+        ? [0x80, 0xbf, DEC_NEED1]
+        : decoder === DEC_NEED3
+          ? [0x80, 0xbf, DEC_NEED2]
+          : decoder === DEC_E0
+            ? [0xa0, 0xbf, DEC_NEED1]
+            : decoder === DEC_ED
+              ? [0x80, 0x9f, DEC_NEED1]
+              : decoder === DEC_F0
+                ? [0x90, 0xbf, DEC_NEED2]
+                : [0x80, 0x8f, DEC_NEED2];
+  if (byte < low || byte > high) {
+    // The partial character is invalid: U+FFFD, then this byte starts over.
+    return stepByte(nextState(parser, NON_ASCII), DEC_NONE, byte);
+  }
+  if (after !== DEC_NONE) return [parser, after];
+  // A complete character: C2 80..9F is a C1 control, anything else non-ASCII.
+  const code = decoder === DEC_C2 && byte <= 0x9f ? byte : NON_ASCII;
+  return [nextState(parser, code), DEC_NONE];
+}
+
+/**
+ * Every (parser, decoder) state and byte, at `(state << 8) | byte`, where
+ * `state = parser * DECODER_STATES + decoder` (126 states). Built once from
+ * {@link stepByte}, so each byte costs one table load whatever the output.
+ */
+const BYTE_TRANSITIONS = (() => {
+  const states = (DCS_PASSTHROUGH + 1) * DECODER_STATES;
+  const table = new Uint8Array(states << 8);
+  for (let parser = 0; parser <= DCS_PASSTHROUGH; parser += 1) {
+    for (let decoder = 0; decoder < DECODER_STATES; decoder += 1) {
+      for (let byte = 0; byte < 0x100; byte += 1) {
+        const [nextParser, nextDecoder] = stepByte(parser, decoder, byte);
+        table[((parser * DECODER_STATES + decoder) << 8) | byte] =
+          nextParser * DECODER_STATES + nextDecoder;
+      }
+    }
+  }
+  return table;
+})();
+
+/** GROUND with no partial character: the only state a tail may start in. */
+const BOUNDARY = GROUND * DECODER_STATES + DEC_NONE;
+
+/**
  * Follows the terminal parser (and a UTF-8 decoder, as TextDecoder decodes)
  * across the bytes a bounded capture drops from the front of its rolling
  * tail. A capture drops bytes until {@link atBoundary}, so its tail always
@@ -267,161 +349,41 @@ function stripTerminalSequences(text: string): string {
  * stream keeps from that point. Without it, a tail that starts inside a DCS,
  * APC, PM or OSC body would show that hidden body as text.
  *
+ * One table load per byte ({@link BYTE_TRANSITIONS}): this runs on the
+ * server's event loop for every byte of headless exec output, so its cost
+ * must not depend on what the output looks like.
+ *
  * The Rust CLI's capture (`apps/cli/src/terminal_parse.rs`) implements the
  * same rules for supervised output.
  */
 export class TerminalByteState {
-  private state = GROUND;
-  private needed = 0;
-  private seen = 0;
-  private codePoint = 0;
-  private lower = 0x80;
-  private upper = 0xbf;
+  private state = BOUNDARY;
 
   /** True in the ground state with no partial character pending. */
   get atBoundary(): boolean {
-    return this.state === GROUND && this.needed === 0;
+    return this.state === BOUNDARY;
   }
 
-  /** Feeds one byte (WHATWG UTF-8 decoding, U+FFFD for invalid input). */
+  /** Feeds one byte. */
   feed(byte: number): void {
-    if (this.needed === 0) {
-      if (byte <= 0x7f) this.state = nextState(this.state, byte);
-      else if (byte >= 0xc2 && byte <= 0xdf) this.start(1, byte & 0x1f);
-      else if (byte >= 0xe0 && byte <= 0xef) {
-        if (byte === 0xe0) this.lower = 0xa0;
-        if (byte === 0xed) this.upper = 0x9f;
-        this.start(2, byte & 0x0f);
-      } else if (byte >= 0xf0 && byte <= 0xf4) {
-        if (byte === 0xf0) this.lower = 0x90;
-        if (byte === 0xf4) this.upper = 0x8f;
-        this.start(3, byte & 0x07);
-      } else this.state = nextState(this.state, 0xfffd);
-      return;
-    }
-    if (byte < this.lower || byte > this.upper) {
-      // The partial character is invalid: it decodes to U+FFFD, and this
-      // byte starts over.
-      this.reset();
-      this.state = nextState(this.state, 0xfffd);
-      this.feed(byte);
-      return;
-    }
-    this.lower = 0x80;
-    this.upper = 0xbf;
-    this.codePoint = (this.codePoint << 6) | (byte & 0x3f);
-    this.seen += 1;
-    if (this.seen === this.needed) {
-      const codePoint = this.codePoint;
-      this.reset();
-      this.state = nextState(this.state, codePoint);
-    }
+    this.state = BYTE_TRANSITIONS[(this.state << 8) | (byte & 0xff)] as number;
   }
 
   /**
-   * Feeds `bytes[from…]` while the index is below `dropUntil` or the parser is
-   * not at a boundary; returns the first index not fed. Same result as
-   * {@link feed} per byte, but it runs on the server's event loop for every
-   * byte of headless output, so it jumps over runs that cannot change the
-   * state with native `indexOf`: in the ground state only ESC or a C1 control
-   * (`C2 80..9F`) leaves it; inside an OSC, SOS/PM/APC or DCS body only ESC,
-   * CAN, SUB, a C1 control or (OSC) BEL ends it. Both ESC and `C2` always
-   * start a new character, so the UTF-8 decoder has nothing pending there.
-   * Escape and CSI headers are short and go through a lookup table.
+   * Feeds `bytes[from…]` while the index is below `dropUntil` or the parser
+   * is not at a boundary; returns the first index not fed. One table load
+   * per byte.
    */
   consume(bytes: Uint8Array, from: number, dropUntil: number): number {
     const length = bytes.length;
-    const next = new NextByte(bytes);
-    let index = from;
     let state = this.state;
-    while (index < length) {
-      if (this.needed === 0) {
-        if (state === GROUND) {
-          if (index >= dropUntil) break;
-          // A short run is cheaper to scan here than through `indexOf`.
-          let stop = index;
-          const near = Math.min(length, index + 32);
-          while (stop < near && bytes[stop] !== 0x1b && bytes[stop] !== 0xc2) stop += 1;
-          if (stop === near && near < length) {
-            stop = Math.min(next.after(0x1b, near), next.after(0xc2, near));
-          }
-          stop = charStop(bytes, stop);
-          if (stop > index) {
-            if (stop < dropUntil) {
-              index = stop;
-              continue;
-            }
-            // Nothing leaves the ground state before the cut: jump to the
-            // start of the character that holds the cut (at most 3 bytes
-            // back; a continuation byte never starts one) and feed from there.
-            index = Math.max(index, characterStart(bytes, dropUntil));
-            if (index >= dropUntil) break;
-          }
-        } else if (state >= OSC_STRING && state !== DCS_ENTRY && state !== DCS_PARAM) {
-          if (state !== DCS_INTERMEDIATE) {
-            let stop = Math.min(
-              next.after(0x1b, index),
-              next.after(0xc2, index),
-              next.after(0x18, index),
-              next.after(0x1a, index),
-            );
-            if (state === OSC_STRING) stop = Math.min(stop, next.after(0x07, index));
-            stop = charStop(bytes, stop);
-            if (stop > index) {
-              index = stop;
-              continue;
-            }
-          }
-        }
-        let byte = bytes[index] as number;
-        if (byte < 0x80) {
-          state = ASCII_TRANSITIONS[(state << 7) | byte] as number;
-          index += 1;
-          // An escape or CSI header: step through its ASCII in one tight loop.
-          while (index < length && state !== GROUND && state < OSC_STRING) {
-            byte = bytes[index] as number;
-            if (byte >= 0x80) break;
-            state = ASCII_TRANSITIONS[(state << 7) | byte] as number;
-            index += 1;
-          }
-          continue;
-        }
-        if (byte === 0xc2) {
-          const second = bytes[index + 1];
-          if (second !== undefined && second >= 0x80 && second <= 0x9f) {
-            // A C1 control (U+0080..U+009F), which acts the same in every state.
-            state = anywhereTransition(second) ?? GROUND;
-            index += 2;
-            continue;
-          }
-        }
-        const size = nonC1CharacterLength(bytes, index);
-        if (size > 0) {
-          if (state !== GROUND) state = nonAsciiTransition(state);
-          index += size;
-          continue;
-        }
-      }
-      this.state = state;
-      this.feed(bytes[index] as number);
-      state = this.state;
+    let index = from;
+    while (index < length && (index < dropUntil || state !== BOUNDARY)) {
+      state = BYTE_TRANSITIONS[(state << 8) | (bytes[index] as number)] as number;
       index += 1;
     }
     this.state = state;
     return index;
-  }
-
-  private start(needed: number, bits: number): void {
-    this.needed = needed;
-    this.codePoint = bits;
-  }
-
-  private reset(): void {
-    this.needed = 0;
-    this.seen = 0;
-    this.codePoint = 0;
-    this.lower = 0x80;
-    this.upper = 0xbf;
   }
 }
 
@@ -447,76 +409,6 @@ export function appendRollingTail(
     return out;
   }
   return chunk.slice(state.consume(chunk, 0, mustDrop - tail.length));
-}
-
-/** Where the next occurrence of each byte value is, found once per value and position. */
-class NextByte {
-  private readonly found = new Int32Array(0x100).fill(-1);
-
-  constructor(private readonly bytes: Uint8Array) {}
-
-  /** The first index at or after `from` holding `value`, or the length. */
-  after(value: number, from: number): number {
-    const cached = this.found[value] as number;
-    if (cached >= from) return cached;
-    const at = this.bytes.indexOf(value, from);
-    const position = at < 0 ? this.bytes.length : at;
-    this.found[value] = position;
-    return position;
-  }
-}
-
-/**
- * A jump target: an ESC or `C2` found by `indexOf` always starts a character,
- * but the end of the bytes may fall inside one, whose bytes must then go
- * through the decoder.
- */
-function charStop(bytes: Uint8Array, stop: number): number {
-  return stop === bytes.length ? characterStart(bytes, stop) : stop;
-}
-
-/**
- * The start of the character that holds `index`: the last byte in the three
- * before it that is not a continuation byte, when the character it starts
- * could reach `index`; otherwise `index` itself.
- */
-function characterStart(bytes: Uint8Array, index: number): number {
-  for (let at = index - 1; at >= Math.max(0, index - 3); at -= 1) {
-    const byte = bytes[at] as number;
-    if (byte < 0x80 || byte > 0xbf) return byte >= 0xc2 ? at : index;
-  }
-  return index;
-}
-
-function isContinuation(byte: number | undefined): boolean {
-  return byte !== undefined && byte >= 0x80 && byte <= 0xbf;
-}
-
-/** Byte length of a valid UTF-8 character at `index` that is not a C1 control, else 0. */
-function nonC1CharacterLength(bytes: Uint8Array, index: number): number {
-  const lead = bytes[index] ?? 0;
-  const next = bytes[index + 1] ?? 0;
-  if (lead >= 0xc2 && lead <= 0xdf) {
-    // C2 80..9F encodes U+0080..U+009F, the C1 controls.
-    if (lead === 0xc2 && next < 0xa0) return 0;
-    return isContinuation(next) ? 2 : 0;
-  }
-  if (lead >= 0xe0 && lead <= 0xef) {
-    const low = lead === 0xe0 ? 0xa0 : 0x80;
-    const high = lead === 0xed ? 0x9f : 0xbf;
-    return next >= low && next <= high && isContinuation(bytes[index + 2]) ? 3 : 0;
-  }
-  if (lead >= 0xf0 && lead <= 0xf4) {
-    const low = lead === 0xf0 ? 0x90 : 0x80;
-    const high = lead === 0xf4 ? 0x8f : 0xbf;
-    return next >= low &&
-      next <= high &&
-      isContinuation(bytes[index + 2]) &&
-      isContinuation(bytes[index + 3])
-      ? 4
-      : 0;
-  }
-  return 0;
 }
 
 function dropLeadingTokenRun(text: string): string {
