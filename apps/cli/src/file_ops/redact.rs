@@ -264,7 +264,7 @@ const SECRET_FLAGS: &str =
 /// Names without an underscore prefix (`TOKEN=`, `KEY=`) stay visible.
 static ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"([A-Z][A-Z0-9_]*(?:_TOKEN|_KEY|_SECRET)|[A-Z][A-Z0-9_]*PASSWORD|PASSWORD)["']?[ \t]*([=:])[ \t]*"#,
+        r#"([A-Z_][A-Z0-9_]*(?:_TOKEN|_KEY|_SECRET)|[A-Z_][A-Z0-9_]*PASSWORD|PASSWORD)["']?[ \t]*([=:])[ \t]*"#,
     )
     .expect("assignment regex")
 });
@@ -724,6 +724,11 @@ impl LineMasker {
 /// Mask `text` (the real file content) for `class`. Used by the edit engine,
 /// which needs the whole masked view; reads mask only the lines they return.
 pub fn mask(class: FileClass, text: &str) -> MaskedView {
+    mask_with_lookback(class, text, LOOKBACK_BYTES)
+}
+
+/// [`mask`] with an explicit lookback (tests use a tiny one).
+pub(crate) fn mask_with_lookback(class: FileClass, text: &str, lookback: usize) -> MaskedView {
     if class == FileClass::Plain && !TRIGGER.is_match(text) {
         return MaskedView::from_parts(text.to_string(), Vec::new(), false);
     }
@@ -741,7 +746,7 @@ pub fn mask(class: FileClass, text: &str) -> MaskedView {
         let masks = masker.scan(line);
         if masker.opened_on_last_line() {
             opener = offset;
-        } else if continued && !masks.is_empty() && offset - opener > LOOKBACK_BYTES {
+        } else if continued && !masks.is_empty() && offset - opener > lookback {
             long_construct = true;
         }
         for (range, tok) in masks {
@@ -1426,6 +1431,8 @@ mod tests {
                 &["\u{a0}", "\u{2002}"],
             ),
             (Plain, "K_TOKEN=abc1   \n", &["   "]),
+            (Plain, "_DEPLOY_TOKEN=lead-secret\n", &["lead-secret"]),
+            (Plain, "  export __A_KEY: under-secret\n", &["under-secret"]),
             // stage-3 round 3 (Opus C3b-4/5): quote escapes, glued text, other flag prefixes
             (
                 Plain,
@@ -1597,6 +1604,103 @@ mod tests {
             assert!(!masker.in_continuation());
             assert_eq!(masker.mask_line("visible"), "visible");
         }
+    }
+
+    /// The reader/full-view contract behind the lookback: a read that starts its
+    /// masker at the lookback line must mask at least what the whole-file view
+    /// masks, for every window start, whenever the file has no masked run longer
+    /// than the lookback (`long_construct`, the case edits refuse to create).
+    /// Random documents from a small hostile line pool, tiny lookback.
+    #[test]
+    fn a_windowed_read_masks_at_least_what_the_full_view_masks() {
+        use crate::file_ops::read::lookback_start_with;
+        let pool = [
+            "K_TOKEN=\"open",
+            "close\"",
+            "K_KEY: |",
+            "  body-secret",
+            "    deeper",
+            "x: 1",
+            "",
+            "",
+            "plain text",
+            "run --token",
+            "-flag-secret",
+            "A_KEY='a",
+            "b'\"c",
+            "M_SECRET=v \\",
+            "cont-secret",
+            "\"K_SECRET\": >-",
+            " folded",
+            "- Z_KEY: |",
+            "  - item",
+            "P_PASSWORD:ab",
+            "//",
+            "K_TOKEN=\"\"\"",
+            "triple-body",
+            "\"\"\"",
+            "it's fine",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lookback = 24;
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let len = 3 + (next() % 22) as usize;
+            let lines: Vec<&str> = (0..len)
+                .map(|_| pool[(next() % pool.len() as u64) as usize])
+                .collect();
+            let text = lines.join("\n") + "\n";
+            for class in [FileClass::Plain, FileClass::Dotenv] {
+                let full = mask_with_lookback(class, &text, lookback);
+                if full.long_construct {
+                    continue;
+                }
+                // per-line masked byte sets of the whole-file scan
+                let mut whole = LineMasker::new(class);
+                let full_masks: Vec<Vec<std::ops::Range<usize>>> = lines
+                    .iter()
+                    .map(|l| whole.scan(l).into_iter().map(|(r, _)| r).collect())
+                    .collect();
+                let offsets: Vec<usize> = lines
+                    .iter()
+                    .scan(0, |at, l| {
+                        let start = *at;
+                        *at += l.len() + 1;
+                        Some(start)
+                    })
+                    .collect();
+                for w in 0..lines.len() {
+                    let start = lookback_start_with(text.as_bytes(), offsets[w], lookback);
+                    let first = offsets.iter().position(|o| *o == start).unwrap_or(0);
+                    let mut reader = LineMasker::new(class);
+                    for l in &lines[first..w] {
+                        let _ = reader.scan(l);
+                    }
+                    // the window itself: every line from w on
+                    for (i, l) in lines.iter().enumerate().skip(w) {
+                        let got: Vec<std::ops::Range<usize>> =
+                            reader.scan(l).into_iter().map(|(r, _)| r).collect();
+                        let covered = |ranges: &[std::ops::Range<usize>], b: usize| {
+                            ranges.iter().any(|r| r.start <= b && b < r.end)
+                        };
+                        for b in 0..l.len() {
+                            assert!(
+                                !covered(&full_masks[i], b) || covered(&got, b),
+                                "{class:?} window {w} line {i} byte {b}: masked in the full view but visible to the reader\n{text:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
     }
 
     #[test]

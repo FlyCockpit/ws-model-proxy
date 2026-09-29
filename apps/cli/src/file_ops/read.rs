@@ -256,7 +256,11 @@ fn line_offset(bytes: &[u8], n: usize) -> usize {
 /// opened on it (or a previous line longer than the lookback) still masks the
 /// window.
 fn lookback_start(bytes: &[u8], offset: usize) -> usize {
-    let from = offset.saturating_sub(redact::LOOKBACK_BYTES);
+    lookback_start_with(bytes, offset, redact::LOOKBACK_BYTES)
+}
+
+pub(crate) fn lookback_start_with(bytes: &[u8], offset: usize, lookback: usize) -> usize {
+    let from = offset.saturating_sub(lookback);
     if from == 0 {
         return 0;
     }
@@ -577,12 +581,17 @@ fn tail_window(
     let chunk_len =
         ((max_bytes as u64) * 2 + 64 * 1024 + redact::LOOKBACK_BYTES as u64).min(stat.size);
     let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
+    if partial_first {
+        // A line longer than 16 MiB precedes the tail: its state cannot be known,
+        // and serving the lines after it unmasked could show a continued value.
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "a line longer than 16 MiB precedes the end of this file; read with a positive startLine",
+        ));
+    }
     let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
     file.read_exact_at(&mut chunk, chunk_start)?;
-    let mut raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
-    if partial_first && !raw_lines.is_empty() {
-        raw_lines.remove(0); // a partial first line is unusable
-    }
+    let raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
     let want = count.min(max_lines).min(raw_lines.len());
     if want == 0 {
         return Err(FileError::new(

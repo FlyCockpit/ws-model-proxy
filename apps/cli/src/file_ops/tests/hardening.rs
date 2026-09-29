@@ -658,3 +658,38 @@ fn crlf_translation_cannot_push_new_text_past_its_cap() {
     );
     assert_eq!(code(r), ErrorCode::InvalidInput);
 }
+
+#[test]
+fn a_tail_read_after_a_line_longer_than_16_mib_is_refused_not_served_unmasked() {
+    let fx = Fx::new();
+    let path = fx.root.join("longline.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let chunk = vec![b'x'; 1 << 20];
+    for _ in 0..70 {
+        file.write_all(&chunk).unwrap();
+    }
+    file.write_all(b"\nK_TOKEN=\"opening\ntail-continued-secret\n\nafter\n")
+        .unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let r = fx.ops.read(
+        &args(json!({ "path": fx.p("longline.log"), "startLine": -3 })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::TooLarge);
+}
+
+#[test]
+fn names_that_start_with_an_underscore_are_secret_names() {
+    let fx = Fx::new();
+    fx.put(
+        "env.sh",
+        "_DEPLOY_TOKEN=lead-secret\nexport __A_KEY=other-secret\n",
+    );
+    let r = fx.read("env.sh");
+    assert!(
+        !r.text.contains("lead-secret") && !r.text.contains("other-secret"),
+        "{}",
+        r.text
+    );
+}
