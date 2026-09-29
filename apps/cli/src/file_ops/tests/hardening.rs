@@ -278,13 +278,13 @@ fn edit_planning_over_many_masked_spans_is_not_quadratic() {
     let fx = Fx::new();
     let mut body = String::new();
     for i in 0..30_000 {
-        body.push_str(&format!("K{i}=value{i}\n"));
+        body.push_str(&format!("K{i}_KEY=value{i}\n"));
     }
-    fx.put("big.env", &body);
+    fx.put("big.conf", &body);
     let started = Instant::now();
     // every match is between two masked values, so none touches a span
     let r = fx.ops.edit(
-        &args(json!({ "path": fx.p("big.env"), "edits": [{
+        &args(json!({ "path": fx.p("big.conf"), "edits": [{
             "oldText": "\n", "newText": "\n", "expectedMatches": "all" }],
             "dryRun": true })),
         &fx.cancel,
@@ -341,4 +341,93 @@ fn edits_to_one_path_queue_instead_of_failing_their_recheck() {
             .expect("a queued edit without expectedEtag applies to the newer content");
     }
     assert_eq!(fx.get("q.txt"), "L1\nL2\nL3\nL4\nL5\nL6\n");
+}
+
+// ---- masking context comes from a bounded lookback, lossy for bad UTF-8 -----
+
+#[test]
+fn context_lines_that_are_not_utf8_still_advance_the_masking_state() {
+    let fx = Fx::new();
+    fx.put(
+        "latin1.txt",
+        b"X_TOKEN=\"caf\xe9 opens\nsecond-line-secret\"\nB=1\n",
+    );
+    let r = fx.read_with(json!({ "path": fx.p("latin1.txt"), "startLine": 2 }));
+    assert!(!r.text.contains("second-line-secret"), "{}", r.text);
+    fx.put(
+        "app.env",
+        b"NOTE=\"caf\xe9 opens\nsecond-env-secret\"\nB=1\n",
+    );
+    let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 2 }));
+    assert!(!r.text.contains("second-env-secret"), "{}", r.text);
+    // an invalid line INSIDE the window of an env file is masked whole, not a binary error
+    let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 1 }));
+    assert!(
+        r.text.starts_with("1|\u{27E6}redacted\u{27E7}"),
+        "{}",
+        r.text
+    );
+    let key = pem("RSA PRIVATE KEY", "MIIEsecretbase64\n");
+    let (first, rest) = key.split_once('\n').unwrap();
+    let mut bytes = b"# caf\xe9 ".to_vec();
+    bytes.extend_from_slice(first.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(rest.as_bytes());
+    fx.put("k.pem", bytes);
+    let r = fx.read_with(json!({ "path": fx.p("k.pem"), "startLine": 2 }));
+    assert!(!r.text.contains("MIIEsecretbase64"), "{}", r.text);
+}
+
+#[test]
+fn a_window_inside_a_multi_line_value_is_masked_from_the_lookback() {
+    let fx = Fx::new();
+    let mut body = String::from("X_TOKEN=\"start\n");
+    for i in 0..30_000 {
+        body.push_str(&format!("secret-line-{i}\n"));
+    }
+    body.push_str("end\"\nvisible\n");
+    fx.put("long.txt", &body);
+    // the window starts ~400 KiB inside the value, well within the 1 MiB lookback
+    let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 29_000, "maxLines": 5 }));
+    assert!(!r.text.contains("secret-line"), "{}", r.text);
+    let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 30_002 }));
+    assert!(r.text.contains("visible"), "{}", r.text);
+    assert!(!r.text.contains("secret-line"), "{}", r.text);
+}
+
+#[test]
+fn the_tail_window_of_a_huge_file_sees_a_value_opened_in_the_lookback() {
+    let fx = Fx::new();
+    let path = fx.root.join("huge.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..70 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.write_all(b"X_TOKEN=\"opening\n").unwrap();
+    for i in 0..20 {
+        writeln!(file, "tail-secret-{i}").unwrap();
+    }
+    file.write_all(b"end\"\nafter\n").unwrap();
+    file.flush().unwrap();
+    drop(file);
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+    let r = fx.read_with(json!({ "path": fx.p("huge.log"), "startLine": -5 }));
+    assert!(!r.text.contains("tail-secret"), "{}", r.text);
+    assert!(r.text.contains("after"), "{}", r.text);
+}
+
+#[test]
+fn rename_overwrite_refuses_a_different_object_kind() {
+    let fx = Fx::new();
+    fx.put("d/x", "x");
+    fx.put("f.txt", "file");
+    let etag = fx.etag("f.txt");
+    let r = rename(
+        &fx,
+        json!({ "from": fx.p("d"), "to": fx.p("f.txt"), "overwrite": true, "expectedEtag": etag }),
+    );
+    assert_eq!(code(r), ErrorCode::Exists);
+    assert_eq!(fx.get("f.txt"), "file");
+    assert!(fx.root.join("d/x").exists());
 }

@@ -375,18 +375,20 @@ fn binary_and_oversized_files_are_refused() {
 
 #[test]
 fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
+    // an ordinary file with a secret-named assignment (secret-class files are
+    // read-only: see `secret_class_paths_are_read_only_for_every_mutating_tool`)
     let fx = Fx::new();
     fx.put(
-        "run.env",
+        "run.conf",
         "PORT=8080\nHF_TOKEN=hunter2secret\nMODEL=qwen\n# note\n",
     );
-    let etag = fx.etag("run.env");
+    let etag = fx.etag("run.conf");
     // touching the secret value is refused ...
     for old in [
         "TOKEN=\u{27E6}redacted:13\u{27E7}",
         "\u{27E6}redacted:13\u{27E7}",
     ] {
-        let code = edit_err(&fx, "run.env", json!([{ "oldText": old, "newText": "x" }])).code;
+        let code = edit_err(&fx, "run.conf", json!([{ "oldText": old, "newText": "x" }])).code;
         assert!(matches!(code, ErrorCode::RedactedSpan), "{old}: {code:?}");
     }
     // ... but the match is on the MASKED view, so guessing the secret finds nothing:
@@ -395,7 +397,7 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
         assert_eq!(
             edit_err(
                 &fx,
-                "run.env",
+                "run.conf",
                 json!([{ "oldText": guess, "newText": "x" }])
             )
             .code,
@@ -406,34 +408,30 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
     // a line-range edit over the secret line is refused, other lines are fine
     let over = edit(
         &fx,
-        "run.env",
+        "run.conf",
         Some(&etag),
         json!([{ "startLine": 2, "endLine": 2, "newText": "HF_TOKEN=new\n" }]),
     );
     assert_eq!(over.unwrap_err().code, ErrorCode::RedactedSpan);
     let r = edit(
         &fx,
-        "run.env",
+        "run.conf",
         Some(&etag),
         json!([{ "startLine": 4, "endLine": 4, "newText": "# note2\n" }]),
     )
     .unwrap();
     assert_eq!(
-        fx.get("run.env"),
+        fx.get("run.conf"),
         "PORT=8080\nHF_TOKEN=hunter2secret\nMODEL=qwen\n# note2\n"
     );
     // the diff of an edit never carries the secret (it is masked like a read)
     let diff = r.diff.unwrap();
-    assert!(
-        !diff.contains("hunter2") && !diff.contains("8080"),
-        "{diff}"
-    );
-    assert!(diff.contains("MODEL=\u{27E6}redacted:4\u{27E7}"), "{diff}");
+    assert!(!diff.contains("hunter2"), "{diff}");
     // writing a mask token back is refused
     assert_eq!(
         edit_err(
             &fx,
-            "run.env",
+            "run.conf",
             json!([{ "oldText": "note2", "newText": "\u{27E6}redacted:3\u{27E7}" }])
         )
         .code,
@@ -445,13 +443,155 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
         &fx,
         "run.sh",
         None,
-        json!([{ "oldText": "A=1", "newText": "A=10" }, { "oldText": "B=2", "newText": "B=20" }]),
+        json!([{ "oldText": "A=1", "newText": "A=10" }]),
     )
     .unwrap();
     assert_eq!(
         fx.get("run.sh"),
-        "A=10\nexport X_API_KEY=\"pw with space\"\nB=20\n"
+        "A=10\nexport X_API_KEY=\"pw with space\"\nB=2\n"
     );
+}
+
+#[test]
+fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
+    // masking depends on the surrounding text: renaming the key, commenting the
+    // line out, closing a quote early or inserting a key-block end would move real
+    // bytes out of the masked spans. The edit and its dry run are refused.
+    let fx = Fx::new();
+    fx.put("cfg.yaml", "API_KEY: sk-live-plainsecret\nother: 1\n");
+    fx.put("multi.txt", "X_TOKEN=\"line1\nline2-multisecret\"\ntail\n");
+    let cases: [(&str, serde_json::Value); 4] = [
+        (
+            "cfg.yaml",
+            json!([{ "oldText": "API_KEY:", "newText": "API_KEX:" }]),
+        ),
+        (
+            "cfg.yaml",
+            json!([{ "oldText": "API_KEY", "newText": "API KEY" }]),
+        ),
+        (
+            "multi.txt",
+            json!([{ "oldText": "X_TOKEN=", "newText": "X_TOKEX=" }]),
+        ),
+        (
+            "multi.txt",
+            json!([{ "oldText": "X_TOKEN", "newText": "X TOKEN" }]),
+        ),
+    ];
+    for (file, edits) in cases {
+        for dry in [true, false] {
+            let r = fx.ops.edit(
+                &args(json!({ "path": fx.p(file), "edits": edits, "dryRun": dry })),
+                &fx.cancel,
+            );
+            assert_eq!(code(r), ErrorCode::RedactedSpan, "{file} {edits} dry={dry}");
+        }
+    }
+    // an insert that opens a new context inside a multi-line value is refused too
+    let etag = fx.etag("multi.txt");
+    let r = edit(
+        &fx,
+        "multi.txt",
+        Some(&etag),
+        json!([{ "startLine": 2, "endLine": 1, "newText": "\"\n" }]),
+    );
+    assert_eq!(code(r), ErrorCode::RedactedSpan);
+    assert_eq!(
+        fx.get("cfg.yaml"),
+        "API_KEY: sk-live-plainsecret\nother: 1\n"
+    );
+    // an edit elsewhere in the file is fine
+    edit(
+        &fx,
+        "cfg.yaml",
+        None,
+        json!([{ "oldText": "other: 1", "newText": "other: 2" }]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn secret_class_paths_are_read_only_for_every_mutating_tool() {
+    let fx = Fx::new();
+    let key = format!(
+        "-----BEGIN {}-----\nAAAA\n-----END {}-----\n",
+        "PRIVATE KEY", "PRIVATE KEY"
+    );
+    fx.put(".env", "A=1\n");
+    fx.put("ID_RSA", key);
+    fx.put(".ssh/known", "h\n");
+    fx.put("notes.txt", "n\n");
+    let paths = [".env", "ID_RSA", ".ssh/known", ".ssh/new"];
+    for path in paths {
+        for (op, value) in [
+            (
+                "write",
+                json!({ "path": fx.p(path), "content": "x", "ifExists": "replace", "expectedEtag": "h:x" }),
+            ),
+            (
+                "edit",
+                json!({ "path": fx.p(path), "edits": [{ "oldText": "A", "newText": "B" }], "dryRun": true }),
+            ),
+            ("delete", json!({ "path": fx.p(path) })),
+            (
+                "mkdir",
+                json!({ "path": fx.p(&format!("{path}.d")), "parents": true }),
+            ),
+        ] {
+            if op == "mkdir" && !path.starts_with(".ssh") && path != ".env" && path != "ID_RSA" {
+                continue;
+            }
+            let r = fx.ops.execute(op, value, &fx.cancel);
+            let err = r.expect_err(&format!("{op} {path}"));
+            assert!(
+                matches!(err.code, ErrorCode::SecretFile | ErrorCode::NotFound),
+                "{op} {path}: {err:?}"
+            );
+        }
+        // moving a secret path away, or anything onto a secret path
+        for (from, to) in [(path, "moved.txt"), ("notes.txt", path)] {
+            let r = fx.ops.execute(
+                "rename",
+                json!({ "from": fx.p(from), "to": fx.p(to) }),
+                &fx.cancel,
+            );
+            let err = r.expect_err(&format!("rename {from} -> {to}"));
+            assert!(
+                matches!(err.code, ErrorCode::SecretFile | ErrorCode::NotFound),
+                "rename {from} -> {to}: {err:?}"
+            );
+        }
+    }
+    // the directory that gives a token file its class cannot be moved either
+    fx.put(".cache/huggingface/token", "hf_x\n");
+    for (from, to) in [
+        (".cache", "cache2"),
+        (".ssh", "ssh2"),
+        (".cache/huggingface", ".cache/hf"),
+    ] {
+        let r = fx.ops.execute(
+            "rename",
+            json!({ "from": fx.p(from), "to": fx.p(to) }),
+            &fx.cancel,
+        );
+        assert_eq!(code(r), ErrorCode::SecretFile, "{from}");
+    }
+    // everything is untouched, and still readable through the masked view
+    assert_eq!(fx.get(".env"), "A=1\n");
+    assert!(fx.root.join(".cache/huggingface/token").exists());
+    assert!(
+        fx.read(".env")
+            .text
+            .contains("A=\u{27E6}redacted:1\u{27E7}")
+    );
+    // ordinary files are unaffected
+    fx.ops
+        .execute(
+            "rename",
+            json!({ "from": fx.p("notes.txt"), "to": fx.p("notes2.txt") }),
+            &fx.cancel,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -461,10 +601,7 @@ fn ssh_key_files_cannot_be_edited_at_all() {
     let end = format!("-----END {}-----", ["PRIVATE", "KEY"].join(" "));
     fx.put("id_rsa", format!("{begin}\nAAAA\n{end}\n"));
     let code = edit_err(&fx, "id_rsa", json!([{ "oldText": begin, "newText": "x" }])).code;
-    assert!(
-        matches!(code, ErrorCode::NoMatch | ErrorCode::RedactedSpan),
-        "{code:?}"
-    );
+    assert_eq!(code, ErrorCode::SecretFile);
     let etag = fx.etag("id_rsa");
     assert_eq!(
         edit(
@@ -475,7 +612,7 @@ fn ssh_key_files_cannot_be_edited_at_all() {
         )
         .unwrap_err()
         .code,
-        ErrorCode::RedactedSpan
+        ErrorCode::SecretFile
     );
 }
 

@@ -112,6 +112,12 @@ impl Policy {
                 "this tree holds special files and is not accessible",
             ));
         }
+        if access != Access::Read && super::redact::is_secret_scope(full) {
+            return Err(FileError::new(
+                ErrorCode::SecretFile,
+                "secret files and their directories are read-only through the file tools",
+            ));
+        }
         if !self.roots.is_empty() && !self.roots.iter().any(|root| full.starts_with(root)) {
             return Err(FileError::denied(
                 "path is outside the configured file roots",
