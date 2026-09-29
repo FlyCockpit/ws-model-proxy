@@ -269,7 +269,14 @@ describe("MCP tool manifest — exact catalog", () => {
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
     const tool = MCP_TOOL_MANIFEST.find((entry) => entry.name === "forwarder_cli_devices_list");
-    for (const phrase of ["effectiveMode", "limitedBy", "cliConfig", "allowCliCommands"]) {
+    for (const phrase of [
+      "effectiveMode",
+      "refusals",
+      "supervised_only",
+      "feature_disabled",
+      "unsupported",
+      "allowCliCommands",
+    ]) {
       expect(tool?.descriptionNote).toContain(phrase);
     }
   });

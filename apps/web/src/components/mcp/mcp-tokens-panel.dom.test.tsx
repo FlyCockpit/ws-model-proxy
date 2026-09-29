@@ -25,6 +25,7 @@ const state = vi.hoisted(() => ({
   updateError: null as Error | null,
   devices: [] as unknown[],
   devicesError: null as Error | null,
+  userId: "user-a" as string | null,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -45,6 +46,14 @@ vi.mock("@tanstack/react-router", () => ({
       {children}
     </a>
   ),
+}));
+
+vi.mock("@/hooks/use-auth-session", () => ({
+  useAuthSession: () => ({
+    state: state.userId
+      ? { status: "authenticated", session: { user: { id: state.userId } } }
+      : { status: "anonymous", session: null },
+  }),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -133,6 +142,7 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
+import { CliCommandDevices } from "./cli-command-devices";
 import { McpTokensPanel } from "./mcp-tokens-panel";
 
 const token = {
@@ -218,6 +228,7 @@ afterEach(() => {
   state.updateError = null;
   state.devices = [];
   state.devicesError = null;
+  state.userId = "user-a";
 });
 
 describe("McpTokensPanel CLI commands", () => {
@@ -326,7 +337,7 @@ function cliDevice(id: string, name: string, commands: object) {
         supported: true,
         live: true,
         effectiveMode: "off",
-        limitedBy: "grant",
+        refusals: { headless: "grant_disabled", supervised: "grant_disabled" },
         available: false,
         ...commands,
       },
@@ -361,17 +372,28 @@ describe("McpTokensPanel CLI command switches", () => {
     expect(await within(dialog).findByTestId("cli-command-devices")).toBeTruthy();
   });
 
-  it("warns when no device allows commands and links each device's grant setting", async () => {
+  it("warns when no device can run a command and links each device's grant setting", async () => {
     state.devices = [
-      cliDevice("cli-1", "desk", { effectiveMode: "off", limitedBy: "grant" }),
-      cliDevice("cli-2", "laptop", { effectiveMode: "off", limitedBy: "offline", live: false }),
+      cliDevice("cli-1", "desk", {
+        effectiveMode: "off",
+        refusals: { headless: "grant_disabled", supervised: "grant_disabled" },
+      }),
+      cliDevice("cli-2", "laptop", {
+        effectiveMode: "off",
+        live: false,
+        refusals: { headless: "offline", supervised: "offline" },
+      }),
     ];
     const user = userEvent.setup();
     const { dialog, cli } = await openCliCommands(user);
     await user.click(cli());
     expect(await within(dialog).findByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeTruthy();
-    expect(within(dialog).getByText(/settings:mcp.tokens.cliDeviceLimit.grant/)).toBeTruthy();
-    expect(within(dialog).getByText(/settings:mcp.tokens.cliDeviceLimit.offline/)).toBeTruthy();
+    expect(
+      within(dialog).getAllByText(/settings:mcp.tokens.cliDeviceRefusal.grant_disabled/),
+    ).toHaveLength(2);
+    expect(
+      within(dialog).getAllByText(/settings:mcp.tokens.cliDeviceRefusal.offline/),
+    ).toHaveLength(2);
     const links = within(dialog).getAllByRole("link");
     expect(links.map((link) => link.getAttribute("href"))).toEqual([
       "/en-US/dashboard/clis#cli-cli-1",
@@ -379,33 +401,59 @@ describe("McpTokensPanel CLI command switches", () => {
     ]);
   });
 
-  it("shows each device's effective mode and its limit, and no warning when one allows commands", async () => {
+  it("warns when every device is permitted but none can run either kind (no PTY)", async () => {
+    // Supervised grant and CLI config, on a CLI with no PTY: the mode is not
+    // off, yet the relay refuses both tools.
     state.devices = [
-      cliDevice("cli-1", "desk", { effectiveMode: "supervised", limitedBy: "cliConfig" }),
-      cliDevice("cli-2", "laptop", { effectiveMode: "off", limitedBy: "grant" }),
+      cliDevice("cli-1", "win", {
+        effectiveMode: "supervised",
+        available: false,
+        refusals: { headless: "supervised_only", supervised: "unsupported" },
+      }),
+    ];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    expect(await within(dialog).findByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeTruthy();
+    expect(
+      within(dialog).getByText(/settings:mcp.tokens.cliDeviceRefusal.unsupported/),
+    ).toBeTruthy();
+  });
+
+  it("shows each device's mode and per-kind refusal, and no warning when one can run a command", async () => {
+    state.devices = [
+      cliDevice("cli-1", "desk", {
+        effectiveMode: "supervised",
+        available: true,
+        refusals: { headless: "supervised_only", supervised: null },
+      }),
+      cliDevice("cli-2", "laptop", { effectiveMode: "off" }),
     ];
     const user = userEvent.setup();
     const { dialog, cli } = await openCliCommands(user);
     await user.click(cli());
     const list = await within(dialog).findByTestId("cli-command-devices");
     expect(within(list).getByText(/settings:mcp.tokens.cliDeviceMode.supervised/)).toBeTruthy();
-    expect(within(list).getByText(/settings:mcp.tokens.cliDeviceLimit.cliConfig/)).toBeTruthy();
+    expect(within(list).getByText(/cliDeviceRefusal.supervised_only/)).toBeTruthy();
+    expect(within(list).getByText(/settings:mcp.tokens.cliDeviceAllowed/)).toBeTruthy();
     expect(within(list).queryByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeNull();
   });
 
-  it("renders no limit line for devices that report no limit or omit the field", async () => {
+  it("renders no refusal lines for devices whose API omits the refusals", async () => {
     state.devices = [
-      cliDevice("cli-1", "desk", { effectiveMode: "unsupervised", limitedBy: null }),
-      cliDevice("cli-2", "laptop", { effectiveMode: "unsupervised", limitedBy: undefined }),
+      cliDevice("cli-1", "desk", {
+        effectiveMode: "unsupervised",
+        available: true,
+        refusals: undefined,
+      }),
     ];
     const user = userEvent.setup();
     const { dialog, cli } = await openCliCommands(user);
     await user.click(cli());
     const list = await within(dialog).findByTestId("cli-command-devices");
-    // Null means nothing limits the device; an omitted field means the API
-    // did not report it. Neither renders a limit, and neither falls through
-    // to the missing key `cliDeviceLimit.null`.
-    expect(within(list).queryByText(/cliDeviceLimit/)).toBeNull();
+    // An omitted field means the API did not report it: no refusal line and
+    // no fall-through to a missing key.
+    expect(within(list).queryByText(/cliDeviceRefusal|cliDeviceAllowed/)).toBeNull();
   });
 
   it("warns when the account has no CLIs", async () => {
@@ -961,5 +1009,45 @@ describe("McpTokensPanel", () => {
         name: "settings:mcp.tokens.revoke",
       }),
     ).toHaveProperty("disabled", false);
+  });
+});
+
+describe("CliCommandDevices account isolation", () => {
+  it("never shows a previous account's cached devices to the next signed-in account", async () => {
+    // One QueryClient outlives the sign-out, as the router's does.
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 60_000 } },
+    });
+    const view = () => (
+      <QueryClientProvider client={queryClient}>
+        <CliCommandDevices lang="en-US" />
+      </QueryClientProvider>
+    );
+    state.userId = "user-a";
+    state.devices = [cliDevice("cli-a", "alice-desk", {})];
+    const first = render(view());
+    expect(await screen.findByText("alice-desk")).toBeTruthy();
+    first.unmount();
+
+    state.userId = "user-b";
+    state.devices = [cliDevice("cli-b", "bob-laptop", {})];
+    render(view());
+    expect(await screen.findByText("bob-laptop")).toBeTruthy();
+    expect(screen.queryByText("alice-desk")).toBeNull();
+  });
+
+  it("does not fetch when nobody is signed in", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    state.userId = null;
+    state.devices = [cliDevice("cli-a", "alice-desk", {})];
+    render(
+      <QueryClientProvider client={queryClient}>
+        <CliCommandDevices lang="en-US" />
+      </QueryClientProvider>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.queryByText("alice-desk")).toBeNull();
+    expect(queryClient.getQueryCache().getAll()).toHaveLength(1);
+    expect(queryClient.getQueryCache().getAll()[0]?.state.fetchStatus).toBe("idle");
   });
 });

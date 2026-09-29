@@ -2,9 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
-
 import { InlineRetry } from "@/components/inline-retry";
-import { commandLimit, readCliDeviceFeatures } from "@/lib/cli-device-features";
+import { useAuthSession } from "@/hooks/use-auth-session";
+import { COMMAND_KINDS, commandRefusals, readCliDeviceFeatures } from "@/lib/cli-device-features";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -16,7 +16,16 @@ import { orpc } from "@/utils/orpc";
  */
 export function CliCommandDevices({ lang }: { lang: string }) {
   const { t } = useTranslation(["settings"]);
-  const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
+  // The router's query cache outlives a sign-out (five-minute staleTime), so the
+  // key carries the signed-in user: another account never reads this list.
+  const { state } = useAuthSession();
+  const userId = state.session?.user.id ?? null;
+  const options = orpc.forwarderManagement.listCliDevices.queryOptions();
+  const devices = useQuery({
+    ...options,
+    queryKey: [...options.queryKey, { userId }],
+    enabled: userId !== null,
+  });
 
   if (devices.isPending) return <Skeleton className="h-16 w-full" />;
   if (devices.isError) {
@@ -34,10 +43,12 @@ export function CliCommandDevices({ lang }: { lang: string }) {
       id: device.id,
       name: device.displayName,
       effectiveMode: commands.effectiveMode,
-      limit: commandLimit(commands),
+      refusals: commandRefusals(commands),
+      available: commands.available,
     };
   });
-  const noneAllow = rows.every((row) => row.effectiveMode === "off");
+  // Some command kind would be admitted (the relay's own refusals, not just the mode).
+  const noneAllow = rows.every((row) => !row.available);
 
   return (
     <div className="min-w-0 space-y-2 rounded-md border p-3" data-testid="cli-command-devices">
@@ -64,13 +75,20 @@ export function CliCommandDevices({ lang }: { lang: string }) {
                   <span className="font-medium">{row.name}</span>
                   {": "}
                   {t(`settings:mcp.tokens.cliDeviceMode.${row.effectiveMode}`)}
-                  {row.limit ? (
-                    <span className="text-muted-foreground">
-                      {" ("}
-                      {t(`settings:mcp.tokens.cliDeviceLimit.${row.limit}`)}
-                      {")"}
-                    </span>
-                  ) : null}
+                  {row.refusals
+                    ? COMMAND_KINDS.map((kind) => {
+                        const refusal = row.refusals?.[kind] ?? null;
+                        return (
+                          <span key={kind} className="block text-muted-foreground">
+                            {t(`settings:mcp.tokens.cliDeviceKind.${kind}`)}
+                            {": "}
+                            {refusal
+                              ? t(`settings:mcp.tokens.cliDeviceRefusal.${refusal}`)
+                              : t("settings:mcp.tokens.cliDeviceAllowed")}
+                          </span>
+                        );
+                      })
+                    : null}
                 </span>
                 <Link
                   to="/$lang/dashboard/clis"

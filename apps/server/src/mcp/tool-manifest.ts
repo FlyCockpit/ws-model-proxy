@@ -466,7 +466,7 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.limitedBy names the switch holding it down: grant (dashboard), cliConfig (wsmp config set-mcp-commands), both, offline (CLI not connected), or null (nothing). A token also needs mcp:write and allowCliCommands.",
+      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), supervised_only (headless needs unsupervised; the grant or wsmp config is supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A token also needs mcp:write and allowCliCommands.",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },

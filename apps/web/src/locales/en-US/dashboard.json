@@ -59,13 +59,18 @@
       "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:",
       "effective": "Agents can run now",
       "commandSwitches": "A command runs only when the MCP token, this grant and the CLI's own config all allow it. The effective mode is the stricter of the last two.",
-      "commandLimit": {
-        "grant": "Held down by the dashboard grant above. Raise the grant to allow more.",
-        "cliConfig": "Held down by this CLI's own config. On that machine run wsmp config set-mcp-commands and restart wsmp to allow more.",
-        "both": "The dashboard grant and this CLI's config both set this mode. Allowing more needs both to change.",
-        "offline": "This CLI is offline or too old to report its config, so agents cannot run commands until it reconnects."
+      "commandKind": {
+        "headless": "Headless commands",
+        "supervised": "Supervised commands"
       },
-      "commandNoLimit": "Nothing limits this device."
+      "commandAllowed": "allowed now",
+      "commandRefusal": {
+        "grant_disabled": "refused: the dashboard grant above does not allow it. Raise the grant to allow it.",
+        "supervised_only": "refused: needs Unsupervised, and the dashboard grant or this CLI's config is Supervised, whichever is stricter.",
+        "offline": "refused: this CLI is offline or too old for it. It works again once the CLI reconnects on a current wsmp.",
+        "feature_disabled": "refused: this CLI's own config does not allow it. On that machine run wsmp config set-mcp-commands and restart wsmp.",
+        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it."
+      }
     },
     "rename": {
       "action": "Rename",

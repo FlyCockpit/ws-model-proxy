@@ -24,17 +24,21 @@ person, on the dashboard or on the machine itself.
 ## Seeing which switch blocks
 
 - **Dashboard, CLIs page**: under each device's MCP commands control, the
-  effective mode and the switch holding it down: the dashboard grant, the
-  CLI's own config, both, or the CLI being offline.
+  effective mode and, for headless and for supervised commands separately,
+  whether the relay would admit one now or why it would refuse.
 - **Token form** (when "Allow CLI commands" is on): each of your devices with
-  its effective mode and a link to its grant setting, and a warning when none
-  allows commands.
+  its effective mode, the same per-kind refusal, and a link to its grant
+  setting, and a warning when no device can run either kind.
 - **MCP `forwarder_cli_devices_list`**: `features.commands` carries `mode`
-  (grant), `deviceMode` (CLI config), `effectiveMode`, and
-  `limitedBy`: `grant`, `cliConfig`, `both`, `offline` or `null` (nothing
-  limits it). `limitedBy` names the switch to look at first: an `off` grant,
-  then a CLI that is not live, then whichever of the grant and the CLI config
-  is lower.
+  (grant), `deviceMode` (CLI config), `effectiveMode`, and `refusals`:
+  `refusals.headless` and `refusals.supervised` are `null` when the relay
+  would admit that tool, else the relay's own code (`grant_disabled`,
+  `supervised_only`, `offline`, `feature_disabled`, `unsupported`). Each is
+  the first refusal in that tool's own check order, which differs between the
+  two tools (headless checks the grant's level before liveness; supervised
+  checks liveness, then the CLI's mode, then PTY support). `available` is true
+  when either tool would be admitted. The token and the per-CLI concurrency
+  limit are not device state and are not shown.
 - **MCP errors** name the switch that refused: "switch 1 of 3" (token),
   "switch 2 of 3" (dashboard grant), "switch 3 of 3" (wsmp config). An
   offline CLI is not one of the three switches.

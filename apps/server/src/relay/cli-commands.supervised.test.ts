@@ -1,4 +1,9 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  type McpCommandLive,
+  mcpCommandModeFromDb,
+  mcpCommandRefusals,
+} from "@ws-model-proxy/api/lib/mcp-command-mode";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
@@ -286,6 +291,65 @@ describe("supervised commands", () => {
         error: "feature_disabled",
       });
       expect(cliOff.sends).toEqual([]);
+    });
+
+    // The dashboard and MCP device list show `mcpCommandRefusals`. It must
+    // give the relay's own answer for every device state, for both tools.
+    it("mcpCommandRefusals matches what the real start functions refuse, in every state", async () => {
+      const grantsDb: DbMode[] = ["OFF", "SUPERVISED", "UNSUPERVISED"];
+      const modes: Mode[] = ["off", "supervised", "unsupervised"];
+      const lives: Array<McpCommandLive | null> = [null];
+      for (const mode of modes) {
+        for (const terminalSupported of [true, false]) {
+          lives.push({ mode, supervisedCommands: true, terminalSupported });
+        }
+      }
+      let row = 0;
+      let refused = 0;
+      let admitted = 0;
+      for (const grant of grantsDb) {
+        for (const live of lives) {
+          row += 1;
+          const slug = `parity-${row}`;
+          resetCliCommandsForTests();
+          if (live) {
+            await connect(slug, {
+              grant,
+              mode: live.mode,
+              terminalSupported: live.terminalSupported,
+            });
+          } else {
+            grants[slug] = grant;
+          }
+          const want = mcpCommandRefusals({ grant: mcpCommandModeFromDb(grant), live });
+          const headless = await startCliCommand({
+            userId: "user-id",
+            tokenId: `token-h-${row}`,
+            expiresAt: null,
+            cliDeviceId: slug,
+            command: "pwd",
+          });
+          const supervised = await start({
+            cliDeviceId: slug,
+            tokenId: `token-s-${row}`,
+            command: "pwd",
+            reason: "parity",
+          });
+          const label = `${grant} grant, live ${JSON.stringify(live)}`;
+          expect(headless.ok ? null : headless.error, `headless: ${label}`).toBe(want.headless);
+          expect(supervised.ok ? null : supervised.error, `supervised: ${label}`).toBe(
+            want.supervised,
+          );
+          for (const result of [want.headless, want.supervised]) {
+            if (result === null) admitted += 1;
+            else refused += 1;
+          }
+        }
+      }
+      // The table exercises both admitted and refused outcomes for both tools.
+      expect(admitted).toBeGreaterThan(0);
+      expect(refused).toBeGreaterThan(0);
+      expect(row).toBe(21);
     });
 
     it("refuses a CLI without terminal support and an offline CLI", async () => {

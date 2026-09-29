@@ -59,31 +59,76 @@ export function allowsHeadlessCommands(mode: McpCommandModeName | null | undefin
 }
 
 /**
- * Which switch holds `effectiveMode` below `unsupervised`, as the switch an
- * agent should look at first (`apps/server/src/relay/cli-commands.ts`):
- * - `grant`: the dashboard grant is the stricter of the two (or the grant is
- *   `off`, which the relay refuses before it looks at the CLI);
- * - `offline`: the grant allows commands but the CLI is not connected or
- *   predates command support, so its config cannot be read;
- * - `cliConfig`: the CLI's own `wsmp config set-mcp-commands` is stricter;
- * - `both`: the grant and the CLI config are equal, and below `unsupervised`;
- * - `null`: nothing limits the device (both allow `unsupervised`).
- * The token switch (allowCliCommands + mcp:write) is per token, not per device.
+ * Why the relay would refuse a command right now, per command kind. These are
+ * the relay's own error codes (`apps/server/src/relay/cli-commands.ts`); the
+ * token (switch 1) and the per-CLI concurrency limit are not device state and
+ * are not modelled here.
+ * - `grant_disabled`: the dashboard grant is `off` (headless), or does not
+ *   allow supervised commands (supervised).
+ * - `supervised_only`: headless exec needs `unsupervised`, and the grant or
+ *   the CLI's config is `supervised`.
+ * - `offline`: the CLI is not connected, predates command support, or (for
+ *   supervised) does not implement supervised terminals.
+ * - `feature_disabled`: the CLI's own config refuses.
+ * - `unsupported`: supervised only; the CLI has no PTY (Windows).
  */
-export type McpCommandLimit = "grant" | "offline" | "cliConfig" | "both" | null;
+export type McpCommandRefusal =
+  | "grant_disabled"
+  | "supervised_only"
+  | "offline"
+  | "feature_disabled"
+  | "unsupported";
 
-export function mcpCommandLimit(input: {
+/** The live CLI facts the relay reads; null when offline or older than protocol 2.6. */
+export type McpCommandLive = {
+  mode: McpCommandModeName;
+  supervisedCommands: boolean;
+  terminalSupported: boolean;
+};
+
+export type McpCommandRefusals = {
+  /** `forwarder_cli_command_run`; null when the relay would admit it. */
+  headless: McpCommandRefusal | null;
+  /** `forwarder_cli_supervised_command_start`; null when the relay would admit it. */
+  supervised: McpCommandRefusal | null;
+};
+
+/**
+ * The ONE place that mirrors the relay's device-state refusal order, for
+ * display only (it gates nothing; the relay still decides). Both checks run
+ * in the relay's exact order, so the first refusal here is the one an agent
+ * would get. `relay/cli-commands.test.ts` compares this against the real
+ * start functions for every state.
+ */
+export function mcpCommandRefusals(input: {
   grant: McpCommandModeName;
-  /** The CLI is connected and reports a mode (protocol 2.6 or later). */
-  live: boolean;
-  /** The CLI's reported config mode; ignored unless `live`. */
-  cliMode: McpCommandModeName | null | undefined;
-}): McpCommandLimit {
-  if (input.grant === "off") return "grant";
-  if (!input.live) return "offline";
-  const grantRank = RANK[input.grant];
-  const cliRank = RANK[input.cliMode ?? "off"];
-  if (grantRank < cliRank) return "grant";
-  if (cliRank < grantRank) return "cliConfig";
-  return input.grant === "unsupervised" ? null : "both";
+  live: McpCommandLive | null;
+}): McpCommandRefusals {
+  return {
+    headless: headlessRefusal(input.grant, input.live),
+    supervised: supervisedRefusal(input.grant, input.live),
+  };
+}
+
+function headlessRefusal(
+  grant: McpCommandModeName,
+  live: McpCommandLive | null,
+): McpCommandRefusal | null {
+  if (grant === "off") return "grant_disabled";
+  if (!allowsHeadlessCommands(grant)) return "supervised_only";
+  if (!live) return "offline";
+  if (live.mode === "off") return "feature_disabled";
+  if (!allowsHeadlessCommands(live.mode)) return "supervised_only";
+  return null;
+}
+
+function supervisedRefusal(
+  grant: McpCommandModeName,
+  live: McpCommandLive | null,
+): McpCommandRefusal | null {
+  if (!allowsSupervisedCommands(grant)) return "grant_disabled";
+  if (!live?.supervisedCommands) return "offline";
+  if (!allowsSupervisedCommands(live.mode)) return "feature_disabled";
+  if (!live.terminalSupported) return "unsupported";
+  return null;
 }

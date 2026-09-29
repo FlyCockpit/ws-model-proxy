@@ -4,10 +4,12 @@ import {
   allowsSupervisedCommands,
   isMcpCommandMode,
   lowestMcpCommandMode,
-  mcpCommandLimit,
+  type McpCommandLive,
+  type McpCommandRefusals,
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
+  mcpCommandRefusals,
 } from "./mcp-command-mode";
 
 describe("MCP command mode", () => {
@@ -36,49 +38,96 @@ describe("MCP command mode", () => {
     expect(isMcpCommandMode("always")).toBe(false);
   });
 
-  // grant x cli mode (live) -> the switch that limits, as the relay would refuse it.
-  it.each([
-    ["off", "off", "grant"],
-    ["off", "supervised", "grant"],
-    ["off", "unsupervised", "grant"],
-    ["supervised", "off", "cliConfig"],
-    ["supervised", "supervised", "both"],
-    ["supervised", "unsupervised", "grant"],
-    ["unsupervised", "off", "cliConfig"],
-    ["unsupervised", "supervised", "cliConfig"],
-    ["unsupervised", "unsupervised", null],
-  ] as const)(
-    "names the limiting switch: grant %s, CLI config %s -> %s",
-    (grant, cliMode, want) => {
-      expect(mcpCommandLimit({ grant, live: true, cliMode })).toBe(want);
-    },
-  );
+  // The relay's refusal order, per tool (apps/server/src/relay/cli-commands.ts).
+  // The real start functions are compared against this in
+  // apps/server/src/relay/cli-commands.supervised.test.ts.
+  const live = (
+    mode: "off" | "supervised" | "unsupervised",
+    terminalSupported = true,
+  ): McpCommandLive => ({ mode, supervisedCommands: true, terminalSupported });
 
-  it("treats a live CLI with no reported mode as off", () => {
-    expect(mcpCommandLimit({ grant: "supervised", live: true, cliMode: null })).toBe("cliConfig");
-    expect(mcpCommandLimit({ grant: "unsupervised", live: true, cliMode: undefined })).toBe(
-      "cliConfig",
-    );
+  it.each<
+    [string, "off" | "supervised" | "unsupervised", McpCommandLive | null, McpCommandRefusals]
+  >([
+    [
+      "off grant is refused before liveness",
+      "off",
+      null,
+      { headless: "grant_disabled", supervised: "grant_disabled" },
+    ],
+    [
+      "off grant, CLI unsupervised",
+      "off",
+      live("unsupervised"),
+      { headless: "grant_disabled", supervised: "grant_disabled" },
+    ],
+    // The offline case Codex found: headless says supervised_only before it looks at liveness.
+    [
+      "supervised grant, offline",
+      "supervised",
+      null,
+      { headless: "supervised_only", supervised: "offline" },
+    ],
+    [
+      "unsupervised grant, offline",
+      "unsupervised",
+      null,
+      { headless: "offline", supervised: "offline" },
+    ],
+    // The CLI-config-off case: the grant is checked first by headless.
+    [
+      "supervised grant, CLI off",
+      "supervised",
+      live("off"),
+      { headless: "supervised_only", supervised: "feature_disabled" },
+    ],
+    [
+      "unsupervised grant, CLI off",
+      "unsupervised",
+      live("off"),
+      { headless: "feature_disabled", supervised: "feature_disabled" },
+    ],
+    [
+      "supervised grant, CLI supervised",
+      "supervised",
+      live("supervised"),
+      { headless: "supervised_only", supervised: null },
+    ],
+    [
+      "unsupervised grant, CLI supervised",
+      "unsupervised",
+      live("supervised"),
+      { headless: "supervised_only", supervised: null },
+    ],
+    [
+      "unsupervised grant, CLI unsupervised",
+      "unsupervised",
+      live("unsupervised"),
+      { headless: null, supervised: null },
+    ],
+    // No PTY: supervised is refused even when the mode allows it; headless is not.
+    [
+      "supervised grant, CLI supervised, no PTY",
+      "supervised",
+      live("supervised", false),
+      { headless: "supervised_only", supervised: "unsupported" },
+    ],
+    [
+      "unsupervised, no PTY",
+      "unsupervised",
+      live("unsupervised", false),
+      { headless: null, supervised: "unsupported" },
+    ],
+  ])("%s", (_name, grant, liveState, want) => {
+    expect(mcpCommandRefusals({ grant, live: liveState })).toEqual(want);
   });
 
-  it("names the connection when the grant allows commands but the CLI is not live", () => {
-    expect(mcpCommandLimit({ grant: "supervised", live: false, cliMode: "unsupervised" })).toBe(
-      "offline",
-    );
-    expect(mcpCommandLimit({ grant: "unsupervised", live: false, cliMode: null })).toBe("offline");
-    // An off grant is refused before the relay looks at the connection.
-    expect(mcpCommandLimit({ grant: "off", live: false, cliMode: null })).toBe("grant");
-  });
-
-  it("agrees with lowestMcpCommandMode: a limit exists exactly when effective < unsupervised", () => {
-    for (const grant of ["off", "supervised", "unsupervised"] as const) {
-      for (const cliMode of ["off", "supervised", "unsupervised"] as const) {
-        for (const live of [true, false]) {
-          const effective = lowestMcpCommandMode(grant, live ? cliMode : "off");
-          const limit = mcpCommandLimit({ grant, live, cliMode });
-          expect(limit === null).toBe(effective === "unsupervised");
-        }
-      }
-    }
+  it("a CLI that does not implement supervised terminals is offline for supervised only", () => {
+    expect(
+      mcpCommandRefusals({
+        grant: "unsupervised",
+        live: { mode: "unsupervised", supervisedCommands: false, terminalSupported: true },
+      }),
+    ).toEqual({ headless: null, supervised: "offline" });
   });
 });

@@ -95,19 +95,25 @@
       "cliDevicesHelp": "A command runs only when this token, the device's dashboard grant and the CLI's own config all allow it. This form does not change device grants.",
       "cliDevicesLoadFailed": "Couldn't load your CLIs' command settings.",
       "cliDevicesEmpty": "You have no CLIs yet. Commands need a connected CLI whose grant allows them.",
-      "cliDevicesNoneAllow": "None of your CLIs currently allows commands, so this token's commands will fail until a grant is raised. Open a device's grant setting below.",
+      "cliDevicesNoneAllow": "None of your CLIs can run a command right now, so this token's commands will fail. Each device below says why: some need a dashboard grant, others need the CLI's own config or a connection.",
       "cliDeviceMode": {
         "off": "Off",
         "supervised": "Supervised",
         "unsupervised": "Unsupervised"
       },
-      "cliDeviceLimit": {
-        "grant": "limited by the dashboard grant",
-        "cliConfig": "limited by the CLI's config",
-        "both": "limited by the grant and the CLI's config",
-        "offline": "CLI offline or too old"
+      "cliDeviceGrantLink": "Open grant setting for {{name}}",
+      "cliDeviceKind": {
+        "headless": "headless",
+        "supervised": "supervised"
       },
-      "cliDeviceGrantLink": "Open grant setting for {{name}}"
+      "cliDeviceAllowed": "allowed",
+      "cliDeviceRefusal": {
+        "grant_disabled": "refused, the dashboard grant is Off",
+        "supervised_only": "refused, needs Unsupervised (the grant or the CLI config is Supervised)",
+        "offline": "refused, CLI offline or too old",
+        "feature_disabled": "refused, the CLI's own config is Off",
+        "unsupported": "refused, no terminal support on this CLI"
+      }
     }
   },
   "title": "Settings",

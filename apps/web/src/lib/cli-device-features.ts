@@ -12,11 +12,21 @@ export const MCP_COMMAND_MODES = ["off", "supervised", "unsupervised"] as const;
 export type McpCommandMode = (typeof MCP_COMMAND_MODES)[number];
 
 /**
- * Which switch holds a device's effective mode down (see
- * `mcpCommandLimit` in the API): the dashboard grant, the CLI's own wsmp
- * config, both, the CLI being offline, or nothing.
+ * Why the relay would refuse a command kind right now (see
+ * `mcpCommandRefusals` in the API); these are the relay's own error codes.
  */
-export type CommandLimit = "grant" | "offline" | "cliConfig" | "both";
+export type CommandRefusal =
+  | "grant_disabled"
+  | "supervised_only"
+  | "offline"
+  | "feature_disabled"
+  | "unsupported";
+
+export const COMMAND_KINDS = ["headless", "supervised"] as const;
+export type CommandKind = (typeof COMMAND_KINDS)[number];
+
+/** Per command kind: the relay's refusal, or null when it would admit it. */
+export type CommandRefusals = Record<CommandKind, CommandRefusal | null>;
 
 export type CommandFeature = {
   /** The dashboard grant. */
@@ -27,8 +37,8 @@ export type CommandFeature = {
   supported: boolean | null;
   live: boolean;
   effectiveMode: McpCommandMode;
-  /** null: nothing limits it. Absent: an API that does not report it. */
-  limitedBy?: CommandLimit | null;
+  /** Absent: an API that does not report it. */
+  refusals?: CommandRefusals;
   available: boolean;
 };
 
@@ -63,7 +73,7 @@ const EMPTY_COMMANDS: CommandFeature = {
   supported: null,
   live: false,
   effectiveMode: "off",
-  limitedBy: "grant",
+  refusals: { headless: "grant_disabled", supervised: "grant_disabled" },
   available: false,
 };
 
@@ -111,9 +121,9 @@ export function commandModeOptionState(
   return { disabled: false, reason: null };
 }
 
-/** The limit to explain, or null when nothing limits the device or the API did not say. */
-export function commandLimit(feature: CommandFeature): CommandLimit | null {
-  return feature.limitedBy ?? null;
+/** The relay's per-kind refusals to explain, or null when the API did not say. */
+export function commandRefusals(feature: CommandFeature): CommandRefusals | null {
+  return feature.refusals ?? null;
 }
 
 /** Recommend CLI-side browser approval while agents can ask for supervised commands. */

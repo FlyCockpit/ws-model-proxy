@@ -95,19 +95,25 @@
       "cliDevicesHelp": "Un comando se ejecuta solo cuando este token, el permiso del dispositivo en el panel y la configuración propia del CLI lo permiten. Este formulario no cambia los permisos de los dispositivos.",
       "cliDevicesLoadFailed": "No se pudo cargar la configuración de comandos de tus CLIs.",
       "cliDevicesEmpty": "Aún no tienes CLIs. Los comandos necesitan un CLI conectado cuyo permiso los autorice.",
-      "cliDevicesNoneAllow": "Ninguno de tus CLIs permite comandos ahora, así que los comandos de este token fallarán hasta que subas un permiso. Abre abajo el ajuste de permiso de un dispositivo.",
+      "cliDevicesNoneAllow": "Ninguno de tus CLIs puede ejecutar un comando ahora, así que los comandos de este token fallarán. Cada dispositivo de abajo indica por qué: algunos necesitan un permiso del panel; otros, la configuración propia del CLI o una conexión.",
       "cliDeviceMode": {
         "off": "Desactivado",
         "supervised": "Supervisado",
         "unsupervised": "Sin supervisión"
       },
-      "cliDeviceLimit": {
-        "grant": "limitado por el permiso del panel",
-        "cliConfig": "limitado por la configuración del CLI",
-        "both": "limitado por el permiso y por la configuración del CLI",
-        "offline": "CLI desconectado o demasiado antiguo"
+      "cliDeviceGrantLink": "Abrir el permiso de {{name}}",
+      "cliDeviceKind": {
+        "headless": "sin cabecera",
+        "supervised": "supervisado"
       },
-      "cliDeviceGrantLink": "Abrir el permiso de {{name}}"
+      "cliDeviceAllowed": "permitido",
+      "cliDeviceRefusal": {
+        "grant_disabled": "rechazado, el permiso del panel está desactivado",
+        "supervised_only": "rechazado, requiere Sin supervisión (el permiso o la configuración del CLI es Supervisado)",
+        "offline": "rechazado, CLI desconectado o demasiado antiguo",
+        "feature_disabled": "rechazado, la configuración propia del CLI está desactivada",
+        "unsupported": "rechazado, este CLI no tiene compatibilidad con terminal"
+      }
     }
   },
   "profile": {

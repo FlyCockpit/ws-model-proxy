@@ -1,15 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { commandLimit, readCliDeviceFeatures } from "./cli-device-features";
+import { commandRefusals, readCliDeviceFeatures } from "./cli-device-features";
 
-describe("command limit", () => {
-  it("treats a device with no reported commands as limited by the grant", () => {
+describe("command refusals", () => {
+  it("treats a device with no reported commands as refused by the grant for both kinds", () => {
     const features = readCliDeviceFeatures({});
     expect(features.features.commands.effectiveMode).toBe("off");
-    expect(commandLimit(features.features.commands)).toBe("grant");
+    expect(features.features.commands.available).toBe(false);
+    expect(commandRefusals(features.features.commands)).toEqual({
+      headless: "grant_disabled",
+      supervised: "grant_disabled",
+    });
   });
 
-  it("passes the API's limit through, and none when the API omits it", () => {
+  it("passes the API's refusals through, and none when the API omits them", () => {
     const base = {
       mode: "supervised",
       deviceMode: "supervised",
@@ -18,8 +22,8 @@ describe("command limit", () => {
       effectiveMode: "supervised",
       available: true,
     } as const;
-    expect(commandLimit({ ...base, limitedBy: "both" })).toBe("both");
-    expect(commandLimit({ ...base, limitedBy: null })).toBeNull();
-    expect(commandLimit(base)).toBeNull();
+    const refusals = { headless: "supervised_only", supervised: null } as const;
+    expect(commandRefusals({ ...base, refusals })).toEqual(refusals);
+    expect(commandRefusals(base)).toBeNull();
   });
 });

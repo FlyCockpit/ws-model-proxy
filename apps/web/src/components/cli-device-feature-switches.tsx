@@ -18,9 +18,10 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
+  COMMAND_KINDS,
   type CommandFeature,
-  commandLimit,
   commandModeOptionState,
+  commandRefusals,
   type FeatureSwitchReason,
   featureReasonKey,
   featureSwitchState,
@@ -79,13 +80,14 @@ function FeatureSwitch({
 }
 
 /**
- * What agents can run right now (the stricter of the dashboard grant and the
- * CLI's own config) and which of those two, or the connection, holds it down.
- * The MCP token is the third switch; it is per token, so it is only named.
+ * What agents can run right now: the stricter of the dashboard grant and the
+ * CLI's own config, then, per command kind, whether the relay would admit it
+ * or why not (its own refusal order). The MCP token is the third switch; it
+ * is per token, so it is only named.
  */
 function EffectiveCommandMode({ feature }: { feature: CommandFeature }) {
   const { t } = useTranslation("dashboard");
-  const limit = commandLimit(feature);
+  const refusals = commandRefusals(feature);
   return (
     <div className="mt-2 min-w-0 text-xs text-muted-foreground" data-testid="command-effective">
       <p>
@@ -94,8 +96,19 @@ function EffectiveCommandMode({ feature }: { feature: CommandFeature }) {
           {t(`dashboard:clis.features.commandModes.${feature.effectiveMode}`)}
         </span>
       </p>
-      {limit ? <p>{t(`dashboard:clis.features.commandLimit.${limit}`)}</p> : null}
-      {feature.limitedBy === null ? <p>{t("dashboard:clis.features.commandNoLimit")}</p> : null}
+      {refusals
+        ? COMMAND_KINDS.map((kind) => {
+            const refusal = refusals[kind];
+            return (
+              <p key={kind} data-testid={`command-${kind}`}>
+                {t(`dashboard:clis.features.commandKind.${kind}`)}:{" "}
+                {refusal
+                  ? t(`dashboard:clis.features.commandRefusal.${refusal}`)
+                  : t("dashboard:clis.features.commandAllowed")}
+              </p>
+            );
+          })
+        : null}
       <p>{t("dashboard:clis.features.commandSwitches")}</p>
     </div>
   );
