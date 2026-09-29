@@ -259,7 +259,15 @@ function buildAuth() {
   const auth = betterAuth({
     secret: SECRET,
     baseURL: "http://localhost:3000",
-    emailAndPassword: { enabled: true },
+    // Test-only hasher: the suite proves the two-factor lockout, not password
+    // hashing, and real scrypt on every sign-in dominated its runtime.
+    emailAndPassword: {
+      enabled: true,
+      password: {
+        hash: async (password) => `fast:${password}`,
+        verify: async ({ hash, password }) => hash === `fast:${password}`,
+      },
+    },
     database: (options: BetterAuthOptions) => stub.adapter(options),
     plugins: [twoFactor({ issuer: "WS Model Proxy" })],
   });
