@@ -2852,13 +2852,29 @@ BEGIN
 END;
 $wsmp_require_fence$;
 
--- A row version this transaction wrote (inserted, or updated earlier while
--- holding the fences that update needed). No other transaction can see a row
--- this transaction inserted, so writing its policy needs no policy fence.
-CREATE OR REPLACE FUNCTION wsmp_written_by_this_transaction(row_xmin XID)
-RETURNS BOOLEAN LANGUAGE sql VOLATILE AS $wsmp_written_here$
-  SELECT row_xmin::text::bigint = txid_current() % 4294967296
-$wsmp_written_here$;
+-- Rows this transaction INSERTED, recorded by an AFTER INSERT trigger (so an
+-- upsert that only updates an existing row never records it) in the
+-- transaction-local setting wsmp.created as ",<table>:<id>,". No other
+-- transaction can see such a row, so writing its policy needs no policy
+-- fence. An earlier UPDATE of an existing row does NOT count (the row's xmin
+-- would equal this transaction after any write, including one that needs no
+-- fence, so xmin cannot tell the two apart). A rolled-back savepoint reverts
+-- the setting with it.
+CREATE OR REPLACE FUNCTION wsmp_row_created_here(relation TEXT, row_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $wsmp_created_here$
+  SELECT strpos(COALESCE(current_setting('wsmp.created', true), ''),
+                ',' || relation || ':' || row_id || ',') > 0
+$wsmp_created_here$;
+
+CREATE OR REPLACE FUNCTION wsmp_record_created_row()
+RETURNS trigger LANGUAGE plpgsql AS $wsmp_record_created$
+BEGIN
+  PERFORM set_config('wsmp.created',
+    COALESCE(current_setting('wsmp.created', true), '') || ',' || TG_TABLE_NAME || ':' || NEW.id || ',',
+    true);
+  RETURN NULL;
+END;
+$wsmp_record_created$;
 
 -- The users whose owner fence a write of this graph row needs: the row's
 -- owner, both parties of a pool grant, and for an allowlist entry both the
@@ -2947,13 +2963,12 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
       target_id := NEW."executionTargetId";
       IF target_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM execution_target target
-         WHERE target.id = target_id AND wsmp_written_by_this_transaction(target.xmin)
+        SELECT 1 WHERE wsmp_row_created_here('execution_target', target_id)
       ) THEN
         PERFORM wsmp_require_fence('06:capacity-policy:' || target_id, TG_TABLE_NAME);
       END IF;
     ELSIF TG_OP = 'UPDATE' AND policy_changed
-          AND NOT wsmp_written_by_this_transaction(OLD.xmin) THEN
+          AND NOT wsmp_row_created_here(TG_TABLE_NAME, OLD.id) THEN
       IF OLD."executionTargetId" IS NOT NULL THEN
         PERFORM wsmp_require_fence('06:capacity-policy:' || OLD."executionTargetId", TG_TABLE_NAME);
       END IF;
@@ -2961,7 +2976,7 @@ BEGIN
         PERFORM wsmp_require_fence('06:capacity-policy:' || NEW."executionTargetId", TG_TABLE_NAME);
       END IF;
     END IF;
-  ELSIF policy_changed AND NOT wsmp_written_by_this_transaction(OLD.xmin) THEN
+  ELSIF policy_changed AND NOT wsmp_row_created_here(TG_TABLE_NAME, OLD.id) THEN
     IF TG_TABLE_NAME = 'execution_target' THEN
       PERFORM wsmp_require_fence('06:capacity-policy:' || NEW.id, TG_TABLE_NAME);
     ELSIF TG_TABLE_NAME = 'inference_capacity' THEN
@@ -3015,6 +3030,12 @@ BEGIN
         'CREATE TRIGGER z_graph_write_fence BEFORE DELETE ON "user" '
         'FOR EACH ROW EXECUTE FUNCTION enforce_graph_write_fence(%L, %L)', '', '');
     ELSE
+      IF spec.policy <> '' THEN
+        EXECUTE format('DROP TRIGGER IF EXISTS z_graph_created_row ON %I', spec.relation);
+        EXECUTE format(
+          'CREATE TRIGGER z_graph_created_row AFTER INSERT ON %I '
+          'FOR EACH ROW EXECUTE FUNCTION wsmp_record_created_row()', spec.relation);
+      END IF;
       EXECUTE format(
         'CREATE TRIGGER z_graph_write_fence BEFORE INSERT OR DELETE ON %I '
         'FOR EACH ROW EXECUTE FUNCTION enforce_graph_write_fence(%L, %L)',
@@ -3031,5 +3052,7 @@ BEGIN
   END LOOP;
 END;
 $install_graph_write_fences$;
+
+DROP FUNCTION IF EXISTS wsmp_written_by_this_transaction(XID);
 
 COMMIT;

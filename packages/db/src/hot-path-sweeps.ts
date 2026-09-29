@@ -30,6 +30,7 @@ import {
   acquireFences,
   deleteTerminalRelayRequestsWithoutWaiting,
   fences,
+  serverTimeoutSqlState,
 } from "./capacity-lock-order";
 import { isDbShutdownFenceArmed } from "./shutdown-fence";
 import { drainRequesterUsageRollupsBatch } from "./usage-rollup-requester-drain";
@@ -230,10 +231,21 @@ export async function purgeDeletedUserHistory(
       () => deleteOwnedBatch(db, table, "ctid", "ownerUserId", userId, batch),
       batch,
     );
-  processed += await sweepLoop(
-    () => db.$transaction((tx) => drainRequesterUsageRollupsBatch(tx, userId, batch)),
-    batch,
-  );
+  processed += await sweepLoop(async () => {
+    // The merge INSERT can wait on a destination row that a hot finalizer
+    // or compactor holds; a purge (writer class S) does not queue behind
+    // it. The short lock_timeout rolls the whole batch back (source rows
+    // and destination adds stay atomic) and the entry is retried next run.
+    try {
+      return await db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${PURGE_MERGE_LOCK_TIMEOUT_MS}ms`}, true)`;
+        return drainRequesterUsageRollupsBatch(tx, userId, batch);
+      });
+    } catch (error) {
+      if (serverTimeoutSqlState(error) === "55P03") return 0;
+      throw error;
+    }
+  }, batch);
   const [left] = await db.$queryRaw<[{ remaining: boolean }]>`
     SELECT EXISTS (SELECT 1 FROM relay_request WHERE "userId" = ${userId})
         OR EXISTS (SELECT 1 FROM admission_request WHERE "userId" = ${userId})
@@ -248,11 +260,23 @@ export async function purgeDeletedUserHistory(
   return { processed, remaining: left?.remaining ?? true };
 }
 
+/** Bound on the purge's wait for a rollup merge destination held by a hot writer. */
+const PURGE_MERGE_LOCK_TIMEOUT_MS = 100;
+
+/** Most queue entries one {@link purgeDeletedUsersHistory} call examines (a clean entry costs one EXISTS probe). */
+const PURGE_QUEUE_SCAN_LIMIT = 500;
+
 /**
- * Works through the `deleted_user_purge` queue, oldest first, at most
- * `maxUsers` users per call. A user's entry is removed once nothing of theirs
- * is left and {@link DELETED_USER_PURGE_GRACE_MS} has passed since the delete.
- * Queue entries are taken with SKIP LOCKED, so two sweepers split the queue.
+ * Works through the `deleted_user_purge` queue, oldest first. A user's entry
+ * is removed once nothing of theirs is left and
+ * {@link DELETED_USER_PURGE_GRACE_MS} has passed since the delete.
+ *
+ * The queue is read with a `(deletedAt, userId)` keyset cursor, so an entry
+ * that is already clean and only waits out the grace period (or that stays
+ * blocked by PENDING history) never hides the entries behind it. The call
+ * stops after it purged rows of `maxUsers` users, after
+ * {@link PURGE_QUEUE_SCAN_LIMIT} examined entries, or at the end of the queue.
+ * Entries are removed with SKIP LOCKED, so two sweepers split the removal.
  */
 export async function purgeDeletedUsersHistory(
   db: SweepDb,
@@ -263,25 +287,41 @@ export async function purgeDeletedUsersHistory(
     graceMs = DELETED_USER_PURGE_GRACE_MS,
   }: { now: Date; maxUsers?: number; batch?: number; graceMs?: number },
 ): Promise<{ users: number; rows: number; completed: number }> {
-  const queue = await db.$queryRaw<Array<{ userId: string; deletedAt: Date }>>`
-    SELECT "userId", "deletedAt" FROM deleted_user_purge
-     ORDER BY "deletedAt", "userId"
-     LIMIT ${maxUsers}`;
+  const pageSize = Math.max(1, Math.min(maxUsers, 50));
   let rows = 0;
   let completed = 0;
-  for (const entry of queue) {
-    if (isDbShutdownFenceArmed()) break;
-    const { processed, remaining } = await purgeDeletedUserHistory(db, entry.userId, { batch });
-    rows += processed;
-    if (remaining || now.getTime() - entry.deletedAt.getTime() < graceMs) continue;
-    completed += await db.$executeRaw`
-      DELETE FROM deleted_user_purge
-       WHERE "userId" IN (
-         SELECT "userId" FROM deleted_user_purge
-          WHERE "userId" = ${entry.userId}
-            FOR UPDATE SKIP LOCKED)`;
+  let worked = 0;
+  let examined = 0;
+  let cursor: { userId: string; deletedAt: Date } | null = null;
+  while (worked < maxUsers && examined < PURGE_QUEUE_SCAN_LIMIT && !isDbShutdownFenceArmed()) {
+    const page: Array<{ userId: string; deletedAt: Date }> = cursor
+      ? await db.$queryRaw`
+          SELECT "userId", "deletedAt" FROM deleted_user_purge
+           WHERE ("deletedAt", "userId") > (${cursor.deletedAt}, ${cursor.userId})
+           ORDER BY "deletedAt", "userId"
+           LIMIT ${pageSize}`
+      : await db.$queryRaw`
+          SELECT "userId", "deletedAt" FROM deleted_user_purge
+           ORDER BY "deletedAt", "userId"
+           LIMIT ${pageSize}`;
+    for (const entry of page) {
+      if (isDbShutdownFenceArmed() || worked >= maxUsers) break;
+      examined += 1;
+      cursor = entry;
+      const { processed, remaining } = await purgeDeletedUserHistory(db, entry.userId, { batch });
+      rows += processed;
+      if (processed > 0) worked += 1;
+      if (remaining || now.getTime() - entry.deletedAt.getTime() < graceMs) continue;
+      completed += await db.$executeRaw`
+        DELETE FROM deleted_user_purge
+         WHERE "userId" IN (
+           SELECT "userId" FROM deleted_user_purge
+            WHERE "userId" = ${entry.userId}
+              FOR UPDATE SKIP LOCKED)`;
+    }
+    if (page.length < pageSize) break;
   }
-  return { users: queue.length, rows, completed };
+  return { users: examined, rows, completed };
 }
 
 /**

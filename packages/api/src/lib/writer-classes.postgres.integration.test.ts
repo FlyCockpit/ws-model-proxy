@@ -446,6 +446,54 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
           });
         }),
       ).toBe("ok");
+      // Fresh values: the writes above already set 3 and 20.
+      const limit4 = (tx: Tx) =>
+        tx.inferenceCapacity.update({
+          where: { id: local.capacityId },
+          data: { hardConcurrencyLimit: 4 },
+        });
+      const direct21 = (tx: Tx) =>
+        tx.executionTarget.update({ where: { id: local.target.id }, data: { directPriority: 21 } });
+      // An earlier write that needs no fence does not make an existing row
+      // "created by this transaction": the policy write is still refused.
+      expect(
+        await attempt(async (tx) => {
+          await owner(tx);
+          await tx.inferenceCapacity.update({
+            where: { id: local.capacityId },
+            data: { label: `renamed-${suffix}` },
+          });
+          return limit4(tx);
+        }),
+      ).toBe("WMPF4");
+      expect(
+        await attempt(async (tx) => {
+          await owner(tx);
+          await tx.executionTarget.update({
+            where: { id: local.target.id },
+            data: { updatedAt: new Date() },
+          });
+          return direct21(tx);
+        }),
+      ).toBe("WMPF4");
+      // An upsert that lands on an existing row inserts nothing.
+      expect(
+        await attempt(async (tx) => {
+          await owner(tx);
+          await tx.inferenceCapacity.upsert({
+            where: { id: local.capacityId },
+            create: {
+              id: local.capacityId,
+              userId: user.id,
+              label: `upsert-${suffix}`,
+              runtimeIdentityKey: `upsert-${suffix}`,
+              runtimeModel: "upsert",
+            },
+            update: {},
+          });
+          return limit4(tx);
+        }),
+      ).toBe("WMPF4");
     });
 
     it("require both owners' fences for a grant and a cross-owner allowlist entry", async () => {
@@ -753,6 +801,102 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
         maxUsers: 1_000,
       });
       expect(await fixtures.deletedUserPurge.count({ where: { userId: user.id } })).toBe(0);
+    });
+
+    it("reaches later queue entries while clean entries wait out the grace period", async () => {
+      const m = required();
+      const suffix = crypto.randomUUID().slice(0, 8);
+      // More clean entries than one call's maxUsers, all older than the late
+      // user: a queue head that is only waiting out the grace period must not
+      // hide the entries behind it.
+      for (let i = 0; i < 12; i++)
+        await fixtures.deletedUserPurge.create({
+          data: {
+            userId: `hol-done-${i}-${suffix}`,
+            deletedAt: new Date(Date.now() - 2 * 3_600_000),
+          },
+        });
+      const late = `hol-late-${suffix}`;
+      await fixtures.deletedUserPurge.create({
+        data: { userId: late, deletedAt: new Date(Date.now() - 3_600_000) },
+      });
+      await fixtures.capacityRuntime.create({
+        data: { capacityId: `hol-cap-${suffix}`, userId: late },
+      });
+      const purged = await m.sweeps.purgeDeletedUsersHistory(m.prisma, {
+        now: new Date(),
+        maxUsers: 10,
+      });
+      expect(purged.rows).toBeGreaterThanOrEqual(1);
+      expect(await fixtures.capacityRuntime.count({ where: { userId: late } })).toBe(0);
+      // The clean entries stay inside the grace period.
+      expect(
+        await fixtures.deletedUserPurge.count({ where: { userId: { startsWith: "hol-done-" } } }),
+      ).toBeGreaterThanOrEqual(12);
+      await fixtures.deletedUserPurge.deleteMany({ where: { userId: { contains: `-${suffix}` } } });
+    });
+
+    it("purge does not queue behind a busy rollup destination and merges after it frees", async () => {
+      const m = required();
+      const { user: owner, suffix } = await userFixture("purge-busy-owner");
+      const gone = `purge-busy-gone-${suffix}`;
+      const bucketStart = new Date(Math.floor(Date.now() / 60_000) * 60_000);
+      await fixtures.deletedUserPurge.create({ data: { userId: gone } });
+      await fixtures.usageRollupMinute.create({
+        data: {
+          bucketStart,
+          ownerUserId: owner.id,
+          requesterUserId: gone,
+          source: "API_TOKEN",
+          requests: 2,
+        },
+      });
+      await fixtures.usageRollupMinute.create({
+        data: {
+          bucketStart,
+          ownerUserId: owner.id,
+          requesterUserId: "",
+          source: "API_TOKEN",
+          requests: 5,
+        },
+      });
+      let release!: () => void;
+      const mayCommit = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let locked!: () => void;
+      const destinationLocked = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      // A hot finalizer holding the sentinel destination row.
+      const holder = fixtures.$transaction(async (tx) => {
+        await tx.$queryRaw`
+          SELECT 1 FROM usage_rollup_minute
+           WHERE "ownerUserId" = ${owner.id} AND "requesterUserId" = '' FOR UPDATE`;
+        locked();
+        await mayCommit;
+      });
+      try {
+        await destinationLocked;
+        const started = Date.now();
+        const busy = await m.sweeps.purgeDeletedUserHistory(m.prisma, gone, { batch: 10 });
+        expect(Date.now() - started).toBeLessThan(5_000);
+        // Nothing merged, nothing lost: the source row stays for the next run.
+        expect(busy.remaining).toBe(true);
+        expect(await fixtures.usageRollupMinute.count({ where: { requesterUserId: gone } })).toBe(
+          1,
+        );
+      } finally {
+        release();
+        await holder;
+      }
+      const done = await m.sweeps.purgeDeletedUserHistory(m.prisma, gone, { batch: 10 });
+      expect(done.remaining).toBe(false);
+      const merged = await fixtures.usageRollupMinute.findFirstOrThrow({
+        where: { ownerUserId: owner.id, requesterUserId: "" },
+      });
+      expect(merged.requests).toBe(7);
+      await fixtures.deletedUserPurge.deleteMany({ where: { userId: gone } });
     });
 
     it("prunes the scheduler state of deleted capacities", async () => {

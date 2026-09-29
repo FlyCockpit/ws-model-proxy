@@ -690,4 +690,108 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
       ]);
     }
   }, 60_000);
+
+  it("orphan sweep takes the cross-capacity request locks in one sorted statement (no 40P01)", async () => {
+    // The sweep holds the fences of capA and capB (its orphaned request waits
+    // on both). Queued requests r5 (capA, capC) and r2 (capB, capC) are also
+    // reachable by a fill on capC, which locks {r2, r5} sorted. A sweep that
+    // locked capA's set (r5) and then capB's set (r2) as two statements would
+    // close a cycle with that fill. The test side plays the capC fill: it
+    // holds r2, waits until the sweep is queued behind it, then asks for r5.
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const inspector = createFixturePrismaClient(databaseUrl);
+    const side = createFixturePrismaClient(namedUrl(`dl1-sweep-side-${suffix}`));
+    let sweepAttempts = 0;
+    const sweepClient = new Proxy(createFixturePrismaClient(namedUrl(`dl1-sweep-${suffix}`)), {
+      get(target, property) {
+        const value = Reflect.get(target, property);
+        if (property !== "$transaction" || typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          sweepAttempts += 1;
+          return Reflect.apply(value, target, args);
+        };
+      },
+    }) as Client;
+    const live = await fixtures.user.create({
+      data: { name: "sweep order", email: `dl1-sweep-${suffix}@example.test` },
+    });
+    const ids = {
+      orphan: `a-orphan-${suffix}`,
+      r2: `b-r2-${suffix}`,
+      r5: `b-r5-${suffix}`,
+    };
+    const caps = { a: `capA-${suffix}`, b: `capB-${suffix}`, c: `capC-${suffix}` };
+    const seed = async (id: string, userId: string, capacityIds: string[], sequence: number) => {
+      await fixtures.admissionRequest.create({
+        data: {
+          id,
+          userId,
+          requestId: id,
+          attemptId: id,
+          sourceKind: "POOL",
+          poolId: `pool-${id}`,
+          basePriority: 16,
+          enqueueSequence: sequence,
+          connectionOwner: id,
+          heartbeatAt: new Date(),
+          state: "WAITING",
+          deadlineAt: new Date(Date.now() + 600_000),
+        },
+      });
+      for (const [order, capacityId] of capacityIds.entries())
+        await fixtures.capacityWaiter.create({
+          data: {
+            userId,
+            admissionRequestId: id,
+            requestId: id,
+            attemptId: id,
+            capacityId,
+            executionTargetId: `target-${capacityId}`,
+            candidateOrder: order,
+            poolId: `pool-${id}`,
+            poolMemberId: `member-${id}-${order}`,
+            effectiveConcurrencyScope: "POOL",
+            effectiveConcurrencyScopeId: `pool-${id}`,
+            state: "WAITING",
+          },
+        });
+    };
+    try {
+      // The orphan's owner row does not exist: the sweep cancels its waiters.
+      await seed(ids.orphan, `gone-${suffix}`, [caps.a, caps.b], 1);
+      await seed(ids.r5, live.id, [caps.a, caps.c], 2);
+      await seed(ids.r2, live.id, [caps.b, caps.c], 3);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(sweepClient, `dl1-sweep-${suffix}`);
+      let sweep: Promise<number> | undefined;
+      const sideOutcome = side.$transaction(async (tx) => {
+        await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
+        const pid = await backendPid(tx);
+        await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${ids.r2} FOR UPDATE`;
+        sweep = store.sweepOrphans({ limit: 1 });
+        await waitUntilBlockedBy(inspector, pid);
+        // The capC fill's second row. Cyclic with a per-capacity sweep.
+        await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${ids.r5} FOR UPDATE`;
+      });
+      await expect(sideOutcome).resolves.toBeUndefined();
+      expect(await sweep).toBe(1);
+      expect(sweepAttempts).toBe(1);
+      expect(
+        (await fixtures.admissionRequest.findUniqueOrThrow({ where: { id: ids.orphan } })).state,
+      ).toBe("CANCELLED");
+    } finally {
+      await Promise.allSettled([
+        fixtures.admissionRequest.deleteMany({ where: { id: { in: Object.values(ids) } } }),
+      ]);
+      await fixtures.user.deleteMany({ where: { id: live.id } });
+      await Promise.all([
+        fixtures.$disconnect(),
+        inspector.$disconnect(),
+        side.$disconnect(),
+        sweepClient.$disconnect(),
+      ]);
+    }
+  }, 60_000);
 });

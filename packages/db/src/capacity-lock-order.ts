@@ -46,7 +46,14 @@
  *   never writes an H table.
  * - S (sweepers): retention, purge of deleted users' history, orphan
  *   terminalization. Row locks with SKIP LOCKED and fences with
- *   `{ wait: false }` only: an S transaction never waits on a lock.
+ *   `{ wait: false }` only: an S transaction never waits on a fence or a
+ *   graph row. The orphan sweep's refill step is the one exception: after
+ *   it holds its fences it takes the cross-capacity `admission_request` set
+ *   with the H order (one sorted statement, {@link lockCrossCapacityAdmissionRequests}),
+ *   which may wait on an H transaction that follows the same order.
+ *   The deleted-user purge's rollup merge can wait on a destination row a hot
+ *   writer holds, for at most `lock_timeout` 100 ms; the batch then rolls back
+ *   and the entry is retried on the next run.
  * - D (deploy DDL): schema-hardening.sql takes every table in one up-front
  *   `LOCK TABLE ... NOWAIT` and is retried; `prisma db push` runs with a
  *   `lock_timeout` (packages/db/scripts/push-schema.mjs).
@@ -80,8 +87,9 @@
  *    parties of a pool grant; the token owner and the referenced resource's
  *    owner of an allowlist entry), or a policy UPDATE runs without the
  *    `capacity-policy` / `capacity` fence of the rows whose admission view it
- *    changes. A row created by the same transaction needs no policy fence
- *    (no other transaction can see it). A forgotten fence fails
+ *    changes. A row INSERTED by the same transaction (recorded by an AFTER
+ *    INSERT trigger; an earlier update of an existing row does not count)
+ *    needs no policy fence (no other transaction can see it). A forgotten fence fails
  *    deterministically in tests instead of deadlocking in production.
  * 3. The catalog test finds no foreign key between an H table and a graph
  *    table (`pg_constraint`, either direction).
@@ -103,7 +111,7 @@
  *   transactions (which share an `owner` fence with it whenever they write a
  *   common row, so they run one after the other) or by H/auxiliary writers
  *   that hold nothing else of M's and take graph rows in the same order.
- * - S never waits.
+ * - S never waits on a fence or graph row (see the S entry above for the orphan refill's H-ordered request lock).
  * - So a wait-for cycle that contains an admission consists of H
  *   transactions only, and their order is the admission-internal order below
  *   (one file, PostgreSQL-tested).

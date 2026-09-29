@@ -1513,9 +1513,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
    * user leaves its live admission rows behind. This sweep cancels every
    * WAITING waiter whose parent is gone (the request with it once no live
    * waiter is left) and releases every ACTIVE lease whose capacity or target
-   * is gone, then refills the capacity. It never waits: it takes each
+   * is gone, then refills the capacity. It never waits on a fence: it takes each
    * request's capacity fences with `{ wait: false }` and passes a busy one to
-   * the next run, and it takes rows only under those fences. Returns the
+   * the next run. Under those fences it takes the cross-capacity request set
+   * in ONE sorted statement (as acquire does), so it can wait only on an
+   * H transaction that follows the same order. Returns the
    * number of requests and leases it terminalized.
    */
   async sweepOrphans({ limit }: { limit: number }): Promise<number> {
@@ -1612,10 +1614,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           }
         }
         // A cancelled waiter or released lease can free a slot for another
-        // waiter on the same capacity; the cross-capacity request locks come
-        // after the fences, as in release.
+        // waiter on the same capacity. The cross-capacity request locks are
+        // taken ONCE, in one sorted statement, for every capacity this
+        // transaction fenced (the same contract as acquire): locking them one
+        // capacity at a time would interleave with another admitter's single
+        // sorted statement and deadlock on admission_request.
+        if (touched.size > 0) await lockCrossCapacityAdmissionRequests(tx, capacities);
         for (const capacityId of [...touched].sort()) {
-          await lockCrossCapacityAdmissionRequests(tx, [capacityId]);
           await this.#admitCapacity(tx, capacityId, now, projections);
         }
         return { count, capacities: [...touched], projections };
