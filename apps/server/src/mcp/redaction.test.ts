@@ -178,7 +178,7 @@ describe("redactSecrets — key-fragment matrix", () => {
       }),
     ).toEqual({ secretFile: false });
     for (const value of [
-      "ANTHROPIC_API_KEY=sk-live-M29-SENTINEL",
+      "M29-SENTINEL-STRING",
       { nested: "M29-SENTINEL" },
       ["M29-SENTINEL"],
       0,
