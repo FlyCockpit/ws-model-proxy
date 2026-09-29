@@ -350,13 +350,13 @@ fn context_lines_that_are_not_utf8_still_advance_the_masking_state() {
     let fx = Fx::new();
     fx.put(
         "latin1.txt",
-        b"X_TOKEN=\"caf\xe9 opens\nsecond-line-secret\"\nB=1\n",
+        b"X_TOKEN=\"v\xe9 opens\nsecond-line-secret\"\nB=1\n",
     );
     let r = fx.read_with(json!({ "path": fx.p("latin1.txt"), "startLine": 2 }));
     assert!(!r.text.contains("second-line-secret"), "{}", r.text);
     fx.put(
         "app.env",
-        b"NOTE=\"caf\xe9 opens\nsecond-env-secret\"\nB=1\n",
+        b"NOTE=\"v\xe9 opens\nsecond-env-secret\"\nB=1\n",
     );
     let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 2 }));
     assert!(!r.text.contains("second-env-secret"), "{}", r.text);
@@ -369,7 +369,7 @@ fn context_lines_that_are_not_utf8_still_advance_the_masking_state() {
     );
     let key = pem("RSA PRIVATE KEY", "MIIEsecretbase64\n");
     let (first, rest) = key.split_once('\n').unwrap();
-    let mut bytes = b"# caf\xe9 ".to_vec();
+    let mut bytes = b"# v\xe9 ".to_vec();
     bytes.extend_from_slice(first.as_bytes());
     bytes.push(b'\n');
     bytes.extend_from_slice(rest.as_bytes());
