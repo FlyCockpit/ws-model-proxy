@@ -476,6 +476,8 @@ function poolMemberRow({
   countStrategy,
   externalAfterWaitMs = 2_000,
   cacheHolderWaitMs = null,
+  engineKind = null,
+  kvBudgetTokens = null,
 }: {
   id: string;
   discoveredModelId: string;
@@ -498,6 +500,8 @@ function poolMemberRow({
   countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
   externalAfterWaitMs?: number;
   cacheHolderWaitMs?: number | null;
+  engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
+  kvBudgetTokens?: number | null;
 }) {
   return {
     id,
@@ -539,7 +543,11 @@ function poolMemberRow({
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
       InferenceCapacity:
-        physicalMaxContext === undefined && !affinityEnabled && countStrategy === undefined
+        physicalMaxContext === undefined &&
+        !affinityEnabled &&
+        countStrategy === undefined &&
+        engineKind === null &&
+        kvBudgetTokens === null
           ? null
           : {
               id: `${id}-capacity`,
@@ -555,6 +563,8 @@ function poolMemberRow({
               templateVersion: "1",
               engine: "engine",
               cacheNamespace: "cache",
+              engineKind,
+              kvBudgetTokens,
             },
       DiscoveredModel: null,
     },
@@ -1293,7 +1303,10 @@ describe("model API routes", () => {
   });
 
   describe("S-C: warm-session protection (redirect-only)", () => {
-    const members = (count = 2) =>
+    const members = (
+      count = 2,
+      facts: Pick<Parameters<typeof poolMemberRow>[0], "engineKind" | "kvBudgetTokens"> = {},
+    ) =>
       ["a", "b", "c"].slice(0, count).map((suffix) =>
         poolMemberRow({
           id: `member-${suffix}`,
@@ -1301,6 +1314,7 @@ describe("model API routes", () => {
           upstreamModelId: `upstream-${suffix}`,
           cliDeviceId: `cli-${suffix}`,
           affinityEnabled: true,
+          ...facts,
         }),
       );
     /** Affinity ran; `affineA` gives member A a continuation prefix hit. */
@@ -1443,6 +1457,68 @@ describe("model API routes", () => {
           capacityIds: ["member-a-capacity", "member-b-capacity"],
         }),
       );
+    });
+
+    /** Member order of the first local admission round (A first = A is not deprioritized). */
+    const firstRound = async (
+      facts: Parameters<typeof members>[1],
+      states: Parameters<typeof kvPools>[0] = { a: "PROTECTED", b: "FREE" },
+      ageSeconds: Parameters<typeof kvPools>[1] = {},
+    ) => {
+      db.poolMember.findMany.mockResolvedValue(members(2, facts));
+      kvPools(states, ageSeconds);
+      const { acquire, runtime } = scripted(["member-a"]);
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+      expect(response.status).toBe(200);
+      return rounds(acquire)[0]?.map(({ member }) => member);
+    };
+
+    it("token mode: the capacity's reported KV budget decides PROTECTED (K known)", async () => {
+      // Member A: 3 active + one 20k warm session. Slot mode: the idle slot is
+      // protected. Token mode with room (20k + request < 90% of 100k): FREE.
+      expect(await firstRound({ engineKind: "VLLM", kvBudgetTokens: 100_000 })).toEqual([
+        "member-a",
+        "member-b",
+      ]);
+    });
+
+    it("token mode: a KV budget without room protects the member", async () => {
+      expect(await firstRound({ engineKind: "SGLANG", kvBudgetTokens: 20_000 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+    });
+
+    it("slot mode when the capacity reports no KV budget", async () => {
+      expect(await firstRound({ engineKind: "VLLM", kvBudgetTokens: null })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+      expect(await firstRound({})).toEqual(["member-b", "member-a"]);
+    });
+
+    it("llama.cpp is slot-based even when a KV budget is reported", async () => {
+      expect(await firstRound({ engineKind: "LLAMA_CPP", kvBudgetTokens: 100_000 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+    });
+
+    it("llama.cpp protects a warm session for a smaller window than other engines", async () => {
+      // 200 s old: inside the pool's 300 s window, outside llama.cpp's 150 s.
+      const old = { a: 200 };
+      expect(await firstRound({ engineKind: "LLAMA_CPP" }, undefined, old)).toEqual([
+        "member-a",
+        "member-b",
+      ]);
+      expect(await firstRound({ engineKind: "VLLM" }, undefined, old)).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+      expect(await firstRound({ engineKind: "LLAMA_CPP" }, undefined, { a: 100 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
     });
 
     it.each([

@@ -2,8 +2,16 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
-const { assessWarmProtection, memberProtectionVerdict, protectedWarmSessions, protectionRouting } =
-  await import("./warm-protection.js");
+const {
+  LLAMA_CPP_WINDOW_FACTOR,
+  assessWarmProtection,
+  memberProtectionVerdict,
+  protectedWarmSessions,
+  protectionKvBudgetTokens,
+  protectionRouting,
+  protectionWindowSecondsFor,
+} = await import("./warm-protection.js");
+type ProtectionEngineKind = import("./warm-protection.js").ProtectionEngineKind;
 type WarmSession = import("./warm-protection.js").WarmSession;
 type WarmProtectionPolicy = import("./warm-protection.js").WarmProtectionPolicy;
 type ProtectionVerdict = import("./warm-protection.js").ProtectionVerdict;
@@ -409,5 +417,146 @@ describe("S-C assessment", () => {
     });
     expect(verdicts.size).toBe(0);
     expect(load).not.toHaveBeenCalled();
+  });
+});
+
+describe("S-C engine facts (token mode and the llama.cpp window)", () => {
+  it.each([
+    ["VLLM", 100_000, 100_000],
+    ["SGLANG", 100_000, 100_000],
+    ["GENERIC", 100_000, 100_000],
+    [null, 100_000, 100_000],
+    [undefined, 100_000, 100_000],
+    ["LLAMA_CPP", 100_000, null],
+    ["VLLM", null, null],
+    ["VLLM", 0, null],
+    ["VLLM", -5, null],
+  ] as const)("%s with K=%s uses K=%s", (engineKind, reported, used) => {
+    expect(protectionKvBudgetTokens(engineKind, reported)).toBe(used);
+  });
+
+  it.each([
+    ["LLAMA_CPP", 300, 150],
+    ["LLAMA_CPP", 1, 1],
+    ["LLAMA_CPP", 3, 1],
+    ["VLLM", 300, 300],
+    ["OLLAMA", 300, 300],
+    ["GENERIC", 300, 300],
+    [null, 300, 300],
+  ] as const)("%s window %s s is %s s", (engineKind, windowSeconds, expected) => {
+    expect(protectionWindowSecondsFor(windowSeconds, engineKind)).toBe(expected);
+  });
+
+  it("pins the llama.cpp factor", () => {
+    expect(LLAMA_CPP_WINDOW_FACTOR).toBe(0.5);
+  });
+
+  const assess = async ({
+    engineKind,
+    kvBudgetTokens,
+    ageSeconds = 30,
+    tokens = 20_000,
+    requestTokens = 100,
+  }: {
+    engineKind?: ProtectionEngineKind | null;
+    kvBudgetTokens: number | null;
+    ageSeconds?: number;
+    tokens?: number;
+    requestTokens?: number;
+  }) => {
+    const verdicts = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy(),
+      members: [
+        {
+          poolMemberId: "a",
+          capacityId: "cap-a",
+          slots: 4,
+          kvBudgetTokens,
+          ...(engineKind === undefined ? {} : { engineKind }),
+          affine: false,
+          requestTokens,
+        },
+      ],
+      // Three active leases: the one idle slot holds the warm session (slot mode: PROTECTED).
+      source: {
+        load: async () => ({
+          activeByCapacity: new Map([["cap-a", 3]]),
+          sessionsByCapacity: new Map([["cap-a", [session("alice", ageSeconds, tokens)]]]),
+        }),
+      },
+    });
+    return verdicts.get("a")!.state;
+  };
+
+  it("slot mode when no KV budget is reported", async () => {
+    expect(await assess({ engineKind: "VLLM", kvBudgetTokens: null })).toBe("PROTECTED");
+  });
+
+  it("token mode: a reported budget with room left is FREE, one without room is PROTECTED", async () => {
+    // 20k warm + 100 < 90% of 100k: room; slot mode would say PROTECTED.
+    expect(await assess({ engineKind: "VLLM", kvBudgetTokens: 100_000 })).toBe("FREE");
+    // 20k warm + 100 > 90% of 20k: no room.
+    expect(await assess({ engineKind: "SGLANG", kvBudgetTokens: 20_000 })).toBe("PROTECTED");
+    // The request's own size counts: 20k + 80k > 90% of 100k.
+    expect(
+      await assess({ engineKind: "VLLM", kvBudgetTokens: 100_000, requestTokens: 80_000 }),
+    ).toBe("PROTECTED");
+  });
+
+  it("llama.cpp ignores a reported KV budget and stays slot-based", async () => {
+    expect(await assess({ engineKind: "LLAMA_CPP", kvBudgetTokens: 100_000 })).toBe("PROTECTED");
+  });
+
+  it("llama.cpp protects sessions for a shorter window than other engines", async () => {
+    // 200 s old: inside the 300 s pool window, outside llama.cpp's 150 s.
+    expect(await assess({ engineKind: "LLAMA_CPP", kvBudgetTokens: null, ageSeconds: 200 })).toBe(
+      "FREE",
+    );
+    expect(await assess({ engineKind: "VLLM", kvBudgetTokens: null, ageSeconds: 200 })).toBe(
+      "PROTECTED",
+    );
+    expect(await assess({ engineKind: null, kvBudgetTokens: null, ageSeconds: 200 })).toBe(
+      "PROTECTED",
+    );
+    // Inside llama.cpp's window it is protected like any other engine.
+    expect(await assess({ engineKind: "LLAMA_CPP", kvBudgetTokens: null, ageSeconds: 100 })).toBe(
+      "PROTECTED",
+    );
+  });
+
+  it("asks the source for the pool's full window, not the shortened one", async () => {
+    const load = vi.fn(async () => ({
+      activeByCapacity: new Map<string, number>(),
+      sessionsByCapacity: new Map<string, readonly WarmSession[]>(),
+    }));
+    await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy(),
+      members: [
+        {
+          poolMemberId: "a",
+          capacityId: "cap-a",
+          slots: 4,
+          kvBudgetTokens: null,
+          engineKind: "LLAMA_CPP",
+          affine: false,
+          requestTokens: 1,
+        },
+        {
+          poolMemberId: "b",
+          capacityId: "cap-b",
+          slots: 4,
+          kvBudgetTokens: null,
+          engineKind: "VLLM",
+          affine: false,
+          requestTokens: 1,
+        },
+      ],
+      source: { load },
+    });
+    expect(load).toHaveBeenCalledWith(
+      expect.objectContaining({ policy: expect.objectContaining({ windowSeconds: 300 }) }),
+    );
   });
 });

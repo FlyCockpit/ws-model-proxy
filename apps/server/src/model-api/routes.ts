@@ -715,6 +715,8 @@ const inferenceCapacityRelaySelect = {
   templateVersion: true,
   engine: true,
   cacheNamespace: true,
+  engineKind: true,
+  kvBudgetTokens: true,
 } satisfies Prisma.InferenceCapacitySelect;
 
 const relayEndpointSelect = {
@@ -5742,9 +5744,11 @@ async function relayPool({
               poolMemberId,
               capacityId: capacity.id,
               slots: capacity.hardConcurrencyLimit,
-              // Token mode needs the engine KV budget (protocol 2.7, #70);
-              // until it is reported every member uses slot mode.
-              kvBudgetTokens: null,
+              // Token mode uses the engine KV budget (protocol 2.7) when the
+              // engine reports one; llama.cpp stays slot-based with a
+              // smaller window (assessWarmProtection).
+              kvBudgetTokens: capacity.kvBudgetTokens,
+              engineKind: capacity.engineKind,
               affine: affineMember(poolMemberId),
               requestTokens:
                 (nativeCounts.get(poolMemberId) ?? operation.contextCount)?.tokens ?? 0,

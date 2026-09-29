@@ -191,10 +191,14 @@ For each request, every local member that has no affinity hit for it is:
 
 - **full** when all its slots are busy;
 - **protected** when it is not full but every idle slot holds a protected
-  session of someone else (slot mode; token mode, which compares the protected
-  tokens plus the request with the engine's KV budget, needs engine facts from
-  protocol 2.7);
+  session of someone else (slot mode), or, when the engine reports its KV
+  budget (vLLM, SGLang: protocol 2.7 engine facts), when the protected tokens
+  plus the request exceed 90% of that budget (token mode);
 - **free** otherwise.
+
+llama.cpp is always slot mode, and its sessions are protected for half the
+pool's window: it restores evicted slot prompts from host RAM, so evicting
+one there is cheap.
 
 Then:
 

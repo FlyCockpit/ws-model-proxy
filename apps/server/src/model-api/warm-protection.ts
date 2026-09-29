@@ -25,6 +25,46 @@ export const PROTECTION_KV_HEADROOM = 0.1;
  */
 export const WARM_SESSION_QUERY_LIMIT = 2_000;
 
+/**
+ * llama.cpp restores evicted slot prompts from host RAM (`--cache-ram`), so
+ * evicting a warm session there is cheap: protection is slot-based (its KV
+ * budget is never used) and uses this fraction of the pool's window.
+ */
+export const LLAMA_CPP_WINDOW_FACTOR = 0.5;
+
+/** Prisma `EngineKind` values (what `InferenceCapacity.engineKind` stores). */
+export type ProtectionEngineKind =
+  | "GENERIC"
+  | "LLAMA_CPP"
+  | "VLLM"
+  | "SGLANG"
+  | "OLLAMA"
+  | "LM_STUDIO";
+
+/**
+ * The KV budget token mode may use: the reported one (vLLM, SGLang), never
+ * llama.cpp's (slot-based), and none when unknown or not positive.
+ */
+export function protectionKvBudgetTokens(
+  engineKind: ProtectionEngineKind | null | undefined,
+  kvBudgetTokens: number | null | undefined,
+): number | null {
+  if (engineKind === "LLAMA_CPP") return null;
+  return kvBudgetTokens !== null && kvBudgetTokens !== undefined && kvBudgetTokens > 0
+    ? kvBudgetTokens
+    : null;
+}
+
+/** The window one member's warm sessions are protected for (seconds, at least 1). */
+export function protectionWindowSecondsFor(
+  windowSeconds: number,
+  engineKind: ProtectionEngineKind | null | undefined,
+): number {
+  return engineKind === "LLAMA_CPP"
+    ? Math.max(1, Math.floor(windowSeconds * LLAMA_CPP_WINDOW_FACTOR))
+    : windowSeconds;
+}
+
 export type ProtectionShareMode = "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
 
 export type WarmProtectionPolicy = {
@@ -383,10 +423,12 @@ export type ProtectionMemberInput = {
   /** Concurrency cap of the member's KV pool (`hardConcurrencyLimit`). */
   slots: number | null;
   /**
-   * KV budget in tokens. Engine facts (protocol 2.7, issue #70) supply it;
-   * until then every member is assessed in slot mode (null).
+   * The capacity's reported KV budget in tokens (engine facts, protocol 2.7).
+   * Null selects slot mode; llama.cpp is always slot mode.
    */
   kvBudgetTokens: number | null;
+  /** The capacity's engine (null = unreported): llama.cpp gets a smaller window. */
+  engineKind?: ProtectionEngineKind | null;
   affine: boolean;
   /** This request's prompt estimate r for the member. */
   requestTokens: number;
@@ -412,12 +454,16 @@ export async function assessWarmProtection({
     const load: CapacityLoad = {
       slots: member.slots,
       active: snapshot.activeByCapacity.get(member.capacityId) ?? 0,
-      kvBudgetTokens: member.kvBudgetTokens,
+      kvBudgetTokens: protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
     };
     const protectedSessions = protectedWarmSessions(
       snapshot.sessionsByCapacity.get(member.capacityId) ?? [],
       load,
-      policy,
+      // The query reads the pool's window; a member's engine may shorten it.
+      {
+        ...policy,
+        windowSeconds: protectionWindowSecondsFor(policy.windowSeconds, member.engineKind),
+      },
     );
     verdicts.set(
       member.poolMemberId,
