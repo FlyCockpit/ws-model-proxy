@@ -564,20 +564,22 @@ function poolMemberOutcomeFence(trialStartedAt: Date | null, now: Date) {
 export async function recordPoolMemberRelayFailure({
   poolMemberId,
   failure,
-  trialStartedAt = null,
+  trialStartedAt,
   now = new Date(),
 }: {
   poolMemberId: string;
   failure: RelayFailureClass;
   /** The half-open trial claim this attempt holds, if any (see the fence). */
-  trialStartedAt?: Date | null;
+  trialStartedAt: Date | null;
   now?: Date;
 }): Promise<{ retryable: boolean; update: PoolMemberHealthUpdate | null }> {
   const failureClass = poolMemberFailureClassForRelayFailure(failure);
   if (!failureClass) return { retryable: false, update: null };
 
   // Read-modify-write, versioned on the fields the transition reads: a
-  // concurrent writer makes the update match 0 rows and we re-read.
+  // concurrent writer makes the update match 0 rows and we re-read (bounded to
+  // 3 rounds; a writer that loses all of them implies >= 3 committed failures,
+  // so the member is already UNHEALTHY).
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const member = await prisma.poolMember.findUnique({
       where: { id: poolMemberId },
@@ -622,7 +624,7 @@ export async function recordPoolMemberRelayFailure({
 
 export async function markPoolMemberRelaySuccess(
   poolMemberId: string,
-  { trialStartedAt = null, now = new Date() }: { trialStartedAt?: Date | null; now?: Date } = {},
+  { trialStartedAt, now = new Date() }: { trialStartedAt: Date | null; now?: Date },
 ): Promise<void> {
   await prisma.poolMember.updateMany({
     where: { id: poolMemberId, ...poolMemberOutcomeFence(trialStartedAt, now) },

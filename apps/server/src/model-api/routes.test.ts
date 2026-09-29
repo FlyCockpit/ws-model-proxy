@@ -8345,6 +8345,66 @@ describe("model API routes", () => {
       }
     });
 
+    // #120: the served-success finalizer and the precommit-5xx site pass the
+    // attempt's own claim to the (owner-fenced) outcome writers.
+    it.each([
+      ["a served success", 200, { healthStatus: "HEALTHY" }],
+      ["a precommit 5xx", 500, { healthStatus: "UNHEALTHY" }],
+    ])("%s carries the attempt's own trial claim", async (_name, status, outcome) => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      const claimDate = () =>
+        writes().find((write) => write.data.halfOpenTrialStartedAt instanceof Date)?.data
+          .halfOpenTrialStartedAt as Date;
+      db.poolMember.findUnique.mockImplementation(async () => ({
+        healthStatus: "HALF_OPEN",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: claimDate(),
+      }));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, status, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(sent.requestId);
+      await Promise.resolve(responsePromise).then((response) => response.text().catch(() => ""));
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.healthStatus === outcome.healthStatus)).toBe(
+          true,
+        ),
+      );
+      const outcomeWrite = writes().find(
+        (write) => write.data.healthStatus === outcome.healthStatus,
+      );
+      expect(outcomeWrite?.where).toMatchObject({
+        id: "member-a",
+        healthStatus: "HALF_OPEN",
+        halfOpenTrialStartedAt: claimDate(),
+      });
+    });
+
     // #120: an expired trial lease is routable again and the claim itself
     // carries the expiry clause (deterministic clock: Date only is faked).
     it("re-claims a half-open trial whose lease expired", async () => {

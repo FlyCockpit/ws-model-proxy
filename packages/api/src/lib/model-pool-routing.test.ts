@@ -412,7 +412,7 @@ describe("modelPoolRouting", () => {
   it("resets health on success and fresh inventory without changing routing status", async () => {
     db.poolMember.updateMany.mockResolvedValue({ count: 2 });
 
-    await markPoolMemberRelaySuccess("member-id", { now });
+    await markPoolMemberRelaySuccess("member-id", { trialStartedAt: null, now });
     await resetPoolMemberHealthForDiscoveredModels(["model-a", "model-b"]);
 
     // A non-claimant success never clears a live trial (owner fence).
@@ -460,6 +460,7 @@ describe("modelPoolRouting", () => {
     const result = await recordPoolMemberRelayFailure({
       poolMemberId: "member-id",
       failure: "timeout",
+      trialStartedAt: null,
       now,
     });
     await markPoolMembersForCliUnavailable({
@@ -522,6 +523,7 @@ describe("modelPoolRouting", () => {
     const result = await recordPoolMemberRelayFailure({
       poolMemberId: "member-id",
       failure: "timeout",
+      trialStartedAt: null,
       now,
       ...options,
     });
@@ -544,6 +546,7 @@ describe("modelPoolRouting", () => {
     const result = await recordPoolMemberRelayFailure({
       poolMemberId: "member-id",
       failure: "timeout",
+      trialStartedAt: null,
       now,
     });
     expect(result.update).not.toBeNull();
