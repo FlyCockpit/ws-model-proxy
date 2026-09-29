@@ -533,6 +533,7 @@ fn read_large(
 }
 
 /// The last `count` lines of a huge file, without line numbers.
+#[allow(clippy::too_many_arguments)]
 fn tail_window(
     file: &std::fs::File,
     stat: &Stat,
