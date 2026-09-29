@@ -166,6 +166,8 @@ pub(crate) fn replace(
 /// Elsewhere (and on filesystems without exchange) a plain rename is used and the
 /// re-check above is the only guard: a documented residual.
 fn commit_stage(dir: &OwnedFd, stage: &OsStr, name: &OsStr, orig_stat: &Stat) -> FileResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = orig_stat;
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{RenameFlags, renameat2};
