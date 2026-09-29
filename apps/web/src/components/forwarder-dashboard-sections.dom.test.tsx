@@ -223,6 +223,7 @@ const editablePool = {
   capacityContextCeiling: 32_768,
   capacityContextMargin: 1_024,
   capacityBorrowPolicy: "WHEN_IDLE" as const,
+  cacheHolderWaitMs: null as number | null,
   affinity: {
     enabled: false,
     ttlSeconds: 3600,
@@ -589,6 +590,73 @@ describe("PoolForm affinity defaults", () => {
     expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: false });
   });
 
+  it("saves the cache-holder wait as automatic (null) or a fixed value (0 = off)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const mode = screen.getByLabelText(
+      "dashboard:pools.affinity.fields.cacheHolderWaitMs",
+    ) as HTMLSelectElement;
+    expect(mode.value).toBe("AUTO");
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ cacheHolderWaitMs: null });
+
+    fireEvent.change(mode, { target: { value: "FIXED" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.affinity.cacheHolderWait.valueLabel"), {
+      target: { value: "0" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(2));
+    expect(state.mutationPayloads[1]?.input).toMatchObject({ cacheHolderWaitMs: 0 });
+  });
+
+  it("loads a stored fixed cache-holder wait", () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, cacheHolderWaitMs: 1_500 },
+    });
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.fields.cacheHolderWaitMs",
+        ) as HTMLSelectElement
+      ).value,
+    ).toBe("FIXED");
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.cacheHolderWait.valueLabel",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("1500");
+  });
+
+  it("keeps a stored cache-holder wait of 0 (off) as a fixed value on save", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, cacheHolderWaitMs: 0 },
+    });
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.fields.cacheHolderWaitMs",
+        ) as HTMLSelectElement
+      ).value,
+    ).toBe("FIXED");
+    expect(
+      (
+        screen.getByLabelText(
+          "dashboard:pools.affinity.cacheHolderWait.valueLabel",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("0");
+    // Saving another routing field must not silently turn "off" into automatic.
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ cacheHolderWaitMs: 0 });
+  });
+
   it("loads the stored affinity value in edit mode", () => {
     // editablePool stores affinity disabled; the edit form must keep it off
     // instead of falling back to the create-mode ON default.
@@ -717,6 +785,30 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
       expect(toast.warning).toHaveBeenCalledWith(
         `dashboard:models.capabilityImpact|${JSON.stringify({ slugs: "alpha" })}`,
       ),
+    );
+  });
+
+  it("flags a device whose CLI must be upgraded for the relay protocol", () => {
+    state.cliDevices = [
+      {
+        ...cliDeviceWithModel,
+        upgradeRequired: {
+          protocolVersion: "2.6",
+          cliVersion: "0.4.0",
+          rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+        },
+      },
+      { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", upgradeRequired: null },
+    ];
+    mountModelsSection();
+
+    const badges = screen.getAllByText(/^dashboard:clis\.upgradeRequired\|/);
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.textContent).toBe(
+      `dashboard:clis.upgradeRequired|${JSON.stringify({ protocol: "2.6" })}`,
+    );
+    expect(screen.getByText(/^dashboard:clis\.upgradeRequiredDetail\|/).textContent).toContain(
+      '"version":"0.4.0"',
     );
   });
 

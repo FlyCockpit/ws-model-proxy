@@ -582,6 +582,16 @@ describe("public overflow compatibility", () => {
     const envelope = encryptProviderCredential("provider-secret", identity, keyring);
     const order: string[] = [];
     const tx = {
+      $executeRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join("?");
+        // C1b-6: `is_local = true` keeps the timeout inside the claim; a
+        // session-level setting would outlive it on the pooled connection.
+        const scope = /,\s*true\s*\)\s*$/.test(sql) ? "local" : "session";
+        order.push(
+          `set:${sql.includes("set_config('lock_timeout'") ? "lock_timeout" : "?"}=${String(values[0])}:${scope}`,
+        );
+        return 0;
+      }),
       $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
         if (strings.join("").includes('AS "requesterValid"'))
           return mockRequesterValidityQuery(strings, values, tx);
@@ -668,6 +678,9 @@ describe("public overflow compatibility", () => {
     // under those locks, then the provider account/credential lifecycle locks,
     // the durable claim, and commit, all before any network I/O.
     expect(order).toEqual([
+      // L1b: the first statement bounds every lock wait of the claim
+      // (transaction-local, so it ends with the claim).
+      "set:lock_timeout=2000ms:local",
       "lock:model_pool FOR SHARE",
       "lock:pool_grant FOR SHARE",
       "lock:model_api_token FOR SHARE",
@@ -678,10 +691,14 @@ describe("public overflow compatibility", () => {
       "read:consent",
       "read:consent",
       "lock:provider_account FOR UPDATE",
+      "lock:provider_model FOR SHARE",
       "lock:provider_credential FOR UPDATE",
       // Time and the (unlocked) account row, re-read after the last wait.
       "read:consent",
       "read:account",
+      // The listed target (provider model, pool member), after consent.
+      "read:target",
+      "read:target",
       "durable-claim",
       "commit",
       "network-may-start",
@@ -727,6 +744,7 @@ describe("public overflow compatibility", () => {
     async (_label, change, reason) => {
       const order: string[] = [];
       const tx = {
+        $executeRaw: vi.fn(async () => 0),
         $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
           if (strings.join("").includes('AS "requesterValid"'))
             return mockRequesterValidityQuery(strings, values, tx);
@@ -755,6 +773,103 @@ describe("public overflow compatibility", () => {
 
       expect(claim).toEqual({ claimed: false, reason });
       expect(order.filter((step) => step.startsWith("lock:provider"))).toEqual([]);
+      expect(tx.providerCredential.update).not.toHaveBeenCalled();
+    },
+  );
+
+  // #64 decision: the listed target is re-read after the last lock wait. A
+  // removed or disabled member, a disabled or replaced provider model, or a
+  // changed endpoint version is refused before the durable claim.
+  it.each([
+    ["the member was removed or disabled", { member: null }, false, "PROVIDER_UNAVAILABLE"],
+    [
+      "the member was removed (stored-response binding)",
+      { member: null },
+      true,
+      "BOUND_TARGET_INVALID",
+    ],
+    [
+      "the provider model is gone or its endpoint changed",
+      { model: null },
+      false,
+      "PROVIDER_UNAVAILABLE",
+    ],
+    [
+      "the endpoint changed (stored-response binding)",
+      { model: null },
+      true,
+      "BOUND_TARGET_INVALID",
+    ],
+    [
+      "the provider model was disabled",
+      { model: { enabled: false } },
+      false,
+      "PROVIDER_UNAVAILABLE",
+    ],
+    [
+      "the provider model was disabled (stored-response binding)",
+      { model: { enabled: false } },
+      true,
+      "PROVIDER_UNAVAILABLE",
+    ],
+    [
+      "the provider account was disabled",
+      { model: { ProviderAccount: { enabled: false } } },
+      false,
+      "PROVIDER_UNAVAILABLE",
+    ],
+  ] as const)(
+    "refuses the send claim when %s, after the last lock wait",
+    async (_label, change, exactBinding, reason) => {
+      const order: string[] = [];
+      const tx = {
+        $executeRaw: vi.fn(async () => 0),
+        $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+          if (strings.join("").includes('AS "requesterValid"'))
+            return mockRequesterValidityQuery(strings, values, tx);
+          order.push(`lock:${lockedTable(strings)}`);
+          return [];
+        }),
+        ...consentTx(order, change),
+        providerCredential: { findFirst: vi.fn(), update: vi.fn() },
+      };
+      db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const keyring = parseProviderCredentialKeyring(
+        `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+      );
+      const claim = await withEgressEnabled(() =>
+        claimPublicProviderCredentialForSend({
+          userId: "owner",
+          target: claimTarget(),
+          keyring,
+          consent: GRANTEE_TOKEN_CONSENT,
+          exactBinding,
+        }),
+      );
+      expect(claim).toEqual({ claimed: false, reason });
+      // Read after the last lock (credential) and after the account re-read.
+      expect(order.lastIndexOf("lock:provider_credential FOR UPDATE")).toBeLessThan(
+        order.indexOf("read:target"),
+      );
+      expect(order.lastIndexOf("read:account")).toBeLessThan(order.indexOf("read:target"));
+      expect(tx.providerModel.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            deletedAt: null,
+            ProviderAccount: expect.objectContaining({ endpointVersion: expect.any(Number) }),
+          }),
+        }),
+      );
+      expect(tx.poolMember.findFirst).toHaveBeenCalledWith({
+        where: expect.objectContaining({
+          poolId: "pool",
+          tier: "PUBLIC_OVERFLOW",
+          routingStatus: "ACTIVE",
+        }),
+        select: { id: true },
+      });
       expect(tx.providerCredential.update).not.toHaveBeenCalled();
     },
   );
@@ -805,6 +920,7 @@ describe("public overflow compatibility", () => {
           token: { expiresAt: new Date(CLAIM_START.getTime() + 1_000) },
         });
         const tx = {
+          $executeRaw: vi.fn(async () => 0),
           $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
             if (strings.join("").includes('AS "requesterValid"'))
               return mockRequesterValidityQuery(strings, values, tx);
@@ -879,6 +995,7 @@ describe("public overflow compatibility", () => {
         });
         const tx = {
           ...rows,
+          $executeRaw: vi.fn(async () => 0),
           $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
             if (strings.join("").includes("FROM provider_account")) banned = true;
             return mockRequesterValidityQuery(strings, values, rows);
@@ -928,6 +1045,7 @@ describe("public overflow compatibility", () => {
 
   it("fails a send-start claim when revocation won the lifecycle lock", async () => {
     const tx = {
+      $executeRaw: vi.fn(async () => 0),
       $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
         mockRequesterValidityQuery(strings, values, tx),
       ),
@@ -1351,6 +1469,8 @@ function consentTx(
     token?: Record<string, unknown>;
     entry?: Record<string, unknown>;
     account?: Record<string, unknown>;
+    member?: null;
+    model?: Record<string, unknown> | null;
   } = {},
 ) {
   const read = <T>(label: string, value: T) =>
@@ -1396,6 +1516,20 @@ function consentTx(
         includeExternal: true,
         ...change.entry,
       }),
+    },
+    // D9: the account's privacy policy, read under the account lock.
+    providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+    // The target re-read after the last lock wait (member, provider model).
+    poolMember: {
+      findFirst: read("read:target", change.member === null ? null : { id: "member" }),
+    },
+    providerModel: {
+      findFirst: read(
+        "read:target",
+        change.model === null
+          ? null
+          : { enabled: true, ProviderAccount: { enabled: true }, ...change.model },
+      ),
     },
   };
 }

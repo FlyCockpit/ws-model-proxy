@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
-import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
+import type {
+  LiveCliFeatureSnapshot,
+  LiveEndpointLoad,
+  LiveNodeTelemetrySnapshot,
+} from "@ws-model-proxy/api/context";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   allowsHeadlessCommands,
@@ -16,7 +20,7 @@ import {
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
@@ -28,9 +32,12 @@ import {
 import {
   type CliTerminalIdentity,
   describeRelayControlParseError,
+  type EndpointLoadMessage,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
   helloNeedsUpgrade,
+  type NodeInfoMessage,
+  type NodeMetricsMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
@@ -43,6 +50,7 @@ import {
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  rejectedHelloFacts,
   relayProtocolAtLeast,
   type TerminalHandshakeIdentity,
   type TerminalSealedMetadata,
@@ -54,6 +62,9 @@ import {
 } from "./registration.js";
 
 const WS_READY_STATE_OPEN = 1;
+/** Close code and reason for a socket closed because the server is shutting down. */
+export const SHUTDOWN_CLOSE_CODE = 1001;
+export const SHUTDOWN_CLOSE_REASON = "shutdown";
 
 export type RelaySocket = {
   readonly readyState: number;
@@ -288,6 +299,32 @@ const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
 /** Ended supervised terminals whose CLI `term.exit` is still awaited, per session. */
 const ENDING_SUPERVISED_MAX = 16;
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
+/** `node.info` is once per connection; a repeat inside this window is dropped. */
+export const NODE_INFO_MIN_INTERVAL_MS = 60_000;
+/**
+ * `node.metrics` frames closer together than this are dropped. The CLI keeps
+ * them at least 5 s apart; the margin absorbs network jitter.
+ */
+export const NODE_METRICS_MIN_INTERVAL_MS = 4_000;
+/**
+ * The CliDevice snapshot of the latest metrics is written at most this often
+ * per device, across sessions and server instances (the write is conditional
+ * on the stored `nodeMetricsAt`), so reconnecting cannot reset the budget.
+ */
+export const NODE_METRICS_PERSIST_INTERVAL_MS = 60_000;
+/** A dropped malformed telemetry frame is logged at most this often per session. */
+const MALFORMED_TELEMETRY_LOG_INTERVAL_MS = 60_000;
+const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
+  "node.info",
+  "node.metrics",
+  "endpoint.load",
+]);
+/** Per endpoint/model key; the CLI sends every 2–5 s and on change. */
+export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
+/** Distinct endpoint/model load keys kept per session. */
+export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
+
+type LiveEndpointLoadEntry = LiveEndpointLoad & { receivedAtMs: number };
 
 type SessionState = {
   socket: RelaySocket;
@@ -322,6 +359,13 @@ type SessionState = {
   endingSupervised: Map<string, TrackedSupervisedCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
+  /** 2.7 telemetry, in memory only (see `handleTelemetry`). */
+  nodeInfoAcceptedAtMs: number | null;
+  nodeMetrics: { sample: Omit<NodeMetricsMessage, "type">; receivedAt: Date } | null;
+  nodeMetricsAcceptedAtMs: number | null;
+  nodeMetricsPersistedAtMs: number | null;
+  endpointLoad: Map<string, LiveEndpointLoadEntry>;
+  malformedTelemetryLoggedAtMs: number | null;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -506,6 +550,8 @@ export class RelaySessionManager {
    *   supervised command starts (`startSupervisedCommand` returns false);
    * - a CLI socket closes once its last model request finishes
    *   ({@link considerDrainClose}).
+   * - a CLI socket whose authentication finished after the drain began is
+   *   closed on open and never registered ({@link acceptAuthenticatedSocket});
    * It does not close sockets already upgraded: browser terminal sockets are
    * closed by the hub's `closeAll` (the shutdown's `closeBrowserSockets`
    * step) and CLI sockets by the close calls above.
@@ -517,6 +563,13 @@ export class RelaySessionManager {
     probe: (member) => this.probeOwnedPoolMember(member),
   });
 
+  /**
+   * Registers an upgraded, authenticated CLI socket. The single admission
+   * point for the drain: the upgrade middleware checks {@link relayDrain}
+   * before its awaited authentication, so a socket whose authentication
+   * finishes after the drain began arrives here. It is closed with the
+   * shutdown close code and never registered. Returns whether it was accepted.
+   */
   acceptAuthenticatedSocket({
     socket,
     identity,
@@ -525,7 +578,13 @@ export class RelaySessionManager {
     socket: RelaySocket;
     identity: CliWebsocketIdentity;
     now?: Date;
-  }) {
+  }): boolean {
+    if (this.relayDrain) {
+      if (socket.readyState === WS_READY_STATE_OPEN) {
+        socket.close(SHUTDOWN_CLOSE_CODE, SHUTDOWN_CLOSE_REASON);
+      }
+      return false;
+    }
     const unauthenticatedTimer = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
       if (!session?.registered) {
@@ -558,7 +617,14 @@ export class RelaySessionManager {
       endingSupervised: new Map(),
       unauthenticatedTimer,
       bodyStreamsByRequest: new Map(),
+      nodeInfoAcceptedAtMs: null,
+      nodeMetrics: null,
+      nodeMetricsAcceptedAtMs: null,
+      nodeMetricsPersistedAtMs: null,
+      endpointLoad: new Map(),
+      malformedTelemetryLoggedAtMs: null,
     });
+    return true;
   }
 
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
@@ -566,8 +632,10 @@ export class RelaySessionManager {
     // An older CLI gets a message it prints ("upgrade wsmp"), not an opaque
     // schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
-      console.error("[relay] refused a hello older than the minimum relay protocol");
+      const rejected = rejectedHelloFacts(frame);
+      console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
       closeWithProtocolError(socket, RELAY_UPGRADE_REQUIRED_MESSAGE);
+      await this.recordRejectedHello(session, rejected, now);
       await this.removeSession(socket, now);
       return;
     }
@@ -741,6 +809,15 @@ export class RelaySessionManager {
           receivedAt: now.toISOString(),
         }),
       );
+      return;
+    }
+
+    if (
+      message.type === "node.info" ||
+      message.type === "node.metrics" ||
+      message.type === "endpoint.load"
+    ) {
+      await this.handleTelemetry(session, message, now);
       return;
     }
 
@@ -1047,7 +1124,7 @@ export class RelaySessionManager {
     if (!this.sessionsBySocket.has(session.socket)) return null;
     this.teardownInteractiveWork(session);
     if (session.socket.readyState === WS_READY_STATE_OPEN) {
-      session.socket.close(1001, "shutdown");
+      session.socket.close(SHUTDOWN_CLOSE_CODE, SHUTDOWN_CLOSE_REASON);
     }
     return this.detachSession(session.socket, {
       now,
@@ -1203,6 +1280,140 @@ export class RelaySessionManager {
     session.allowHumanTerminal = grants.allowHumanTerminal;
     session.mcpCommandMode = grants.mcpCommandMode;
     this.reconcileInteractiveGrants(session);
+  }
+
+  /**
+   * Remember why a device's CLI was refused so its card can say "CLI upgrade
+   * required". Only a credential already bound to a device identifies it; an
+   * unbound token has no device yet (the relay log above has the versions).
+   */
+  private async recordRejectedHello(
+    session: SessionState,
+    rejected: { protocolVersion: string | null; cliVersion: string | null },
+    now: Date,
+  ) {
+    const cliDeviceId = session.identity.cliDeviceId;
+    if (!cliDeviceId) return;
+    try {
+      await prisma.cliDevice.updateMany({
+        where: { id: cliDeviceId, userId: session.identity.userId },
+        data: {
+          rejectedRelayProtocolVersion: rejected.protocolVersion,
+          rejectedCliVersion: rejected.cliVersion,
+          relayRejectedAt: now,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[relay] recording a refused hello failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /**
+   * 2.7 telemetry. Frames above the rate limits are dropped, never fatal.
+   * `endpoint.load` and the freshest metrics stay in memory; the CliDevice
+   * row gets `node.info` once per connection and a metrics snapshot at most
+   * once a minute.
+   */
+  private async handleTelemetry(
+    session: SessionState,
+    message: NodeInfoMessage | NodeMetricsMessage | EndpointLoadMessage,
+    now: Date,
+  ) {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId) return;
+    const nowMs = now.getTime();
+    if (message.type === "endpoint.load") {
+      const { type: _type, ...load } = message;
+      const key = `${load.endpointSlug}\u0000${load.modelSlug ?? ""}`;
+      const previous = session.endpointLoad.get(key);
+      if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) return;
+      if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
+      session.endpointLoad.set(key, {
+        ...load,
+        modelSlug: load.modelSlug ?? null,
+        receivedAt: now,
+        receivedAtMs: nowMs,
+      });
+      return;
+    }
+    if (message.type === "node.info") {
+      if (
+        session.nodeInfoAcceptedAtMs !== null &&
+        nowMs - session.nodeInfoAcceptedAtMs < NODE_INFO_MIN_INTERVAL_MS
+      ) {
+        return;
+      }
+      session.nodeInfoAcceptedAtMs = nowMs;
+      const { type: _type, ...info } = message;
+      await this.writeTelemetry(cliDeviceId, { nodeInfo: info, nodeInfoAt: now });
+      return;
+    }
+    if (
+      session.nodeMetricsAcceptedAtMs !== null &&
+      nowMs - session.nodeMetricsAcceptedAtMs < NODE_METRICS_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    session.nodeMetricsAcceptedAtMs = nowMs;
+    const { type: _type, ...sample } = message;
+    session.nodeMetrics = { sample, receivedAt: now };
+    if (
+      session.nodeMetricsPersistedAtMs !== null &&
+      nowMs - session.nodeMetricsPersistedAtMs < NODE_METRICS_PERSIST_INTERVAL_MS
+    ) {
+      return;
+    }
+    session.nodeMetricsPersistedAtMs = nowMs;
+    await this.writeTelemetry(
+      cliDeviceId,
+      { nodeMetrics: sample, nodeMetricsAt: now },
+      // Per device, not per session: a snapshot stored by an earlier session
+      // (or another server instance) inside the window keeps this one out,
+      // and an older delayed write never replaces a newer snapshot.
+      {
+        OR: [
+          { nodeMetricsAt: null },
+          { nodeMetricsAt: { lte: new Date(nowMs - NODE_METRICS_PERSIST_INTERVAL_MS) } },
+        ],
+      },
+    );
+  }
+
+  private async writeTelemetry(
+    cliDeviceId: string,
+    data:
+      | { nodeInfo: Omit<NodeInfoMessage, "type">; nodeInfoAt: Date }
+      | { nodeMetrics: Omit<NodeMetricsMessage, "type">; nodeMetricsAt: Date },
+    condition: Prisma.CliDeviceWhereInput = {},
+  ) {
+    try {
+      await prisma.cliDevice.updateMany({ where: { ...condition, id: cliDeviceId }, data });
+    } catch (error) {
+      console.error(
+        "[relay] storing node telemetry failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /** The freshest node metrics and endpoint load per connected CLI. */
+  getLiveNodeTelemetry(cliDeviceIds: readonly string[]): Map<string, LiveNodeTelemetrySnapshot> {
+    const snapshots = new Map<string, LiveNodeTelemetrySnapshot>();
+    for (const cliDeviceId of cliDeviceIds) {
+      const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+      if (!session?.registered) continue;
+      snapshots.set(cliDeviceId, {
+        nodeMetrics: session.nodeMetrics?.sample ?? null,
+        nodeMetricsReceivedAt: session.nodeMetrics?.receivedAt ?? null,
+        endpointLoad: [...session.endpointLoad.values()].map(
+          ({ receivedAtMs: _receivedAtMs, ...load }) => load,
+        ),
+      });
+    }
+    return snapshots;
   }
 
   getLiveCliFeatures(cliDeviceIds: readonly string[]): Map<string, LiveCliFeatureSnapshot> {
@@ -2700,6 +2911,20 @@ export class RelaySessionManager {
       const command = commandId ? session.commandsById.get(commandId) : undefined;
       if (command?.status === "running") this.cancelTrackedCommand(session, command);
       console.error("[relay] malformed exec frame");
+      return true;
+    }
+    // Telemetry is advisory: a reading outside the strict schema (or an
+    // unknown field) drops that frame, never the session and the inference
+    // it carries. Nothing from the frame is stored or logged but its type.
+    if (session.registered && TELEMETRY_FRAME_TYPES.has(type)) {
+      const nowMs = Date.now();
+      if (
+        session.malformedTelemetryLoggedAtMs === null ||
+        nowMs - session.malformedTelemetryLoggedAtMs >= MALFORMED_TELEMETRY_LOG_INTERVAL_MS
+      ) {
+        session.malformedTelemetryLoggedAtMs = nowMs;
+        console.error("[relay] malformed telemetry frame dropped", type);
+      }
       return true;
     }
     return false;

@@ -6,6 +6,8 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
+import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -42,6 +44,7 @@ const mockedTokenAccess = tokenAccess as unknown as {
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
+  user: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
   };
@@ -375,7 +378,11 @@ function admittingCapacityRuntime(): CapacityAdmissionRuntime {
   };
 }
 
-function appWith(manager: FakeRelayManager, authSession: Session | null = session) {
+function appWith(
+  manager: FakeRelayManager,
+  authSession: Session | null = session,
+  capacityRuntime: CapacityAdmissionRuntime = admittingCapacityRuntime(),
+) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
     c.set("session", authSession);
@@ -386,7 +393,7 @@ function appWith(manager: FakeRelayManager, authSession: Session | null = sessio
     createChatTestRoutes({
       manager,
       concurrencyLimiter: new ModelApiConcurrencyLimiter(),
-      capacityRuntime: admittingCapacityRuntime(),
+      capacityRuntime,
     }),
   );
   return app;
@@ -406,6 +413,12 @@ describe("chat test routes", () => {
       return Promise.all(input as Promise<unknown>[]);
     });
     db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
+    // #76: the pool owner is read again before every local dispatch.
+    db.user.findUnique.mockResolvedValue({
+      banned: false,
+      banExpires: null,
+      deletionRequestedAt: null,
+    });
     mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
       directModels: [directTarget],
       modelPools: [poolTarget],
@@ -540,6 +553,84 @@ describe("chat test routes", () => {
     manager.body(sent.requestId, '{"choices":[{"message":{"role":"assistant","content":"pong"}}]}');
     manager.complete(sent.requestId);
     await expect(responsePromise).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("F2-CAP-3: answers a lost Chat Test lease with 503, not a 499 cancellation", async () => {
+    const manager = new FakeRelayManager();
+    const lease = new AbortController();
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const selected = attempt.candidates[0]!;
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: "lease-chat-test",
+          attemptId: attempt.attemptId,
+          capacityId: selected.capacityId,
+          executionTargetId: selected.executionTargetId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: lease.signal,
+        },
+      };
+    });
+    const responsePromise = appWith(manager, session, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: directTarget.modelId, messages: [] }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    lease.abort(new CapacityLeaseLostError("ownership_lost"));
+    const response = await responsePromise;
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "capacity_lease_lost" },
+    });
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+      }),
+    );
+  });
+
+  it("F2-CAP-6: the Chat Test request scope releases an owner the route never released", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = {
+      heartbeat: vi.fn().mockResolvedValue(true),
+      release: vi.fn().mockResolvedValue(true),
+    };
+    const owners: CapacityLeaseOwner[] = [];
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const selected = attempt.candidates[0]!;
+      const lease = {
+        leaseId: "lease-leaked",
+        attemptId: attempt.attemptId,
+        capacityId: selected.capacityId,
+        executionTargetId: selected.executionTargetId,
+        fencingToken: 1n,
+        expiresAt: new Date(Date.now() + 30_000),
+      };
+      const owner = new CapacityLeaseOwner(leaseStore, lease, undefined, 0);
+      owners.push(owner);
+      return { state: "ADMITTED" as const, lease: { ...lease, signal: owner.signal } };
+    });
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager, session, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: directTarget.modelId, messages: [] }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, "{}");
+    manager.complete(sent.requestId);
+    await response.text();
+    await vi.waitFor(() => expect(leaseStore.release).toHaveBeenCalledOnce());
+    expect(owners[0]?.signal.reason).toMatchObject({ kind: "request_scope_closed" });
+    warn.mockRestore();
   });
 
   it("cancels the websocket relay request when the browser stops reading", async () => {

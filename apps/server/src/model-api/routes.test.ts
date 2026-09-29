@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import type {
   ModelApiTokenIdentity,
   VisibleDirectModelTarget,
@@ -6,12 +8,18 @@ import type {
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
+import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
 import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
-import type { CapacityAdmissionStore } from "./capacity/types.js";
+import type {
+  AdmissionAttempt,
+  AdmissionCandidate,
+  CapacityAdmissionStore,
+} from "./capacity/types.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 import type { PublicOverflowRequest, PublicProviderTarget } from "./public-overflow.js";
@@ -54,6 +62,14 @@ vi.mock("./cache-affinity.js", async (importOriginal) => {
   };
 });
 
+// The prefill speed source is the auto-mode input to the cache-holder wait;
+// stub it at the routing seam so the tests never read relay history.
+const prefillSpeed = vi.hoisted(() => ({ tokensPerSecond: vi.fn() }));
+vi.mock("./prefill-estimator.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./prefill-estimator.js")>();
+  return { ...actual, prefillSpeedSource: prefillSpeed };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -92,7 +108,9 @@ const {
   captureProviderResponseBinding,
   chatTestCompletionsHandler,
   createModelApiRoutes,
+  EXTERNAL_PROVIDER_WAIT_CAP_MS,
   localAdmissionWaitBudget,
+  providerCapacityWaitBudget,
   resumedLocalWaitBudget,
 } = await import("./routes.js");
 const retryPolicy = await import("./relay-retry-policy.js");
@@ -125,6 +143,7 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
   };
   modelPool: {
     findFirst: MockInstance;
@@ -149,10 +168,15 @@ const db = prisma as unknown as {
   appSetting: {
     findUnique: MockInstance;
   };
+  user: {
+    findUnique: MockInstance;
+  };
   mediaAsset: {
     findMany: MockInstance;
   };
 };
+
+const ACTIVE_POOL_OWNER = { banned: false, banExpires: null, deletionRequestedAt: null };
 
 const mockedTokenAccess = tokenAccess as unknown as {
   authenticateModelApiTokenSecret: MockInstance;
@@ -301,10 +325,11 @@ const EXTERNAL_MODEL_ID = `${externalPoolTarget.modelId}:external`;
 
 function listedExternalTargets(
   targets: ReturnType<typeof externalProviderTarget>[],
-  overrides: { enabled?: boolean; fallbackForGrantees?: boolean } = {},
+  overrides: { enabled?: boolean; fallbackForGrantees?: boolean; ownerActive?: boolean } = {},
 ) {
   return {
     enabled: overrides.enabled ?? true,
+    ownerActive: overrides.ownerActive ?? true,
     fallbackForGrantees: overrides.fallbackForGrantees ?? false,
     affinityPolicy: {
       enabled: false,
@@ -442,6 +467,7 @@ function poolMemberRow({
   affinityEnabled = false,
   countStrategy,
   externalAfterWaitMs = 2_000,
+  cacheHolderWaitMs = null,
 }: {
   id: string;
   discoveredModelId: string;
@@ -463,6 +489,7 @@ function poolMemberRow({
   affinityEnabled?: boolean;
   countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
   externalAfterWaitMs?: number;
+  cacheHolderWaitMs?: number | null;
 }) {
   return {
     id,
@@ -486,6 +513,7 @@ function poolMemberRow({
       capacityContextMargin: poolContextMargin,
       capacityWaitBudgetMs: 30_000,
       externalAfterWaitMs,
+      cacheHolderWaitMs,
       affinityEnabled,
       affinityTtlSeconds: 3600,
       affinityMaxRecords: 10_000,
@@ -584,7 +612,7 @@ function externalProviderTarget(poolMemberId = "primary-provider-member") {
     poolMemberId,
     executionTargetId: `${poolMemberId}-target`,
     inferenceCapacityId: `${poolMemberId}-capacity`,
-    capacityWaitBudgetMs: 30_000,
+    capacityWaitBudgetMs: 30_000 as number | null,
     publicOrder: 0,
     providerModelId: `${poolMemberId}-model`,
     upstreamModelId: "provider-upstream",
@@ -694,6 +722,23 @@ describe("X1 local wait budgets", () => {
   });
 });
 
+describe("S-A provider-capacity wait cap", () => {
+  it("caps owner-paid provider waits only on pools with local members", () => {
+    expect(providerCapacityWaitBudget(null, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+    expect(providerCapacityWaitBudget(60_000, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+    expect(providerCapacityWaitBudget(3_000, true)).toBe(3_000);
+    // One cap per external phase: later provider rounds get what is left.
+    expect(providerCapacityWaitBudget(null, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(3_000, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(500, true, 9_000)).toBe(500);
+    expect(providerCapacityWaitBudget(null, true, 12_000)).toBe(0);
+    // Provider-only pools keep the member budget (no local queue to return to).
+    expect(providerCapacityWaitBudget(60_000, false, 12_000)).toBe(60_000);
+    expect(providerCapacityWaitBudget(null, false)).toBeNull();
+    expect(providerCapacityWaitBudget(60_000, false)).toBe(60_000);
+  });
+});
+
 describe("model API routes", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -704,6 +749,8 @@ describe("model API routes", () => {
       return Promise.all(input as Promise<unknown>[]);
     });
     db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
+    // #76: the pool owner is read again before every local dispatch.
+    db.user.findUnique.mockResolvedValue(ACTIVE_POOL_OWNER);
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(token);
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [directTarget],
@@ -757,6 +804,7 @@ describe("model API routes", () => {
     externalConsent.poolIds = [];
     publicOverflow.list.mockResolvedValue({
       enabled: false,
+      ownerActive: true,
       fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
@@ -859,6 +907,376 @@ describe("model API routes", () => {
     // A plain pool name never inspects external (PUBLIC_OVERFLOW) members.
     expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  describe("S-A: wait for the cache holder", () => {
+    const affineMembers = (options: { cacheHolderWaitMs?: number | null } = {}) => [
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+        ...options,
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+        affinityEnabled: true,
+        ...options,
+      }),
+    ];
+    /** Member A holds the continuation prefix (depth 2, about 6000 tokens). */
+    const holderDecision = (prefixDepthA = 2) => ({
+      orderedTargetIds: ["member-a-target", "member-b-target"],
+      scores: { "member-a-target": 200, "member-b-target": 0 },
+      prefixDepths: { "member-a-target": prefixDepthA, "member-b-target": 0 },
+      conversationMatches: { "member-a-target": false, "member-b-target": false },
+      reasons: {},
+      matchedPrefixDepth: prefixDepthA,
+      prefixTokens: prefixDepthA > 0 ? { "member-a-target": 6_000 } : {},
+    });
+    /** Admits the member named `grant` (the store decides; this fakes its answer). */
+    const grantingRuntime = (grant: string) => {
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate =
+          attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant) ??
+          attempt.candidates[0]!;
+        if (candidate.poolMemberId !== grant) return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      return { acquire, runtime };
+    };
+    const candidatesOf = (acquire: ReturnType<typeof grantingRuntime>["acquire"], call = 0) =>
+      acquire.mock.calls[call]?.[0].candidates.map((candidate) => ({
+        poolMemberId: candidate.poolMemberId,
+        notBeforeMs: candidate.notBeforeMs,
+        waitBudgetMs: candidate.waitBudgetMs,
+      }));
+    const serve = async (runtime: CapacityAdmissionRuntime, model = poolTarget.modelId) => {
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(model),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      return { response: await responsePromise, manager };
+    };
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      // Unmeasured speed: the automatic wait falls back to the 2 s default.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+    });
+
+    it("defers the cold member by the default 2 s and records the spill", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response, manager } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // Prefill speed of the holder is not measured yet: the 2 s default.
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        { poolMemberId: "member-b", notBeforeMs: 2_000, waitBudgetMs: 30_000 },
+      ]);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({
+                affinityOutcome: "HOLDER_SPILLED",
+                affinityWaitMs: expect.any(Number),
+              }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it("sizes the automatic wait from the holder prefix and measured prefill speed", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      // 6000-token holder prefix at 2000 tokens/s: 3 s re-prefill time.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(2_000);
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      expect(prefillSpeed.tokensPerSecond).toHaveBeenCalledWith("member-a-target");
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        { poolMemberId: "member-b", notBeforeMs: 3_000, waitBudgetMs: 30_000 },
+      ]);
+    });
+
+    it("records a holder wait when the cache holder serves", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers({ cacheHolderWaitMs: 750 }));
+      affinity.rank.mockResolvedValue(holderDecision());
+      const { acquire, runtime } = grantingRuntime("member-a");
+
+      const { response } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      // A fixed pool override replaces the automatic estimate.
+      expect(candidatesOf(acquire)?.[1]).toMatchObject({ notBeforeMs: 750 });
+      expect(prefillSpeed.tokensPerSecond).not.toHaveBeenCalled();
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityOutcome: "HOLDER_WAITED" }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it.each([
+      ["no real affinity hit", affineMembers(), holderDecision(0)],
+      ["the pool turned the wait off", affineMembers({ cacheHolderWaitMs: 0 }), holderDecision()],
+    ] as const)("defers nothing when %s", async (_label, members, decision) => {
+      db.poolMember.findMany.mockResolvedValue([...members]);
+      affinity.rank.mockResolvedValue(decision);
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      await serve(runtime);
+
+      expect(candidatesOf(acquire)?.map(({ notBeforeMs }) => notBeforeMs)).toEqual([
+        undefined,
+        undefined,
+      ]);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityWaitMs: null }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it(":external counts every shortened budget from the spill instant", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response } = await serve(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      // E = 2 s for both: the store counts it from max(notBefore) = now + 2 s,
+      // so the external phase can start only at 4 s, never while the cold
+      // member is free and eligible.
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 2_000 },
+        { poolMemberId: "member-b", notBeforeMs: 2_000, waitBudgetMs: 2_000 },
+      ]);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it(":external retry rounds all anchor to the first attempt, keeping the hold window", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        ...affineMembers(),
+        poolMemberRow({
+          id: "member-c",
+          discoveredModelId: "model-c",
+          upstreamModelId: "upstream-c",
+          cliDeviceId: "cli-c",
+          affinityEnabled: true,
+        }),
+      ]);
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const acquire = vi.mocked(runtime.acquire);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      // The holder and then member B fail before commit; member C serves.
+      for (const index of [0, 1]) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(index + 1), { timeout: 5_000 });
+        manager.headers(requireSent(manager, index).requestId, 500, {
+          "content-type": "application/json",
+        });
+      }
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(3), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 2).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      const attempts = acquire.mock.calls.map(([attempt]) => attempt);
+      expect(attempts).toHaveLength(3);
+      const [first, ...retries] = attempts;
+      // Round 1 holds the cold members back by the 2 s default window.
+      expect(first?.schedule).toBeUndefined();
+      expect(first?.candidates.map(({ notBeforeMs }) => notBeforeMs)).toEqual([
+        undefined,
+        2_000,
+        2_000,
+      ]);
+      for (const retry of retries) {
+        // Every retry (not only the second) re-anchors to the FIRST attempt
+        // and keeps its spill instant (anchor + window) even without the holder.
+        expect(retry?.schedule).toEqual({
+          anchorAttemptId: first?.attemptId,
+          spillDelayMs: 2_000,
+        });
+        expect(retry?.candidates.every(({ waitBudgetMs }) => waitBudgetMs === 2_000)).toBe(true);
+      }
+    });
+
+    it("keeps the ordinary affinity outcome when a member serves after a pre-commit failover", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      const runtime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      // The holder is admitted at once, then fails before commit; member B
+      // serves the retry. No spill-over happened: not HOLDER_SPILLED.
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2), { timeout: 5_000 });
+      expect(requireSent(manager, 1).endpointSlug).toBe("member-b-endpoint");
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityOutcome: "NO_MATCH" }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+      expect(db.relayRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ affinityOutcome: "HOLDER_SPILLED" }),
+        }),
+      );
+    });
+
+    it(":external retry rounds reuse the original external deadline", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision(0));
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const acquire = vi.mocked(runtime.acquire);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      // The first member spends 300 ms before failing retryably (precommit 5xx).
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      const first = acquire.mock.calls[0]?.[0];
+      const retry = acquire.mock.calls[1]?.[0];
+      expect(first?.candidates[0]?.waitBudgetMs).toBe(2_000);
+      expect(first?.schedule).toBeUndefined();
+      // Not a fresh 2 s: the retry re-anchors to the FIRST attempt's
+      // database-clock schedule, so the store counts the same 2 s from the
+      // original spill instant (the 300 ms already spent, plus any lock wait
+      // before the retry's transaction, count against the same deadline).
+      expect(retry?.attemptId).not.toBe(first?.attemptId);
+      expect(retry?.schedule).toEqual({ anchorAttemptId: first?.attemptId, spillDelayMs: 0 });
+      expect(retry?.candidates[0]?.waitBudgetMs).toBe(2_000);
+    });
   });
 
   it.each([
@@ -1997,6 +2415,94 @@ describe("model API routes", () => {
     ).toHaveLength(1);
   });
 
+  it("F2-CAP-3: a lease lost after an adapted stream commits is not a member health failure", async () => {
+    // A member row exists, so a (wrong) health write would be observable.
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const lease = new AbortController();
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: "lease-responses-member",
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: lease.signal,
+        },
+      };
+    });
+    const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const first = responsesConformanceFixture.events[0];
+    if (!first) throw new Error("Expected a conformance event.");
+    manager.body(
+      sent.requestId,
+      `${first.event ? `event: ${first.event}\n` : ""}data: ${JSON.stringify(first.data)}\n\n`,
+    );
+    const response = await responsePromise;
+    const reading = response.text().catch(() => "");
+    lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+    await reading;
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+        }),
+      ),
+    );
+    expect(
+      db.poolMember.update.mock.calls.filter(([call]) => call?.where?.id === "responses-member"),
+    ).toHaveLength(0);
+  });
+
   it("keeps Responses sequence numbers contiguous when a committed adapted stream fails", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -2206,6 +2712,102 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ object: "chat.completion" });
     expect(manager.sent).toHaveLength(2);
+  });
+
+  it("F2-CAP-3: a lease lost while reading an adapted body fails over without a protocol_error penalty", async () => {
+    // A member row exists, so a (wrong) health write would be observable.
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue(
+      ["first", "second"].map((suffix) =>
+        poolMemberRow({
+          id: `${suffix}-responses-member`,
+          discoveredModelId: `${suffix}-responses-model`,
+          upstreamModelId: `${suffix}-upstream-responses`,
+          cliDeviceId: `cli-${suffix}`,
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiResponses: { source: "declared", confidence: "exact", supported: true },
+            },
+          },
+        }),
+      ),
+    );
+    const leases: AbortController[] = [];
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      const controller = new AbortController();
+      leases.push(controller);
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${leases.length}`,
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: BigInt(leases.length),
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: controller.signal,
+        },
+      };
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-first", "cli-second"];
+    const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const lost = requireSent(manager);
+    manager.headers(lost.requestId, 200, { "content-type": "application/json" });
+    manager.body(lost.requestId, '{"object":"response"');
+    leases[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    // Not a protocol failure of the member: no health write for it.
+    expect(
+      db.poolMember.update.mock.calls.filter(
+        ([call]) => call?.where?.id === "first-responses-member",
+      ),
+    ).toHaveLength(0);
+    const fallback = requireSent(manager, 1);
+    await completeJsonRelay({
+      manager,
+      requestId: fallback.requestId,
+      body: {
+        id: "resp-fallback",
+        object: "response",
+        created_at: 0,
+        status: "completed",
+        model: "second-upstream-responses",
+        output: [],
+        usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+        error: null,
+        incomplete_details: null,
+        parallel_tool_calls: false,
+        tool_choice: "none",
+        tools: [],
+        temperature: null,
+        top_p: null,
+        max_output_tokens: null,
+      },
+    });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
   });
 
   it("falls back when an adapted member returns the wrong successful content type", async () => {
@@ -4917,6 +5519,141 @@ describe("model API routes", () => {
     },
   );
 
+  it("F2-CAP-3: an own-key lease lost before commit falls through to the owner-paid tier", async () => {
+    const { paid } = ownKeyRouteFixture();
+    const leases: Array<{ controller: AbortController; sourceKind: string }> = [];
+    publicOverflow.dispatch
+      .mockImplementationOnce(
+        ({ signal }: { signal: AbortSignal }) =>
+          new Promise((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => resolve({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" }),
+              { once: true },
+            );
+            leases[0]!.controller.abort(new CapacityLeaseLostError("ownership_lost"));
+          }),
+      )
+      .mockResolvedValueOnce(externalDispatchResult(paid));
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      const controller = new AbortController();
+      leases.push({ controller, sourceKind: attempt.sourceKind });
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${leases.length}`,
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: BigInt(leases.length),
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: controller.signal,
+        },
+      };
+    });
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+    // Own-key (DIRECT) first, then the owner-paid pool tier.
+    expect(leases.map(({ sourceKind }) => sourceKind)).toEqual(["DIRECT", "POOL"]);
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("F2-CAP-3: an own-key lease lost after commit but before hold falls through to the owner-paid tier", async () => {
+    const { own, paid } = ownKeyRouteFixture();
+    const leases: Array<{ controller: AbortController; sourceKind: string }> = [];
+    publicOverflow.dispatch
+      .mockImplementationOnce(async () => {
+        const result = externalDispatchResult(own);
+        // Lease lost in the gap between dispatch returning and hold.
+        leases[0]!.controller.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      })
+      .mockResolvedValueOnce(externalDispatchResult(paid));
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      const controller = new AbortController();
+      leases.push({ controller, sourceKind: attempt.sourceKind });
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${leases.length}`,
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: BigInt(leases.length),
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: controller.signal,
+        },
+      };
+    });
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    await response.text();
+    // Fail over to the owner-paid tier instead of the previous generic 500, and
+    // never re-admit the own-key member whose lease was lost.
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("pool-fallback");
+    expect(leases.map(({ sourceKind }) => sourceKind)).toEqual(["DIRECT", "POOL"]);
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(2);
+    expect(publicOverflow.dispatch.mock.calls[1]?.[0]).toMatchObject({
+      userId: "pool-owner-id",
+    });
+  });
+
+  it("F2-CAP-3: records an external lease lost after commit as capacity_lease_lost", async () => {
+    const { paid } = ownKeyRouteFixture();
+    let settle!: (terminal: { ok: boolean; responseBytes: number }) => void;
+    publicOverflow.dispatch.mockImplementation(async (request: PublicOverflowRequest) =>
+      request.ownKeyProviderModelId
+        ? { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" }
+        : {
+            ...externalDispatchResult(paid),
+            terminal: new Promise((resolve) => {
+              settle = resolve;
+            }),
+          },
+    );
+    const lease = new AbortController();
+    const runtime = admittingCapacityRuntime();
+    const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+      const admitted = await admit(attempt, signal);
+      return admitted.state === "ADMITTED"
+        ? { ...admitted, lease: { ...admitted.lease, signal: lease.signal } }
+        : admitted;
+    });
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(200);
+    lease.abort(new CapacityLeaseLostError("ownership_lost"));
+    settle({ ok: false, responseBytes: 2 });
+    await response.text().catch(() => "");
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+        }),
+      ),
+    );
+  });
+
   it("does not retry a non-retry-safe operation after possible own-key provider I/O", async () => {
     const { own } = ownKeyRouteFixture();
     const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
@@ -5301,8 +6038,13 @@ describe("model API routes", () => {
       );
       expect(response.headers.get("retry-after")).toBeNull();
       expect(response.headers.get("x-wsmp-route")).toBeNull();
-      if (outcome === "disabled" || outcome === "uncovered")
-        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      // F-C (#64): owner flags gate provider admission. A pool whose owner
+      // turned fallback (or grantee coverage) off never takes or waits for
+      // an owner provider capacity slot, and nothing is dispatched.
+      if (outcome === "disabled" || outcome === "uncovered") {
+        expect(capacity.acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      }
       if (outcome === "missing-member") expect(capacity.release).toHaveBeenCalledOnce();
     },
   );
@@ -5705,6 +6447,553 @@ describe("model API routes", () => {
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
+  it("F2-CAP-3: fails external members over on lease loss before commit", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    const leaseControllers: AbortController[] = [];
+    publicOverflow.dispatch
+      .mockImplementationOnce(
+        ({ signal }: { signal: AbortSignal }) =>
+          new Promise((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => resolve({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" }),
+              { once: true },
+            );
+            leaseControllers[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+          }),
+      )
+      .mockResolvedValueOnce(externalDispatchResult(second, { id: "secondary" }));
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        const controller = new AbortController();
+        leaseControllers.push(controller);
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(leaseControllers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: controller.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.forcedPoolMemberId)).toEqual([
+      "overflow-a",
+      "overflow-b",
+    ]);
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("F2-CAP-3: fails external members over when the lease is lost after dispatch but before hold", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    // The lease is lost between dispatch committing and the hand-off: the
+    // non-streaming provider body is fully read before `hold`, and the loss
+    // lands inside that window.
+    const leaseControllers: AbortController[] = [];
+    publicOverflow.dispatch
+      .mockImplementationOnce(async () => {
+        const result = externalDispatchResult(first, { id: "first" });
+        leaseControllers[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      })
+      .mockResolvedValueOnce(externalDispatchResult(second, { id: "secondary" }));
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        const controller = new AbortController();
+        leaseControllers.push(controller);
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(leaseControllers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: controller.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    // Failover instead of a generic 500 from an unclassified throw.
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.forcedPoolMemberId)).toEqual([
+      "overflow-a",
+      "overflow-b",
+    ]);
+    // The lease is released, and the lost member's lease loss is attributed to
+    // the relay row (once the winning tier commits and finalizes).
+    expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "SUCCEEDED" }),
+        }),
+      ),
+    );
+  });
+
+  it("F2-CAP-3: answers 503 capacity_lease_lost when the external lease is lost before hold and nothing else remains", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const only = externalProviderTarget("overflow-a");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([only]));
+    const lease = new AbortController();
+    publicOverflow.dispatch.mockImplementationOnce(async () => {
+      const result = externalDispatchResult(only, { id: "only" });
+      lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+      return result;
+    });
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "lease-only",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: lease.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    // The no-failover remainder is the family's 503 envelope, never a generic
+    // 500 and never a 400 "no compatible provider".
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "capacity_lease_lost" },
+    });
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+        }),
+      ),
+    );
+  });
+
+  it("F2-CAP-3: a lease lost before hand-off settles the abandoned provider body", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const only = externalProviderTarget("overflow-a");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([only]));
+    const bodyCancelled = vi.fn();
+    const { runtime, controllers } = controllableCapacityRuntime(() => false);
+    publicOverflow.dispatch.mockImplementationOnce(async () => {
+      const result = externalDispatchResult(only);
+      // A provider body that nobody will ever read: only a cancel settles the
+      // attempt (heartbeat, budget reservation, terminal event).
+      result.response = new Response(
+        new ReadableStream({
+          cancel(reason) {
+            bodyCancelled(reason);
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+      controllers[0]!.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+      return result;
+    });
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(503);
+    expect(bodyCancelled).toHaveBeenCalledOnce();
+    expect(bodyCancelled.mock.calls[0]?.[0]).toBeInstanceOf(CapacityLeaseLostError);
+  });
+
+  it("F2-CAP-3: a lease lost while confirming ownership fails over to the next external member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(second));
+    const { runtime, admitted } = controllableCapacityRuntime(
+      (candidate) => candidate.poolMemberId === "overflow-a",
+    );
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    // The lost member is never dispatched to; the next one is admitted alone.
+    expect(admitted).toEqual([["overflow-a", "overflow-b"], ["overflow-b"]]);
+    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.forcedPoolMemberId)).toEqual([
+      "overflow-b",
+    ]);
+  });
+
+  it("F2-CAP-3: answers 503 when every external member's lease is lost at admission", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValue(
+      listedExternalTargets([externalProviderTarget("overflow-a")]),
+    );
+    const { runtime } = controllableCapacityRuntime(() => true);
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "capacity_lease_lost" },
+    });
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("F2-CAP-3: a lease-loss re-entry does not re-send the own-key tier", async () => {
+    const { own } = ownKeyRouteFixture();
+    const paidA = externalProviderTarget("paid-a");
+    const paidB = externalProviderTarget("paid-b");
+    publicOverflow.list.mockImplementation(async (_owner, _pool, ownKey) =>
+      listedExternalTargets(ownKey ? [own] : [paidA, paidB], { fallbackForGrantees: true }),
+    );
+    const { runtime, controllers } = controllableCapacityRuntime(() => false);
+    publicOverflow.dispatch.mockImplementation(async (request: PublicOverflowRequest) => {
+      if (request.ownKeyProviderModelId)
+        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE", providerIoStarted: false };
+      if (request.forcedPoolMemberId === "paid-a") {
+        const result = externalDispatchResult(paidA);
+        controllers.at(-1)!.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      }
+      return externalDispatchResult(paidB);
+    });
+    const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    const dispatches = publicOverflow.dispatch.mock.calls.map(([input]) => input);
+    // own-key once, then paid-a (lost), then paid-b: never own-key again.
+    expect(dispatches.filter((input) => input.ownKeyProviderModelId)).toHaveLength(1);
+    expect(dispatches.map((input) => input.forcedPoolMemberId).filter(Boolean)).toEqual([
+      "paid-a",
+      "paid-b",
+    ]);
+  });
+
+  it("F2-CAP-3: a non-retry-safe external operation does not fail over after a lease loss", async () => {
+    // A non-retry-safe operation must never repeat provider I/O, whatever
+    // members remain listed: the pre-hold lease loss ends the request as the
+    // family's 503 instead of re-dispatching.
+    const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+    try {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([]);
+      const first = externalProviderTarget("overflow-a");
+      const second = externalProviderTarget("overflow-b");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+      const leaseControllers: AbortController[] = [];
+      // A persistent implementation (never a one-shot queue) so a mutant that
+      // dispatches twice fails on the call-count assertion instead of silently
+      // draining a queued result.
+      let dispatchCount = 0;
+      publicOverflow.dispatch.mockImplementation(async () => {
+        dispatchCount += 1;
+        if (dispatchCount === 1) {
+          const result = externalDispatchResult(first, { id: "first" });
+          leaseControllers[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+          return result;
+        }
+        return externalDispatchResult(second, { id: "secondary" });
+      });
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async (attempt) => {
+          const candidate = attempt.candidates[0]!;
+          const controller = new AbortController();
+          leaseControllers.push(controller);
+          return {
+            state: "ADMITTED" as const,
+            lease: {
+              leaseId: `lease-${candidate.poolMemberId}`,
+              attemptId: attempt.attemptId,
+              capacityId: candidate.capacityId,
+              executionTargetId: candidate.executionTargetId,
+              poolMemberId: candidate.poolMemberId,
+              fencingToken: BigInt(leaseControllers.length),
+              expiresAt: new Date(Date.now() + 30_000),
+              signal: controller.signal,
+            },
+          };
+        }),
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerReleases = vi.fn();
+      const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+      vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+        const lease = acquireGlobal(identity);
+        return {
+          release: () => {
+            callerReleases();
+            lease.release();
+          },
+        };
+      });
+
+      const response = await appWith(new FakeRelayManager(), capacityRuntime, limiter).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        },
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "capacity_lease_lost" },
+      });
+      // Nothing reached the client and the member is never re-admitted.
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+      expect(capacityRuntime.hold).not.toHaveBeenCalled();
+      // Both leases are released before the answer: the caller's own lease and
+      // the lost provider-capacity lease.
+      expect(callerReleases).toHaveBeenCalledTimes(1);
+      expect(capacityRuntime.release).toHaveBeenCalledWith(
+        expect.objectContaining({ leaseId: "lease-overflow-a" }),
+      );
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+          }),
+        ),
+      );
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
+  it("F2-CAP-3: a lease-loss failover never lets the losing attempt claim the relay row", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = externalProviderTarget("overflow-a");
+    const second = externalProviderTarget("overflow-b");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([first, second]));
+    const leaseControllers: AbortController[] = [];
+    let dispatchCount = 0;
+    publicOverflow.dispatch.mockImplementation(async () => {
+      dispatchCount += 1;
+      if (dispatchCount === 1) {
+        const result = externalDispatchResult(first, { id: "first" });
+        leaseControllers[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      }
+      return externalDispatchResult(second, { id: "secondary" });
+    });
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        const controller = new AbortController();
+        leaseControllers.push(controller);
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(leaseControllers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: controller.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    await response.text();
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "SUCCEEDED" }),
+        }),
+      ),
+    );
+    // The losing attempt's terminal settles as well (its provider body was
+    // aborted), but its finalizer is registered only after a successful
+    // hand-off: exactly one attempt claims the row, and it is the winner.
+    const claimed = db.relayRequest.update.mock.calls.filter(([args]) => {
+      const status = (args as { data?: { status?: string } }).data?.status;
+      return status === "SUCCEEDED" || status === "FAILED" || status === "CANCELED";
+    });
+    expect(claimed).toHaveLength(1);
+    expect(
+      (claimed[0]![0] as { data: { status: string; selectedExecutionTargetId?: string } }).data,
+    ).toMatchObject({ status: "SUCCEEDED", selectedExecutionTargetId: "overflow-b-target" });
+  });
+
+  it("F2-CAP-3: a non-lease-loss failure after external dispatch still finalizes the relay row", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = externalProviderTarget("overflow-a");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    // The provider response commits, then its own body read fails: a
+    // non-lease-loss precommit error, with a real attempt already dispatched.
+    publicOverflow.dispatch.mockImplementation(async () => ({
+      ...externalDispatchResult(provider),
+      response: new Response(
+        new ReadableStream({
+          pull() {
+            throw new Error("provider body disconnected");
+          },
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      ),
+      terminal: Promise.resolve({ ok: false, responseBytes: 0 }),
+    }));
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "lease-overflow-a",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    expect(response.status).toBe(500);
+    expect(consoleError).toHaveBeenCalled();
+    // The dispatched attempt is this request's outcome: its terminal transition
+    // must claim the PENDING row instead of leaving it behind forever.
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "relay-request-id", status: "PENDING" },
+          data: expect.objectContaining({ status: "FAILED" }),
+        }),
+      ),
+    );
+  });
+
   it("re-admits remaining external members after a retry-safe precommit failure", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -5762,11 +7051,15 @@ describe("model API routes", () => {
   });
 
   it.each(["direct", "pool", "external", "local sticky", "external sticky"])(
-    "F2-CAP-1: aborts %s dispatch on physical lease loss before response headers",
+    "F2-CAP-1/3: aborts %s dispatch on physical lease loss before response headers (503, not 499)",
     async (route) => {
       vi.useFakeTimers();
       const store: CapacityAdmissionStore = {
-        acquire: admittingCapacityRuntime().acquire,
+        acquire: async (attempt, signal) => {
+          const admission = await admittingCapacityRuntime().acquire(attempt, signal);
+          if (admission.state === "LEASE_LOST") throw admission.reason;
+          return admission;
+        },
         heartbeat: vi.fn().mockResolvedValue(true),
         release: vi.fn().mockResolvedValue(true),
         terminalizeAttempt: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
@@ -5873,7 +7166,17 @@ describe("model API routes", () => {
         vi.mocked(store.heartbeat).mockResolvedValueOnce(false);
         await vi.advanceTimersByTimeAsync(10_000);
         const response = await pending;
-        expect(response.status).toBeGreaterThanOrEqual(400);
+        // F2-CAP-3: the client is still connected. Lease loss is a server-side
+        // 503 recorded as capacity_lease_lost, never a 499 cancellation.
+        expect(response.status).toBe(503);
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: "FAILED",
+              errorClass: "capacity_lease_lost",
+            }),
+          }),
+        );
         if (external) {
           expect(providerSignal?.aborted).toBe(true);
           expect(providerCancelled).toHaveBeenCalledOnce();
@@ -6383,6 +7686,108 @@ describe("model API routes", () => {
       );
     });
 
+    it("charges provider pre-commit retries against one external-phase capacity-wait cap", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          { ...externalProviderTarget("overflow-a"), capacityWaitBudgetMs: null },
+          { ...externalProviderTarget("overflow-b"), capacityWaitBudgetMs: null },
+        ]),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
+      });
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const scripted = acquire.getMockImplementation()!;
+      // The first provider slot arrives after 9 s (simulated monotonic time),
+      // then its dispatch fails before commit and the next member is tried.
+      let simulatedElapsedMs = 0;
+      const monotonic = performance.now.bind(performance);
+      const clock = vi
+        .spyOn(performance, "now")
+        .mockImplementation(() => monotonic() + simulatedElapsedMs);
+      acquire.mockImplementation(async (attempt) => {
+        if (attempt.candidates[0]?.poolMemberId?.startsWith("overflow-")) {
+          const first = !acquire.mock.calls
+            .slice(0, -1)
+            .some(([earlier]) => earlier.candidates[0]?.poolMemberId?.startsWith("overflow-"));
+          simulatedElapsedMs += first ? 9_000 : 1_000;
+          return first ? scripted(attempt) : { state: "EXPIRED" as const };
+        }
+        return scripted(attempt);
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      try {
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        const response = await responsePromise;
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-wsmp-route")).toBe("local");
+        const providerBudgets = acquire.mock.calls
+          .map(([attempt]) => attempt.candidates[0])
+          .filter((candidate) => candidate?.poolMemberId?.startsWith("overflow-"))
+          .map((candidate) => candidate?.waitBudgetMs);
+        // Not a fresh 10 s for the second member: 9 s of the cap are spent.
+        expect(providerBudgets).toHaveLength(2);
+        expect(providerBudgets[0]).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+        expect(providerBudgets[1]).toBeGreaterThanOrEqual(900);
+        expect(providerBudgets[1]).toBeLessThanOrEqual(1_000);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("bounds the owner-paid provider-capacity wait on a mixed pool and returns to the local queue", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      // The provider member has no budget of its own: without the cap it could
+      // wait for provider capacity until the 15-minute relay deadline.
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          {
+            ...externalProviderTarget("overflow-member"),
+            capacityWaitBudgetMs: null,
+          },
+        ]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "EXPIRED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      const providerBudgets = acquire.mock.calls
+        .map(([attempt]) => attempt.candidates[0])
+        .filter((candidate) => candidate?.poolMemberId === "overflow-member")
+        .map((candidate) => candidate?.waitBudgetMs);
+      expect(providerBudgets).toEqual([EXTERNAL_PROVIDER_WAIT_CAP_MS]);
+      // The capped provider wait expired: the request resumed its local wait.
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+    });
+
     it("fails like the plain name (429) with the header when the resumed wait also expires", async () => {
       db.poolMember.findMany.mockResolvedValue([localMember()]);
       publicOverflow.list.mockResolvedValue(
@@ -6411,6 +7816,832 @@ describe("model API routes", () => {
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
       expect(manager.sent).toHaveLength(0);
     });
+
+    // #64 telemetry: the client leaves during the resumed local wait after a
+    // saturated external attempt. That is a cancel (499), not rate_limited.
+    it("records a client cancel (499), not 429, when the client leaves after a saturated external attempt", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "EXPIRED"],
+        provider: "EXPIRED",
+      });
+      const controller = new AbortController();
+      const scripted = acquire.getMockImplementation()!;
+      acquire.mockImplementation(async (attempt) => {
+        const result = await scripted(attempt);
+        // The resumed local wait (third admission) ends because the client left.
+        if (acquire.mock.calls.length === 3) controller.abort();
+        return result;
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      expect(response.status).toBe(499);
+      const terminal = db.relayRequest.update.mock.calls
+        .map(([arg]) => arg as { data: Record<string, unknown> })
+        .find((arg) => arg.data.status !== undefined);
+      expect(terminal?.data).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    /**
+     * Local admission answers from `local`; the provider admission aborts
+     * the client (the client leaves while the external phase waits) and
+     * then reports the provider as saturated.
+     */
+    const cancellingProviderRuntime = (
+      controller: AbortController,
+      local: Array<"ADMITTED" | "EXPIRED">,
+    ) => {
+      const { acquire, runtime } = scriptedRuntime({ local, provider: "EXPIRED" });
+      const scripted = acquire.getMockImplementation()!;
+      acquire.mockImplementation(async (attempt) => {
+        if (attempt.candidates[0]?.poolMemberId !== "local-primary") controller.abort();
+        return scripted(attempt);
+      });
+      return { acquire, runtime };
+    };
+    const terminalRelayUpdate = () =>
+      db.relayRequest.update.mock.calls
+        .map(([arg]) => arg as { data: Record<string, unknown> })
+        .find((arg) => arg.data.status !== undefined)?.data;
+
+    // G1b-1 (#64 telemetry): every external phase that ends because the
+    // client left is a cancel (499), whichever branch finalizes it.
+    it("records a client cancel (499) when the client leaves during a provider-only pool's external phase", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { runtime } = cancellingProviderRuntime(controller, []);
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499), not 503, when no local member is healthy and the client leaves", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { acquire, runtime } = cancellingProviderRuntime(controller, []);
+      const manager = new FakeRelayManager();
+      // The local member's CLI is offline: no healthy local route.
+      manager.activeCliDeviceIds = [];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(localBudgets(acquire)).toEqual([]);
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499), not the local failure, when the client leaves during the final external phase", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { acquire, runtime } = cancellingProviderRuntime(controller, ["ADMITTED"]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      // A retryable pre-first-byte local failure triggers the external phase.
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(localBudgets(acquire)).toEqual([2_000]);
+      expect(acquire).toHaveBeenCalledTimes(2);
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499) when the client leaves before a second trigger replays the recorded external outcome", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      // Shortened wait expires, the provider is saturated (client still
+      // there), the resumed local wait admits, and the local send fails.
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "EXPIRED",
+      });
+      const controller = new AbortController();
+      // The client leaves while the failed local attempt is recorded, before
+      // the second trigger replays the recorded (saturated) outcome.
+      db.relayExecutionAttempt.updateMany.mockImplementation(async () => {
+        controller.abort();
+        return { count: 1 };
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      // One external phase per request: the second trigger does not retry.
+      expect(acquire).toHaveBeenCalledTimes(3);
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    // C1a-1 (#76): an external phase that finds the pool owner (or the
+    // requester) without access ends the request. It never resumes the
+    // local wait and never sends to the owner's machine.
+    it.each([
+      ["the listing sees the owner inactive", "listing", 404],
+      ["the send boundary sees the owner inactive", "POOL_OWNER_INACTIVE", 404],
+      ["the send boundary sees the requester blocked", "REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)(
+      "ends the request without resuming locally when %s",
+      async (_label, source, status) => {
+        db.poolMember.findMany.mockResolvedValue([localMember()]);
+        publicOverflow.list.mockResolvedValue(
+          listedExternalTargets([externalProviderTarget("overflow-member")], {
+            ownerActive: source !== "listing",
+          }),
+        );
+        if (source !== "listing")
+          publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason: source });
+        const { acquire, runtime } = scriptedRuntime({
+          local: ["EXPIRED", "ADMITTED"],
+          provider: "ADMITTED",
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const response = await appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+
+        expect(response.status).toBe(status);
+        // Answered like arrival: no route or fallback headers.
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+        expect(localBudgets(acquire)).toEqual([2_000]);
+        expect(manager.sent).toHaveLength(0);
+        expect(runtime.release).toHaveBeenCalledTimes(source === "listing" ? 0 : 1);
+        expect(terminalRelayUpdate()).toMatchObject({ status: "FAILED" });
+      },
+    );
+
+    // Design pass (authz-boundaries, #76): every send to the pool owner's
+    // machines is gated by the local-send gate. Rows: the owner's row as read
+    // at the native-count fan-out and then at the local dispatch.
+    const BANNED = { banned: true, banExpires: null, deletionRequestedAt: null };
+    const ACTIVE = { banned: false, banExpires: null, deletionRequestedAt: null };
+    it.each([
+      ["banned before the native count", [BANNED], 404, "none"],
+      [
+        "temporarily banned before the native count",
+        [{ banned: true, banExpires: new Date(Date.now() + 60_000), deletionRequestedAt: null }],
+        404,
+        "none",
+      ],
+      [
+        "deletion-marked before the native count",
+        [{ banned: false, banExpires: null, deletionRequestedAt: new Date() }],
+        404,
+        "none",
+      ],
+      ["missing before the native count", [null], 404, "none"],
+      ["unreadable before the native count", [new Error("db down")], 500, "none"],
+      ["banned while the request waited for admission", [ACTIVE, BANNED], 404, "released"],
+      [
+        "banned while an :external request waited for admission",
+        [ACTIVE, BANNED],
+        404,
+        "released-external",
+      ],
+      ["unreadable at the local dispatch", [ACTIVE, new Error("db down")], 500, "released"],
+      [
+        "past a temporary ban",
+        [{ banned: true, banExpires: new Date(Date.now() - 60_000), deletionRequestedAt: null }],
+        200,
+        "served",
+      ],
+    ] as const)(
+      "gates every send to the owner's machines: owner %s",
+      async (_label, reads, status, outcome) => {
+        db.poolMember.findMany.mockResolvedValue([localMember()]);
+        db.user.findUnique.mockReset();
+        for (const read of reads) {
+          if (read instanceof Error) db.user.findUnique.mockRejectedValueOnce(read);
+          else db.user.findUnique.mockResolvedValueOnce(read);
+        }
+        db.user.findUnique.mockResolvedValue(reads.at(-1) instanceof Error ? null : reads.at(-1));
+        if (outcome === "released-external")
+          publicOverflow.list.mockResolvedValue(
+            listedExternalTargets([externalProviderTarget("overflow-member")]),
+          );
+        const { acquire, runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          // The plain name unless the row asks for the external tier.
+          body: requestBody(
+            outcome === "released-external" ? EXTERNAL_MODEL_ID : externalPoolTarget.modelId,
+          ),
+        });
+        if (outcome === "served") {
+          await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+          await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        }
+        const response = await responsePromise;
+
+        expect(db.user.findUnique).toHaveBeenCalledWith(
+          expect.objectContaining({ where: { id: externalPoolTarget.ownerUserId } }),
+        );
+        expect(response.status).toBe(status);
+        // A refused send (inactive owner, failed read) sent nothing: no route header.
+        if (outcome !== "served") expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(manager.sent).toHaveLength(outcome === "served" ? 1 : 0);
+        expect(acquire).toHaveBeenCalledTimes(outcome === "none" ? 0 : 1);
+        if (outcome === "released" || outcome === "released-external") {
+          expect(runtime.release).toHaveBeenCalledOnce();
+          // The pool is unavailable to everyone: no external phase either.
+          expect(publicOverflow.list).not.toHaveBeenCalled();
+        }
+        if (outcome !== "served") {
+          expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+          expect(terminalRelayUpdate()).toMatchObject({
+            status: "FAILED",
+            httpStatusCode: status,
+          });
+        }
+      },
+    );
+
+    // CF-a1: the gate runs after the last awaited preparation, immediately
+    // before the send. A ban committed while the attempt's telemetry is
+    // being written still stops the send.
+    it("sends nothing when the owner is banned during the attempt's telemetry write", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const { runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+
+      expect(db.relayExecutionAttempt.create).toHaveBeenCalled();
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      expect(runtime.release).toHaveBeenCalledOnce();
+    });
+
+    // C4-1: a refused send gives back the half-open trial it claimed, fenced
+    // on the claim's timestamp, so the member is routable again when the
+    // owner's ban ends.
+    it("releases a claimed half-open trial when the owner gate refuses the send", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const { runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      const writes = db.poolMember.updateMany.mock.calls.map(
+        ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+      );
+      const claim = writes.find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+      expect(claim).toBeDefined();
+      expect(writes.at(-1)).toEqual({
+        where: {
+          id: "local-primary",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+        },
+        data: { halfOpenTrialStartedAt: null },
+      });
+    });
+
+    // C4-3: a refused send ends the request; no other member is admitted.
+    it("admits no other member after the owner gate refuses a send", async () => {
+      const { acquire, runtime, manager } = twoMemberPool(["ADMITTED", "ADMITTED"]);
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      expect(acquire).toHaveBeenCalledOnce();
+    });
+
+    // C4-2 + CF-a2: the ONE gate reads BOTH accounts. A banned owner makes
+    // the pool unavailable (404); a requester banned while the request waited
+    // is refused (401 access_denied) instead of being served locally.
+    it.each([
+      ["the owner is banned and the requester active", "owner", 404],
+      ["the requester is banned and the owner active", "requester", 401],
+    ] as const)("gates on both accounts when %s", async (_label, banned, status) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...externalPoolTarget, ownerUserId: "pool-owner-id", accessGrantId: "grant-id" },
+        ],
+      });
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      // The early gate (before the native count) reads both accounts active;
+      // the ban lands while the request waits for admission, so the send gate
+      // (owner read first, requester read right after it) sees it.
+      let gateRuns = 0;
+      db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+        const isOwner = args.where.id === "pool-owner-id";
+        if (isOwner) gateRuns += 1;
+        if (gateRuns < 2) return ACTIVE;
+        return isOwner === (banned === "owner") ? BANNED : ACTIVE;
+      });
+      const { acquire, runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      expect(response.status).toBe(status);
+      // Nothing reached the owner's machine; the admitted lease was released.
+      expect(manager.sent).toHaveLength(0);
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(runtime.release).toHaveBeenCalledOnce();
+      // Neither answer carries route headers, and no external phase follows.
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "user-id" } }),
+      );
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "pool-owner-id" } }),
+      );
+    });
+
+    // C4-2: the native context count is gated too: a ban committed while the
+    // count's telemetry is written sends no count frame to the owner.
+    // CF2-1: the refusal is TERMINAL whatever admission would have answered
+    // afterwards (an expired wait used to turn it into a 429, or an external
+    // phase for :external); it carries no route headers.
+    it.each([
+      ["admitted capacity", "ADMITTED", false],
+      ["expired capacity wait", "EXPIRED", false],
+      ["expired capacity wait on an :external request", "EXPIRED", true],
+    ] as const)(
+      "sends no native count once the owner is banned during the count's telemetry: %s",
+      async (_label, admission, external) => {
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "local-primary",
+            discoveredModelId: "local-model",
+            upstreamModelId: "local-upstream",
+            cliDeviceId: "cli-local",
+            countStrategy: "ENGINE_REPORTED",
+            capabilityOverrideMetadata: {
+              version: 3,
+              protocol: "anthropic-compatible",
+              surfaces: {
+                anthropicMessages: {
+                  source: "declared",
+                  confidence: "exact",
+                  supported: true,
+                  countTokens: true,
+                  protocolVersion: "2023-06-01",
+                },
+              },
+            },
+          }),
+        ]);
+        db.relayExecutionAttempt.create.mockImplementation(async () => {
+          db.user.findUnique.mockResolvedValue(BANNED);
+          return { id: "attempt" };
+        });
+        if (external)
+          publicOverflow.list.mockResolvedValue(
+            listedExternalTargets([externalProviderTarget("overflow-member")]),
+          );
+        const { acquire, runtime } = scriptedRuntime({ local: [admission], provider: "ADMITTED" });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const response = await appWith(manager, runtime).request("/messages", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer wsmp_model_test",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: external ? EXTERNAL_MODEL_ID : externalPoolTarget.modelId,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        expect(db.relayExecutionAttempt.create).toHaveBeenCalled();
+        expect(manager.sent).toHaveLength(0);
+        expect(response.status).toBe(404);
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+        // Ended before admission and any external phase.
+        expect(acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.list).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+      10_000,
+    );
+
+    // CF-b1 (F-C): the owner's flags and account are read again before every
+    // later member's provider admission, not only the first.
+    it.each([
+      ["the owner turned fallback off", { enabled: false }],
+      ["the owner was banned", { ownerActive: false }],
+    ] as const)("admits no further provider member once %s", async (_label, overrides) => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list
+        .mockResolvedValueOnce(
+          listedExternalTargets([
+            externalProviderTarget("overflow-member"),
+            externalProviderTarget("overflow-second"),
+          ]),
+        )
+        .mockResolvedValue(
+          listedExternalTargets(
+            [externalProviderTarget("overflow-member"), externalProviderTarget("overflow-second")],
+            overrides,
+          ),
+        );
+      // The first member's attempt fails without sending (retry-safe).
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "SEND_CLAIM_FAILED",
+      });
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await response.text();
+
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(publicOverflow.list).toHaveBeenCalledTimes(2);
+    });
+
+    // CF-b3: an owner-inactive refusal at the send boundary ends the external
+    // phase for every member.
+    it("does not try another provider member after POOL_OWNER_INACTIVE", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          externalProviderTarget("overflow-member"),
+          externalProviderTarget("overflow-second"),
+        ]),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: "POOL_OWNER_INACTIVE",
+      });
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(404);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+    });
+
+    /** Two local members; admissions answer from `states` in order. */
+    const twoMemberPool = (states: Array<"ADMITTED" | "EXPIRED">) => {
+      db.poolMember.findMany.mockResolvedValue([
+        localMember(),
+        poolMemberRow({
+          id: "local-second",
+          discoveredModelId: "local-second-model",
+          upstreamModelId: "local-second-upstream",
+          cliDeviceId: "cli-second",
+          externalAfterWaitMs: 2_000,
+        }),
+      ]);
+      const queue = [...states];
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        // The provider member is admitted; local members follow the script.
+        if (candidate.poolMemberId !== "overflow-member" && queue.shift() !== "ADMITTED")
+          return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local", "cli-second"];
+      return { acquire, runtime, manager };
+    };
+
+    // C3-2: the owner is re-read before a retry on another member, not only
+    // before the first attempt.
+    it("sends no retry to another member once the owner is banned", async () => {
+      const { runtime, manager } = twoMemberPool(["ADMITTED", "ADMITTED"]);
+      db.user.findUnique.mockReset();
+      db.user.findUnique
+        .mockResolvedValueOnce(ACTIVE) // native count
+        .mockResolvedValueOnce(ACTIVE) // first member
+        .mockResolvedValue(BANNED); // retry on the second member
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(1);
+      expect(db.user.findUnique).toHaveBeenCalledTimes(3);
+    });
+
+    // C2-3 m4: an access loss seen by the external phase inside the retry
+    // loop (shortened wait for the next member) ends the request; the next
+    // member is never admitted or sent.
+    it.each([
+      ["POOL_OWNER_INACTIVE", 404],
+      ["REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)("does not resume the retry loop after %s", async (reason, status) => {
+      const { acquire, runtime, manager } = twoMemberPool(["ADMITTED", "EXPIRED", "ADMITTED"]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(response.status).toBe(status);
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(manager.sent).toHaveLength(1);
+      // First member, the in-loop shortened wait and the provider slot; no
+      // resumed local admission.
+      expect(
+        acquire.mock.calls.filter(
+          ([attempt]) => attempt.candidates[0]?.poolMemberId !== "overflow-member",
+        ),
+      ).toHaveLength(2);
+    });
+
+    // C2-3: fallback-only withdrawals keep independently authorized local
+    // service (no over-refusal); only access losses end the request.
+    it.each([
+      "POOL_PRIVATE",
+      "GRANTEE_NOT_COVERED",
+      "CALLER_CONSENT_WITHDRAWN",
+      "OWN_KEY_CONSENT_WITHDRAWN",
+      "REQUESTER_NOT_VISIBLE",
+      "PROVIDER_SATURATED",
+    ] as const)("resumes locally after a fallback-only outcome: %s", async (reason) => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+    });
+
+    // C2-3: an access loss seen by the external phase ends the request at
+    // every trigger site, without route headers.
+    it.each([
+      ["the final phase after a local failure", "final", "POOL_OWNER_INACTIVE", 404],
+      ["the final phase after a local failure", "final", "REQUESTER_ACCESS_BLOCKED", 401],
+      ["the no-healthy-member phase", "no-healthy", "POOL_OWNER_INACTIVE", 404],
+      ["the no-compatible-member phase", "no-compatible", "POOL_OWNER_INACTIVE", 404],
+      ["the context-ceiling phase", "context", "REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)("ends the request when %s sees %s", async (_label, site, reason, status) => {
+      const member =
+        site === "context"
+          ? poolMemberRow({
+              id: "local-primary",
+              discoveredModelId: "local-model",
+              upstreamModelId: "local-upstream",
+              cliDeviceId: "cli-local",
+              physicalMaxContext: 8,
+            })
+          : localMember();
+      db.poolMember.findMany.mockResolvedValue([
+        site === "no-compatible"
+          ? poolMemberRow({
+              id: "local-primary",
+              discoveredModelId: "local-model",
+              upstreamModelId: "local-upstream",
+              cliDeviceId: "cli-local",
+              // Serves Responses only: no compatible member for chat.
+              capabilityOverrideMetadata: {
+                version: 3,
+                protocol: "openai-compatible",
+                surfaces: {
+                  openaiResponses: { source: "declared", confidence: "exact", supported: true },
+                },
+              },
+            })
+          : member,
+      ]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const { runtime } = scriptedRuntime({
+        local: site === "final" ? ["ADMITTED"] : [],
+        provider: "ADMITTED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = site === "no-healthy" ? [] : ["cli-local"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      if (site === "final") {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        manager.error(requireSent(manager).requestId, "transport");
+      }
+      const response = await responsePromise;
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(response.status).toBe(status);
+      expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(manager.sent).toHaveLength(site === "final" ? 1 : 0);
+    });
+
+    // F-C (#64) and #76: owner flags and the owner's account gate provider
+    // admission; no provider capacity slot is taken or waited for.
+    // A fallback withdrawal is a 503 with the header; an inactive owner makes
+    // the pool unavailable to everyone (404, as at arrival).
+    it.each([
+      ["the owner turned fallback off", { enabled: false }, 503, "unavailable"],
+      ["the owner's account is banned or deletion-marked", { ownerActive: false }, 404, null],
+    ] as const)(
+      "never admits provider capacity when %s",
+      async (_label, overrides, status, header) => {
+        db.poolMember.findMany.mockResolvedValue([]);
+        publicOverflow.list.mockResolvedValue(
+          listedExternalTargets([externalProviderTarget("overflow-member")], overrides),
+        );
+        const { acquire, runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+        const response = await appWith(new FakeRelayManager(), runtime).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+
+        expect(response.status).toBe(status);
+        expect(response.headers.get("x-wsmp-fallback")).toBe(header);
+        expect(acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+    );
 
     it("answers 429 (not 400) with the header on a provider-only pool whose provider is saturated", async () => {
       db.poolMember.findMany.mockResolvedValue([]);
@@ -7141,6 +9372,601 @@ describe("model API routes", () => {
       }),
     );
     now.mockRestore();
+  });
+
+  it("F2-CAP-3: fails a pool over on lease loss before the first byte without a member health penalty", async () => {
+    // A member row exists, so a (wrong) health write would be observable.
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+    const leaseControllers: AbortController[] = [];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        const controller = new AbortController();
+        leaseControllers.push(controller);
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(leaseControllers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: controller.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const lost = requireSent(manager);
+    expect(lost.cliDeviceId).toBe("cli-a");
+    // The heartbeat found the row reclaimed while waiting for member-a's headers.
+    leaseControllers[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const retried = requireSent(manager, 1);
+    expect(retried.cliDeviceId).toBe("cli-b");
+    // The CLI protocol has no lease-loss reason: member-a is simply told to stop.
+    expect(manager.cancelled).toContainEqual({
+      cliDeviceId: "cli-a",
+      requestId: lost.requestId,
+      reason: "cancelled",
+    });
+    // A DB-side event is never the member's fault.
+    expect(db.poolMember.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "member-a" } }),
+    );
+
+    manager.headers(retried.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(retried.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    manager.complete(retried.requestId);
+    expect(response.status).toBe(200);
+    await response.text();
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            selectedDiscoveredModelId: "model-b",
+            status: "SUCCEEDED",
+          }),
+        }),
+      ),
+    );
+    // The lost attempt is recorded as its own server-side failure, not a 499 cancel.
+    expect(db.relayExecutionEvent.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [
+          expect.objectContaining({
+            attemptId: lost.requestId,
+            terminalState: "FAILED",
+            errorClass: "capacity_lease_lost",
+            httpStatusCode: 503,
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("F2-CAP-3: does not fail a non-retry-safe operation over after lease loss", async () => {
+    const policy = vi.spyOn(retryPolicy, "shouldRetryRelayOperation").mockReturnValue(false);
+    try {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+        poolMemberRow({
+          id: "member-b",
+          discoveredModelId: "model-b",
+          upstreamModelId: "upstream-b",
+          cliDeviceId: "cli-b",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const leases: AbortController[] = [];
+      const runtime = admittingCapacityRuntime();
+      const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+      vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+        const admitted = await admit(attempt, signal);
+        const controller = new AbortController();
+        leases.push(controller);
+        return admitted.state === "ADMITTED"
+          ? { ...admitted, lease: { ...admitted.lease, signal: controller.signal } }
+          : admitted;
+      });
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      leases[0]!.abort(new CapacityLeaseLostError("ownership_lost"));
+      const response = await responsePromise;
+      expect(response.status).toBe(503);
+      expect(manager.sent).toHaveLength(1);
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
+  it("F2-CAP-3: answers 503 when a pool lease is lost and no other member remains", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-device-id",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    const lease = new AbortController();
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: "lease-a",
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolMemberId: candidate.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: lease.signal,
+        },
+      };
+    });
+    const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+    const response = await responsePromise;
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "capacity_lease_lost" },
+    });
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+      }),
+    );
+  });
+
+  it("F2-CAP-3: ends a committed direct stream with a server error when the lease is lost", async () => {
+    const manager = new FakeRelayManager();
+    const lease = new AbortController();
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: "lease-direct",
+          attemptId: attempt.attemptId,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+          signal: lease.signal,
+        },
+      };
+    });
+    const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    manager.body(sent.requestId, 'data: {"choices":[]}\n\n');
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+    // Never a clean (truncated) EOF.
+    await expect(reader.read()).rejects.toThrow();
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+        }),
+      ),
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // F2-CAP-3 design table: every capacity-held route classifies a lease loss
+  // at the same boundaries (admission confirmation, completed-attempt
+  // hand-off) instead of relabelling it 429/500.
+  // ---------------------------------------------------------------------
+  function controllableCapacityRuntime(
+    lostAtAdmission: (candidate: AdmissionCandidate) => boolean,
+  ) {
+    const controllers: AbortController[] = [];
+    const admitted: string[][] = [];
+    const runtime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt: AdmissionAttempt) => {
+        admitted.push(
+          attempt.candidates.map(
+            (candidate) => candidate.poolMemberId ?? candidate.executionTargetId,
+          ),
+        );
+        const candidate = attempt.candidates[0]!;
+        if (lostAtAdmission(candidate))
+          return {
+            state: "LEASE_LOST" as const,
+            reason: new CapacityLeaseLostError("ownership_lost"),
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+          };
+        const controller = new AbortController();
+        controllers.push(controller);
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId ?? candidate.executionTargetId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(controllers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+            signal: controller.signal,
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    return { runtime, controllers, admitted };
+  }
+
+  function setupLocalLeaseRoute(route: "direct" | "pool" | "local sticky") {
+    const manager = new FakeRelayManager();
+    if (route === "direct") return { manager, path: "/chat/completions", method: "POST" };
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+    db.poolMember.findMany.mockResolvedValue(
+      (route === "pool" ? ["a", "b"] : ["a"]).map((letter) =>
+        poolMemberRow({
+          id: `member-${letter}`,
+          discoveredModelId: `model-${letter}`,
+          upstreamModelId: `upstream-${letter}`,
+          cliDeviceId: `cli-${letter}`,
+        }),
+      ),
+    );
+    if (route === "local sticky") {
+      db.responseStickinessRecord.findUnique.mockResolvedValue({
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        targetDiscoveredModelId: null,
+        targetModelPoolId: "pool-id",
+        selectedDiscoveredModelId: "model-a",
+        TargetExecutionTarget: null,
+        SelectedExecutionTarget: { discoveredModelId: "model-a" },
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+      );
+      return { manager, path: "/responses/resp_provider", method: "GET" };
+    }
+    return { manager, path: "/chat/completions", method: "POST" };
+  }
+
+  function localLeaseRequest(
+    route: "direct" | "pool" | "local sticky",
+    setup: ReturnType<typeof setupLocalLeaseRoute>,
+    runtime: CapacityAdmissionRuntime,
+  ) {
+    return appWith(setup.manager, runtime).request(setup.path, {
+      method: setup.method,
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      ...(setup.method === "GET"
+        ? {}
+        : { body: requestBody(route === "pool" ? poolTarget.modelId : directTarget.modelId) }),
+    });
+  }
+
+  const expectLeaseLost503 = () =>
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+      }),
+    );
+
+  it.each(["direct", "pool", "local sticky"] as const)(
+    "F2-CAP-3: a lease lost while confirming ownership answers 503 on %s, never 429",
+    async (route) => {
+      const setup = setupLocalLeaseRoute(route);
+      const { runtime, admitted } = controllableCapacityRuntime(() => true);
+      const response = await localLeaseRequest(route, setup, runtime);
+      expect(response.status).toBe(503);
+      expectLeaseLost503();
+      expect(setup.manager.sent).toHaveLength(0);
+      // A pool re-admits its remaining members before giving up.
+      expect(admitted).toEqual(
+        route === "pool" ? [["member-a", "member-b"], ["member-b"]] : [[expect.any(String)]],
+      );
+    },
+  );
+
+  it("F2-CAP-3: every local member lost at admission overflows as a retryable precommit failure", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+      }),
+    ]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValueOnce(externalDispatchResult(provider));
+    const { runtime, admitted } = controllableCapacityRuntime(
+      (candidate) => candidate.poolMemberId === "local-primary",
+    );
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+    const response = await appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(EXTERNAL_MODEL_ID),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    // A lost local lease is a precommit failure, not an expired local wait,
+    // and the lost member is not admitted a second time.
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      reason: "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE",
+    });
+    expect(admitted.filter((members) => members.includes("local-primary"))).toHaveLength(1);
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it.each([
+    ["the pool owner becomes inactive", "POOL_OWNER_INACTIVE", false, 404],
+    ["the requester becomes blocked", "REQUESTER_ACCESS_BLOCKED", false, 401],
+    ["the client cancels", "PROVIDER_UNAVAILABLE", true, 499],
+  ] as const)(
+    "C7-1: after every local lease is lost, %s beats capacity_lease_lost",
+    async (_label, reason, abortClient, expectedStatus) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      const controller = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        if (abortClient) controller.abort(new Error("client disconnected"));
+        return { dispatched: false as const, reason };
+      });
+      const { runtime } = controllableCapacityRuntime(
+        (candidate) => candidate.poolMemberId === "local-primary",
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(response.status).toBe(expectedStatus);
+      expect(manager.sent).toHaveLength(0);
+    },
+  );
+
+  it("F2-CAP-3: a client abort is not a lease loss even when the hand-off refuses", async () => {
+    const setup = setupLocalLeaseRoute("direct");
+    const { runtime, controllers } = controllableCapacityRuntime(() => false);
+    const client = new AbortController();
+    const lost = new CapacityLeaseLostError("ownership_lost");
+    vi.mocked(runtime.hold).mockImplementationOnce((response) => {
+      client.abort(new Error("client disconnected"));
+      controllers[0]!.abort(lost);
+      void response.body?.cancel(lost).catch(() => undefined);
+      throw lost;
+    });
+    const responsePromise = appWith(setup.manager, runtime).request(setup.path, {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(directTarget.modelId),
+      signal: client.signal,
+    });
+    await vi.waitFor(() => expect(setup.manager.sent).toHaveLength(1));
+    const sent = requireSent(setup.manager);
+    setup.manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    setup.manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    setup.manager.complete(sent.requestId);
+    await Promise.resolve(responsePromise).catch(() => undefined);
+    await vi.waitFor(() => expect(db.relayRequest.update).toHaveBeenCalled());
+    expect(db.relayRequest.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ errorClass: "capacity_lease_lost" }),
+      }),
+    );
+  });
+
+  it("F2-CAP-3: a pool member lost at admission fails over to the next member", async () => {
+    const setup = setupLocalLeaseRoute("pool");
+    const { runtime, admitted } = controllableCapacityRuntime(
+      (candidate) => candidate.poolMemberId === "member-a",
+    );
+    const responsePromise = localLeaseRequest("pool", setup, runtime);
+    await vi.waitFor(() => expect(setup.manager.sent).toHaveLength(1));
+    const sent = requireSent(setup.manager);
+    expect(sent.cliDeviceId).toBe("cli-b");
+    setup.manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    setup.manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    setup.manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(admitted).toEqual([["member-a", "member-b"], ["member-b"]]);
+  });
+
+  it.each(["direct", "pool", "local sticky"] as const)(
+    "F2-CAP-3: a lease lost after the CLI attempt completed but before hand-off answers 503 on %s",
+    async (route) => {
+      const setup = setupLocalLeaseRoute(route);
+      const { runtime, controllers } = controllableCapacityRuntime(() => false);
+      const lost = new CapacityLeaseLostError("ownership_lost");
+      vi.mocked(runtime.hold).mockImplementationOnce((response) => {
+        // What the real hand-off does when the owner is already gone.
+        controllers[0]!.abort(lost);
+        void response.body?.cancel(lost).catch(() => undefined);
+        throw lost;
+      });
+      const responsePromise = localLeaseRequest(route, setup, runtime);
+      await vi.waitFor(() => expect(setup.manager.sent).toHaveLength(1));
+      const first = requireSent(setup.manager);
+      // The upstream attempt finishes successfully BEFORE the hand-off refusal.
+      setup.manager.headers(first.requestId, 200, { "content-type": "application/json" });
+      setup.manager.body(first.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      setup.manager.complete(first.requestId);
+      if (route === "pool") {
+        // The pool fails over to the next member instead of a generic 500.
+        await vi.waitFor(() => expect(setup.manager.sent).toHaveLength(2));
+        const second = requireSent(setup.manager, 1);
+        expect(second.cliDeviceId).toBe("cli-b");
+        setup.manager.headers(second.requestId, 200, { "content-type": "application/json" });
+        setup.manager.body(second.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+        setup.manager.complete(second.requestId);
+        const response = await responsePromise;
+        expect(response.status).toBe(200);
+        await response.text();
+        // A DB-side event is never the member's fault.
+        expect(db.poolMember.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({ where: { id: "member-a" } }),
+        );
+        return;
+      }
+      const response = await responsePromise;
+      expect(response.status).toBe(503);
+      expectLeaseLost503();
+    },
+  );
+
+  it("F2-CAP-6: the model API request scope releases an owner the route never released", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = {
+      heartbeat: vi.fn().mockResolvedValue(true),
+      release: vi.fn().mockResolvedValue(true),
+    };
+    const owners: CapacityLeaseOwner[] = [];
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const candidate = attempt.candidates[0]!;
+      const lease = {
+        leaseId: "lease-leaked",
+        attemptId: attempt.attemptId,
+        capacityId: candidate.capacityId,
+        executionTargetId: candidate.executionTargetId,
+        fencingToken: 1n,
+        expiresAt: new Date(Date.now() + 30_000),
+      };
+      // A runtime whose release path "forgets" this owner (release is a mock).
+      const owner = new CapacityLeaseOwner(leaseStore, lease, undefined, 0);
+      owners.push(owner);
+      return { state: "ADMITTED" as const, lease: { ...lease, signal: owner.signal } };
+    });
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    manager.complete(sent.requestId);
+    expect(owners[0]?.signal.aborted).toBe(false);
+    await response.text();
+    await vi.waitFor(() => expect(leaseStore.release).toHaveBeenCalledOnce());
+    expect(owners[0]?.signal.reason).toMatchObject({ kind: "request_scope_closed" });
+    expect(warn).toHaveBeenCalledWith(
+      "[capacity] lease owner outlived its request scope; releasing",
+      { owners: 1 },
+    );
+    warn.mockRestore();
   });
 
   it("rejects direct context ceilings before durable admission", async () => {
@@ -7901,6 +10727,7 @@ describe("model API routes", () => {
     };
     publicOverflow.list.mockResolvedValue({
       enabled: true,
+      ownerActive: true,
       fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
@@ -8667,6 +11494,203 @@ describe("model API routes", () => {
       },
     );
 
+    it("F2-CAP-3: answers 503 when the bound lease is lost after dispatch but before hold", async () => {
+      const lease = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        const result = boundDispatch();
+        lease.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      });
+      const runtime = admittingCapacityRuntime();
+      const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+      vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+        const admitted = await admit(attempt, signal);
+        return admitted.state === "ADMITTED"
+          ? { ...admitted, lease: { ...admitted.lease, signal: lease.signal } }
+          : admitted;
+      });
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      // The bound family has no failover, but the pre-first-byte loss must be
+      // classified (the family's 503) instead of an unclassified generic 500.
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "external_unavailable" },
+      });
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+          }),
+        ),
+      );
+    });
+
+    function boundLeaseRuntime(lease: AbortController) {
+      const runtime = admittingCapacityRuntime();
+      const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+      vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+        const admitted = await admit(attempt, signal);
+        return admitted.state === "ADMITTED"
+          ? { ...admitted, lease: { ...admitted.lease, signal: lease.signal } }
+          : admitted;
+      });
+      return runtime;
+    }
+
+    it("F2-CAP-3: a bound lease lost before hand-off has a single relay-row claimant", async () => {
+      // Model the real PENDING-guarded terminal transition: the first writer
+      // wins and a later one is rejected (P2025), as usage-rollup does.
+      let rowStatus = "PENDING";
+      let finalData: Record<string, unknown> = {};
+      db.relayRequest.update.mockImplementation(((args: {
+        where: { status?: string };
+        data: Record<string, unknown>;
+      }) => {
+        const terminal = ["SUCCEEDED", "FAILED", "CANCELED"].includes(String(args.data.status));
+        if (args.where.status === "PENDING" && rowStatus !== "PENDING")
+          return Promise.reject(Object.assign(new Error("not found"), { code: "P2025" }));
+        if (terminal) {
+          rowStatus = String(args.data.status);
+          finalData = args.data;
+        }
+        return Promise.resolve({ id: "relay-request" });
+      }) as never);
+      const lease = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        // The provider attempt has already succeeded when the lease is lost.
+        const result = boundDispatch();
+        lease.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      });
+      const response = await appWith(new FakeRelayManager(), boundLeaseRuntime(lease)).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(503);
+      await vi.waitFor(() => expect(rowStatus).not.toBe("PENDING"));
+      // The request the client saw (503) is the recorded outcome, not the
+      // provider's success.
+      expect(finalData).toMatchObject({ status: "FAILED", errorClass: "capacity_lease_lost" });
+    });
+
+    it("F2-CAP-3: a bound lease lost before hand-off settles the abandoned provider body", async () => {
+      const lease = new AbortController();
+      const bodyCancelled = vi.fn();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        const result = boundDispatch();
+        result.response = new Response(
+          new ReadableStream({
+            cancel(reason) {
+              bodyCancelled(reason);
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+        lease.abort(new CapacityLeaseLostError("ownership_lost"));
+        return result;
+      });
+      const response = await appWith(new FakeRelayManager(), boundLeaseRuntime(lease)).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(503);
+      expect(bodyCancelled).toHaveBeenCalledOnce();
+    });
+
+    it("F2-CAP-3: a bound error-body read that fails because the lease was lost answers 503", async () => {
+      const lease = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        const result = boundDispatch();
+        // A transport error (not the typed loss) surfaces from the body read.
+        result.response = new Response(
+          new ReadableStream({
+            start(controller) {
+              lease.signal.addEventListener(
+                "abort",
+                () => controller.error(new Error("socket hang up")),
+                { once: true },
+              );
+            },
+          }),
+          { status: 404, headers: { "content-type": "application/json" } },
+        );
+        setTimeout(() => lease.abort(new CapacityLeaseLostError("ownership_lost")), 0);
+        return result;
+      });
+      const response = await appWith(new FakeRelayManager(), boundLeaseRuntime(lease)).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "external_unavailable" },
+      });
+    });
+
+    it("F2-CAP-3: a bound lease lost while confirming ownership answers 503, never 429", async () => {
+      const runtime: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async (attempt) => ({
+          state: "LEASE_LOST" as const,
+          reason: new CapacityLeaseLostError("ownership_lost"),
+          executionTargetId: attempt.candidates[0]!.executionTargetId,
+          poolMemberId: attempt.candidates[0]!.poolMemberId,
+        })),
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(503);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+          }),
+        ),
+      );
+    });
+
+    it("F2-CAP-3: records a bound lease lost after commit as capacity_lease_lost", async () => {
+      let settle!: (terminal: { ok: boolean; responseBytes: number }) => void;
+      publicOverflow.dispatch.mockResolvedValueOnce(
+        boundDispatch(
+          new Promise((resolve) => {
+            settle = resolve;
+          }),
+        ),
+      );
+      const lease = new AbortController();
+      const runtime = admittingCapacityRuntime();
+      const admit = vi.mocked(runtime.acquire).getMockImplementation()!;
+      vi.mocked(runtime.acquire).mockImplementation(async (attempt, signal) => {
+        const admitted = await admit(attempt, signal);
+        return admitted.state === "ADMITTED"
+          ? { ...admitted, lease: { ...admitted.lease, signal: lease.signal } }
+          : admitted;
+      });
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+      expect(response.status).toBe(200);
+      lease.abort(new CapacityLeaseLostError("ownership_lost"));
+      settle({ ok: false, responseBytes: 2 });
+      await response.text().catch(() => "");
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FAILED", errorClass: "capacity_lease_lost" }),
+          }),
+        ),
+      );
+    });
+
     it.each(boundOperations)(
       "H1: %s holds the caller lease until the provider terminal settles",
       async (_label, method, path, create) => {
@@ -8890,6 +11914,10 @@ describe("model API routes", () => {
           },
         ],
       });
+      // The owner still pays for grantees (checked before provider admission).
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([boundProvider()], { fallbackForGrantees: true }),
+      );
       db.responseStickinessRecord.findUnique.mockResolvedValue(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
@@ -8916,6 +11944,46 @@ describe("model API routes", () => {
           accessGrantId: "binding-grant",
         }),
       });
+    });
+
+    // C1b-3 (F-C, #64): a grantee's bound operation after the owner stopped
+    // covering grantees is refused before provider admission (403).
+    it("answers a grantee's bound operation without admission when grantee coverage is off", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "binding-grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([boundProvider()], { fallbackForGrantees: false }),
+      );
+      db.responseStickinessRecord.findUnique.mockResolvedValue(
+        consentedProviderBinding({
+          poolGrantId: "binding-grant",
+          PoolGrant: {
+            id: "binding-grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      const runtime = admittingCapacityRuntime();
+
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(403);
+      expect(runtime.acquire).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
     });
 
     // R4: the cooldown shortcut applies the full binding match. A cooling
@@ -8967,6 +12035,34 @@ describe("model API routes", () => {
       expect(runtime.acquire).not.toHaveBeenCalled();
     });
 
+    // F-C (#64) and #76 on the bound path: owner flags and the owner's
+    // account are checked before provider admission, with the dispatcher's
+    // reasons (403 consent withdrawn, 404 pool no longer available), never a
+    // 429 after a wasted capacity wait.
+    it.each([
+      ["the owner turned fallback off", { enabled: false }, 403],
+      ["the owner's account is banned or deletion-marked", { ownerActive: false }, 404],
+    ] as const)(
+      "answers a bound operation without admission when %s",
+      async (_label, overrides, status) => {
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()], overrides));
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          "/responses/resp_provider",
+          boundRequest("GET", false),
+        );
+
+        expect(response.status).toBe(status);
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
     // R3: only a permanently invalid binding is "gone". Every transient
     // dispatcher outcome after listing is 503 with both leases released.
     it.each([
@@ -8980,6 +12076,8 @@ describe("model API routes", () => {
       ["GRANTEE_NOT_COVERED", 403],
       ["CALLER_CONSENT_WITHDRAWN", 403],
       ["REQUESTER_ACCESS_BLOCKED", 403],
+      // #76: the owner was banned or deletion-marked at the send boundary.
+      ["POOL_OWNER_INACTIVE", 404],
     ] as const)("maps a bound dispatch result %s to %i", async (reason, status) => {
       publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
       const limiter = new ModelApiConcurrencyLimiter();
@@ -9585,6 +12683,10 @@ describe("model API routes", () => {
           memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
         ]);
         if (isFollowUp) db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        // The early gate (before the native count fan-out) passes on an admitted
+        // create; the read fails at the send gate after admission.
+        if (withRuntime && !isFollowUp)
+          db.poolGrant.findFirst.mockResolvedValueOnce({ id: "grant-id" });
         db.poolGrant.findFirst.mockRejectedValue(new Error("connection pool timeout"));
         const limiter = new ModelApiConcurrencyLimiter();
         const outstanding = trackLeases(limiter);
@@ -9607,6 +12709,8 @@ describe("model API routes", () => {
           },
         );
         expect(response.status).toBe(500);
+        // A refused send is not a local route: no route header (CF2-2).
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
         expect(manager.sent).toEqual([]);
         expect(outstanding()).toBe(0);
         if (withRuntime) {
@@ -9618,31 +12722,65 @@ describe("model API routes", () => {
       },
     );
 
-    it("checks the send boundary before claiming a half-open trial", async () => {
-      db.poolMember.findMany.mockResolvedValue([
-        poolMemberRow({
+    // The one send gate runs after the half-open claim, so EVERY denial kind
+    // gives the claimed trial back (fenced on the claim's timestamp).
+    it.each([
+      ["its grant is revoked", 404],
+      ["the pool owner is banned", 404],
+      ["the requester is banned", 401],
+      ["the member is removed", 404],
+      ["the account read fails", 500],
+    ] as const)(
+      "releases a claimed half-open trial when the send gate refuses: %s",
+      async (name, status) => {
+        const halfOpen = poolMemberRow({
           id: "member-a",
           discoveredModelId: "model-a",
           upstreamModelId: "upstream-a",
           cliDeviceId: "cli-a",
           healthStatus: "HALF_OPEN",
-        }),
-      ]);
-      db.poolGrant.findFirst.mockResolvedValue(null);
-      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
-      updateMany.mockResolvedValue({ count: 1 });
-      const manager = new FakeRelayManager();
-      manager.activeCliDeviceIds = ["cli-a"];
-      const response = await appWith(manager).request("/responses", {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
-      });
-      expect(response.status).toBe(404);
-      expect(manager.sent).toEqual([]);
-      // No trial was claimed, so none is left stranded.
-      expect(updateMany).not.toHaveBeenCalled();
-    });
+        });
+        db.poolMember.findMany.mockResolvedValue([halfOpen]);
+        const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+        updateMany.mockResolvedValue({ count: 1 });
+        // The refusal lands while the claim is being written: after routing.
+        updateMany.mockImplementationOnce(async () => {
+          if (name === "its grant is revoked") db.poolGrant.findFirst.mockResolvedValue(null);
+          if (name === "the member is removed") db.poolMember.findMany.mockResolvedValue([]);
+          if (name === "the pool owner is banned" || name === "the requester is banned")
+            db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) =>
+              (args.where.id === "pool-owner-id") === (name === "the pool owner is banned")
+                ? { banned: true, banExpires: null, deletionRequestedAt: null }
+                : { banned: false, banExpires: null, deletionRequestedAt: null },
+            );
+          if (name === "the account read fails")
+            db.user.findUnique.mockRejectedValue(new Error("db down"));
+          return { count: 1 };
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const response = await appWith(manager).request("/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+        });
+        expect(response.status).toBe(status);
+        expect(manager.sent).toEqual([]);
+        const writes = updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+        const claim = writes.find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+        expect(claim).toBeDefined();
+        expect(writes.at(-1)).toEqual({
+          where: {
+            id: "member-a",
+            healthStatus: "HALF_OPEN",
+            halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+          },
+          data: { halfOpenTrialStartedAt: null },
+        });
+      },
+    );
 
     it("skips a member removed before the send and serves the request from the next member", async () => {
       const memberB = poolMemberRow({
@@ -9799,12 +12937,133 @@ describe("model API routes", () => {
     });
   });
 
+  // C1a-1 (#76): a follow-up pinned to a local pool member is not sent once
+  // the pool owner is banned or deletion-marked, even after admission.
+  // C3-3: both the GET/DELETE lifecycle path and the POST follow-up path
+  // answer like arrival, without x-wsmp-route.
+  it.each(["GET", "POST"] as const)(
+    "does not send a sticky pool %s follow-up once the pool owner lost access",
+    async (method) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.responseStickinessRecord.findUnique.mockResolvedValue({
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        targetDiscoveredModelId: null,
+        targetModelPoolId: "pool-id",
+        selectedDiscoveredModelId: "model-a",
+        TargetExecutionTarget: null,
+        SelectedExecutionTarget: { discoveredModelId: "model-a" },
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      const member = directRow({
+        id: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(member);
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async (attempt) => {
+          const candidate = attempt.candidates[0]!;
+          return {
+            state: "ADMITTED" as const,
+            lease: {
+              leaseId: "pool-sticky-lease",
+              attemptId: attempt.attemptId,
+              capacityId: candidate.capacityId,
+              executionTargetId: candidate.executionTargetId,
+              poolMemberId: candidate.poolMemberId,
+              fencingToken: 1n,
+              expiresAt: new Date(Date.now() + 30_000),
+            },
+          };
+        }),
+        release: vi.fn().mockResolvedValue(true),
+        hold: vi.fn((response) => response),
+      };
+
+      const response =
+        method === "GET"
+          ? await appWith(manager, capacityRuntime).request("/responses/resp_123", {
+              headers: { authorization: "Bearer wsmp_model_test" },
+            })
+          : await appWith(manager, capacityRuntime).request("/responses", {
+              method: "POST",
+              headers: {
+                authorization: "Bearer wsmp_model_test",
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({
+                model: poolTarget.modelId,
+                previous_response_id: "resp_123",
+                input: "follow-up prompt",
+              }),
+            });
+
+      expect(response.status).toBe(404);
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: member.userId } }),
+      );
+      expect(manager.sent).toHaveLength(0);
+      expect(capacityRuntime.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  // C2-1 (#76): a local-member follow-up to a pool that is no longer visible
+  // (owner banned or deletion-marked, or grant lost) is not found, as at
+  // arrival and for provider bindings; never 401.
+  it("answers 404 for a sticky follow-up to a pool that is no longer visible", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [],
+    });
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 2,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/responses/resp_123", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+
+    expect(response.status).toBe(404);
+    expect(manager.sent).toHaveLength(0);
+  });
+
   describe("pool media transformer", () => {
     const transformerId = "transformer-model-id";
     const transformerUpstream = "vlm-upstream";
 
     function enablePoolTransformer(overrides: Record<string, unknown> = {}) {
       db.modelPool.findUnique.mockResolvedValue({
+        userId: poolTarget.ownerUserId,
         transformerDiscoveredModelId: transformerId,
         transformerSystemPrompt: null,
         transformerImages: true,
@@ -9839,6 +13098,110 @@ describe("model API routes", () => {
         };
       });
     }
+
+    // C2-2 (#76): every transformer hop hands the grantee's media to the pool
+    // owner's machine; a banned owner stops the prepass before any hop.
+    it("sends no transformer hop once the pool owner is banned", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer({ userId: poolTarget.ownerUserId });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const response = await appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "what is this?" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+              ],
+            },
+          ],
+        }),
+      });
+
+      expect(response.status).toBe(404);
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: poolTarget.ownerUserId } }),
+      );
+      expect(manager.sent).toHaveLength(0);
+    });
+
+    // C3-2: the owner is re-read before EVERY hop; a ban saved during the
+    // prepass stops the next hop.
+    it("stops the transformer prepass at the next hop once the owner is banned", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer({ userId: poolTarget.ownerUserId });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockReset();
+      db.user.findUnique
+        .mockResolvedValueOnce({ banned: false, banExpires: null, deletionRequestedAt: null })
+        .mockResolvedValue({ banned: true, banExpires: null, deletionRequestedAt: null });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+      const image = (text: string) => ({
+        role: "user",
+        content: [
+          { type: "text", text },
+          { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+        ],
+      });
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [image("first"), { role: "assistant", content: "ok" }, image("second")],
+        }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const hop = requireSent(manager, 0);
+      manager.headers(hop.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        hop.requestId,
+        JSON.stringify({ choices: [{ message: { role: "assistant", content: "A cat." } }] }),
+      );
+      manager.complete(hop.requestId);
+      const response = await responsePromise;
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(1);
+      expect(db.user.findUnique).toHaveBeenCalledTimes(2);
+    });
 
     it("transforms media then forwards rewritten chat to the pool primary", async () => {
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
@@ -10278,6 +13641,7 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
   return {
     fallbackEnabled: true,
     fallbackForGrantees: false,
+    User: { banned: false, banExpires: null, deletionRequestedAt: null },
     PoolMembers: [
       {
         id: "member-cooldown",
@@ -10333,3 +13697,199 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
     ],
   };
 }
+
+// Design pass (authz-boundaries, #76, #95): assertLocalSendAllowed is THE enforcement
+// point for work handed to a pool owner's machines. Every relay send site in
+// apps/server/src must be listed here (with its count); a gated site must be
+// preceded by the gate with no wait, admission or loop head in between. See
+// prs/64-76/design-authz-boundaries.md.
+describe("local send gate (static)", () => {
+  const sendCall = /\b(startRelayAttempt|sendRelayRequest|nativeContextCount)\(\{/g;
+  const srcRoot = new URL("../", import.meta.url);
+  const source = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
+  const { parse } = createRequire(import.meta.url)(
+    "@babel/parser",
+  ) as typeof import("@babel/parser");
+  const listSources = (dir: URL): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory()
+        ? listSources(new URL(`${entry.name}/`, dir)).map((file) => `${entry.name}/${file}`)
+        : entry.name.endsWith(".ts") &&
+            !entry.name.endsWith(".test.ts") &&
+            !entry.name.endsWith(".test-helper.ts")
+          ? [entry.name]
+          : [],
+    );
+
+  it("lists every relay send site in the server sources", () => {
+    // Other modules: exact counts, all exempt from the local-send gate.
+    const exemptFiles: Record<string, number> = {
+      // The executor itself (definition and its one manager send).
+      "model-api/relay-executor.ts": 2,
+      // The manager's own definition and the owner's system health probe (no grantee data).
+      "relay/session-manager.ts": 2,
+      // Owner-only member diagnostics: the caller is the authenticated owner.
+      "model-api/diagnostics.ts": 1,
+    };
+    const counts: Record<string, number> = {};
+    for (const file of listSources(srcRoot)) {
+      if (file === "model-api/routes.ts") continue;
+      const found = [...readFileSync(new URL(file, srcRoot), "utf8").matchAll(sendCall)].length;
+      if (found > 0) counts[file] = found;
+    }
+    expect(counts).toEqual(exemptFiles);
+  });
+
+  type AstNode = { type: string; start: number; end: number; [key: string]: unknown };
+  const isAstNode = (value: unknown): value is AstNode =>
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { type?: unknown }).type === "string" &&
+    typeof (value as { start?: unknown }).start === "number";
+  const astChildren = (node: AstNode): AstNode[] =>
+    Object.entries(node).flatMap(([key, value]) =>
+      key === "loc" || key === "extra"
+        ? []
+        : Array.isArray(value)
+          ? value.filter(isAstNode)
+          : isAstNode(value)
+            ? [value]
+            : [],
+    );
+  const program = parse(source, {
+    sourceType: "module",
+    plugins: ["typescript"],
+  }).program as unknown as AstNode;
+  const parents = new Map<AstNode, AstNode>();
+  const calls: AstNode[] = [];
+  const indexAst = (node: AstNode) => {
+    if (node.type === "CallExpression") calls.push(node);
+    for (const child of astChildren(node)) {
+      parents.set(child, node);
+      indexAst(child);
+    }
+  };
+  indexAst(program);
+  const calleeName = (call: AstNode) => {
+    const callee = call.callee as AstNode;
+    return callee.type === "Identifier" ? (callee.name as string) : null;
+  };
+  const isFunctionNode = (node: AstNode) =>
+    node.type === "FunctionDeclaration" ||
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ObjectMethod" ||
+    node.type === "ClassMethod";
+  const ancestorsOf = (node: AstNode) => {
+    const chain: AstNode[] = [];
+    for (let current = parents.get(node); current; current = parents.get(current))
+      chain.push(current);
+    return chain;
+  };
+
+  /**
+   * AST proof that `assertLocalSendAllowed` runs before `send` on every path
+   * that reaches it (CF2-3; a matching string is not an executed gate): an
+   * awaited expression statement whose ancestors are (a) ancestors of the
+   * send too, or (b) an `if` whose test text is listed for the site and whose
+   * then-branch holds the gate; with no await, `for` or `while` between the
+   * gate and the send. `if (false)`, an un-awaited call, or a gate in a
+   * sibling branch all fail.
+   */
+  const gateDominatesSend = (send: AstNode, allowedConditions: readonly string[]) => {
+    const fn = ancestorsOf(send).find(isFunctionNode);
+    if (!fn) return false;
+    const sendAncestors = new Set(ancestorsOf(send));
+    return calls.some((gate) => {
+      if (calleeName(gate) !== "assertLocalSendAllowed" || gate.end > send.start) return false;
+      if (ancestorsOf(gate).find(isFunctionNode) !== fn) return false;
+      const awaited = parents.get(gate);
+      const statement = awaited && parents.get(awaited);
+      if (awaited?.type !== "AwaitExpression" || statement?.type !== "ExpressionStatement")
+        return false;
+      const path = [statement, ...ancestorsOf(statement)];
+      for (const [index, node] of path.entries()) {
+        if (node === fn) break;
+        // A plain block only groups statements; the `if` above it is what gates.
+        if (node === statement || node.type === "BlockStatement" || sendAncestors.has(node))
+          continue;
+        // Not shared with the send: only a listed `if` with the gate in its then-branch.
+        const listed =
+          node.type === "IfStatement" &&
+          path[index - 1] === node.consequent &&
+          allowedConditions.includes(
+            source.slice((node.test as AstNode).start, (node.test as AstNode).end),
+          );
+        if (!listed) return false;
+      }
+      return !/\bawait\b|\bfor \(|\bwhile \(/.test(source.slice(gate.end, send.start));
+    });
+  };
+
+  it("gates every pool-scoped local send in routes.ts", () => {
+    const sendNodes = new Map<number, AstNode>(
+      calls.map((call) => [(call.callee as AstNode).start, call] as const),
+    );
+    const declarations = [
+      ...source.matchAll(/^(?:export )?(?:(?:async )?function (\w+)\(|const (\w+) =)/gm),
+    ].map((match) => ({ name: (match[1] ?? match[2])!, index: match.index }));
+    const enclosing = (index: number) =>
+      declarations.filter((declaration) => declaration.index < index).at(-1)!;
+    // Per function: how many relay sends (startRelayAttempt) and native-count
+    // calls it has, and whether its sends reach a pool owner's machine.
+    type SiteEntry = {
+      gated: boolean;
+      sends: number;
+      counts: number;
+      /** The only `if` conditions the gate may sit under (pool-scoped variants of a shared function). */
+      conditions?: readonly string[];
+    };
+    const table: Record<string, SiteEntry> = {
+      // Pool member attempts and retries; the native-count fan-out passes
+      // pool.ownerUserId and pool.accessGrantId (required by the type) and is gated inside.
+      relayPool: { gated: true, sends: 1, counts: 1 },
+      // Stored-Responses follow-up pinned to a pool member.
+      relaySelectedModelNoFailover: {
+        gated: true,
+        sends: 1,
+        counts: 0,
+        conditions: ["requestedModelPoolId"],
+      },
+      // Every media-transformer hop (owner-owned transformer model).
+      maybeApplyPoolMediaTransformer: { gated: true, sends: 1, counts: 0 },
+      // Gated when counting for a pool member (pool.ownerUserId).
+      nativeContextCount: { gated: true, sends: 1, counts: 0, conditions: ["pool"] },
+      // The requester's own direct models; a banned requester cannot authenticate.
+      relayDirect: { gated: false, sends: 1, counts: 1 },
+    };
+    const found: Record<string, SiteEntry> = {};
+    for (const match of source.matchAll(sendCall)) {
+      if (source.slice(Math.max(0, match.index - 15), match.index).includes("function")) continue;
+      const fn = enclosing(match.index);
+      const entry = table[fn.name];
+      expect(entry, `${match[1]} in ${fn.name} is not a listed send site`).toBeDefined();
+      found[fn.name] ??= {
+        gated: entry?.gated ?? false,
+        sends: 0,
+        counts: 0,
+        ...(entry?.conditions ? { conditions: entry.conditions } : {}),
+      };
+      const tally = found[fn.name]!;
+      if (match[1] === "nativeContextCount") {
+        tally.counts += 1;
+        continue;
+      }
+      tally.sends += 1;
+      if (!entry?.gated) continue;
+      // The gate must DOMINATE the send (CF2-3): a matching string is not an
+      // executed gate. See gateDominatesSend.
+      const sendNode = sendNodes.get(match.index);
+      expect(sendNode, `${match[1]} in ${fn.name}: send call not found in the AST`).toBeDefined();
+      expect(
+        gateDominatesSend(sendNode!, entry.conditions ?? []),
+        `${match[1]} in ${fn.name}: no awaited unconditional assertLocalSendAllowed before the send (allowed conditions: ${(entry.conditions ?? []).join(", ") || "none"}), or an await/loop head between them`,
+      ).toBe(true);
+    }
+    expect(found).toEqual(table);
+  });
+});

@@ -469,6 +469,15 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },
   {
+    name: "forwarder_device_metrics_get",
+    target: "forwarderManagement.getCliDeviceMetrics",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
+  },
+  {
     name: "forwarder_model_pools_list",
     target: "forwarderManagement.listModelPools",
     scope: "read",
@@ -797,8 +806,9 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     // fallbackEnabled / fallbackForGrantees go through the dedicated,
-    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
-    // passes through (audited). Token external consent is never an MCP arg.
+    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs and
+    // cacheHolderWaitMs pass through (audited). Token external consent is
+    // never an MCP arg.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
@@ -811,8 +821,9 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     // fallbackEnabled / fallbackForGrantees go through the dedicated,
-    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs
-    // passes through (audited). Capacity policy fields are always admitted.
+    // cost-described forwarder_pool_fallback_update; externalAfterWaitMs and
+    // cacheHolderWaitMs pass through (audited). Capacity policy fields are
+    // always admitted.
     inputSchema: poolArgsWithoutFallbackSwitches(),
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],

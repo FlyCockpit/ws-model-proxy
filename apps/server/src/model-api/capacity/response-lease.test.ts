@@ -1,5 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CapacityLeaseLostError } from "./lease-loss.js";
 import { holdCapacityLeaseForResponse } from "./response-lease.js";
+
+afterEach(() => vi.useRealTimers());
 
 const lease = {
   leaseId: "lease",
@@ -65,33 +68,59 @@ describe("capacity response lease lifetime", () => {
   });
 
   it.each([
-    ["returns false", vi.fn().mockResolvedValue(false)],
-    ["rejects", vi.fn().mockRejectedValue(new Error("database unavailable"))],
-  ])("cancels and errors the response when heartbeat %s", async (_label, heartbeat) => {
-    vi.useFakeTimers();
+    ["returns false", vi.fn().mockResolvedValue(false), 10],
+    // A thrown heartbeat is retried inside the acknowledged TTL; only when no
+    // retry fits (here after the 1 s, 2 s, 4 s, ... backoff) is the lease lost.
+    ["keeps rejecting", vi.fn().mockRejectedValue(new Error("database unavailable")), 28_000],
+  ])(
+    "cancels and errors the response when heartbeat %s",
+    async (_label, heartbeat, lossAfterMs) => {
+      vi.useFakeTimers();
+      const cancelled = vi.fn();
+      const source = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("first"));
+        },
+        cancel: cancelled,
+      });
+      const release = vi.fn().mockResolvedValue(true);
+      const response = holdCapacityLeaseForResponse({
+        response: new Response(source),
+        store: { heartbeat, release },
+        lease,
+        heartbeatIntervalMs: 10,
+      });
+      const reader = response.body!.getReader();
+      await expect(reader.read()).resolves.toMatchObject({ done: false });
+      await vi.advanceTimersByTimeAsync(lossAfterMs);
+      await expect(reader.read()).rejects.toThrow(CapacityLeaseLostError);
+      expect(cancelled).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(release).toHaveBeenCalledTimes(1);
+      vi.useRealTimers();
+    },
+  );
+
+  it("refuses the hand-off when the lease was already lost before any byte", async () => {
     const cancelled = vi.fn();
-    const source = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        controller.enqueue(new TextEncoder().encode("first"));
-      },
-      cancel: cancelled,
-    });
+    const source = new ReadableStream<Uint8Array>({ cancel: cancelled });
     const release = vi.fn().mockResolvedValue(true);
-    const response = holdCapacityLeaseForResponse({
-      response: new Response(source),
-      store: { heartbeat, release },
-      lease,
-      heartbeatIntervalMs: 10,
-    });
-    const reader = response.body!.getReader();
-    await expect(reader.read()).resolves.toMatchObject({ done: false });
-    await vi.advanceTimersByTimeAsync(10);
-    await expect(reader.read()).rejects.toThrow();
+    const controller = new AbortController();
+    const lost = new CapacityLeaseLostError("ownership_lost");
+    controller.abort(lost);
+    expect(() =>
+      holdCapacityLeaseForResponse({
+        response: new Response(source),
+        store: { heartbeat: vi.fn(), release },
+        lease,
+        signal: controller.signal,
+        heartbeatIntervalMs: 0,
+      }),
+    ).toThrow(lost);
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(cancelled).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(release).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
   });
 
   it("handles a pre-aborted signal without exposing upstream chunks", async () => {
@@ -105,14 +134,16 @@ describe("capacity response lease lifetime", () => {
     const release = vi.fn().mockResolvedValue(true);
     const controller = new AbortController();
     controller.abort("already gone");
-    const response = holdCapacityLeaseForResponse({
-      response: new Response(source),
-      store: { heartbeat: vi.fn(), release },
-      lease,
-      signal: controller.signal,
-      heartbeatIntervalMs: 0,
-    });
-    await expect(response.body!.getReader().read()).rejects.toThrow();
+    expect(() =>
+      holdCapacityLeaseForResponse({
+        response: new Response(source),
+        store: { heartbeat: vi.fn(), release },
+        lease,
+        signal: controller.signal,
+        heartbeatIntervalMs: 0,
+      }),
+    ).toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(cancelled).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
   });

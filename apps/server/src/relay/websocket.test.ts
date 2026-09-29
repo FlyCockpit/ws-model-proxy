@@ -1,5 +1,6 @@
+import type { WebSocketLike } from "@hono/node-server";
 import { Hono } from "hono";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RELAY_SUBPROTOCOL } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -43,7 +44,9 @@ vi.mock("../rate-limit.js", () => ({
 const { authenticateCliWebsocketSecret } = await import(
   "@ws-model-proxy/api/lib/cli-credential-access"
 );
-const { createRelayWebsocketMiddleware } = await import("./websocket.js");
+const { createRelayWebsocketMiddleware, relaySocketEvents } = await import("./websocket.js");
+const { relaySessionManager } = await import("./session-manager.js");
+const { WSContext } = await import("hono/ws");
 
 const authenticateMock = vi.mocked(authenticateCliWebsocketSecret);
 
@@ -132,5 +135,87 @@ describe("createRelayWebsocketMiddleware", () => {
     await expect(response.json()).resolves.toEqual({
       error: "Invalid or revoked CLI websocket credential.",
     });
+  });
+});
+
+describe("relay upgrade during shutdown", () => {
+  const identity = {
+    userId: "user-id",
+    cliCredentialId: "cred-id",
+    cliDeviceId: null,
+  } as unknown as Parameters<typeof relaySocketEvents>[0];
+
+  function fakeWs() {
+    const closes: Array<{ code?: number; reason?: string }> = [];
+    const raw = {
+      readyState: 1 as 0 | 1 | 2 | 3,
+      send: () => undefined,
+      close: (code?: number, reason?: string) => {
+        closes.push({ code, reason });
+      },
+    };
+    return { ws: new WSContext<WebSocketLike>(raw), closes };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    limiterState.hits = 0;
+    limiterState.limit = Number.POSITIVE_INFINITY;
+  });
+
+  afterEach(() => {
+    // Test hygiene only: production never clears the flag.
+    Reflect.set(relaySessionManager, "relayDrain", false);
+  });
+
+  const sessionCount = () =>
+    (Reflect.get(relaySessionManager, "sessionsBySocket") as Map<unknown, unknown>).size;
+
+  it("closes with the shutdown code and never registers a socket whose authentication finishes after the drain began", async () => {
+    let finishAuth: (value: typeof identity) => void = () => {};
+    authenticateMock.mockReturnValue(
+      new Promise((resolve) => {
+        finishAuth = resolve as typeof finishAuth;
+      }),
+    );
+    const hono = new Hono();
+    hono.use("/api/cli/ws", createRelayWebsocketMiddleware());
+    let handlerIdentity: typeof identity | undefined;
+    hono.get("/api/cli/ws", (c) => {
+      handlerIdentity = (c as unknown as { get: (k: string) => typeof identity }).get(
+        "relayIdentity",
+      );
+      return c.text("upgraded");
+    });
+
+    // The drain check passed; authentication is now in flight.
+    const upgrade = hono.request("/api/cli/ws", {
+      method: "GET",
+      headers: websocketHeaders({ Authorization: "Bearer wsmp_cli_secret" }),
+    });
+    await vi.waitFor(() => expect(authenticateMock).toHaveBeenCalledTimes(1));
+    expect(relaySessionManager.isDraining()).toBe(false);
+    relaySessionManager.beginDrain();
+    finishAuth(identity);
+    expect((await upgrade).status).toBe(200);
+    expect(handlerIdentity).toBe(identity);
+
+    // The upgrade completes: onOpen runs for the authenticated socket.
+    const { ws, closes } = fakeWs();
+    relaySocketEvents(handlerIdentity as typeof identity).onOpen?.(new Event("open"), ws);
+    expect(closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    expect(sessionCount()).toBe(0);
+  });
+
+  it("still registers a socket that opens before the drain", async () => {
+    const { ws, closes } = fakeWs();
+    relaySocketEvents(identity).onOpen?.(new Event("open"), ws);
+    try {
+      expect(closes).toEqual([]);
+      expect(sessionCount()).toBe(1);
+    } finally {
+      relaySocketEvents(identity).onClose?.(new CloseEvent("close"), ws);
+      await vi.waitFor(() => expect(sessionCount()).toBe(0));
+    }
   });
 });

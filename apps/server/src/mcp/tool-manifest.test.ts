@@ -44,6 +44,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
+  "forwarder_device_metrics_get",
   "forwarder_model_pools_list",
   "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
@@ -155,6 +156,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
+  forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
   forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
@@ -258,13 +260,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 26 read + 51 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 27 read + 51 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(26);
+    expect(PLAN_READ_TOOLS).toHaveLength(27);
     expect(PLAN_WRITE_TOOLS).toHaveLength(51);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(77);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(78);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -447,9 +449,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 77 catalog entries − 5 extracted cores = 72 procedure dispatches.
-    expect(dispatched).toBe(72);
-    expect(invoked).toHaveLength(72);
+    // 78 catalog entries − 5 extracted cores = 73 procedure dispatches.
+    expect(dispatched).toBe(73);
+    expect(invoked).toHaveLength(73);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -534,6 +536,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         id: "pool",
         name: "Pool",
         externalAfterWaitMs: 500,
+        cacheHolderWaitMs: 1_500,
       });
       expect(allowed).not.toHaveProperty("issues");
       // K1-1: the external wait they still accept carries its cost statement.

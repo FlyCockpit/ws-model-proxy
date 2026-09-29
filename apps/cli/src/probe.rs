@@ -22,6 +22,9 @@ pub struct ProbeReport {
     pub suggested_default_capabilities: OpenAiCompatibleCapabilities,
     pub model_suggestions: Vec<ModelSuggestion>,
     pub error: Option<String>,
+    /// Engine detection result (online probes only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<crate::engine::DetectedEngine>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +62,9 @@ struct ModelRow {
     reasoning: Option<UpstreamReasoning>,
     #[serde(default, deserialize_with = "deserialize_advisory_option")]
     model_spec: Option<UpstreamModelSpec>,
+    /// vLLM reports each served model's context limit.
+    #[serde(default, deserialize_with = "deserialize_advisory_option")]
+    max_model_len: Option<u64>,
 }
 
 /// Discovery metadata is advisory: a malformed optional hint must not make an
@@ -116,6 +122,7 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
             suggested_default_capabilities: endpoint.default_capabilities.clone(),
             model_suggestions: Vec::new(),
             error: Some(error.to_string()),
+            engine: None,
         },
     }
 }
@@ -169,6 +176,11 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .iter()
         .filter_map(suggest_model_from_upstream)
         .collect();
+    let model_limits = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.max_model_len))
+        .collect::<Vec<_>>();
+    let engine = crate::engine::detect_engine(endpoint, &model_limits);
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
@@ -176,6 +188,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         suggested_default_capabilities: endpoint.default_capabilities.clone(),
         model_suggestions,
         error: None,
+        engine: Some(engine),
     })
 }
 
@@ -183,11 +196,18 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
     let Some(endpoint) = config.endpoint_mut(&report.endpoint_slug) else {
         anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
     };
+    // An offline probe keeps the engine facts the last online probe found,
+    // so a restarting upstream does not flap its facts.
+    let previous_engine = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.clone());
     if report.status == ProbeStatus::Online {
         endpoint.last_probe = Some(ProbeSnapshot {
             status: ProbeStatus::Online,
             models: report.discovered_model_ids.clone(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
+            engine: report.engine.clone(),
         });
         let discovered: std::collections::HashSet<&str> = report
             .discovered_model_ids
@@ -233,6 +253,7 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
             status: ProbeStatus::Offline,
             models: Vec::new(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
+            engine: previous_engine,
         });
     }
     Ok(())
@@ -652,6 +673,7 @@ mod tests {
                 suggested_default_capabilities: OpenAiCompatibleCapabilities::default(),
                 model_suggestions: vec![],
                 error: None,
+                engine: None,
             },
             false,
         )
@@ -708,6 +730,7 @@ mod tests {
                     capabilities: OpenAiCompatibleCapabilities::openai_defaults(),
                 }],
                 error: None,
+                engine: None,
             },
             true,
         )
