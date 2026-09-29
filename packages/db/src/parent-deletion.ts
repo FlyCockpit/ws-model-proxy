@@ -250,11 +250,45 @@ function noteDrainWork(budget: DrainBudget, rows: number): void {
   }
 }
 
-const PERMANENT_CODES = new Set(["RETAINED_HISTORY", "P2003", "P2014", "23503", "23514", "55000"]);
+const PERMANENT_CODES = new Set(["RETAINED_HISTORY", "P2003", "P2014", "23503", "23514"]);
+
+/**
+ * SQLSTATE 55000 (object_not_in_prerequisite_state) is what the hardening
+ * triggers (schema-hardening.sql) raise for both kinds of refusal:
+ *
+ * - permanent: a table that refuses every DELETE (append-only history,
+ *   `provider_attempt`, budget reservations, budget rules). Retrying the same
+ *   delete hits the same trigger;
+ * - transient: the relay execution attempt state checks (identity, active
+ *   ownership, terminal immutability, heartbeat), which a delete can meet
+ *   while an attempt is being finalized concurrently. The next try sees the
+ *   settled row.
+ *
+ * So a 55000 is transient (retried with the sweep's backoff) unless its
+ * message is one of the permanent refusals below. Keep this list in step
+ * with the refusing triggers in schema-hardening.sql.
+ */
+const OBJECT_NOT_IN_PREREQUISITE_STATE = "55000";
+const PERMANENT_55000_MESSAGES: readonly RegExp[] = [
+  /\bis append-only\b/,
+  /\bprovider_attempt is durable history\b/,
+  /\bprovider budget reservations cannot be deleted\b/,
+  /\bprovider budget rules are immutable\b/,
+];
+
+function isPermanent55000(candidate: object): boolean {
+  for (const key of ["message", "originalMessage"]) {
+    const message = Reflect.get(candidate, key);
+    if (typeof message === "string" && PERMANENT_55000_MESSAGES.some((re) => re.test(message)))
+      return true;
+  }
+  return false;
+}
 
 /**
  * True for failures a retry cannot fix: retained history, a foreign-key or
- * check violation (a database invariant refused the delete). Deadlocks,
+ * check violation (a database invariant refused the delete), or a 55000 from
+ * a trigger that refuses every delete of its table. Other 55000s, deadlocks,
  * serialization failures, timeouts, lost connections and shutdown are
  * transient.
  */
@@ -267,7 +301,11 @@ export function isPermanentParentDeletionFailure(error: unknown): boolean {
     seen.add(candidate);
     for (const key of ["code", "originalCode"]) {
       const code = Reflect.get(candidate, key);
-      if (typeof code === "string" && PERMANENT_CODES.has(code)) return true;
+      if (typeof code !== "string") continue;
+      if (PERMANENT_CODES.has(code)) return true;
+      // The message sits next to the SQLSTATE on the same object (the
+      // driver-adapter cause, or a raw query's `meta`).
+      if (code === OBJECT_NOT_IN_PREREQUISITE_STATE && isPermanent55000(candidate)) return true;
     }
     for (const key of ["meta", "driverAdapterError", "cause"])
       pending.push(Reflect.get(candidate, key));

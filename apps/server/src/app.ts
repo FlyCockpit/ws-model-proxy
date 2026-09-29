@@ -5,7 +5,7 @@ import { onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
-import { createContext } from "@ws-model-proxy/api/context";
+import { type Context as ApiContext, createContext } from "@ws-model-proxy/api/context";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -20,9 +20,10 @@ import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
+import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
-import { deviceAdminGate } from "./device-admin-gate.js";
-import { deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
+import { ALWAYS_CSRF_PROTECTED_PROCEDURES } from "./csrf-policy.js";
+import { deviceCodeBodyCap, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
@@ -87,6 +88,7 @@ import { transcriptionContentLengthGuard } from "./model-api/transcription-body-
 import { logOrpcError } from "./orpc-error-log.js";
 import {
   authLimiter,
+  consumeDeviceCodeExchange,
   createRateLimiterMiddleware,
   emailRecipientLimiter,
   mcpClientRegistrationLimiter,
@@ -581,6 +583,11 @@ export async function createApp(options: CreateAppOptions = {}) {
     }),
   );
 
+  // `wsmp login`'s public, unauthenticated start: its 16 KiB cap must run
+  // BEFORE the global limit below, which buffers a body without
+  // Content-Length (up to 10 MB) before calling the next middleware.
+  app.use("/api/auth/device/code", deviceCodeBodyCap);
+
   // Body-limit — reject oversized payloads early (before JSON parsing) to
   // prevent memory exhaustion. 10 MB covers image uploads and large form
   // payloads; individual routes can override with a tighter limit if needed.
@@ -779,13 +786,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   // multiply guesses against a single account.
   app.use(SIGNIN_FAILURE_PATH, signinFailureLimit(signinFailureLimiter));
 
-  // Verified-admin gate for the deviceAuthorization plugin's approve/deny
-  // endpoints. The plugin only checks "is this user signed in" — without this
-  // guard a signed-in non-admin or unverified admin could call these endpoints
-  // directly and approve a pending CLI device flow. See `device-admin-gate.ts`
-  // for the shape of the rejection. Must be mounted BEFORE the auth handler.
-  app.use("/api/auth/device/approve", deviceAdminGate);
-  app.use("/api/auth/device/deny", deviceAdminGate);
+  // Better Auth's `/device`, `/device/approve`, `/device/deny` and
+  // `/device/token` are disabled (`DISABLED_DEVICE_AUTHORIZATION_PATHS`): the
+  // approval page claims and approves in `cliCredentials.approveDeviceLogin`.
   // A `wsmp login` too old to name its CLI slug gets an upgrade message it prints.
   app.use("/api/auth/device/code", deviceCodeUpgradeGate);
 
@@ -860,10 +863,19 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api-reference/*", createRateLimiterMiddleware(rpcLimiter));
 
   // When CORS_ORIGIN is set (cross-origin deployment), validate the x-csrf-token
-  // header sent by the client's SimpleCsrfProtectionLinkPlugin. Same-origin
-  // deployments don't need this because browsers block cross-origin custom
-  // headers at preflight anyway.
-  const csrfPlugins = env.CORS_ORIGIN ? [new SimpleCsrfProtectionHandlerPlugin()] : [];
+  // header sent by the client's SimpleCsrfProtectionLinkPlugin on every
+  // procedure. Same-origin deployments check it only on the procedures in
+  // ALWAYS_CSRF_PROTECTED_PROCEDURES: a cross-origin page (a same-site
+  // sibling subdomain, whose request still carries the SameSite=Lax session
+  // cookie) cannot add the header without a CORS preflight, which a
+  // same-origin deployment never grants.
+  const csrfPlugins = [
+    new SimpleCsrfProtectionHandlerPlugin<ApiContext>({
+      exclude: env.CORS_ORIGIN
+        ? false
+        : ({ path }) => !ALWAYS_CSRF_PROTECTED_PROCEDURES.has(path.join(".")),
+    }),
+  ];
 
   const apiHandler = new OpenAPIHandler(appRouter, {
     plugins: [
@@ -886,7 +898,12 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/*", async (c, next) => {
     const context = await createContext({
       context: c,
-      services: cliContextServices(),
+      services: {
+        ...cliContextServices(),
+        // `cliCredentials.exchangeDeviceCode`, per call (a batch is several).
+        limitDeviceCodeExchange: (deviceCode: string) =>
+          consumeDeviceCodeExchange(resolveClientIp(c), deviceCode),
+      },
     });
 
     const rpcResult = await rpcHandler.handle(c.req.raw, {

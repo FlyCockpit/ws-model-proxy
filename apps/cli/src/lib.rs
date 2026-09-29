@@ -30,5 +30,6 @@ pub mod state;
 pub mod supervised_run;
 pub mod terminal_crypto;
 pub mod terminal_identity;
+pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;

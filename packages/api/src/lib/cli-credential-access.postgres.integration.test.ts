@@ -583,4 +583,195 @@ integration("device-code exchange with real PostgreSQL", () => {
       await pause.drop();
     }
   });
+  function approverClient(userId: string) {
+    return import("../routers/cli-credentials").then(async ({ cliCredentialsRouter }) => {
+      const { createRouterClient } = await import("@orpc/server");
+      const now = new Date();
+      return createRouterClient(cliCredentialsRouter, {
+        context: {
+          session: {
+            user: {
+              id: userId,
+              email: `${userId}@example.test`,
+              name: "Approver",
+              emailVerified: true,
+              role: "user",
+              twoFactorEnabled: false,
+              image: null,
+              banned: false,
+              banReason: null,
+              banExpires: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+            session: {
+              id: `session-${userId}`,
+              userId,
+              token: `token-${userId}`,
+              expiresAt: new Date(now.getTime() + 60_000),
+              ipAddress: null,
+              userAgent: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          } as import("@ws-model-proxy/auth").Session,
+        },
+      });
+    });
+  }
+
+  it("a wrong account's look leaves the code; one of two racing approvals wins (f3-F1)", async () => {
+    const { prisma, access } = required();
+    const [owner, wrong] = await Promise.all([createUser(), createUser()]);
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
+    const row = await prisma.deviceCode.create({
+      data: {
+        deviceCode: `device-${suffix}`,
+        userCode: `PEND${suffix}`,
+        expiresAt: new Date(Date.now() + 10 * 60_000),
+        status: "pending",
+        pollingInterval: 5000,
+        clientId: "ws-model-proxy",
+        scope: "cli-slug:claim-race",
+      },
+    });
+    const [ownerClient, wrongClient] = await Promise.all([
+      approverClient(owner.id),
+      approverClient(wrong.id),
+    ]);
+
+    await expect(wrongClient.deviceLoginRequest({ userCode: row.userCode })).resolves.toMatchObject(
+      { status: "pending", slug: "claim-race" },
+    );
+    expect(await prisma.deviceCode.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+      status: "pending",
+      userId: null,
+    });
+
+    const approve = (client: typeof ownerClient) => () =>
+      client.approveDeviceLogin({ userCode: row.userCode, slug: "claim-race" });
+    const outcomes = await contendBehindRowLock("device_code", row.id, [
+      approve(ownerClient),
+      approve(wrongClient),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+    expect(rejected?.status === "rejected" && rejected.reason).toMatchObject({ code: "CONFLICT" });
+    const approved = await prisma.deviceCode.findUniqueOrThrow({ where: { id: row.id } });
+    expect(approved.status).toBe("approved");
+    const winner = outcomes[0]?.status === "fulfilled" ? owner.id : wrong.id;
+    expect(approved.userId).toBe(winner);
+
+    // The exchange mints for the account whose approval won.
+    await expect(
+      access.mintCliDeviceCredentialFromApprovedDeviceCode({
+        deviceCode: row.deviceCode,
+        cliSlug: "claim-race",
+      }),
+    ).resolves.toMatchObject({ userId: winner });
+  });
+
+  it("does not approve a code that expires while the approval waits for its row lock", async () => {
+    const { prisma } = required();
+    const owner = await createUser();
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
+    const expiresAt = new Date(Date.now() + 1500);
+    const row = await prisma.deviceCode.create({
+      data: {
+        deviceCode: `device-${suffix}`,
+        userCode: `EXPI${suffix}`,
+        expiresAt,
+        status: "pending",
+        pollingInterval: 5000,
+        clientId: "ws-model-proxy",
+        scope: "cli-slug:expiry-wait",
+      },
+    });
+    const client = await approverClient(owner.id);
+    let release: (() => void) | undefined;
+    let reportLocked: (() => void) | undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blockerTransaction = blocker.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM device_code WHERE id = ${row.id} FOR UPDATE`;
+        reportLocked?.();
+        await released;
+      },
+      { timeout: 20_000 },
+    );
+    await locked;
+    // Starts (and reads the row) before expiry, then waits on the lock.
+    const approval = client
+      .approveDeviceLogin({ userCode: row.userCode, slug: "expiry-wait" })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    let waiting = false;
+    try {
+      for (let attempt = 0; attempt < 500 && !waiting; attempt++) {
+        const rows = await observer.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint AS count
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND wait_event_type = 'Lock'
+            AND query ILIKE '%device_code%'
+        `;
+        waiting = Number(rows[0]?.count ?? 0n) > 0;
+      }
+      expect(waiting).toBe(true);
+      expect(Date.now()).toBeLessThan(expiresAt.getTime());
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, expiresAt.getTime() + 100 - Date.now())),
+      );
+    } finally {
+      release?.();
+      await blockerTransaction;
+    }
+
+    expect(await approval).toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("expired"),
+    });
+    expect(await prisma.deviceCode.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+      status: "pending",
+      userId: null,
+    });
+  });
+
+  it("classifies a real 55000 by its message: transient unless a permanent refusal (f4-c)", async () => {
+    const { prisma, deletion } = required();
+    const raise = (message: string) =>
+      prisma
+        .$executeRawUnsafe(
+          `DO $$ BEGIN RAISE EXCEPTION '${message}' USING ERRCODE = '55000'; END $$`,
+        )
+        .then(
+          () => {
+            throw new Error("expected a 55000");
+          },
+          (error: unknown) => error,
+        );
+
+    for (const message of [
+      "terminal relay execution attempt is immutable",
+      "active relay execution ownership is immutable",
+      "relay execution attempt identity is immutable",
+    ]) {
+      expect(deletion.isPermanentParentDeletionFailure(await raise(message))).toBe(false);
+    }
+    for (const message of [
+      "provider_budget_settlement is append-only",
+      "provider_attempt is durable history",
+      "provider budget reservations cannot be deleted",
+      "provider budget rules are immutable",
+    ]) {
+      expect(deletion.isPermanentParentDeletionFailure(await raise(message))).toBe(true);
+    }
+  });
 });

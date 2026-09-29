@@ -1381,6 +1381,11 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Browser device-login approval page read; not an MCP surface.",
   },
   {
+    target: "cliCredentials.approveDeviceLogin",
+    reason:
+      "Human-only browser approval of a `wsmp login`: an agent must never grant a CLI credential.",
+  },
+  {
     target: "relayMetadata.deleteOwn",
     reason: "Audit/history deletion without an agent workflow.",
   },

@@ -649,3 +649,166 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
     }
   });
 });
+
+describe("createApp registration contract — device-code exchange limiter (CI-2)", () => {
+  it("binds exchangeDeviceCode to the per-code limiter: slow_down after the budget", async () => {
+    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "203.0.113.77" } });
+    const exchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({
+          json: { deviceCode: `wiring-${BASE}-code`, cliSlug: "desk-01" },
+        }),
+      });
+    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
+      const res = await exchange();
+      // The mocked database has no such code.
+      expect(res.status, `call ${call}`).toBe(404);
+    }
+    const limited = await exchange();
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({
+      json: { code: "TOO_MANY_REQUESTS", data: { deviceFlowError: "slow_down" } },
+    });
+  });
+
+  it("answers the pre-0.4.0 upgrade sentinel even after the code bucket is saturated", async () => {
+    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE } =
+      await import("@ws-model-proxy/config/cli-device-login");
+    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "[IP_ADDRESS]" } });
+    // A real code saturates the shared per-code bucket first, as an
+    // unauthenticated caller flooding the known constant sentinel would.
+    const realExchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({ json: { deviceCode: "saturation-code", cliSlug: "desk-01" } }),
+      });
+    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
+      await realExchange();
+    }
+    expect((await realExchange()).status).toBe(429);
+
+    // Every sentinel poll must still get the upgrade message a 0.3.x CLI
+    // prints — never the 429 that its poll loop treats as retryable. Thirty
+    // polls keep the whole test inside the 60-point per-IP bucket.
+    const sentinelExchange = () =>
+      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+        body: JSON.stringify({
+          json: { deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, cliSlug: "desk-01" },
+        }),
+      });
+    for (let call = 0; call < 30; call += 1) {
+      const res = await sentinelExchange();
+      expect(res.status, `sentinel call ${call}`).toBe(400);
+      expect(await res.json(), `sentinel call ${call}`).toMatchObject({
+        json: { code: "BAD_REQUEST", message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE },
+      });
+    }
+  });
+});
+
+describe("createApp registration contract — device-code body cap runs first (f3-F2)", () => {
+  it("refuses an unlength'd oversized /device/code body without buffering it", async () => {
+    const { DEVICE_CODE_BODY_MAX_BYTES } = await import("./device-code-upgrade-gate");
+    const app = await buildApp(false);
+    const chunk = new TextEncoder().encode("x".repeat(1024));
+    let pulls = 0;
+    // 1 MiB offered in 1 KiB chunks, with no Content-Length. The app-wide
+    // 10 MB limit would read all of it before any later middleware ran.
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 1024) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const res = await app.request(`${BASE}/api/auth/device/code`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(413);
+    // 16 chunks fill the cap and the 17th crosses it; a few more are read ahead.
+    expect(pulls).toBeLessThanOrEqual(DEVICE_CODE_BODY_MAX_BYTES / 1024 + 4);
+  });
+});
+
+describe("createApp registration contract — device-login approval needs the CSRF header", () => {
+  const approveBody = JSON.stringify({ json: { userCode: "ABCDEFGH", slug: "desk-01" } });
+  // A same-origin deployment: no CORS_ORIGIN, so the rest of /rpc checks no
+  // CSRF header (read by createApp at construction).
+  let savedCorsOrigin: string | undefined;
+  beforeEach(() => {
+    savedCorsOrigin = envMock.CORS_ORIGIN;
+    Reflect.deleteProperty(envMock, "CORS_ORIGIN");
+  });
+  afterEach(() => {
+    if (savedCorsOrigin !== undefined) envMock.CORS_ORIGIN = savedCorsOrigin;
+  });
+
+  it("refuses a headerless approval (a no-preflight cross-origin POST) before any auth or write", async () => {
+    const app = await buildApp(false);
+    for (const contentType of [undefined, "application/json", "text/plain"]) {
+      const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+        method: "POST",
+        headers: {
+          ...HOST,
+          origin: "https://evil.example.com",
+          ...(contentType ? { "content-type": contentType } : {}),
+        },
+        body: new TextEncoder().encode(approveBody),
+      });
+      expect(res.status, String(contentType)).toBe(403);
+      expect(await res.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
+    }
+  });
+
+  it("refuses it inside a batch too, even when the inner request names the header", async () => {
+    const app = await buildApp(false);
+    const res = await app.request(`${BASE}/rpc/__batch__`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json", "x-orpc-batch": "buffered" },
+      body: JSON.stringify([
+        {
+          url: `${BASE}/rpc/cliCredentials/approveDeviceLogin`,
+          headers: { "x-csrf-token": "orpc" },
+          body: JSON.parse(approveBody),
+        },
+      ]),
+    });
+    const text = await res.text();
+    expect(text).toContain("CSRF_TOKEN_MISMATCH");
+    expect(text).not.toContain("UNAUTHORIZED");
+  });
+
+  it("lets a request with the header reach the procedure (the session check answers)", async () => {
+    const app = await buildApp(false);
+    const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
+      body: approveBody,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("leaves the CLI's headerless exchange alone on a same-origin deployment", async () => {
+    const app = await buildApp(false);
+    mockGetConnInfo.mockReturnValue({ remote: { address: "198.51.100.44" } });
+    const res = await app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "application/json" },
+      body: JSON.stringify({ json: { deviceCode: "headerless-code", cliSlug: "desk-01" } }),
+    });
+    // The mocked database has no such code: the procedure ran.
+    expect(res.status).toBe(404);
+  });
+});

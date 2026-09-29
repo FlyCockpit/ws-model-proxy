@@ -66,8 +66,9 @@ export const PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS = PARENT_DELETION_DRA
  * - `retained_history_refused`: the table is retained history the preflight
  *   refuses (`findRetainedHistoryBlocker`), so the trigger never fires on a
  *   delete that proceeds.
- * - `refuses_delete`: raises 55000 on any DELETE, a permanent refusal
- *   (`isPermanentParentDeletionFailure`); it adds no rows.
+ * - `refuses_delete`: raises 55000 on any DELETE with a message
+ *   `isPermanentParentDeletionFailure` lists as a permanent refusal (other
+ *   55000s are transient); it adds no rows.
  */
 export const PARENT_DELETE_TRIGGER_WORK = [
   {

@@ -242,7 +242,7 @@ export type DeviceFlowError =
   | "access_denied"
   | "expired_token";
 
-function deviceFlowErrorData(deviceFlowError: DeviceFlowError): {
+export function deviceFlowErrorData(deviceFlowError: DeviceFlowError): {
   deviceFlowError: DeviceFlowError;
 } {
   return { deviceFlowError };

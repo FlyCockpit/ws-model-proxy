@@ -29,6 +29,9 @@ export type LiveCliFeatureSnapshot = {
   terminalIdentity?: { publicKey: string; signature: string } | null;
 };
 
+/** Outcome of the per-process `exchangeDeviceCode` limiter. */
+export type DeviceCodeExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
+
 export type ContextServices = {
   /** Server-owned accounting repair. Kept injectable so the API package does not depend on the server. */
   repairExpiredProviderBudgets?: (scope: {
@@ -59,6 +62,14 @@ export type ContextServices = {
   cancelMcpTokenCommands?: (tokenId: string) => void;
   /** In-memory supervised-command requests (dashboard awareness and output review). */
   supervisedCommands?: SupervisedCommandServices;
+  /**
+   * Charges one `cliCredentials.exchangeDeviceCode` call to the caller's IP
+   * and to the device code (per process; one replica is the supported
+   * topology). The HTTP transport binds it to the request's client IP.
+   * Absent where no network caller exists (unit tests); the procedure is not
+   * an MCP surface.
+   */
+  limitDeviceCodeExchange?: (deviceCode: string) => Promise<DeviceCodeExchangeLimit>;
   /** Live protocol/feature snapshot for dashboard and MCP device lists. */
   getLiveCliFeatures?: (
     cliDeviceIds: readonly string[],

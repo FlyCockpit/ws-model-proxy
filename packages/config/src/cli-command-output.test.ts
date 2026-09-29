@@ -1,10 +1,79 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  appendRollingTail,
   CLI_OUTPUT_ELLIPSIS,
+  CLI_STREAM_HEAD_MAX_BYTES,
+  CLI_STREAM_TAIL_MAX_BYTES,
   cleanText,
   formatBoundedStream,
+  nextState,
   redactCredentialSubstrings,
+  TerminalByteState,
 } from "./cli-command-output";
+
+/**
+ * The per-byte WHATWG UTF-8 decoder + parser that TerminalByteState's byte
+ * table replaced (verbatim logic from before the table), kept as the
+ * reference the table must reproduce.
+ */
+class LegacyTerminalByteState {
+  private state = 0;
+  private needed = 0;
+  private seen = 0;
+  private codePoint = 0;
+  private lower = 0x80;
+  private upper = 0xbf;
+
+  get atBoundary(): boolean {
+    return this.state === 0 && this.needed === 0;
+  }
+
+  feed(byte: number): void {
+    if (this.needed === 0) {
+      if (byte <= 0x7f) this.state = nextState(this.state, byte);
+      else if (byte >= 0xc2 && byte <= 0xdf) this.start(1, byte & 0x1f);
+      else if (byte >= 0xe0 && byte <= 0xef) {
+        if (byte === 0xe0) this.lower = 0xa0;
+        if (byte === 0xed) this.upper = 0x9f;
+        this.start(2, byte & 0x0f);
+      } else if (byte >= 0xf0 && byte <= 0xf4) {
+        if (byte === 0xf0) this.lower = 0x90;
+        if (byte === 0xf4) this.upper = 0x8f;
+        this.start(3, byte & 0x07);
+      } else this.state = nextState(this.state, 0xfffd);
+      return;
+    }
+    if (byte < this.lower || byte > this.upper) {
+      this.reset();
+      this.state = nextState(this.state, 0xfffd);
+      this.feed(byte);
+      return;
+    }
+    this.lower = 0x80;
+    this.upper = 0xbf;
+    this.codePoint = (this.codePoint << 6) | (byte & 0x3f);
+    this.seen += 1;
+    if (this.seen === this.needed) {
+      const codePoint = this.codePoint;
+      this.reset();
+      this.state = nextState(this.state, codePoint);
+    }
+  }
+
+  private start(needed: number, bits: number): void {
+    this.needed = needed;
+    this.codePoint = bits;
+  }
+
+  private reset(): void {
+    this.needed = 0;
+    this.seen = 0;
+    this.codePoint = 0;
+    this.lower = 0x80;
+    this.upper = 0xbf;
+  }
+}
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
@@ -15,6 +84,102 @@ describe("cleanText", () => {
     ).toBe("red ok key=[redacted]\r\n");
     expect(cleanText("wsmp_cli_")).toBe("[redacted]");
     expect(cleanText("tab\tstays\u0085")).toBe("tab\tstays");
+  });
+
+  it.each([
+    ["DCS", "\u001bP1$r0m\u001b\\"],
+    ["APC", "\u001b_Gf=100;AAAA\u001b\\"],
+    ["PM", "\u001b^private message\u001b\\"],
+    ["SOS", "\u001bXstart of string\u001b\\"],
+    ["DCS (8-bit)", "\u0090q#0;2;0;0;0\u009c"],
+    ["APC (8-bit)", "\u009fGpayload\u009c"],
+    ["PM (8-bit)", "\u009epm\u001b\\"],
+    ["CSI (8-bit)", "\u009b2J"],
+    ["OSC (8-bit)", "\u009d0;title\u0007"],
+    ["charset designation", "\u001b(B"],
+  ])("removes a whole %s sequence, payload included (f4-a)", (_label, sequence) => {
+    expect(cleanText(`before${sequence}after`)).toBe("beforeafter");
+  });
+
+  it("does not end DCS/APC/PM at BEL; only ST ends them", () => {
+    expect(cleanText("a\u001bPpayload\u0007still-payload\u001b\\b")).toBe("ab");
+    expect(cleanText("a\u001b_x\u0007y\u009cb")).toBe("ab");
+  });
+
+  it.each([
+    ["DCS", "\u001bPq#0;2;0;0;0#0~~"],
+    ["APC", "\u001b_Gf=100;AAAA"],
+    ["PM", "\u001b^secret"],
+    ["DCS (8-bit)", "\u0090partial"],
+    ["OSC", "\u001b]0;title"],
+    ["CSI", "\u001b[1;3"],
+    ["lone ESC", "\u001b"],
+    ["ESC before the terminator", "\u001bPpayload\u001b"],
+  ])("drops an unterminated %s at the end of the buffer", (_label, sequence) => {
+    expect(cleanText(`kept${sequence}`)).toBe("kept");
+  });
+
+  it("resumes after an ESC that aborts a control string", () => {
+    expect(cleanText("a\u001bPdcs\u001b[31mred\u001b[0m")).toBe("ared");
+  });
+
+  // Each pair was checked against xterm.js's EscapeSequenceParser (the web
+  // terminal), which prints only "before" and "after" for all of them.
+  it.each([
+    ["CSI cancelled by a DCS", "\u001b[0\u001bPqHIDDEN\u001b\\"],
+    ["CSI cancelled by an APC", "\u001b[0\u001b_HIDDEN\u001b\\"],
+    ["CSI cancelled by an 8-bit APC", "\u001b[0\u009fHIDDEN\u009c"],
+    ["ESC restarted into a PM", "\u001b\u001b^HIDDEN\u001b\\"],
+    ["ESC intermediate cancelled by an APC", "\u001b(\u001b_HIDDEN\u001b\\"],
+    ["CSI intermediate cancelled by a SOS", "\u001b[1 \u001bXHIDDEN\u001b\\"],
+    ["OSC ended by a DCS", "\u001b]0;t\u001bPqHIDDEN\u001b\\"],
+    ["DCS ended by an APC", "\u001bPq\u001b_HIDDEN\u001b\\"],
+    ["CAN, then an APC", "\u001b[1\u0018\u001b_HIDDEN\u009c"],
+  ])("follows the terminal when a sequence is cut short: %s", (_label, sequence) => {
+    expect(cleanText(`before${sequence}after`)).toBe("beforeafter");
+  });
+
+  it("keeps consuming a control string past non-ASCII text, where xterm.js stops", () => {
+    // xterm.js abandons an APC at "é" and prints " HIDDEN"; other terminals
+    // consume to ST. Dropping it can only hide text, never show hidden text.
+    expect(cleanText("before\u001b_é HIDDEN\u001b\\after")).toBe("beforeafter");
+    expect(cleanText("before\u001bP1é HIDDEN\u001b\\after")).toBe("beforeafter");
+  });
+
+  it.each([
+    ["ESC", "\u001b"],
+    ["CSI", "\u001b[1"],
+    ["charset escape", "\u001b("],
+    ["8-bit CSI", "\u009b"],
+  ])("drops a whole astral character that abandons a %s", (_label, sequence) => {
+    // xterm.js drops the code point, never half of it.
+    expect(cleanText(`ok ${sequence}😀 done`)).toBe("ok  done");
+    expect(cleanText(`${sequence}😀`)).toBe("");
+  });
+
+  it("keeps astral characters in plain and styled text", () => {
+    expect(cleanText("a😀b\u001b[31m😀\u001b[0m")).toBe("a😀b😀");
+  });
+
+  it("keeps the text after a sequence the terminal cancels", () => {
+    // CAN and SUB end a sequence; the text after them prints.
+    expect(cleanText("a\u001b[12\u0018shown")).toBe("ashown");
+    expect(cleanText("a\u001b]0;t\u001ashown")).toBe("ashown");
+    // A non-ASCII character abandons a CSI and is itself dropped.
+    expect(cleanText("a\u001b[1éshown")).toBe("ashown");
+    // LF inside a CSI is executed, so it survives.
+    expect(cleanText("a\u001b[1\n2mb")).toBe("a\nb");
+  });
+
+  it("never lets a control string's payload through formatBoundedStream", () => {
+    const head = bytes("ok \u001bP+q544e\u001b\\ \u001b_evil\u001b\\ \u001b^pm\u001b\\ done");
+    const text = formatBoundedStream({
+      head,
+      tail: new Uint8Array(),
+      totalBytes: head.length,
+    }).text;
+    expect(text).toBe("ok    done");
+    expect(text).not.toMatch(/544e|evil|pm/);
   });
 
   it("redacts every product prefix anywhere in the text", () => {
@@ -63,5 +228,324 @@ describe("formatBoundedStream", () => {
     expect(
       formatBoundedStream({ head: new Uint8Array(), tail: new Uint8Array(), totalBytes: 0 }),
     ).toEqual({ text: "", truncated: false, totalBytes: 0 });
+  });
+});
+
+/** A capture as the runtimes keep it: head, rolling tail, total. */
+function capture(stream: Uint8Array, chunkSize: number, tailMax = CLI_STREAM_TAIL_MAX_BYTES) {
+  const state = new TerminalByteState();
+  let tail = new Uint8Array();
+  for (let offset = 0; offset < stream.length; offset += chunkSize) {
+    tail = appendRollingTail(tail, stream.subarray(offset, offset + chunkSize), tailMax, state);
+  }
+  return {
+    head: stream.subarray(0, CLI_STREAM_HEAD_MAX_BYTES),
+    tail,
+    totalBytes: stream.length,
+  };
+}
+
+describe("appendRollingTail", () => {
+  it("matches every shared vector (the Rust CLI's capture checks the same file)", () => {
+    const shared = JSON.parse(
+      readFileSync(new URL("./terminal-tail-vectors.json", import.meta.url), "utf8"),
+    ) as { vectors: Array<{ streamHex: string; chunk: number; max: number; tailHex: string }> };
+    expect(shared.vectors.length).toBeGreaterThan(20);
+    for (const vector of shared.vectors) {
+      const stream = Uint8Array.from(Buffer.from(vector.streamHex, "hex"));
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      for (let offset = 0; offset < stream.length; offset += vector.chunk) {
+        tail = appendRollingTail(
+          tail,
+          stream.subarray(offset, offset + vector.chunk),
+          vector.max,
+          state,
+        );
+      }
+      expect(Buffer.from(tail).toString("hex"), vector.streamHex).toBe(vector.tailHex);
+    }
+  });
+
+  // The tracker runs on the server's event loop for every byte of headless
+  // output: its cost per byte must not depend on what the output looks like
+  // (C3b-1/C4-1/C5-1 found shapes 10-40x slower than plain text).
+  it("costs the same work per byte for every output shape", () => {
+    const shape = (prefix: string, unit: number[]) => {
+      const body = new Uint8Array(1 << 20);
+      for (let at = 0; at < body.length; at += 1) body[at] = unit[at % unit.length] ?? 0;
+      return { prefix: bytes(prefix), body };
+    };
+    const shapes = {
+      ascii: shape("", [...bytes("plain ascii text line 0123456789\n")]),
+      utf8: shape("", [...bytes("ünïcödé € 😀 текст\n")]),
+      sgr: shape("", [...bytes("\u001b[31mred\u001b[0m text\n")]),
+      csiParams: shape("", [...bytes("\u001b[1;2;3;4;5;6;7;8;9m")]),
+      c1Csi: shape("", [0xc2, 0x9b, 0x31, 0x3b, 0x32, 0x6d]),
+      nbspInOsc: shape("\u001b]", [0xc2, 0xa0]),
+      nbspInDcs: shape("\u001bP", [0xc2, 0xa0]),
+      c2Pairs: shape("", [0xc2, 0x41]),
+      escInvalid: shape("", [0x1b, 0xff]),
+      binary: shape(
+        "",
+        Array.from({ length: 251 }, (_, n) => (n * 37) & 0xff),
+      ),
+    };
+    const timeOnce = (value: { prefix: Uint8Array; body: Uint8Array }) => {
+      const state = new TerminalByteState();
+      state.consume(value.prefix, 0, value.prefix.length);
+      const started = performance.now();
+      state.consume(value.body, 0, value.body.length);
+      return ((performance.now() - started) * 1e6) / value.body.length;
+    };
+    // Interleaved rounds, each shape's minimum: a burst of contention during
+    // one shape's window cannot single it out.
+    const costs: Record<string, number> = {};
+    for (let round = 0; round < 7; round += 1) {
+      for (const [name, value] of Object.entries(shapes)) {
+        const cost = timeOnce(value);
+        costs[name] = Math.min(costs[name] ?? Number.POSITIVE_INFINITY, cost);
+      }
+    }
+    const cheapest = Math.min(...Object.values(costs));
+    for (const [name, cost] of Object.entries(costs)) {
+      // One table load per byte: every shape within a small factor of the
+      // cheapest (the regressions this guards were 10-40x), and far above the
+      // event-loop-blocking rates measured before.
+      expect(cost, `${name} ${JSON.stringify(costs)}`).toBeLessThan(Math.max(6 * cheapest, 2));
+      expect(cost, name).toBeLessThan(50);
+    }
+  });
+
+  it("matches the per-byte parser it replaced, byte for byte after every state", () => {
+    // Every parser state (reached by a prefix) × every two-byte sequence,
+    // followed by probes that tell the states apart: the boundary flag after
+    // each byte must match the legacy per-byte decoder + parser.
+    // Parser states, plus every UTF-8 decoder substate (partial characters).
+    const decoderPrefixes = [
+      [0xc2],
+      [0xc3],
+      [0xe0],
+      [0xe1],
+      [0xe1, 0x80],
+      [0xed],
+      [0xf0],
+      [0xf1],
+      [0xf1, 0x80],
+      [0xf1, 0x80, 0x80],
+      [0xf3, 0xa0, 0x81],
+      [0xf4],
+      [0x1b, 0x5d, 0xf1, 0x80],
+    ];
+    const prefixes = [
+      "",
+      "\u001b",
+      "\u001b(",
+      "\u001b[",
+      "\u001b[1",
+      "\u001b[1 ",
+      "\u001b[1<",
+      "\u001b]",
+      "\u001b_",
+      "\u001bP",
+      "\u001bP1",
+      "\u001bP ",
+      "\u001bP1<",
+      "\u001bPq",
+    ]
+      .map(bytes)
+      .concat(decoderPrefixes.map((prefix) => Uint8Array.from(prefix)));
+    // The probe starts with continuation bytes, which tell apart how many a
+    // partial character still needs.
+    const probe = Uint8Array.from([0x80, 0x80, 0x80, ...bytes("x\u0007m\\\u001b\\y")]);
+    for (const prefix of prefixes) {
+      for (let first = 0; first < 0x100; first += 1) {
+        for (let second = 0; second < 0x100; second += 1) {
+          const table = new TerminalByteState();
+          const legacy = new LegacyTerminalByteState();
+          for (const byte of prefix) {
+            table.feed(byte);
+            legacy.feed(byte);
+          }
+          const check = (byte: number) => {
+            table.feed(byte);
+            legacy.feed(byte);
+            if (table.atBoundary !== legacy.atBoundary) {
+              expect([...prefix, first, second]).toEqual("boundary mismatch");
+            }
+          };
+          check(first);
+          check(second);
+          for (const byte of probe) check(byte);
+        }
+      }
+    }
+  }, 60_000);
+
+  it("drops exactly what feeding every byte through the parser drops", () => {
+    const alphabet = [
+      ..."ab \n\t\u0007\u0018\u001a\u007f[]P_^X\\;0<?m@q",
+      ..."\u001b\u001b\u001b",
+    ].map((char) => char.charCodeAt(0));
+    const high = [
+      0xc2, 0x80, 0x9b, 0x9c, 0x9f, 0xa0, 0xc3, 0xa9, 0xe0, 0xed, 0xa0, 0xf0, 0x9f, 0x98, 0x80,
+      0xf4, 0x90, 0xff, 0xe2, 0x82, 0xac,
+    ];
+    // Whole valid characters: non-C1 ones take the fast path, C1 ones do not.
+    const characters = [
+      [0xc3, 0xa9],
+      [0xc2, 0xa0],
+      [0xe2, 0x82, 0xac],
+      [0xf0, 0x9f, 0x98, 0x80],
+      [0xc2, 0x9b],
+      [0xc2, 0x90],
+      [0xc2, 0x9c],
+    ];
+    let seed = 11; // fixed: the corpus is the same on every run
+    const random = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+      return seed % n;
+    };
+    const reference = (stream: Uint8Array, chunks: number[], max: number) => {
+      const state = new LegacyTerminalByteState();
+      let tail: number[] = [];
+      let offset = 0;
+      for (const size of chunks) {
+        tail.push(...stream.subarray(offset, offset + size));
+        offset += size;
+        let drop = 0;
+        while (
+          drop < tail.length &&
+          (drop < tail.length - Math.min(tail.length, max) || !state.atBoundary)
+        ) {
+          state.feed(tail[drop] ?? 0);
+          drop += 1;
+        }
+        tail = tail.slice(drop);
+      }
+      return Uint8Array.from(tail);
+    };
+    for (let round = 0; round < 4000; round += 1) {
+      const parts: number[] = [];
+      while (parts.length < 1 + random(60)) {
+        const pick = random(6);
+        if (pick === 0) parts.push(high[random(high.length)] ?? 0);
+        else if (pick === 1) parts.push(...(characters[random(characters.length)] ?? []));
+        else parts.push(alphabet[random(alphabet.length)] ?? 0);
+      }
+      const stream = Uint8Array.from(parts);
+      const length = stream.length;
+      const chunks: number[] = [];
+      for (let left = length; left > 0; ) {
+        const size = Math.min(left, 1 + random(9));
+        chunks.push(size);
+        left -= size;
+      }
+      const max = 1 + random(16);
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      let offset = 0;
+      for (const size of chunks) {
+        tail = appendRollingTail(tail, stream.subarray(offset, offset + size), max, state);
+        offset += size;
+      }
+      expect(Array.from(tail), Array.from(stream).join(",")).toEqual(
+        Array.from(reference(stream, chunks, max)),
+      );
+    }
+  });
+
+  it("keeps exactly the last bytes of plain output", () => {
+    const stream = bytes("line of plain output\n".repeat(5000));
+    const view = capture(stream, 4096);
+    expect(view.tail).toEqual(stream.subarray(stream.length - CLI_STREAM_TAIL_MAX_BYTES));
+  });
+
+  it.each([
+    ["DCS", "\u001bPq", "\u001b\\"],
+    ["APC", "\u001b_", "\u001b\\"],
+    ["PM", "\u001b^", "\u001b\\"],
+    ["OSC", "\u001b]52;c;", "\u0007"],
+    ["8-bit APC", "\u009f", "\u009c"],
+  ])("never shows a %s body that the head/tail gap cuts into", (_label, open, close) => {
+    const stream = bytes(`VISIBLE\n${open}${"x".repeat(60_000)}\nHIDDEN PAYLOAD\n${close} AFTER\n`);
+    for (const chunkSize of [1, 4096, 1 << 20]) {
+      const view = formatBoundedStream(capture(stream, chunkSize));
+      expect(view.truncated).toBe(true);
+      expect(view.text).not.toContain("HIDDEN");
+      expect(view.text).not.toContain("xxx");
+      // The tail starts right after the terminator; " AFTER" survives the
+      // partial-token trim a truncated tail gets.
+      expect(view.text.endsWith(" AFTER\n")).toBe(true);
+    }
+  });
+
+  it("does not split a UTF-8 encoded C1 introducer at the tail's start", () => {
+    // U+009F (APC) is C2 9F. A tail starting at the 9F byte would decode it
+    // as U+FFFD and show the APC body.
+    const prefix = new Uint8Array(CLI_STREAM_TAIL_MAX_BYTES).fill(0x61);
+    const body = bytes("HIDDEN\u009cAFTER");
+    const stream = new Uint8Array(prefix.length + 2 + body.length);
+    stream.set(prefix, 0);
+    stream.set([0xc2, 0x9f], prefix.length);
+    stream.set(body, prefix.length + 2);
+    // One byte more than the tail holds, so the cut falls between C2 and 9F.
+    const view = capture(stream, 1, body.length + 1);
+    expect(new TextDecoder().decode(view.tail)).toBe("AFTER");
+  });
+
+  it("parses a tail on its own exactly as the whole stream parses from there", () => {
+    const pieces = [
+      "a",
+      "b ",
+      "\n",
+      "\u001b",
+      "[",
+      "31m",
+      "]",
+      "P",
+      "_",
+      "^",
+      "X",
+      "\\",
+      "\u0007",
+      "\u0018",
+      "\u009b",
+      "\u009c",
+      "\u009d",
+      "\u0090",
+      "é",
+      "😀",
+      "\ufffd",
+    ];
+    const raw = [0xc2, 0xe0, 0x80, 0xed, 0xf4, 0xff];
+    let seed = 7;
+    const random = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let round = 0; round < 3000; round += 1) {
+      const parts: number[] = [];
+      const length = 1 + random(40);
+      for (let item = 0; item < length; item += 1) {
+        if (random(8) === 0) parts.push(raw[random(raw.length)] ?? 0);
+        else parts.push(...bytes(pieces[random(pieces.length)] ?? ""));
+      }
+      const stream = Uint8Array.from(parts);
+      const state = new TerminalByteState();
+      let tail = new Uint8Array();
+      const max = 1 + random(12);
+      let offset = 0;
+      while (offset < stream.length) {
+        const end = Math.min(stream.length, offset + 1 + random(5));
+        tail = appendRollingTail(tail, stream.subarray(offset, end), max, state);
+        offset = end;
+      }
+      const dropped = stream.subarray(0, stream.length - tail.length);
+      const decode = (value: Uint8Array) => new TextDecoder().decode(value);
+      expect(cleanText(decode(stream)), JSON.stringify(parts)).toBe(
+        cleanText(decode(dropped)) + cleanText(decode(tail)),
+      );
+    }
   });
 });

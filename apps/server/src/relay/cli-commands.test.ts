@@ -598,6 +598,41 @@ describe("cli commands", () => {
     logSpy.mockRestore();
   });
 
+  it("starts the stdout tail after a control string the head/tail gap cuts into", async () => {
+    const { formatBoundedStream } = await import("@ws-model-proxy/config/cli-command-output");
+    const socket = await connect();
+    db.mcpPersonalToken.findFirst.mockResolvedValueOnce(liveToken());
+    const started = await startCliCommand({
+      userId: "user-id",
+      tokenId: "token-gap",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "cat sixel.txt",
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const stream = new TextEncoder().encode(
+      `VISIBLE\n\u001b_${"x".repeat(60_000)}\nHIDDEN PAYLOAD\n\u001b\\ AFTER\n`,
+    );
+    let seq = 1;
+    for (let offset = 0; offset < stream.length; offset += 4096) {
+      await relaySessionManager.handleBinaryFrame(
+        socket,
+        encodeRelayBinaryFrame(
+          { type: "exec.stdout", commandId: started.commandId, seq },
+          stream.subarray(offset, offset + 4096),
+        ),
+      );
+      seq += 1;
+    }
+    const snapshot = snapshotCliCommand(started.commandId, "user-id", "token-gap");
+    expect(snapshot?.stdout.totalBytes).toBe(stream.length);
+    const text = snapshot ? formatBoundedStream(snapshot.stdout).text : "";
+    expect(text.startsWith("VISIBLE\n")).toBe(true);
+    expect(text).not.toContain("HIDDEN");
+    expect(text.endsWith(" AFTER\n")).toBe(true);
+  });
+
   it("cancels and frees a command that never reports done after 11 minutes plus 15 seconds", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
