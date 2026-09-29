@@ -1,3 +1,4 @@
+import { fileAccessRefusal, fileToolAccess } from "@ws-model-proxy/api/lib/cli-file-access";
 import {
   allowsHeadlessCommands,
   allowsSupervisedCommands,
@@ -17,7 +18,7 @@ import { relaySessionManager } from "./session-manager.js";
  * (`revokeOpenCliAgentAdmissions`). Callers keep the "no await between the
  * verdict and the dispatch" ordering described on `Admission`.
  */
-export type CliAgentCapability = "headless_exec" | "supervised";
+export type CliAgentCapability = "headless_exec" | "supervised" | "file_read" | "file_write";
 
 export type CliAgentAdmissionRejection =
   | "not_found"
@@ -26,7 +27,9 @@ export type CliAgentAdmissionRejection =
   | "feature_disabled"
   | "supervised_only"
   | "unsupported"
-  | "token_inactive";
+  | "token_inactive"
+  /** File capabilities only: the offline CLI's last hello was refused for an old protocol. */
+  | "upgrade_required";
 
 type CliOwnerState = {
   banned: boolean | null;
@@ -127,7 +130,12 @@ function admitted(
   return admittedExpiry === null || admittedExpiry.getTime() > now;
 }
 
-type AdmissionDevice = { id: string; userId: string; mcpCommandMode: McpCommandModeDb };
+type AdmissionDevice = {
+  id: string;
+  userId: string;
+  mcpCommandMode: McpCommandModeDb;
+  rejectedRelayProtocolVersion: string | null;
+};
 
 export type CliAgentAdmissionInput = {
   userId: string;
@@ -161,7 +169,12 @@ export async function readCliAgentAdmission(
     [device, token, owner] = await Promise.all([
       prisma.cliDevice.findUnique({
         where: { id: input.cliDeviceId },
-        select: { id: true, userId: true, mcpCommandMode: true },
+        select: {
+          id: true,
+          userId: true,
+          mcpCommandMode: true,
+          rejectedRelayProtocolVersion: true,
+        },
       }),
       liveCliToken(input.tokenId, input.userId),
       readCliOwner(input.userId),
@@ -172,14 +185,26 @@ export async function readCliAgentAdmission(
   return { input, admission, device, token, owner };
 }
 
+type AdmissionOk = {
+  ok: true;
+  token: LiveCliToken;
+  device: AdmissionDevice;
+  live: NonNullable<ReturnType<typeof liveFeatures>>;
+};
+
 export type CliAgentAdmissionVerdict =
+  | AdmissionOk
   | {
-      ok: true;
-      token: LiveCliToken;
-      device: AdmissionDevice;
-      live: NonNullable<ReturnType<typeof liveFeatures>>;
-    }
-  | { ok: false; error: CliAgentAdmissionRejection };
+      ok: false;
+      error: CliAgentAdmissionRejection;
+      /** With `upgrade_required`: the relay protocol the refused CLI spoke. */
+      rejectedProtocolVersion?: string;
+    };
+
+/** The verdict for a command capability: never `upgrade_required` (file ops only). */
+export type CliCommandAdmissionVerdict =
+  | AdmissionOk
+  | { ok: false; error: Exclude<CliAgentAdmissionRejection, "upgrade_required"> };
 
 function liveFeatures(cliDeviceId: string) {
   return relaySessionManager.getLiveCliFeatures([cliDeviceId]).get(cliDeviceId);
@@ -191,6 +216,14 @@ function liveFeatures(cliDeviceId: string) {
  * The caller checks its limits and input and registers the record in the same
  * synchronous step; nothing may await in between.
  */
+export function judgeCliAgentAdmission(
+  reads: CliAgentAdmissionReads,
+  capability: "headless_exec" | "supervised",
+): CliCommandAdmissionVerdict;
+export function judgeCliAgentAdmission(
+  reads: CliAgentAdmissionReads,
+  capability: CliAgentCapability,
+): CliAgentAdmissionVerdict;
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: CliAgentCapability,
@@ -212,6 +245,34 @@ export function judgeCliAgentAdmission(
     if (live.mcpCommandMode === "off") return { ok: false, error: "feature_disabled" };
     if (!allowsHeadlessCommands(live.mcpCommandMode)) {
       return { ok: false, error: "supervised_only" };
+    }
+    return { ok: true, token, device, live };
+  }
+
+  if (capability === "file_read" || capability === "file_write") {
+    const opClass = capability === "file_read" ? "read" : "write";
+    const grantAccess = fileToolAccess(grant, opClass);
+    if (grantAccess !== "headless") {
+      return { ok: false, error: fileAccessRefusal(grantAccess, "grant") };
+    }
+    const live = liveFeatures(input.cliDeviceId);
+    if (!live) {
+      // Not connected. A device whose last hello was refused for an old
+      // protocol says so (#90) instead of a bare `offline`.
+      return device.rejectedRelayProtocolVersion
+        ? {
+            ok: false,
+            error: "upgrade_required",
+            rejectedProtocolVersion: device.rejectedRelayProtocolVersion,
+          }
+        : { ok: false, error: "offline" };
+    }
+    if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
+      return { ok: false, error: "offline" };
+    }
+    const liveAccess = fileToolAccess(live.mcpCommandMode, opClass);
+    if (liveAccess !== "headless") {
+      return { ok: false, error: fileAccessRefusal(liveAccess, "live") };
     }
     return { ok: true, token, device, live };
   }

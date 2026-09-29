@@ -103,6 +103,7 @@ import {
   listPendingSupervised,
   submitSupervisedOutput,
 } from "./relay/cli-commands.js";
+import { cancelFileOpsForToken } from "./relay/cli-file-ops.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
@@ -239,7 +240,10 @@ function cliContextServices() {
       kind: "cliToken" | "deviceCredential";
       ids: readonly string[];
     }) => relaySessionManager.closeSessionsForRevokedCredentials(revoked),
-    cancelMcpTokenCommands: (tokenId: string) => cancelCommandsForToken(tokenId),
+    cancelMcpTokenCommands: (tokenId: string) => {
+      cancelCommandsForToken(tokenId);
+      cancelFileOpsForToken(tokenId);
+    },
     getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
       relaySessionManager.getLiveCliFeatures(cliDeviceIds),
     getLiveNodeTelemetry: (cliDeviceIds: readonly string[]) =>

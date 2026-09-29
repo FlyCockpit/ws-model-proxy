@@ -6,6 +6,11 @@ import type {
 } from "@ws-model-proxy/api/context";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
+  type FileOpClass,
+  fileAccessRefusal,
+  fileToolAccess,
+} from "@ws-model-proxy/api/lib/cli-file-access";
+import {
   allowsHeadlessCommands,
   allowsSupervisedCommands,
   lowestMcpCommandMode,
@@ -22,6 +27,14 @@ import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/opena
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
+import {
+  type FileOp,
+  type FileOpFrame,
+  type FileRejectDetail,
+  type FileRejectReason,
+  type FileResultFrame,
+  isMutatingFileOp,
+} from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
   listDueOwnedPoolMemberRecoveries,
@@ -102,6 +115,12 @@ export type CliReportedFeatures = {
   mcpCommandMode: McpCommandModeName;
   terminalApproval: boolean;
   terminalSupported: boolean;
+  /** 2.8: the CLI's read-only file grant (false until P4). */
+  mcpFileRead: boolean;
+  /** 2.8: the CLI has `fileRoots` configured (false until P4). */
+  fileRootsConfigured: boolean;
+  /** 2.8: `wsmp config set-file-tools-as-root on`. */
+  allowFileToolsAsRoot: boolean;
 };
 
 export type TrackedCliCommand = {
@@ -113,6 +132,22 @@ export type TrackedCliCommand = {
   markRejected(reason: string): void;
   markDone(result: { exitCode?: number; signal?: string; timedOut: boolean }): void;
   appendOutput(stream: "stdout" | "stderr", body: Uint8Array): void;
+};
+
+/** Why an in-flight file op ended without an answer from the CLI. */
+export type FileOpLossCause = "offline" | "grant_disabled" | "feature_disabled" | "supervised_only";
+
+/** A file op the relay session routes CLI answers to (see `cli-file-ops.ts`). */
+export type TrackedFileOp = {
+  opId: string;
+  cliDeviceId: string;
+  op: FileOp;
+  markResult(frame: FileResultFrame): void;
+  markData(body: Uint8Array): void;
+  markRejected(reason: FileRejectReason, detail?: FileRejectDetail): void;
+  /** The CLI sent a `file.*` frame for this op that failed the strict schema. */
+  markMalformed(): void;
+  markLost(cause: FileOpLossCause): void;
 };
 
 /** What the terminal socket lists for an agent-requested (supervised) terminal. */
@@ -349,6 +384,8 @@ type SessionState = {
   mcpCommandMode: McpCommandModeName;
   terminalsById: Map<string, TerminalRecord>;
   commandsById: Map<string, TrackedCliCommand>;
+  /** 2.8: in-flight node file ops by op id (answers route only to the session that got the op). */
+  filesById: Map<string, TrackedFileOp>;
   /** Supervised commands by command id, from `term.spawn` until their terminal ends. */
   supervisedById: Map<string, TrackedSupervisedCommand>;
   /**
@@ -484,6 +521,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedMcpCommandMode: mcpCommandModeToDb(features.mcpCommandMode),
     reportedTerminalApproval: features.terminalApproval,
     reportedTerminalSupported: features.terminalSupported,
+    reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
     reportedHostname: message.cli.hostname ?? null,
     featuresReportedAt: now,
   };
@@ -491,7 +529,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
 
 function interactiveTargetFromBinary(
   frame: ArrayBuffer,
-): { kind: "terminal" | "command" | "supervised"; id: string } | null {
+): { kind: "terminal" | "command" | "supervised" | "file"; id: string } | null {
   if (frame.byteLength < 4) return null;
   const metadataLength = new DataView(frame).getUint32(0, false);
   if (metadataLength > RELAY_JSON_CONTROL_MAX_BYTES || frame.byteLength < 4 + metadataLength) {
@@ -513,6 +551,9 @@ function interactiveTargetFromBinary(
     }
     if (record.type === "supervised.output" && typeof record.commandId === "string") {
       return { kind: "supervised", id: record.commandId };
+    }
+    if (record.type === "file.data" && typeof record.opId === "string") {
+      return { kind: "file", id: record.opId };
     }
     return null;
   } catch {
@@ -613,6 +654,7 @@ export class RelaySessionManager {
       mcpCommandMode: "off",
       terminalsById: new Map(),
       commandsById: new Map(),
+      filesById: new Map(),
       supervisedById: new Map(),
       endingSupervised: new Map(),
       unauthenticatedTimer,
@@ -877,6 +919,11 @@ export class RelaySessionManager {
       return;
     }
 
+    if (message.type === "file.result" || message.type === "file.rejected") {
+      this.handleFileControl(session, message);
+      return;
+    }
+
     if (
       message.type === "term.spawned" ||
       message.type === "supervised.rejected" ||
@@ -913,6 +960,15 @@ export class RelaySessionManager {
         );
         return;
       }
+      if (parsed.metadata.type === "file.data") {
+        // Only the session that got the op may answer it; anything else is dropped.
+        session.filesById.get(parsed.metadata.opId)?.markData(parsed.body);
+        return;
+      }
+      if (parsed.metadata.type === "file.body") {
+        // Server to CLI only. A CLI has no business sending it.
+        return;
+      }
       if (parsed.metadata.type === "supervised.output") {
         // The record keeps it only when output was requested and the command
         // has exited without review (see `onOutput`).
@@ -930,6 +986,9 @@ export class RelaySessionManager {
         const session = this.sessionsBySocket.get(socket);
         const command = session?.commandsById.get(target.id);
         if (session && command?.status === "running") this.cancelTrackedCommand(session, command);
+      } else if (target?.kind === "file") {
+        // A malformed answer fails that op only; the session stays.
+        this.sessionsBySocket.get(socket)?.filesById.get(target.id)?.markMalformed();
       } else if (target?.kind === "supervised") {
         const session = this.sessionsBySocket.get(socket);
         const supervised = session?.supervisedById.get(target.id);
@@ -1429,6 +1488,10 @@ export class RelaySessionManager {
         supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
+        fileOps: relayProtocolAtLeast(session.protocolVersion, "2.8"),
+        mcpFileRead: session.features?.mcpFileRead ?? false,
+        fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
+        allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
         terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
           ? session.terminalPublicKey
           : null,
@@ -1886,6 +1949,59 @@ export class RelaySessionManager {
     this.cancelTrackedCommand(session, command);
   }
 
+  /**
+   * Store a file op and send `file.op` (then `file.body` for a write). False
+   * means no frame was sent and the op was not stored: offline, draining, or
+   * the effective mode no longer allows it (`fileOpModeRefusal` says which).
+   * The frame is encoded first, so a string the CLI could not read throws
+   * before anything is registered or sent.
+   */
+  dispatchFileOp(op: TrackedFileOp, frame: FileOpFrame, body?: Uint8Array): boolean {
+    if (this.relayDrain) return false;
+    const session = this.sessionsByCliDeviceId.get(op.cliDeviceId);
+    if (!session || !this.canStartFile(session, isMutatingFileOp(op.op) ? "write" : "read")) {
+      return false;
+    }
+    if (session.filesById.has(op.opId)) return false;
+    const control = encodeRelayServerControlMessage(frame);
+    const bodyFrame = body
+      ? encodeRelayBinaryFrame({ type: "file.body", opId: op.opId }, body)
+      : null;
+    session.filesById.set(op.opId, op);
+    session.socket.send(control);
+    if (bodyFrame) session.socket.send(bodyFrame);
+    return true;
+  }
+
+  /** Ask the CLI to stop a file op. The op stays until the CLI answers or its deadline. */
+  dispatchFileCancel(cliDeviceId: string, opId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session?.filesById.has(opId)) return;
+    if (this.canSignalFile(session)) this.sendControl(session, { type: "file.cancel", opId });
+  }
+
+  forgetFileOp(cliDeviceId: string, opId: string) {
+    this.sessionsByCliDeviceId.get(cliDeviceId)?.filesById.delete(opId);
+  }
+
+  /**
+   * Why a file op that passed admission was refused at the dispatch gate by
+   * the mode (the grant or the CLI's own mode changed meanwhile). Null when the
+   * mode still allows it.
+   */
+  fileOpModeRefusal(
+    cliDeviceId: string,
+    opClass: FileOpClass,
+  ): "grant_disabled" | "feature_disabled" | "supervised_only" | null {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session) return null;
+    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass);
+    if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
+    const liveAccess = fileToolAccess(session.features?.mcpCommandMode ?? "off", opClass);
+    if (liveAccess !== "headless") return fileAccessRefusal(liveAccess, "live");
+    return null;
+  }
+
   sendRelayRequest({
     cliDeviceId,
     endpointSlug,
@@ -2214,6 +2330,22 @@ export class RelaySessionManager {
     );
   }
 
+  /** Node file ops (2.8) follow the effective mode through the one file matrix. */
+  private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
+    return (
+      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+      fileToolAccess(this.effectiveCommandMode(session), opClass) === "headless" &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  private canSignalFile(session: SessionState): boolean {
+    return (
+      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
   private canSignalExec(session: SessionState): boolean {
     return (
       relayProtocolAtLeast(session.protocolVersion, "2.6") &&
@@ -2243,11 +2375,39 @@ export class RelaySessionManager {
       relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
+    this.cancelFileOpsNoLongerAllowed(session);
   }
 
   private teardownInteractiveWork(session: SessionState) {
     this.closeAllTerminals(session, this.canSignalTerminal(session), "disconnected");
     this.cancelAllCommands(session);
+    this.cancelAllFileOps(session);
+  }
+
+  /** Session loss: every in-flight file op ends `offline` (a mutating one with an unknown outcome). */
+  private cancelAllFileOps(session: SessionState) {
+    for (const op of [...session.filesById.values()]) {
+      if (this.canSignalFile(session)) {
+        this.sendControl(session, { type: "file.cancel", opId: op.opId });
+      }
+      op.markLost("offline");
+    }
+  }
+
+  /**
+   * The grant or the CLI's own mode dropped: file ops the matrix no longer
+   * allows are cancelled and end with the refusal the mode now gives.
+   */
+  private cancelFileOpsNoLongerAllowed(session: SessionState) {
+    for (const op of [...session.filesById.values()]) {
+      const opClass: FileOpClass = isMutatingFileOp(op.op) ? "write" : "read";
+      const refusal = this.fileOpModeRefusal(op.cliDeviceId, opClass);
+      if (refusal === null) continue;
+      if (this.canSignalFile(session)) {
+        this.sendControl(session, { type: "file.cancel", opId: op.opId });
+      }
+      op.markLost(refusal);
+    }
   }
 
   private closeAllTerminals(
@@ -2772,6 +2932,23 @@ export class RelaySessionManager {
   }
 
   /**
+   * `file.result` / `file.rejected`. Only the op the server dispatched to this
+   * very session is touched; a frame naming another op id is dropped.
+   */
+  private handleFileControl(
+    session: SessionState,
+    message: Extract<RelayClientControlMessage, { type: "file.result" | "file.rejected" }>,
+  ) {
+    const tracked = session.filesById.get(message.opId);
+    if (!tracked) return;
+    if (message.type === "file.result") {
+      tracked.markResult(message);
+      return;
+    }
+    tracked.markRejected(message.reason, message.detail);
+  }
+
+  /**
    * CLI reports for a supervised command. Only the command the server
    * dispatched to this very session is touched; a frame naming another
    * command id is dropped.
@@ -2911,6 +3088,18 @@ export class RelaySessionManager {
       const command = commandId ? session.commandsById.get(commandId) : undefined;
       if (command?.status === "running") this.cancelTrackedCommand(session, command);
       console.error("[relay] malformed exec frame");
+      return true;
+    }
+    if (type.startsWith("file.") && session.registered) {
+      // A file answer outside the strict schema fails that op only (never the
+      // session); an unknown op id is dropped. Nothing of the frame is logged.
+      const opId = typeof record.opId === "string" ? record.opId : null;
+      const tracked = opId ? session.filesById.get(opId) : undefined;
+      if (tracked) {
+        this.sendControl(session, { type: "file.cancel", opId: tracked.opId });
+        tracked.markMalformed();
+      }
+      console.error("[relay] malformed file frame");
       return true;
     }
     // Telemetry is advisory: a reading outside the strict schema (or an

@@ -23,6 +23,8 @@ export type CommandFeature = {
   available: boolean;
 };
 
+export type FileToolAccess = "headless" | "supervised" | "off";
+
 export type CliDeviceFeatures = {
   cliVersion: string | null;
   relayProtocolVersion: string | null;
@@ -30,6 +32,10 @@ export type CliDeviceFeatures = {
     terminal: TerminalFeature;
     commands: CommandFeature;
   };
+  /** What MCP node file tools may do now (relay 2.8); null until the list carries it. */
+  fileTools: { read: FileToolAccess; write: FileToolAccess } | null;
+  /** The CLI's `allowFileToolsAsRoot` config; null when not reported. */
+  allowFileToolsAsRoot: boolean | null;
 };
 
 export type FeatureSwitchReason = "windows" | "configDisabled" | "updateWsmp";
@@ -65,6 +71,8 @@ export function readCliDeviceFeatures(device: {
     terminal?: TerminalFeature;
     commands?: CommandFeature;
   } | null;
+  fileTools?: { read: FileToolAccess; write: FileToolAccess } | null;
+  allowFileToolsAsRoot?: boolean | null;
 }): CliDeviceFeatures {
   return {
     cliVersion: device.cliVersion ?? null,
@@ -73,6 +81,8 @@ export function readCliDeviceFeatures(device: {
       terminal: device.features?.terminal ?? EMPTY_TERMINAL,
       commands: device.features?.commands ?? EMPTY_COMMANDS,
     },
+    fileTools: device.fileTools ?? null,
+    allowFileToolsAsRoot: device.allowFileToolsAsRoot ?? null,
   };
 }
 

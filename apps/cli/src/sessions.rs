@@ -1731,6 +1731,10 @@ impl TerminalRegistry {
         if !terminal_supported() || !self.multi {
             return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
         }
+        // 2.8: supervised file ops are in the schema but not implemented (P5).
+        if spawn.is_file() {
+            return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
+        }
         if !startup.mcp_command_mode().allows_supervised() {
             return vec![supervised_rejected(command_id, REASON_DISABLED)];
         }
@@ -2001,6 +2005,7 @@ impl TerminalRegistry {
                 signal: signal_token(status.1),
                 review,
                 output_bytes,
+                file_result: None,
             })
         };
         if share_output && review {
@@ -5748,6 +5753,9 @@ exit 3
             reason: Some("needs your password".to_string()),
             requester: "test agent".to_string(),
             share_output,
+            kind: None,
+            file_op: None,
+            body_bytes: None,
         }
     }
 
@@ -6310,6 +6318,28 @@ exit 3
         request.cwd = Some(good.to_str().expect("utf8").to_string());
         let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
         assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
+    }
+
+    /// 2.8: a supervised file op is in the schema but never runs before P5.
+    #[cfg(unix)]
+    #[test]
+    fn supervised_file_spawn_is_unsupported_even_when_supervised_is_allowed() {
+        let (tx, _rx) = channel();
+        let mut terminals = supervised_registry(tx, "sleep 30");
+        let supervised = supervised_startup(McpCommandMode::Unsupervised, false);
+        let mut request = spawn_request(true);
+        request.kind = Some("file".to_string());
+        request.file_op = Some(crate::protocol::FileSpawnOp {
+            op: "mkdir".to_string(),
+            args: serde_json::json!({ "path": "~/x" }),
+        });
+        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_UNSUPPORTED
+        ));
+        assert!(terminals.sessions.is_empty());
     }
 
     #[cfg(unix)]

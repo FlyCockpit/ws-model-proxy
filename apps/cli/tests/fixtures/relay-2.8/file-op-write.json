@@ -1,0 +1,15 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "write",
+  "args": {
+    "path": "~/deploy/run.sh",
+    "ifExists": "replace",
+    "expectedEtag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+    "mode": "0755",
+    "makeParents": true,
+    "returnDiff": false,
+    "reason": "deploy"
+  },
+  "bodyBytes": 812
+}

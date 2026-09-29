@@ -204,7 +204,14 @@
         "cancel": "Mantener el modo actual",
         "confirm": "Permitir sin supervisión"
       },
-      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:"
+      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:",
+      "fileTools": "Herramientas de archivos: lectura {{read}}, escritura {{write}}. Siguen el modo de comandos MCP.",
+      "fileToolAccess": {
+        "headless": "se ejecutan sin supervisión",
+        "supervised": "requieren a una persona",
+        "off": "desactivadas"
+      },
+      "fileToolsAsRoot": "Este CLI permite que las herramientas de archivos MCP se ejecuten como root (allowFileToolsAsRoot está activado). Un agente podría leer o cambiar cualquier archivo de esta máquina. Desactívalo con wsmp config set-file-tools-as-root off."
     },
     "rename": {
       "action": "Renombrar",

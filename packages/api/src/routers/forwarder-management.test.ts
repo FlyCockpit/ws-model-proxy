@@ -5136,11 +5136,12 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: true,
         mcpCommandMode: "UNSUPERVISED",
         cliVersion: "0.4.0",
-        relayProtocolVersion: "2.7",
+        relayProtocolVersion: "2.8",
         reportedHumanTerminal: true,
         reportedMcpCommandMode: "SUPERVISED",
         reportedTerminalApproval: false,
         reportedTerminalSupported: true,
+        reportedAllowFileToolsAsRoot: true,
         User: { slug: "owner" },
         Endpoints: [],
       },
@@ -5168,8 +5169,15 @@ describe("setCliDeviceFeatureGrants", () => {
     });
     expect(offline[0]?.displayName).toBe("Desk");
     expect(offline[0]?.cliVersion).toBe("0.4.0");
+    // Offline: no file tool runs, and the root switch is the last reported value.
+    expect(offline[0]?.fileTools).toEqual({ read: "off", write: "off" });
+    expect(offline[0]?.allowFileToolsAsRoot).toBe(true);
 
-    const liveClient = (mcpCommandMode: "off" | "supervised" | "unsupervised") =>
+    const liveClient = (
+      mcpCommandMode: "off" | "supervised" | "unsupervised",
+      protocolVersion = "2.8",
+      allowFileToolsAsRoot = false,
+    ) =>
       createRouterClient(forwarderManagementRouter, {
         context: {
           ...buildContext(),
@@ -5179,13 +5187,17 @@ describe("setCliDeviceFeatureGrants", () => {
                 [
                   "cli-id",
                   {
-                    protocolVersion: "2.7",
+                    protocolVersion,
                     cliVersion: "0.4.0",
                     humanTerminal: true,
                     mcpCommandMode,
                     supervisedCommands: true,
                     terminalSupported: true,
                     terminalApproval: false,
+                    fileOps: protocolVersion === "2.8",
+                    mcpFileRead: false,
+                    fileRootsConfigured: false,
+                    allowFileToolsAsRoot,
                     terminalPublicKey: "key",
                   },
                 ],
@@ -5207,6 +5219,74 @@ describe("setCliDeviceFeatureGrants", () => {
       effectiveMode: "off",
       available: false,
     });
+
+    // File tools follow the effective mode (lowest of grant, CLI config, live hello).
+    expect(live[0]?.fileTools).toEqual({ read: "supervised", write: "supervised" });
+    expect(liveOff[0]?.fileTools).toEqual({ read: "off", write: "off" });
+    const liveUnsupervised = await liveClient("unsupervised", "2.8", true).listCliDevices();
+    expect(liveUnsupervised[0]?.fileTools).toEqual({ read: "headless", write: "headless" });
+    // The live root switch wins over the stored report.
+    expect(liveUnsupervised[0]?.allowFileToolsAsRoot).toBe(true);
+    expect((await liveClient("unsupervised").listCliDevices())[0]?.allowFileToolsAsRoot).toBe(
+      false,
+    );
+    // A live CLI older than 2.8 runs no file tool.
+    const legacy = await liveClient("unsupervised", "2.7").listCliDevices();
+    expect(legacy[0]?.fileTools).toEqual({ read: "off", write: "off" });
+  });
+
+  it("grants no file tools when the dashboard grant is off, whatever the CLI reports", async () => {
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        id: "cli-id",
+        createdAt: new Date("2026-01-01"),
+        updatedAt: new Date("2026-01-02"),
+        slug: "desk",
+        name: null,
+        reportedHostname: null,
+        status: "CONNECTED",
+        allowHumanTerminal: false,
+        mcpCommandMode: "OFF",
+        cliVersion: "0.5.0",
+        relayProtocolVersion: "2.8",
+        reportedHumanTerminal: false,
+        reportedMcpCommandMode: "UNSUPERVISED",
+        reportedTerminalApproval: false,
+        reportedTerminalSupported: true,
+        reportedAllowFileToolsAsRoot: null,
+        User: { slug: "owner" },
+        Endpoints: [],
+      },
+    ]);
+    const devices = await createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.8",
+                  cliVersion: "0.5.0",
+                  humanTerminal: false,
+                  mcpCommandMode: "unsupervised" as const,
+                  supervisedCommands: true,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  fileOps: true,
+                  mcpFileRead: false,
+                  fileRootsConfigured: false,
+                  allowFileToolsAsRoot: false,
+                  terminalPublicKey: null,
+                },
+              ],
+            ]),
+        },
+      },
+    }).listCliDevices();
+    expect(devices[0]?.fileTools).toEqual({ read: "off", write: "off" });
+    expect(devices[0]?.allowFileToolsAsRoot).toBe(false);
   });
 
   it("flags a device whose last hello was refused for an old relay protocol", async () => {

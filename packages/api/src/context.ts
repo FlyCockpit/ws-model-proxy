@@ -20,6 +20,14 @@ export type LiveCliFeatureSnapshot = {
   supervisedCommands: boolean;
   terminalSupported: boolean;
   terminalApproval: boolean;
+  /** 2.8: the CLI implements `file.op`. */
+  fileOps: boolean;
+  /** 2.8: the CLI's own read-only file grant (false until the read grant ships). */
+  mcpFileRead: boolean;
+  /** 2.8: the CLI has `fileRoots` configured (false until the read grant ships). */
+  fileRootsConfigured: boolean;
+  /** 2.8: the CLI's `allowFileToolsAsRoot` config. */
+  allowFileToolsAsRoot: boolean;
   /** Uncompressed P-256 public key, base64url, when the live session is 2.4. */
   terminalPublicKey: string | null;
   /**

@@ -49,8 +49,9 @@ import {
   isDeletionConflictReason,
 } from "@ws-model-proxy/config/deletion-conflict";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
-import { cliCommandsAllowed, isCliCommandTool } from "./cli-command-access";
 import { McpCliCommandRejectedError } from "./cli-command-tools";
+import { McpCliFileError } from "./cli-file-tools";
+import { cliToolAllowed, isCliTool } from "./cli-tool-access";
 import { mcpSanitizedLog } from "./errors";
 import { redactSecrets } from "./redaction";
 import { toJsonSafe } from "./serialization";
@@ -185,11 +186,15 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
     : undefined;
 
   for (const descriptor of MCP_TOOL_MANIFEST) {
-    // CLI command tools stay unregistered unless this request's credential
-    // is a personal token minted with allowCliCommands. OAuth, a PAT
-    // without the flag, and an unbound dispatch (treated as OAuth) do not
-    // see them. Call time checks the same predicate again.
-    if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(dispatch?.credential)) {
+    // CLI tools (commands and node file tools) stay unregistered unless this
+    // request's credential is a personal token minted with allowCliCommands
+    // (file tools also need mcp:write). OAuth, a PAT without the flag, and an
+    // unbound dispatch (treated as OAuth) do not see them. Call time checks
+    // the same predicate again.
+    if (
+      isCliTool(descriptor.name) &&
+      !cliToolAllowed(descriptor.name, dispatch?.credential, scopes)
+    ) {
       continue;
     }
     // Explicit type arguments: the SDK's first overload cannot infer
@@ -270,11 +275,11 @@ export async function runManifestTool(
   const signal = dispatch.signal;
   const credential = dispatch.credential ?? { kind: "oauth" as const };
 
-  // CLI command tools are re-checked before scope and confirmation so a
-  // credential that cannot see them gets the same not-found answer as an
-  // unregistered name, not an insufficient-scope or confirmation error
-  // that would reveal the tool.
-  if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(credential)) {
+  // CLI tools are re-checked before scope and confirmation so a credential
+  // that cannot see them gets the same not-found answer as an unregistered
+  // name, not an insufficient-scope or confirmation error that would reveal
+  // the tool.
+  if (isCliTool(descriptor.name) && !cliToolAllowed(descriptor.name, credential, scopes)) {
     mcpSanitizedLog("tool call rejected: unknown tool", {
       toolName: descriptor.name,
       requestId,
@@ -416,6 +421,14 @@ export async function runManifestTool(
         requestId,
       });
       return toolError(error.message, { error: { code: error.code } });
+    }
+    if (error instanceof McpCliFileError) {
+      // The code is a fixed runtime value. Paths and file content are not logged.
+      mcpSanitizedLog(`tool call rejected: cli file ${error.code}`, {
+        toolName: descriptor.name,
+        requestId,
+      });
+      return toolError(error.message, { error: { code: error.code, ...error.extra } });
     }
     return mapToolError(error, descriptor, requestId);
   }

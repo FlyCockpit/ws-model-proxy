@@ -22,7 +22,7 @@ import { mcpIdentityKey, mcpIdentityQuotaLimiter } from "../mcp-rate-limit";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "../public-request-url";
 import { MCP_CLOSE_SHADOW_AWAIT_MS } from "../shutdown-timeouts";
 import { createMcpAdmissionGate, type McpAdmission, type McpAdmissionGate } from "./admission";
-import type { McpRequestCredential } from "./cli-command-access";
+import type { McpRequestCredential } from "./cli-tool-access";
 import { createMcpContext, type McpContext, type McpSessionUser } from "./context";
 import {
   mcpForbiddenResponse,

@@ -11,7 +11,8 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.7) is read-only over MCP.
+Node telemetry (relay protocol 2.7) is read-only over MCP. Node file tools
+(relay protocol 2.8) are described in [CLI file tools](#cli-file-tools-relay-protocol-28).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
 stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
@@ -21,6 +22,73 @@ stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
 every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
+
+## CLI file tools (relay protocol 2.8)
+
+Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
+`forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
+(read class, scope `read`, no confirmation) and `forwarder_cli_file_edit`,
+`forwarder_cli_file_write`, `forwarder_cli_file_rename`, `forwarder_cli_dir_create`
+(write class, `confirm: "RUN"`) and `forwarder_cli_file_delete` (`confirm: "DELETE"`).
+All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
+it does not compose shell commands. Every result that touches a file carries an
+`etag`, results are bounded windows, and write-class calls take an optional `reason`
+(500 characters) that goes to the CLI log.
+
+**Who may call.** Like the CLI command tools, the file tools are visible and callable
+only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth
+is always denied and the tools are hidden from `tools/list`.
+
+**Permission matrix.** What runs depends on the device's effective mode, the lowest of the
+dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live hello:
+
+| Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
+| --- | --- | --- |
+| `unsupervised` | headless | headless |
+| `supervised` | refused `supervised_only` | refused `supervised_only` |
+| `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
+
+A supervised confirm screen for writes and an opt-in read-only grant are later phases;
+until then a supervised node refuses file tools. `listCliDevices` reports
+`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`, so
+an agent can see what works without trial calls. The CLI refuses every file tool as
+`unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
+The CLI re-checks its own mode on every operation; a server request never overrides it.
+The protected set (the wsmp state directory, `service.env`, `config.json` for writes,
+`/proc`, `/sys`, `/dev` and other special files) is refused as `path_denied`.
+
+**Masking boundary.** Only three things are masked in what the CLI returns: SSH private
+keys; environment-variable secrets (dotenv and env files such as `.env`, `*.env`, `.envrc`
+and `service.env`, plus secret-named `KEY=value` assignments in any file), shown as
+`KEY=⟦redacted:N⟧`; and the Hugging Face token file plus `--api-key` and `--hf-token`
+flag values. Masking happens before windowing, edits cannot target a masked span, and the
+etag is keyed. **On an `unsupervised` node masking is not a security boundary**: an agent
+with command access can `cat .env`. It keeps those secrets out of transcripts on the
+normal path. The server never logs or stores file content, and it additionally removes
+`wsmp_` credential substrings from every returned string.
+
+**ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
+with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
+and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`:
+re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
+when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
+fails with `timeout` or `offline` carries `error.outcome: "unknown"`: call
+`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying.
+
+**Limits.** 120 file operations per minute per user, of which at most 30 change files;
+4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
+Operations are never queued and time out after 30 seconds (search and hashing have shorter
+CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
+windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
+request), write content is at most 1 MiB, and an edit request must fit one 64 KiB relay
+frame. Errors are in-band `isError` results with a stable `error.code`: the command codes
+(`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
+`unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
+file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
+`too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
+`hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
+`cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
+("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
 

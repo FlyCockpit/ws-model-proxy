@@ -30,6 +30,11 @@ vi.mock("../relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
 }));
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+}));
 
 const { MCP_TOOL_MANIFEST, MCP_TOOL_EXCLUSIONS } = await import("./tool-manifest");
 const { appRouter } = await import("@ws-model-proxy/api/routers/index");

@@ -1,0 +1,11 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "mkdir",
+  "args": {
+    "path": "~/deploy/new",
+    "parents": true,
+    "mode": "0755",
+    "reason": "setup"
+  }
+}

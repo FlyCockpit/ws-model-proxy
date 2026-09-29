@@ -6,12 +6,12 @@ import {
   startSupervisedCommand,
   waitCliCommand,
 } from "../relay/cli-commands.js";
-import type { McpRequestCredential } from "./cli-command-access.js";
 import {
   parseCliCommandSnapshot,
   presentCliCommand,
   presentSupervisedCommand,
 } from "./cli-command-output.js";
+import type { McpRequestCredential } from "./cli-tool-access.js";
 
 type CliCommandDeps = {
   userId: string;

@@ -23,6 +23,7 @@ import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recover
 import { startUsageRetention } from "./model-api/usage-retention.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
+import { sweepExpiredFileOps } from "./relay/cli-file-ops.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
@@ -184,7 +185,11 @@ const stopUsageRetention = startUsageRetention({
 // session rechecks (60 s); see relay-maintenance.ts.
 const stopRelayMaintenance = startRelayMaintenance({
   relaySessions: relaySessionManager,
-  sweepExpiredTokenCommands,
+  // Token-scoped CLI work: commands and (relay 2.8) node file ops.
+  sweepExpiredTokenCommands: () => {
+    sweepExpiredTokenCommands();
+    sweepExpiredFileOps();
+  },
   terminalHub: terminalBrowserHub,
 });
 

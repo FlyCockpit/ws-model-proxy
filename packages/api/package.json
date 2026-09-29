@@ -83,6 +83,9 @@
     "./lib/relay-protocol-version": {
       "default": "./src/lib/relay-protocol-version.ts"
     },
+    "./lib/cli-file-access": {
+      "default": "./src/lib/cli-file-access.ts"
+    },
     "./lib/mcp-command-mode": {
       "default": "./src/lib/mcp-command-mode.ts"
     },

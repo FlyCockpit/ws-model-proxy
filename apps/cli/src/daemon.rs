@@ -844,6 +844,20 @@ fn run_relay_session(
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
     let mut terminals = TerminalRegistry::new(worker_tx.clone(), true);
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
+    // 2.8 node file ops run on the daemon's file pool, never on this loop; the
+    // relay keeps only the ops it has pending. Dropping it cancels them all.
+    #[cfg(unix)]
+    let mut files = {
+        let tx = worker_tx.clone();
+        let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
+            let _ = tx.send(FromWorker::FileFrames { op_id, frames });
+        });
+        crate::file_relay::FileRelay::new(
+            crate::file_relay::shared_runtime(startup.allow_file_tools_as_root()),
+            startup.mcp_command_mode(),
+            sink,
+        )
+    };
 
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
@@ -898,6 +912,8 @@ fn run_relay_session(
             &mut terminals,
             &mut execs,
             #[cfg(unix)]
+            &mut files,
+            #[cfg(unix)]
             &mut reload_preparing,
             #[cfg(unix)]
             &mut pending_preparation,
@@ -911,6 +927,10 @@ fn run_relay_session(
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
+            break Err(error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = send_file_frames(&mut socket, files.expire_stale(now)) {
             break Err(error);
         }
 
@@ -1009,6 +1029,8 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
+                #[cfg(unix)]
+                &mut files,
                 &mut registered,
                 telemetry.as_ref(),
             ),
@@ -1019,6 +1041,8 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
+                #[cfg(unix)]
+                &mut files,
             ),
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server");
@@ -1091,6 +1115,9 @@ fn run_relay_session(
     drop(telemetry);
     let _ = send_outbound_frames(&mut socket, terminals.kill_all());
     let _ = send_outbound_frames(&mut socket, execs.kill_all());
+    // In-flight file ops are cancelled; their results are dropped.
+    #[cfg(unix)]
+    files.cancel_all();
     abort_all_workers(workers);
     if matches!(result, Err(RelaySessionError::Shutdown(_))) {
         // The connection is still open: say goodbye so the server marks the
@@ -1131,6 +1158,7 @@ fn drain_worker_output<S>(
     recent_finished: &mut RecentlyFinished,
     #[cfg(unix)] terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     #[cfg(unix)] reload_preparing: &mut bool,
     #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
     #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
@@ -1192,6 +1220,13 @@ where
                 socket
                     .send(Message::Text(text.into()))
                     .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
+            }
+            #[cfg(unix)]
+            Ok(FromWorker::FileFrames { op_id, frames }) => {
+                // Cancelled or torn-down ops are no longer pending: drop them.
+                if files.complete(&op_id) {
+                    send_file_frames(socket, frames)?;
+                }
             }
             #[cfg(unix)]
             Ok(FromWorker::InventoryPrepared { candidate }) => {
@@ -1550,6 +1585,7 @@ fn handle_text<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     registered: &mut bool,
     telemetry: Option<&crate::telemetry::Telemetry>,
 ) -> RelaySessionResult<()>
@@ -1840,6 +1876,34 @@ where
         } => {
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
         }
+        ServerControlMessage::FileOp {
+            op_id,
+            op,
+            args,
+            body_bytes,
+        } => {
+            #[cfg(unix)]
+            send_file_frames(socket, files.handle_op(&op_id, &op, args, body_bytes))?;
+            #[cfg(not(unix))]
+            {
+                let _ = (&op, &args, &body_bytes);
+                send_control(
+                    socket,
+                    &ClientControlMessage::FileRejected {
+                        op_id,
+                        reason: "unsupported".to_string(),
+                        detail: None,
+                    },
+                    "sending a file op rejection",
+                )?;
+            }
+        }
+        ServerControlMessage::FileCancel { op_id } => {
+            #[cfg(unix)]
+            files.handle_cancel(&op_id);
+            #[cfg(not(unix))]
+            let _ = op_id;
+        }
         ServerControlMessage::MetricsSourcesSet { id, sources } => {
             // Remote metric sources need a local opt-in and hash approval
             // (S-B part 2). This CLI runs none and reports each `unsupported`
@@ -2024,6 +2088,18 @@ where
                 "sending a supervised command rejection",
             )
         }
+        FrameFault::RejectFile { op_id } => {
+            tracing::warn!("refusing a malformed file op");
+            send_control(
+                socket,
+                &ClientControlMessage::FileRejected {
+                    op_id,
+                    reason: "bad_frame".to_string(),
+                    detail: None,
+                },
+                "sending a file op rejection",
+            )
+        }
         FrameFault::CancelSupervised { command_id } => {
             tracing::warn!(
                 command_id,
@@ -2041,6 +2117,7 @@ fn handle_binary<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2091,6 +2168,17 @@ where
             }
             RelayBinaryFrameMetadata::SupervisedOutput { .. } => {
                 tracing::warn!("ignoring an unexpected supervised output frame");
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::FileBody { op_id } => {
+                #[cfg(unix)]
+                send_file_frames(socket, files.handle_body(&op_id, body))?;
+                #[cfg(not(unix))]
+                let _ = (&op_id, &body);
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::FileData { .. } => {
+                tracing::warn!("ignoring an unexpected file.data frame");
                 Ok(())
             }
             RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
@@ -2709,6 +2797,8 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }
         | ClientControlMessage::ExecDone { .. }
+        | ClientControlMessage::FileResult { .. }
+        | ClientControlMessage::FileRejected { .. }
         | ClientControlMessage::NodeInfo(_)
         | ClientControlMessage::NodeMetrics(_)
         | ClientControlMessage::EndpointLoad(_) => {
@@ -2778,6 +2868,34 @@ where
         },
         "sending relay error",
     )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_file_frames<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    frames: Vec<crate::file_relay::FileFrame>,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    use crate::file_relay::FileFrame;
+    for frame in frames {
+        match frame {
+            FileFrame::Control(message) => {
+                send_control(socket, &message, "sending a file op frame")?;
+            }
+            FileFrame::Binary(metadata, body) => {
+                let encoded =
+                    encode_binary_frame(&metadata, &body).map_err(RelaySessionError::Fatal)?;
+                socket
+                    .send(Message::Binary(encoded.into()))
+                    .map_err(|error| {
+                        websocket_session_error(error, "sending a file op frame", true)
+                    })?;
+            }
+        }
+    }
     Ok(())
 }
 

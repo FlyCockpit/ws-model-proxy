@@ -12,6 +12,11 @@ vi.mock("./relay/cli-commands.js", () => ({
   listPendingSupervised: vi.fn(() => []),
   submitSupervisedOutput: vi.fn(),
 }));
+vi.mock("./relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+}));
 
 /**
  * PRODUCTION-REGISTRATION ORDERING CONTRACT TESTS (ledger L24, Part E pass 3;

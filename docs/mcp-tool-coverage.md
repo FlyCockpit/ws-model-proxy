@@ -43,6 +43,15 @@ fails the suite when a leaf is unclassified.
 | `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
 | `core:forwarderCliCommandResult` | `forwarder_cli_command_result` | write | — | pure | — | — | — |
 | `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
+| `core:forwarderCliFileDelete` | `forwarder_cli_file_delete` | write | DELETE | destructive | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileEdit` | `forwarder_cli_file_edit` | write | RUN | external | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileList` | `forwarder_cli_dir_list` | read | — | pure | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileMkdir` | `forwarder_cli_dir_create` | write | RUN | external | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileRead` | `forwarder_cli_file_read` | read | — | pure | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileRename` | `forwarder_cli_file_rename` | write | RUN | external | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileSearch` | `forwarder_cli_file_search` | read | — | pure | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileStat` | `forwarder_cli_file_stat` | read | — | pure | `projectFileToolOutput` | — | — |
+| `core:forwarderCliFileWrite` | `forwarder_cli_file_write` | write | RUN | external | `projectFileToolOutput` | — | — |
 | `core:forwarderCliSupervisedCommandStart` | `forwarder_cli_supervised_command_start` | write | RUN | external | — | — | — |
 | `core:model-api/runChatCompletionDiagnostic` | `forwarder_chat_completion_test` | write | RUN | cost | — | — | — |
 | `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |

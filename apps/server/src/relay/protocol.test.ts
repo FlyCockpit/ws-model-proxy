@@ -234,8 +234,8 @@ function bytes16(): string {
   return Buffer.alloc(16, 7).toString("base64url");
 }
 
-const CAPABILITIES_27 = {
-  protocolVersion: "2.7",
+const CAPABILITIES_28 = {
+  protocolVersion: "2.8",
   inventoryAck: true,
   inventoryReplace: true,
   endpointTargeting: true,
@@ -254,11 +254,15 @@ const CAPABILITIES_27 = {
     terminalApproval: false,
     terminalSupported: true,
     remoteMetricSources: false,
+    mcpFileRead: false,
+    fileRootsConfigured: false,
+    allowFileToolsAsRoot: false,
   },
   terminalPublicKey: uncompressedKey(),
   terminalViewers: true,
   supervisedCommands: true,
   nodeTelemetry: true,
+  fileOps: true,
 };
 
 function hello(protocolVersion: string, capabilities: unknown) {
@@ -275,10 +279,10 @@ function helloWithCli(cli: Record<string, unknown>) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug: "desktop",
-      capabilities: CAPABILITIES_27,
+      capabilities: CAPABILITIES_28,
       ...cli,
     },
     endpoints: [endpoint()],
@@ -308,16 +312,16 @@ describe("hello hostname", () => {
   });
 });
 
-describe("relay protocol 2.7 minimum", () => {
-  it("speaks only 2.7 and names the protocol in the upgrade message", () => {
-    expect(RELAY_PROTOCOL_VERSIONS).toEqual(["2.7"]);
-    expect(RELAY_MIN_PROTOCOL_VERSION).toBe("2.7");
-    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("relay protocol 2.7");
+describe("relay protocol 2.8 minimum", () => {
+  it("speaks only 2.8 and names the protocol in the upgrade message", () => {
+    expect(RELAY_PROTOCOL_VERSIONS).toEqual(["2.8"]);
+    expect(RELAY_MIN_PROTOCOL_VERSION).toBe("2.8");
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("relay protocol 2.8");
     expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("Upgrade wsmp");
   });
 
   it("flags every older hello, and the pre-naming label field, before schema parsing", () => {
-    for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6"]) {
+    for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6", "2.7"]) {
       expect(helloNeedsUpgrade(hello(version, { protocolVersion: version }))).toBe(true);
     }
     // 0.3.x shape: protocol 2.3 with `cli.label` and no hostname.
@@ -333,22 +337,22 @@ describe("relay protocol 2.7 minimum", () => {
       ),
     ).toBe(true);
     expect(helloNeedsUpgrade(helloWithCli({ label: "Desk" }))).toBe(true);
-    expect(helloNeedsUpgrade(hello("2.7", { ...CAPABILITIES_27, protocolVersion: "2.6" }))).toBe(
+    expect(helloNeedsUpgrade(hello("2.8", { ...CAPABILITIES_28, protocolVersion: "2.6" }))).toBe(
       true,
     );
     // A released 0.4.x CLI (protocol 2.6) gets the upgrade message, not "malformed".
-    const released26 = { ...CAPABILITIES_27, protocolVersion: "2.6" } as Record<string, unknown>;
+    const released26 = { ...CAPABILITIES_28, protocolVersion: "2.6" } as Record<string, unknown>;
     delete released26.nodeTelemetry;
     expect(helloNeedsUpgrade(hello("2.6", released26))).toBe(true);
-    expect(helloNeedsUpgrade(hello("2.7", CAPABILITIES_27))).toBe(false);
+    expect(helloNeedsUpgrade(hello("2.8", CAPABILITIES_28))).toBe(false);
     expect(helloNeedsUpgrade(JSON.stringify({ type: "heartbeat", id: "x" }))).toBe(false);
     expect(helloNeedsUpgrade("not json")).toBe(false);
   });
 
-  it("parses a 2.7 hello and refuses older or loose capability shapes", () => {
-    expect(parseRelayClientControlFrame(hello("2.7", CAPABILITIES_27))).toMatchObject({
+  it("parses a 2.8 hello and refuses older or loose capability shapes", () => {
+    expect(parseRelayClientControlFrame(hello("2.8", CAPABILITIES_28))).toMatchObject({
       type: "hello",
-      protocolVersion: "2.7",
+      protocolVersion: "2.8",
       cli: {
         capabilities: {
           supervisedCommands: true,
@@ -356,7 +360,7 @@ describe("relay protocol 2.7 minimum", () => {
         },
       },
     });
-    const withConcurrency = JSON.parse(hello("2.7", CAPABILITIES_27)) as {
+    const withConcurrency = JSON.parse(hello("2.8", CAPABILITIES_28)) as {
       endpoints: Array<{ models: unknown[] }>;
     };
     withConcurrency.endpoints[0]?.models.push({
@@ -375,36 +379,39 @@ describe("relay protocol 2.7 minimum", () => {
     expect(() => parseRelayClientControlFrame(JSON.stringify(withConcurrency))).toThrow();
 
     const bad: unknown[] = [
-      { ...CAPABILITIES_27, supervisedCommands: false },
-      { ...CAPABILITIES_27, nodeTelemetry: false },
-      { ...CAPABILITIES_27, nodeTelemetry: undefined },
+      { ...CAPABILITIES_28, supervisedCommands: false },
+      { ...CAPABILITIES_28, nodeTelemetry: false },
+      { ...CAPABILITIES_28, nodeTelemetry: undefined },
       {
-        ...CAPABILITIES_27,
-        features: { ...CAPABILITIES_27.features, remoteMetricSources: undefined },
+        ...CAPABILITIES_28,
+        features: { ...CAPABILITIES_28.features, remoteMetricSources: undefined },
       },
-      { ...CAPABILITIES_27, terminalViewers: false },
-      { ...CAPABILITIES_27, extra: true },
-      { ...CAPABILITIES_27, terminalPublicKey: uncompressedKey(0x02) },
+      { ...CAPABILITIES_28, terminalViewers: false },
+      { ...CAPABILITIES_28, extra: true },
+      { ...CAPABILITIES_28, terminalPublicKey: uncompressedKey(0x02) },
       {
-        ...CAPABILITIES_27,
-        features: { ...CAPABILITIES_27.features, mcpCommandMode: "always" },
+        ...CAPABILITIES_28,
+        features: { ...CAPABILITIES_28.features, mcpCommandMode: "always" },
       },
       {
-        ...CAPABILITIES_27,
+        ...CAPABILITIES_28,
         features: {
           humanTerminal: true,
           mcpCommands: true,
           terminalApproval: false,
           terminalSupported: true,
           remoteMetricSources: false,
+          mcpFileRead: false,
+          fileRootsConfigured: false,
+          allowFileToolsAsRoot: false,
         },
       },
     ];
     for (const capabilities of bad) {
-      expect(() => parseRelayClientControlFrame(hello("2.7", capabilities))).toThrow();
+      expect(() => parseRelayClientControlFrame(hello("2.8", capabilities))).toThrow();
     }
     expect(() =>
-      parseRelayClientControlFrame(hello("2.6", { ...CAPABILITIES_27, protocolVersion: "2.6" })),
+      parseRelayClientControlFrame(hello("2.6", { ...CAPABILITIES_28, protocolVersion: "2.6" })),
     ).toThrow();
   });
 
@@ -416,7 +423,7 @@ describe("relay protocol 2.7 minimum", () => {
       signature: Buffer.alloc(64, 7).toString("base64url"),
     };
     expect(
-      parseRelayClientControlFrame(hello("2.7", { ...CAPABILITIES_27, terminalIdentity })),
+      parseRelayClientControlFrame(hello("2.8", { ...CAPABILITIES_28, terminalIdentity })),
     ).toMatchObject({ cli: { capabilities: { terminalIdentity } } });
     for (const bad of [
       { publicKey: terminalIdentity.publicKey },
@@ -424,7 +431,7 @@ describe("relay protocol 2.7 minimum", () => {
       { ...terminalIdentity, extra: true },
     ]) {
       expect(() =>
-        parseRelayClientControlFrame(hello("2.7", { ...CAPABILITIES_27, terminalIdentity: bad })),
+        parseRelayClientControlFrame(hello("2.8", { ...CAPABILITIES_28, terminalIdentity: bad })),
       ).toThrow();
     }
   });
@@ -760,10 +767,15 @@ function relay27Vector(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(url, "utf8")) as Record<string, unknown>;
 }
 
+/** Cross-language vectors: `apps/cli/src/protocol.rs` (`relay_28_vectors`) encodes these exactly. */
+function relay28Vector(name: string): Record<string, unknown> {
+  const url = new URL(`../../../cli/tests/fixtures/relay-2.8/${name}`, import.meta.url);
+  return JSON.parse(readFileSync(url, "utf8")) as Record<string, unknown>;
+}
+
 describe("relay protocol 2.7 telemetry frames", () => {
-  it("accepts every CLI-encoded 2.7 vector", () => {
+  it("accepts every CLI-encoded 2.7 telemetry vector and the 2.8 hello", () => {
     for (const name of [
-      "hello.json",
       "node-info.json",
       "node-metrics.json",
       "endpoint-load.json",
@@ -778,7 +790,7 @@ describe("relay protocol 2.7 telemetry frames", () => {
         type: vector.type,
       });
     }
-    const hello = parseRelayClientControlFrame(JSON.stringify(relay27Vector("hello.json")));
+    const hello = parseRelayClientControlFrame(JSON.stringify(relay28Vector("hello.json")));
     if (hello.type !== "hello") throw new Error("expected hello");
     expect(hello.endpoints[0]?.engineFacts).toEqual({
       engine: { value: "vllm", source: "probe" },
@@ -930,7 +942,7 @@ describe("relay protocol 2.7 telemetry frames", () => {
   });
 
   it("validates engine facts strictly", () => {
-    const hello = relay27Vector("hello.json") as {
+    const hello = relay28Vector("hello.json") as {
       endpoints: Array<{ engineFacts?: Record<string, unknown> }>;
     };
     const endpoint = hello.endpoints[0];

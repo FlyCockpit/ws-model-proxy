@@ -104,7 +104,7 @@ function capabilities26(features?: {
   terminalSupported?: boolean;
 }) {
   return {
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     inventoryAck: true,
     inventoryReplace: true,
     endpointTargeting: true,
@@ -123,11 +123,15 @@ function capabilities26(features?: {
       terminalApproval: features?.terminalApproval ?? false,
       terminalSupported: features?.terminalSupported ?? true,
       remoteMetricSources: false,
+      mcpFileRead: false,
+      fileRootsConfigured: false,
+      allowFileToolsAsRoot: false,
     },
     terminalPublicKey: uncompressedKey(),
     terminalViewers: true,
     supervisedCommands: true,
     nodeTelemetry: true,
+    fileOps: true,
   };
 }
 
@@ -135,7 +139,7 @@ function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -701,7 +705,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.7",
+      protocolVersion: "2.8",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -951,7 +955,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.7",
+      protocolVersion: "2.8",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -1330,7 +1334,7 @@ function hello24(features?: {
   return JSON.stringify({
     type: "hello",
     id: "hello-24",
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -1365,20 +1369,81 @@ describe("relay terminal and exec sessions", () => {
     return socket;
   }
 
+  it("persists allowFileToolsAsRoot from hello and reports the file features live", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(hello24()) as {
+      cli: { capabilities: { features: Record<string, unknown> } };
+    };
+    frame.cli.capabilities.features.allowFileToolsAsRoot = true;
+    await register(manager, socket, JSON.stringify(frame));
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ reportedAllowFileToolsAsRoot: true }),
+      }),
+    );
+    expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
+      protocolVersion: "2.8",
+      fileOps: true,
+      mcpFileRead: false,
+      fileRootsConfigured: false,
+      allowFileToolsAsRoot: true,
+    });
+  });
+
+  it("drops file frames for an unknown op and refuses them before registration", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    await register(manager, socket);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    socket.sends.length = 0;
+    // A CLI that answers an op the server never sent, or sends a server-only frame.
+    for (const frame of [
+      { type: "file.rejected", opId: id16(9), reason: "conflict" },
+      { type: "file.result", opId: id16(9), op: "mkdir", result: { created: true } },
+      { type: "file.result", opId: id16(9), op: "mkdir", result: { leak: 1 } },
+      { type: "file.op", opId: id16(9), op: "read", args: { path: "~/a" } },
+      { type: "file.cancel", opId: id16(9) },
+    ]) {
+      await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    }
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "file.data", opId: id16(9) }, new Uint8Array(4)),
+    );
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "file.body", opId: id16(9) }, new Uint8Array(4)),
+    );
+    expect(socket.closes).toEqual([]);
+    expect(socket.sends).toEqual([]);
+
+    const early = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: early, identity, now });
+    await manager.handleTextFrame(
+      early,
+      JSON.stringify({ type: "file.rejected", opId: id16(9), reason: "conflict" }),
+      now,
+    );
+    expect(early.closes.length).toBeGreaterThan(0);
+    errors.mockRestore();
+  });
+
   it("echoes the client protocol version and persists reported columns only from hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, hello24({ mcpCommandMode: "supervised" }));
-    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.7");
+    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.8");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.7",
+          relayProtocolVersion: "2.8",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
           reportedTerminalSupported: true,
+          reportedAllowFileToolsAsRoot: false,
           reportedHostname: "desk-01.local",
           featuresReportedAt: now,
         }),
@@ -1550,7 +1615,7 @@ describe("relay terminal and exec sessions", () => {
     consoleError.mockRestore();
   });
 
-  it("registers a valid 2.7 hello", async () => {
+  it("registers a valid 2.8 hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket);
@@ -1819,19 +1884,19 @@ describe("relay protocol 2.5 terminal viewers", () => {
     });
   }
 
-  it("keeps MCP commands and terminal keys for a 2.7 CLI and persists the version", async () => {
+  it("keeps MCP commands and terminal keys for a 2.8 CLI and persists the version", async () => {
     const { manager } = await setup();
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.7",
+          relayProtocolVersion: "2.8",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.7",
+      protocolVersion: "2.8",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),

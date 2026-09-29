@@ -173,6 +173,10 @@ pub struct Config {
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
+    /// Run the MCP node file tools even when the daemon is root (euid 0). Read
+    /// once when the relay starts; off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_file_tools_as_root: bool,
 }
 
 /// The on-disk shape, including the legacy `allowMcpCommands` switch that
@@ -191,6 +195,7 @@ struct ConfigWire {
     mcp_command_mode: Option<McpCommandMode>,
     allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
+    allow_file_tools_as_root: bool,
 }
 
 impl Default for ConfigWire {
@@ -207,6 +212,7 @@ impl Default for ConfigWire {
             mcp_command_mode: None,
             allow_mcp_commands: None,
             require_terminal_approval: false,
+            allow_file_tools_as_root: false,
         }
     }
 }
@@ -229,6 +235,7 @@ impl From<ConfigWire> for Config {
             allow_human_terminal: wire.allow_human_terminal,
             mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
+            allow_file_tools_as_root: wire.allow_file_tools_as_root,
         }
     }
 }
@@ -245,6 +252,7 @@ impl Default for Config {
             allow_human_terminal: false,
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
+            allow_file_tools_as_root: false,
         }
     }
 }

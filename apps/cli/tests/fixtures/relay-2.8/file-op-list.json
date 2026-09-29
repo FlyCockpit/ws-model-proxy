@@ -1,0 +1,13 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "list",
+  "args": {
+    "path": "~/models",
+    "depth": 2,
+    "glob": "*.gguf",
+    "includeHidden": false,
+    "maxEntries": 200,
+    "cursor": "~/models/a"
+  }
+}

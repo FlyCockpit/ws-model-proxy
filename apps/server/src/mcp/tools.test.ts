@@ -57,6 +57,14 @@ const cliRuntime = vi.hoisted(() => ({
 
 vi.mock("../relay/cli-commands.js", () => cliRuntime);
 
+const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn() }));
+
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: fileRuntime.runFileOp,
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+}));
+
 // The full-chain test drives the Phase 4 request handler whose verifier is
 // the upstream requireMcpAuth wrapper. Mock ONLY that wrapper (keeping the
 // real `mcp` plugin via importOriginal — the auth package's plugin chain
@@ -194,10 +202,24 @@ function bindRequest(
   });
 }
 
+const CLI_FILE_TOOL_NAMES = [
+  "forwarder_cli_file_read",
+  "forwarder_cli_file_stat",
+  "forwarder_cli_dir_list",
+  "forwarder_cli_file_search",
+  "forwarder_cli_file_edit",
+  "forwarder_cli_file_write",
+  "forwarder_cli_file_rename",
+  "forwarder_cli_dir_create",
+  "forwarder_cli_file_delete",
+] as const;
+
+/** Every PAT-only CLI tool: the three command tools and the nine node file tools. */
 const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  ...CLI_FILE_TOOL_NAMES,
 ]);
 
 function catalogNames(includeCliCommands: boolean): string[] {
@@ -1808,4 +1830,449 @@ describe("MCP preview provider disclosure", () => {
         providerGate.enabled = true;
       }
     });
+});
+
+describe("CLI file tools", () => {
+  const READ_RESULT = {
+    etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    size: 12,
+    mtime: "2026-01-01T00:00:00Z",
+    mode: "0644",
+    totalLines: 1,
+    startLine: 1,
+    endLine: 1,
+    eol: "lf",
+    text: "1|KEY=⟦redacted:12⟧",
+    redactions: 1,
+    more: null,
+    secretFile: true,
+  };
+
+  beforeEach(() => {
+    fileRuntime.runFileOp.mockReset();
+  });
+
+  async function listedTools(
+    credential: ListedCredential | undefined,
+    scopes: string[],
+  ): Promise<Array<{ name: string; description?: string; annotations?: Record<string, unknown> }>> {
+    const authInfo = buildAuthInfo(scopes);
+    if (credential !== undefined) bindRequest(authInfo, "req-list", credential);
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(9), { authInfo });
+    const body = (await response.json()) as {
+      result?: { tools?: Array<{ name: string; description?: string }> };
+    };
+    return body.result?.tools ?? [];
+  }
+
+  async function call(
+    name: string,
+    args: unknown,
+    options: { credential?: ListedCredential; scopes?: string[]; signal?: AbortSignal } = {},
+  ) {
+    return runManifestTool(requireDescriptor(name), {
+      dispatch: cliDispatch(options.credential ?? PAT_WITH_CLI, options.signal),
+      scopes: options.scopes ?? ["mcp:write"],
+      client: undefined,
+      args,
+    });
+  }
+
+  function structured(result: { structuredContent?: unknown }) {
+    return result.structuredContent as {
+      result?: Record<string, unknown>;
+      error?: Record<string, unknown>;
+    };
+  }
+
+  it("registers 4 read-class and 5 write-class descriptors with the documented policy", () => {
+    const table: Array<[string, "read" | "write", "DELETE" | "RUN" | null, string]> = [
+      ["forwarder_cli_file_read", "read", null, "pure"],
+      ["forwarder_cli_file_stat", "read", null, "pure"],
+      ["forwarder_cli_dir_list", "read", null, "pure"],
+      ["forwarder_cli_file_search", "read", null, "pure"],
+      ["forwarder_cli_file_edit", "write", "RUN", "external"],
+      ["forwarder_cli_file_write", "write", "RUN", "external"],
+      ["forwarder_cli_file_rename", "write", "RUN", "external"],
+      ["forwarder_cli_dir_create", "write", "RUN", "external"],
+      ["forwarder_cli_file_delete", "write", "DELETE", "destructive"],
+    ];
+    for (const [name, scope, confirmation, classification] of table) {
+      const descriptor = requireDescriptor(name);
+      expect(
+        `${name} ${descriptor.scope} ${descriptor.confirmation} ${descriptor.classification}`,
+      ).toBe(`${name} ${scope} ${confirmation} ${classification}`);
+      expect(descriptor.target).toMatch(/^core:forwarderCliFile/);
+      expect(descriptor.deliverDespiteAbort).not.toBe(true);
+    }
+  });
+
+  it("hides all nine tools from OAuth and from a PAT without the flag, and lists them for a flagged PAT with mcp:write", async () => {
+    for (const [credential, scopes] of [
+      [OAUTH_CREDENTIAL, ["mcp:write"]],
+      [OAUTH_CREDENTIAL, ["mcp:read"]],
+      [PAT_WITHOUT_CLI, ["mcp:write"]],
+      [undefined, ["mcp:write"]],
+    ] as const) {
+      const names = (await listedTools(credential, [...scopes])).map((tool) => tool.name);
+      for (const name of CLI_FILE_TOOL_NAMES) expect(names).not.toContain(name);
+    }
+    const flagged = (await listedTools(PAT_WITH_CLI, ["mcp:write"])).map((tool) => tool.name);
+    for (const name of CLI_FILE_TOOL_NAMES) expect(flagged).toContain(name);
+    // A flagged PAT that only holds mcp:read does not get the file tools in this phase.
+    const readOnly = (await listedTools(PAT_WITH_CLI, ["mcp:read"])).map((tool) => tool.name);
+    for (const name of CLI_FILE_TOOL_NAMES) expect(readOnly).not.toContain(name);
+  });
+
+  it("answers an unknown-tool error at call time to OAuth, a PAT without the flag, and a read-only PAT", async () => {
+    for (const [credential, scopes] of [
+      [OAUTH_CREDENTIAL, ["mcp:write"]],
+      [PAT_WITHOUT_CLI, ["mcp:write"]],
+      [PAT_WITH_CLI, ["mcp:read"]],
+    ] as const) {
+      for (const name of CLI_FILE_TOOL_NAMES) {
+        const result = await call(
+          name,
+          { cliDeviceId: "cli-1", path: "~/a", confirm: "RUN" },
+          { credential, scopes: [...scopes] },
+        );
+        expect(result.isError).toBe(true);
+        expect(resultText(result)).toBe(`Tool ${name} not found`);
+      }
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("requires the confirmation literal on write-class tools before anything runs", async () => {
+    for (const [name, literal] of [
+      ["forwarder_cli_file_edit", "RUN"],
+      ["forwarder_cli_file_write", "RUN"],
+      ["forwarder_cli_file_rename", "RUN"],
+      ["forwarder_cli_dir_create", "RUN"],
+      ["forwarder_cli_file_delete", "DELETE"],
+    ] as const) {
+      const result = await call(name, { cliDeviceId: "cli-1", path: "~/a" });
+      expect(resultText(result)).toContain(`confirm="${literal}"`);
+      const wrong = await call(name, {
+        cliDeviceId: "cli-1",
+        path: "~/a",
+        confirm: literal === "RUN" ? "DELETE" : "RUN",
+      });
+      expect(resultText(wrong)).toContain(`confirm="${literal}"`);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("advertises strict inputs and states the masking boundary, the ETag workflow, and the unknown-outcome recovery", async () => {
+    const tools = await listedTools(PAT_WITH_CLI, ["mcp:write"]);
+    const read = tools.find((tool) => tool.name === "forwarder_cli_file_read");
+    const edit = tools.find((tool) => tool.name === "forwarder_cli_file_edit");
+    expect(read?.description).toContain("NOT a security boundary");
+    expect(read?.description).toContain("⟦redacted:N⟧");
+    expect(read?.description).toContain("SSH private keys");
+    expect(read?.description).toContain("ifNoneMatch");
+    expect(edit?.description).toContain("expectedEtag");
+    expect(edit?.description).toContain("forwarder_cli_file_stat");
+    expect(edit?.description).toContain('confirm: "RUN"');
+    expect(read?.annotations?.readOnlyHint).toBe(true);
+    expect(edit?.annotations?.readOnlyHint).toBe(false);
+    const listing = await (async () => {
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-schema", PAT_WITH_CLI);
+      const response = await createMcpTransport().fetch(toolsListRequest(10), { authInfo });
+      return (await response.json()) as {
+        result?: {
+          tools?: Array<{
+            name: string;
+            inputSchema?: { properties?: Record<string, unknown>; additionalProperties?: unknown };
+          }>;
+        };
+      };
+    })();
+    const schema = listing.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_file_read",
+    )?.inputSchema;
+    expect(Object.keys(schema?.properties ?? {}).sort()).toEqual(
+      [
+        "byteOffset",
+        "cliDeviceId",
+        "ifNoneMatch",
+        "lineNumbers",
+        "maxBytes",
+        "maxLines",
+        "path",
+        "startLine",
+      ].sort(),
+    );
+    expect(schema?.additionalProperties).toBe(false);
+  });
+
+  it("runs a read with exactly the documented arguments, and projects only documented fields", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: { ...READ_RESULT, leaked: "SHOULD_NOT_APPEAR", nested: { more: 1 } },
+    });
+    const result = await call("forwarder_cli_file_read", {
+      cliDeviceId: "cli-1",
+      path: "~/.env",
+      startLine: 1,
+      maxLines: 10,
+      unknownField: "ignored",
+    });
+    expect(result.isError).toBeUndefined();
+    expect(fileRuntime.runFileOp).toHaveBeenCalledWith({
+      userId: USER.id,
+      tokenId: "token-pat-1",
+      expiresAt: PAT_EXPIRES,
+      cliDeviceId: "cli-1",
+      op: "read",
+      args: { path: "~/.env", startLine: 1, maxLines: 10 },
+      signal: undefined,
+    });
+    const payload = structured(result).result;
+    expect(payload).toEqual(READ_RESULT);
+    expect(JSON.stringify(result)).not.toContain("SHOULD_NOT_APPEAR");
+    // The boolean secretFile flag survives the generic key redactor.
+    expect(payload?.secretFile).toBe(true);
+    expect(resultText(result)).toContain("⟦redacted:12⟧");
+  });
+
+  it("clamps a read window to the MCP output budget", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({ ok: true, op: "read", result: READ_RESULT });
+    await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", maxBytes: 131072 });
+    expect(fileRuntime.runFileOp.mock.calls[0]?.[0]).toMatchObject({ args: { maxBytes: 98304 } });
+  });
+
+  it("projects stat entries, list, search, and the write-class results field by field", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "stat",
+      result: { entries: [{ path: "~/a", type: "file", size: 1, junk: true }], junk: 1 },
+    });
+    expect(
+      structured(await call("forwarder_cli_file_stat", { cliDeviceId: "cli-1", paths: ["~/a"] }))
+        .result,
+    ).toEqual({ entries: [{ path: "~/a", type: "file", size: 1 }] });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "list",
+      result: { entries: "f 1B ~/a", count: 1, more: { cursor: "c", junk: 1 }, junk: 1 },
+    });
+    expect(
+      structured(await call("forwarder_cli_dir_list", { cliDeviceId: "cli-1", path: "~/" })).result,
+    ).toEqual({ entries: "f 1B ~/a", count: 1, more: { cursor: "c" } });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "search",
+      result: { matches: "a:1|x", files: 1, count: 1, scannedFiles: 3, more: null, junk: 1 },
+    });
+    expect(
+      structured(
+        await call("forwarder_cli_file_search", { cliDeviceId: "cli-1", root: "~/", pattern: "x" }),
+      ).result,
+    ).toEqual({ matches: "a:1|x", files: 1, count: 1, scannedFiles: 3, more: null });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "edit",
+      result: {
+        etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+        previousEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+        added: 1,
+        removed: 1,
+        applied: true,
+        junk: 1,
+      },
+    });
+    const edited = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      edits: [{ oldText: "a", newText: "b" }],
+      reason: "why",
+      confirm: "RUN",
+    });
+    expect(structured(edited).result).toEqual({
+      etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+      previousEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      added: 1,
+      removed: 1,
+      applied: true,
+    });
+    // The optional reason and the confirm-stripped arguments reach the op.
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0]).toMatchObject({
+      op: "edit",
+      args: {
+        path: "~/a",
+        expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+        edits: [{ oldText: "a", newText: "b" }],
+        reason: "why",
+      },
+    });
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0].args).not.toHaveProperty("confirm");
+  });
+
+  it("decodes write content into the binary body and keeps it out of the args", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "write",
+      result: { etag: "h:AAAAAAAAAAAAAAAAAAAAAA", size: 5, created: true },
+    });
+    const text = await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n.txt",
+      content: "héllo",
+      confirm: "RUN",
+    });
+    expect(text.isError).toBeUndefined();
+    const first = fileRuntime.runFileOp.mock.calls[0]?.[0];
+    expect(Buffer.from(first.body).toString("utf8")).toBe("héllo");
+    expect(first.args).toEqual({ path: "~/n.txt" });
+    await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n.bin",
+      content: Buffer.from([0, 255, 1]).toString("base64"),
+      encoding: "base64",
+      ifExists: "replace",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      confirm: "RUN",
+    });
+    const second = fileRuntime.runFileOp.mock.calls[1]?.[0];
+    expect([...second.body]).toEqual([0, 255, 1]);
+    expect(second.args).toEqual({
+      path: "~/n.bin",
+      ifExists: "replace",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+    });
+  });
+
+  it("refuses content the relay cannot carry as invalid_input without calling the op", async () => {
+    for (const content of [
+      { content: "\ud800", encoding: "utf-8" },
+      { content: "not base64!!", encoding: "base64" },
+      { content: "QQ=x", encoding: "base64" },
+      { content: "x".repeat(1024 * 1024 + 1) },
+    ]) {
+      const result = await call("forwarder_cli_file_write", {
+        cliDeviceId: "cli-1",
+        path: "~/n",
+        confirm: "RUN",
+        ...content,
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("invalid_input");
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("removes wsmp_ credential substrings from every string, not only whole values", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: {
+        ...READ_RESULT,
+        secretFile: false,
+        text: "1|export T=wsmp_mcp_abcdef0123456789 # and wsmp_cli_zzzzzzzz\n2|wsmp_model_qqqqqqqq",
+        resolvedPath: "/home/u/wsmp_device_abcdefabcdef",
+      },
+    });
+    const result = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    const wire = JSON.stringify(result);
+    expect(wire).not.toMatch(/wsmp_(mcp|cli|model|device)_[A-Za-z0-9]{6,}/);
+    expect(resultText(result)).toContain("export T=");
+    expect(structured(result).result?.secretFile).toBe(false);
+  });
+
+  it("refuses a result that does not fit twice into the 256 KiB output cap with too_large", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "list",
+      result: { entries: "f 1B ~/a\n".repeat(30_000), count: 30_000, more: null },
+    });
+    const result = await call("forwarder_cli_dir_list", { cliDeviceId: "cli-1", path: "~/" });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("too_large");
+    expect(JSON.stringify(result).length).toBeLessThan(1024);
+  });
+
+  it("returns failures in-band with a stable code and the small documented facts", async () => {
+    const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [
+        { ok: false, code: "conflict", detail: { currentEtag: "h:CCCCCCCCCCCCCCCCCCCCCC" } },
+        { code: "conflict", currentEtag: "h:CCCCCCCCCCCCCCCCCCCCCC" },
+      ],
+      [
+        { ok: false, code: "limit", retryAfterMs: 1500 },
+        { code: "limit", retryAfterMs: 1500 },
+      ],
+      [
+        { ok: false, code: "timeout", outcome: "unknown" },
+        { code: "timeout", outcome: "unknown" },
+      ],
+      [
+        { ok: false, code: "offline", outcome: "unknown" },
+        { code: "offline", outcome: "unknown" },
+      ],
+      [
+        { ok: false, code: "upgrade_required", rejectedProtocolVersion: "2.7" },
+        { code: "upgrade_required", relayProtocolVersion: "2.7" },
+      ],
+      [{ ok: false, code: "supervised_only" }, { code: "supervised_only" }],
+      [{ ok: false, code: "grant_disabled" }, { code: "grant_disabled" }],
+      [{ ok: false, code: "token_inactive" }, { code: "token_inactive" }],
+      [
+        {
+          ok: false,
+          code: "match_count",
+          detail: { edit: 0, expected: 1, found: 3, lines: [1, 2, 3] },
+        },
+        { code: "match_count", edit: 0, expected: 1, found: 3, lines: [1, 2, 3] },
+      ],
+    ];
+    for (const [failure, expected] of cases) {
+      fileRuntime.runFileOp.mockResolvedValueOnce(failure);
+      const result = await call("forwarder_cli_file_edit", {
+        cliDeviceId: "cli-1",
+        path: "~/a",
+        edits: [{ oldText: "a", newText: "b" }],
+        confirm: "RUN",
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error).toEqual(expected);
+      expect(resultText(result).length).toBeGreaterThan(0);
+      expect(resultText(result)).not.toContain("~/a");
+    }
+  });
+
+  it("names the old protocol for upgrade_required and says the device, not a file, was not found", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "upgrade_required",
+      rejectedProtocolVersion: "2.7",
+    });
+    const upgrade = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    expect(resultText(upgrade)).toBe("This CLI speaks relay 2.7; upgrade wsmp");
+    fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "not_found", scope: "device" });
+    const device = await call("forwarder_cli_file_read", { cliDeviceId: "nope", path: "~/a" });
+    expect(resultText(device)).toBe("CLI device not found");
+    fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "not_found" });
+    const missing = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    expect(resultText(missing)).toBe("No such file or directory");
+  });
+
+  it("does not deliver a result after the request aborts", async () => {
+    const controller = new AbortController();
+    fileRuntime.runFileOp.mockImplementation(async () => {
+      controller.abort();
+      return { ok: true, op: "read", result: READ_RESULT };
+    });
+    const result = await call(
+      "forwarder_cli_file_read",
+      { cliDeviceId: "cli-1", path: "~/a" },
+      { signal: controller.signal },
+    );
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+  });
 });

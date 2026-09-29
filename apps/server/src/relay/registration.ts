@@ -135,6 +135,8 @@ export type ReportedRelayFeatures = {
   reportedMcpCommandMode: McpCommandModeDb | null;
   reportedTerminalApproval: boolean | null;
   reportedTerminalSupported: boolean | null;
+  /** 2.8: the CLI's `allowFileToolsAsRoot` config. */
+  reportedAllowFileToolsAsRoot: boolean | null;
   /** Already normalized (see `normalizeReportedHostname`); null when not reported. */
   reportedHostname: string | null;
   featuresReportedAt: Date | null;
@@ -184,6 +186,7 @@ export async function persistRelayRegistration({
           reportedMcpCommandMode: reported.reportedMcpCommandMode,
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
+          reportedAllowFileToolsAsRoot: reported.reportedAllowFileToolsAsRoot,
           reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
           // An accepted hello ends any "CLI upgrade required" state.

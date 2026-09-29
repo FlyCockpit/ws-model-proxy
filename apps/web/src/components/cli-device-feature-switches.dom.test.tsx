@@ -46,11 +46,14 @@ import { createAppMutationCache } from "@/utils/mutation-error-toast";
 
 import { CliDeviceFeatureSwitches } from "./cli-device-feature-switches";
 
-function device(features: object) {
-  return { id: "cli-1", features };
+function device(features: object, extra: object = {}) {
+  return { id: "cli-1", features, ...extra };
 }
 
-function renderSwitches(features: object, { appToasts = false }: { appToasts?: boolean } = {}) {
+function renderSwitches(
+  features: object,
+  { appToasts = false, extra = {} }: { appToasts?: boolean; extra?: object } = {},
+) {
   return render(
     <QueryClientProvider
       client={
@@ -63,7 +66,7 @@ function renderSwitches(features: object, { appToasts = false }: { appToasts?: b
       <CliDeviceFeatureSwitches
         cliDeviceId="cli-1"
         deviceName="build-box"
-        device={device(features)}
+        device={device(features, extra)}
       />
     </QueryClientProvider>,
   );
@@ -100,6 +103,48 @@ function modeRadio(mode: string, { hidden = false }: { hidden?: boolean } = {}) 
     name: (name) => name.startsWith(label),
   });
 }
+
+describe("CLI file tools (relay 2.8)", () => {
+  const terminal = {
+    granted: false,
+    deviceAllows: true,
+    supported: true,
+    live: true,
+    available: false,
+  };
+
+  it("shows the file tool access from the effective mode", () => {
+    renderSwitches(
+      { terminal, commands: commands({ mode: "unsupervised", effectiveMode: "unsupervised" }) },
+      { extra: { fileTools: { read: "headless", write: "supervised" } } },
+    );
+    expect(screen.getByText("dashboard:clis.features.fileTools").textContent).toBe(
+      "dashboard:clis.features.fileTools",
+    );
+  });
+
+  it("warns when the CLI allows file tools as root, and only then", () => {
+    const view = renderSwitches(
+      { terminal, commands: commands() },
+      { extra: { allowFileToolsAsRoot: true } },
+    );
+    expect(screen.getByText("dashboard:clis.features.fileToolsAsRoot")).toBeTruthy();
+    view.unmount();
+    for (const value of [false, null, undefined]) {
+      const other = renderSwitches(
+        { terminal, commands: commands() },
+        { extra: value === undefined ? {} : { allowFileToolsAsRoot: value } },
+      );
+      expect(screen.queryByText("dashboard:clis.features.fileToolsAsRoot")).toBeNull();
+      other.unmount();
+    }
+  });
+
+  it("shows no file tool line for a list that does not carry it", () => {
+    renderSwitches({ terminal, commands: commands() });
+    expect(screen.queryByText("dashboard:clis.features.fileTools")).toBeNull();
+  });
+});
 
 describe("CLI feature switches", () => {
   it("disables the terminal switch on Windows and explains why", () => {

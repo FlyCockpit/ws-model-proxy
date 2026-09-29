@@ -28,7 +28,7 @@ import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { z } from "zod";
 import { runChatCompletionDiagnostic, runPoolMemberTest } from "../model-api/diagnostics.js";
-import type { McpRequestCredential } from "./cli-command-access.js";
+import { FILE_BODY_MAX_BYTES } from "../relay/file-protocol.js";
 import {
   adaptCliCommandResultInput,
   adaptCliCommandRunInput,
@@ -39,6 +39,15 @@ import {
   runForwarderCliCommandResult,
   runForwarderCliSupervisedCommandStart,
 } from "./cli-command-tools.js";
+import {
+  FILE_TOOL_NOTES,
+  FILE_TOOLS,
+  type FileToolName,
+  fileToolInputSchema,
+  projectFileToolOutput,
+  runForwarderCliFileTool,
+} from "./cli-file-tools.js";
+import type { McpRequestCredential } from "./cli-tool-access.js";
 
 /** Endpoint-wide scope requirement. Write tools require literal `mcp:write`. */
 export type McpToolScope = "read" | "write";
@@ -254,17 +263,20 @@ function inputByteLength(value: unknown): number {
  * pipeline short-circuits with exactly one issue and child parsing never
  * executes.
  */
-const INPUT_SIZE_GUARD = z.transform((value, ctx) => {
-  if (inputByteLength(value) > MCP_TOOL_INPUT_MAX_BYTES) {
-    ctx.addIssue({
-      code: "custom",
-      message: `input exceeds the maximum size of ${MCP_TOOL_INPUT_MAX_BYTES} bytes`,
-      input: value,
-      path: [],
-    });
-  }
-  return value;
-});
+function inputSizeGuard(maxBytes: number) {
+  return z.transform((value, ctx) => {
+    if (inputByteLength(value) > maxBytes) {
+      ctx.addIssue({
+        code: "custom",
+        message: `input exceeds the maximum size of ${maxBytes} bytes`,
+        input: value,
+        path: [],
+      });
+    }
+    return value;
+  });
+}
+const INPUT_SIZE_GUARD = inputSizeGuard(MCP_TOOL_INPUT_MAX_BYTES);
 
 /**
  * Wrap one advertised input schema with the first-pass size bound: the
@@ -273,9 +285,17 @@ const INPUT_SIZE_GUARD = z.transform((value, ctx) => {
  * unchanged — the pipe's `toJSONSchema` output equals the inner object's
  * (custom transforms emit no JSON-Schema keywords).
  */
-function withInputSizeBound<T extends z.ZodType>(schema: T) {
-  return z.pipe(INPUT_SIZE_GUARD, schema as z.ZodType);
+function withInputSizeBound<T extends z.ZodType>(schema: T, maxBytes?: number) {
+  const guard = maxBytes === undefined ? INPUT_SIZE_GUARD : inputSizeGuard(maxBytes);
+  return z.pipe(guard, schema as z.ZodType);
 }
+
+/**
+ * `forwarder_cli_file_write` carries up to 1 MiB of content (base64 grows it
+ * by a third), so its first-stage bound is the content cap plus headroom for
+ * the other fields; the raw wire stays bounded by the 1 MiB body cap.
+ */
+const FILE_WRITE_INPUT_MAX_BYTES = FILE_BODY_MAX_BYTES + 16 * 1024;
 
 /** Loose passthrough object — the procedure's zod input stays the authority. */
 function anyArgs(): StandardSchemaWithJSON {
@@ -437,6 +457,33 @@ const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
 // The checked catalog — every entry's name/target pair is pinned against the
 // checked read/write catalog by tool-manifest.test.ts.
 // ---------------------------------------------------------------------------
+
+/**
+ * One node file tool (relay 2.8, #103). Read-class tools are scope `read`,
+ * pure, unconfirmed; write-class tools are scope `write`, external, `RUN`
+ * (`DELETE` for delete). All nine are extracted cores that go through the one
+ * file-op relay path; visibility is the PAT-only `cliToolAllowed` predicate.
+ */
+function fileToolDescriptor(name: FileToolName): McpToolDescriptor {
+  const entry = FILE_TOOLS.find((tool) => tool.name === name);
+  if (!entry) throw new Error(`unknown file tool ${name}`);
+  const { op } = entry;
+  const readClass = op === "read" || op === "stat" || op === "list" || op === "search";
+  return {
+    name,
+    target: entry.target,
+    scope: readClass ? "read" : "write",
+    confirmation: readClass ? null : op === "delete" ? "DELETE" : "RUN",
+    classification: readClass ? "pure" : op === "delete" ? "destructive" : "external",
+    descriptionNote: FILE_TOOL_NOTES[name],
+    inputSchema: withInputSizeBound(
+      fileToolInputSchema(name),
+      op === "write" ? FILE_WRITE_INPUT_MAX_BYTES : undefined,
+    ),
+    invokeCore: (input, deps) => runForwarderCliFileTool(op, input, deps),
+    outputProjector: projectFileToolOutput,
+  };
+}
 
 const READ_TOOLS: readonly McpToolDescriptor[] = [
   {
@@ -706,6 +753,11 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.overview.health),
   },
+  // --- node file tools, read class (relay 2.8; PAT-only) ---
+  fileToolDescriptor("forwarder_cli_file_read"),
+  fileToolDescriptor("forwarder_cli_file_stat"),
+  fileToolDescriptor("forwarder_cli_dir_list"),
+  fileToolDescriptor("forwarder_cli_file_search"),
 ];
 
 /**
@@ -1314,11 +1366,18 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),
   },
+  // --- node file tools, write class (relay 2.8; PAT-only) ---
+  fileToolDescriptor("forwarder_cli_file_edit"),
+  fileToolDescriptor("forwarder_cli_file_write"),
+  fileToolDescriptor("forwarder_cli_file_rename"),
+  fileToolDescriptor("forwarder_cli_dir_create"),
+  fileToolDescriptor("forwarder_cli_file_delete"),
 ];
 
 /**
- * The checked catalog: exactly 26 read tools and 51 write tools
- * (46 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 31 read tools and 56 write tools
+ * (46 procedure-backed + 15 extracted cores: 2 diagnostics, 3 CLI commands
+ * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 

@@ -12,6 +12,11 @@ vi.mock("./relay/cli-commands.js", () => ({
   listPendingSupervised: vi.fn(() => []),
   submitSupervisedOutput: vi.fn(),
 }));
+vi.mock("./relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+}));
 
 /**
  * /mcp CHAIN-ORDER contract tests (Phase 4 items 6-7) — the REAL
