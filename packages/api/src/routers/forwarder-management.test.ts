@@ -5277,7 +5277,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
   });
 
-  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+  it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {
     const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
     const row = {
       id: "cli-id",
@@ -5306,6 +5306,13 @@ describe("setCliDeviceFeatureGrants", () => {
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
+      {
+        ...row,
+        id: "cli-newer",
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0",
+        relayRejectedAt: rejectedAt,
+      },
     ]);
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: buildContext(),
@@ -5314,8 +5321,13 @@ describe("setCliDeviceFeatureGrants", () => {
       protocolVersion: "2.6",
       cliVersion: "0.4.0",
       rejectedAt,
+      reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
+    expect(devices[2]?.upgradeRequired).toMatchObject({
+      protocolVersion: "2.8",
+      reason: "cli_too_new",
+    });
   });
 });
 
