@@ -98,6 +98,7 @@ type McpToolDescriptor = (typeof MCP_TOOL_MANIFEST)[number];
 const db = prisma as unknown as {
   modelApiToken: { findMany: MockInstance; findUnique: MockInstance; update: MockInstance };
   relayRequest: { findMany: MockInstance };
+  cliDevice: { findMany: MockInstance };
   providerAccount: { findFirst: MockInstance };
   providerCredential: { findMany: MockInstance };
   mcpGrant: { findUnique: MockInstance };
@@ -954,6 +955,59 @@ describe("G3 — JSON→Date input adaptation", () => {
     expect(body.result?.structuredContent).not.toMatchObject({
       error: { code: "INVALID_INPUT" },
     });
+  });
+});
+
+describe("CLI presence through the MCP projection", () => {
+  it("forwarder_cli_devices_list shows a disconnected CLI's endpoints as OFFLINE", async () => {
+    const heartbeat = new Date(Date.now() - 1_000);
+    db.cliDevice.findMany = db.cliDevice.findMany ?? vi.fn();
+    db.cliDevice.findMany.mockResolvedValue(
+      (["CONNECTED", "DISCONNECTED"] as const).map((status) => ({
+        id: `cli-${status}`,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+        slug: status.toLowerCase(),
+        name: null,
+        reportedHostname: "host",
+        status,
+        lastHeartbeatAt: heartbeat,
+        User: { slug: "owner" },
+        Endpoints: [
+          {
+            id: `ep-${status}`,
+            createdAt: new Date("2026-01-01T00:00:00Z"),
+            updatedAt: new Date("2026-01-01T00:00:00Z"),
+            slug: "ep",
+            label: "ep",
+            kind: "OPENAI_COMPATIBLE",
+            status: "ONLINE",
+            defaultCapabilities: [],
+            capabilityMetadata: null,
+            probeSuggestions: null,
+            lastSeenAt: null,
+            lastHealthCheckAt: null,
+            statusChangedAt: null,
+            failureReasonCode: null,
+            published: true,
+            unpublishedAt: null,
+            DiscoveredModels: [],
+          },
+        ],
+      })),
+    );
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_cli_devices_list", {});
+    const rows = body.result?.structuredContent?.result as {
+      status: string;
+      endpoints: { status: string; reportedStatus: string }[];
+    }[];
+    expect(rows.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
+      ["CONNECTED", "ONLINE"],
+      ["DISCONNECTED", "OFFLINE"],
+    ]);
+    expect(rows[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
   });
 });
 

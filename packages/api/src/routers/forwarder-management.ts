@@ -38,6 +38,11 @@ import {
   deleteCliDeviceAndCredentials,
 } from "../lib/cli-credential-access";
 import {
+  cliHeartbeatIsStale,
+  cliHeartbeatStaleAt,
+  effectiveEndpointStatus,
+} from "../lib/cli-presence";
+import {
   type ContextWindowSeedDependent,
   declaredContextWindow,
   isContextWindowSeedAdmissible,
@@ -113,8 +118,6 @@ import {
 } from "../lib/surface-capabilities";
 import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
 import { visibleModelReasoning } from "../lib/visible-model-reasoning";
-
-const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
 let guardedSetupTestFailure: (() => void) | undefined;
 
@@ -710,9 +713,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
           }
         : null,
   });
-  const staleAt = row.lastHeartbeatAt
-    ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
-    : null;
+  const staleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
     id: row.id,
     createdAt: row.createdAt,
@@ -726,7 +727,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     lastDisconnectedAt: row.lastDisconnectedAt,
     lastHeartbeatAt: row.lastHeartbeatAt,
     staleAt,
-    isStale: Boolean(staleAt && staleAt <= now),
+    isStale: cliHeartbeatIsStale(row.lastHeartbeatAt, now),
     connectionCount: row.connectionCount,
     inventorySeq: row.inventorySeq,
     inventoryDigest: row.inventoryDigest,
@@ -790,7 +791,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
       slug: endpoint.slug,
       label: endpoint.label,
       kind: endpoint.kind,
-      status: endpoint.status,
+      status: effectiveEndpointStatus(endpoint.status, row, now),
+      reportedStatus: endpoint.status,
       defaultCapabilities: endpoint.defaultCapabilities,
       capabilityMetadata: endpoint.capabilityMetadata,
       probeSuggestions: endpoint.probeSuggestions,

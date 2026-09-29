@@ -1,4 +1,6 @@
 import prisma from "@ws-model-proxy/db";
+import { serverTimeoutSqlState } from "@ws-model-proxy/db/capacity-lock-order";
+import { retryableSerializableTransactionCode } from "./serializable-transaction";
 
 export const POOL_MEMBER_UNHEALTHY_AFTER_RETRYABLE_FAILURES = 3;
 export const POOL_MEMBER_HEALTH_COOLDOWN_MS = 60_000;
@@ -37,6 +39,8 @@ export const poolMemberFailureClasses = [
   "UPSTREAM_5XX",
 ] as const;
 export type PoolMemberFailureClass = (typeof poolMemberFailureClasses)[number];
+/** Failure classes that mean "the device is away", not an upstream/transport failure. */
+const cliUnavailableFailureClasses = ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] as const;
 
 export const relayFailureClasses = [
   "transport",
@@ -576,6 +580,17 @@ export async function recordPoolMemberRelayFailure({
   const failureClass = poolMemberFailureClassForRelayFailure(failure);
   if (!failureClass) return { retryable: false, update: null };
 
+  // A relay `disconnected` outcome is the in-flight echo of a device detach,
+  // and the detach's own fenced write (`disconnectCliDeviceAtGeneration`) is
+  // the single owner of "device unavailable" member health. Writing it here
+  // too, from a request that outlived its connection, would land after a
+  // reconnect and re-impose a cooldown the fence exists to prevent. Give any
+  // claimed trial back (its own timestamp fence) and record nothing.
+  if (failureClass === "WEBSOCKET_DISCONNECTED") {
+    if (trialStartedAt) await releasePoolMemberHalfOpenTrial({ poolMemberId, trialStartedAt });
+    return { retryable: true, update: null };
+  }
+
   // Read-modify-write, versioned on the fields the transition reads: a
   // concurrent writer makes the update match 0 rows and we re-read (bounded to
   // 3 rounds; a writer that loses all of them implies >= 3 committed failures,
@@ -698,6 +713,29 @@ export async function settlePoolMemberRecoveryTrial({
   return result.count === 1;
 }
 
+/**
+ * A recovery probe whose connection was superseded (its session replaced or
+ * gone) proves nothing about the member. Give the claimed trial back as a due
+ * UNHEALTHY member, fenced on its own timestamp, so the successor session's
+ * scheduler re-probes at once instead of waiting out a failure backoff that
+ * the old connection caused. Counters and failure class are untouched.
+ */
+export async function abandonPoolMemberRecoveryTrial({
+  poolMemberId,
+  trialStartedAt,
+  now = new Date(),
+}: {
+  poolMemberId: string;
+  trialStartedAt: Date;
+  now?: Date;
+}): Promise<boolean> {
+  const result = await prisma.poolMember.updateMany({
+    where: { id: poolMemberId, healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
+    data: { healthStatus: "UNHEALTHY", nextRetryAt: now, halfOpenTrialStartedAt: null },
+  });
+  return result.count === 1;
+}
+
 export async function markPoolMemberHalfOpenTrial({
   poolMemberId,
   allowSingleDegradedFallback = false,
@@ -788,24 +826,219 @@ export async function resetPoolMemberHealthForDiscoveredModels(
 }
 
 /**
- * Marks every pool member served by a disconnected CLI device. Hot-path
- * health write (writer class H, @ws-model-proxy/db/capacity-lock-order): one
- * single-row statement per member, holding nothing else, so it never holds
- * one member row while it waits on another (a multi-row UPDATE takes its rows
- * in heap order and could wait on a management transaction that holds a
- * later row and waits on an earlier one).
+ * A device's relay session went away: its members are circuit-opened for the
+ * full health cooldown. Hot-path health write (writer class H,
+ * @ws-model-proxy/db/capacity-lock-order): one single-row statement per member
+ * in id order (a multi-row UPDATE takes its rows in heap order). It runs inside
+ * the disconnect transaction, so each member row stays locked until commit
+ * together with the device row: a documented exception to "holds nothing
+ * else" (see the H entry in capacity-lock-order.ts). Its waits are bounded by
+ * the transaction's `lock_timeout`, and a deadlock with a management cascade
+ * is broken by PostgreSQL and retried.
+ *
+ * `generation` is the device connection generation the caller saw when it
+ * detached the session, and is required. The fence is the caller's
+ * transaction (`db`, REQUIRED): `disconnectCliDeviceAtGeneration` first runs
+ * the fenced `cliDevice` update, which locks the device row, so a successor's
+ * registration (the only writer of a newer generation) waits for that
+ * transaction and its reconnect due-write always runs after these writes. The
+ * generation in the member scope below is a belt-and-braces re-check, not the
+ * fence (a statement-snapshot `EXISTS` alone does not stop a write that waited
+ * on a member row lock across a successor's commit). The only caller is
+ * `disconnectCliDeviceAtGeneration`.
  */
 export async function markPoolMembersForCliUnavailable({
   cliDeviceId,
   failureClass,
+  generation,
   now = new Date(),
+  db,
 }: {
   cliDeviceId: string;
   failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+  generation: number;
   now?: Date;
+  db: Pick<typeof prisma, "poolMember">;
 }): Promise<void> {
+  const endpointScope = { cliDeviceId, CliDevice: { connectionGeneration: generation } };
+  // Real failure provenance survives a disconnect: a member circuit-open for a
+  // real upstream/transport failure with its cooldown still running keeps that
+  // class and cooldown, so the reconnect due-write (which only touches
+  // disconnect-class members) cannot cut it short. Members that were healthy,
+  // degraded, or whose cooldown ended are opened as before. Re-checked in each
+  // per-member write so a row that changed after the scan is judged as it is.
+  const notRealFailureCoolingDown = {
+    NOT: {
+      healthStatus: { in: ["UNHEALTHY" as const, "DEGRADED" as const] },
+      nextRetryAt: { gt: now },
+      // `not: null` keeps a NULL class out of the exclusion: SQL `NOT (NULL AND ..)`
+      // would otherwise skip the row instead of opening it.
+      lastFailureClass: { not: null, notIn: [...cliUnavailableFailureClasses] },
+    },
+  };
+  const members = await db.poolMember.findMany({
+    where: {
+      ...notRealFailureCoolingDown,
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { DiscoveredModel: { Endpoint: endpointScope } },
+        },
+        {
+          executionTargetId: null,
+          DiscoveredModel: { Endpoint: endpointScope },
+        },
+      ],
+    },
+    orderBy: { id: "asc" },
+    select: { id: true },
+  });
+  const data = transitionPoolMemberHealthForCliUnavailable({ failureClass, now });
+  for (const member of members) {
+    await db.poolMember.updateMany({
+      where: { id: member.id, ...notRealFailureCoolingDown },
+      data,
+    });
+  }
+}
+
+const DISCONNECT_TRANSACTION_MAX_ATTEMPTS = 5;
+const DISCONNECT_TRANSACTION_TIMEOUT_MS = 10_000;
+const DISCONNECT_TRANSACTION_MAX_WAIT_MS = 5_000;
+/**
+ * The transaction holds the `cli_device` row (L0) while it waits for member
+ * rows (L7). Bound that wait so a slow member-row holder cannot make a
+ * reconnecting hello (which needs the device row) wait out its own transaction
+ * timeout: the attempt aborts and releases the device row, a successor that
+ * committed meanwhile makes the retry a fenced no-op, and otherwise it retries.
+ */
+const DISCONNECT_LOCK_TIMEOUT_MS = 2_000;
+const DISCONNECT_RETRY_BACKOFF_MS = 100;
+/**
+ * Lock timeouts are retried on a time budget, not a count: every attempt
+ * releases the device row within DISCONNECT_LOCK_TIMEOUT_MS, so retrying never
+ * blocks a reconnect, and dropping a genuine disconnect (the session is
+ * already gone from memory) would leave the device CONNECTED with nothing to
+ * correct it. The budget bounds shutdown; other retryable errors stay
+ * count-bound.
+ */
+const DISCONNECT_LOCK_RETRY_BUDGET_MS = 30_000;
+
+function isLockTimeout(error: unknown): boolean {
+  return serverTimeoutSqlState(error) === "55P03";
+}
+
+/** P2028 = Prisma interactive transaction expired / could not start in `maxWait`. */
+function isRetryableDisconnectError(error: unknown): boolean {
+  if (retryableSerializableTransactionCode(error) !== undefined) return true;
+  if (isLockTimeout(error)) return true;
+  return typeof error === "object" && error !== null && Reflect.get(error, "code") === "P2028";
+}
+
+/**
+ * The ONE persistence point for "no session serves this device" (status + pool
+ * member circuit-open). Returns false, writing nothing, when the device's
+ * stored `connectionGeneration` is no longer `generation` (a successor hello
+ * committed, in this process or another replica).
+ *
+ * One transaction, device row first: the fenced UPDATE locks `cli_device`, so
+ * a successor's registration upsert waits for this transaction and its
+ * reconnect due-write always runs after our member write; member rows are
+ * locked only afterwards (DL-1 order L0 then L7). Two autocommit statements
+ * would let the member UPDATE, blocked on a member row lock, land after the
+ * successor committed (its `EXISTS` reads the statement snapshot).
+ */
+export async function disconnectCliDeviceAtGeneration({
+  cliDeviceId,
+  generation,
+  cliStatus,
+  failureClass,
+  now = new Date(),
+}: {
+  cliDeviceId: string;
+  generation: number;
+  cliStatus: "DISCONNECTED" | "STALE";
+  failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+  now?: Date;
+}): Promise<boolean> {
+  // The fenced write is idempotent (same generation, same `now`): a retry
+  // either re-applies the same values or is refused because a successor has
+  // committed, so a transaction that a row lock pushed past its timeout (or
+  // that lost a deadlock/serialization race) is safely re-run. Without the
+  // retry the session is already gone from memory and nothing would record
+  // the disconnect (device left CONNECTED with no session).
+  const lockRetryDeadline = Date.now() + DISCONNECT_LOCK_RETRY_BUDGET_MS;
+  let failures = 0;
+  let otherFailures = 0;
+  for (;;) {
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${DISCONNECT_LOCK_TIMEOUT_MS}ms`}, true)`;
+          const claimed = await tx.cliDevice.updateMany({
+            where: { id: cliDeviceId, connectionGeneration: generation },
+            data: { status: cliStatus, lastDisconnectedAt: now },
+          });
+          if (claimed.count === 0) return false;
+          await markPoolMembersForCliUnavailable({
+            cliDeviceId,
+            failureClass,
+            generation,
+            now,
+            db: tx,
+          });
+          return true;
+        },
+        { timeout: DISCONNECT_TRANSACTION_TIMEOUT_MS, maxWait: DISCONNECT_TRANSACTION_MAX_WAIT_MS },
+      );
+    } catch (error) {
+      failures += 1;
+      // Lock timeouts retry until the time budget ends; every other retryable
+      // error is capped by count.
+      const lockTimeout = isLockTimeout(error);
+      if (!lockTimeout) otherFailures += 1;
+      const exhausted = lockTimeout
+        ? Date.now() >= lockRetryDeadline
+        : otherFailures >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS ||
+          !isRetryableDisconnectError(error);
+      if (exhausted) throw error;
+      await new Promise((resolve) =>
+        setTimeout(resolve, DISCONNECT_RETRY_BACKOFF_MS * Math.min(failures, 10)),
+      );
+    }
+  }
+}
+
+/**
+ * A CLI reconnected (hello accepted): members that were circuit-opened only
+ * because the device was away become due now, so the recovery probe runs at
+ * once instead of after the disconnect cooldown. Members whose last failure
+ * was anything else (a real upstream/transport failure) keep their state.
+ * Nothing is marked healthy here; the probe decides.
+ *
+ * Hot-path health write (writer class H): one single-row statement per member
+ * in id order, each re-checking the eligibility predicate. The device-status
+ * fence already forces an executable/inventory path to revisit the device
+ * before this runs, so this write needs no generation of its own: it only
+ * moves `nextRetryAt` earlier for members that were opened by a disconnect,
+ * and a late one cannot strand routing (the recovery scan and the routing gate
+ * decide from the stored `CONNECTED` status and a live session).
+ */
+export async function markPoolMembersDueAfterCliReconnect({
+  cliDeviceId,
+  now = new Date(),
+}: {
+  cliDeviceId: string;
+  now?: Date;
+}): Promise<number> {
+  const eligible = {
+    healthStatus: "UNHEALTHY" as const,
+    lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED" as const, "STALE_SESSION" as const] },
+    nextRetryAt: { gt: now },
+  };
   const members = await prisma.poolMember.findMany({
     where: {
+      ...eligible,
       OR: [
         {
           executionTargetId: { not: null },
@@ -820,8 +1053,13 @@ export async function markPoolMembersForCliUnavailable({
     orderBy: { id: "asc" },
     select: { id: true },
   });
-  const data = transitionPoolMemberHealthForCliUnavailable({ failureClass, now });
+  let count = 0;
   for (const member of members) {
-    await prisma.poolMember.updateMany({ where: { id: member.id }, data });
+    const result = await prisma.poolMember.updateMany({
+      where: { id: member.id, ...eligible },
+      data: { nextRetryAt: now },
+    });
+    count += result.count;
   }
+  return count;
 }

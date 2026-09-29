@@ -5301,6 +5301,56 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(hook).not.toHaveBeenCalled();
   });
 
+  it("shows endpoints of disconnected or stale CLIs as OFFLINE and keeps the reported status", async () => {
+    const endpoint = (id: string, status: string) => ({
+      id,
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: id,
+      label: id,
+      kind: "OPENAI_COMPATIBLE",
+      status,
+      defaultCapabilities: [],
+      capabilityMetadata: null,
+      probeSuggestions: null,
+      lastSeenAt: new Date("2026-01-01"),
+      lastHealthCheckAt: null,
+      statusChangedAt: null,
+      failureReasonCode: null,
+      published: true,
+      unpublishedAt: null,
+      DiscoveredModels: [],
+    });
+    const device = (id: string, status: string, heartbeatAgoMs: number | null) => ({
+      id,
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: id,
+      name: id,
+      reportedHostname: null,
+      status,
+      lastHeartbeatAt: heartbeatAgoMs === null ? null : new Date(Date.now() - heartbeatAgoMs),
+      User: { slug: "owner" },
+      Endpoints: [endpoint(`${id}-ep`, "ONLINE")],
+    });
+    db.cliDevice.findMany.mockResolvedValue([
+      device("live", "CONNECTED", 1_000),
+      device("gone", "DISCONNECTED", 1_000),
+      device("stale", "CONNECTED", 5 * 60_000),
+      device("never", "CONNECTED", null),
+    ]);
+
+    const result = await client().listCliDevices();
+
+    expect(result.map((cli) => [cli.slug, cli.endpoints[0]?.status])).toEqual([
+      ["live", "ONLINE"],
+      ["gone", "OFFLINE"],
+      ["stale", "OFFLINE"],
+      ["never", "OFFLINE"],
+    ]);
+    expect(result.every((cli) => cli.endpoints[0]?.reportedStatus === "ONLINE")).toBe(true);
+  });
+
   it("reports terminal and command features from the live snapshot and stored columns", async () => {
     db.cliDevice.findMany.mockResolvedValue([
       {
