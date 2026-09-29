@@ -38,9 +38,13 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(),
 }));
 
-const { diagnosticsCapacityRuntime, runChatCompletionDiagnostic, runPoolMemberTest } = await import(
-  "./diagnostics"
-);
+const {
+  classifyChatProbeReply,
+  diagnosticsCapacityRuntime,
+  REASONING_ONLY_PROBE_DETAIL,
+  runChatCompletionDiagnostic,
+  runPoolMemberTest,
+} = await import("./diagnostics");
 
 function admittingCapacityRuntime(): CapacityAdmissionRuntime {
   return {
@@ -443,6 +447,138 @@ describe("runPoolMemberTest — typed core outcomes", () => {
     expect(db.poolMember.update).not.toHaveBeenCalled();
   });
 
+  function reasoningInventory(reasoningConfig?: Record<string, unknown>, reasoning = true) {
+    return {
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared",
+          confidence: "exact",
+          streaming: true,
+          operations: ["create"],
+          reasoning,
+          ...(reasoningConfig ? { reasoningConfig } : {}),
+        },
+      },
+    };
+  }
+
+  async function probeBody(capabilityOverrideMetadata: Record<string, unknown>) {
+    db.poolMember.findUnique.mockResolvedValue(memberRow({ capabilityOverrideMetadata }));
+    const manager = new FakeRelayManager();
+    const corePromise = runPoolMemberTest({ userId: "user-id", memberId: "member-id", manager });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    const body = JSON.parse(
+      new TextDecoder().decode(Buffer.concat(sent.bodyChunks ?? [])),
+    ) as Record<string, unknown>;
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
+    manager.complete(sent.requestId);
+    await corePromise;
+    return body;
+  }
+
+  it("sends a 64-token probe with no reasoning fields for a non-reasoning member", async () => {
+    const body = await probeBody({
+      version: 1,
+      protocol: "openai-compatible",
+      chatCompletions: { supported: true, streaming: true },
+    });
+    expect(body.max_tokens).toBe(64);
+    expect(Object.keys(body).sort()).toEqual(["max_tokens", "messages", "model", "stream"]);
+    const flagOff = await probeBody(reasoningInventory(undefined, false));
+    expect(flagOff).not.toHaveProperty("reasoning_effort");
+  });
+
+  it.each([
+    ["default (effort field)", undefined, { reasoning_effort: "none" }],
+    [
+      "openai_reasoning_effort",
+      { encoding: { kind: "openai_reasoning_effort" } },
+      { reasoning_effort: "none" },
+    ],
+    [
+      "openai_reasoning_object",
+      { encoding: { kind: "openai_reasoning_object" } },
+      { reasoning: { effort: "none" } },
+    ],
+    [
+      "openai_output_config_effort",
+      { encoding: { kind: "openai_output_config_effort" } },
+      { output_config: { effort: "none" } },
+    ],
+    [
+      "openai_top_level_effort",
+      { encoding: { kind: "openai_top_level_effort" } },
+      { effort: "none" },
+    ],
+    [
+      "supportedLevels without none uses the lowest supported level",
+      { supportedLevels: ["medium", "high"] },
+      { reasoning_effort: "medium" },
+    ],
+    [
+      "anthropic encoding cannot ride the chat surface: no reasoning field",
+      { encoding: { kind: "anthropic_thinking" } },
+      {},
+    ],
+  ])("encodes probe reasoning level none: %s", async (_name, config, expected) => {
+    const body = await probeBody(reasoningInventory(config));
+    expect(body.max_tokens).toBe(64);
+    const { model: _m, stream: _s, max_tokens: _t, messages: _msg, ...rest } = body;
+    expect(rest).toEqual(expected);
+  });
+
+  it("treats a length-capped reasoning-only 200 as reachable with a distinct detail and marks health", async () => {
+    const manager = new FakeRelayManager();
+    const corePromise = runPoolMemberTest({ userId: "user-id", memberId: "member-id", manager });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({
+        choices: [
+          {
+            finish_reason: "length",
+            message: { role: "assistant", content: "", reasoning_content: "The user wants" },
+          },
+        ],
+      }),
+    );
+    manager.complete(sent.requestId);
+    const result = await corePromise;
+    expect(result).toMatchObject({
+      outcome: "ok",
+      status: 200,
+      detail: REASONING_ONLY_PROBE_DETAIL,
+    });
+    expect(REASONING_ONLY_PROBE_DETAIL).not.toMatch(/pong/);
+    expect(db.poolMember.update).toHaveBeenCalled();
+  });
+
+  it("does not attach a detail when visible pong content is present", async () => {
+    const manager = new FakeRelayManager();
+    const corePromise = runPoolMemberTest({ userId: "user-id", memberId: "member-id", manager });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({
+        choices: [
+          { finish_reason: "stop", message: { content: "pong", reasoning_content: "thinking" } },
+        ],
+      }),
+    );
+    manager.complete(sent.requestId);
+    const result = await corePromise;
+    expect(result).toMatchObject({ outcome: "ok" });
+    expect(result).not.toHaveProperty("detail");
+  });
+
   it("maps a relay terminal failure after headers to probe-failed with the failure reason", async () => {
     const manager = new FakeRelayManager();
     const corePromise = runPoolMemberTest({
@@ -820,3 +956,49 @@ async function readSentBody(sent: SendRelayRequestArgs): Promise<string> {
   }
   throw new Error("Expected relayed body chunks.");
 }
+
+describe("classifyChatProbeReply", () => {
+  const reply = (choice: Record<string, unknown>) => JSON.stringify({ choices: [choice] });
+  it.each([
+    [200, reply({ message: { content: "Pong!" } }), "pong"],
+    [200, reply({ message: { content: [{ type: "text", text: "pong" }] } }), "pong"],
+    [200, reply({ message: { content: "hello" } }), "failed"],
+    [200, reply({ finish_reason: "length", message: { content: "hel" } }), "failed"],
+    [302, reply({ message: { content: "pong" } }), "failed"],
+    [200, "<html>pong</html>", "failed"],
+    [200, "{}", "failed"],
+    [
+      200,
+      reply({ finish_reason: "length", message: { content: "", reasoning_content: "hmm" } }),
+      "reasoning-only",
+    ],
+    [
+      200,
+      reply({ finish_reason: "length", message: { content: null, reasoning: "hmm" } }),
+      "reasoning-only",
+    ],
+    [
+      200,
+      reply({ finish_reason: "length", message: { reasoning_details: [{ text: "hmm" }] } }),
+      "reasoning-only",
+    ],
+    [
+      200,
+      reply({ finish_reason: "stop", message: { content: "", reasoning_content: "hmm" } }),
+      "failed",
+    ],
+    [
+      200,
+      reply({ finish_reason: "length", message: { content: "", reasoning_content: "  " } }),
+      "failed",
+    ],
+    [200, reply({ finish_reason: "length", message: { content: "" } }), "failed"],
+    [
+      500,
+      reply({ finish_reason: "length", message: { content: "", reasoning_content: "hmm" } }),
+      "failed",
+    ],
+  ])("classifies %#", (status, raw, expected) => {
+    expect(classifyChatProbeReply(status, raw)).toBe(expected);
+  });
+});
