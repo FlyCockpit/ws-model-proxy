@@ -13,6 +13,37 @@ detection timing based on server configuration, making such a test nondeterminis
 shared CI. The injected proof deterministically verifies the same driver error codes, retry bound,
 and absence of state committed by failed attempts.
 
+## One admission planner: who gets a slot
+
+Every grant of a physical-capacity slot goes through `admission-planner.ts` (`planGrants`), the
+single enforcement point for "who gets a slot". `PostgresCapacityAdmissionStore.#admitCapacity` runs
+it for both callers: acquire (offer mode: stop once the polling or creating request is granted)
+and release/reclaim (fill mode: grant until nothing more fits).
+
+1. **Read** (`#readAdmissionSnapshot`): the deadline sweep (deferred waiters are left to their
+   owner's poll), the grant-time routability re-check, then ONE snapshot of the capacity (limit, DRR
+   cursor/deficits/version), ACTIVE leases, WAITING waiters, reservation members, direct
+   reservations and per-scope lease counts, all under the L4/L6 locks the caller already holds.
+2. **Plan** (`planGrants`, pure, no database): applies the decision repeatedly in memory. Each step
+   is the single-grant decision (eligibility: `notBefore <= now`, candidate/request deadlines with
+   the creating-request and last-chance exceptions, member/scope and physical limits, reservation
+   borrowing, then one weighted deficit round robin pick), then updates the in-memory state (active
+   counts, per-owner and per-scope counts, the winner's request leaves the queue, DRR state). The
+   loop is bounded by progress (waiters at entry + 1 steps, every grant removes a waiter), never by a
+   constant, so unlimited capacities are served completely. Borrow-check aggregates are computed
+   once per step.
+3. **Write** (`#persistGrants`): one sorted `FOR UPDATE` over the winners' request rows plus a
+   re-read (a winner no longer WAITING ends the persisted prefix and the pass re-plans), the
+   shutdown fence checked ONCE right before the first write (armed: nothing is written), then
+   batched writes: the capacity's scheduler state and fencing counter, `createMany` leases,
+   requests to ADMITTED, sibling waiters to CANCELLED, winner waiters to ADMITTED.
+
+The transaction can be retried (`runCapacitySerializable`): nothing is carried across attempts;
+each attempt re-reads, re-plans and takes fencing tokens from the capacity row's counter. Cost per
+transaction is one snapshot plus O(waiters) work per grant in memory and a handful of statements,
+independent of how many waiters are granted (256 grants: about 0.5 s release, 1.5 s poll on a
+loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged.
+
 ## Spill-over `notBefore` and grant-time routability (saturation S-A)
 
 - A pool request whose prefix is warm on one member (the cache holder: best continuation

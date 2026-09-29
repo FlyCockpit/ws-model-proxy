@@ -182,7 +182,14 @@ describe("capacity lease release", () => {
       effectiveConcurrencyScope: "DIRECT_TARGET",
       effectiveConcurrencyScopeId: "target",
       effectiveBorrowPolicy: "WHEN_IDLE",
-      AdmissionRequest: { requestId: "request", attemptId: "attempt-1", enqueueSequence: 1n },
+      AdmissionRequest: {
+        requestId: "request",
+        attemptId: "attempt-1",
+        enqueueSequence: 1n,
+        deadlineAt: null,
+      },
+      notBefore: null,
+      deadlineAt: null,
       PoolMember: null,
     };
     const tx = {
@@ -200,9 +207,9 @@ describe("capacity lease release", () => {
       capacityLease: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findMany: vi.fn().mockResolvedValue([]),
-        create: vi.fn(async () => {
+        createMany: vi.fn(async () => {
           admitted = true;
-          return {};
+          return { count: 1 };
         }),
       },
       inferenceCapacity: {
@@ -220,11 +227,10 @@ describe("capacity lease release", () => {
       admissionRequest: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         update: vi.fn().mockResolvedValue({}),
-        findUnique: vi.fn(async (args: { where: { id?: string } }) =>
-          args.where.id === "request-1"
-            ? { state: admitted ? "ADMITTED" : "WAITING", Lease: null }
-            : null,
-        ),
+        findMany: vi.fn(async () => [
+          { id: "request-1", state: admitted ? "ADMITTED" : "WAITING", Lease: null },
+        ]),
+        findUnique: vi.fn(async () => null),
       },
     };
     let attempts = 0;
@@ -274,7 +280,7 @@ describe("capacity lease release", () => {
     });
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
-    expect(tx.capacityLease.create).not.toHaveBeenCalled();
+    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
     expect(tx.inferenceCapacity.update).not.toHaveBeenCalled();
   });
 
@@ -284,7 +290,7 @@ describe("capacity lease release", () => {
     const { tx, transaction, store, lease } = releaseFixture();
     await expect(store.release(lease)).resolves.toBe(true);
     expect(transaction).toHaveBeenCalledTimes(2);
-    expect(tx.capacityLease.create).toHaveBeenCalled();
+    expect(tx.capacityLease.createMany).toHaveBeenCalledTimes(1);
   });
 });
 

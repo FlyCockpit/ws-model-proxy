@@ -427,7 +427,7 @@ integration("PostgreSQL capacity admission primitives", () => {
     // DL-1 regression. Side A is a policy writer (or admission poll): it holds
     // the model_pool row and the execution_target row + capacity-policy fence
     // through the production helpers, then requests the capacity advisory lock.
-    // Side B is the admitter (release/reclaim/acquire via #admitOne): it holds
+    // Side B is the admitter (release/reclaim/acquire via #admitCapacity): it holds
     // the capacity advisory lock and inference_capacity row, then inserts a
     // capacity_lease whose FK checks take FOR KEY SHARE on the pool and target
     // rows. With FOR UPDATE parent locks this is a guaranteed deadlock that
@@ -2401,8 +2401,15 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
   type Db = ReturnType<typeof createPrismaClient>;
   type Store = import("./postgres-store.js").PostgresCapacityAdmissionStore;
 
-  /** One pool whose members each sit on their own single-slot capacity. */
-  async function spillFixture(db: Db, memberCount: number, limits: readonly number[] = []) {
+  /**
+   * One pool whose members each sit on their own capacity (single-slot unless
+   * `limits[index]` says otherwise; `null` = an unlimited capacity).
+   */
+  async function spillFixture(
+    db: Db,
+    memberCount: number,
+    limits: readonly (number | null)[] = [],
+  ) {
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: { name: "Spill proof", email: `spill-${suffix}@example.test`, slug: `spill-${suffix}` },
@@ -2425,7 +2432,7 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
           label: `spill-${index}-${suffix}`,
           runtimeIdentityKey: `spill-${index}-${suffix}`,
           runtimeModel: "spill-proof",
-          hardConcurrencyLimit: limits[index] ?? 1,
+          hardConcurrencyLimit: index < limits.length ? limits[index]! : 1,
         },
       });
       const model = await db.discoveredModel.create({
@@ -2633,9 +2640,12 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
    */
   type OfferRow = {
     name: string;
-    coldSlots: number;
+    /** Cold capacity limit (null = unlimited). */
+    coldSlots: number | null;
     /** An older request deferred to the cold member, eligible when R1 is checked. */
     olderDeferred: boolean;
+    /** How many older deferred requests (default 1). */
+    olderCount?: number;
     cancelOlder?: boolean;
     occupyCold?: boolean;
     /** How R1 gets its check. */
@@ -2695,76 +2705,270 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
       check: "new-zero-budget",
       expected: "EXPIRED",
     },
+    {
+      // C3-1: a constant loop bound left an unlimited capacity unserved.
+      name: "unlimited cold capacity, 70 older eligible waiters, last chance",
+      coldSlots: null,
+      olderDeferred: true,
+      olderCount: 70,
+      check: "last-chance",
+      expected: "ADMITTED",
+    },
+    {
+      name: "unlimited cold capacity, 70 older eligible waiters, new zero budget",
+      coldSlots: null,
+      olderDeferred: true,
+      olderCount: 70,
+      check: "new-zero-budget",
+      expected: "ADMITTED",
+    },
   ];
 
-  it.each(offerRows)("offers every free slot before expiry: $name", async (row) => {
-    if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
-    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
-    const store = new PostgresCapacityAdmissionStore(db, "spill-offer-proof");
-    const fixture = await spillFixture(db, 2, [1, row.coldSlots]);
-    const leases: CapacityLeaseHandle[] = [];
-    const admit = async (attempt: Parameters<Store["acquire"]>[0]) => {
-      const result = await store.acquire(attempt);
-      if (result.state === "ADMITTED") leases.push(result.lease);
-      return result;
-    };
-    try {
-      await expect(admit(fixture.attempt("holder-busy", [{ member: 0 }]))).resolves.toMatchObject({
-        state: "ADMITTED",
-      });
-      if (row.occupyCold)
-        await expect(admit(fixture.attempt("cold-busy", [{ member: 1 }]))).resolves.toMatchObject({
-          state: "ADMITTED",
-        });
-      const older = fixture.attempt("older", [
-        { member: 0, waitBudgetMs: 10_000 },
-        { member: 1, waitBudgetMs: 10_000, notBeforeMs: 300 },
-      ]);
-      if (row.olderDeferred)
-        await expect(admit(older)).resolves.toMatchObject({ state: "WAITING" });
-      const r1 =
-        row.check === "new-zero-budget"
-          ? fixture.attempt("r1", [
-              { member: 0, waitBudgetMs: 0 },
-              { member: 1, waitBudgetMs: 0 },
-            ])
-          : fixture.attempt("r1", [
-              { member: 0, waitBudgetMs: 0 },
-              { member: 1, waitBudgetMs: 0, notBeforeMs: 300 },
-            ]);
-      if (row.check !== "new-zero-budget")
-        await expect(admit(r1)).resolves.toMatchObject({ state: "WAITING" });
-      if (row.cancelOlder) await store.terminalizeAttempt(older.attemptId, "CANCELLED");
-      let result: Awaited<ReturnType<Store["acquire"]>>;
-      if (row.check === "new-zero-budget") {
-        // Let the older request's deferred waiter become eligible first.
-        await sleep(450);
-        result = await admit(r1);
-      } else {
-        const cold = await db.capacityWaiter.findFirstOrThrow({
-          where: { attemptId: r1.attemptId, candidateOrder: 1 },
-        });
-        const target =
-          row.check === "in-window"
-            ? cold.notBefore!.getTime() + 60
-            : cold.deadlineAt!.getTime() + 100;
-        await sleep(Math.max(0, target - (await dbNow(db)).getTime()));
-        result = await admit({ ...r1, candidates: [] });
+  it.each(offerRows)(
+    "offers every free slot before expiry: $name",
+    async (row) => {
+      if (!databaseUrl) return;
+      const db = createPrismaClient(databaseUrl);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "spill-offer-proof");
+      const fixture = await spillFixture(db, 2, [1, row.coldSlots]);
+      const leases: CapacityLeaseHandle[] = [];
+      const admit = async (attempt: Parameters<Store["acquire"]>[0]) => {
+        const result = await store.acquire(attempt);
+        if (result.state === "ADMITTED") leases.push(result.lease);
+        return result;
+      };
+      try {
+        await expect(admit(fixture.attempt("holder-busy", [{ member: 0 }]))).resolves.toMatchObject(
+          {
+            state: "ADMITTED",
+          },
+        );
+        if (row.occupyCold)
+          await expect(admit(fixture.attempt("cold-busy", [{ member: 1 }]))).resolves.toMatchObject(
+            {
+              state: "ADMITTED",
+            },
+          );
+        const olderCount = row.olderDeferred ? (row.olderCount ?? 1) : 0;
+        const olders = Array.from({ length: olderCount }, (_, index) =>
+          fixture.attempt(`older-${index}`, [
+            { member: 0, waitBudgetMs: 10_000 },
+            // Far in the future while the fixture is built (SQL re-times it below),
+            // so no creating pass grants an older waiter early.
+            { member: 1, waitBudgetMs: 10_000, notBeforeMs: 30_000 },
+          ]),
+        );
+        for (let start = 0; start < olders.length; start += 4)
+          await Promise.all(
+            olders
+              .slice(start, start + 4)
+              .map(async (older) =>
+                expect(admit(older)).resolves.toMatchObject({ state: "WAITING" }),
+              ),
+          );
+        const r1 =
+          row.check === "new-zero-budget"
+            ? fixture.attempt("r1", [
+                { member: 0, waitBudgetMs: 0 },
+                { member: 1, waitBudgetMs: 0 },
+              ])
+            : fixture.attempt("r1", [
+                { member: 0, waitBudgetMs: 0 },
+                { member: 1, waitBudgetMs: 0, notBeforeMs: 300 },
+              ]);
+        if (row.check !== "new-zero-budget")
+          await expect(admit(r1)).resolves.toMatchObject({ state: "WAITING" });
+        if (row.cancelOlder)
+          for (const older of olders) await store.terminalizeAttempt(older.attemptId, "CANCELLED");
+        const olderLeases = () =>
+          db.capacityLease.count({
+            where: { attemptId: { in: olders.map((older) => older.attemptId) }, state: "ACTIVE" },
+          });
+        let result: Awaited<ReturnType<Store["acquire"]>>;
+        if (row.check === "new-zero-budget") {
+          // Make the older requests' deferred waiters eligible (SQL) first.
+          await db.$executeRaw`UPDATE capacity_waiter
+          SET "notBefore" = clock_timestamp() - interval '100 milliseconds'
+          WHERE "attemptId" = ANY(${olders.map((older) => older.attemptId)}::text[])
+            AND "candidateOrder" = 1 AND state = 'WAITING'`;
+          // No pass has touched the cold capacity since: the older requests hold
+          // no lease, so R1's creating pass is the first to see them eligible.
+          expect(await olderLeases()).toBe(0);
+          result = await admit(r1);
+        } else {
+          const cold = await db.capacityWaiter.findFirstOrThrow({
+            where: { attemptId: r1.attemptId, candidateOrder: 1 },
+          });
+          // Re-time the older requests' cold waiters (SQL) so they become
+          // eligible just before R1's check, however long R1's creating pass took
+          // (its own notBefore is 300 ms after its creation instant).
+          await db.$executeRaw`UPDATE capacity_waiter
+          SET "notBefore" = ${new Date(cold.notBefore!.getTime() - 100)}
+          WHERE "attemptId" = ANY(${olders.map((older) => older.attemptId)}::text[])
+            AND "candidateOrder" = 1 AND state = 'WAITING'`;
+          const target =
+            row.check === "in-window"
+              ? cold.notBefore!.getTime() + 60
+              : cold.deadlineAt!.getTime() + 100;
+          await sleep(Math.max(0, target - (await dbNow(db)).getTime()));
+          // The discrimination of this row: R1's check is the FIRST pass on the
+          // cold capacity after the older waiters became eligible.
+          expect(await olderLeases()).toBe(0);
+          result = await admit({ ...r1, candidates: [] });
+        }
+        expect(result.state).toBe(row.expected);
+        if (result.state === "ADMITTED")
+          expect(result.lease.poolMemberId).toBe(fixture.members[1]!.poolMemberId);
+        // Fairness is unchanged: every older eligible waiter was served first.
+        if (row.olderDeferred && !row.cancelOlder) {
+          expect(await olderLeases()).toBe(olderCount);
+          // Batched write: each winner's waiter is ADMITTED, its sibling on the
+          // holder's capacity is CANCELLED (sibling_lost), none stays WAITING.
+          const olderWaiters = await db.capacityWaiter.findMany({
+            where: { attemptId: { in: olders.map((older) => older.attemptId) } },
+            select: { state: true, terminalReason: true, capacityId: true },
+          });
+          expect(olderWaiters).toHaveLength(2 * olderCount);
+          expect(
+            olderWaiters.filter(
+              (waiter) =>
+                waiter.state === "ADMITTED" && waiter.capacityId === fixture.members[1]!.capacityId,
+            ),
+          ).toHaveLength(olderCount);
+          expect(
+            olderWaiters.filter(
+              (waiter) => waiter.state === "CANCELLED" && waiter.terminalReason === "sibling_lost",
+            ),
+          ).toHaveLength(olderCount);
+        }
+      } finally {
+        for (const lease of leases) await store.release(lease).catch(() => false);
+        await cleanupCapacityFixture(db, fixture.user.id);
+        await db.$disconnect();
       }
-      expect(result.state).toBe(row.expected);
-      if (result.state === "ADMITTED")
-        expect(result.lease.poolMemberId).toBe(fixture.members[1]!.poolMemberId);
-      // Fairness is unchanged: an older eligible waiter was served first.
-      if (row.olderDeferred && !row.cancelOlder)
-        await expect(
-          db.capacityLease.findFirst({ where: { attemptId: older.attemptId, state: "ACTIVE" } }),
-        ).resolves.not.toBeNull();
-    } finally {
-      for (const lease of leases) await store.release(lease).catch(() => false);
-      await cleanupCapacityFixture(db, fixture.user.id);
-      await db.$disconnect();
+    },
+    120_000,
+  );
+
+  /**
+   * C3-2: one transaction that serves k eligible waiters must stay far below
+   * the 15 s transaction timeout (read once, plan in memory, batched writes).
+   */
+  describe("volume: k eligible deferred waiters are granted by ONE transaction", () => {
+    const K = 256;
+    const BUDGET_MS = 3000;
+
+    /** A busy holder (member 0) and K deferred waiters on the cold member 1. */
+    async function volumeSetup(db: Db, store: Store, coldLimit: number | null) {
+      const fixture = await spillFixture(db, 2, [1, coldLimit]);
+      const holder = await store.acquire(fixture.attempt("holder", [{ member: 0 }]));
+      if (holder.state !== "ADMITTED") throw new Error("Expected the holder to be admitted.");
+      const attempts = Array.from({ length: K }, (_, index) =>
+        fixture.attempt(`w-${String(index).padStart(3, "0")}`, [
+          { member: 0 },
+          { member: 1, notBeforeMs: 30_000 },
+        ]),
+      );
+      // Building K waiters takes longer than the 30 s notBefore cap, so push
+      // every cold waiter's notBefore out again (SQL) after each chunk.
+      const deferAll = () =>
+        db.$executeRaw`UPDATE capacity_waiter
+          SET "notBefore" = clock_timestamp() + interval '5 minutes'
+          WHERE "userId" = ${fixture.user.id} AND "capacityId" = ${fixture.members[1]!.capacityId}
+            AND state = 'WAITING'`;
+      for (let start = 0; start < attempts.length; start += 4) {
+        await Promise.all(
+          attempts.slice(start, start + 4).map(async (attempt) => {
+            const created = await store.acquire(attempt);
+            expect(created.state).toBe("WAITING");
+          }),
+        );
+        await deferAll();
+      }
+      const makeEligible = () =>
+        db.$executeRaw`UPDATE capacity_waiter
+          SET "notBefore" = clock_timestamp() - interval '100 milliseconds'
+          WHERE "userId" = ${fixture.user.id} AND "capacityId" = ${fixture.members[1]!.capacityId}
+            AND state = 'WAITING'`;
+      const coldLeases = () =>
+        db.capacityLease.count({
+          where: {
+            capacityId: fixture.members[1]!.capacityId,
+            attemptId: { in: attempts.map((attempt) => attempt.attemptId) },
+            state: "ACTIVE",
+          },
+        });
+      return { fixture, holder, attempts, makeEligible, coldLeases };
     }
+
+    it(`grants ${K} eligible waiters on an unlimited capacity in ONE poll`, async () => {
+      if (!databaseUrl) return;
+      const db = createPrismaClient(databaseUrl);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "spill-volume-poll-proof");
+      const setup = await volumeSetup(db, store, null);
+      try {
+        await setup.makeEligible();
+        expect(await setup.coldLeases()).toBe(0);
+        // The youngest request polls: it is served last, after all older ones.
+        // (Chunks are created concurrently, so "youngest" is by durable sequence.)
+        const youngestRow = await db.admissionRequest.findFirstOrThrow({
+          where: {
+            userId: setup.fixture.user.id,
+            attemptId: { in: setup.attempts.map((a) => a.attemptId) },
+          },
+          orderBy: { enqueueSequence: "desc" },
+        });
+        const youngest = setup.attempts.find(
+          (attempt) => attempt.attemptId === youngestRow.attemptId,
+        )!;
+        const started = performance.now();
+        const result = await store.acquire({ ...youngest, candidates: [] });
+        const elapsedMs = performance.now() - started;
+        console.log(`[volume] one poll granted ${K} waiters in ${elapsedMs.toFixed(0)} ms`);
+        expect(result.state).toBe("ADMITTED");
+        expect(await setup.coldLeases()).toBe(K);
+        expect(elapsedMs).toBeLessThan(BUDGET_MS);
+        // Fencing tokens are unique per grant on the capacity.
+        const tokens = await db.capacityLease.findMany({
+          where: { capacityId: setup.fixture.members[1]!.capacityId },
+          select: { fencingToken: true },
+        });
+        expect(new Set(tokens.map((lease) => lease.fencingToken)).size).toBe(K);
+        const capacity = await db.inferenceCapacity.findUniqueOrThrow({
+          where: { id: setup.fixture.members[1]!.capacityId },
+        });
+        expect(capacity.nextFencingToken).toBe(BigInt(K) + 1n);
+      } finally {
+        await cleanupCapacityFixture(db, setup.fixture.user.id);
+        await db.$disconnect();
+      }
+    }, 240_000);
+
+    it(`grants ${K} eligible waiters in ONE release()`, async () => {
+      if (!databaseUrl) return;
+      const db = createPrismaClient(databaseUrl);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "spill-volume-release-proof");
+      // Limit K + 1: one occupant, K free slots once it is released.
+      const setup = await volumeSetup(db, store, K + 1);
+      try {
+        const occupant = await store.acquire(setup.fixture.attempt("occupant", [{ member: 1 }]));
+        if (occupant.state !== "ADMITTED") throw new Error("Expected the occupant to be admitted.");
+        await setup.makeEligible();
+        expect(await setup.coldLeases()).toBe(0);
+        const started = performance.now();
+        await expect(store.release(occupant.lease)).resolves.toBe(true);
+        const elapsedMs = performance.now() - started;
+        console.log(`[volume] one release granted ${K} waiters in ${elapsedMs.toFixed(0)} ms`);
+        expect(await setup.coldLeases()).toBe(K);
+        expect(elapsedMs).toBeLessThan(BUDGET_MS);
+      } finally {
+        await cleanupCapacityFixture(db, setup.fixture.user.id);
+        await db.$disconnect();
+      }
+    }, 240_000);
   });
 
   it("expires a deferred waiter after its last-chance check when nothing is free", async () => {

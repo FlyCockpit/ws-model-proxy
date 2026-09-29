@@ -159,11 +159,11 @@ import {
   relayFailureHttpStatus,
   relayFailureMessage,
 } from "./openai-errors.js";
-import { prefillSpeedSource } from "./prefill-estimator.js";
 import {
   OPENROUTER_DATA_POLICY_ERROR_CODE,
   OPENROUTER_DATA_POLICY_ERROR_MESSAGE,
 } from "./openrouter-privacy.js";
+import { prefillSpeedSource } from "./prefill-estimator.js";
 import {
   ADAPTER_VERSION,
   AdapterError,
