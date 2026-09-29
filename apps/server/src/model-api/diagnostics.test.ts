@@ -984,6 +984,11 @@ describe("classifyChatProbeReply", () => {
     ],
     [
       200,
+      reply({ finish_reason: "length", message: { content: "", reasoning_details: [] } }),
+      "failed",
+    ],
+    [
+      200,
       reply({ finish_reason: "stop", message: { content: "", reasoning_content: "hmm" } }),
       "failed",
     ],
