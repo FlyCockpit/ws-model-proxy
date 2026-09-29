@@ -418,25 +418,37 @@ struct SourceState {
     spec: SourceSpec,
     eligibility: Eligibility,
     next_due: Instant,
-    in_flight: bool,
-    /// Ends the run in flight for THIS definition (set when the source is
-    /// replaced, withdrawn, un-approved, or the runner goes away). Each
-    /// attempt owns its own flag, so cancelling one never touches another.
-    attempt_cancel: Option<Arc<AtomicBool>>,
+    /// The id of THIS state's run in flight, if any. A result counts only
+    /// when it carries this id (a run of a replaced definition never does).
+    attempt: Option<u64>,
     last: Option<LastValues>,
     error: Option<MetricSourceError>,
 }
 
-impl SourceState {
-    /// The one way a run in flight is ended early. Idempotent.
-    fn cancel_attempt(&self) {
-        if let Some(cancel) = &self.attempt_cancel {
-            cancel.store(true, Ordering::SeqCst);
-        }
-    }
+/// A run that has not reported yet, live or already cancelled. The runner
+/// owns every such run until it reports (or is given up on), so a
+/// replaced or withdrawn source's dying run stays cancellable and blocks a
+/// new run of the same source.
+#[derive(Debug)]
+struct Attempt {
+    key: SourceKey,
+    /// Ends this run only (each attempt owns its flag).
+    cancel: Arc<AtomicBool>,
+    /// A run always returns within its timeout plus the reap grace; past
+    /// this the attempt is forgotten so a lost report cannot block forever.
+    give_up_at: Instant,
 }
 
+const ATTEMPT_GRACE: Duration = Duration::from_secs(10);
+
 type SourceKey = (bool, String);
+
+/// End every unreported run of this source (idempotent).
+fn cancel_key(attempts: &BTreeMap<u64, Attempt>, key: &SourceKey) {
+    for attempt in attempts.values().filter(|attempt| attempt.key == *key) {
+        attempt.cancel.store(true, Ordering::SeqCst);
+    }
+}
 
 fn key(spec: &SourceSpec) -> SourceKey {
     (spec.origin == MetricSourceOrigin::Remote, spec.name.clone())
@@ -444,6 +456,7 @@ fn key(spec: &SourceSpec) -> SourceKey {
 
 struct RunResult {
     key: SourceKey,
+    attempt: u64,
     command_sha256: String,
     outcome: Result<Vec<Series>, MetricSourceError>,
     ts: String,
@@ -484,6 +497,10 @@ pub struct Runner {
     results_tx: Sender<RunResult>,
     results_rx: Receiver<RunResult>,
     changed: bool,
+    /// Every unreported run, by attempt id: the one place runs are ended
+    /// early (`cancel_key`, `Drop`) and the one place "in flight" is read.
+    attempts: BTreeMap<u64, Attempt>,
+    next_attempt: u64,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -496,8 +513,8 @@ impl Drop for Runner {
     /// The session ended: every run in flight kills its process group at the
     /// next poll instead of running out.
     fn drop(&mut self) {
-        for state in self.states.values() {
-            state.cancel_attempt();
+        for attempt in self.attempts.values() {
+            attempt.cancel.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -525,6 +542,8 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
+            attempts: BTreeMap::new(),
+            next_attempt: 0,
         };
         runner.reload_config(true);
         runner.rebuild(Instant::now());
@@ -548,6 +567,8 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
+            attempts: BTreeMap::new(),
+            next_attempt: 0,
         };
         runner.rebuild(Instant::now());
         runner
@@ -602,19 +623,17 @@ impl Runner {
                     // The definition or its authority changed (command,
                     // withdrawal is handled below, approval revoked, opt-in):
                     // the run of the old one must not keep executing.
-                    if let Some(previous) = &previous {
-                        previous.cancel_attempt();
+                    if previous.is_some() {
+                        cancel_key(&self.attempts, &source_key);
                     }
                     SourceState {
                         spec,
                         eligibility,
                         next_due: now,
-                        // A run of the old definition may still finish; its
-                        // result is ignored (hash mismatch) and it cannot
-                        // overlap a run of the new one for long: timeouts
-                        // bound it.
-                        in_flight: previous.is_some_and(|previous| previous.in_flight),
-                        attempt_cancel: None,
+                        // A run of the old definition is being ended; its
+                        // result is ignored (it carries another attempt id)
+                        // and no run of the new one starts until it reports.
+                        attempt: None,
                         last: None,
                         error: None,
                     }
@@ -624,8 +643,8 @@ impl Runner {
         }
         // What is left in the old map was withdrawn (or is no longer
         // reportable): end its run too.
-        for withdrawn in self.states.values() {
-            withdrawn.cancel_attempt();
+        for withdrawn in self.states.keys() {
+            cancel_key(&self.attempts, withdrawn);
         }
         if !self.states.is_empty() {
             self.changed = true;
@@ -639,12 +658,27 @@ impl Runner {
             self.next_reload_check = now + RELOAD_CHECK_INTERVAL;
             self.reload_config(false);
         }
+        // A run that never reported (a lost thread) is forgotten after its
+        // bound, so its source is not blocked forever.
+        self.attempts.retain(|_, attempt| {
+            if now < attempt.give_up_at {
+                return true;
+            }
+            attempt.cancel.store(true, Ordering::SeqCst);
+            false
+        });
         while let Ok(result) = self.results_rx.try_recv() {
+            self.attempts.remove(&result.attempt);
             let Some(state) = self.states.get_mut(&result.key) else {
                 continue;
             };
-            state.in_flight = false;
-            state.attempt_cancel = None;
+            // Only this state's own run counts: a cancelled run of a
+            // replaced or withdrawn definition never clears (or feeds) its
+            // successor.
+            if state.attempt != Some(result.attempt) {
+                continue;
+            }
+            state.attempt = None;
             if state.spec.command_sha256 != result.command_sha256
                 || state.eligibility != Eligibility::Run
             {
@@ -670,22 +704,31 @@ impl Runner {
             self.changed = true;
         }
         for (source_key, state) in &mut self.states {
-            if state.eligibility != Eligibility::Run || state.in_flight || now < state.next_due {
+            if state.eligibility != Eligibility::Run
+                || state.attempt.is_some()
+                || now < state.next_due
+                || self
+                    .attempts
+                    .values()
+                    .any(|attempt| attempt.key == *source_key)
+            {
                 continue;
             }
-            state.in_flight = true;
+            self.next_attempt += 1;
+            let attempt_id = self.next_attempt;
             state.next_due = now + Duration::from_secs(u64::from(state.spec.interval_secs));
             let spec = state.spec.clone();
             let tx = self.results_tx.clone();
             let cancel = Arc::new(AtomicBool::new(false));
-            state.attempt_cancel = Some(Arc::clone(&cancel));
-            let source_key = source_key.clone();
+            let key_for_thread = source_key.clone();
+            let cancel_for_thread = Arc::clone(&cancel);
             let spawned = thread::Builder::new()
                 .name("wsmp-metric-source".to_string())
                 .spawn(move || {
-                    let outcome = run_source(&spec, Some(&cancel));
+                    let outcome = run_source(&spec, Some(&cancel_for_thread));
                     let _ = tx.send(RunResult {
-                        key: source_key,
+                        key: key_for_thread,
+                        attempt: attempt_id,
                         command_sha256: spec.command_sha256,
                         outcome,
                         ts: crate::telemetry::now_rfc3339(),
@@ -693,10 +736,21 @@ impl Runner {
                     });
                 });
             if spawned.is_err() {
-                state.in_flight = false;
-                state.attempt_cancel = None;
                 state.error = Some(MetricSourceError::Spawn);
+                continue;
             }
+            state.attempt = Some(attempt_id);
+            self.attempts.insert(
+                attempt_id,
+                Attempt {
+                    key: source_key.clone(),
+                    cancel,
+                    give_up_at: now
+                        + Duration::from_secs(u64::from(state.spec.timeout_secs))
+                        + crate::bounded_run::REAP_GRACE
+                        + ATTEMPT_GRACE,
+                },
+            );
         }
     }
 
@@ -994,10 +1048,7 @@ escaped{v="a\"b"} 1
         );
         assert_eq!(pending.interval_secs, Some(10));
         runner.tick(Instant::now());
-        assert!(
-            runner.states.values().all(|state| !state.in_flight),
-            "a pending source never runs"
-        );
+        assert!(runner.attempts.is_empty(), "a pending source never runs");
 
         let mut approved = MetricsConfig::default();
         approved
@@ -1185,6 +1236,73 @@ escaped{v="a\"b"} 1
                 "{change:?}: dropping the runner left it running"
             );
         }
+    }
+
+    /// A cancelled run reports late. It must neither start alongside the
+    /// re-added source's new run, nor strip that run's cancel handle (so a
+    /// later withdrawal still ends it).
+    #[cfg(unix)]
+    #[test]
+    fn a_dying_run_neither_overlaps_nor_disarms_its_successor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("runs.pid");
+        let command = format!("echo $$ >> '{}'; sleep 60 & wait", pid_file.display());
+        let (metrics, definition) = approved_remote(&command);
+        let mut runner = Runner::with_inputs(settings(true), metrics, vec![definition.clone()]);
+        runner.tick(Instant::now());
+        let pids = |count: usize| -> Vec<i32> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let pids: Vec<i32> = std::fs::read_to_string(&pid_file)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect();
+                if pids.len() >= count {
+                    return pids;
+                }
+                assert!(Instant::now() < deadline, "run {count} never started");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = pids(1)[0];
+        // Withdrawn and re-added before the cancelled run has reported.
+        runner.set_remote(Vec::new());
+        runner.set_remote(vec![definition]);
+        runner.tick(Instant::now());
+        assert_eq!(
+            runner.attempts.len(),
+            1,
+            "a new run started while the old one was still unreported"
+        );
+        // Tick until the old run has reported and the new one is running.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runner.attempts.len() != 1
+            || !runner
+                .attempts
+                .values()
+                .all(|attempt| attempt.key.1 == "slow")
+            || std::fs::read_to_string(&pid_file)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < 2
+        {
+            assert!(Instant::now() < deadline, "the re-added source never ran");
+            runner.tick(Instant::now());
+            thread::sleep(Duration::from_millis(20));
+        }
+        let second = pids(2)[1];
+        assert!(!is_alive(first), "the cancelled run is still running");
+        assert!(is_alive(second));
+        // The old run's report must not have disarmed the new run: a later
+        // withdrawal still ends it.
+        runner.set_remote(Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while is_alive(second) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!is_alive(second), "the successor survived its withdrawal");
     }
 
     /// The session ended (the runner is dropped): a run in flight is killed

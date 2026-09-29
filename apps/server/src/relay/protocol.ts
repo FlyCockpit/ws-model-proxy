@@ -494,6 +494,9 @@ const endpointLoadSchema = z
   .strict();
 export type EndpointLoadMessage = z.infer<typeof endpointLoadSchema>;
 
+/** Blank as the CLI's `str::trim().is_empty()` sees it (Unicode White_Space; not JS `trim()`). */
+const BLANK_COMMAND = /^\p{White_Space}*$/u;
+
 /** Server to CLI (2.7): a remotely defined custom metric source (S-B part 2). */
 export const remoteMetricSourceSchema = z
   .object({
@@ -506,7 +509,7 @@ export const remoteMetricSourceSchema = z
       .max(4096)
       .refine(
         (command) =>
-          command.trim().length > 0 &&
+          !BLANK_COMMAND.test(command) &&
           !command.includes("\u0000") &&
           new TextEncoder().encode(command).length <= 4096,
         { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },

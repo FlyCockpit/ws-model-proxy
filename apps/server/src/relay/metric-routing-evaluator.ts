@@ -227,8 +227,9 @@ export class MetricRoutingEvaluator {
    * The ONE write of a verdict: never older than what is stored. The row is
    * updated only while its `evaluatedAt` is not newer than this
    * evaluation's; a missing row is created, and losing that creation race
-   * (unique violation) means a newer evaluation already wrote. True when
-   * this evaluation's verdict is now the stored one.
+   * (unique violation) is decided again by `evaluatedAt`: only a NEWER row
+   * makes this evaluation lose. True when this evaluation's verdict is now
+   * the stored one.
    */
   private async publish(memberId: string, data: VerdictData): Promise<boolean> {
     const updated = await this.db.poolMemberRoutingVerdict.updateMany({
@@ -240,8 +241,14 @@ export class MetricRoutingEvaluator {
       await this.db.poolMemberRoutingVerdict.create({ data: { poolMemberId: memberId, ...data } });
       return true;
     } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === "P2002") return false;
-      throw error;
+      if ((error as { code?: unknown } | null)?.code !== "P2002") throw error;
+      // Another evaluation created the row first. It may be an OLDER one, so
+      // decide by `evaluatedAt` again instead of assuming a newer wrote.
+      const retried = await this.db.poolMemberRoutingVerdict.updateMany({
+        where: { poolMemberId: memberId, evaluatedAt: { lte: data.evaluatedAt } },
+        data,
+      });
+      return retried.count > 0;
     }
   }
 

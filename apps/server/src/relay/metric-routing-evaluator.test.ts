@@ -230,6 +230,29 @@ describe("MetricRoutingEvaluator", () => {
     expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
   });
 
+  it("an older evaluation that wins the create race is overwritten by the newer one", async () => {
+    // Row absent: newer B's updateMany misses, older A creates first, then
+    // B's create hits the unique violation. B must still win (its
+    // evaluatedAt is newer), not read the violation as "a newer row exists".
+    const h = harness([member("m1", hotRule)]);
+    const older = createRoutingEvaluationState("user-1", "device-1");
+    const newer = createRoutingEvaluationState("user-1", "device-1");
+    const create = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
+    let ran = false;
+    h.db.poolMemberRoutingVerdict.create.mockImplementationOnce(async (args) => {
+      // B's create is about to run: the older evaluation slips in first.
+      if (!ran) {
+        ran = true;
+        h.advance(-50);
+        await h.evaluator.evaluate(older, metrics(90, h.now()));
+        h.advance(50);
+      }
+      return create ? create(args) : {};
+    });
+    await h.evaluator.evaluate(newer, metrics(40, h.now()));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
+  });
+
   it("publishes nothing once its session was cancelled mid-evaluation", async () => {
     const h = harness([member("m1", hotRule)]);
     const state = createRoutingEvaluationState("user-1", "device-1");
@@ -268,6 +291,19 @@ describe("MetricRoutingEvaluator", () => {
     h.advance(1_000);
     await h.evaluator.evaluate(state, metrics(90, h.now()));
     expect(h.rows.size).toBe(0);
+  });
+
+  it("stops publishing the remaining members once its session is cancelled between writes", async () => {
+    const h = harness([member("m1", hotRule), member("m2", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const create = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
+    h.db.poolMemberRoutingVerdict.create.mockImplementationOnce(async (args) => {
+      const result = await (create ? create(args) : Promise.resolve({}));
+      h.evaluator.cancel(state);
+      return result;
+    });
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    expect([...h.rows.keys()]).toEqual(["m1"]);
   });
 
   it("keeps a verdict whose rules did not change while it was written", async () => {

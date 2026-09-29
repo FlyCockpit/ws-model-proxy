@@ -119,7 +119,7 @@
         "parse": "output not numeric"
       },
       "interval": "every {{seconds}} s",
-      "pendingHint": "Approve it on the machine with `wsmp metrics approve {{name}}`.",
+      "pendingHint": "Read its command with `wsmp metrics list` on the machine, then approve it with `wsmp metrics approve {{name}} --sha256 <hash>` using the hash shown there.",
       "refusedHint": "The CLI refuses remote sources unless `allowRemoteMetricSources` is on locally.",
       "notReported": "Defined on the server; the CLI has not reported it yet.",
       "remoteNotAllowed": "Remote sources are sent to the CLI only while its MCP command mode is unsupervised.",

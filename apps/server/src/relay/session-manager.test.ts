@@ -2567,6 +2567,29 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  it("withdraws the sources on a mode downgrade even when the grant re-read fails", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The downgrade is committed; the hook's own grant read fails, the
+    // push's read (a later call) sees the committed OFF mode.
+    findUnique.mockRejectedValueOnce(new Error("db down"));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await expect(manager.onCliFeatureGrantsChanged("cli-device-id")).rejects.toThrow("db down");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
   it("never sends an oversized remote source list: the CLI gets an empty one", async () => {
     const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
       .findUnique;

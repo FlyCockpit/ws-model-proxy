@@ -84,6 +84,13 @@ export function parseStoredRoutingRules(value: unknown): RoutingRule[] {
   return parsed.success ? parsed.data : [];
 }
 
+/**
+ * Blank as the CLI's `str::trim().is_empty()` sees it: every Unicode
+ * White_Space character (NOT JS `trim()`, which also strips U+FEFF and misses
+ * U+0085), so both sides agree on what a blank command is.
+ */
+const BLANK_COMMAND = /^\p{White_Space}*$/u;
+
 /** Server-to-CLI remote source definition (mirrors the relay 2.7 schema). */
 export const remoteMetricSourceDefinitionSchema = z
   .object({
@@ -96,7 +103,7 @@ export const remoteMetricSourceDefinitionSchema = z
       .max(4096)
       .refine(
         (command) =>
-          command.trim().length > 0 &&
+          !BLANK_COMMAND.test(command) &&
           !command.includes("\u0000") &&
           new TextEncoder().encode(command).length <= 4096,
         { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },

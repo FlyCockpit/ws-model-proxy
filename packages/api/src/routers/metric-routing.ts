@@ -241,9 +241,13 @@ export const metricRoutingProcedures = {
       return {
         cliDeviceId: device.id,
         sources: serializeRemoteMetricSources(input.sources),
-        /** False when the CLI is offline here; it gets them at its next hello. */
+        /**
+         * False when the CLI is offline here (it gets them at its next hello)
+         * or the push could not read the device and sent a withdrawal (an
+         * empty list, fail closed): save again to retry.
+         */
         delivered,
-        note: "The CLI runs a remote source only with its local opt-in (allowRemoteMetricSources) and after `wsmp metrics approve <name>`; it reports each source's state in node.metrics.",
+        note: "The CLI runs a remote source only with its local opt-in (allowRemoteMetricSources) and after `wsmp metrics approve <name> --sha256 <hash>` (the hash of the command the person read); it reports each source's state in node.metrics.",
       };
     }),
 };

@@ -127,6 +127,10 @@ describe("remote metric source definitions", () => {
     expect(ok("a".repeat(4097))).toBe(false);
     expect(ok("echo\u0000 1")).toBe(false);
     expect(ok("   ")).toBe(false);
+    // Blank exactly as the CLI's `str::trim()` sees it: NEL is blank, BOM is not.
+    expect(ok("\u0085")).toBe(false);
+    expect(ok("\u2003\u3000")).toBe(false);
+    expect(ok("\uFEFF")).toBe(true);
     expect(parseStoredRemoteMetricSources("garbage")).toEqual([]);
   });
 });

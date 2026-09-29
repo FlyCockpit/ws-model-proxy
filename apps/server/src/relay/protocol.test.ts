@@ -1088,6 +1088,7 @@ describe("metrics.sources.set encoding (G2a-3) and reserved label keys (CFc-5)",
       [{ ...source, command: "€".repeat(1509) }],
       [{ ...source, command: "echo\u0000 1" }],
       [{ ...source, command: "   " }],
+      [{ ...source, command: "\u0085" }],
     ]) {
       expect(() => encodeRelayServerControlMessage(frame(sources))).toThrow(/wire schema/);
     }

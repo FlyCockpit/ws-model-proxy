@@ -1190,16 +1190,21 @@ export class RelaySessionManager {
   }
 
   async onCliFeatureGrantsChanged(cliDeviceId: string) {
-    const device = await prisma.cliDevice.findUnique({
-      where: { id: cliDeviceId },
-      select: { allowHumanTerminal: true, mcpCommandMode: true },
-    });
-    this.applyFeatureGrants(cliDeviceId, {
-      allowHumanTerminal: device?.allowHumanTerminal === true,
-      mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
-    });
-    // Leaving `unsupervised` withdraws remote metric sources at once.
-    await this.onRemoteMetricSourcesChanged(cliDeviceId);
+    try {
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: cliDeviceId },
+        select: { allowHumanTerminal: true, mcpCommandMode: true },
+      });
+      this.applyFeatureGrants(cliDeviceId, {
+        allowHumanTerminal: device?.allowHumanTerminal === true,
+        mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
+      });
+    } finally {
+      // Leaving `unsupervised` withdraws remote metric sources at once, even
+      // when the grant read above failed: the push re-reads the committed
+      // mode itself and fails closed (an empty list) on any error.
+      await this.onRemoteMetricSourcesChanged(cliDeviceId);
+    }
   }
 
   /**

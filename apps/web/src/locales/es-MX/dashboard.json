@@ -268,7 +268,7 @@
         "parse": "salida no numérica"
       },
       "interval": "cada {{seconds}} s",
-      "pendingHint": "Apruébala en la máquina con `wsmp metrics approve {{name}}`.",
+      "pendingHint": "Lee su comando con `wsmp metrics list` en la máquina y apruébala con `wsmp metrics approve {{name}} --sha256 <hash>`, usando el hash que aparece ahí.",
       "refusedHint": "La CLI rechaza fuentes remotas salvo que `allowRemoteMetricSources` esté activado localmente.",
       "notReported": "Definida en el servidor; la CLI aún no la reporta.",
       "remoteNotAllowed": "Las fuentes remotas se envían a la CLI solo mientras su modo de comandos MCP es sin supervisión.",

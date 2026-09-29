@@ -151,15 +151,23 @@ static ACTIVE: Mutex<Registry> = Mutex::new(Registry {
     spawning: 0,
 });
 
+fn lock_registry(shared: &'static Mutex<Registry>) -> std::sync::MutexGuard<'static, Registry> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
-    ACTIVE.lock().unwrap_or_else(PoisonError::into_inner)
+    lock_registry(&ACTIVE)
 }
 
 /// The shutdown check that comes BEFORE anything is spawned: `false` when
 /// the process is already exiting (nothing is started). On `true` the run
 /// is counted as spawning until [`register`] or [`spawn_failed`].
 fn begin_spawn() -> bool {
-    let mut registry = registry();
+    begin_spawn_in(&ACTIVE)
+}
+
+fn begin_spawn_in(shared: &'static Mutex<Registry>) -> bool {
+    let mut registry = lock_registry(shared);
     if registry.closed {
         return false;
     }
@@ -176,7 +184,11 @@ fn spawn_failed() {
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
 fn register(pid: u32) -> bool {
-    let mut registry = registry();
+    register_in(&ACTIVE, pid)
+}
+
+fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
+    let mut registry = lock_registry(shared);
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
@@ -202,11 +214,16 @@ pub fn active_runs() -> usize {
 }
 
 /// Kill the process group of every run in flight and refuse later runs. Call
-/// on every path that ends the process. Idempotent, non-blocking, and safe
-/// to call from any thread.
+/// on every path that ends the process. Idempotent, and safe to call from any
+/// thread; it waits (at most [`SHUTDOWN_SPAWN_WAIT`]) for runs that are
+/// mid-spawn, so it returns only once nothing it could have started is left.
 pub fn kill_all_active() {
+    kill_all_in(&ACTIVE);
+}
+
+fn kill_all_in(shared: &'static Mutex<Registry>) {
     {
-        let mut registry = registry();
+        let mut registry = lock_registry(shared);
         registry.closed = true;
         let groups = std::mem::take(&mut registry.groups);
         // Unix: `killpg` is a non-blocking syscall, and `finish` unregisters
@@ -228,7 +245,7 @@ pub fn kill_all_active() {
     // A run past its shutdown check but not yet registered is killed by its
     // own `register`; wait (bounded) until every such run has passed it.
     let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
-    while self::registry().spawning > 0 && Instant::now() < until {
+    while lock_registry(shared).spawning > 0 && Instant::now() < until {
         thread::sleep(Duration::from_millis(2));
     }
 }
@@ -638,6 +655,61 @@ mod tests {
         assert!(admit_in(shared).is_some());
         drop(permits);
         assert_eq!(lock(shared).held, 0);
+    }
+
+    fn fresh_registry() -> &'static Mutex<Registry> {
+        Box::leak(Box::new(Mutex::new(Registry {
+            closed: false,
+            groups: BTreeSet::new(),
+            spawning: 0,
+        })))
+    }
+
+    #[cfg(unix)]
+    fn own_group_sleeper() -> Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("sleep")
+    }
+
+    /// A run that already passed the shutdown check but is not registered
+    /// yet when the exit begins: shutdown must wait for it, and its own
+    /// registration must kill its group (nothing it started outlives the
+    /// exit). Deleting either the wait or the register-time kill fails this.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_mid_spawn_is_killed_by_its_registration_and_shutdown_waits_for_it() {
+        let shared = fresh_registry();
+        assert!(begin_spawn_in(shared));
+        let mut child = own_group_sleeper();
+        let pid = child.id();
+        let exiting = thread::spawn(move || {
+            let started = Instant::now();
+            kill_all_in(shared);
+            started.elapsed()
+        });
+        // Shutdown is now waiting for this run to register.
+        thread::sleep(Duration::from_millis(300));
+        assert!(child.try_wait().expect("try_wait").is_none());
+        assert!(
+            !register_in(shared, pid),
+            "registration after the exit began must be refused"
+        );
+        let waited = exiting.join().expect("shutdown thread");
+        assert!(
+            waited >= Duration::from_millis(250),
+            "shutdown returned before the mid-spawn run registered: {waited:?}"
+        );
+        // Killed by `register_in` itself: no `finish` ran for this child.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the mid-spawn child survived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!begin_spawn_in(shared), "nothing starts after the exit");
     }
 
     #[test]
