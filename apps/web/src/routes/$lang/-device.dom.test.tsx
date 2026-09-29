@@ -269,7 +269,7 @@ describe("DevicePage approval refusals", () => {
     expect(screen.queryByText("device.refusal.slug_mismatch.title")).toBeNull();
   });
 
-  it("keeps the details but shows an alert and disables Approve when a reload fails with a non-refusal error", async () => {
+  it("keeps the details and shows an alert (Approve stays available as the retry path) when a reload fails with a non-refusal error", async () => {
     state.approve = () => Promise.reject(refusal("slug_mismatch"));
     await mount();
     const user = userEvent.setup();
