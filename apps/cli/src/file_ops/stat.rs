@@ -115,7 +115,7 @@ fn stat_one(ops: &FileOps, path: &str, hash: bool) -> FileResult<StatEntry> {
             entry.etag = Some(if hash && st.size <= STRONG_ETAG_MAX_BYTES {
                 let (mut file, opened) = resolved.open_regular(&ops.policy, Access::Read)?;
                 let bytes = load_all(&mut file, &opened, STRONG_ETAG_MAX_BYTES)?;
-                ops.key.strong(&bytes)
+                ops.key.strong(&opened, &bytes)
             } else {
                 ops.key.weak_stat(&st)
             });

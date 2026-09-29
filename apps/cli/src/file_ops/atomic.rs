@@ -108,7 +108,7 @@ pub fn replace(
     orig_etag: &str,
     content: &[u8],
     cancel: &Cancel,
-) -> FileResult<()> {
+) -> FileResult<Stat> {
     check_replaceable(ops, orig_stat)?;
     let tmp = temp_name(name);
     let fd = openat(
@@ -140,6 +140,8 @@ pub fn replace(
     ops.step(Step::Chowned)?;
     fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
     ops.step(Step::Chmodded)?;
+    // the identity the replacement will have once renamed (etags are bound to it)
+    let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
 
     recheck(ops, dir, name, orig, orig_stat, orig_etag)?;
     ops.step(Step::EtagRechecked)?;
@@ -151,7 +153,7 @@ pub fn replace(
     let _ = ops.step(Step::Renamed);
     fsync(dir.as_fd()).map_err(FileError::errno)?;
     let _ = ops.step(Step::DirSynced);
-    Ok(())
+    Ok(new_stat)
 }
 
 /// The name must still point at the file we read, and that file must still
@@ -188,7 +190,7 @@ fn read_from_start(ops: &FileOps, file: &mut File, stat: &Stat) -> FileResult<St
 
 /// Create `name` exclusively with `mode` (after umask) and `content`. The new
 /// file is removed again if any later step fails.
-pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> FileResult<()> {
+pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> FileResult<Stat> {
     let fd = openat(
         dir.as_fd(),
         name,
@@ -197,11 +199,11 @@ pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> Fil
     )
     .map_err(FileError::errno)?;
     let mut file = File::from(fd);
-    let finish = (|| -> FileResult<()> {
+    let finish = (|| -> FileResult<Stat> {
         file.write_all(content)?;
         file.sync_all()?;
         fsync(dir.as_fd()).map_err(FileError::errno)?;
-        Ok(())
+        Ok(Stat::from_metadata(&file.metadata()?))
     })();
     if finish.is_err() {
         let _ = unlinkat(dir.as_fd(), name, UnlinkatFlags::NoRemoveDir);

@@ -1,9 +1,9 @@
 //! `forwarder_cli_file_read`: bounded, line-numbered, masked windows.
 //!
-//! The file is masked line by line as it is returned (only the returned window
-//! plus one line of context, or the whole file for `.pem`/`.key` files), so a
-//! secret is always masked whole and reading a plain file costs one cheap
-//! trigger-substring check per returned line.
+//! The file is masked line by line as it is returned. The masker is first fed the
+//! lines in the lookback (`redact::LOOKBACK_BYTES`, 1 MiB) before the window, for
+//! every class but the whole-line ones, so a value or key block opened there masks
+//! the window; reading a plain file costs one cheap trigger-word check per line.
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::FileExt;
@@ -136,7 +136,7 @@ pub(crate) fn current_etag(
         return Ok(ops.key.weak_stat(stat));
     }
     let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES)?;
-    Ok(ops.key.strong(&bytes))
+    Ok(ops.key.strong(stat, &bytes))
 }
 
 pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
@@ -178,7 +178,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
 
     let bytes = load_all(&mut file, &stat, STRONG_ETAG_MAX_BYTES)?;
     cancel.check()?;
-    let etag = ops.key.strong(&bytes);
+    let etag = ops.key.strong(&stat, &bytes);
     if args.if_none_match.as_deref() == Some(etag.as_str()) {
         return Ok(ReadOutcome::Unchanged {
             unchanged: true,
@@ -195,12 +195,10 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
         total.saturating_sub(start.unsigned_abs() - 1).max(1)
     };
     let offset = line_offset(&bytes, first.saturating_sub(1) as usize);
-    // A `.pem` `PRIVATE KEY` block or a quoted value opened before the window
-    // masks every following line, so the masker must see the whole prefix (the
-    // in-memory path has the whole file; `read_large` feeds the prefix up to the
-    // scan cap and refuses the classes that cannot be served without it). Only
-    // the whole-line classes get by with one line of context before the window
-    // for the flag-continuation rule.
+    // A `.pem` `PRIVATE KEY` block or a multi-line value opened before the window
+    // masks the following lines, so the masker is fed the lookback before the
+    // window (`redact::LOOKBACK_BYTES`, the straddling line kept whole). Only the
+    // whole-line classes get by with one line of context for the flag rule.
     let context_from = if class.needs_prefix() {
         lookback_start(&bytes, offset)
     } else {

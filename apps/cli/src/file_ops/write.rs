@@ -164,7 +164,6 @@ fn write_resolved(
     let _lock = ops.lock_path(full.clone(), cancel)?;
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
-    let etag = ops.key.strong(content);
 
     let Some(existing) = existing else {
         if if_exists == IfExists::Replace {
@@ -174,7 +173,7 @@ fn write_resolved(
             ));
         }
         cancel.check()?;
-        atomic::create_new(
+        let created = atomic::create_new(
             &resolved.dir,
             &resolved.name,
             content,
@@ -182,7 +181,7 @@ fn write_resolved(
         )?;
         resolved.created.clear(); // committed: parents stay
         return Ok(WriteResult {
-            etag,
+            etag: ops.key.strong(&created, content),
             size: content.len() as u64,
             created: true,
             added: None,
@@ -230,7 +229,7 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    atomic::replace(
+    let new_stat = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
@@ -242,7 +241,7 @@ fn write_resolved(
     )?;
 
     let mut result = WriteResult {
-        etag,
+        etag: ops.key.strong(&new_stat, content),
         size: content.len() as u64,
         created: false,
         added: None,

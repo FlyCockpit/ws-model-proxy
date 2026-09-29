@@ -160,7 +160,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
-    let previous_etag = ops.key.strong(&original);
+    let previous_etag = ops.key.strong(&stat, &original);
     if let Some(expected) = &args.expected_etag
         && *expected != previous_etag
     {
@@ -291,7 +291,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     }
 
     cancel.check()?;
-    atomic::replace(
+    let new_stat = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
@@ -302,7 +302,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         cancel,
     )?;
     Ok(EditResult {
-        etag: ops.key.strong(&updated),
+        etag: ops.key.strong(&new_stat, &updated),
         previous_etag,
         added: summary.added,
         removed: summary.removed,

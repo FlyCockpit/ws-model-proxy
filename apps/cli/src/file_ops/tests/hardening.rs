@@ -693,3 +693,92 @@ fn names_that_start_with_an_underscore_are_secret_names() {
         r.text
     );
 }
+
+// ---- one line-splitting rule for read, search and edit ------------------------
+
+#[test]
+fn stray_carriage_returns_do_not_make_read_and_the_edit_view_disagree() {
+    let fx = Fx::new();
+    for (name, text) in [
+        (
+            "cr2.yml",
+            "      - --api-key\r\r\n      - SECRETXAGENT\r\r\n",
+        ),
+        ("cr1.yml", "      - --api-key\r\n      - SECRETXAGENT\r\n"),
+        ("crlone.yml", "run --token \r\rSECRETXCR2\r\n"),
+    ] {
+        fx.put(name, text);
+        for start in 1..=3 {
+            let r = fx.read_with(json!({ "path": fx.p(name), "startLine": start }));
+            assert!(
+                !r.text.contains("SECRETX"),
+                "{name} startLine {start}: {:?}",
+                r.text
+            );
+        }
+    }
+    // an edit that appends stray CRs to the flag line cannot unmask the next line
+    fx.put("deploy.yml", "      - --api-key\n      - SECRETXAGENT\n");
+    let _ = fx.ops.edit(
+        &args(json!({ "path": fx.p("deploy.yml"),
+            "edits": [{ "oldText": "- --api-key", "newText": "- --api-key\r\r" }] })),
+        &fx.cancel,
+    );
+    let r = fx.read_with(json!({ "path": fx.p("deploy.yml"), "startLine": 1 }));
+    assert!(!r.text.contains("SECRETXAGENT"), "{:?}", r.text);
+}
+
+// ---- etags do not confirm a guess of a masked value ---------------------------
+
+#[test]
+fn the_same_bytes_in_another_file_do_not_share_an_etag() {
+    let fx = Fx::new();
+    fx.put("target.conf", "PORT=8080\nDB_PASSWORD=abc12\n");
+    // the agent writes a candidate file with the guessed value
+    let created = fx
+        .ops
+        .write(
+            &args(
+                json!({ "path": fx.p("guess.conf"), "content": "PORT=8080\nDB_PASSWORD=abc12\n" }),
+            ),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_ne!(
+        created.etag,
+        fx.etag("target.conf"),
+        "an etag must not confirm a guess"
+    );
+    // every etag that a tool returns for a file equals what a later read returns
+    assert_eq!(created.etag, fx.etag("guess.conf"));
+    let edited = fx
+        .ops
+        .edit(
+            &args(json!({ "path": fx.p("guess.conf"), "edits": [{ "oldText": "PORT=8080", "newText": "PORT=9090" }] })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(edited.etag, fx.etag("guess.conf"));
+    let etag = fx.etag("guess.conf");
+    let moved = fx
+        .ops
+        .rename(
+            &args(json!({ "from": fx.p("guess.conf"), "to": fx.p("moved.conf") })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(
+        moved.etag.as_deref(),
+        Some(etag.as_str()),
+        "a rename keeps the object, so its etag"
+    );
+    assert_eq!(fx.etag("moved.conf"), etag);
+    let hashed = fx
+        .ops
+        .stat(
+            &args(json!({ "paths": [fx.p("moved.conf")], "hash": true })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(hashed.entries[0].etag.as_deref(), Some(etag.as_str()));
+}
