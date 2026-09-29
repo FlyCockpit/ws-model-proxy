@@ -546,11 +546,18 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         "POOL_FALLBACK_UPDATED",
       ])
         expect(byName.get(name)!.descriptionNote).toContain(phrase);
-      const { toJSONSchema } = await import("zod");
-      const json: unknown = toJSONSchema(schema as unknown as Parameters<typeof toJSONSchema>[0]);
-      expect(json).toMatchObject({
-        properties: { fallbackEnabled: { not: {} }, fallbackForGrantees: { not: {} } },
-      });
+      // The advertised schema names the replacement tool on each field (#117).
+      const json = schema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+      for (const key of ["fallbackEnabled", "fallbackForGrantees"]) {
+        expect(json).toMatchObject({
+          properties: {
+            [key]: {
+              not: {},
+              description: expect.stringContaining("forwarder_pool_fallback_update"),
+            },
+          },
+        });
+      }
     }
     // Guarded create turns fallback on when it attaches external members, so
     // MCP may create only local-only guarded pools.
@@ -594,11 +601,14 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         }),
       ).not.toHaveProperty("issues");
     }
-    const badWait = (await update.inputSchema["~standard"].validate({
-      poolId: "pool",
-      externalAfterWaitMs: -1,
-    })) as { issues?: unknown[] };
-    expect(badWait.issues?.length).toBeGreaterThan(0);
+    // The real procedure schema (bounds included) is advertised; the procedure
+    // itself rejects an out-of-range wait at runtime (#117).
+    expect(
+      update.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
+    ).toMatchObject({
+      properties: { externalAfterWaitMs: { type: "integer", minimum: 0, maximum: 600_000 } },
+      required: ["poolId"],
+    });
     const read = byName.get("forwarder_pool_fallback_get")!;
     expect(read.scope).toBe("read");
     expect(read.confirmation).toBeNull();
@@ -818,26 +828,22 @@ describe("G5 — advertised schemas bound tool input size", () => {
     }
   });
 
-  it("the advertised JSON Schema shape is unchanged by the first-stage guard", async () => {
-    // The pipe's JSON Schema equals the inner loose object's — the guard
-    // emits no JSON-Schema keywords, so the advertised shape (type object,
-    // loose additionalProperties, required confirm/memberId/model) is
-    // identical to the pass-3 appended-check form.
-    const { toJSONSchema } = await import("zod");
-    for (const name of ["app_config_get", "provider_account_delete"] as const) {
-      const schema = MCP_TOOL_MANIFEST.find((tool) => tool.name === name)!.inputSchema;
-      const json = toJSONSchema(schema as unknown as Parameters<typeof toJSONSchema>[0]);
-      expect(json).toEqual({
-        $schema: "https://json-schema.org/draft/2020-12/schema",
-        type: "object",
-        properties:
-          name === "provider_account_delete"
-            ? { confirm: { type: "string", const: "DELETE" } }
-            : {},
-        ...(name === "provider_account_delete" ? { required: ["confirm"] } : {}),
-        additionalProperties: {},
-      });
-    }
+  it("the first-stage guard adds no JSON Schema keywords to the advertised shape", () => {
+    const json = (name: string) =>
+      MCP_TOOL_MANIFEST.find((tool) => tool.name === name)!.inputSchema[
+        "~standard"
+      ].jsonSchema.input({ target: "draft-2020-12" });
+    expect(json("app_config_get")).toEqual({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {},
+      additionalProperties: {},
+    });
+    expect(json("provider_account_delete")).toMatchObject({
+      type: "object",
+      properties: { confirm: { type: "string", const: "DELETE" } },
+      required: expect.arrayContaining(["confirm"]),
+    });
   });
 });
 
