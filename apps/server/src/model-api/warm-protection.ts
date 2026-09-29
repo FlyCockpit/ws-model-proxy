@@ -402,9 +402,11 @@ export async function loadWarmSessions({
          AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
-         -- Every record of one request carries the request's whole estimate, so a
-         -- record below the floor never changes a session's size or eligibility.
-         AND r."estimatedTokens" >= ${policy.minTokens}
+         -- Prefix records below the floor never change a session's size or
+         -- eligibility (their group's MAX is what counts), so they are dropped
+         -- here to keep the scan cheap. Conversation records stay: a sub-floor or
+         -- estimate-less conversation record still covers its instant's group.
+         AND (r."prefixDigest" IS NULL OR r."estimatedTokens" >= ${policy.minTokens})
     ),
     session AS (
       -- An explicit conversation is one session: its (single, refreshed)

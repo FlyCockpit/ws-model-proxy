@@ -671,6 +671,19 @@ describe("PoolForm affinity defaults", () => {
     });
   });
 
+  it("does not validate a hidden owner percent (PERCENT back to INHERIT still saves)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const owner = screen.getByLabelText("dashboard:pools.protection.ownerShare");
+    fireEvent.change(owner, { target: { value: "PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(owner, { target: { value: "INHERIT" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ ownerProtectionPercent: null });
+  });
+
   it("loads a stored owner protection percent", () => {
     mount(true, {
       mode: "edit",

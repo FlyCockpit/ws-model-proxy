@@ -423,6 +423,21 @@ integration("warm-session protection with real PostgreSQL", () => {
           }),
           row({ tenantUserId: mixed.id, lastUsedAt: ago(50), tokens: 13_000 }),
           row({ tenantUserId: mixed.id, lastUsedAt: ago(150), tokens: 14_000 }),
+          // A small explicit conversation still covers its instant's prefix group,
+          // even when the group carries another request's larger (stale) estimate.
+          row({
+            tenantUserId: mixed.id,
+            lastUsedAt: ago(20),
+            tokens: 2_000,
+            bindingDigest: "f".repeat(64),
+            conversationDigest: "g".repeat(40),
+          }),
+          row({
+            tenantUserId: mixed.id,
+            lastUsedAt: ago(20),
+            tokens: 20_000,
+            bindingDigest: "f".repeat(64),
+          }),
           // Two explicit conversations finishing in the same instant, each with
           // its conversation record and the shared prefix records of the request.
           row({

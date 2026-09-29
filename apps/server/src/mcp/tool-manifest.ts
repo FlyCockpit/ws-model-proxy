@@ -853,7 +853,6 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updatePoolGrant),
   },
   {
