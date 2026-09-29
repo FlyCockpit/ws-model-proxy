@@ -61,12 +61,12 @@ describe("MCP command mode", () => {
       live("unsupervised"),
       { headless: "grant_disabled", supervised: "grant_disabled" },
     ],
-    // The offline case Codex found: headless says supervised_only before it looks at liveness.
+    // The offline case Codex found: headless says supervised (the grant) before it looks at liveness.
     [
       "supervised grant, offline",
       "supervised",
       null,
-      { headless: "supervised_only", supervised: "offline" },
+      { headless: "grant_supervised_only", supervised: "offline" },
     ],
     [
       "unsupervised grant, offline",
@@ -79,7 +79,7 @@ describe("MCP command mode", () => {
       "supervised grant, CLI off",
       "supervised",
       live("off"),
-      { headless: "supervised_only", supervised: "feature_disabled" },
+      { headless: "grant_supervised_only", supervised: "feature_disabled" },
     ],
     [
       "unsupervised grant, CLI off",
@@ -91,13 +91,13 @@ describe("MCP command mode", () => {
       "supervised grant, CLI supervised",
       "supervised",
       live("supervised"),
-      { headless: "supervised_only", supervised: null },
+      { headless: "grant_supervised_only", supervised: null },
     ],
     [
       "unsupervised grant, CLI supervised",
       "unsupervised",
       live("supervised"),
-      { headless: "supervised_only", supervised: null },
+      { headless: "cli_supervised_only", supervised: null },
     ],
     [
       "unsupervised grant, CLI unsupervised",
@@ -110,7 +110,7 @@ describe("MCP command mode", () => {
       "supervised grant, CLI supervised, no PTY",
       "supervised",
       live("supervised", false),
-      { headless: "supervised_only", supervised: "unsupported" },
+      { headless: "grant_supervised_only", supervised: "unsupported" },
     ],
     [
       "unsupervised, no PTY",

@@ -214,10 +214,11 @@
       "commandAllowed": "permitido ahora",
       "commandRefusal": {
         "grant_disabled": "rechazado: el permiso del panel de arriba no lo permite. Sube el permiso para permitirlo.",
-        "supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel o la configuración de este CLI es Supervisado, el que sea más estricto.",
         "offline": "rechazado: este CLI está desconectado o es demasiado antiguo. Funciona de nuevo cuando el CLI se reconecte con un wsmp actual.",
         "feature_disabled": "rechazado: la configuración propia de este CLI no lo permite. En esa máquina ejecuta wsmp config set-mcp-commands y reinicia wsmp.",
-        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados."
+        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
+        "grant_supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel de arriba es Supervisado. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
+        "cli_supervised_only": "rechazado: requiere Sin supervisión, y la configuración propia de este CLI es Supervisado. En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
       }
     },
     "rename": {

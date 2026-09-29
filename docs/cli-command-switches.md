@@ -33,7 +33,8 @@ person, on the dashboard or on the machine itself.
   (grant), `deviceMode` (CLI config), `effectiveMode`, and `refusals`:
   `refusals.headless` and `refusals.supervised` are `null` when the relay
   would admit that tool, else the relay's own code (`grant_disabled`,
-  `supervised_only`, `offline`, `feature_disabled`, `unsupported`). Each is
+  `grant_supervised_only`, `cli_supervised_only` (the relay's `supervised_only`,
+  attributed to the grant when it is `supervised`, else to the CLI config), `offline`, `feature_disabled`, `unsupported`). Each is
   the first refusal in that tool's own check order, which differs between the
   two tools (headless checks the grant's level before liveness; supervised
   checks liveness, then the CLI's mode, then PTY support). `available` is true

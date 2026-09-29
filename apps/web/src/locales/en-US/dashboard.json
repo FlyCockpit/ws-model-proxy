@@ -66,10 +66,11 @@
       "commandAllowed": "allowed now",
       "commandRefusal": {
         "grant_disabled": "refused: the dashboard grant above does not allow it. Raise the grant to allow it.",
-        "supervised_only": "refused: needs Unsupervised, and the dashboard grant or this CLI's config is Supervised, whichever is stricter.",
         "offline": "refused: this CLI is offline or too old for it. It works again once the CLI reconnects on a current wsmp.",
         "feature_disabled": "refused: this CLI's own config does not allow it. On that machine run wsmp config set-mcp-commands and restart wsmp.",
-        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it."
+        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it.",
+        "grant_supervised_only": "refused: needs Unsupervised, and the dashboard grant above is Supervised. Raise the grant to allow it (this CLI's config must then allow it too).",
+        "cli_supervised_only": "refused: needs Unsupervised, and this CLI's own config is Supervised. On that machine run wsmp config set-mcp-commands unsupervised and restart wsmp."
       }
     },
     "rename": {

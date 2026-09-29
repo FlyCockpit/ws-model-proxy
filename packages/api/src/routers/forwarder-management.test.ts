@@ -5177,11 +5177,11 @@ describe("setCliDeviceFeatureGrants", () => {
     const live = await liveClient("supervised").listCliDevices();
     expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
     // Grant unsupervised, live CLI supervised: the lower one applies, and only
-    // headless is refused (the relay's supervised_only).
+    // headless is refused (the relay's supervised_only, attributed to the CLI config).
     expect(live[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "supervised",
-      refusals: { headless: "supervised_only", supervised: null },
+      refusals: { headless: "cli_supervised_only", supervised: null },
       available: true,
     });
     const liveOff = await liveClient("off").listCliDevices();
@@ -5205,21 +5205,52 @@ describe("setCliDeviceFeatureGrants", () => {
       refusals: { headless: null, supervised: "unsupported" },
       available: true,
     });
+    // A connected CLI older than protocol 2.6 has no command support: offline.
+    const oldClient = createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.5",
+                  cliVersion: "0.3.0",
+                  humanTerminal: true,
+                  mcpCommandMode: "unsupervised" as const,
+                  supervisedCommands: true,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  terminalPublicKey: "key",
+                },
+              ],
+            ]),
+        },
+      },
+    });
+    const preCommands = await oldClient.listCliDevices();
+    expect(preCommands[0]?.features.commands).toMatchObject({
+      live: false,
+      effectiveMode: "off",
+      refusals: { headless: "offline", supervised: "offline" },
+      available: false,
+    });
     const [row] = await db.cliDevice.findMany();
     db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "SUPERVISED" }]);
     // A supervised-only device without a PTY cannot run anything: not available.
     const nothing = await liveClient("supervised", false).listCliDevices();
     expect(nothing[0]?.features.commands).toMatchObject({
       effectiveMode: "supervised",
-      refusals: { headless: "supervised_only", supervised: "unsupported" },
+      refusals: { headless: "grant_supervised_only", supervised: "unsupported" },
       available: false,
     });
     // The relay checks the grant first: a supervised grant refuses headless as
-    // supervised_only whatever the CLI reports.
+    // supervised_only whatever the CLI reports (attributed to the grant).
     const grantLimited = await liveClient("unsupervised").listCliDevices();
     expect(grantLimited[0]?.features.commands).toMatchObject({
       effectiveMode: "supervised",
-      refusals: { headless: "supervised_only", supervised: null },
+      refusals: { headless: "grant_supervised_only", supervised: null },
     });
   });
 });

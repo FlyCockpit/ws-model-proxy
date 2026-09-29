@@ -17,7 +17,8 @@ export type McpCommandMode = (typeof MCP_COMMAND_MODES)[number];
  */
 export type CommandRefusal =
   | "grant_disabled"
-  | "supervised_only"
+  | "grant_supervised_only"
+  | "cli_supervised_only"
   | "offline"
   | "feature_disabled"
   | "unsupported";

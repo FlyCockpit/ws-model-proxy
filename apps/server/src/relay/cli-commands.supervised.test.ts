@@ -336,10 +336,23 @@ describe("supervised commands", () => {
             reason: "parity",
           });
           const label = `${grant} grant, live ${JSON.stringify(live)}`;
-          expect(headless.ok ? null : headless.error, `headless: ${label}`).toBe(want.headless);
-          expect(supervised.ok ? null : supervised.error, `supervised: ${label}`).toBe(
-            want.supervised,
+          // The display splits the relay's supervised_only by switch; nothing else differs.
+          const relayCode = (code: string | null) =>
+            code === "grant_supervised_only" || code === "cli_supervised_only"
+              ? "supervised_only"
+              : code;
+          expect(headless.ok ? null : headless.error, `headless: ${label}`).toBe(
+            relayCode(want.headless),
           );
+          expect(supervised.ok ? null : supervised.error, `supervised: ${label}`).toBe(
+            relayCode(want.supervised),
+          );
+          // ...and it attributes it to the switch the relay checked first.
+          if (want.headless === "grant_supervised_only") expect(grant).toBe("SUPERVISED");
+          if (want.headless === "cli_supervised_only") {
+            expect(grant).toBe("UNSUPERVISED");
+            expect(live?.mode).toBe("supervised");
+          }
           for (const result of [want.headless, want.supervised]) {
             if (result === null) admitted += 1;
             else refused += 1;

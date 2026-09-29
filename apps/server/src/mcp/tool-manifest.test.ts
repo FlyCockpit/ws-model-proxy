@@ -272,7 +272,8 @@ describe("MCP tool manifest — exact catalog", () => {
     for (const phrase of [
       "effectiveMode",
       "refusals",
-      "supervised_only",
+      "grant_supervised_only",
+      "cli_supervised_only",
       "feature_disabled",
       "unsupported",
       "allowCliCommands",

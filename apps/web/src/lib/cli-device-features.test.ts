@@ -22,7 +22,7 @@ describe("command refusals", () => {
       effectiveMode: "supervised",
       available: true,
     } as const;
-    const refusals = { headless: "supervised_only", supervised: null } as const;
+    const refusals = { headless: "cli_supervised_only", supervised: null } as const;
     expect(commandRefusals({ ...base, refusals })).toEqual(refusals);
     expect(commandRefusals(base)).toBeNull();
   });

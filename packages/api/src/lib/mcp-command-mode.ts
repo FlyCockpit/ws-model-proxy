@@ -65,8 +65,10 @@ export function allowsHeadlessCommands(mode: McpCommandModeName | null | undefin
  * are not modelled here.
  * - `grant_disabled`: the dashboard grant is `off` (headless), or does not
  *   allow supervised commands (supervised).
- * - `supervised_only`: headless exec needs `unsupervised`, and the grant or
- *   the CLI's config is `supervised`.
+ * - `grant_supervised_only` / `cli_supervised_only`: the relay's single
+ *   `supervised_only` (headless exec needs `unsupervised`), split by which
+ *   switch is `supervised`: the grant is checked first, so the grant when it is
+ *   `supervised`, otherwise the CLI's config.
  * - `offline`: the CLI is not connected, predates command support, or (for
  *   supervised) does not implement supervised terminals.
  * - `feature_disabled`: the CLI's own config refuses.
@@ -74,7 +76,8 @@ export function allowsHeadlessCommands(mode: McpCommandModeName | null | undefin
  */
 export type McpCommandRefusal =
   | "grant_disabled"
-  | "supervised_only"
+  | "grant_supervised_only"
+  | "cli_supervised_only"
   | "offline"
   | "feature_disabled"
   | "unsupported";
@@ -95,7 +98,7 @@ export type McpCommandRefusals = {
 
 /**
  * The ONE place that mirrors the relay's device-state refusal order, for
- * display only (it gates nothing; the relay still decides). Both checks run
+ * display only. Codes equal the relay's, except `supervised_only`, which is split by switch (it gates nothing; the relay still decides). Both checks run
  * in the relay's exact order, so the first refusal here is the one an agent
  * would get. `relay/cli-commands.test.ts` compares this against the real
  * start functions for every state.
@@ -115,10 +118,10 @@ function headlessRefusal(
   live: McpCommandLive | null,
 ): McpCommandRefusal | null {
   if (grant === "off") return "grant_disabled";
-  if (!allowsHeadlessCommands(grant)) return "supervised_only";
+  if (!allowsHeadlessCommands(grant)) return "grant_supervised_only";
   if (!live) return "offline";
   if (live.mode === "off") return "feature_disabled";
-  if (!allowsHeadlessCommands(live.mode)) return "supervised_only";
+  if (!allowsHeadlessCommands(live.mode)) return "cli_supervised_only";
   return null;
 }
 

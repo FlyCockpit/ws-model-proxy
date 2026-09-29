@@ -408,7 +408,7 @@ describe("McpTokensPanel CLI command switches", () => {
       cliDevice("cli-1", "win", {
         effectiveMode: "supervised",
         available: false,
-        refusals: { headless: "supervised_only", supervised: "unsupported" },
+        refusals: { headless: "grant_supervised_only", supervised: "unsupported" },
       }),
     ];
     const user = userEvent.setup();
@@ -425,7 +425,7 @@ describe("McpTokensPanel CLI command switches", () => {
       cliDevice("cli-1", "desk", {
         effectiveMode: "supervised",
         available: true,
-        refusals: { headless: "supervised_only", supervised: null },
+        refusals: { headless: "cli_supervised_only", supervised: null },
       }),
       cliDevice("cli-2", "laptop", { effectiveMode: "off" }),
     ];
@@ -434,7 +434,7 @@ describe("McpTokensPanel CLI command switches", () => {
     await user.click(cli());
     const list = await within(dialog).findByTestId("cli-command-devices");
     expect(within(list).getByText(/settings:mcp.tokens.cliDeviceMode.supervised/)).toBeTruthy();
-    expect(within(list).getByText(/cliDeviceRefusal.supervised_only/)).toBeTruthy();
+    expect(within(list).getByText(/cliDeviceRefusal.cli_supervised_only/)).toBeTruthy();
     expect(within(list).getByText(/settings:mcp.tokens.cliDeviceAllowed/)).toBeTruthy();
     expect(within(list).queryByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeNull();
   });

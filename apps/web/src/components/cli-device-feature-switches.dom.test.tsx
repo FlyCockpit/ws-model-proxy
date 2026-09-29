@@ -111,7 +111,7 @@ describe("effective command mode", () => {
   };
   const cases = [
     ["grant off", "off", { headless: "grant_disabled", supervised: "grant_disabled" }],
-    ["supervised only", "supervised", { headless: "supervised_only", supervised: null }],
+    ["supervised only", "supervised", { headless: "cli_supervised_only", supervised: null }],
     ["offline", "off", { headless: "offline", supervised: "offline" }],
     ["config off", "off", { headless: "feature_disabled", supervised: "feature_disabled" }],
     ["no PTY", "unsupervised", { headless: null, supervised: "unsupported" }],

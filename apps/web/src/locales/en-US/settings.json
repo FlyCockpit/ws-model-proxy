@@ -109,10 +109,11 @@
       "cliDeviceAllowed": "allowed",
       "cliDeviceRefusal": {
         "grant_disabled": "refused, the dashboard grant is Off",
-        "supervised_only": "refused, needs Unsupervised (the grant or the CLI config is Supervised)",
         "offline": "refused, CLI offline or too old",
         "feature_disabled": "refused, the CLI's own config is Off",
-        "unsupported": "refused, no terminal support on this CLI"
+        "unsupported": "refused, no terminal support on this CLI",
+        "grant_supervised_only": "refused, needs Unsupervised (the dashboard grant is Supervised)",
+        "cli_supervised_only": "refused, needs Unsupervised (the CLI's own config is Supervised)"
       }
     }
   },
