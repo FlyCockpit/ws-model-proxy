@@ -54,15 +54,31 @@ const FILE_RESULT_MAX_JSON_BYTES = 120 * 1024;
 
 const cliDeviceIdSchema = z.string().min(1).max(128);
 
-/** The advertised input for a tool: `cliDeviceId`, the op's fields, and `confirm` when gated. */
-export function fileToolInputSchema(name: FileToolName) {
+function fileToolEntry(name: FileToolName) {
   const entry = FILE_TOOLS.find((tool) => tool.name === name);
   if (!entry) throw new Error(`unknown file tool ${name}`);
-  const shape = fileToolArgShapes[entry.op];
-  const base = { cliDeviceId: cliDeviceIdSchema, ...shape };
-  if (entry.op === "delete") return z.object({ ...base, confirm: z.literal("DELETE") }).strict();
-  if (FILE_READ_OPS.has(entry.op)) return z.object(base).strict();
-  return z.object({ ...base, confirm: z.literal("RUN") }).strict();
+  return entry;
+}
+
+/**
+ * The MCP-owned argument shape of a tool (`cliDeviceId` plus the op's fields).
+ * The manifest generator (input-schema.ts, #117) turns it into the advertised
+ * JSON Schema and adds `confirm`; nothing here builds a schema by hand.
+ */
+export function fileToolCoreShape(name: FileToolName) {
+  return { cliDeviceId: cliDeviceIdSchema, ...fileToolArgShapes[fileToolEntry(name).op] };
+}
+
+/** The strict input of one op, checked by the core (the SDK validator is the loose generated one). */
+const strictInputByOp = new Map<FileOp, z.ZodType>();
+
+function strictInput(op: FileOp): z.ZodType {
+  let schema = strictInputByOp.get(op);
+  if (schema === undefined) {
+    schema = z.object({ cliDeviceId: cliDeviceIdSchema, ...fileToolArgShapes[op] }).strict();
+    strictInputByOp.set(op, schema);
+  }
+  return schema;
 }
 
 export type AdaptedFileInput = {
@@ -165,8 +181,10 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
 export class McpCliFileError extends Error {
   readonly code: ToolErrorCode;
   readonly extra: Record<string, unknown>;
+  /** Raw zod issues of an `invalid_input` from the strict input check; sanitized by the wrapper. */
+  readonly validation: { issues: unknown[] } | null;
 
-  constructor(failure: FileOpFailure) {
+  constructor(failure: FileOpFailure, validation: { issues: unknown[] } | null = null) {
     const device = failure.code === "not_found" && failure.scope === "device";
     super(
       failure.code === "upgrade_required" && failure.rejectedProtocolVersion
@@ -176,6 +194,7 @@ export class McpCliFileError extends Error {
           : FILE_ERROR_MESSAGES[failure.code],
     );
     this.name = "McpCliFileError";
+    this.validation = validation;
     this.code = failure.code;
     const extra: Record<string, unknown> = { ...(failure.detail ?? {}) };
     if (failure.retryAfterMs !== undefined) extra.retryAfterMs = failure.retryAfterMs;
@@ -219,7 +238,16 @@ export async function runForwarderCliFileTool(
   deps: FileToolDeps,
 ): Promise<FileOpSuccess> {
   const pat = requireFilePat(deps.credential);
-  const adapted = adaptFileToolInput(op, input);
+  // The SDK validator is the loose generated one (#117): the strict per-op
+  // shape is enforced here, and its issues reach the agent as named fields.
+  const checked = strictInput(op).safeParse(input);
+  if (!checked.success) {
+    throw new McpCliFileError(
+      { ok: false, code: "invalid_input" },
+      { issues: checked.error.issues },
+    );
+  }
+  const adapted = adaptFileToolInput(op, checked.data);
   if (adapted === null) return fail({ ok: false, code: "invalid_input" });
   const outcome = await runFileOp({
     userId: deps.userId,

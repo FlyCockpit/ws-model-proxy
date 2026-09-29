@@ -345,7 +345,8 @@ model CliDevice {
   /// relay session holds the freshest sample.
   nodeMetrics                  Json?
   nodeMetricsAt                DateTime?
-  /// A hello refused for an old relay protocol ("CLI upgrade required").
+  /// A hello refused for an unsupported relay protocol, older or newer than the
+  /// server supports ("CLI upgrade required" / "Server upgrade required").
   /// Cleared by the next accepted hello.
   rejectedRelayProtocolVersion String?
   rejectedCliVersion           String?

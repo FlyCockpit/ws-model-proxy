@@ -1457,17 +1457,37 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
   });
 
-  it.each(["REVOKED", "REPLACED"])(
+  it.each(["REVOKED", "REPLACED"] as const)(
     "refuses rotation when a concurrent operation has made the credential %s",
-    async () => {
+    async (status) => {
       envMock.enabled = true;
       db.providerCredential.findFirst
         .mockResolvedValueOnce({ id: "credential", providerAccountId: "account" })
-        .mockResolvedValueOnce(null);
+        // Locked re-read: a status-aware row store matching the real
+        // database, so THIS run's terminal status is the row's own state —
+        // the read only yields the row while it still satisfies the query's
+        // ACTIVE filter (which the assertion below pins). Returning the row
+        // unconditionally would let the product proceed and blow up on the
+        // missing ciphertext, i.e. a false NOT_FOUND.
+        .mockImplementationOnce(async ({ where }: { where: { status?: string } }) =>
+          where.status === "ACTIVE"
+            ? null
+            : { id: "credential", providerAccountId: "account", status },
+        );
       db.$queryRaw.mockResolvedValue([{ id: "locked" }]);
       const client = createRouterClient(providerManagementRouter, { context });
       await expect(client.rotateCredential({ id: "credential" })).rejects.toMatchObject({
         code: "NOT_FOUND",
+      });
+      // Status-specific handling: the locked re-read demands ACTIVE, so a
+      // REVOKED or REPLACED row is refused without any write.
+      expect(db.providerCredential.findFirst).toHaveBeenLastCalledWith({
+        where: {
+          id: "credential",
+          userId: "owner",
+          status: "ACTIVE",
+          ProviderAccount: { deletedAt: null, currentCredentialId: "credential" },
+        },
       });
       expect(db.$queryRaw).toHaveBeenCalledTimes(2);
       expect(db.providerCredential.updateMany).not.toHaveBeenCalled();

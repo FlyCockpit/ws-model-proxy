@@ -253,7 +253,6 @@ describe("agent request tabs", () => {
       approvalCode: null,
       rejectionReason: null,
       error: null,
-      multiViewer: true,
       viewerId: null,
       writer: "none",
       viewerCount: 0,

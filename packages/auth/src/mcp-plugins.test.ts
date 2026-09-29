@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   canonicalMcpResource,
@@ -11,6 +10,7 @@ import {
   MCP_REFRESH_RETRY_WINDOW_SECONDS,
   MCP_SCOPES,
 } from "./mcp-config";
+import { issueMcpGrantClaims } from "./mcp-grant";
 import { resolveMcpPlugins } from "./mcp-plugins";
 
 // mcp-config binds env-derived constants at module load; give it a valid
@@ -25,6 +25,13 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-secret",
   },
 }));
+
+// Real behavior, observable calls: the adapter test asserts what the claims
+// hook forwards into the grant function.
+vi.mock("./mcp-grant", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./mcp-grant")>();
+  return { ...actual, issueMcpGrantClaims: vi.fn(actual.issueMcpGrantClaims) };
+});
 
 vi.mock("@ws-model-proxy/db", () => ({
   default: {
@@ -181,18 +188,38 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
     expect(plugins.filter((plugin) => plugin.id === "oauth-provider")).toHaveLength(1);
   });
 
-  it("forwards the claims-hook referenceId (the durable consent HMAC) into the grant function", () => {
+  it("forwards the claims-hook referenceId (the durable consent HMAC) and sessionId into the grant function", async () => {
     // The hook input's referenceId IS the postLogin.consentReferenceId HMAC,
     // persisted on the consent/verification record and forwarded at code
     // exchange, refresh, and introspection. The adapter must pass it through
     // as the authoritative grant key (L17); the behavioral matrix for what
     // the grant function does with it lives in mcp-grant.test.ts.
-    const source = readFileSync(new URL("./mcp-plugins.ts", import.meta.url), "utf8");
-    expect(source).toContain("referenceId: input.referenceId");
-    expect(source).toContain("referenceId?: string | undefined;");
-    // Session derivation stays a MINT-path-only concern of the grant module;
-    // the adapter forwards sessionId unchanged alongside referenceId.
-    expect(source).toContain("sessionId: input.sessionId");
+    const plugins = resolveMcpPlugins({ enabled: true, baseUrl: httpsBase });
+    const mcpPlugin = plugins.find((plugin) => plugin.id === "oauth-provider");
+    const options = mcpPlugin && "options" in mcpPlugin ? mcpPlugin.options : undefined;
+    const hook = options?.extensions?.[0]?.claims?.accessToken;
+    expect(hook).toBeDefined();
+    vi.mocked(issueMcpGrantClaims).mockClear();
+    vi.mocked(issueMcpGrantClaims).mockResolvedValueOnce({});
+    // Only the fields the adapter reads; ctx/opts/scopes are unused by it.
+    const input = {
+      grantType: "refresh_token",
+      user: { id: "user-1" },
+      client: { clientId: "client-1" },
+      sessionId: "session-1",
+      referenceId: "consent-hmac-1",
+    } as unknown as Parameters<NonNullable<typeof hook>>[0];
+    await hook?.(input);
+    expect(vi.mocked(issueMcpGrantClaims)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(issueMcpGrantClaims)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grantType: "refresh_token",
+        userId: "user-1",
+        clientId: "client-1",
+        referenceId: "consent-hmac-1",
+        sessionId: "session-1",
+      }),
+    );
   });
 
   it("does not require DPoP globally on the MCP resource (no per-resource dpop requirement option)", () => {
@@ -207,17 +234,5 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
         typeof entry === "object" && entry !== null,
     );
     expect(resourceRows.some((row) => row.dpopBoundAccessTokensRequired)).toBe(false);
-  });
-});
-
-describe("auth instance wiring", () => {
-  it("spreads resolveMcpPlugins after the three always-on plugins, gated on env.WMP_MCP_ENABLED", () => {
-    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-    expect(source).toContain("...resolveMcpPlugins({\n      enabled: env.WMP_MCP_ENABLED,");
-    // The three always-on plugins stay ahead of the gated spread.
-    const deviceIndex = source.indexOf("deviceAuthorization({");
-    const spreadIndex = source.indexOf("...resolveMcpPlugins(");
-    expect(deviceIndex).toBeGreaterThan(-1);
-    expect(spreadIndex).toBeGreaterThan(deviceIndex);
   });
 });

@@ -16,6 +16,7 @@ import {
   RELAY_SUBPROTOCOL,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
   type RelayServerControlMessage,
+  rejectedHelloFacts,
   relayProtocolAtLeast,
   remoteMetricSourceSchema,
   remoteMetricSourcesSchema,
@@ -320,7 +321,7 @@ describe("relay protocol 2.8 minimum", () => {
     expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("Upgrade wsmp");
   });
 
-  it("flags every older hello, and the pre-naming label field, before schema parsing", () => {
+  it("flags every hello that is not the minimum protocol, and the pre-naming label field", () => {
     for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6", "2.7"]) {
       expect(helloNeedsUpgrade(hello(version, { protocolVersion: version }))).toBe(true);
     }
@@ -347,6 +348,91 @@ describe("relay protocol 2.8 minimum", () => {
     expect(helloNeedsUpgrade(hello("2.8", CAPABILITIES_28))).toBe(false);
     expect(helloNeedsUpgrade(JSON.stringify({ type: "heartbeat", id: "x" }))).toBe(false);
     expect(helloNeedsUpgrade("not json")).toBe(false);
+  });
+
+  it("flags a hello newer than the minimum too: the server must be upgraded", () => {
+    for (const version of ["2.9", "2.10", "3.0"]) {
+      expect(
+        helloNeedsUpgrade(hello(version, { ...CAPABILITIES_28, protocolVersion: version })),
+      ).toBe(true);
+    }
+    // The capability echo is not consulted for a non-minimum hello, so a
+    // self-consistent 2.9 frame cannot slip through as "malformed".
+    expect(helloNeedsUpgrade(hello("2.9", { ...CAPABILITIES_28, protocolVersion: "2.8" }))).toBe(
+      true,
+    );
+  });
+
+  describe("rejectedHelloFacts sanitising", () => {
+    const facts = (protocolVersion: unknown, version: unknown) =>
+      rejectedHelloFacts(
+        JSON.stringify({ type: "hello", id: "h", protocolVersion, cli: { version } }),
+      );
+
+    it("keeps well-formed versions", () => {
+      expect(facts("2.6", "0.4.0")).toEqual({ protocolVersion: "2.6", cliVersion: "0.4.0" });
+      expect(facts("2.8", "1.2.3-rc.1+build.5")).toEqual({
+        protocolVersion: "2.8",
+        cliVersion: "1.2.3-rc.1+build.5",
+      });
+      expect(facts("2.10", "10.20.30").protocolVersion).toBe("2.10");
+    });
+
+    it.each([
+      ["overlong", "1.0." + "9".repeat(40)],
+      ["overlong padded semver", `1.2.3-${"a".repeat(40)}`],
+      ["newline", "1.2.3\nX-Injected: 1"],
+      ["NUL", "1.2.3\u0000"],
+      ["ANSI escape", "1.2.3\u001b[31m"],
+      ["bidi override", "1.2.3\u202e"],
+      ["html", "<script>1.2.3</script>"],
+      ["non-semver word", "latest"],
+      ["two-part", "1.2"],
+      ["four-part", "1.2.3.4"],
+      // A >9-digit numeric identifier that still fits in the 32-character cap
+      // (an IP-shaped string here; phone-shaped elsewhere) is not a semver, and
+      // the per-component digit bound rejects it.
+      ["overlong numeric identifier", `${"9".repeat(10)}.1.1`],
+      ["v prefix", "v1.2.3"],
+      ["empty", ""],
+      ["padded with spaces", " 1.2.3 "],
+      ["number", 123],
+      ["object", { toString: "1.2.3" }],
+      ["array", ["1.2.3"]],
+      ["null", null],
+    ])("drops a hostile cli version: %s", (_name, value) => {
+      expect(facts("2.6", value).cliVersion).toBeNull();
+      expect(facts("2.6", value).protocolVersion).toBe("2.6");
+    });
+
+    it.each([
+      ["overlong", `2.${"9".repeat(40)}`],
+      ["control characters", "2.\u00006"],
+      ["newline", "2.6\n"],
+      ["semver", "2.6.1"],
+      ["single number", "2"],
+      ["word", "next"],
+      ["empty", ""],
+      ["number", 2.6],
+      ["null", null],
+    ])("drops a hostile protocol version: %s", (_name, value) => {
+      expect(facts(value, "0.4.0").protocolVersion).toBeNull();
+      expect(facts(value, "0.4.0").cliVersion).toBe("0.4.0");
+    });
+
+    it("returns nothing for unusable frames", () => {
+      const none = { protocolVersion: null, cliVersion: null };
+      expect(rejectedHelloFacts("not json")).toEqual(none);
+      expect(rejectedHelloFacts("[]")).toEqual(none);
+      expect(rejectedHelloFacts("null")).toEqual(none);
+      expect(rejectedHelloFacts(JSON.stringify({ type: "hello", cli: "1.2.3" }))).toEqual(none);
+      const oversize = JSON.stringify({
+        type: "hello",
+        protocolVersion: "2.6",
+        pad: "x".repeat(RELAY_JSON_CONTROL_MAX_BYTES),
+      });
+      expect(rejectedHelloFacts(oversize)).toEqual(none);
+    });
   });
 
   it("parses a 2.8 hello and refuses older or loose capability shapes", () => {

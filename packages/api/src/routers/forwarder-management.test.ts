@@ -5164,6 +5164,7 @@ describe("setCliDeviceFeatureGrants", () => {
         supported: true,
         live: false,
         effectiveMode: "off",
+        refusals: { headless: "offline", supervised: "offline" },
         available: false,
       },
     });
@@ -5175,6 +5176,7 @@ describe("setCliDeviceFeatureGrants", () => {
 
     const liveClient = (
       mcpCommandMode: "off" | "supervised" | "unsupervised",
+      terminalSupported = true,
       protocolVersion = "2.8",
       allowFileToolsAsRoot = false,
     ) =>
@@ -5192,7 +5194,7 @@ describe("setCliDeviceFeatureGrants", () => {
                     humanTerminal: true,
                     mcpCommandMode,
                     supervisedCommands: true,
-                    terminalSupported: true,
+                    terminalSupported,
                     terminalApproval: false,
                     fileOps: protocolVersion === "2.8",
                     mcpFileRead: false,
@@ -5207,23 +5209,92 @@ describe("setCliDeviceFeatureGrants", () => {
       });
     const live = await liveClient("supervised").listCliDevices();
     expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
-    // Grant unsupervised, live CLI supervised: the lower one applies.
+    // Grant unsupervised, live CLI supervised: the lower one applies, and only
+    // headless is refused (the relay's supervised_only, attributed to the CLI config).
     expect(live[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "supervised",
+      refusals: { headless: "cli_supervised_only", supervised: null },
       available: true,
     });
     const liveOff = await liveClient("off").listCliDevices();
     expect(liveOff[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "off",
+      refusals: { headless: "feature_disabled", supervised: "feature_disabled" },
       available: false,
+    });
+    const liveFull = await liveClient("unsupervised").listCliDevices();
+    expect(liveFull[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: null },
+      available: true,
+    });
+    // No PTY (Windows): supervised is refused although the mode allows it, and
+    // headless still works on an unsupervised device.
+    const noPty = await liveClient("unsupervised", false).listCliDevices();
+    expect(noPty[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: "unsupported" },
+      available: true,
+    });
+    // A connected CLI older than protocol 2.6 has no command support: offline.
+    const oldClient = createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.5",
+                  cliVersion: "0.3.0",
+                  humanTerminal: true,
+                  mcpCommandMode: "unsupervised" as const,
+                  supervisedCommands: true,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  fileOps: false,
+                  mcpFileRead: false,
+                  fileRootsConfigured: false,
+                  allowFileToolsAsRoot: false,
+                  terminalPublicKey: "key",
+                },
+              ],
+            ]),
+        },
+      },
+    });
+    const preCommands = await oldClient.listCliDevices();
+    expect(preCommands[0]?.features.commands).toMatchObject({
+      live: false,
+      effectiveMode: "off",
+      refusals: { headless: "offline", supervised: "offline" },
+      available: false,
+    });
+    const [row] = await db.cliDevice.findMany();
+    db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "SUPERVISED" }]);
+    // A supervised-only device without a PTY cannot run anything: not available.
+    const nothing = await liveClient("supervised", false).listCliDevices();
+    expect(nothing[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: "unsupported" },
+      available: false,
+    });
+    // The relay checks the grant first: a supervised grant refuses headless as
+    // supervised_only whatever the CLI reports (attributed to the grant).
+    const grantLimited = await liveClient("unsupervised").listCliDevices();
+    expect(grantLimited[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: null },
     });
 
     // File tools follow the effective mode (lowest of grant, CLI config, live hello).
-    expect(live[0]?.fileTools).toEqual({ read: "supervised", write: "supervised" });
+    expect(grantLimited[0]?.fileTools).toEqual({ read: "supervised", write: "supervised" });
     expect(liveOff[0]?.fileTools).toEqual({ read: "off", write: "off" });
-    const liveUnsupervised = await liveClient("unsupervised", "2.8", true).listCliDevices();
+    db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "UNSUPERVISED" }]);
+    const liveUnsupervised = await liveClient("unsupervised", true, "2.8", true).listCliDevices();
     expect(liveUnsupervised[0]?.fileTools).toEqual({ read: "headless", write: "headless" });
     // The live root switch wins over the stored report.
     expect(liveUnsupervised[0]?.allowFileToolsAsRoot).toBe(true);
@@ -5231,7 +5302,7 @@ describe("setCliDeviceFeatureGrants", () => {
       false,
     );
     // A live CLI older than 2.8 runs no file tool.
-    const legacy = await liveClient("unsupervised", "2.7").listCliDevices();
+    const legacy = await liveClient("unsupervised", true, "2.7").listCliDevices();
     expect(legacy[0]?.fileTools).toEqual({ read: "off", write: "off" });
   });
 
@@ -5289,7 +5360,7 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(devices[0]?.allowFileToolsAsRoot).toBe(false);
   });
 
-  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+  it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {
     const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
     const row = {
       id: "cli-id",
@@ -5318,6 +5389,13 @@ describe("setCliDeviceFeatureGrants", () => {
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
+      {
+        ...row,
+        id: "cli-newer",
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0",
+        relayRejectedAt: rejectedAt,
+      },
     ]);
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: buildContext(),
@@ -5326,8 +5404,13 @@ describe("setCliDeviceFeatureGrants", () => {
       protocolVersion: "2.6",
       cliVersion: "0.4.0",
       rejectedAt,
+      reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
+    expect(devices[2]?.upgradeRequired).toMatchObject({
+      protocolVersion: "2.8",
+      reason: "cli_too_new",
+    });
   });
 });
 

@@ -211,7 +211,22 @@
         "supervised": "requieren a una persona",
         "off": "desactivadas"
       },
-      "fileToolsAsRoot": "Este CLI permite que las herramientas de archivos MCP se ejecuten como root (allowFileToolsAsRoot está activado). Un agente podría leer o cambiar cualquier archivo de esta máquina. Desactívalo con wsmp config set-file-tools-as-root off."
+      "fileToolsAsRoot": "Este CLI permite que las herramientas de archivos MCP se ejecuten como root (allowFileToolsAsRoot está activado). Un agente podría leer o cambiar cualquier archivo de esta máquina. Desactívalo con wsmp config set-file-tools-as-root off.",
+      "effective": "Lo que los agentes pueden ejecutar ahora",
+      "commandSwitches": "Un comando se ejecuta solo cuando el token MCP, este permiso y la configuración propia del CLI lo permiten. El modo efectivo es el más estricto de los dos últimos.",
+      "commandKind": {
+        "headless": "Comandos sin cabecera (headless)",
+        "supervised": "Comandos supervisados"
+      },
+      "commandAllowed": "permitido ahora",
+      "commandRefusal": {
+        "grant_disabled": "rechazado: el permiso del panel de arriba no lo permite. Sube el permiso para permitirlo.",
+        "offline": "rechazado: este CLI está desconectado o es demasiado antiguo. Funciona de nuevo cuando el CLI se reconecte con un wsmp actual.",
+        "feature_disabled": "rechazado: la configuración propia de este CLI no lo permite. En esa máquina ejecuta wsmp config set-mcp-commands y reinicia wsmp.",
+        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
+        "grant_supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel de arriba es Supervisado. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
+        "cli_supervised_only": "rechazado: requiere Sin supervisión, y la configuración propia de este CLI es Supervisado. En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
+      }
     },
     "rename": {
       "action": "Renombrar",
@@ -229,6 +244,8 @@
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     },
+    "serverUpgradeRequired": "Actualización del servidor necesaria: el protocolo {{protocol}} de la CLI es más nuevo de lo que admite este servidor",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}} porque es más nuevo que este servidor. Pide al administrador que actualice el servidor, o instala una versión anterior de wsmp en esta máquina.",
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",
@@ -365,19 +382,15 @@
       "checking": "Verificando identidad…",
       "offline": "Sin conexión",
       "unpinned": "Este navegador no pudo guardar la clave. Compara la huella antes de escribir algo sensible.",
-      "unverified": "Sin verificar. Actualiza la CLI para verificar su identidad.",
       "invalid": "Esta CLI no demostró su identidad. Sus terminales están bloqueadas.",
       "changed": "La clave de identidad de esta CLI cambió. Sus terminales están bloqueadas hasta que confíes en la nueva clave.",
-      "downgraded": "Esta CLI ya no demuestra su identidad. Sus terminales están bloqueadas hasta que la permitas.",
       "pinned": "Fijada",
       "new": "Nueva",
       "trustNew": "Confiar en la nueva clave",
-      "allowUnverified": "Permitir sin verificar",
       "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
       "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
       "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
       "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
-      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla.",
       "attention": "La clave de identidad de una CLI necesita revisión. Sus terminales están bloqueadas hasta que la verifiques.",
       "review": "Revisar"
     },

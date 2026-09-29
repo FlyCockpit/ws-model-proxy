@@ -63,7 +63,22 @@
         "supervised": "needs a person",
         "off": "off"
       },
-      "fileToolsAsRoot": "This CLI allows MCP file tools to run as root (allowFileToolsAsRoot is on). An agent could read or change any file on this machine. Turn it off with wsmp config set-file-tools-as-root off."
+      "fileToolsAsRoot": "This CLI allows MCP file tools to run as root (allowFileToolsAsRoot is on). An agent could read or change any file on this machine. Turn it off with wsmp config set-file-tools-as-root off.",
+      "effective": "Agents can run now",
+      "commandSwitches": "A command runs only when the MCP token, this grant and the CLI's own config all allow it. The effective mode is the stricter of the last two.",
+      "commandKind": {
+        "headless": "Headless commands",
+        "supervised": "Supervised commands"
+      },
+      "commandAllowed": "allowed now",
+      "commandRefusal": {
+        "grant_disabled": "refused: the dashboard grant above does not allow it. Raise the grant to allow it.",
+        "offline": "refused: this CLI is offline or too old for it. It works again once the CLI reconnects on a current wsmp.",
+        "feature_disabled": "refused: this CLI's own config does not allow it. On that machine run wsmp config set-mcp-commands and restart wsmp.",
+        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it.",
+        "grant_supervised_only": "refused: needs Unsupervised, and the dashboard grant above is Supervised. Raise the grant to allow it (this CLI's config must then allow it too).",
+        "cli_supervised_only": "refused: needs Unsupervised, and this CLI's own config is Supervised. On that machine run wsmp config set-mcp-commands unsupervised and restart wsmp."
+      }
     },
     "rename": {
       "action": "Rename",
@@ -81,6 +96,8 @@
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
     },
+    "serverUpgradeRequired": "Server upgrade required: CLI protocol {{protocol}} is newer than this server supports",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} was refused on {{value}} because it is newer than this server. Ask the server administrator to upgrade the server, or install an older wsmp on this machine.",
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
     "upgradeUnknownProtocol": "unknown",
@@ -365,19 +382,15 @@
       "checking": "Checking identity…",
       "offline": "Offline",
       "unpinned": "This browser could not save the key. Compare the fingerprint before you type anything sensitive.",
-      "unverified": "Unverified. Update the CLI to verify its identity.",
       "invalid": "This CLI did not prove its identity. Its terminals are blocked.",
       "changed": "This CLI's identity key changed. Its terminals are blocked until you trust the new key.",
-      "downgraded": "This CLI no longer proves its identity. Its terminals are blocked until you allow it.",
       "pinned": "Pinned",
       "new": "New",
       "trustNew": "Trust new key",
-      "allowUnverified": "Allow unverified",
       "trustTitle": "Trust the new key for {{label}}?",
       "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
       "trustFailed": "The key could not be trusted. Reload and try again.",
       "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
-      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it.",
       "attention": "A CLI's identity key needs review. Its terminals are blocked until you check it.",
       "review": "Review"
     },

@@ -164,14 +164,22 @@ describe("createApp MCP web page gate (production registration)", () => {
     }
   });
 
-  it("keeps near-miss locale forms on normal handling (not the gate's 404-for-every-method)", async () => {
-    // In the test NODE_ENV there is no SSR catch-all, so unmatched paths also
-    // 404 — the distinguishing assertion is the /health control plus the
-    // near-miss path NOT being owned by the gate (the pure matcher tests pin
-    // non-membership; here we prove the app still answers normally for a
-    // non-page path while the gate is off).
-    const health = await app.request(new Request(`${BASE}/health`, { headers: HOST }));
-    expect(health.status).toBe(200);
+  it("keeps near-miss locale forms on normal handling (not the gate's 404)", async () => {
+    // CORS_ORIGIN is set in the env mock, so an OPTIONS preflight is answered
+    // 204 by cors() for any path that is NOT owned by the gate. The exact
+    // valid-locale path gets the gate's 404 (test above); near-miss spellings
+    // must fall through to normal handling and reach cors().
+    const preflight = {
+      host: "proxy.example.com",
+      origin: "https://app.example.com",
+      "access-control-request-method": "GET",
+    };
+    for (const path of ["/en-US/mcp-login/", "/EN-US/mcp-login", "/fr-FR/mcp-consent"]) {
+      const res = await app.request(
+        new Request(`${BASE}${path}`, { method: "OPTIONS", headers: preflight }),
+      );
+      expect(res.status, path).toBe(204);
+    }
   });
 
   it("passes valid-locale forms through to downstream handling while enabled", async () => {

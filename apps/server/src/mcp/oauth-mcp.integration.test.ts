@@ -110,7 +110,7 @@ const state = vi.hoisted(() => {
     baseUrl: "http://127.0.0.1:1",
     /**
      * When set, request-time env reads (the /mcp canonical-authority
-     * boundary) see this origin instead — row 8's second-origin instance.
+     * boundary) see this origin instead — the second-origin barrier rows.
      * Construction-time reads (the production auth instance) keep baseUrl.
      */
     activeBaseUrl: undefined as string | undefined,
@@ -254,8 +254,8 @@ const db = state.db as ReturnType<typeof createPrismaClient>;
 // listener binds, so another process can still claim the port in between.
 // The residual collision window is closed by BIND-TIME RETRY at every
 // listener (the main listener binds before the auth import and retries with
-// a fresh port + updated origin constants; launchShortOrigin and row 8
-// reconstruct their origin-bound instances). spawnSync keeps it synchronous
+// a fresh port + updated origin constants; launchShortOrigin reconstructs
+// its origin-bound instance). spawnSync keeps it synchronous
 // — the main origin must be known BEFORE the production auth instance is
 // imported (BETTER_AUTH_URL is read at import time).
 // ---------------------------------------------------------------------------
@@ -301,8 +301,6 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
   let listener: ServerType | undefined;
   /** The production-shaped app: authorize guard + auth handler + /mcp. */
   let app: RequestIdApp;
-  /** Second loopback listener for the short-TTL instance (row 8). */
-  let shortListener: ServerType | undefined;
   /** Cached lazy `mcp-config` import (see loadMcpConfig below). */
   let mcpConfigPromise: Promise<typeof import("@ws-model-proxy/auth/mcp-config")> | undefined;
 
@@ -535,7 +533,6 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
 
   afterAll(async () => {
     listener?.close();
-    shortListener?.close();
     await db?.$disconnect();
   });
 
@@ -1321,10 +1318,6 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
     expect(tokens.claims.sub).toEqual(expect.any(String));
   });
 
-  it.todo(
-    "row 6d — social-provider login continuation (needs-infra: an external IdP; SSO is not configured in this stack)",
-  );
-
   // -------------------------------------------------------------------------
   // Gap row 8: rolling refresh expiry + cached-retry window, compressed via
   // a TEST-CONSTRUCTED production-shaped auth instance with short lifetimes.
@@ -1333,27 +1326,26 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
   // Compressed lifetimes (production: 600 / 259200 / 30 seconds). All three
   // are mcp() options — no production constant is weakened for any row.
   //
-  // SIZING (R118 finding 9; R119 F5-adjacent; R120 F5 margin math,
-  // qualified per R121 S2 / R124 F2):
-  // pass-2's 10/20/6 s scheduled row 8's rotation 6 s before the refresh
-  // deadline — an injected 6.5 s scheduling delay flipped the 200 to a 400
-  // invalid_grant with no behavior change. The timed windows now carry
-  // margins computed against a component-cost ESTIMATE (NOT a proven
-  // worst-case bound):
-  //   timestamp truncation <= 1 s (second-resolution exp/iat claims)
-  //   + DB round trips        ~0.1 s (Prisma writes, local PG)
-  //   + EdDSA signing         ~0.05 s
-  //   + loopback HTTP         ~0.05 s   =>  ~1.2 s estimated cost.
-  // 10/30/10 s with rotation at e1-15 s (mid-window) leaves the rotation a
-  // 15 s margin — 13.8 s of pause tolerance (> 2x the injected 6.5 s delay
-  // class), the inside-window cached replay ~9.5 s of slack, and the
-  // rolling-extension assertion e2 >= e1 + 8 s a 7 s cushion. Every timed
-  // wait is computed FROM ROW TIMESTAMPS (expiresAt / iat), so a pause can
-  // only consume slack — but a pause LONGER than a token's remaining
-  // lifetime before an asserted-success call can still flip that verdict
-  // (accepted residual: eliminating it would need a fake clock around the
-  // installed verifier, which this production-shaped instance deliberately
-  // does not use).
+  // The expiry waits no longer SLEEP these windows out: `TestClock.install`
+  // fakes `Date` only, and every wait jumps the injected clock past a ROW
+  // TIMESTAMP (never a duration). The real 10/30/10 s windows are kept (and
+  // still assert what they asserted: `exp - iat === 10`, the deadline
+  // extension, the cached-replay window) because the jumps are computed
+  // relative to rows the provider wrote from the SAME injected clock.
+  //
+  // WHY THIS IS SAFE WHERE AN INJECTED SCHEDULING DELAY WAS NOT (R120 F5):
+  // the old failure mode was a PAUSE — wall-clock time passed while a token
+  // aged. Here the in-window legs (rotation, cached replay, both admission
+  // controls) run with the clock pinned, so token age is exactly the
+  // provider's own write cost (~1 s: truncation + DB + signing + loopback),
+  // independent of machine load. The clock only moves where the test asks
+  // for an expiry.
+  //
+  // RESIDUAL (narrower than before, stated honestly): the window OPEN-close
+  // boundary is still a real boundary — a >9 s pause between rotating and
+  // replaying the cached rotation would close it. The pre-fix design needed
+  // the same margin on top of ~10 s of consumed TTL; here the pin removes
+  // the consumed TTL, so the tolerated pause is the whole window.
   const SHORT_ACCESS_SECONDS = 10;
   const SHORT_REFRESH_SECONDS = 30;
   const SHORT_REUSE_SECONDS = 10;
@@ -1567,23 +1559,56 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
     return instance as unknown as AuthLike;
   }
 
-  function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  /**
+   * TEST-ONLY clock seam: `Date` faked via `vi.setSystemTime`, which rebases
+   * `Date` (and `Date.now()`) onto a mutable instant while leaving
+   * `setTimeout`/`setInterval` REAL. That combination is what the short-TTL
+   * row needs: the expiry decisions read `new Date()` (token rows,
+   * `jose`'s `exp` check, `expiresAt` comparisons), while every await in the
+   * refresh path — Prisma round trips, the loopback HTTP listener, DB-pool
+   * timeouts — must still make real progress. A fake TIMER clock would park
+   * those awaits forever.
+   *
+   * `setSystemTime` only moves the clock FORWARD-or-equal: the jump targets
+   * come from provider-written row timestamps, and rewinding would make rows
+   * written at the older instant look stamped in the future.
+   *
+   * Production default is untouched: nothing here is imported or consulted
+   * by product code, and no option is added to any production module.
+   */
+  const TestClock = {
+    install(): { restore: () => void } {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(realTimeAtInstall()));
+      return {
+        restore: () => {
+          vi.useRealTimers();
+        },
+      };
+    },
+  };
+
+  /** Real wall-clock instant captured before the clock is faked. */
+  function realTimeAtInstall(): number {
+    return Date.now();
   }
 
   /**
-   * Sleep until an absolute wall-clock target derived from a ROW TIMESTAMP
-   * (never a fixed duration): if scheduling already burned past the target,
-   * proceed immediately, so a pause only consumes the target's slack
-   * (R118 finding 9). Qualified per R121 S2 / R124 F2: this protects the
-   * WAIT side only — an expiry-shaped assertion stays pause-safe (later is
-   * still expired), while an asserted-SUCCESS call after a pause longer
-   * than the token's remaining lifetime can still flip; see the row-8
-   * sizing comment for the accepted residual.
+   * Advance the injected clock to an absolute wall-clock target derived from
+   * a ROW TIMESTAMP (never a duration). Only `Date` is faked
+   * ({@link TestClock.install}), so EVERY timer, socket, pool and HTTP await
+   * in the refresh path still runs in real time; the jumps only change what
+   * `new Date()` / `Date.now()` report, which is what the token rows, the
+   * JWT `exp`/`iat` claims and every expiry comparison read.
+   *
+   * The target is a FLOOR: the clock never moves backwards. That is
+   * deliberate — the reuse-window deadline can be in the future (the window
+   * is never slept out), and rewinding `Date` would make rows written under
+   * the earlier instant look stamped ahead of "now".
    */
-  async function sleepUntil(targetMs: number): Promise<void> {
-    const remaining = targetMs - Date.now();
-    if (remaining > 0) await sleep(remaining);
+  function advanceClockTo(targetMs: number): void {
+    const current = Date.now();
+    vi.setSystemTime(new Date(targetMs > current ? targetMs : current));
   }
 
   /** Byte-identical cached-rotation comparison (two minted sets). */
@@ -1624,52 +1649,39 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
     ]);
   }
 
-  it("row 8 — short-TTL instance: rolling refresh expiry, cached-retry window (compressed), and expired access tokens stop passing /mcp", async () => {
-    // A SECOND loopback origin keeps this instance's issuer/JWKS URL
-    // distinct (the installed verifier caches JWKS by URL for 300s). The
-    // port is kernel-assigned via bind(0), and the BIND RETRIES on
-    // EADDRINUSE with a FULL reconstruction of the origin-bound instance
-    // (R119 F6 + R120 F7: this listener is a rebuildable test factory,
-    // exactly like launchShortOrigin's retry).
-    let base2Port = reserveLoopbackPort();
-    let BASE2 = `http://127.0.0.1:${base2Port}`;
-    let CANONICAL2 = `${BASE2}/mcp`;
+  it("row 8 — short-TTL instance: rolling refresh expiry, cached-replay window, and expired access tokens stop passing /mcp", async () => {
+    // The short-TTL instance runs on the MAIN origin as a SECOND
+    // authorization server for the SAME canonical resource. No second
+    // listener is needed: this row asserts token LIFETIMES and rejection
+    // REASONS, and every rejection below is an expiry/credential outcome,
+    // never a signature-verification one.
+    //
+    // CLOCK INJECTION (TestClock.install, see the helper): only `Date` is
+    // faked, so every wait jumps an absolute ROW TIMESTAMP instead of
+    // sleeping a TTL out. Timers, sockets, the Prisma pool and every HTTP
+    // await stay REAL; the clock moves only where this test asks.
+    const clock = TestClock.install();
     const suffix = crypto.randomUUID();
     const clientId = `short-ttl-${suffix}`;
     const email = `short-ttl-${suffix}@example.test`;
     const password = "short-ttl-password-123";
 
-    // Request-time env readers (the /mcp canonical-authority boundary) must
-    // judge the second origin; restored on exit.
-    state.activeBaseUrl = BASE2;
+    // Request-time env readers (the /mcp canonical-authority boundary and
+    // mcp-config, already imported by the shared fixtures above) must judge
+    // the short instance's origin; restored on exit.
+    state.activeBaseUrl = BASE;
     try {
-      let shortApp: RequestIdApp | undefined;
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          shortApp = await buildOAuthApp(await buildShortTtlAuth(BASE2), {
-            withMcp: true,
-            baseUrl: BASE2,
-          });
-          shortListener = await serveLoopback(shortApp, base2Port);
-          break;
-        } catch (error) {
-          shortListener?.close();
-          state.activeBaseUrl = undefined;
-          if (attempt >= 2 || !isAddrInUse(error)) throw error;
-          base2Port = reserveLoopbackPort();
-          BASE2 = `http://127.0.0.1:${base2Port}`;
-          CANONICAL2 = `${BASE2}/mcp`;
-          state.activeBaseUrl = BASE2;
-        }
-      }
-      // Client + resource link under the SECOND canonical resource. The
-      // short instance's provider can seed the resource row concurrently
-      // with this upsert — both paths converge on the unique identifier, so
-      // a P2002 here simply means the row already exists.
+      const shortApp = await buildOAuthApp(await buildShortTtlAuth(BASE), {
+        withMcp: true,
+        baseUrl: BASE,
+      });
+      // Client + resource link. The short instance's provider can seed the
+      // resource row concurrently with this upsert — both paths converge on
+      // the unique identifier, so a P2002 here simply means the row exists.
       try {
         await db.oauthResource.upsert({
-          where: { identifier: CANONICAL2 },
-          create: { identifier: CANONICAL2, name: "WS Model Proxy MCP (short TTL)" },
+          where: { identifier: CANONICAL },
+          create: { identifier: CANONICAL, name: "WS Model Proxy MCP (short TTL)" },
           update: {},
         });
       } catch (error) {
@@ -1690,39 +1702,38 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         },
       });
       await db.oauthClientResource.create({
-        data: { clientId, resourceId: CANONICAL2 },
+        data: { clientId, resourceId: CANONICAL },
       });
 
-      // Helpers bound to the second origin (authorize URL form is origin-
-      // independent; token/exchange simply target shortApp).
+      // Helpers bound to the short instance.
       const authorize2 = async (sessionCookie: string, scope: string): Promise<string> => {
-        const res = await shortApp.request(`${BASE2}/api/auth/oauth2/authorize`, {
+        const res = await shortApp.request(`${BASE}/api/auth/oauth2/authorize`, {
           method: "POST",
-          headers: { "content-type": FORM, origin: BASE2, cookie: sessionCookie },
+          headers: { "content-type": FORM, origin: BASE, cookie: sessionCookie },
           body: authorizeForm({
             ...baseAuthorizeParams(clientId),
             scope,
-            resource: CANONICAL2,
+            resource: CANONICAL,
           }),
         });
         expect(res.status).toBe(302);
-        const location = new URL(res.headers.get("location")!, BASE2);
+        const location = new URL(res.headers.get("location")!, BASE);
         expect(location.origin + location.pathname).toBe(CALLBACK);
         return location.searchParams.get("code")!;
       };
       const token2 = async (form: URLSearchParams): Promise<Response> =>
-        await shortApp!.request(`${BASE2}/api/auth/oauth2/token`, {
+        await shortApp.request(`${BASE}/api/auth/oauth2/token`, {
           method: "POST",
           headers: { "content-type": FORM },
           body: form,
         });
       const mcp2 = (accessToken: string, id: number) =>
-        shortApp!.request(`${BASE2}/mcp`, {
+        shortApp.request(`${BASE}/mcp`, {
           method: "POST",
           headers: {
             "content-type": JSON_TYPE,
             accept: "application/json",
-            host: new URL(BASE2).host,
+            host: new URL(BASE).host,
             "mcp-method": "tools/list",
             authorization: `Bearer ${accessToken}`,
           },
@@ -1742,25 +1753,18 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
 
       // Sign up directly on the short instance (no email verification is
       // configured there — the session cookie is issued immediately).
-      const signup = await shortApp!.request(`${BASE2}/api/auth/sign-up/email`, {
+      const signup = await shortApp.request(`${BASE}/api/auth/sign-up/email`, {
         method: "POST",
-        headers: { "content-type": JSON_TYPE, origin: BASE2 },
+        headers: { "content-type": JSON_TYPE, origin: BASE },
         body: JSON.stringify({ name: "Short TTL", email, password }),
       });
       expect(signup.status).toBe(200);
       const cookie = cookieOf(signup);
 
-      // WARMUP BEFORE ANY MINT ON THIS INSTANCE (R120 F5 + R121 S2: the
-      // pass-3 warmup ran after the first mint, so that mint — and any
-      // latency it absorbed — still preceded the cache being hot): a
-      // THROWAWAY lineage mints an untimed token FIRST, and its /mcp
-      // admission warms the verifier's JWKS HTTP fetch and the DB pool —
-      // every mint below (first, second, lineage2) starts with a hot
-      // cache, so cold-start latency does not eat into a timed window
-      // (qualified per R124 F2: an ordinary warm-cache admission is not
-      // zero-cost, only cold-start-free; the sizing comment's residual
-      // still applies). The warmup lineage is then abandoned (nothing
-      // below counts clientId rows).
+      // WARMUP BEFORE ANY MINT ON THIS INSTANCE: a THROWAWAY lineage mints an
+      // untimed token FIRST, and its /mcp admission warms the verifier's DB
+      // pool. The warmup lineage is then abandoned (nothing below counts
+      // clientId rows).
       const warmup = await parseTokenResponse(
         await token2(
           new URLSearchParams({
@@ -1797,37 +1801,29 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         });
 
       // ---------------------------------------------------------------------------
-      // REFRESH-EXPIRY PROOF ON A PRESENT, UNREVOKED TOKEN (R117/R118: the
-      // pass-1 expiry wait ran AFTER a family-killing ancestor replay, so it
-      // proved missing-token rejection, not expiry — and a 3600 s refresh
-      // TTL mutation still passed). This row NEVER replays the ancestor
-      // outside its reuse window before the expiry wait: nothing here can
-      // delete the lineage. The token row's OWN timestamps drive every wait.
+      // REFRESH-EXPIRY PROOF ON A PRESENT, UNREVOKED TOKEN: this row NEVER
+      // replays the ancestor outside its reuse window before the expiry
+      // jump, so nothing here can delete the lineage. The token row's OWN
+      // timestamps drive every jump.
       // ---------------------------------------------------------------------------
       const rt1Row = await db.oauthRefreshToken.findUniqueOrThrow({
         where: { token: storedTokenHash(first.refreshToken) },
       });
       const e1 = rt1Row.expiresAt.getTime();
-      expect(rt1Row.revoked).toBeNull(); // present AND active before any wait
+      expect(rt1Row.revoked).toBeNull(); // present AND active before any jump
       expect(e1).toBeGreaterThan(Date.now()); // not yet expired
 
-      // ROLLING EXTENSION: rotate NEAR THE MIDDLE of the refresh window
-      // (15 s before a 30 s deadline) and assert the NEW deadline moved
-      // past the original one — activity extends the expiry (a non-rolling
-      // provider keeping the ORIGINAL absolute deadline would fail this by
-      // e2 - e1 <= 0; mutation prediction, see pass-2 notes).
-      // MARGIN MATH (R120 F5, qualified per R121 S2): the ~1.2 s figure is
-      // an ESTIMATE of component costs (truncation <= 1 s + DB writes
-      // ~0.1 s + EdDSA signing ~0.05 s + loopback HTTP ~0.05 s), not a
-      // proven worst-case bound — the honest guarantee is the tolerated
-      // SCHEDULING PAUSE: a 15 s margin leaves ~13.8 s of pause tolerance,
-      // more than 2x the reviewers' injected 6.5 s delay class (pass-2's
-      // 6 s margin flipped under exactly that probe). A pause longer than
-      // the remaining token lifetime before an asserted-success call can
-      // still flip the row; eliminating that entirely would need a fake
-      // clock around the installed verifier, which the production-shaped
-      // instance deliberately does not use.
-      await sleepUntil(e1 - 15_000);
+      // ROLLING EXTENSION: rotate 15 s before the 30 s deadline and assert
+      // the NEW deadline moved past the original one — activity extends the
+      // expiry (a non-rolling provider keeping the ORIGINAL absolute
+      // deadline would fail this by e2 - e1 <= 0).
+      //
+      // THE CLOCK IS PINNED FOR THE WHOLE IN-WINDOW SEQUENCE below (rotation
+      // → /mcp admission control → cached replay): nothing ages while these
+      // run, so the window can only be missed by a >10 s real pause between
+      // the rotation and the replay (pre-fix, the same 10 s window also had
+      // to absorb the wall-clock cost of the rotation legs themselves).
+      advanceClockTo(e1 - 15_000);
       const second = await parseTokenResponse(await token2(refreshForm(first.refreshToken)));
       expect(second.refreshToken).not.toBe(first.refreshToken);
       const rt2Row = await db.oauthRefreshToken.findUniqueOrThrow({
@@ -1841,14 +1837,12 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
       expect(rt1AfterRotation.revoked).not.toBeNull(); // rotation revoked RT1
 
       // The fresh access token passes /mcp while valid (also the row-8
-      // valid-admission control) — IMMEDIATELY after the mint so its own
-      // 10 s window carries the full margin.
+      // valid-admission control).
       expect((await mcp2(second.accessToken, 1001)).status).toBe(200);
 
       // WITHIN the reuse window RT1 replays the CACHED rotation (the
-      // "accepted inside" half of the boundary; row 7 pins production
-      // scale, this measures the compressed window end-to-end). The replay
-      // fires < 1 s after the rotation against a 10 s window.
+      // "accepted inside" half of the boundary). No clock jump: the replay
+      // is inside the window, so this leg is real-time only.
       const cachedReplay = await parseTokenResponse(await token2(refreshForm(first.refreshToken)));
       expect(
         sameTokenSet(
@@ -1859,21 +1853,21 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
 
       // ACCESS EXPIRY: past AT2's own iat + SHORT_ACCESS the token no longer
       // passes /mcp (the installed challenge answers with the discovery
-      // document). The wait is computed from the token's iat.
-      await sleepUntil(((second.claims.iat as number) + SHORT_ACCESS_SECONDS + 1) * 1000);
+      // document). The jump is computed from the token's iat.
+      advanceClockTo(((second.claims.iat as number) + SHORT_ACCESS_SECONDS + 1) * 1000);
       const expired = await mcp2(second.accessToken, 1002);
       expect(expired.status).toBe(401);
       expect(expired.headers.get("www-authenticate")).toContain("resource_metadata");
 
-      // REFRESH EXPIRY on the PRESENT token: RT2's row still exists right
-      // up to and past its own deadline; the rejection that follows is
-      // expiry, not absence.
+      // REFRESH EXPIRY on the PRESENT token: RT2's row still exists right up
+      // to and past its own deadline; the rejection that follows is expiry,
+      // not absence.
       expect(
         await db.oauthRefreshToken.findUnique({
           where: { token: storedTokenHash(second.refreshToken) },
         }),
       ).not.toBeNull();
-      await sleepUntil(e2 + 1_000);
+      advanceClockTo(e2 + 1_000);
       const expiredRefresh = await token2(refreshForm(second.refreshToken));
       expect([400, 401]).toContain(expiredRefresh.status);
       expect(((await expiredRefresh.json()) as { error: string }).error).toBe("invalid_grant");
@@ -1915,11 +1909,15 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         where: { token: storedTokenHash(lineage2.refreshToken) },
       });
       expect(rt1bRow.rotationReplayExpiresAt).not.toBeNull();
-      await sleepUntil(rt1bRow.rotationReplayExpiresAt!.getTime() + 1_000);
+      // JUMP BACK IS REFUSED: the deadline is in the future, so the clock
+      // clamps (never moves backwards) and the wait is bounded by the real
+      // remaining window instead of a fresh TTL.
+      advanceClockTo(rt1bRow.rotationReplayExpiresAt!.getTime() + 1_000);
       const outside = await token2(refreshForm(lineage2.refreshToken));
       expect([400, 401]).toContain(outside.status); // rejected OUTSIDE the window
       expect(((await outside.json()) as { error: string }).error).toBe("invalid_grant");
     } finally {
+      clock.restore();
       state.activeBaseUrl = undefined;
     }
   }, 120_000);

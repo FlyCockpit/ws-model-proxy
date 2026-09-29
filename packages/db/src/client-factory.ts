@@ -100,6 +100,13 @@ export type StatementBoundedClientOptions = {
    * never set it.
    */
   keepClientReadTimeoutForTest?: boolean;
+  /**
+   * Test seam only: pg-pool `idleTimeoutMillis` (default: pg-pool's 10 s).
+   * Lets a test show that `minIdleConnections` keeps a held connection past
+   * the idle timeout without idling for the default 10 s. Production callers
+   * never set it.
+   */
+  idleTimeoutMsForTest?: number;
 };
 
 /**
@@ -197,6 +204,7 @@ export function createStatementBoundedPrismaClient(
     minIdleConnections,
     keepAliveInitialDelayMs,
     keepClientReadTimeoutForTest = false,
+    idleTimeoutMsForTest,
   }: StatementBoundedClientOptions,
 ): StatementBoundedPrismaClient {
   if (!(statementTimeoutMs > 0) || !(connectTimeoutMs > 0)) {
@@ -224,6 +232,7 @@ export function createStatementBoundedPrismaClient(
     application_name: applicationName,
     max: maxConnections,
     min: minIdleConnections,
+    ...(idleTimeoutMsForTest === undefined ? {} : { idleTimeoutMillis: idleTimeoutMsForTest }),
     keepAlive: true,
     keepAliveInitialDelayMillis: keepAliveInitialDelayMs,
     // pg-pool builds every connection of this pool with this class.

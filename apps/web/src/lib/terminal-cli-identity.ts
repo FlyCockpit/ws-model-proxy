@@ -8,25 +8,22 @@ import type { ListedCli } from "@/lib/terminal-protocol";
 /**
  * Trust in one CLI's terminal key (phase 6, CLI identity pinning).
  *
- * - `trusted`: a 2.5 CLI whose identity signs its current ECDH key, and whose
+ * - `trusted`: a CLI whose identity signs its current ECDH key, and whose
  *   identity matches the key pinned for this `cliDeviceId` (or was just pinned).
  * - `unpinned`: as `trusted`, but this browser could not store the pin.
- * - `unverified`: a 2.4 CLI. It cannot prove an identity; allowed with a notice.
- * - `changed`: the identity differs from the pinned one. `fingerprint` is null
- *   when a previously pinned CLI stopped proving an identity at all.
- * - `invalid`: a 2.5 CLI without a valid identity signature.
+ * - `changed`: the identity differs from the pinned one.
+ * - `invalid`: a CLI without a valid identity signature.
  * - `offline`: no live CLI (no terminal key to check right now). The pin is
  *   kept; nothing about the identity is known until the CLI reconnects.
  */
 export type CliTrust =
   | { status: "trusted"; fingerprint: string; terminalPublicKey: string; firstUse: boolean }
   | { status: "unpinned"; fingerprint: string; terminalPublicKey: string }
-  | { status: "unverified" }
   | {
       status: "changed";
       pinnedFingerprint: string;
-      fingerprint: string | null;
-      identityPublicKey: string | null;
+      fingerprint: string;
+      identityPublicKey: string;
     }
   | { status: "invalid" }
   | { status: "offline" };
@@ -37,17 +34,15 @@ export type ChangedCliTrust = Extract<CliTrust, { status: "changed" }>;
 export type CliPinStore = {
   get(cliDeviceId: string): Promise<string | null>;
   put(cliDeviceId: string, identityPublicKey: string): Promise<void>;
-  remove(cliDeviceId: string): Promise<void>;
 };
 
 /** Whether a handshake may start, and the ECDH key the CLI must answer with. */
 export function trustAllowsHandshake(
   trust: CliTrust,
-): { ok: true; expectedCliPublicKey: string | null } | { ok: false } {
+): { ok: true; expectedCliPublicKey: string } | { ok: false } {
   if (trust.status === "trusted" || trust.status === "unpinned") {
     return { ok: true, expectedCliPublicKey: trust.terminalPublicKey };
   }
-  if (trust.status === "unverified") return { ok: true, expectedCliPublicKey: null };
   return { ok: false };
 }
 
@@ -61,7 +56,6 @@ export function trustRejectionReason(trust: CliTrust): string {
 /** Everything that changes the outcome of `evaluateCliTrust`. */
 export function cliTrustInputKey(cli: ListedCli): string {
   return [
-    cli.terminalViewers ? "2.5" : "2.4",
     cli.slug ?? "",
     cli.publicKey ?? "",
     cli.identityPublicKey ?? "",
@@ -116,8 +110,7 @@ async function verifiedIdentity(
 
 /**
  * A CLI is live when the relay lists its per-start terminal key: the relay
- * only lists one for a connected CLI speaking protocol 2.4 or later. An offline
- * CLI reports no protocol version, so `terminalViewers` says nothing about it.
+ * only lists one for a connected CLI.
  */
 function cliIsLive(cli: ListedCli): boolean {
   return cli.publicKey !== null;
@@ -128,13 +121,6 @@ export async function evaluateCliTrust(cli: ListedCli, store: CliPinStore): Prom
   if (!cliIsLive(cli)) return { status: "offline" };
   const pinned = await readPin(store, cli.cliDeviceId);
   const pinnedFingerprint = pinned && pinned !== "error" ? await fingerprintOf(pinned) : null;
-  if (!cli.terminalViewers) {
-    // A live pinned CLI that now speaks 2.4 no longer proves its identity.
-    if (pinned && pinned !== "error" && pinnedFingerprint) {
-      return { status: "changed", pinnedFingerprint, fingerprint: null, identityPublicKey: null };
-    }
-    return { status: "unverified" };
-  }
   const verified = await verifiedIdentity(cli);
   if (!verified) return { status: "invalid" };
   const { fingerprint, identityPublicKey, terminalPublicKey } = verified;
@@ -168,8 +154,7 @@ async function pinStillMatches(
  * snapshot taken when it opened). Pins exactly that key, and only while the
  * relay still lists it with a valid signature over the CLI's current terminal
  * key and the pin is still the one shown. Anything else pins nothing and
- * returns the fresh evaluation. A CLI that stopped proving an identity loses
- * its pin only while it is still a live 2.4 CLI.
+ * returns the fresh evaluation.
  */
 export async function trustNewCliKey(
   cli: ListedCli,
@@ -177,12 +162,6 @@ export async function trustNewCliKey(
   store: CliPinStore,
 ): Promise<CliTrust> {
   if (!(await pinStillMatches(store, cli.cliDeviceId, shown.pinnedFingerprint))) {
-    return evaluateCliTrust(cli, store);
-  }
-  if (shown.identityPublicKey === null) {
-    // Only a live 2.4 CLI may drop the pin. An offline one keeps it.
-    if (cli.terminalViewers || !cliIsLive(cli)) return evaluateCliTrust(cli, store);
-    await store.remove(cli.cliDeviceId);
     return evaluateCliTrust(cli, store);
   }
   if (!cliIsLive(cli) || cli.identityPublicKey !== shown.identityPublicKey) {
@@ -202,7 +181,6 @@ export async function trustNewCliKey(
 
 /** Whether `trustNewCliKey` applied the confirmed snapshot rather than re-evaluating. */
 export function trustAppliedSnapshot(shown: ChangedCliTrust, result: CliTrust): boolean {
-  if (shown.identityPublicKey === null) return result.status === "unverified";
   return result.status === "trusted" && result.fingerprint === shown.fingerprint;
 }
 
@@ -254,9 +232,6 @@ export const indexedDbCliPinStore: CliPinStore = {
     const record: PinRecord = { identityPublicKey, pinnedAt: Date.now() };
     await withPinStore("readwrite", (store) => store.put(record, cliDeviceId));
   },
-  async remove(cliDeviceId) {
-    await withPinStore("readwrite", (store) => store.delete(cliDeviceId));
-  },
 };
 
 /** In-memory pins, for tests. */
@@ -271,9 +246,6 @@ export function createMemoryCliPinStore(initial?: Record<string, string>): CliPi
     },
     async put(cliDeviceId, identityPublicKey) {
       pins.set(cliDeviceId, identityPublicKey);
-    },
-    async remove(cliDeviceId) {
-      pins.delete(cliDeviceId);
     },
   };
 }
