@@ -21,24 +21,24 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-pub mod atomic;
-pub mod diff;
+pub(crate) mod atomic;
+pub(crate) mod diff;
 pub mod edit;
 pub mod error;
 pub mod etag;
-pub mod fmt;
-pub mod glob;
+pub(crate) mod fmt;
+pub(crate) mod glob;
 pub mod list;
 pub mod mutate;
 pub mod policy;
 pub mod pool;
 pub mod read;
 pub mod redact;
-pub mod resolve;
+pub(crate) mod resolve;
 pub mod search;
 pub mod stat;
-pub mod text;
-pub mod walk;
+pub(crate) mod text;
+pub(crate) mod walk;
 pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};

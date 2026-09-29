@@ -3,8 +3,11 @@
 //!
 //! What is masked, and nothing else:
 //!
-//! 1. SSH private keys: files named `id_*` (not `*.pub`) are masked whole, and
-//!    `*.pem` / `*.key` files have their `PRIVATE KEY` blocks masked.
+//! 1. Private keys: files named `id_*` (not `*.pub`) and the non-public files
+//!    under `.ssh` are masked whole, and a `-----BEGIN ... PRIVATE KEY-----`
+//!    block is masked by CONTENT in every file, through its END line (to the end
+//!    of the scanned region when there is none). Public keys and certificates
+//!    stay visible.
 //! 2. Environment variables. In dotenv-shaped files (`.env`, `*.env`, `.env.*`,
 //!    `.envrc`, `service.env`) only blank lines, comments and the `KEY` of a
 //!    simple `KEY=` / `export KEY=` line are shown; every other line is masked
@@ -15,8 +18,8 @@
 //!    `PASSWORD`, the whole rest of the physical line is masked. Lower-case and
 //!    mixed-case names (`hf_token=`, `Password=`) are not secret names: the
 //!    issue's name set is upper case, as the tests pin.
-//! 3. The Hugging Face token file (`~/.cache/huggingface/token`,
-//!    `~/.huggingface/token`) and the values of `--api-key`, `--hf-token`,
+//! 3. The Hugging Face token files (`token` and `stored_tokens` under
+//!    `~/.cache/huggingface` and `~/.huggingface`) and the values of `--api-key`, `--hf-token`,
 //!    `--token`, `--password`, `--secret`-style command-line flags (again to the
 //!    end of the line), including a value on the following line (`\`
 //!    continuation or a YAML/JSON list item).
@@ -298,7 +301,7 @@ const SECRET_FLAG_SUFFIX: &str = "api[-_]?key|token|secret|password";
 /// `_`) that ends in `_TOKEN`, `_KEY`, `_SECRET` or `PASSWORD`. Names without a
 /// prefix (`TOKEN=`, `KEY=`) stay visible.
 const SECRET_NAME: &str =
-    r"[A-Z_][A-Z0-9_]*(?:_TOKEN|_KEY|_SECRET)|[A-Z_][A-Z0-9_]*PASSWORD|PASSWORD";
+    r"(?:[A-Z_][A-Z0-9_]*)?(?:_TOKEN|_KEY|_SECRET)|[A-Z_][A-Z0-9_]*PASSWORD|PASSWORD";
 
 /// Space-separated environment forms: Dockerfile `ENV NAME value`, `ARG`,
 /// csh `setenv NAME value`.
@@ -314,6 +317,20 @@ static INLINE_PAIR: LazyLock<Regex> = LazyLock::new(|| {
         r#"["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?[ \t]*,[ \t]*["']?value["']?[ \t]*:[ \t]*"#
     ))
     .expect("inline pair regex")
+});
+/// The reversed inline pair: `{"value": "...", "name": "DB_PASSWORD"}`; group 1 is
+/// everything up to the start of the value.
+static INLINE_PAIR_REV: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(["']?value["']?[ \t]*:[ \t]*).*[ \t]*,[ \t]*["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?"#
+    ))
+    .expect("reversed inline pair regex")
+});
+/// An environment list header (`env:`, `environment:`, `"env": [`): every `value:`
+/// line below it is masked, whatever order the item's fields come in.
+static ENV_LIST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[ \t]*-?[ \t]*["']?(?:env|environment|envs|variables)["']?[ \t]*:[ \t]*[\[{]?[ \t\r]*$"#)
+        .expect("env list regex")
 });
 /// `name: SECRET_NAME` alone on a line (Kubernetes `env:` items, JSON objects):
 /// its `value:` sibling follows.
@@ -648,14 +665,23 @@ fn first_inline_pair(line: &str) -> Option<Candidate> {
     if !(line.contains("name") && line.contains("value")) {
         return None;
     }
-    let m = INLINE_PAIR.find(line)?;
-    let tail = &line[m.end()..];
+    let forward = INLINE_PAIR.find(line).map(|m| m.end());
+    let reversed = INLINE_PAIR_REV
+        .captures(line)
+        .and_then(|caps| caps.get(1))
+        .map(|group| group.end());
+    // the earliest value of either order (the mask runs to the end of the line)
+    let start = match (forward, reversed) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    let tail = &line[start..];
     let trimmed = tail.trim_end();
     if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
         return None;
     }
     Some((
-        m.end(),
+        start,
         construct_for_tail(tail, false, indent_of(line), quote_left_open(line)),
     ))
 }
@@ -741,6 +767,18 @@ fn continuation_value(line: &str) -> Option<(Range<usize>, Construct)> {
     ))
 }
 
+/// A `-----BEGIN <anything> PRIVATE KEY-----` marker (`OPENSSH`, `RSA`, `EC`,
+/// `ENCRYPTED` and plain): public keys and certificates do not match.
+fn pem_begin(line: &str) -> bool {
+    line.find("-----BEGIN")
+        .is_some_and(|at| line[at..].contains("PRIVATE KEY-----"))
+}
+
+fn pem_end(line: &str) -> bool {
+    line.find("-----END")
+        .is_some_and(|at| line[at..].contains("PRIVATE KEY-----"))
+}
+
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -772,13 +810,21 @@ struct OpenBlock {
 pub struct LineMasker {
     class: FileClass,
     lookback: usize,
-    in_private_block: bool,
+    /// Offset of the `-----BEGIN ... PRIVATE KEY-----` line of the open key block.
+    pem_block: Option<usize>,
     pending_flag_value: bool,
     /// Offset of the latest opener of the run that masks lines until a blank line.
     until_blank: Option<usize>,
     blocks: Vec<OpenBlock>,
-    /// Lines left in which a `value:` line belongs to a `name: SECRET_NAME` line.
+    /// Open `env:` / `environment:` lists: their `value:` lines are masked.
+    env_blocks: Vec<OpenBlock>,
+    /// Lines left in which a `value:` line belongs to a `name: SECRET_NAME` line,
+    /// and the offset of that name line.
     pair_lines: u8,
+    pair_opener: usize,
+    /// Offset of the earlier line whose content decided that THIS line is masked
+    /// through a prerequisite (a name line, an env list header).
+    dep: Option<usize>,
     /// Offset of the next line when the caller does not supply one.
     next_at: usize,
     long_run: bool,
@@ -793,11 +839,14 @@ impl LineMasker {
         Self {
             class,
             lookback,
-            in_private_block: false,
+            pem_block: None,
             pending_flag_value: false,
             until_blank: None,
             blocks: Vec::new(),
+            env_blocks: Vec::new(),
             pair_lines: 0,
+            pair_opener: 0,
+            dep: None,
             next_at: 0,
             long_run: false,
         }
@@ -816,7 +865,7 @@ impl LineMasker {
     /// Whether a multi-line value that started on an earlier line is still open:
     /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
-        self.until_blank.is_some() || !self.blocks.is_empty()
+        self.until_blank.is_some() || !self.blocks.is_empty() || self.pem_block.is_some()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a
@@ -848,27 +897,36 @@ impl LineMasker {
         // 1. which open constructs mask this line (the latest opener decides how far
         //    back a reader would have to look)
         let mut masked_by: Option<usize> = None;
+        let mut env_open: Option<usize> = None;
         if blank {
             // a blank line ends the until-blank run; blocks pass through it
             self.until_blank = None;
         } else {
             let indent = indent_of(line);
             self.blocks.retain(|block| block.indent < indent);
+            self.env_blocks.retain(|block| block.indent < indent);
             masked_by = self
                 .blocks
                 .iter()
                 .map(|block| block.opener)
                 .chain(self.until_blank)
                 .max();
+            env_open = self.env_blocks.iter().map(|block| block.opener).max();
         }
+        // a private-key block (any file): from its BEGIN line through its END line
+        let begin = pem_begin(line);
+        let end = pem_end(line);
+        let pem_opener = self.pem_block.or(begin.then_some(at));
+        masked_by = masked_by.max(pem_opener);
         // 2. the line's own rules and openers, always (union semantics)
-        let (masks, opened) = self.scan_body(line);
-        if let Some(opener) = masked_by
+        self.dep = None;
+        let (masks, opened) = self.scan_body(line, at, env_open);
+        if let Some(opener) = masked_by.max(self.dep)
             && at.saturating_sub(opener) > self.lookback
         {
             self.long_run = true;
         }
-        // 3. register what this line opened
+        // 3. register what this line opened or closed
         match opened {
             Construct::None => {}
             Construct::UntilBlank => self.until_blank = Some(at),
@@ -879,6 +937,16 @@ impl LineMasker {
                     opener: at,
                 });
             }
+        }
+        if (line.contains("env") || line.contains("variables")) && ENV_LIST.is_match(line) {
+            let indent = indent_of(line);
+            self.env_blocks.retain(|block| block.indent != indent);
+            self.env_blocks.push(OpenBlock { indent, opener: at });
+        }
+        if end && (self.pem_block.is_some() || begin) {
+            self.pem_block = None;
+        } else if begin && self.pem_block.is_none() {
+            self.pem_block = Some(at);
         }
         if masked_by.is_some() {
             return vec![(0..line.len(), token_bare())];
@@ -891,7 +959,12 @@ impl LineMasker {
     }
 
     /// The class and generic rules over `line` (ranges relative to `line`).
-    fn scan_body(&mut self, line: &str) -> (Vec<LineMask>, Construct) {
+    fn scan_body(
+        &mut self,
+        line: &str,
+        at: usize,
+        env_open: Option<usize>,
+    ) -> (Vec<LineMask>, Construct) {
         let mut masks: Vec<LineMask> = Vec::new();
         let mut construct = Construct::None;
         let mut generic = true;
@@ -906,18 +979,7 @@ impl LineMasker {
                     masks.push((0..line.len(), token(line.chars().count())));
                 }
             }
-            FileClass::PemKey => {
-                if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
-                    self.in_private_block = true;
-                }
-                if self.in_private_block {
-                    masks.push((0..line.len(), token_bare()));
-                    if line.contains("-----END") && line.contains("PRIVATE KEY-----") {
-                        self.in_private_block = false;
-                    }
-                    generic = false;
-                }
-            }
+            FileClass::PemKey | FileClass::Plain => {}
             FileClass::Dotenv => {
                 // Unknown means masked: only blank lines, comments and the KEY of
                 // a simple `KEY=` line are shown.
@@ -942,7 +1004,6 @@ impl LineMasker {
                         construct_for_tail(line, false, indent_of(line), quote_left_open(line));
                 }
             }
-            FileClass::Plain => {}
         }
         if generic {
             if self.pending_flag_value
@@ -953,22 +1014,30 @@ impl LineMasker {
             }
             // Kubernetes/ECS style: `name: SECRET_NAME` then `value: ...`
             let mut next_pair = self.pair_lines.saturating_sub(1);
-            if self.pair_lines > 0 {
-                if let Some(m) = VALUE_KEY.find(line) {
-                    masks.extend(tail_mask(line, m.end()));
-                    construct = construct_for_tail(
-                        &line[m.end()..],
-                        true,
-                        indent_of(line),
-                        quote_left_open(line),
-                    );
-                    next_pair = 0;
-                } else if line.trim().is_empty() {
-                    next_pair = 0;
+            let value_key = (self.pair_lines > 0 || env_open.is_some())
+                .then(|| VALUE_KEY.find(line))
+                .flatten();
+            if let Some(m) = value_key {
+                masks.extend(tail_mask(line, m.end()));
+                construct = construct_for_tail(
+                    &line[m.end()..],
+                    true,
+                    indent_of(line),
+                    quote_left_open(line),
+                );
+                // the prerequisite lines (a name line, an env list header) can be
+                // far above: a reader must be able to see them
+                if self.pair_lines > 0 {
+                    self.dep = Some(self.pair_opener);
                 }
+                self.dep = self.dep.max(env_open);
+                next_pair = 0;
+            } else if self.pair_lines > 0 && line.trim().is_empty() {
+                next_pair = 0;
             }
             if line.contains("name") && NAME_LINE.is_match(line) {
                 next_pair = 3;
+                self.pair_opener = at;
             }
             self.pair_lines = next_pair;
             if has_trigger(line)
@@ -1400,8 +1469,7 @@ mod tests {
     }
 
     /// Whole-file classes (`id_*`) and the by-label rule for `*.pem`/`*.key`
-    /// files, including a private key pasted into a plain file (not masked, by
-    /// owner narrowing).
+    /// files, plus private-key blocks in ANY file (owner decision).
     #[test]
     fn key_blocks_are_masked_by_class_and_label() {
         let bare = "\u{27E6}redacted\u{27E7}\n";
@@ -1421,9 +1489,80 @@ mod tests {
         assert_eq!(masked(FileClass::PemKey, &unterminated), bare.repeat(3));
         let public = pem("PUBLIC KEY", "MIIB\n");
         assert_eq!(masked(FileClass::PemKey, &public), public);
-        // a private key pasted into a plain file is NOT masked (owner narrowing)
+        // a private key pasted into a plain file IS masked (owner decision: content-based)
         let pasted = pem("PRIVATE KEY", "K\n");
-        assert_eq!(masked(FileClass::Plain, &pasted), pasted);
+        assert_eq!(masked(FileClass::Plain, &pasted), bare.repeat(3));
+    }
+
+    /// Owner decision: whenever a `BEGIN ... PRIVATE KEY` line appears in any file,
+    /// everything through the matching `END` line is masked; no END masks to the end
+    /// of what is scanned; public keys and certificates stay visible.
+    #[test]
+    fn private_key_blocks_are_masked_in_any_file_by_content() {
+        let kinds = [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+        ];
+        for kind in kinds {
+            let (begin, end) = (
+                format!("-----BEGIN {kind}-----"),
+                format!("-----END {kind}-----"),
+            );
+            for class in [FileClass::Plain, FileClass::Dotenv, FileClass::PemKey] {
+                let text = format!("before\n{begin}\nBODYLINEONE\nBODYLINETWO\n{end}\nafter\n");
+                let view = masked(class, &text);
+                assert!(!view.contains("BODYLINE"), "{kind} {class:?}: {view:?}");
+                assert!(
+                    !view.contains("BEGIN") && !view.contains("END"),
+                    "{kind} {class:?}: {view:?}"
+                );
+                if class == FileClass::Plain {
+                    assert!(
+                        view.starts_with("before\n") && view.ends_with("after\n"),
+                        "{view:?}"
+                    );
+                }
+            }
+            // embedded in YAML (indented block scalar), JSON (one line), and a doc
+            let yaml = format!("key: |\n  {begin}\n  BODYLINEONE\n  {end}\nnext: 1\n");
+            let view = masked(FileClass::Plain, &yaml);
+            assert!(
+                !view.contains("BODYLINE") && view.ends_with("next: 1\n"),
+                "{view:?}"
+            );
+            let json = format!("{{\"k\": \"{begin}\\nBODYLINEONE\\n{end}\\n\", \"n\": 1}}\n");
+            assert!(!masked(FileClass::Plain, &json).contains("BODYLINE"));
+            // no END: masked to the end of what is scanned
+            let open = format!("head\n{begin}\nBODYLINEONE\nBODYLINETWO\n");
+            let view = masked(FileClass::Plain, &open);
+            assert_eq!(view.matches("BODYLINE").count(), 0, "{view:?}");
+            assert!(view.starts_with("head\n"));
+        }
+        // public keys and certificates stay visible
+        for label in [
+            "PUBLIC KEY",
+            "CERTIFICATE",
+            "RSA PUBLIC KEY",
+            "CERTIFICATE REQUEST",
+        ] {
+            let text = pem(label, "PUBLICBODY\n");
+            assert_eq!(masked(FileClass::Plain, &text), text, "{label}");
+        }
+        // a private key that follows a certificate in the same file
+        let both = format!(
+            "{}{}tail\n",
+            pem("CERTIFICATE", "CERTBODY\n"),
+            pem("PRIVATE KEY", "KEYBODY\n")
+        );
+        let view = masked(FileClass::Plain, &both);
+        assert!(
+            view.contains("CERTBODY") && !view.contains("KEYBODY") && view.ends_with("tail\n"),
+            "{view:?}"
+        );
     }
 
     #[test]

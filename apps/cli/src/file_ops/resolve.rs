@@ -32,7 +32,7 @@ use std::fs::{File, Metadata};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat, readlinkat};
@@ -447,13 +447,4 @@ fn join_names(names: &[OsString]) -> PathBuf {
         path.push(name);
     }
     path
-}
-
-/// `unlinkat` a leaf that this call created (used to roll back a failed create).
-pub fn unlink_created(dir: &OwnedFd, name: &OsStr) {
-    let _ = unlinkat(dir.as_fd(), name, UnlinkatFlags::NoRemoveDir);
-}
-
-pub fn path_of(dir_path: &Path, name: &OsStr) -> PathBuf {
-    dir_path.join(name)
 }

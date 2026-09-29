@@ -1010,3 +1010,121 @@ fn edits_cannot_arrange_a_layout_that_makes_a_window_show_a_masked_value() {
         );
     }
 }
+
+// ---- private keys are masked by content in any file ---------------------------
+
+#[test]
+fn a_private_key_in_an_ordinary_file_is_masked_for_read_search_and_diff() {
+    let fx = Fx::new();
+    let key = pem("OPENSSH PRIVATE KEY", &"KEYBODYLINE\n".repeat(300));
+    fx.put("notes.txt", format!("intro line\n{key}outro line\n"));
+    // every window, including one that starts in the middle of the block
+    for start in [1_u64, 2, 100, 250, 301, 302, 303] {
+        let r = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": start }));
+        assert!(
+            !r.text.contains("KEYBODYLINE") && !r.text.contains("PRIVATE KEY"),
+            "start {start}: {}",
+            r.text.get(..200).unwrap_or(&r.text)
+        );
+    }
+    let tail = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": -2 }));
+    assert!(tail.text.contains("outro line"), "{}", tail.text);
+    // search sees only the masked view
+    let hits = fx
+        .ops
+        .search(
+            &args(json!({ "root": fx.p("notes.txt"), "pattern": "KEYBODYLINE" })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(hits.count, 0, "{}", hits.matches);
+    let hits = fx
+        .ops
+        .search(
+            &args(json!({ "root": fx.p("notes.txt"), "pattern": "outro" })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(hits.count, 1);
+    // an edit whose range touches the block is refused; one elsewhere works and
+    // its diff carries no key bytes
+    let touch = fx.ops.edit(
+        &args(json!({ "path": fx.p("notes.txt"), "edits": [{
+            "oldText": "\u{27E6}redacted\u{27E7}", "newText": "x", "expectedMatches": "all" }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(touch), ErrorCode::RedactedSpan);
+    let ok = fx
+        .ops
+        .edit(
+            &args(json!({ "path": fx.p("notes.txt"), "edits": [{ "oldText": "outro", "newText": "OUTRO" }] })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert!(!ok.diff.unwrap_or_default().contains("KEYBODYLINE"));
+    assert!(
+        fx.get("notes.txt").contains("KEYBODYLINE"),
+        "the file itself is untouched"
+    );
+    // a public key stays visible
+    fx.put("pub.txt", pem("PUBLIC KEY", "PUBLICBODY\n"));
+    assert!(fx.read("pub.txt").text.contains("PUBLICBODY"));
+}
+
+// ---- name/value pairs: padding, order, env lists, short names ---------------------
+
+#[test]
+fn a_name_value_pair_is_masked_whatever_the_padding_order_or_name_length() {
+    let fx = Fx::new();
+    // reversed order inside an env list, and inline both ways
+    fx.put(
+        "deploy.yaml",
+        "containers:\n  env:\n    - value: pairsecretone\n      name: DB_PASSWORD\n    - name: PUBLIC\n      value: shown\n",
+    );
+    let r = fx.read("deploy.yaml").text;
+    assert!(!r.contains("pairsecretone"), "{r}");
+    fx.put(
+        "task.json",
+        "{\"env\": [{\"value\": \"reversedsecret\", \"name\": \"API_KEY\"}, {\"name\": \"DB_PASSWORD\", \"value\": \"forwardsecret\"}]}\n",
+    );
+    let r = fx.read("task.json").text;
+    assert!(
+        !r.contains("reversedsecret") && !r.contains("forwardsecret"),
+        "{r}"
+    );
+    // the shortest names in every shape
+    fx.put(
+        "short.txt",
+        "ENV _TOKEN shortenvsecret\nARG _KEY shortargsecret\nsetenv _SECRET shortsetsecret\n- name: _TOKEN\n  value: shortpairsecret\n{\"name\": \"_KEY\", \"value\": \"shortinlinesecret\"}\n",
+    );
+    let r = fx.read("short.txt").text;
+    for leaked in [
+        "shortenvsecret",
+        "shortargsecret",
+        "shortsetsecret",
+        "shortpairsecret",
+        "shortinlinesecret",
+    ] {
+        assert!(!r.contains(leaked), "{leaked} in {r}");
+    }
+    // the value stays masked when accepted edits pad between the name and the value:
+    // each edit is small, the total distance is longer than the lookback
+    fx.put(
+        "pad.yaml",
+        "- name: SECRET_KEY\n  x: 1\n  y: 2\n  value: padsecretvalue\n",
+    );
+    let padding = "p".repeat(700_000);
+    for (old, line) in [("y: 2", "y"), ("y: ", "y")] {
+        let etag = fx.etag("pad.yaml");
+        let _ = fx.ops.edit(
+            &args(
+                json!({ "path": fx.p("pad.yaml"), "expectedEtag": etag, "edits": [{
+                "oldText": old, "newText": format!("{line}: {padding}") }] }),
+            ),
+            &fx.cancel,
+        );
+    }
+    // refused, or applied with the value still masked in every window
+    let last = fx.read_with(json!({ "path": fx.p("pad.yaml"), "startLine": -1 }));
+    assert!(!last.text.contains("padsecretvalue"), "{}", last.text);
+}
