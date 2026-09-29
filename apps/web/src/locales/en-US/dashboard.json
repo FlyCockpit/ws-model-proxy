@@ -74,6 +74,8 @@
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
     },
+    "serverUpgradeRequired": "Server upgrade required: CLI protocol {{protocol}} is newer than this server supports",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} was refused on {{value}} because it is newer than this server. Ask the server administrator to upgrade the server, or install an older wsmp on this machine.",
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
     "upgradeUnknownProtocol": "unknown",

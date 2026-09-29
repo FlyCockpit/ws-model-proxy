@@ -98,7 +98,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
-import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
+import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
   drainBeforeParentDelete,
   runCapacityDeleteTransaction,
@@ -678,13 +678,15 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     relayProtocolVersion: row.relayProtocolVersion ?? null,
     /**
      * Set when this device's last hello was refused for an old relay
-     * protocol; the next accepted hello clears it.
+     * protocol, or one newer than this server speaks (`reason`); the next
+     * accepted hello clears it.
      */
     upgradeRequired: row.relayRejectedAt
       ? {
           protocolVersion: row.rejectedRelayProtocolVersion ?? null,
           cliVersion: row.rejectedCliVersion ?? null,
           rejectedAt: row.relayRejectedAt,
+          reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
         }
       : null,
     nodeInfoAt: row.nodeInfoAt ?? null,

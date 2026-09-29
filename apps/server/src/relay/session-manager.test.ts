@@ -1550,6 +1550,33 @@ describe("relay terminal and exec sessions", () => {
     consoleError.mockRestore();
   });
 
+  it("stores only sanitised versions from a refused hello with hostile client strings", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(hello24()) as {
+      protocolVersion: string;
+      cli: { version?: string; capabilities: Record<string, unknown> };
+    };
+    frame.protocolVersion = `2.${"9".repeat(40)}`;
+    frame.cli.version = "1.0.0\u001b[31m\n";
+    manager.acceptAuthenticatedSocket({
+      socket,
+      identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
+      now,
+    });
+    await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "bound-device", userId: "user-id" },
+      data: { rejectedRelayProtocolVersion: null, rejectedCliVersion: null, relayRejectedAt: now },
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      "[relay] refused a hello older than the minimum relay protocol",
+      { protocolVersion: null, cliVersion: null },
+    );
+    consoleError.mockRestore();
+  });
+
   it("registers a valid 2.7 hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

@@ -222,6 +222,8 @@
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     },
+    "serverUpgradeRequired": "Actualización del servidor necesaria: el protocolo {{protocol}} de la CLI es más nuevo de lo que admite este servidor",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}} porque es más nuevo que este servidor. Pide al administrador que actualice el servidor, o instala una versión anterior de wsmp en esta máquina.",
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",

@@ -2,12 +2,22 @@ import {
   type OpenAiCompatibleCapabilities,
   openAiCompatibleCapabilitiesSchema,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
+import {
+  RELAY_MIN_PROTOCOL_VERSION,
+  RELAY_PROTOCOL_VERSIONS,
+  type RelayProtocolVersion,
+  relayProtocolAtLeast,
+} from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
 import { isWellFormedText, stringifyWellFormed } from "./wire-text.js";
 
-export { relayProtocolAtLeast };
+export {
+  RELAY_MIN_PROTOCOL_VERSION,
+  RELAY_PROTOCOL_VERSIONS,
+  type RelayProtocolVersion,
+  relayProtocolAtLeast,
+};
 
 /**
  * The only relay protocol this server speaks. 2.7 adds engine facts in the
@@ -16,9 +26,6 @@ export { relayProtocolAtLeast };
  * hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`. 2.8 goes to the MCP node file
  * tools (#103) and 2.9 to model deployments (owner decision on #70).
  */
-export const RELAY_PROTOCOL_VERSIONS = ["2.7"] as const;
-export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
-export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.7";
 /**
  * Sent as `protocol.error` to a CLI whose hello is older than 2.7. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
@@ -952,10 +959,14 @@ export function helloNeedsUpgrade(frame: string): boolean {
   return (capabilities as Record<string, unknown>).protocolVersion !== RELAY_MIN_PROTOCOL_VERSION;
 }
 
-const REJECTED_VERSION_PATTERN = /^[0-9A-Za-z.+-]{1,32}$/;
+/** `major.minor`, the only shape `relayProtocolAtLeast` and the card's newer/older split read. */
+const REJECTED_PROTOCOL_PATTERN = /^\d{1,4}\.\d{1,4}$/;
+/** Semver (`1.2.3`, `1.2.3-rc.1+build`), at most 32 characters. */
+const REJECTED_CLI_VERSION_PATTERN =
+  /^(?=.{1,32}$)\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
-function rejectedVersionField(value: unknown): string | null {
-  return typeof value === "string" && REJECTED_VERSION_PATTERN.test(value) ? value : null;
+function rejectedVersionField(value: unknown, pattern: RegExp): string | null {
+  return typeof value === "string" && pattern.test(value) ? value : null;
 }
 
 /**
@@ -980,9 +991,12 @@ export function rejectedHelloFacts(frame: string): {
   const cli = record.cli;
   const cliVersion =
     cli && typeof cli === "object" && !Array.isArray(cli)
-      ? rejectedVersionField((cli as Record<string, unknown>).version)
+      ? rejectedVersionField((cli as Record<string, unknown>).version, REJECTED_CLI_VERSION_PATTERN)
       : null;
-  return { protocolVersion: rejectedVersionField(record.protocolVersion), cliVersion };
+  return {
+    protocolVersion: rejectedVersionField(record.protocolVersion, REJECTED_PROTOCOL_PATTERN),
+    cliVersion,
+  };
 }
 
 function utf8Length(text: string): number {

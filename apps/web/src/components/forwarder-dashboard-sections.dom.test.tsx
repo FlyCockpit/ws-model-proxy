@@ -796,6 +796,7 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
           protocolVersion: "2.6",
           cliVersion: "0.4.0",
           rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_old",
         },
       },
       { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", upgradeRequired: null },
@@ -810,6 +811,29 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     expect(screen.getByText(/^dashboard:clis\.upgradeRequiredDetail\|/).textContent).toContain(
       '"version":"0.4.0"',
     );
+  });
+
+  it("says the server must be upgraded when the refused CLI is newer", () => {
+    state.cliDevices = [
+      {
+        ...cliDeviceWithModel,
+        upgradeRequired: {
+          protocolVersion: "2.8",
+          cliVersion: "0.9.0",
+          rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_new",
+        },
+      },
+    ];
+    mountModelsSection();
+
+    expect(screen.queryByText(/^dashboard:clis\.upgradeRequired/)).toBeNull();
+    expect(screen.getByText(/^dashboard:clis\.serverUpgradeRequired\|/).textContent).toBe(
+      `dashboard:clis.serverUpgradeRequired|${JSON.stringify({ protocol: "2.8" })}`,
+    );
+    expect(
+      screen.getByText(/^dashboard:clis\.serverUpgradeRequiredDetail\|/).textContent,
+    ).toContain('"version":"0.9.0"');
   });
 
   it("keeps the plain success toast on clean responses", async () => {

@@ -5238,6 +5238,13 @@ describe("setCliDeviceFeatureGrants", () => {
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
+      {
+        ...row,
+        id: "cli-newer",
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0",
+        relayRejectedAt: rejectedAt,
+      },
     ]);
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: buildContext(),
@@ -5246,8 +5253,13 @@ describe("setCliDeviceFeatureGrants", () => {
       protocolVersion: "2.6",
       cliVersion: "0.4.0",
       rejectedAt,
+      reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
+    expect(devices[2]?.upgradeRequired).toMatchObject({
+      protocolVersion: "2.8",
+      reason: "cli_too_new",
+    });
   });
 });
 
