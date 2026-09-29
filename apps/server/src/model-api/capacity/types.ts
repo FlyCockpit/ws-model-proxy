@@ -38,7 +38,14 @@ export type AdmissionAttempt = {
   ownerId: string;
   sourceKind: "DIRECT" | "POOL";
   poolId?: string;
+  /** Recorded on the request; the scheduler uses each waiter's effective priority. */
   basePriority: number;
+  /**
+   * The pool grant the requester was resolved under (grantees only). Its
+   * `queuePriority` (S-C), when set, replaces the pool/member capacity
+   * priority for every candidate of this attempt; null inherits it.
+   */
+  accessGrantId?: string | null;
   connectionOwner: string;
   deadlineAt: Date;
   candidates: readonly AdmissionCandidate[];

@@ -76,6 +76,11 @@ import {
 export type PublicOverflowReason =
   | "NO_COMPATIBLE_HEALTHY_PRIMARY"
   | "LOCAL_WAIT_EXPIRED"
+  /**
+   * Saturation S-C: no local member is FREE for this new session; the ones
+   * with an idle slot hold other conversations' protected warm sessions.
+   */
+  | "LOCAL_SATURATED_PROTECTED"
   | "LOCAL_CONTEXT_CEILING"
   | "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
 

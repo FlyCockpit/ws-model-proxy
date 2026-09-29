@@ -32,6 +32,12 @@ import { openAiErrorBody } from "./openai-errors.js";
 export const EXTERNAL_MODEL_VARIANT = "external";
 
 export const ROUTE_HEADER = "x-wsmp-route";
+/**
+ * Why an external response was used: `local_wait_expired`,
+ * `local_saturated_protected` (S-C: the only local members with an idle slot
+ * hold protected warm sessions), `no_local_member`, `local_context_ceiling`,
+ * or `local_failure`.
+ */
 export const FALLBACK_REASON_HEADER = "x-wsmp-fallback-reason";
 export const SERVED_MODEL_HEADER = "x-wsmp-served-model";
 export const FALLBACK_HEADER = "x-wsmp-fallback";

@@ -138,7 +138,10 @@ const db = prisma as unknown as {
     upsert: MockInstance;
     deleteMany: MockInstance;
     findMany: MockInstance;
+    updateMany: MockInstance;
+    findUniqueOrThrow: MockInstance;
   };
+  $queryRaw: MockInstance;
   capacityAuditEvent: { create: MockInstance };
   cacheAffinityRecord: {
     count: MockInstance;
@@ -227,6 +230,12 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
     cacheHolderWaitMs: null,
+    protectionEnabled: true,
+    protectionWindowSeconds: 300,
+    protectMinTokens: 8192,
+    protectionShare: "EQUAL_SHARE",
+    protectionFixedPercent: null,
+    ownerProtectionPercent: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -2179,6 +2188,129 @@ describe("forwarderManagementRouter", () => {
     await client().updateModelPool({ id: "pool-id", name: "Renamed" });
     const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
     expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
+  });
+
+  it("stores warm-session protection settings and keeps the share mode consistent", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    db.modelPool.update.mockResolvedValue(poolRow());
+    const lastUpdate = () =>
+      (db.modelPool.update.mock.calls.at(-1)![0] as { data: Record<string, unknown> }).data;
+
+    await client().updateModelPool({
+      id: "pool-id",
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectMinTokens: 4096,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+    expect(lastUpdate()).toMatchObject({
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectMinTokens: 4096,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+    // FIXED_PERCENT needs a percent; any other mode stores none.
+    await expect(
+      client().updateModelPool({ id: "pool-id", protectionShare: "FIXED_PERCENT" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", protectionShare: "FIXED_PERCENT", protectionFixedPercent: 25 }),
+    );
+    await client().updateModelPool({ id: "pool-id", protectionShare: "EQUAL_SHARE" });
+    expect(lastUpdate()).toMatchObject({
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+    });
+    // Changing only the percent of a FIXED_PERCENT pool keeps the mode.
+    await client().updateModelPool({ id: "pool-id", protectionFixedPercent: 60 });
+    expect(lastUpdate()).toMatchObject({
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 60,
+    });
+    // Out-of-range values never reach the database.
+    const updates = db.modelPool.update.mock.calls.length;
+    for (const input of [
+      { protectionWindowSeconds: 0 },
+      { protectionWindowSeconds: 3_601 },
+      { ownerProtectionPercent: 101 },
+      { protectionFixedPercent: 0 },
+    ])
+      await expect(client().updateModelPool({ id: "pool-id", ...input })).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+      });
+    expect(db.modelPool.update).toHaveBeenCalledTimes(updates);
+    // Unrelated saves leave the protection settings untouched.
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    expect(Object.keys(lastUpdate()).filter((key) => key.startsWith("protect"))).toEqual([]);
+  });
+
+  it("creates a pool with protection on by default", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+    await client().createModelPool({ slug: "fresh", name: "Fresh" });
+    expect(
+      (db.modelPool.create.mock.calls.at(-1)![0] as { data: Record<string, unknown> }).data,
+    ).toMatchObject({
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+      ownerProtectionPercent: null,
+    });
+  });
+
+  it("lets only the pool owner set a grant's protection override and queue priority", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.$queryRaw.mockResolvedValue([{ id: "pool-id" }]);
+    db.poolGrant.updateMany.mockResolvedValue({ count: 1 });
+    db.poolGrant.findUniqueOrThrow.mockResolvedValue({
+      id: "grant-id",
+      poolId: "pool-id",
+      granteeUserId: "grantee-id",
+      protectionOverridePercent: 0,
+      queuePriority: 24,
+    });
+
+    await expect(
+      client().updatePoolGrant({
+        poolId: "pool-id",
+        grantId: "grant-id",
+        protectionOverridePercent: 0,
+        queuePriority: 24,
+      }),
+    ).resolves.toMatchObject({ protectionOverridePercent: 0, queuePriority: 24 });
+    expect(db.poolGrant.updateMany).toHaveBeenCalledWith({
+      where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
+      data: { protectionOverridePercent: 0, queuePriority: 24 },
+    });
+    // Omitted fields stay; null means "inherit".
+    await client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: null });
+    expect(db.poolGrant.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
+      data: { queuePriority: null },
+    });
+    // Ranges are 0..100 and 0..31.
+    for (const input of [{ protectionOverridePercent: 101 }, { queuePriority: 32 }])
+      await expect(
+        client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", ...input }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // A grant of another pool (or owner) is not found, never written.
+    db.poolGrant.updateMany.mockResolvedValue({ count: 0 });
+    await expect(
+      client().updatePoolGrant({ poolId: "pool-id", grantId: "other-grant", queuePriority: 1 }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    // A grantee (not the owner) cannot reach it: the pool is not theirs.
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "someone-else" });
+    const writes = db.poolGrant.updateMany.mock.calls.length;
+    await expect(
+      client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: 31 }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.poolGrant.updateMany).toHaveBeenCalledTimes(writes);
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {

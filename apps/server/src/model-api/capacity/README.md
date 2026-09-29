@@ -79,6 +79,17 @@ grantable waiters per capacity.
   no lock-order edge. CLI connection state is per process and remains a candidate-build and
   dispatch check only.
 
+## Per-grant queue priority (saturation S-C)
+
+- A pool attempt carries the requester's `accessGrantId` (grantees only). When the grant's
+  `queuePriority` is set, it replaces the pool/member `capacityPriority` as every candidate's
+  effective waiter priority (clamped to 0..31) and is recorded as the request's `basePriority`;
+  null, the owner (no grant) and a grant of another pool inherit. It is read once, when the
+  attempt is created, with a plain `pool_grant` read after the L2 fences: no row lock, so no
+  lock-order edge. The DRR scheduler is unchanged; the grant only moves the waiter's class.
+- Warm-session protection (`../warm-protection.ts`) never touches the store: it reorders and
+  filters candidates before the attempt is built, so it adds no waiter state and no lock.
+
 ## Lease ownership from admission to release (F2-CAP-1)
 
 `StoreCapacityAdmissionRuntime.acquire` attaches one `CapacityLeaseOwner` to the admitted handle,

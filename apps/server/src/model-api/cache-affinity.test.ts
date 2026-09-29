@@ -534,6 +534,109 @@ describe("cache affinity", () => {
     );
   });
 
+  it("stamps every record of one call with the same lastUsedAt (S-C session grouping)", async () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(2);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
+  it("refreshes existing records with the call's lastUsedAt (S-C session grouping)", async () => {
+    // The common continuation refreshes records instead of creating them, so
+    // the per-material `update` path must stamp `lastUsedAt` like the create
+    // paths do; otherwise the session ages out of the protection window while
+    // it is still in use (warm-protection.ts groups by `lastUsedAt`).
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-conversation-record" });
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    // The conversation record exists: this call must refresh it, not recreate it.
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).toHaveBeenCalled();
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(0);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
+  it("scores a single target so protection can tell a continuation from a new session", async () => {
+    const only = target("target-a", "runtime-a");
+    const continuation = {
+      ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "secret answer" }],
+    };
+    const material = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      runtimeIdentity: only.targetIdentity,
+    });
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      material.digests.map((prefixDigest, index) => ({
+        executionTargetId: only.executionTargetId,
+        targetIdentity: only.targetIdentity,
+        bindingDigest: material.bindingDigest,
+        prefixDigest,
+        conversationDigest: null,
+        prefixDepth: index + 1,
+        digestVersion: 4,
+        engineCacheConfirmed: false,
+        estimatedTokens: 9_000,
+      })),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      targets: [only],
+      scoreSingleTarget: true,
+    });
+    expect(material.isContinuation).toBe(true);
+    expect(ranked.prefixDepths["target-a"]).toBeGreaterThan(0);
+  });
+
   it("persists digests only, refreshes TTL, and enforces the row bound", async () => {
     db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "old" }]);
     const now = new Date("2026-08-25T12:00:00.000Z");
