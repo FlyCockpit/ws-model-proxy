@@ -202,7 +202,12 @@ function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
 export function renderOpenAiChatRequest(
   request: CanonicalRequest,
   model: string,
-  options: { acceptsTopK?: boolean; reasoning?: ReasoningRenderControl } = {},
+  options: {
+    acceptsTopK?: boolean;
+    reasoning?: ReasoningRenderControl;
+    /** False for a target that rejects `stream_options.include_usage`. Default true. */
+    streamUsage?: boolean;
+  } = {},
 ): Record<string, unknown> {
   if (request.sampling.topK !== undefined && options.acceptsTopK !== true) unsupported("top_k");
   const reasoningFields = reasoningWireFieldsForRequest(request, "openai-chat", options.reasoning);
@@ -282,8 +287,11 @@ export function renderOpenAiChatRequest(
     stream: request.stream,
     // Adapted streams report usage only when asked. Chat sources reject
     // `stream_options` and are never rendered back to Chat, so there is no
-    // caller value to merge.
-    ...(request.stream ? { stream_options: { include_usage: true } } : {}),
+    // caller value to merge. A target that rejects the field opts out; its
+    // stream then settles without reported usage (conservative liability).
+    ...(request.stream && options.streamUsage !== false
+      ? { stream_options: { include_usage: true } }
+      : {}),
     ...(request.sampling.temperature !== undefined
       ? { temperature: request.sampling.temperature }
       : {}),

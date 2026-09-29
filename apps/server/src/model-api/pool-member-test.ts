@@ -54,7 +54,12 @@ export function createPoolMemberTestRoutes({
       case "rate-limited":
         return c.json({ ok: false, error: "Too many active model API requests." }, 429);
       case "ok":
-        return c.json({ ok: true, status: result.status, latencyMs: result.latencyMs });
+        return c.json({
+          ok: true,
+          status: result.status,
+          latencyMs: result.latencyMs,
+          ...(result.detail ? { detail: result.detail } : {}),
+        });
       case "probe-failed":
         return c.json({
           ok: false,

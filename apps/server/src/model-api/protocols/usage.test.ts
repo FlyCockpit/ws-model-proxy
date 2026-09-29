@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createProtocolAdaptationTransform } from "./adaptation.js";
+import { adaptNonstreamResponse, createProtocolAdaptationTransform } from "./adaptation.js";
 import {
   ADAPTER_VERSION,
   type CanonicalEvent,
@@ -8,6 +8,7 @@ import {
   type ProtocolSurface,
 } from "./canonical.js";
 import { parseProtocolResponse } from "./nonstream.js";
+import { canonicalUsageFromCounts } from "./parse-utils.js";
 import { CanonicalStreamParser } from "./streams.js";
 
 const encode = (value: string) => new TextEncoder().encode(value);
@@ -51,6 +52,12 @@ const anthropicUsage = {
 
 /** Canonical input is every input token processed, whatever the source surface. */
 const canonicalUsage = { inputTokens: 104, outputTokens: 10 };
+/** The cached subset rides beside inclusive input; only Anthropic reports writes. */
+const canonicalUsageBySurface = {
+  "openai-chat": { ...canonicalUsage, cacheReadTokens: 80 },
+  "openai-responses": { ...canonicalUsage, cacheReadTokens: 80 },
+  "anthropic-messages": { ...canonicalUsage, cacheReadTokens: 80, cacheWriteTokens: 5 },
+} satisfies Record<ProtocolSurface, CanonicalUsage>;
 
 const usageBySurface = {
   "openai-chat": openAiChatUsage,
@@ -203,8 +210,8 @@ describe("shared stream and non-stream usage parser", () => {
     "accepts the real %s usage shape on both paths with the same counts",
     (surface) => {
       const usage = usageBySurface[surface];
-      expect(nonstreamUsage(surface, usage)).toEqual(canonicalUsage);
-      expect(streamUsage(surface, usage)).toEqual(canonicalUsage);
+      expect(nonstreamUsage(surface, usage)).toEqual(canonicalUsageBySurface[surface]);
+      expect(streamUsage(surface, usage)).toEqual(canonicalUsageBySurface[surface]);
     },
   );
 
@@ -221,8 +228,8 @@ describe("shared stream and non-stream usage parser", () => {
         vendor_usage: { anything: "goes" },
         [detailKey]: { ...(base[detailKey] as Record<string, unknown>), future_tokens: "n/a" },
       };
-      expect(nonstreamUsage(surface, usage)).toEqual(canonicalUsage);
-      expect(streamUsage(surface, usage)).toEqual(canonicalUsage);
+      expect(nonstreamUsage(surface, usage)).toEqual(canonicalUsageBySurface[surface]);
+      expect(streamUsage(surface, usage)).toEqual(canonicalUsageBySurface[surface]);
     },
   );
 
@@ -254,7 +261,7 @@ describe("shared stream and non-stream usage parser", () => {
         cache_creation_input_tokens: null,
         cache_read_input_tokens: 7,
       }),
-    ).toEqual({ inputTokens: 8, outputTokens: 2 });
+    ).toEqual({ inputTokens: 8, outputTokens: 2, cacheReadTokens: 7 });
   });
 
   it.each([
@@ -389,7 +396,7 @@ describe("Anthropic message_delta usage", () => {
         server_tool_use: { web_search_requests: 1 },
         service_tier: "standard",
       },
-      canonicalUsage,
+      canonicalUsageBySurface["anthropic-messages"],
     ],
     [
       "input with null cache counts",
@@ -400,12 +407,13 @@ describe("Anthropic message_delta usage", () => {
         output_tokens: 10,
         server_tool_use: null,
       },
-      canonicalUsage,
+      // Null cache counts keep the ones message_start reported.
+      canonicalUsageBySurface["anthropic-messages"],
     ],
     [
       "a later cache count with null input",
       { input_tokens: null, cache_read_input_tokens: 90, output_tokens: 10 },
-      { inputTokens: 114, outputTokens: 10 },
+      { inputTokens: 114, outputTokens: 10, cacheReadTokens: 90, cacheWriteTokens: 5 },
     ],
     ["output only", { output_tokens: 10 }, { outputTokens: 10 }],
   ] as const)("keeps canonical input inclusive for %s", (_name, deltaUsage, expected) => {
@@ -484,7 +492,7 @@ describe("Anthropic message_delta usage", () => {
       },
     });
     if (!parsed.ok) throw new Error("expected success");
-    expect(parsed.response.usage).toEqual(canonicalUsage);
+    expect(parsed.response.usage).toEqual(canonicalUsageBySurface["anthropic-messages"]);
   });
 });
 
@@ -498,8 +506,10 @@ describe("total_tokens is validated but not reconciled", () => {
   it.each(["openai-chat", "openai-responses"] as const)(
     "accepts a mismatched %s total on both paths",
     (surface) => {
-      expect(nonstreamUsage(surface, mismatched[surface])).toEqual(canonicalUsage);
-      expect(streamUsage(surface, mismatched[surface])).toEqual(canonicalUsage);
+      expect(nonstreamUsage(surface, mismatched[surface])).toEqual(
+        canonicalUsageBySurface[surface],
+      );
+      expect(streamUsage(surface, mismatched[surface])).toEqual(canonicalUsageBySurface[surface]);
     },
   );
 
@@ -530,8 +540,199 @@ describe("total_tokens is validated but not reconciled", () => {
       expect(output).toContain(
         target === "openai-responses"
           ? renderedUsage(target, 104, 10)
-          : '"usage":{"input_tokens":104,"output_tokens":10}',
+          : '"usage":{"input_tokens":24,"cache_read_input_tokens":80,"output_tokens":10}',
       );
     },
   );
+});
+
+describe("cache-read split for Anthropic clients", () => {
+  const chatBody = (usage: unknown) => ({
+    id: "c",
+    object: "chat.completion",
+    created: 0,
+    model: "gpt",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "ok" },
+        finish_reason: "stop",
+        logprobs: null,
+      },
+    ],
+    usage,
+  });
+  const responsesBody = (usage: unknown) => ({
+    id: "r",
+    object: "response",
+    status: "completed",
+    output: [
+      {
+        id: "i",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "ok", annotations: [] }],
+      },
+    ],
+    usage,
+  });
+  const splitUsage = { input_tokens: 24, cache_read_input_tokens: 80, output_tokens: 10 };
+
+  it.each([
+    ["openai-chat", chatBody(openAiChatUsage)],
+    ["openai-responses", responsesBody(openAiResponsesUsage)],
+  ] as const)("splits cached input out of a non-stream %s reply", (source, body) => {
+    const adapted = adaptNonstreamResponse({
+      source,
+      target: "anthropic-messages",
+      body,
+      status: 200,
+    });
+    if (!adapted.ok) throw new Error("expected success");
+    expect((adapted.body as { usage: unknown }).usage).toEqual(splitUsage);
+  });
+
+  it("renders input whole when the upstream reports no cache details", () => {
+    const adapted = adaptNonstreamResponse({
+      source: "openai-chat",
+      target: "anthropic-messages",
+      body: chatBody({ prompt_tokens: 104, completion_tokens: 10, total_tokens: 114 }),
+      status: 200,
+    });
+    if (!adapted.ok) throw new Error("expected success");
+    expect((adapted.body as { usage: unknown }).usage).toEqual({
+      input_tokens: 104,
+      output_tokens: 10,
+    });
+  });
+
+  it("drops an inconsistent cached count instead of rendering negative input", () => {
+    const adapted = adaptNonstreamResponse({
+      source: "openai-chat",
+      target: "anthropic-messages",
+      body: chatBody({
+        prompt_tokens: 10,
+        completion_tokens: 1,
+        total_tokens: 11,
+        prompt_tokens_details: { cached_tokens: 20 },
+      }),
+      status: 200,
+    });
+    if (!adapted.ok) throw new Error("expected success");
+    expect((adapted.body as { usage: unknown }).usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 1,
+    });
+  });
+
+  it("keeps Chat and Responses renderers on their native inclusive shapes", () => {
+    for (const target of ["openai-chat", "openai-responses"] as const) {
+      const adapted = adaptNonstreamResponse({
+        source: "anthropic-messages",
+        target,
+        body: {
+          id: "m",
+          type: "message",
+          role: "assistant",
+          model: "claude",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: anthropicUsage,
+        },
+        status: 200,
+      });
+      if (!adapted.ok) throw new Error("expected success");
+      expect(JSON.stringify(adapted.body)).toContain(renderedUsage(target, 104, 10));
+    }
+  });
+
+  const chatChunk = (value: Record<string, unknown>) =>
+    encode(
+      `data: ${JSON.stringify({
+        id: "c",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "gpt",
+        ...value,
+      })}\n\n`,
+    );
+
+  it("splits cached input in the final message_delta of an adapted Chat stream", async () => {
+    const { output, onProtocolError } = await adapt("openai-chat", "anthropic-messages", [
+      chatChunk({
+        choices: [{ index: 0, delta: { role: "assistant", content: "hi" }, finish_reason: null }],
+      }),
+      chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      chatChunk({ choices: [], usage: openAiChatUsage }),
+      encode("data: [DONE]\n\n"),
+    ]);
+    expect(onProtocolError).not.toHaveBeenCalled();
+    expect(output).toContain(
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":24,"cache_read_input_tokens":80,"output_tokens":10}',
+    );
+  });
+
+  it("splits cached input in the final message_delta of an adapted Responses stream", async () => {
+    const { output, onProtocolError } = await adapt("openai-responses", "anthropic-messages", [
+      named("response.created", {
+        sequence_number: 0,
+        response: responsesEnvelope("in_progress", null),
+      }),
+      named("response.completed", {
+        sequence_number: 1,
+        response: responsesEnvelope("completed", openAiResponsesUsage),
+      }),
+    ]);
+    expect(onProtocolError).not.toHaveBeenCalled();
+    expect(output).toContain(
+      '"usage":{"input_tokens":24,"cache_read_input_tokens":80,"output_tokens":10}',
+    );
+  });
+});
+
+describe("canonicalUsageFromCounts", () => {
+  it("rejects input that overflows a safe integer once parts are added", () => {
+    expect(
+      thrown(() =>
+        canonicalUsageFromCounts(
+          {
+            input: Number.MAX_SAFE_INTEGER,
+            inputParts: { cache_read_input_tokens: 1 },
+          },
+          "stream.usage",
+        ),
+      ),
+    ).toMatchObject({ code: "invalid_usage", parameter: "stream.usage" });
+  });
+
+  it("rejects input plus output that overflows a safe integer", () => {
+    expect(
+      thrown(() =>
+        canonicalUsageFromCounts(
+          { input: Number.MAX_SAFE_INTEGER - 1, output: 2, inputParts: {} },
+          "usage",
+        ),
+      ),
+    ).toMatchObject({ code: "invalid_usage", parameter: "usage" });
+    expect(
+      canonicalUsageFromCounts(
+        { input: Number.MAX_SAFE_INTEGER - 2, output: 2, inputParts: {} },
+        "usage",
+      ),
+    ).toEqual({ inputTokens: Number.MAX_SAFE_INTEGER - 2, outputTokens: 2 });
+  });
+
+  it("lets a later Anthropic input_tokens replace an earlier one", () => {
+    const events = anthropicStreamEvents([
+      anthropicStart({ input_tokens: 19, output_tokens: 1 }),
+      anthropicDelta({ input_tokens: 30, output_tokens: 10 }),
+      named("message_stop", {}),
+    ]);
+    expect(events.find((event) => event.type === "message_start")).toMatchObject({
+      usage: { inputTokens: 19, outputTokens: 1 },
+    });
+    expect(usageEvents(events)).toEqual([{ inputTokens: 30, outputTokens: 10 }]);
+  });
 });

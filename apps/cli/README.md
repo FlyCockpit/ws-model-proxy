@@ -48,7 +48,8 @@ wsmp config set-slug desk-01        # set this CLI connection's slug
 wsmp endpoints add local http://127.0.0.1:11434
 wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
 wsmp endpoints concurrency local 4          # register this limit for every model
-wsmp endpoints engine local llama.cpp       # advertise top_k (also: vllm, generic)
+wsmp endpoints engine local llama.cpp       # declare the engine; llama.cpp and vllm advertise top_k
+                                            # (also: auto, generic, sglang, ollama, lm-studio)
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
 wsmp daemon start --detach          # background relay (new session; owns a PID file)
@@ -71,7 +72,19 @@ Configuration is stored in a JSON file. `wsmp config path` prints the resolved p
 
 `wsmp config set-mcp-commands <off|supervised|unsupervised>` chooses what MCP agents may run on this machine (restart wsmp to apply; the dashboard grant for the device must allow it too). `unsupervised` allows headless commands (`sh -c`, no TTY, no stdin). `supervised` allows only supervised commands: the agent's request opens a terminal on the dashboard's Terminals page that shows who asked, the agent's reason, the working directory and the exact command, with every control or invisible character shown as `\u{..}`. The screen always fits the terminal: a request taller than it scrolls (arrow keys, PgUp/PgDn, Home/End) above a footer that stays next to the Enter prompt and says, when part is not shown, how many lines and bytes the command has. Read the command on this screen: it is drawn by wsmp inside the end-to-end encrypted terminal and is exactly what runs. The dashboard panel also shows the whole command, but that copy is relayed by the server, as a convenience. Below about 12 rows or 20 columns the status line may be cut, but the Enter prompt row is always kept; if the terminal size cannot be read, the screen is laid out for 40 columns by 16 rows, so it fits any terminal at least that big. Nothing runs until someone presses Enter on that screen; Ctrl-C, Ctrl-D or `q` declines, and keys typed before the screen was drawn are discarded. Enter hands the decision to the relay daemon, which starts the command only if the request is still waiting: when the server's 15-minute confirm deadline (or a Decline in the dashboard) reaches it first, the request is declined and the command never starts, and when the Enter came first the command runs to its end. A Decline never kills a command: if the Enter came first, the tab that declined says the command started, and only End session stops it. End session is an explicit kill at any point, including of a command that just started. The command then runs in that terminal (so `sudo` and other prompts work) and the terminal ends when it exits. `unsupervised` also allows supervised commands. Supervised commands need a Unix PTY but not `allowHumanTerminal`. Browser approval is optional, but recommended with `supervised`: without `wsmp config set-terminal-approval on`, this CLI admits any browser the WS Model Proxy server sends it, so "nothing runs without a person's keypress" and "the server never sees unreviewed output" hold only while the server is honest (a compromised server could attach its own viewer, press Enter, and read the output). With approval on, only browsers you approved on this machine can view or answer the request, and both guarantees hold even against a compromised server, provided the dashboard code your browser runs is genuine: that same server serves the code, and the approved browser key is used by it, so a compromised server that also serves you altered dashboard code could act as your approved browser. At most one request waits for confirmation and at most two supervised terminals run per CLI. When the agent asked to see the output, the terminal offers "Review output before sending": the output is then held on this machine and shown only to the reviewing browser, which decides what (if anything) the agent receives. A config written by an older wsmp with `allowMcpCommands: true` loads as `unsupervised`.
 
-This release speaks relay protocol 2.6 only. An older server rejects it and wsmp stops with a message to upgrade the server.
+This release speaks relay protocol 2.7 only. An older server rejects it and wsmp stops with a message to upgrade the server; a newer server refuses an older wsmp with a message to upgrade wsmp.
+
+### Engine facts and node telemetry (relay 2.7)
+
+An endpoint's `engine` defaults to `auto`: at probe time (connect, reconnect, `wsmp reload`) wsmp asks the engine's server root (the base URL without `/v1`) for `GET /props` (llama.cpp: `total_slots`, per-slot `n_ctx`), `GET /get_server_info` (SGLang: `max_running_requests`, `max_total_num_tokens`), `GET /metrics` (vLLM: `vllm:cache_config_info` blocks × block size; SGLang by its `sglang:` prefix), `GET /api/version` (Ollama) and `GET /api/v0/models` (LM Studio), each with a 3-second timeout and the endpoint's configured headers. `wsmp endpoints engine <slug> <engine>` declares the engine instead and probes only its own route; `generic` turns detection and load sampling off (use it for remote providers). The detected engine, slot count, KV capacity, context limits and the endpoint's `concurrencyLimit` (sent as `slots`; when set it wins over the engine's reported slots, which only fill an unset value) go to the server as engine facts, each marked `probe` or `config`. The server stores them on the model's inference capacity and, while that capacity's hard limit is still automatic, keeps the limit equal to the reported slots; a limit you set in the dashboard is never changed.
+
+After registration a sampling thread sends, never blocking the relay:
+
+- `node.info` once per connection: OS, kernel, architecture, CPU model and count, total RAM, GPUs from `nvidia-smi` (name, UUID, driver, VRAM), whether memory is unified (for example GB10), per-interface addresses, link speed and MTU, and how wsmp runs (foreground, systemd, launchd, container);
+- `node.metrics` every 20 seconds: CPU use and load averages, `MemAvailable` and swap from `/proc/meminfo`, free space on `/`, per-GPU VRAM, utilization, temperature, power and SM clock, and per-interface byte counters (lifetime totals since boot, reported at most as 9007199254740991, the largest integer JSON numbers carry without loss);
+- `endpoint.load` every 2 seconds when it changes (and every 5 seconds regardless) for llama.cpp (`/slots`, and `/metrics` when started with `--metrics`), vLLM and SGLang (`/metrics`): running and waiting requests, KV use and prefix-cache deltas.
+
+Each endpoint is scraped on its own schedule, 2 seconds after its previous scrape finished, with at most 16 scrapes in flight, so a slow endpoint never delays another endpoint's load or the node metrics. Linux reads `/proc` and `/sys`; other platforms send what they can. `nvidia-smi` runs with a 5-second timeout and its stderr is discarded, and any helper it leaves behind is killed with its process group; HTTP scrapes time out after 2 seconds, and a body over its size limit after decompression is refused. Every reading is held to the server's limits before it is sent (for example CPU use at most 100%, over-long GPU text cut); an out-of-range reading is left out rather than sent. From llama.cpp `/slots` wsmp keeps only each slot's id, `n_ctx` and `is_processing`: prompt text and generated text in that response are never kept or sent. Remotely defined metric sources (`metrics.sources.set`) are not supported yet; wsmp reports each as `unsupported` and runs nothing.
 
 ### Browser terminal viewers
 
@@ -189,6 +202,15 @@ surface when its native reasoning ladder and encoding are known. Omit it when
 they are unknown; `reasoning: true` remains the routing gate. Upgrade the WMP
 server before publishing this optional field, because older servers reject it
 as an unknown capability property.
+
+### Stream usage opt-out
+
+A version 3 or 4 `openaiChatCompletions` surface may declare `streamUsage: false`
+when the endpoint rejects `stream_options.include_usage`; adapted streaming
+requests then omit it, and settlement keeps the conservative liability because
+no stream usage is reported. Absent means `true`. The CLI rejects `streamUsage`
+on any other surface. Upgrade the WMP server first: older servers reject the
+field as an unknown capability property.
 
 Only URLs whose origin matches the connected WMP server (derived from
 `serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from

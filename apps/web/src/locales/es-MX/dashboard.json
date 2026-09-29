@@ -221,7 +221,11 @@
       "saved": "Se renombró el CLI",
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
-    }
+    },
+    "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
+    "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
+    "upgradeUnknownProtocol": "desconocido",
+    "upgradeUnknownVersion": "(versión desconocida)"
   },
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
@@ -425,7 +429,14 @@
         "affinityMaxRecords": "Máximo de registros por destino",
         "affinityPrefixWeight": "Peso por profundidad del prefijo de conversación",
         "affinityConversationWeight": "Peso de conversación",
-        "affinityLoadPenaltyWeight": "Penalización por carga activa"
+        "affinityLoadPenaltyWeight": "Penalización por carga activa",
+        "cacheHolderWaitMs": "Esperar al miembro con la caché"
+      },
+      "cacheHolderWait": {
+        "auto": "Automático (tiempo de reprocesamiento ahorrado, hasta 30 s)",
+        "fixed": "Fijo (milisegundos; 0 lo desactiva)",
+        "valueLabel": "Espera por el miembro con la caché en milisegundos",
+        "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
     },
     "capacity": {
@@ -491,6 +502,33 @@
         "template": "Usar un tokenizador y plantilla registrados coincidentes",
         "engineRequirement": "Requiere soporte para contar tokens en el destino seleccionado. WSMP usa una estimación conservadora cuando no está disponible.",
         "registeredRequirement": "Requiere un contador registrado que coincida con esta identidad de runtime. WSMP usa una estimación conservadora cuando no hay coincidencia."
+      },
+      "engineFacts": {
+        "engine": "Motor: {{engine}}",
+        "slots_one": "{{count}} ranura",
+        "slots_other": "{{count}} ranuras",
+        "kvBudget": "Presupuesto KV: {{value}} tokens",
+        "maxModelLen": "Contexto máximo: {{value}} tokens",
+        "preset": "Preajuste: {{preset}}",
+        "kinds": {
+          "GENERIC": "Genérico",
+          "LLAMA_CPP": "llama.cpp",
+          "VLLM": "vLLM",
+          "SGLANG": "SGLang",
+          "OLLAMA": "Ollama",
+          "LM_STUDIO": "LM Studio"
+        },
+        "presets": {
+          "llama.cpp": "llama.cpp (lleno al alcanzar sus ranuras)",
+          "vllm-sglang": "vLLM / SGLang (tu límite y luego la carga del motor)",
+          "ollama-lm-studio": "Ollama / LM Studio (tu ajuste de paralelismo)",
+          "generic": "Genérico (tu límite)"
+        },
+        "sources": {
+          "PROBE": "detectado por la CLI",
+          "CONFIG": "desde la configuración de la CLI",
+          "MIXED": "detectado y configurado"
+        }
       }
     },
     "noneAvailable": "Ninguna disponible",
@@ -530,7 +568,7 @@
       "enabled": "Permitir respaldo externo",
       "forGrantees": "También para usuarios con acceso compartido",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
-      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre (después de cualquier espera por el miembro con la caché). Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",
@@ -898,7 +936,7 @@
     "noAttempts": "No hay eventos de intentos en esta ventana.",
     "noAudit": "No hay eventos de auditoría para esta cuenta.",
     "noCapabilities": "No hay un inventario validado de capacidades nativas",
-    "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento y reasoningConfig opcional, límites de contexto, fuente y confianza.",
+    "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento y reasoningConfig opcional, límites de contexto, streamUsage de Chat (false cuando el endpoint rechaza stream_options.include_usage), fuente y confianza.",
     "visibilityDisclosure": "Los pools visibles permanecen locales de forma predeterminada. Las solicitudes externas necesitan <pool>:external, permiso del token y la configuración de respaldo del propietario, y solo consumen presupuestos de proveedores cuando los miembros locales no pueden atenderlas.",
     "fields": {
       "label": "Etiqueta de cuenta",
@@ -1087,6 +1125,7 @@
     "responseBytes": "Bytes de respuesta",
     "attempts": "Intentos",
     "affinity": "Afinidad / puntuación / profundidad",
+    "affinityWait": "esperó {{ms}} ms al miembro con la caché",
     "status": "Estado",
     "title": "Metadatos de relay",
     "tokenPrefix": "Prefijo del token",

@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { CLI_DEVICE_CODE_EXPIRES_IN } from "@ws-model-proxy/config/cli-device-login";
 import {
   FORWARDER_SLUG_MAX_LENGTH,
   slugifyForwarderSeed,
@@ -240,7 +241,8 @@ export const auth = betterAuth({
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
   },
-  // Only the device-flow session endpoint; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
+  // The device-flow paths this PR replaces with the atomic claim+approve
+  // procedure; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
   disabledPaths: [...DISABLED_DEVICE_AUTHORIZATION_PATHS],
   plugins: [
     admin({
@@ -296,7 +298,7 @@ export const auth = betterAuth({
     // `schema` field without `.optional()`, so we have to pass it explicitly
     // (even as `undefined`) or zod rejects the call at startup.
     deviceAuthorization({
-      expiresIn: "30m",
+      expiresIn: CLI_DEVICE_CODE_EXPIRES_IN,
       interval: "5s",
       // Every request names the CLI slug it is for (`cli-slug:<slug>`); the
       // approval page shows it and the exchange mints for that slug only.

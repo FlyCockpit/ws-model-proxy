@@ -38,9 +38,15 @@ import {
   resolveEffectiveCapabilityMetadata,
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  encodeReasoning,
+  type ReasoningLevel,
+  reasoningLevels,
+} from "@ws-model-proxy/api/lib/reasoning-contract";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import { withCapacityRequestScope } from "./capacity/request-scope.js";
 import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
@@ -53,20 +59,99 @@ import {
   modelApiConcurrencyLimiter,
 } from "./limits.js";
 import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
+import { reasoningControlForSurface } from "./protocols/request-controls.js";
 import { startRelayAttempt } from "./relay-executor.js";
 import { chatTestCompletionsHandler } from "./routes.js";
 
 const TEST_TIMEOUT_MS = 20_000;
 const EXPECTED_PROBE_WORD = /\bpong\b/i;
 
-export function isSuccessfulChatProbeReply(status: number, rawText: string): boolean {
-  if (status !== 200) return false;
+/** Visible-token budget for the member probe (room for a short reasoning preamble). */
+const PROBE_MAX_TOKENS = 64;
+
+export const REASONING_ONLY_PROBE_DETAIL =
+  "Member is reachable, but the model spent the probe's token budget on reasoning and returned no visible text.";
+
+export type ChatProbeReplyClass = "pong" | "reasoning-only" | "failed";
+
+function nonEmptyReasoning(message: Record<string, unknown>): boolean {
+  for (const key of ["reasoning_content", "reasoning"] as const) {
+    const value = message[key];
+    if (typeof value === "string" && value.trim() !== "") return true;
+  }
+  const details = message.reasoning_details;
+  if (!Array.isArray(details)) return false;
+  return details.some((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    return (["text", "summary"] as const).some((key) => {
+      const value = (entry as Record<string, unknown>)[key];
+      return typeof value === "string" && value.trim() !== "";
+    });
+  });
+}
+
+/**
+ * Classify a probe reply. `pong`: visible text contains the expected word.
+ * `reasoning-only`: a 200 that was cut off by the token limit after emitting
+ * only reasoning text (the member answered; the model just did not finish).
+ * Everything else, including non-JSON bodies and non-200 statuses, is `failed`.
+ */
+export function classifyChatProbeReply(status: number, rawText: string): ChatProbeReplyClass {
+  if (status !== 200) return "failed";
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(rawText);
-    const text = extractAssistantTextFromChatCompletion(parsed);
-    return Boolean(text && EXPECTED_PROBE_WORD.test(text));
+    parsed = JSON.parse(rawText);
   } catch {
-    return false;
+    return "failed";
+  }
+  if (typeof parsed !== "object" || parsed === null) return "failed";
+  const text = extractAssistantTextFromChatCompletion(parsed);
+  if (text) return EXPECTED_PROBE_WORD.test(text) ? "pong" : "failed";
+  const choice = (parsed as { choices?: unknown }).choices;
+  const first: unknown = Array.isArray(choice) ? choice[0] : undefined;
+  if (typeof first !== "object" || first === null) return "failed";
+  const { finish_reason: finishReason, message } = first as Record<string, unknown>;
+  if (
+    finishReason === "length" &&
+    typeof message === "object" &&
+    message !== null &&
+    nonEmptyReasoning(message as Record<string, unknown>)
+  ) {
+    return "reasoning-only";
+  }
+  return "failed";
+}
+
+/**
+ * The lowest reasoning level the member accepts: `none` unless its
+ * `supportedLevels` exclude it. Undefined when reasoning is not controllable.
+ */
+function probeReasoningLevel(supportedLevels: readonly ReasoningLevel[] | undefined) {
+  if (!supportedLevels) return "none" as const;
+  return reasoningLevels.find((level) => supportedLevels.includes(level));
+}
+
+/**
+ * Reasoning control fields for the probe, built from the member's own
+ * capability inventory so each encoding (effort field, reasoning object,
+ * output_config, ...) is honoured. Empty when the member does not advertise
+ * reasoning, or advertises an encoding the chat surface cannot carry.
+ */
+export function probeReasoningFields(
+  capabilities: ReturnType<typeof resolveEffectiveCapabilityMetadata>,
+): Record<string, unknown> {
+  const control = reasoningControlForSurface(capabilities, "openai-chat");
+  if (!control.supported) return {};
+  const selection = probeReasoningLevel(control.config?.supportedLevels);
+  if (!selection) return {};
+  try {
+    return encodeReasoning({
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      selection,
+      ...(control.config ? { config: control.config } : {}),
+    });
+  } catch {
+    return {};
   }
 }
 
@@ -115,7 +200,7 @@ export async function closeDiagnosticsCapacityRuntime(): Promise<void> {
 
 /** Typed outcomes of a pool member test probe (mapped, never a raw error). */
 export type PoolMemberTestResult =
-  | { outcome: "ok"; status: number; latencyMs: number }
+  | { outcome: "ok"; status: number; latencyMs: number; detail?: string }
   | { outcome: "not-found" }
   | { outcome: "not-relay-capable" }
   | { outcome: "unpublished" }
@@ -205,12 +290,13 @@ export async function runPoolMemberTest({
   if (!model.published || !model.Endpoint.published) {
     return { outcome: "unpublished" };
   }
+  const effectiveCapabilities = resolveEffectiveCapabilityMetadata({
+    capabilityOverrideMode: model.capabilityOverrideMode,
+    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+  });
   const supportsChat = supportsChatCompletions({
-    capabilities: resolveEffectiveCapabilityMetadata({
-      capabilityOverrideMode: model.capabilityOverrideMode,
-      capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-      endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-    }),
+    capabilities: effectiveCapabilities,
     coarse:
       model.capabilityOverrideMode === "OVERRIDE"
         ? model.capabilityOverrides
@@ -245,7 +331,8 @@ export async function runPoolMemberTest({
     JSON.stringify({
       model: model.upstreamModelId,
       stream: false,
-      max_tokens: 8,
+      max_tokens: PROBE_MAX_TOKENS,
+      ...probeReasoningFields(effectiveCapabilities),
       messages: [{ role: "user", content: "Reply with the single word pong." }],
     }),
   );
@@ -267,7 +354,8 @@ export async function runPoolMemberTest({
     const rawText = await readResponseUtf8(started.body);
     const terminal = await attempt.terminal;
     const latencyMs = Date.now() - startedAt;
-    if (!terminal.ok || !isSuccessfulChatProbeReply(started.status, rawText)) {
+    const replyClass = classifyChatProbeReply(started.status, rawText);
+    if (!terminal.ok || replyClass === "failed") {
       return {
         outcome: "probe-failed",
         status: started.status,
@@ -278,7 +366,12 @@ export async function runPoolMemberTest({
       };
     }
     await markPoolMemberRelaySuccess(member.id);
-    return { outcome: "ok", status: started.status, latencyMs };
+    return {
+      outcome: "ok",
+      status: started.status,
+      latencyMs,
+      ...(replyClass === "reasoning-only" ? { detail: REASONING_ONLY_PROBE_DETAIL } : {}),
+    };
   } catch (error) {
     // G2 (stable outcomes only): the caught error can be ANY failure — a
     // Prisma error from health marking (SQL/credential material in the
@@ -347,7 +440,15 @@ interface ChatCompletionDiagnosticInput {
  * function. Upstream failures surface as the provider's OpenAI error
  * `type`/status (stable enums), never the provider's message text.
  */
-export async function runChatCompletionDiagnostic({
+export function runChatCompletionDiagnostic(
+  input: Parameters<typeof chatCompletionDiagnostic>[0],
+): Promise<ChatCompletionDiagnosticResult> {
+  // F2-CAP-6: the diagnostic reads (or cancels) the whole response before it
+  // returns, so any capacity lease owner still alive at return was leaked.
+  return withCapacityRequestScope(() => chatCompletionDiagnostic(input));
+}
+
+async function chatCompletionDiagnostic({
   userId,
   body,
   signal,

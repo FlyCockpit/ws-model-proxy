@@ -4,9 +4,9 @@ import { Client } from "pg";
 export const POSTGRES_NOTIFICATION_LISTENER_CLOSE_TIMEOUT_MS = 2_000;
 
 function destroyPgClientSocket(client: Client): void {
-  const stream = (client as unknown as { connection?: { stream?: { destroy?: () => void } } })
-    .connection?.stream;
-  stream?.destroy?.();
+  // `@types/pg` declares `connection.stream`; a client that never connected
+  // may not have created its socket yet, so stay defensive at runtime.
+  client.connection?.stream?.destroy();
 }
 
 export class PostgresNotificationListener {
@@ -64,6 +64,5 @@ export class PostgresNotificationListener {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
-    void endSettled;
   }
 }

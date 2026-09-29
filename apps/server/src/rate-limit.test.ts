@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,7 +53,14 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
   };
 });
 
-const { createRateLimiterMiddleware } = await import("./rate-limit.js");
+const {
+  consumeDeviceCodeExchange,
+  createRateLimiterMiddleware,
+  DEVICE_CODE_EXCHANGE_CODE_POINTS,
+  DEVICE_CODE_EXCHANGE_IP_POINTS,
+  deviceCodeExchangeCodeLimiter,
+  deviceCodeExchangeIpLimiter,
+} = await import("./rate-limit.js");
 
 // ---------------------------------------------------------------------------
 // Test: rate limiter middleware returns 429 with correct headers
@@ -256,3 +264,84 @@ describe("createRateLimiterMiddleware resolveKey option", () => {
     expect((await app.request("/ping")).status).toBe(429);
   });
 });
+
+describe("consumeDeviceCodeExchange (cliCredentials.exchangeDeviceCode, CI-2)", () => {
+  function limiters(ipPoints: number, codePoints: number) {
+    return {
+      ip: new RateLimiterMemory({
+        keyPrefix: `t-ip-${Math.random()}`,
+        points: ipPoints,
+        duration: 60,
+      }),
+      code: new RateLimiterMemory({
+        keyPrefix: `t-code-${Math.random()}`,
+        points: codePoints,
+        duration: 60,
+      }),
+    };
+  }
+
+  it("limits one device code whatever address polls it", async () => {
+    const buckets = limiters(100, 2);
+    await expect(consumeDeviceCodeExchange("203.0.113.1", "code-a", buckets)).resolves.toEqual({
+      allowed: true,
+    });
+    await expect(consumeDeviceCodeExchange("203.0.113.2", "code-a", buckets)).resolves.toEqual({
+      allowed: true,
+    });
+    const refused = await consumeDeviceCodeExchange("203.0.113.3", "code-a", buckets);
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) expect(refused.retryAfterMs).toBeGreaterThan(0);
+    // Another code keeps its own budget.
+    await expect(consumeDeviceCodeExchange("203.0.113.3", "code-b", buckets)).resolves.toEqual({
+      allowed: true,
+    });
+  });
+
+  it("limits one address across made-up codes, before charging any code bucket", async () => {
+    const buckets = limiters(2, 100);
+    await consumeDeviceCodeExchange("198.51.100.7", "guess-1", buckets);
+    await consumeDeviceCodeExchange("198.51.100.7", "guess-2", buckets);
+    const refused = await consumeDeviceCodeExchange("198.51.100.7", "guess-3", buckets);
+    expect(refused.allowed).toBe(false);
+    // The refused call never reached the code bucket.
+    expect((await buckets.code.get(createHashKey("guess-3")))?.consumedPoints ?? 0).toBe(0);
+    // Another address still exchanges.
+    await expect(consumeDeviceCodeExchange("198.51.100.8", "guess-3", buckets)).resolves.toEqual({
+      allowed: true,
+    });
+  });
+
+  it("keys the code bucket by a digest, never the raw code", async () => {
+    const buckets = limiters(10, 10);
+    await consumeDeviceCodeExchange("192.0.2.1", "secret-device-code", buckets);
+    expect(await buckets.code.get("secret-device-code")).toBeNull();
+    expect((await buckets.code.get(createHashKey("secret-device-code")))?.consumedPoints).toBe(1);
+  });
+
+  it("fails open on an unexpected limiter error", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const broken = {
+      ip: { points: 1, consume: vi.fn(async () => Promise.reject(new TypeError("boom"))) },
+      code: limiters(1, 1).code,
+    };
+    await expect(consumeDeviceCodeExchange("192.0.2.1", "code", broken)).resolves.toEqual({
+      allowed: true,
+    });
+    errors.mockRestore();
+  });
+
+  it("allows an honest 5 s poller a full minute on the default limiters", async () => {
+    expect(DEVICE_CODE_EXCHANGE_CODE_POINTS).toBeGreaterThanOrEqual(12);
+    expect(DEVICE_CODE_EXCHANGE_IP_POINTS).toBeGreaterThanOrEqual(DEVICE_CODE_EXCHANGE_CODE_POINTS);
+    const defaults = { ip: deviceCodeExchangeIpLimiter, code: deviceCodeExchangeCodeLimiter };
+    for (let poll = 0; poll < 12; poll += 1)
+      await expect(
+        consumeDeviceCodeExchange("192.0.2.50", "honest-code", defaults),
+      ).resolves.toEqual({ allowed: true });
+  });
+});
+
+function createHashKey(deviceCode: string): string {
+  return createHash("sha256").update(deviceCode).digest("base64url");
+}

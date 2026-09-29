@@ -35,6 +35,7 @@ fails the suite when a leaf is unclassified.
 | `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
+| `cliCredentials.approveDeviceLogin` | — (excluded) | — | — | — | — | — | Human-only browser approval of a `wsmp login`: an agent must never grant a CLI credential. |
 | `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
 | `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
@@ -56,6 +57,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
 | `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |

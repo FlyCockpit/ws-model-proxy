@@ -243,11 +243,30 @@ enum CapacityLimitMode {
 
 /// Who last authored an inference capacity's hard concurrency limit. AUTO rows
 /// (created by discovery, the CLI report, or the startup backfill) may have a
-/// null limit filled in. USER rows were saved through a user-facing path; a null
-/// USER limit means explicitly unlimited and is never overwritten automatically.
+/// null limit filled in, and engine-reported slots refresh it. USER rows were
+/// saved through a user-facing path; a null USER limit means explicitly
+/// unlimited and is never overwritten automatically.
 enum CapacityLimitSource {
   AUTO
   USER
+}
+
+/// Inference engine a CLI detected or was told (relay 2.7 engine facts).
+enum EngineKind {
+  GENERIC
+  LLAMA_CPP
+  VLLM
+  SGLANG
+  OLLAMA
+  LM_STUDIO
+}
+
+/// Where a capacity's stored engine facts came from: the CLI's probe, its
+/// local config, or both.
+enum EngineFactsSource {
+  PROBE
+  CONFIG
+  MIXED
 }
 
 enum AdmissionSourceKind {
@@ -279,48 +298,60 @@ enum CapacityLeaseState {
 }
 
 model CliDevice {
-  id                        String                @id @default(cuid(2))
-  createdAt                 DateTime              @default(now())
-  updatedAt                 DateTime              @default(now()) @updatedAt
-  userId                    String
+  id                           String                @id @default(cuid(2))
+  createdAt                    DateTime              @default(now())
+  updatedAt                    DateTime              @default(now()) @updatedAt
+  userId                       String
   /// Chosen at `wsmp login`; used in model ids and signed by the terminal
   /// identity statement.
-  slug                      String
+  slug                         String
   /// Set by the user in the dashboard; null until they name the device.
   /// Hello must not overwrite it. Display name: name ?? reportedHostname ?? slug.
-  name                      String?
-  status                    CliConnectionStatus   @default(DISCONNECTED)
-  lastConnectedAt           DateTime?
-  lastDisconnectedAt        DateTime?
-  lastHeartbeatAt           DateTime?
-  connectionCount           Int                   @default(0)
-  inventorySeq              Int                   @default(0)
-  inventoryDigest           String?
-  inventoryAcknowledgedAt   DateTime?
+  name                         String?
+  status                       CliConnectionStatus   @default(DISCONNECTED)
+  lastConnectedAt              DateTime?
+  lastDisconnectedAt           DateTime?
+  lastHeartbeatAt              DateTime?
+  connectionCount              Int                   @default(0)
+  inventorySeq                 Int                   @default(0)
+  inventoryDigest              String?
+  inventoryAcknowledgedAt      DateTime?
   /// True only for a relay that negotiated complete-snapshot acknowledgements
   /// and endpoint targeting. Legacy 2.0 registration is visible but never
   /// represented as a confirmed published inventory.
-  inventoryConfirmed        Boolean               @default(false)
+  inventoryConfirmed           Boolean               @default(false)
   /// Whether this relay negotiated endpoint-targeted request frames. Legacy
   /// relays must never be allowed to replace their inventory with >1 endpoint.
-  endpointTargeting         Boolean               @default(false)
+  endpointTargeting            Boolean               @default(false)
   /// Server grants. Hello must not overwrite these; the dashboard does.
-  allowHumanTerminal        Boolean               @default(false)
-  mcpCommandMode            McpCommandMode        @default(OFF)
-  cliVersion                String?
-  relayProtocolVersion      String?
+  allowHumanTerminal           Boolean               @default(false)
+  mcpCommandMode               McpCommandMode        @default(OFF)
+  cliVersion                   String?
+  relayProtocolVersion         String?
   /// Null until a 2.4 hello reports the CLI's own config. False is a report.
-  reportedHumanTerminal     Boolean?
-  reportedMcpCommandMode    McpCommandMode?
-  reportedTerminalApproval  Boolean?
-  reportedTerminalSupported Boolean?
+  reportedHumanTerminal        Boolean?
+  reportedMcpCommandMode       McpCommandMode?
+  reportedTerminalApproval     Boolean?
+  reportedTerminalSupported    Boolean?
   /// The machine's hostname from the latest hello. Null when not reported.
-  reportedHostname          String?
-  featuresReportedAt        DateTime?
-  User                      User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliTokens                 CliToken[]
-  CliDeviceCredentials      CliDeviceCredential[]
-  Endpoints                 Endpoint[]
+  reportedHostname             String?
+  featuresReportedAt           DateTime?
+  /// Relay 2.7 `node.info` from the latest connection (static machine facts).
+  nodeInfo                     Json?
+  nodeInfoAt                   DateTime?
+  /// Latest relay 2.7 `node.metrics`, written at most once a minute. The live
+  /// relay session holds the freshest sample.
+  nodeMetrics                  Json?
+  nodeMetricsAt                DateTime?
+  /// A hello refused for an old relay protocol ("CLI upgrade required").
+  /// Cleared by the next accepted hello.
+  rejectedRelayProtocolVersion String?
+  rejectedCliVersion           String?
+  relayRejectedAt              DateTime?
+  User                         User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliTokens                    CliToken[]
+  CliDeviceCredentials         CliDeviceCredential[]
+  Endpoints                    Endpoint[]
 
   @@unique([userId, slug])
   @@index([userId, status])
@@ -1010,6 +1041,12 @@ model ModelPool {
   affinityConversationWeight      Int                           @default(150)
   affinityConfirmedCacheWeight    Int                           @default(250)
   affinityLoadPenaltyWeight       Int                           @default(100)
+  /// How long a request whose prefix is warm on one member waits for that
+  /// member before spilling to a cold one (saturation S-A). Null = automatic
+  /// (expected re-prefill time of the matched prefix, 2 s when the member's
+  /// prefill speed is not measured yet, capped at 30 s); 0 = off (no
+  /// spill-over delay); 1..30000 = fixed milliseconds.
+  cacheHolderWaitMs               Int?
   /// Owner-declared external equivalent: a verbatim OpenRouter catalog id
   /// (for example "qwen/qwen3-coder" or the floating alias "~vendor/x-latest"),
   /// picked from the public catalog. Declaring it is the owner's consent that
@@ -1148,6 +1185,16 @@ model InferenceCapacity {
   templateVersion            String?
   engine                     String?
   cacheNamespace             String?
+  /// Relay 2.7 engine facts from the CLI (the free-text `engine` stays for display).
+  engineKind                 EngineKind?
+  /// Concurrent sequences the engine reported (llama.cpp slots, SGLang max
+  /// running requests) or the CLI's configured concurrency.
+  engineSlots                Int?
+  /// Total KV capacity in tokens (vLLM, SGLang).
+  kvBudgetTokens             Int?
+  maxModelLen                Int?
+  engineFactsSource          EngineFactsSource?
+  engineFactsAt              DateTime?
   schedulerCursor            Int                   @default(31)
   schedulerDeficits          Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
   schedulerVersion           Int                   @default(1)
@@ -1218,6 +1265,10 @@ model CapacityWaiter {
   poolMemberId                String?
   candidateOrder              Int
   deadlineAt                  DateTime?
+  /// Spill-over delay (saturation S-A): the waiter is ineligible for grant
+  /// and for reservation-borrowing arbitration until the database clock
+  /// reaches this instant. Null (and the cache holder's own waiter) = now.
+  notBefore                   DateTime?
   effectivePriority           Int                  @default(16)
   effectiveConcurrencyLimit   Int?
   effectiveConcurrencyScope   String               @default("")
@@ -1517,6 +1568,9 @@ model RelayRequest {
   affinityScore              Int?
   affinityPrefixDepth        Int?
   affinityReason             String?
+  /// Milliseconds the local admission held the request for the cache-holder
+  /// member (spill-over window applied); null when no window applied.
+  affinityWaitMs             Int?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.
@@ -1530,6 +1584,12 @@ model RelayRequest {
   auxiliaryAttemptCount      Int                     @default(0)
   auxiliaryRequestBytes      BigInt                  @default(0)
   auxiliaryResponseBytes     BigInt                  @default(0)
+  /// Durable owner of the requested resource, for usage attribution: the
+  /// requested pool's owner, else the requester. Derived by the database at
+  /// insert (schema-hardening.sql, derive_relay_request_resource_owner) and
+  /// immutable afterwards, so it survives the pool's deletion. Deliberately a
+  /// plain id, not a foreign key: readers tolerate a deleted owner.
+  resourceOwnerUserId        String?
   User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -1549,7 +1609,8 @@ model RelayRequest {
   @@index([selectedDiscoveredModelId])
   @@index([selectedPoolMemberId])
   @@index([requestedExecutionTargetId, createdAt])
-  @@index([selectedExecutionTargetId])
+  // Prefill-speed estimator: the latest rows served by one execution target.
+  @@index([selectedExecutionTargetId, createdAt])
   @@index([status, createdAt])
   @@index([createdAt])
   @@map("relay_request")

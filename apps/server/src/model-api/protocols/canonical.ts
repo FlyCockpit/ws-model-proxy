@@ -102,7 +102,17 @@ export type ParsedProtocolResponse =
   | { ok: true; metadata: ProtocolResponseMetadata; response: CanonicalResponse }
   | { ok: false; metadata: ProtocolResponseMetadata; error: CanonicalProtocolError };
 
-export type CanonicalUsage = { inputTokens?: number; outputTokens?: number };
+/**
+ * `inputTokens` is every input token processed. `cacheReadTokens` and
+ * `cacheWriteTokens` are the cached subset of it, present only alongside
+ * `inputTokens` when the source surface reports them.
+ */
+export type CanonicalUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+};
 export type CanonicalEvent =
   | { type: "message_start"; id: string; model?: string; usage?: CanonicalUsage }
   | {

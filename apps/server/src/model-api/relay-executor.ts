@@ -4,6 +4,8 @@ import {
   type RelayServerControlMessage,
 } from "../relay/protocol.js";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { isCapacityLeaseLost } from "./capacity/lease-loss.js";
+import type { ModelApiFailure } from "./openai-errors.js";
 import type { RelayBodySource } from "./request-body-source.js";
 import { ResponseUsageRecorder, type ResponseUsageSample } from "./response-usage-sample.js";
 
@@ -26,7 +28,11 @@ export const RELAY_RESPONSE_QUEUE_MAX_BYTES = 8 * 1024 * 1024;
 
 export type RelayAttemptTerminal = {
   ok: boolean;
-  failure: RelayFailure | null;
+  /**
+   * Wire failures plus the server-only `capacity_lease_lost`: the dispatch
+   * was aborted because its capacity lease was lost (never a client cancel).
+   */
+  failure: ModelApiFailure | null;
   httpStatusCode: number | null;
   upstreamStatusCode: number | null;
   usage: RelayUsage | null;
@@ -130,6 +136,21 @@ export function sanitizeNativeResponseHeaders(
   return output;
 }
 
+/**
+ * Terminal facts for a dispatch aborted by `signal`. A lost capacity lease is a
+ * server-side failure (503, failover-eligible before commit); anything else is
+ * a client cancellation (499). Classified on `signal.reason`, never on
+ * `signal.aborted` alone.
+ */
+export function abortedRelayFailure(signal: AbortSignal | undefined): {
+  failure: Extract<ModelApiFailure, "cancelled" | "capacity_lease_lost">;
+  httpStatusCode: number;
+} {
+  return isCapacityLeaseLost(signal?.reason)
+    ? { failure: "capacity_lease_lost", httpStatusCode: 503 }
+    : { failure: "cancelled", httpStatusCode: 499 };
+}
+
 function failureForHttpStatus(status: number): RelayFailure | null {
   if (status >= 500) return "upstream_5xx";
   if (status >= 400) return "upstream_4xx";
@@ -175,11 +196,11 @@ export function startRelayAttempt({
   // timeout. The attempt settles immediately as cancelled; callers that
   // await `started` observe the rejection through their own catch paths.
   if (abortSignal?.aborted) {
-    started.reject(new Error("cancelled"));
+    const aborted = abortedRelayFailure(abortSignal);
+    started.reject(new Error(aborted.failure));
     terminal.resolve({
       ok: false,
-      failure: "cancelled",
-      httpStatusCode: 499,
+      ...aborted,
       upstreamStatusCode: null,
       usage: null,
       metrics: null,
@@ -242,11 +263,11 @@ export function startRelayAttempt({
   }, timeoutMs);
 
   const abort = () => {
+    // The wire protocol has no lease-loss reason: the CLI only needs to stop.
     manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
     finish({
       ok: false,
-      failure: "cancelled",
-      httpStatusCode: 499,
+      ...abortedRelayFailure(abortSignal),
       upstreamStatusCode,
       usage: null,
       metrics: null,
@@ -260,7 +281,13 @@ export function startRelayAttempt({
     clearTimeout(timeout);
     abortSignal?.removeEventListener("abort", abort);
     manager.completeRelayRequest(requestId);
-    if ((result.ok || headersResolved) && !responseStreamCancelled) {
+    // A lost lease after headers is a server error: the body must end in an
+    // error, never a clean (truncated) EOF.
+    if (
+      (result.ok || headersResolved) &&
+      !responseStreamCancelled &&
+      result.failure !== "capacity_lease_lost"
+    ) {
       responseController?.close();
     } else {
       started.reject(new Error(result.failure ?? "unknown"));

@@ -181,6 +181,8 @@ describe("providerCatalog.search", () => {
 
   it("computes verdicts against a pool the caller can see (owner or grantee)", async () => {
     db.modelPool.findFirst.mockResolvedValue({
+      userId: "pool-owner",
+      User: { banned: null, banExpires: null, deletionRequestedAt: null },
       capacityContextCeiling: null,
       PoolMembers: [
         {
@@ -779,9 +781,12 @@ describe("providerCatalog pool external equivalent", () => {
   });
 
   it("sets a catalog model with pool verdicts", async () => {
-    db.modelPool.findFirst
-      .mockResolvedValueOnce({ id: "p" })
-      .mockResolvedValueOnce({ capacityContextCeiling: 100_000, PoolMembers: [] });
+    db.modelPool.findFirst.mockResolvedValueOnce({ id: "p" }).mockResolvedValueOnce({
+      userId: "owner",
+      User: { banned: null, banExpires: null, deletionRequestedAt: null },
+      capacityContextCeiling: 100_000,
+      PoolMembers: [],
+    });
     db.modelPool.updateMany.mockResolvedValue({ count: 1 });
     await expect(
       client().setPoolExternalEquivalent({ poolId: "p", modelId: "vendor/no-tools" }),
@@ -802,9 +807,12 @@ describe("providerCatalog pool external equivalent", () => {
       fetchedAt,
       stale: false,
     };
-    db.modelPool.findFirst
-      .mockResolvedValueOnce({ id: "p" })
-      .mockResolvedValueOnce({ capacityContextCeiling: null, PoolMembers: [] });
+    db.modelPool.findFirst.mockResolvedValueOnce({ id: "p" }).mockResolvedValueOnce({
+      userId: "owner",
+      User: { banned: null, banExpires: null, deletionRequestedAt: null },
+      capacityContextCeiling: null,
+      PoolMembers: [],
+    });
     db.modelPool.updateMany.mockResolvedValue({ count: 1 });
     await expect(
       client().setPoolExternalEquivalent({ poolId: "p", modelId: "~openai/gpt-luna-latest" }),

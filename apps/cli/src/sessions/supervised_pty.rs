@@ -175,13 +175,13 @@ impl Capture {
         let room = terminal_crypto::CAPTURE_HEAD_MAX.saturating_sub(self.head.len());
         self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
         self.tail.extend(bytes);
-        let overflow = self
-            .tail
-            .len()
-            .saturating_sub(terminal_crypto::CAPTURE_TAIL_MAX);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
-        }
+        // Never start the tail inside an escape sequence or control string:
+        // the reviewer and the model would see its hidden body as text.
+        crate::terminal_parse::trim_rolling_tail(
+            &mut self.tail,
+            terminal_crypto::CAPTURE_TAIL_MAX,
+            &mut self.tail_state,
+        );
         self.total = self.total.saturating_add(bytes.len() as u64);
     }
 }
@@ -232,12 +232,36 @@ mod tests {
     }
 
     #[test]
+    fn capture_tail_starts_after_a_control_string_the_gap_cuts_into() {
+        let mut stream = b"VISIBLE\n\x1bPq".to_vec();
+        stream.extend(vec![b'x'; 60_000]);
+        stream.extend(b"\nHIDDEN PAYLOAD\n\x1b\\ AFTER\n");
+        let mut capture = Capture::default();
+        for chunk in stream.chunks(4096) {
+            capture.push(chunk);
+        }
+        let (head, tail) = capture.parts();
+        assert_eq!(head, stream[..terminal_crypto::CAPTURE_HEAD_MAX]);
+        assert_eq!(tail, b" AFTER\n");
+        assert_eq!(capture.total, stream.len() as u64);
+    }
+
+    #[test]
     fn capture_keeps_the_head_and_a_rolling_tail_like_the_server() {
         let mut capture = Capture::default();
         capture.push(b"abc");
         assert_eq!(capture.parts(), (b"abc".to_vec(), Vec::new()));
         let mut capture = Capture::default();
-        let stream = (0..60_000_u32).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        // Plain text: the tail starts exactly CAPTURE_TAIL_MAX bytes from the end.
+        let stream = (0..60_000_u32)
+            .map(|n| {
+                if n % 80 == 79 {
+                    b'\n'
+                } else {
+                    b'a' + (n % 26) as u8
+                }
+            })
+            .collect::<Vec<_>>();
         for chunk in stream.chunks(1000) {
             capture.push(chunk);
         }

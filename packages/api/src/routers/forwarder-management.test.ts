@@ -226,6 +226,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     protocolAdaptationEnabled: false,
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
+    cacheHolderWaitMs: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -2156,6 +2157,28 @@ describe("forwarderManagementRouter", () => {
     // Disabling never inspects or removes the external members.
     expect(db.poolMember.findMany).not.toHaveBeenCalled();
     expect(db.poolMember.delete).not.toHaveBeenCalled();
+  });
+
+  it("stores the cache-holder wait override (auto, off, fixed) and caps it at 30 s", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    for (const value of [750, 0, null]) {
+      db.modelPool.update.mockResolvedValueOnce(poolRow({ cacheHolderWaitMs: value }));
+      await expect(
+        client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: value }),
+      ).resolves.toMatchObject({ cacheHolderWaitMs: value });
+      const update = db.modelPool.update.mock.calls.at(-1)?.[0] as {
+        data: Record<string, unknown>;
+      };
+      expect(update.data).toMatchObject({ cacheHolderWaitMs: value });
+    }
+    await expect(
+      client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: 30_001 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // Unrelated saves leave the stored override untouched.
+    db.modelPool.update.mockResolvedValueOnce(poolRow({ name: "Renamed" }));
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {
@@ -5113,7 +5136,7 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: true,
         mcpCommandMode: "UNSUPERVISED",
         cliVersion: "0.4.0",
-        relayProtocolVersion: "2.6",
+        relayProtocolVersion: "2.7",
         reportedHumanTerminal: true,
         reportedMcpCommandMode: "SUPERVISED",
         reportedTerminalApproval: false,
@@ -5156,7 +5179,7 @@ describe("setCliDeviceFeatureGrants", () => {
                 [
                   "cli-id",
                   {
-                    protocolVersion: "2.6",
+                    protocolVersion: "2.7",
                     cliVersion: "0.4.0",
                     humanTerminal: true,
                     mcpCommandMode,
@@ -5184,6 +5207,124 @@ describe("setCliDeviceFeatureGrants", () => {
       effectiveMode: "off",
       available: false,
     });
+  });
+
+  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+    const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
+    const row = {
+      id: "cli-id",
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: "desk",
+      name: null,
+      reportedHostname: null,
+      status: "DISCONNECTED",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      cliVersion: "0.4.0",
+      relayProtocolVersion: "2.6",
+      reportedHumanTerminal: null,
+      reportedMcpCommandMode: null,
+      reportedTerminalApproval: null,
+      reportedTerminalSupported: null,
+      User: { slug: "owner" },
+      Endpoints: [],
+    };
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        ...row,
+        rejectedRelayProtocolVersion: "2.6",
+        rejectedCliVersion: "0.4.0",
+        relayRejectedAt: rejectedAt,
+      },
+      { ...row, id: "cli-ok", relayRejectedAt: null },
+    ]);
+    const devices = await createRouterClient(forwarderManagementRouter, {
+      context: buildContext(),
+    }).listCliDevices();
+    expect(devices[0]?.upgradeRequired).toEqual({
+      protocolVersion: "2.6",
+      cliVersion: "0.4.0",
+      rejectedAt,
+    });
+    expect(devices[1]?.upgradeRequired).toBeNull();
+  });
+});
+
+describe("getCliDeviceMetrics", () => {
+  const storedMetrics = { ts: "2026-09-28T11:00:00.000Z", cpu: { usagePercent: 5 } };
+  const deviceMetricsRow = {
+    id: "cli-id",
+    userId: "user-id",
+    slug: "desk",
+    status: "CONNECTED",
+    nodeInfo: { nodeKind: "unified" },
+    nodeInfoAt: new Date("2026-09-28T10:00:00.000Z"),
+    nodeMetrics: storedMetrics,
+    nodeMetricsAt: new Date("2026-09-28T11:00:00.000Z"),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function metricsClient(services?: Record<string, unknown>) {
+    return createRouterClient(forwarderManagementRouter, {
+      context: { ...buildContext(), ...(services ? { services } : {}) },
+    });
+  }
+
+  it("prefers the live relay sample and lists live endpoint load", async () => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceMetricsRow);
+    const receivedAt = new Date("2026-09-28T11:00:30.000Z");
+    const load = {
+      endpointSlug: "vllm",
+      modelSlug: null,
+      running: 3,
+      waiting: 1,
+      source: "vllm-metrics" as const,
+      ts: "2026-09-28T11:00:29.000Z",
+      receivedAt,
+    };
+    const result = await metricsClient({
+      getLiveNodeTelemetry: (ids: readonly string[]) =>
+        new Map(
+          ids.map((id) => [
+            id,
+            {
+              nodeMetrics: { ts: "2026-09-28T11:00:30.000Z" },
+              nodeMetricsReceivedAt: receivedAt,
+              endpointLoad: [load],
+            },
+          ]),
+        ),
+    }).getCliDeviceMetrics({ cliDeviceId: "cli-id" });
+    expect(result).toMatchObject({
+      live: true,
+      nodeInfo: { nodeKind: "unified" },
+      nodeMetrics: { ts: "2026-09-28T11:00:30.000Z" },
+      nodeMetricsAt: receivedAt,
+      nodeMetricsSource: "live",
+      endpointLoad: [load],
+    });
+  });
+
+  it("falls back to the stored snapshot while the CLI is offline", async () => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceMetricsRow);
+    const result = await metricsClient().getCliDeviceMetrics({ cliDeviceId: "cli-id" });
+    expect(result).toMatchObject({
+      live: false,
+      nodeMetrics: storedMetrics,
+      nodeMetricsSource: "stored",
+      endpointLoad: [],
+    });
+  });
+
+  it("hides another user's device", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ ...deviceMetricsRow, userId: "someone-else" });
+    await expect(
+      metricsClient().getCliDeviceMetrics({ cliDeviceId: "cli-id" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });
 

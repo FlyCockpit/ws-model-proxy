@@ -1,0 +1,230 @@
+{
+  "cliVersion": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+  "cpu": {
+    "model": "model"
+  },
+  "gpus": [
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 1,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 2,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 3,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 4,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 5,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 6,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 7,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 8,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 9,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 10,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 11,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 12,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 13,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 14,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 15,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 16,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 17,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 18,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 19,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 20,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 21,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 22,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 23,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 24,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 25,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 26,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 27,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 28,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 29,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 30,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 31,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "driverVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "index": 32,
+      "name": "GPU",
+      "uuid": "GPU-uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    }
+  ],
+  "interfaces": [
+    {
+      "addresses": [
+        "10.0.0.0",
+        "10.0.0.1",
+        "10.0.0.2",
+        "10.0.0.3",
+        "10.0.0.4",
+        "10.0.0.5",
+        "10.0.0.6",
+        "10.0.0.7",
+        "10.0.0.8",
+        "10.0.0.9",
+        "10.0.0.10",
+        "10.0.0.11",
+        "10.0.0.12",
+        "10.0.0.13",
+        "10.0.0.14",
+        "10.0.0.15"
+      ],
+      "name": "br@eth0"
+    }
+  ],
+  "os": {
+    "arch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "kernel": "6.8.0",
+    "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+  },
+  "type": "node.info",
+  "unifiedMemory": false
+}

@@ -13,6 +13,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod display_escape;
+pub mod engine;
 pub mod exit;
 #[cfg(unix)]
 pub mod file_ops;
@@ -30,7 +31,10 @@ pub mod slug;
 pub mod startup;
 pub mod state;
 pub mod supervised_run;
+pub mod telemetry;
+pub mod telemetry_bounds;
 pub mod terminal_crypto;
 pub mod terminal_identity;
+pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;

@@ -67,6 +67,18 @@ export function executionTargetAcceptsTopK(input: { capabilityInventory?: unknow
   return capabilityInventoryAcceptsTopK(input.capabilityInventory);
 }
 
+/**
+ * Whether an adapted Chat stream may ask for `stream_options.include_usage`.
+ * Only an explicit `streamUsage: false` on the Chat surface opts out; every
+ * other inventory (including none) keeps the default of asking.
+ */
+export function executionTargetSupportsStreamUsage(
+  capabilities: OpenAiCompatibleCapabilities | null | undefined,
+): boolean {
+  if (!capabilities || (capabilities.version !== 3 && capabilities.version !== 4)) return true;
+  return capabilities.surfaces.openaiChatCompletions?.streamUsage !== false;
+}
+
 export function reasoningControlForSurface(
   capabilities: OpenAiCompatibleCapabilities | null | undefined,
   surface: ProtocolSurface,

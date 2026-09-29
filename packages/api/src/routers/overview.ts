@@ -23,6 +23,7 @@ import { ORPCError } from "@orpc/server";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { OVERVIEW_RANGES } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -415,6 +416,9 @@ export const overviewRouter = {
                   fallbackEnabled: true,
                   fallbackForGrantees: true,
                   externalEquivalentModel: true,
+                  User: {
+                    select: { banned: true, banExpires: true, deletionRequestedAt: true },
+                  },
                   PoolMembers: {
                     where: externalFallbackMemberWhere,
                     select: {
@@ -433,7 +437,14 @@ export const overviewRouter = {
               Owner: { select: { slug: true } },
             },
           });
-    const grantByPool = new Map(grants.map((grant) => [grant.poolId, grant]));
+    // #76: a pool whose owner is banned or deletion-marked is unavailable to
+    // everyone, so it is labelled like a pool no longer shared with you.
+    const sharedNow = new Date();
+    const grantByPool = new Map(
+      grants
+        .filter((grant) => poolOwnerActive(grant.ModelPool.User, sharedNow))
+        .map((grant) => [grant.poolId, grant]),
+    );
     const sharedPools = sharedPoolIds
       .map((poolId) => {
         const keys = [...shared.identities.keys()].filter(

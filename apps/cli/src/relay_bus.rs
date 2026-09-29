@@ -49,4 +49,7 @@ pub(crate) enum FromWorker {
         command_id: String,
         stderr: bool,
     },
+    /// 2.7 `node.info` / `node.metrics` / `endpoint.load` text from the
+    /// telemetry thread. Sent only after registration; never request-scoped.
+    Telemetry(String),
 }

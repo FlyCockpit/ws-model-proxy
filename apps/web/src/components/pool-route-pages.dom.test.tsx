@@ -760,6 +760,16 @@ describe("dedicated pool pages", () => {
   });
 });
 
+const NO_ENGINE_FACTS = {
+  engineKind: null,
+  engineSlots: null,
+  kvBudgetTokens: null,
+  maxModelLen: null,
+  engineFactsSource: null,
+  engineFactsAt: null,
+  enginePreset: { preset: "generic", fullWhen: "active_at_user_cap", protectionUnit: "slots" },
+};
+
 describe("delete conflicts on pool pages", () => {
   function mountWithAppToasts(children: ReactNode) {
     return render(
@@ -841,6 +851,62 @@ describe("delete conflicts on pool pages", () => {
     );
   });
 
+  it("shows detected engine facts, the preset and their source", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 4,
+        engineKind: "LLAMA_CPP",
+        engineSlots: 4,
+        kvBudgetTokens: null,
+        maxModelLen: 32768,
+        engineFactsSource: "PROBE",
+        engineFactsAt: new Date("2026-09-28T10:00:00.000Z"),
+        enginePreset: { preset: "llama.cpp", fullWhen: "active_at_slots", protectionUnit: "slots" },
+        _count: { CapacityLeases: 0 },
+      },
+      {
+        id: "capacity-2",
+        label: "Manual",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 1,
+        ...NO_ENGINE_FACTS,
+        _count: { CapacityLeases: 0 },
+      },
+    ];
+    mountWithAppToasts(<InferenceCapacityPage />);
+
+    expect(await screen.findByText(/dashboard:pools\.capacity\.engineFacts\.engine/)).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.capacity\.engineFacts\.slots/)).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.capacity\.engineFacts\.sources\.PROBE/)).toBeTruthy();
+    // Only the capacity with facts shows them.
+    expect(screen.getAllByText(/dashboard:pools\.capacity\.engineFacts\.preset/)).toHaveLength(1);
+  });
+
+  it("shows facts for a capacity whose only stored fact is maxModelLen", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 2,
+        ...NO_ENGINE_FACTS,
+        maxModelLen: 131072,
+        engineFactsSource: "PROBE",
+        engineFactsAt: new Date("2026-09-28T10:00:00.000Z"),
+        _count: { CapacityLeases: 0 },
+      },
+    ];
+    mountWithAppToasts(<InferenceCapacityPage />);
+
+    expect(
+      await screen.findByText(/dashboard:pools\.capacity\.engineFacts\.maxModelLen/),
+    ).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.capacity\.engineFacts\.preset/)).toBeTruthy();
+  });
+
   it("shows the capacity retained-history copy on a capacity delete", async () => {
     state.capacities = [
       {
@@ -848,6 +914,7 @@ describe("delete conflicts on pool pages", () => {
         label: "GPU box",
         runtimeModel: "example",
         hardConcurrencyLimit: 2,
+        ...NO_ENGINE_FACTS,
         _count: { CapacityLeases: 0 },
       },
     ];
@@ -871,6 +938,7 @@ describe("delete conflicts on pool pages", () => {
         label: "GPU box",
         runtimeModel: "example",
         hardConcurrencyLimit: 2,
+        ...NO_ENGINE_FACTS,
         _count: { CapacityLeases: 0 },
       },
     ];

@@ -43,6 +43,7 @@ const db = prisma as unknown as {
     findUnique: ReturnType<typeof vi.fn>;
     findFirst: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
+    updateMany: ReturnType<typeof vi.fn>;
     deleteMany: ReturnType<typeof vi.fn>;
   };
 };
@@ -414,6 +415,101 @@ describe("cliCredentialsRouter", () => {
     });
   });
 
+  it("charges the exchange limiter with the device code before any database read", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(deviceCodeRow());
+    const limitDeviceCodeExchange = vi.fn(async () => ({ allowed: true as const }));
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(null, { limitDeviceCodeExchange }),
+    });
+
+    await expect(
+      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+    ).resolves.toMatchObject({ credentialId: "credential-1" });
+    expect(limitDeviceCodeExchange).toHaveBeenCalledWith("approved-device-code");
+  });
+
+  it("answers a limited exchange with slow_down on the wire and reads nothing", async () => {
+    db.deviceCode.findUnique.mockResolvedValue(deviceCodeRow());
+    const limitDeviceCodeExchange = vi.fn(async () => ({
+      allowed: false as const,
+      retryAfterMs: 30_000,
+    }));
+    const handler = new RPCHandler(cliCredentialsRouter);
+
+    const result = await handler.handle(
+      new Request("https://example.test/rpc/exchangeDeviceCode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ json: { deviceCode: "approved-device-code", cliSlug: "desk-01" } }),
+      }),
+      { prefix: "/rpc", context: buildContext(null, { limitDeviceCodeExchange }) },
+    );
+
+    expect(result.matched).toBe(true);
+    if (!result.matched) return;
+    expect(result.response.status).toBe(429);
+    // apps/cli/src/auth.rs backs off on `slow_down` instead of ending the login.
+    // The refusal carries the computed wait so a client can back off precisely.
+    expect(await result.response.json()).toMatchObject({
+      json: {
+        code: "TOO_MANY_REQUESTS",
+        data: { deviceFlowError: "slow_down", retryAfterMs: 30_000 },
+      },
+    });
+    expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  });
+
+  it("clamps a refusal's retryAfterMs to the device-code lifetime", async () => {
+    const { CLI_DEVICE_CODE_LIFETIME_MS } = await import("@ws-model-proxy/config/cli-device-login");
+    const limitDeviceCodeExchange = vi.fn(async () => ({
+      allowed: false as const,
+      retryAfterMs: CLI_DEVICE_CODE_LIFETIME_MS * 10,
+    }));
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(null, { limitDeviceCodeExchange }),
+    });
+
+    const error = await client
+      .exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ORPCError);
+    if (error instanceof ORPCError) {
+      expect(error.data).toEqual({
+        deviceFlowError: "slow_down",
+        retryAfterMs: CLI_DEVICE_CODE_LIFETIME_MS,
+      });
+    }
+  });
+
+  it("never charges the exchange limiter for the pre-0.4.0 upgrade sentinel", async () => {
+    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE } = await import(
+      "@ws-model-proxy/config/cli-device-login"
+    );
+    // Saturate: the limiter refuses every call. The sentinel must short-circuit
+    // before it is charged, or one caller could starve the whole fleet's
+    // upgrade message.
+    const limitDeviceCodeExchange = vi.fn(async () => ({
+      allowed: false as const,
+      retryAfterMs: 60_000,
+    }));
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(null, { limitDeviceCodeExchange }),
+    });
+
+    await expect(
+      client.exchangeDeviceCode({
+        deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
+        cliSlug: "desk-01",
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      return true;
+    });
+    expect(limitDeviceCodeExchange).not.toHaveBeenCalled();
+  });
+
   it("tells a pre-0.4.0 wsmp login to upgrade through the envelope 0.3.x prints", async () => {
     const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE } =
       await import("@ws-model-proxy/config/cli-device-login");
@@ -547,11 +643,17 @@ describe("cliCredentialsRouter", () => {
         slug: "desk-01",
         existingDevice: null,
       });
-      // Only the signed-in user's claimed code; exact and normalized user code.
+      // An unclaimed pending code or one this user holds; exact and
+      // normalized user code. The read writes nothing.
       expect(db.deviceCode.findFirst).toHaveBeenCalledWith({
-        where: { userCode: { in: ["ABCD-EFGH", "ABCDEFGH"] }, userId: "user-1" },
+        where: {
+          userCode: { in: ["ABCD-EFGH", "ABCDEFGH"] },
+          OR: [{ userId: null, status: "pending" }, { userId: "user-1" }],
+        },
         select: { status: true, expiresAt: true, scope: true },
       });
+      expect(db.deviceCode.update).not.toHaveBeenCalled();
+      expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
       expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
         where: { userId_slug: { userId: "user-1", slug: "desk-01" } },
         select: { id: true, slug: true, name: true, reportedHostname: true },
@@ -575,7 +677,7 @@ describe("cliCredentialsRouter", () => {
       });
     });
 
-    it("hides codes the user did not claim, expired codes, and slug-less requests", async () => {
+    it("hides codes another account holds, expired codes, and slug-less requests", async () => {
       const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
 
       db.deviceCode.findFirst.mockResolvedValueOnce(null);
@@ -603,6 +705,184 @@ describe("cliCredentialsRouter", () => {
       await expect(client.deviceLoginRequest({ userCode: "ABCDEFGH" })).rejects.toSatisfy(
         (error: ORPCError) => error.code === "UNAUTHORIZED",
       );
+      expect(db.deviceCode.findFirst).not.toHaveBeenCalled();
+    });
+  });
+  describe("approveDeviceLogin", () => {
+    function pendingRow(overrides: Record<string, unknown> = {}) {
+      return deviceCodeRow({ userId: null, status: "pending", ...overrides });
+    }
+
+    it("claims and approves an unclaimed code in one conditional write", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      db.deviceCode.updateMany.mockResolvedValue({ count: 1 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCD-EFGH", slug: "desk-01" }),
+      ).resolves.toEqual({ status: "approved", slug: "desk-01" });
+      expect(db.deviceCode.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: "device-code-row-1",
+          status: "pending",
+          expiresAt: { gt: expect.any(Date) },
+          scope: "cli-slug:desk-01",
+          OR: [{ userId: null }, { userId: "user-1" }],
+        },
+        data: { status: "approved", userId: "user-1" },
+      });
+      expect(db.deviceCode.update).not.toHaveBeenCalled();
+    });
+
+    it("lets the right account approve after the wrong account only looked", async () => {
+      // The wrong account opens the page: a read, no write.
+      db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      const wrong = createRouterClient(cliCredentialsRouter, {
+        context: buildContext({ user: { id: "wrong-user" } }),
+      });
+      await wrong.deviceLoginRequest({ userCode: "ABCDEFGH" });
+      expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
+
+      // The row is still unclaimed, so the owner's approve claims it.
+      db.deviceCode.updateMany.mockResolvedValue({ count: 1 });
+      const owner = createRouterClient(cliCredentialsRouter, {
+        context: buildContext({ user: { id: "owner" } }),
+      });
+      await expect(
+        owner.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).resolves.toEqual({ status: "approved", slug: "desk-01" });
+      expect(db.deviceCode.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { status: "approved", userId: "owner" } }),
+      );
+    });
+
+    it("loses a race to another account with CONFLICT", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+    });
+
+    it("is idempotent when the SAME account's double-submit loses the conditional write", async () => {
+      // Both requests read the row as pending; one updateMany wins (count 1),
+      // the other's matches 0 rows. The loser re-reads and finds it approved
+      // by its own account, so it reports the idempotent success.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(deviceCodeRow({ userId: "user-1", status: "approved" }));
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).resolves.toEqual({ status: "approved", slug: "desk-01" });
+      expect(db.deviceCode.findFirst).toHaveBeenCalledTimes(2);
+    });
+
+    it("locks the row before the conditional write, inside one transaction", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(pendingRow());
+      db.deviceCode.updateMany.mockResolvedValue({ count: 1 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" });
+
+      expect(db.$transaction).toHaveBeenCalledTimes(1);
+      const [lockSql] = db.$queryRaw.mock.calls[0] ?? [];
+      expect((lockSql as TemplateStringsArray).join("?")).toMatch(
+        /FROM device_code WHERE id = \? FOR UPDATE/,
+      );
+      expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        db.deviceCode.updateMany.mock.invocationCallOrder[0] ?? 0,
+      );
+    });
+
+    it("reports expiry, not CONFLICT, when the code expired before the write", async () => {
+      // Read while live; by the time the row lock was held it had expired, so
+      // the conditional write matched nothing.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(pendingRow({ expiresAt: new Date(Date.now() - 1) }));
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy(
+        (error: ORPCError) => error.code === "BAD_REQUEST" && error.message.includes("expired"),
+      );
+    });
+
+    it("still CONFLICTs when a DIFFERENT account won the same race", async () => {
+      // The inverse failure: the re-read must re-check userId. A status-only
+      // check would report another account's win as this caller's success.
+      db.deviceCode.findFirst
+        .mockResolvedValueOnce(pendingRow())
+        .mockResolvedValueOnce(deviceCodeRow({ userId: "other-user", status: "approved" }));
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+    });
+
+    it("hides a code another account holds", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(
+        deviceCodeRow({ userId: "someone-else", status: "approved" }),
+      );
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "NOT_FOUND");
+      expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("refuses expired, handled, slug-less, and different-slug requests without writing", async () => {
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+      const approve = () => client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" });
+
+      db.deviceCode.findFirst.mockResolvedValueOnce(null);
+      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "NOT_FOUND");
+
+      db.deviceCode.findFirst.mockResolvedValueOnce(
+        pendingRow({ expiresAt: new Date(Date.now() - 1000) }),
+      );
+      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+
+      db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ status: "denied" }));
+      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+
+      db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ scope: null }));
+      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+
+      db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ scope: "cli-slug:other-01" }));
+      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+
+      expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("is idempotent for the account that already approved", async () => {
+      db.deviceCode.findFirst.mockResolvedValue(
+        deviceCodeRow({ userId: "user-1", status: "approved" }),
+      );
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).resolves.toEqual({ status: "approved", slug: "desk-01" });
+      expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("requires a session", async () => {
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext(null) });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "UNAUTHORIZED");
       expect(db.deviceCode.findFirst).not.toHaveBeenCalled();
     });
   });

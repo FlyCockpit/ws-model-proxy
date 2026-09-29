@@ -347,9 +347,10 @@ export const usersRouter = {
           ),
       });
     } catch (err) {
-      // Classified by error class and SQLSTATE / Prisma code only
-      // (RETAINED_HISTORY, P2003, P2014, 23503, 23514, 55000), never by
-      // message text.
+      // Classified by error class and SQLSTATE / Prisma code
+      // (RETAINED_HISTORY, P2003, P2014, 23503, 23514), and for 55000 by the
+      // hardening trigger's message: a permanent refusal only when it matches
+      // one (see `isPermanentParentDeletionFailure`), otherwise transient.
       if (err instanceof RetainedHistoryError || isPermanentParentDeletionFailure(err)) {
         throw deletionConflict(
           "retained_history",

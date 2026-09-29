@@ -57,8 +57,12 @@ export type ShutdownHttpServer = {
 };
 
 export type ServerShutdownDeps = {
-  /** Stops of the periodic jobs (undefined when a job is not running). */
-  periodicJobStops: ReadonlyArray<(() => void) | null | undefined>;
+  /**
+   * Stops of the periodic jobs (undefined when a job is not running). A stop
+   * that returns a promise (relay maintenance) resolves once its callbacks in
+   * flight settled; the periodic-job step awaits it under its deadline.
+   */
+  periodicJobStops: ReadonlyArray<(() => MaybePromise) | null | undefined>;
   stopUserDeletionSweep: StopUserDeletionSweep;
   userDeletionSweepClient: StatementBoundedPrismaClient;
   relaySessions: ShutdownRelaySessions;
@@ -109,19 +113,25 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
     runGracefulShutdownSequence({
       // Stop the periodic jobs so they can't fire mid-shutdown.
       stopPeriodicJobs: async () => {
-        for (const stop of deps.periodicJobStops) stop?.();
+        // Every timer is cleared synchronously; the joins of callbacks
+        // already running are awaited below, with capacity maintenance.
+        const jobJoins = deps.periodicJobStops.map((stop) => stop?.());
         // Sets the stop flag only (no await): the in-flight tick is joined
         // after the DB fence arms, in disconnectPrisma.
         userDeletionSweepStopped = deps.stopUserDeletionSweep();
         relaySessions.dispose();
         // Maintenance only: the capacity runtimes keep serving until the
-        // drain ends and are closed in closeCapacityRuntimes.
-        await deps.capacityLifecycle?.stopMaintenance();
+        // drain ends and are closed in closeCapacityRuntimes. Awaited
+        // together, so one slow join does not delay another's start; the step
+        // is bounded by PERIODIC_JOBS_STOP_TIMEOUT_MS.
+        await Promise.all([...jobJoins, deps.capacityLifecycle?.stopMaintenance()]);
       },
       closeBrowserSockets: () => {
-        // Drain flag first: a browser terminal upgrade arriving after
-        // closeAll() would otherwise register and stay open until exit (the
-        // HTTP drain below sets the flag again; it is idempotent).
+        // Drain flag first, in the same synchronous turn as closeAll(): an
+        // upgrade that passed the middleware's drain check before this ran
+        // registers after closeAll(), and admitBrowserConnection re-checks
+        // the flag at registration and closes it (the HTTP drain below sets
+        // the flag again; it is idempotent).
         relaySessions.beginDrain();
         deps.terminalHub.closeAll();
       },

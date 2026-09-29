@@ -388,14 +388,67 @@ jobs:
       - name: Prove capacity admission PostgreSQL primitives
         run: pnpm --filter server test:postgres
 
-      - name: Prove provider management and capacity policy races
-        run: pnpm --filter @ws-model-proxy/api test:postgres
-
       - name: Prove provider attempt lifecycle recovery
         run: pnpm --filter server exec vitest run src/model-api/provider-attempt-runtime.integration.test.ts
 
       - name: Prove cache affinity concurrency and retention
         run: pnpm --filter server exec vitest run src/model-api/cache-affinity.integration.test.ts
+
+  postgres-api:
+    # Split from prisma-validate so the slowest PostgreSQL suite runs in parallel.
+    name: PostgreSQL API integration
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: schema_validation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d schema_validation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SCHEMA_VALIDATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      REQUIRE_POSTGRES_INTEGRATION: "1"
+      BETTER_AUTH_SECRET: w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB
+      BETTER_AUTH_URL: http://localhost:3000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Apply validation schema
+        env:
+          DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
+        run: pnpm --filter @ws-model-proxy/db db:push
+
+      - name: Prove provider management and capacity policy races
+        run: pnpm --filter @ws-model-proxy/api test:postgres
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
 

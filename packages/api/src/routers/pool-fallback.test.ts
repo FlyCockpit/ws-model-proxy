@@ -295,6 +295,31 @@ describe("poolFallback.get", () => {
     expect(ready).toMatchObject({ ownKey: { ready: true }, tokenAllowed: true });
   });
 
+  // C6-2 (#76): a grantee sees a banned or deletion-marked owner's pool as
+  // not found, like a missing grant.
+  it.each([
+    ["banned", { banned: true, banExpires: null, deletionRequestedAt: null }],
+    ["deletion-marked", { banned: false, banExpires: null, deletionRequestedAt: new Date() }],
+  ] as const)("is NOT_FOUND for a grantee when the owner is %s", async (_label, owner) => {
+    db.modelPool.findFirst.mockResolvedValue(null);
+    db.poolGrant.findFirst.mockResolvedValue({
+      ModelPool: {
+        id: "pool",
+        slug: "pool",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalEquivalentModel: "vendor/model",
+        User: { slug: "owner", ...owner },
+        PoolMembers: [],
+      },
+      FallbackPreferences: [],
+    } as never);
+    db.modelApiToken.findMany.mockResolvedValue([]);
+    await expect(clientFor("grantee").get({ poolId: "pool" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+
   it("is NOT_FOUND for a pool the caller neither owns nor was granted", async () => {
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolGrant.findFirst.mockResolvedValue(null);

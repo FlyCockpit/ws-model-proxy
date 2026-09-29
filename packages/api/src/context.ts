@@ -29,6 +29,34 @@ export type LiveCliFeatureSnapshot = {
   terminalIdentity?: { publicKey: string; signature: string } | null;
 };
 
+/** Outcome of the per-process `exchangeDeviceCode` limiter. */
+export type DeviceCodeExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
+
+/** Relay 2.7 `endpoint.load` as the relay session keeps it (in memory only). */
+export type LiveEndpointLoad = {
+  endpointSlug: string;
+  modelSlug: string | null;
+  running: number;
+  waiting: number;
+  kvUsage?: number;
+  slotsBusy?: number;
+  deferred?: number;
+  prefixCacheHitsDelta?: number;
+  prefixCacheQueriesDelta?: number;
+  source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics";
+  /** The CLI's sample time. */
+  ts: string;
+  receivedAt: Date;
+};
+
+/** The freshest 2.7 telemetry a connected CLI sent. Absent map entries are offline. */
+export type LiveNodeTelemetrySnapshot = {
+  /** The latest `node.metrics` body (schema-validated by the relay). */
+  nodeMetrics: Record<string, unknown> | null;
+  nodeMetricsReceivedAt: Date | null;
+  endpointLoad: LiveEndpointLoad[];
+};
+
 export type ContextServices = {
   /** Server-owned accounting repair. Kept injectable so the API package does not depend on the server. */
   repairExpiredProviderBudgets?: (scope: {
@@ -59,12 +87,24 @@ export type ContextServices = {
   cancelMcpTokenCommands?: (tokenId: string) => void;
   /** In-memory supervised-command requests (dashboard awareness and output review). */
   supervisedCommands?: SupervisedCommandServices;
+  /**
+   * Charges one `cliCredentials.exchangeDeviceCode` call to the caller's IP
+   * and to the device code (per process; one replica is the supported
+   * topology). The HTTP transport binds it to the request's client IP.
+   * Absent where no network caller exists (unit tests); the procedure is not
+   * an MCP surface.
+   */
+  limitDeviceCodeExchange?: (deviceCode: string) => Promise<DeviceCodeExchangeLimit>;
   /** Live protocol/feature snapshot for dashboard and MCP device lists. */
   getLiveCliFeatures?: (
     cliDeviceIds: readonly string[],
   ) =>
     | ReadonlyMap<string, LiveCliFeatureSnapshot>
     | Promise<ReadonlyMap<string, LiveCliFeatureSnapshot>>;
+  /** Live node metrics and endpoint load (dashboard and MCP reads). */
+  getLiveNodeTelemetry?: (
+    cliDeviceIds: readonly string[],
+  ) => ReadonlyMap<string, LiveNodeTelemetrySnapshot>;
 };
 
 export async function createContext({ context, services }: CreateContextOptions) {

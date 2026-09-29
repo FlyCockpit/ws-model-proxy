@@ -1,0 +1,12 @@
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="qwen"} 7.0
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="qwen"} 1.0
+# HELP sglang:token_usage The token usage.
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="qwen"} 0.5
+# HELP sglang:cache_hit_rate The prefix cache hit rate.
+# TYPE sglang:cache_hit_rate gauge
+sglang:cache_hit_rate{model_name="qwen"} 0.31

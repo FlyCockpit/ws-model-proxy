@@ -1,6 +1,7 @@
 import type {
   CanonicalProtocolError,
   CanonicalResponse,
+  CanonicalUsage,
   ParsedProtocolResponse,
   ProtocolResponseMetadata,
   ProtocolSurface,
@@ -544,6 +545,28 @@ function renderResponses(response: CanonicalResponse) {
   };
 }
 
+/**
+ * Anthropic `input_tokens` excludes cache reads and writes, which it reports
+ * beside it. Canonical input includes them, so a reported split is subtracted
+ * out. Without a split (or an inconsistent one) input is rendered whole.
+ */
+export function anthropicInputUsage(usage: CanonicalUsage | undefined): {
+  input_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+} {
+  const input = usage?.inputTokens ?? 0;
+  const read = usage?.cacheReadTokens;
+  const write = usage?.cacheWriteTokens;
+  const cached = (read ?? 0) + (write ?? 0);
+  if (usage?.inputTokens === undefined || cached > input) return { input_tokens: input };
+  return {
+    input_tokens: input - cached,
+    ...(write !== undefined ? { cache_creation_input_tokens: write } : {}),
+    ...(read !== undefined ? { cache_read_input_tokens: read } : {}),
+  };
+}
+
 function renderAnthropic(response: CanonicalResponse) {
   return {
     id: response.id,
@@ -565,7 +588,7 @@ function renderAnthropic(response: CanonicalResponse) {
           : "end_turn",
     stop_sequence: null,
     usage: {
-      input_tokens: response.usage?.inputTokens ?? 0,
+      ...anthropicInputUsage(response.usage),
       output_tokens: response.usage?.outputTokens ?? 0,
     },
   };

@@ -266,8 +266,10 @@ pub struct EndpointConfig {
     /// server fallback of 1. An existing non-null capacity is left unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
-    /// Upstream engine. llama.cpp and vLLM advertise `top_k` in the inventory.
-    #[serde(default, skip_serializing_if = "is_generic_engine")]
+    /// Upstream engine. `auto` (the default) detects it at probe time; an
+    /// explicit value overrides detection. llama.cpp and vLLM advertise
+    /// `top_k` in the inventory only when declared explicitly.
+    #[serde(default, skip_serializing_if = "is_auto_engine")]
     pub engine: EndpointEngine,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
@@ -287,7 +289,7 @@ impl Default for EndpointConfig {
             enabled: true,
             expand_media: false,
             concurrency_limit: None,
-            engine: EndpointEngine::Generic,
+            engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
             auth: None,
@@ -304,19 +306,25 @@ pub struct EndpointAuthConfig {
     pub env: String,
 }
 
-fn is_generic_engine(engine: &EndpointEngine) -> bool {
-    *engine == EndpointEngine::Generic
+fn is_auto_engine(engine: &EndpointEngine) -> bool {
+    *engine == EndpointEngine::Auto
 }
 
-/// Declared upstream engine. Only llama.cpp and vLLM advertise `top_k`.
+/// Declared upstream engine. `Auto` means "detect at probe time"; every other
+/// value is the person's declaration and turns detection off. Only an explicit
+/// llama.cpp or vLLM advertises `top_k`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EndpointEngine {
     #[default]
+    Auto,
     Generic,
     #[serde(rename = "llama.cpp")]
     LlamaCpp,
     Vllm,
+    Sglang,
+    Ollama,
+    LmStudio,
 }
 
 impl EndpointEngine {
@@ -326,9 +334,27 @@ impl EndpointEngine {
 
     pub fn as_config_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Generic => "generic",
             Self::LlamaCpp => "llama.cpp",
             Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+            Self::Ollama => "ollama",
+            Self::LmStudio => "lm-studio",
+        }
+    }
+
+    /// The engine kind this declaration names, or `None` for `auto`.
+    pub fn declared_kind(self) -> Option<crate::engine::EngineKind> {
+        use crate::engine::EngineKind;
+        match self {
+            Self::Auto => None,
+            Self::Generic => Some(EngineKind::Generic),
+            Self::LlamaCpp => Some(EngineKind::LlamaCpp),
+            Self::Vllm => Some(EngineKind::Vllm),
+            Self::Sglang => Some(EngineKind::Sglang),
+            Self::Ollama => Some(EngineKind::Ollama),
+            Self::LmStudio => Some(EngineKind::LmStudio),
         }
     }
 }
@@ -397,6 +423,10 @@ pub struct ProbeSnapshot {
     pub status: ProbeStatus,
     pub models: Vec<String>,
     pub suggested_capabilities: OpenAiCompatibleCapabilities,
+    /// Static engine facts from the last probe (engine detection). Reported in
+    /// the inventory and never part of the inventory digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<crate::engine::DetectedEngine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -897,6 +927,23 @@ impl SurfaceInventory {
         if let Some(surface) = &self.anthropic_messages {
             validate("anthropicMessages", &surface.common, true)?;
         }
+        // The server schema accepts `streamUsage` on the Chat surface only.
+        for (name, common) in [
+            (
+                "openaiResponses",
+                self.openai_responses.as_ref().map(|s| &s.common),
+            ),
+            (
+                "anthropicMessages",
+                self.anthropic_messages.as_ref().map(|s| &s.common),
+            ),
+        ] {
+            if common.is_some_and(|surface| surface.stream_usage.is_some()) {
+                return Err(format!(
+                    "surface `{name}` cannot declare streamUsage; it applies to openaiChatCompletions only"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -942,6 +989,10 @@ pub struct SurfaceCapabilities {
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
+    /// Chat Completions only: `false` marks an endpoint that rejects
+    /// `stream_options.include_usage`, so adapted streams omit it. Absent means true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1726,6 +1777,79 @@ mod tests {
     }
 
     #[test]
+    fn accepts_stream_usage_on_the_chat_surface_only() {
+        let inventory = |surfaces: serde_json::Value, protocol: &str| {
+            serde_json::from_value::<OpenAiCompatibleCapabilities>(serde_json::json!({
+                "version": 4, "protocol": protocol, "surfaces": surfaces
+            }))
+        };
+        for stream_usage in [false, true] {
+            let parsed = inventory(
+                serde_json::json!({ "openaiChatCompletions": {
+                    "source": "declared", "confidence": "exact",
+                    "operations": ["create"], "streamUsage": stream_usage
+                }}),
+                "openai-compatible",
+            )
+            .expect("chat streamUsage");
+            let chat = parsed
+                .surfaces
+                .as_ref()
+                .and_then(|surfaces| surfaces.openai_chat_completions.as_ref())
+                .expect("chat surface");
+            assert_eq!(chat.stream_usage, Some(stream_usage));
+            let written = serde_json::to_value(&parsed).expect("serialize");
+            assert_eq!(
+                written["surfaces"]["openaiChatCompletions"]["streamUsage"],
+                stream_usage
+            );
+        }
+        let absent = inventory(
+            serde_json::json!({ "openaiChatCompletions": {
+                "source": "declared", "confidence": "exact", "operations": ["create"]
+            }}),
+            "openai-compatible",
+        )
+        .expect("chat without streamUsage");
+        let written = serde_json::to_value(&absent).expect("serialize");
+        assert!(
+            written["surfaces"]["openaiChatCompletions"]
+                .get("streamUsage")
+                .is_none()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "openaiResponses": {
+                    "source": "declared", "confidence": "exact",
+                    "operations": ["create"], "streamUsage": false
+                }}),
+                "openai-compatible",
+            )
+            .is_err()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "anthropicMessages": {
+                    "source": "declared", "confidence": "exact", "operations": ["create"],
+                    "protocolVersions": [{ "version": "2023-06-01" }], "streamUsage": false
+                }}),
+                "anthropic-compatible",
+            )
+            .is_err()
+        );
+        assert!(
+            inventory(
+                serde_json::json!({ "anthropicMessages": {
+                    "source": "declared", "confidence": "exact", "operations": ["create"],
+                    "protocolVersions": [{ "version": "2023-06-01" }]
+                }}),
+                "anthropic-compatible",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn rejects_v1_v2_surfaces_and_never_serializes_them() {
         for version in [1, 2] {
             assert!(
@@ -1891,6 +2015,7 @@ mod tests {
             status: ProbeStatus::Online,
             models: Vec::new(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+            engine: None,
         });
         assert!(config.validate().is_err());
 
