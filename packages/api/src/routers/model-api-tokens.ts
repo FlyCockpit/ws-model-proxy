@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
@@ -189,19 +190,28 @@ export const modelApiTokensRouter = {
       const allowlistTargets =
         input.scopeMode === "ALLOWLIST" ? targets : { directModels: [], modelPools: [] };
       const rawSecret = generateProductCredentialSecret("modelApiToken");
-      const created = await prisma.modelApiToken.create({
-        data: {
-          userId: context.session.user.id,
-          name: input.name,
-          scopeMode: input.scopeMode,
-          lookupPrefix: credentialLookupPrefix(rawSecret),
-          secretDigest: digestModelApiTokenSecret(rawSecret),
-          expiresAt: input.expiresAt ?? null,
-          AllowlistEntries: {
-            create: buildModelApiTokenAllowlistEntries(allowlistTargets),
+      // Writer class M: an allowlist entry links the token owner's graph to
+      // the pool owner's (a shared pool), so the insert takes both owners'
+      // fences (the fence trigger on allowlist entries requires them).
+      const created = await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [
+          context.session.user.id,
+          ...allowlistTargets.modelPools.map((pool) => pool.ownerUserId),
+        ]);
+        return tx.modelApiToken.create({
+          data: {
+            userId: context.session.user.id,
+            name: input.name,
+            scopeMode: input.scopeMode,
+            lookupPrefix: credentialLookupPrefix(rawSecret),
+            secretDigest: digestModelApiTokenSecret(rawSecret),
+            expiresAt: input.expiresAt ?? null,
+            AllowlistEntries: {
+              create: buildModelApiTokenAllowlistEntries(allowlistTargets),
+            },
           },
-        },
-        select: tokenSelection,
+          select: tokenSelection,
+        });
       });
 
       return {

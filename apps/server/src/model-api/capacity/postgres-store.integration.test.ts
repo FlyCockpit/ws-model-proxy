@@ -1,9 +1,12 @@
 import {
-  lockAndValidateModelPoolCapacityPolicy,
-  lockExecutionTargetPolicies,
+  fenceAndValidateModelPoolCapacityPolicy,
+  fenceExecutionTargetPolicies,
 } from "@ws-model-proxy/api/lib/capacity-policy-safety";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { PostgresNotificationListener } from "@ws-model-proxy/db/postgres-notifications";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 
@@ -18,7 +21,7 @@ if (!databaseUrl)
   console.warn("[capacity-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 async function cleanupCapacityFixture(
-  db: ReturnType<typeof createPrismaClient>,
+  db: ReturnType<typeof createFixturePrismaClient>,
   userId: string,
 ): Promise<void> {
   const terminalAt = new Date();
@@ -43,7 +46,7 @@ async function cleanupCapacityFixture(
 integration("PostgreSQL capacity admission primitives", () => {
   it("rolls back pool creation when its capacity-policy audit write fails", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: { name: "Pool rollback proof", email: `pool-rollback-${suffix}@example.test` },
@@ -89,8 +92,8 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("installs fresh-schema admission hardening and a database-owned enqueue sequence", async () => {
     if (!databaseUrl) return;
-    const first = createPrismaClient(databaseUrl);
-    const second = createPrismaClient(databaseUrl);
+    const first = createFixturePrismaClient(databaseUrl);
+    const second = createFixturePrismaClient(databaseUrl);
     try {
       const triggers = await first.$queryRaw<Array<{ name: string }>>`
         SELECT tgname AS name FROM pg_trigger
@@ -122,8 +125,8 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("serializes the same stable capacity lock across independent clients", async () => {
     if (!databaseUrl) return;
-    const first = createPrismaClient(databaseUrl);
-    const second = createPrismaClient(databaseUrl);
+    const first = createFixturePrismaClient(databaseUrl);
+    const second = createFixturePrismaClient(databaseUrl);
     const order: string[] = [];
     let firstLocked!: () => void;
     const firstHasLock = new Promise<void>((resolve) => {
@@ -151,9 +154,9 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("observes a concurrent physical-limit reduction before admitting", async () => {
     if (!databaseUrl) return;
-    const writer = createPrismaClient(databaseUrl);
-    const admission = createPrismaClient(databaseUrl);
-    const inspector = createPrismaClient(databaseUrl);
+    const writer = createFixturePrismaClient(databaseUrl);
+    const admission = createFixturePrismaClient(databaseUrl);
+    const inspector = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await writer.user.create({
       data: { name: "Capacity limit race", email: `capacity-limit-race-${suffix}@example.test` },
@@ -213,8 +216,11 @@ integration("PostgreSQL capacity admission primitives", () => {
       const writerHasLock = new Promise<void>((resolve) => {
         writerLocked = resolve;
       });
+      // A limit writer (class M): owner fence, then the capacity fence the
+      // admission path also takes, then the row.
       policyWrite = writer.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
+        await fenceOwners(tx, [user.id]);
+        await acquireFences(tx, [fences.capacity(capacity.id)]);
         await tx.inferenceCapacity.update({
           where: { id: capacity.id },
           data: { hardConcurrencyLimit: 1 },
@@ -232,7 +238,7 @@ integration("PostgreSQL capacity admission primitives", () => {
             SELECT 1
               FROM pg_stat_activity
              WHERE cardinality(pg_blocking_pids(pid)) > 0
-               AND query LIKE '%inference_capacity%FOR UPDATE%'
+               AND query LIKE '%wsmp_acquire_fences%'
           ) AS blocked`;
         blocked = rows[0]?.blocked ?? false;
         if (!blocked) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -266,9 +272,9 @@ integration("PostgreSQL capacity admission primitives", () => {
       `capacity-policy-admission-a-${suffix}`,
       `capacity-policy-admission-b-${suffix}`,
     ];
-    const writer = createPrismaClient(namedUrl(writerName));
-    const admissions = admissionNames.map((name) => createPrismaClient(namedUrl(name)));
-    const inspector = createPrismaClient(databaseUrl);
+    const writer = createFixturePrismaClient(namedUrl(writerName));
+    const admissions = admissionNames.map((name) => createFixturePrismaClient(namedUrl(name)));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await writer.user.create({
       data: { name: "Pool policy race", email: `pool-policy-race-${suffix}@example.test` },
     });
@@ -353,13 +359,14 @@ integration("PostgreSQL capacity admission primitives", () => {
         const backend = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
         writerPid = backend[0]?.pid;
         if (writerPid === undefined) throw new Error("Policy writer backend unavailable.");
-        // The production writer lock sequence: pool row (L1), then sorted
-        // target rows plus their capacity-policy fences (L2).
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR NO KEY UPDATE`;
-        await lockExecutionTargetPolicies(
+        // The production writer sequence (writer class M): the owner fence,
+        // the capacity-policy fences of the member targets, then the pool row.
+        await fenceOwners(tx, [user.id]);
+        await fenceExecutionTargetPolicies(
           tx,
           candidates.map(({ executionTargetId }) => executionTargetId),
         );
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR NO KEY UPDATE`;
         await tx.modelPool.update({
           where: { id: pool.id },
           data: { capacityConcurrencyLimit: 1 },
@@ -435,9 +442,9 @@ integration("PostgreSQL capacity admission primitives", () => {
     const suffix = crypto.randomUUID();
     const namedUrl = (name: string) =>
       `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(name)}`;
-    const writer = createPrismaClient(namedUrl(`dl1-policy-${suffix}`));
-    const admitter = createPrismaClient(namedUrl(`dl1-admitter-${suffix}`));
-    const inspector = createPrismaClient(databaseUrl);
+    const writer = createFixturePrismaClient(namedUrl(`dl1-policy-${suffix}`));
+    const admitter = createFixturePrismaClient(namedUrl(`dl1-admitter-${suffix}`));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await writer.user.create({
       data: { name: "Lock order proof", email: `dl1-lock-order-${suffix}@example.test` },
     });
@@ -536,7 +543,8 @@ integration("PostgreSQL capacity admission primitives", () => {
             Array<{ pid: number }>
           >`SELECT pg_backend_pid() AS pid`;
           policyPid = backend[0]?.pid;
-          await lockAndValidateModelPoolCapacityPolicy(tx, {
+          await fenceOwners(tx, [user.id]);
+          await fenceAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: pool.id,
             userId: user.id,
             policy: {},
@@ -546,7 +554,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           });
           policyLocked();
           await policyMayRequestCapacity;
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+          await acquireFences(tx, [fences.capacity(capacity.id)]);
         },
         { timeout: 20_000 },
       );
@@ -559,8 +567,7 @@ integration("PostgreSQL capacity admission primitives", () => {
             Array<{ pid: number }>
           >`SELECT pg_backend_pid() AS pid`;
           const admitterPid = backend[0]?.pid;
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
-          await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
+          await acquireFences(tx, [fences.capacity(capacity.id)]);
           allowPolicyCapacityLock();
           // Wait until side A is provably queued behind this transaction's
           // capacity advisory lock, then take the FK FOR KEY SHARE locks.
@@ -625,8 +632,8 @@ integration("PostgreSQL capacity admission primitives", () => {
       "options",
       `${url.searchParams.get("options") ?? ""} -c TimeZone=${timezone}`.trim(),
     );
-    const first = createPrismaClient(url.toString());
-    const second = createPrismaClient(url.toString());
+    const first = createFixturePrismaClient(url.toString());
+    const second = createFixturePrismaClient(url.toString());
     const suffix = crypto.randomUUID();
     const user = await first.user.create({
       data: { name: "Database clock proof", email: `database-clock-${suffix}@example.test` },
@@ -739,7 +746,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         unlock = resolve;
       });
       const lockHolder = first.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+        await acquireFences(tx, [fences.capacity(capacity.id)]);
         // Shorten only the persisted candidate deadline after setup has
         // completed. The competing manager must re-read it after obtaining the
         // advisory lock instead of trusting its pre-lock view or process clock.
@@ -771,7 +778,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       // F2-CAP-1: renewal must not wait for an unrelated admission/reclaim
       // transaction's L4/L5 locks. This file is already registered in test:postgres.
       await first.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+        await acquireFences(tx, [fences.capacity(capacity.id)]);
         await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
         let timeout: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -828,7 +835,7 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("admits a zero wait budget only when a slot is free right now (database clock)", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: { name: "Zero budget proof", email: `zero-budget-${suffix}@example.test` },
@@ -915,8 +922,8 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("persists FIFO and weighted WDRR state across independent-client restart", async () => {
     if (!databaseUrl) return;
-    let client = createPrismaClient(databaseUrl);
-    const cleanup = createPrismaClient(databaseUrl);
+    let client = createFixturePrismaClient(databaseUrl);
+    const cleanup = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await cleanup.user.create({
       data: { name: "Scheduler Proof", email: `scheduler-${suffix}@example.test`, slug: suffix },
@@ -970,8 +977,12 @@ integration("PostgreSQL capacity admission primitives", () => {
       const bound = 33;
       for (let round = 0; round < 96; round++) {
         const winner = await client.$transaction(async (tx) => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
-          const row = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } });
+          await acquireFences(tx, [fences.capacity(capacity.id)]);
+          const row = await tx.capacityRuntime.upsert({
+            where: { capacityId: capacity.id },
+            create: { capacityId: capacity.id, userId: capacity.userId },
+            update: {},
+          });
           const deficits =
             Array.isArray(row.schedulerDeficits) && row.schedulerDeficits.length === 32
               ? row.schedulerDeficits.map((value) => (typeof value === "number" ? value : 0))
@@ -997,8 +1008,8 @@ integration("PostgreSQL capacity admission primitives", () => {
               },
             ],
           });
-          await tx.inferenceCapacity.update({
-            where: { id: capacity.id },
+          await tx.capacityRuntime.update({
+            where: { capacityId: capacity.id },
             data: {
               schedulerCursor: decision.state.cursor,
               schedulerDeficits: decision.state.deficits,
@@ -1011,7 +1022,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         if (winner === 0 && firstLowRound === -1) firstLowRound = round;
         if (round === 15) {
           await client.$disconnect();
-          client = createPrismaClient(databaseUrl);
+          client = createFixturePrismaClient(databaseUrl);
         }
       }
       expect(firstLowRound).toBeGreaterThanOrEqual(0);
@@ -1019,8 +1030,8 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(winners.filter((priority) => priority === 31).length).toBeGreaterThan(
         winners.filter((priority) => priority === 0).length,
       );
-      const persisted = await cleanup.inferenceCapacity.findUniqueOrThrow({
-        where: { id: capacity.id },
+      const persisted = await cleanup.capacityRuntime.findUniqueOrThrow({
+        where: { capacityId: capacity.id },
       });
       expect(persisted.schedulerVersion).toBe(1);
       expect(persisted.schedulerDeficits).not.toEqual({});
@@ -1034,7 +1045,7 @@ integration("PostgreSQL capacity admission primitives", () => {
   it("recovers from a notification missed while disconnected by bounded polling", async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: {
@@ -1053,9 +1064,8 @@ integration("PostgreSQL capacity admission primitives", () => {
     });
     try {
       await db.$executeRaw`SELECT pg_notify('wsmp_capacity', ${capacity.id})`;
-      await db.inferenceCapacity.update({
-        where: { id: capacity.id },
-        data: { schedulerVersion: 2 },
+      await db.capacityRuntime.create({
+        data: { capacityId: capacity.id, userId: user.id, schedulerVersion: 2 },
       });
       const listener = new PostgresNotificationListener(databaseUrl);
       await listener.connect();
@@ -1070,8 +1080,8 @@ integration("PostgreSQL capacity admission primitives", () => {
         poll: async () => {
           polls++;
           if (polls === 1) return { state: "WAITING" as const, requestId: "notify-proof" };
-          const row = await db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } });
-          return row.schedulerVersion === 2
+          const row = await db.capacityRuntime.findUnique({ where: { capacityId: capacity.id } });
+          return row?.schedulerVersion === 2
             ? { state: "CANCELLED" as const }
             : { state: "WAITING" as const, requestId: "notify-proof" };
         },
@@ -1088,7 +1098,7 @@ integration("PostgreSQL capacity admission primitives", () => {
   it("atomically chooses one pool candidate, cancels siblings, fences, and enforces the shared cap", async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: {
@@ -1178,7 +1188,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           notifications.push([...capacityIds]);
         },
       });
-      const secondClient = createPrismaClient(databaseUrl);
+      const secondClient = createFixturePrismaClient(databaseUrl);
       const secondManager = new PostgresCapacityAdmissionStore(secondClient, "proof-server-b");
       const deadlineAt = new Date(Date.now() + 60_000);
       const spoofedCallerPolicy = {
@@ -1593,7 +1603,7 @@ integration("PostgreSQL capacity admission primitives", () => {
 
   it("caps overcommitted shared-target reservations and distinguishes NEVER from WHEN_IDLE borrowing", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
       data: { name: "Reservation Proof", email: `reserve-${suffix}@example.test`, slug: suffix },
@@ -1753,7 +1763,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         where: { id: members[0]!.pool.id },
         data: { capacityReservedSlots: 0 },
       });
-      const raceClient = createPrismaClient(databaseUrl);
+      const raceClient = createFixturePrismaClient(databaseUrl);
       const raceManager = new PostgresCapacityAdmissionStore(raceClient, "expiry-race-proof");
       try {
         for (let index = 0; index < 20; index++) {
@@ -1915,9 +1925,15 @@ integration("PostgreSQL capacity admission primitives", () => {
       ).resolves.toMatchObject({
         state: "WAITING",
       });
-      await db.inferenceCapacity.update({
-        where: { id: capacity.id },
-        data: { schedulerCursor: 31, schedulerDeficits: Array(32).fill(0) },
+      await db.capacityRuntime.upsert({
+        where: { capacityId: capacity.id },
+        create: {
+          capacityId: capacity.id,
+          userId: capacity.userId,
+          schedulerCursor: 31,
+          schedulerDeficits: Array(32).fill(0),
+        },
+        update: { schedulerCursor: 31, schedulerDeficits: Array(32).fill(0) },
       });
       if (occupyingOwner.state !== "ADMITTED") throw new Error("Expected reservation owner lease.");
       await manager.release(occupyingOwner.lease);
@@ -2097,7 +2113,7 @@ integration("model API routes with real PostgreSQL capacity", () => {
     process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
     process.env.BETTER_AUTH_URL = "http://localhost:3000";
 
-    const [{ default: prisma }, security, routes, storeModule, runtimeModule, apiRouters, orpc] =
+    const [{ default: shared }, security, routes, storeModule, runtimeModule, apiRouters, orpc] =
       await Promise.all([
         import("@ws-model-proxy/db"),
         import("@ws-model-proxy/db/forwarder-security"),
@@ -2107,6 +2123,9 @@ integration("model API routes with real PostgreSQL capacity", () => {
         import("@ws-model-proxy/api/routers/index"),
         import("@orpc/server"),
       ]);
+    // Fixture writes bypass the graph-write fences; the store under test runs
+    // on the shared production client.
+    const prisma = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const secret = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
     const user = await prisma.user.create({
@@ -2220,7 +2239,7 @@ integration("model API routes with real PostgreSQL capacity", () => {
       },
     });
 
-    const store = new storeModule.PostgresCapacityAdmissionStore(prisma, `route-proof-${suffix}`);
+    const store = new storeModule.PostgresCapacityAdmissionStore(shared, `route-proof-${suffix}`);
     const runtime = new runtimeModule.StoreCapacityAdmissionRuntime(store, 5, 60_000);
     const app = routes.createModelApiRoutes({
       manager: manager as never,
@@ -2388,6 +2407,7 @@ integration("model API routes with real PostgreSQL capacity", () => {
     } finally {
       await cleanupCapacityFixture(prisma, user.id);
       await prisma.$disconnect();
+      await shared.$disconnect();
     }
   }, 20_000);
 });

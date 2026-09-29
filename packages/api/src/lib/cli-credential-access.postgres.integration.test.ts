@@ -1,3 +1,5 @@
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -22,13 +24,13 @@ integration("device-code exchange with real PostgreSQL", () => {
     process.env.NODE_ENV = "test";
     process.env.BETTER_AUTH_SECRET = "test-better-auth-secret-at-least-thirty-two";
     process.env.BETTER_AUTH_URL = "https://proxy.example.test";
-    const [db, dbFactory, access, deletion] = await Promise.all([
+    const [, dbFactory, access, deletion] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/client-factory"),
       import("./cli-credential-access"),
       import("@ws-model-proxy/db/parent-deletion"),
     ]);
-    modules = { prisma: db.default, access, deletion };
+    modules = { prisma: createFixturePrismaClient(databaseUrl!), access, deletion };
     blocker = dbFactory.createPrismaClient(databaseUrl);
     observer = dbFactory.createPrismaClient(databaseUrl);
   });
@@ -112,7 +114,8 @@ integration("device-code exchange with real PostgreSQL", () => {
         FROM pg_stat_activity
         WHERE datname = current_database()
           AND wait_event_type = 'Lock'
-          AND (query ILIKE '%device_code%' OR query ILIKE '%cli_device%')
+          AND (query ILIKE '%device_code%' OR query ILIKE '%cli_device%'
+               OR query ILIKE '%wsmp_acquire_fences%')
       `;
       waiters = Number(rows[0]?.count ?? 0n);
     }
@@ -213,8 +216,9 @@ integration("device-code exchange with real PostgreSQL", () => {
     const user = await createUser();
     const codes = [await approvedCode(user.id, "desk-03"), await approvedCode(user.id, "desk-03")];
 
-    // An uncommitted row with the same (userId, slug) makes both upserts wait
-    // on it; rolling it back lets them race for the insert.
+    // An uncommitted row with the same (userId, slug), written under the
+    // owner fence, makes both logins wait (at the owner fence); rolling it
+    // back lets them race for the insert.
     let release: (() => void) | undefined;
     let reportInserted: (() => void) | undefined;
     const released = new Promise<void>((resolve) => {
@@ -226,6 +230,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const blockerTransaction = blocker
       .$transaction(
         async (tx) => {
+          await fenceOwners(tx, [user.id]);
           await tx.cliDevice.create({ data: { userId: user.id, slug: "desk-03" } });
           reportInserted?.();
           await released;
@@ -247,7 +252,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         FROM pg_stat_activity
         WHERE datname = current_database()
           AND wait_event_type = 'Lock'
-          AND query ILIKE '%cli_device%'
+          AND (query ILIKE '%cli_device%' OR query ILIKE '%wsmp_acquire_fences%')
       `;
       waiters = Number(rows[0]?.count ?? 0n);
     }
@@ -353,6 +358,8 @@ integration("device-code exchange with real PostgreSQL", () => {
   // A pg_stat_activity LIKE pattern matching the ordered user delete's
   // statement text while it waits on a lock; it is not SQL that runs.
   const USER_DELETE_WAITER = '%DELETE FROM "public"."user"%'; // policy: bounded-delete (LIKE pattern, not SQL)
+  // A writer (class M) waiting for another transaction's owner fence.
+  const OWNER_FENCE_WAITER = "%wsmp_acquire_fences%";
 
   async function waitingOrSettled(pattern: string, settled: Promise<unknown>): Promise<void> {
     let done = false;
@@ -466,6 +473,8 @@ integration("device-code exchange with real PostgreSQL", () => {
       );
       await waitingOrSettled("%device_code%", login);
       const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
+      // The exchange refused the marked owner and is removing its code row
+      // outside any fence; the delete's cascade waits on that row.
       await waitingOrSettled(USER_DELETE_WAITER, deleting);
       await pause.release();
       const [loginResult, deleteResult] = await Promise.all([login, deleting]);
@@ -531,7 +540,7 @@ integration("device-code exchange with real PostgreSQL", () => {
       );
       await waitingOrSettled("%cli_device%", login);
       const deleting = outcome(deletion.completeUserDeletion(prisma, user.id, mark!.generation));
-      await waitingOrSettled('%FROM "user"%', deleting);
+      await waitingOrSettled(OWNER_FENCE_WAITER, deleting);
       await pause.release();
       const [loginResult, deleteResult] = await Promise.all([login, deleting]);
 
@@ -566,7 +575,8 @@ integration("device-code exchange with real PostgreSQL", () => {
           cliSlug: "delete-first",
         }),
       );
-      await waitingOrSettled("%cli_device%", login);
+      // The exchange waits at the owner fence the delete holds.
+      await waitingOrSettled(OWNER_FENCE_WAITER, login);
       await pause.release();
       const [loginResult, deleteResult] = await Promise.all([login, deleting]);
 

@@ -104,25 +104,39 @@ describe("capacity lease release", () => {
           return {};
         }),
       },
+      // The capacity's policy is a graph row read without a lock; its
+      // scheduler state lives in capacity_runtime (writer class H).
       inferenceCapacity: {
+        findUnique: vi.fn().mockResolvedValue({ userId: "user", hardConcurrencyLimit: 2 }),
+      },
+      capacityRuntime: {
         findUniqueOrThrow: vi.fn().mockResolvedValue({
-          id: "capacity",
-          hardConcurrencyLimit: 2,
+          capacityId: "capacity",
           schedulerCursor: 16,
           schedulerDeficits: [],
           schedulerVersion: 1,
+          nextFencingToken: 1n,
         }),
         update: vi.fn().mockResolvedValue({ nextFencingToken: 2n }),
       },
       poolMember: { findMany: vi.fn().mockResolvedValue([]) },
-      executionTarget: { findMany: vi.fn().mockResolvedValue([]) },
+      // The winner's graph is live: its target is still on this capacity.
+      executionTarget: {
+        findMany: vi.fn().mockResolvedValue([]),
+        findUnique: vi.fn().mockResolvedValue({ inferenceCapacityId: "capacity" }),
+      },
       admissionRequest: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         update: vi.fn().mockResolvedValue({}),
-        findUnique: vi.fn(async (args: { where: { id?: string } }) =>
-          args.where.id === "request-1"
-            ? { state: admitted ? "ADMITTED" : "WAITING", Lease: null }
-            : null,
+        findUnique: vi.fn(
+          async (args: {
+            where: { id?: string; attemptId?: string };
+          }): Promise<Record<string, unknown> | null> =>
+            args.where.id === "request-1"
+              ? { state: admitted ? "ADMITTED" : "WAITING", Lease: null }
+              : args.where.attemptId === "attempt"
+                ? { relayRequestId: "relay-1" }
+                : null,
         ),
       },
     };
@@ -142,7 +156,10 @@ describe("capacity lease release", () => {
     // The real shutdown-fence proxy: with the fence armed, every operation
     // outside the durable-cleanup permit (including a retried attempt that
     // lost the permit) is rejected.
-    const client = withDbShutdownFence({ $transaction: transaction });
+    // Relay admission-state projections are written on the client after the
+    // store transaction commits, never inside it (tx has no relayRequest).
+    const relayRequest = { updateMany: vi.fn().mockResolvedValue({ count: 1 }) };
+    const client = withDbShutdownFence({ $transaction: transaction, relayRequest });
     const store = new PostgresCapacityAdmissionStore(client as never, "release-retry-unit");
     const lease = {
       leaseId: "lease",
@@ -154,7 +171,7 @@ describe("capacity lease release", () => {
       reservationClass: 16,
       borrowed: false,
     };
-    return { tx, transaction, store, lease };
+    return { tx, transaction, relayRequest, store, lease, waiter };
   }
 
   it("retries a deadlocked release under the real permit proxy and skips the fill while the fence is armed", async () => {
@@ -174,16 +191,111 @@ describe("capacity lease release", () => {
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
     expect(tx.capacityLease.create).not.toHaveBeenCalled();
-    expect(tx.inferenceCapacity.update).not.toHaveBeenCalled();
+    expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
   });
 
   it("fills the queued waiter on a retried release when the fence is not armed", async () => {
     // Control for the case above: the same fixture admits the waiter, so the
     // armed-fence assertion is not vacuous.
-    const { tx, transaction, store, lease } = releaseFixture();
+    const { tx, transaction, relayRequest, store, lease } = releaseFixture();
     await expect(store.release(lease)).resolves.toBe(true);
     expect(transaction).toHaveBeenCalledTimes(2);
     expect(tx.capacityLease.create).toHaveBeenCalled();
+    const sqlOf = (call: unknown[]) => (call[0] as TemplateStringsArray).join("?");
+    // The capacity fence (no inference_capacity row lock) opens each attempt.
+    const fenceCalls = tx.$queryRaw.mock.calls.filter((call) =>
+      sqlOf(call).includes("wsmp_acquire_fences"),
+    );
+    expect(fenceCalls.map((call) => call[1])).toEqual([
+      ["08:capacity:capacity"],
+      ["08:capacity:capacity"],
+    ]);
+    for (const call of tx.$queryRaw.mock.calls)
+      expect(sqlOf(call)).not.toMatch(/FROM inference_capacity/);
+    // Scheduler state and the fencing token come from capacity_runtime,
+    // created lazily before it is read.
+    expect(
+      tx.$executeRaw.mock.calls.some((call) =>
+        sqlOf(call).includes("INSERT INTO capacity_runtime"),
+      ),
+    ).toBe(true);
+    expect(tx.capacityRuntime.findUniqueOrThrow).toHaveBeenCalledWith({
+      where: { capacityId: "capacity" },
+    });
+    expect(tx.capacityRuntime.update).toHaveBeenCalledWith({
+      where: { capacityId: "capacity" },
+      data: expect.objectContaining({ nextFencingToken: { increment: 1 } }),
+    });
+    expect(tx.capacityLease.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ fencingToken: 1n, admissionRequestId: "request-1" }),
+    });
+    // The winner's graph was checked before the lease.
+    expect(tx.executionTarget.findUnique).toHaveBeenCalledWith({
+      where: { id: "target" },
+      select: { inferenceCapacityId: true },
+    });
+    // The released attempt's relay row is projected once, after the commit.
+    expect(relayRequest.updateMany).toHaveBeenCalledTimes(1);
+    expect(relayRequest.updateMany).toHaveBeenCalledWith({
+      where: { id: "relay-1", admissionAttemptId: "attempt" },
+      data: { admissionTerminalState: "TERMINAL" },
+    });
+    expect(relayRequest.updateMany.mock.invocationCallOrder[0]).toBeGreaterThan(
+      Math.max(...tx.capacityLease.create.mock.invocationCallOrder),
+    );
+  });
+
+  it("cancels an orphaned winner instead of leasing it", async () => {
+    // No foreign key keeps a waiter's graph: a winner whose target is gone is
+    // cancelled (parent_deleted) and its request projected as CANCELLED.
+    const { tx, relayRequest, store, lease, waiter } = releaseFixture();
+    tx.executionTarget.findUnique.mockResolvedValue(null);
+    const count = vi.fn().mockResolvedValue(0);
+    Object.assign(tx.capacityWaiter, { count });
+    tx.admissionRequest.findUnique.mockImplementation(
+      async (args: { where: { id?: string; attemptId?: string } }) =>
+        args.where.id === "request-1"
+          ? { state: "WAITING", Lease: null, relayRequestId: "relay-2", attemptId: "attempt-1" }
+          : args.where.attemptId === "attempt"
+            ? { relayRequestId: "relay-1" }
+            : null,
+    );
+    // After the cancellation the waiter is no longer WAITING; the first
+    // (deadlocked) attempt rolls back, so each attempt starts over.
+    let cancelled = false;
+    tx.capacityLease.updateMany.mockImplementation(async () => {
+      cancelled = false;
+      return { count: 1 };
+    });
+    tx.capacityWaiter.findMany.mockImplementation(async (args: { distinct?: unknown }) =>
+      args.distinct || cancelled ? [] : [waiter],
+    );
+    tx.capacityWaiter.updateMany.mockImplementation(async (args: { data: { state: string } }) => {
+      if (args.data.state === "CANCELLED") cancelled = true;
+      return { count: 1 };
+    });
+    await expect(store.release(lease)).resolves.toBe(true);
+    expect(tx.capacityLease.create).not.toHaveBeenCalled();
+    expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
+    expect(tx.capacityWaiter.updateMany).toHaveBeenCalledWith({
+      where: { id: "waiter-1", state: "WAITING" },
+      data: expect.objectContaining({ state: "CANCELLED", terminalReason: "parent_deleted" }),
+    });
+    expect(tx.admissionRequest.update).toHaveBeenCalledWith({
+      where: { id: "request-1" },
+      data: expect.objectContaining({ state: "CANCELLED", terminalReason: "parent_deleted" }),
+    });
+    // Only the committed attempt's projections are written.
+    expect(relayRequest.updateMany.mock.calls.map(([args]) => args)).toEqual([
+      {
+        where: { id: "relay-1", admissionAttemptId: "attempt" },
+        data: { admissionTerminalState: "TERMINAL" },
+      },
+      {
+        where: { id: "relay-2", admissionAttemptId: "attempt-1" },
+        data: { admissionTerminalState: "CANCELLED" },
+      },
+    ]);
   });
 });
 

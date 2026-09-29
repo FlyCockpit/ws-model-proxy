@@ -1,4 +1,5 @@
 import prisma from "@ws-model-proxy/db";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import {
   asJson,
@@ -484,16 +485,17 @@ export async function rememberAffinity({
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
-    // requests cannot race past the configured bound. FOR NO KEY UPDATE still
-    // serializes these writers; FOR UPDATE would also block the FK FOR KEY
-    // SHARE check of a concurrent capacity_lease insert on this pool, closing
-    // a deadlock cycle with admission (see lockExecutionTargetPolicies).
-    const lockedPool = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM model_pool
-       WHERE id = ${poolId} AND "userId" = ${resourceOwnerId}
-       FOR NO KEY UPDATE
-    `;
-    if (lockedPool.length !== 1) return;
+    // requests cannot race past the configured bound: the cache-affinity
+    // fence, taken before any row (writer class H,
+    // @ws-model-proxy/db/capacity-lock-order). No pool row is locked; the
+    // pool is read without a lock and its records carry plain ids, so a pool
+    // deleted meanwhile leaves records the expiry sweep removes.
+    await acquireFences(tx, [fences.cacheAffinity(resourceOwnerId, poolId)]);
+    const pool = await tx.modelPool.findFirst({
+      where: { id: poolId, userId: resourceOwnerId },
+      select: { id: true },
+    });
+    if (!pool) return;
     await tx.cacheAffinityRecord.deleteMany({
       where: {
         userId: resourceOwnerId,
@@ -600,16 +602,20 @@ export async function rememberAffinity({
   });
 }
 
+/**
+ * Deletes expired records (writer class S): one statement that takes its rows
+ * with SKIP LOCKED, so it never waits on a writer's record lock. Records of a
+ * deleted pool, target or tenant expire like any other (at most the pool's
+ * TTL, seven days) and are never read meanwhile: ranking reads only the
+ * records of live targets of a visible pool.
+ */
 export async function sweepExpiredAffinity({ now = new Date(), limit = 1000 } = {}) {
-  const expired = await prisma.cacheAffinityRecord.findMany({
-    where: { expiresAt: { lte: now } },
-    orderBy: [{ expiresAt: "asc" }, { id: "asc" }],
-    take: Math.max(1, Math.min(limit, 10_000)),
-    select: { id: true },
-  });
-  if (!expired.length) return 0;
-  const result = await prisma.cacheAffinityRecord.deleteMany({
-    where: { id: { in: expired.map(({ id }) => id) }, expiresAt: { lte: now } },
-  });
-  return result.count;
+  return prisma.$executeRaw`
+    DELETE FROM cache_affinity_record
+     WHERE id IN (
+       SELECT id FROM cache_affinity_record
+        WHERE "expiresAt" <= ${now}
+        ORDER BY "expiresAt", id
+        LIMIT ${Math.max(1, Math.min(limit, 10_000))}
+          FOR UPDATE SKIP LOCKED)`;
 }

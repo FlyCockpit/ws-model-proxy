@@ -15,35 +15,26 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
-// The ordered-delete locking runs against real PostgreSQL
+// The parent-delete fence prelude runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
-const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
-  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+const { fenceParentDelete } = vi.hoisted(() => ({
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
-  lockCapacityGraphForDelete,
-}));
-// The history drain before an ordered delete runs against real PostgreSQL
-// (parent-deletion.postgres.integration.test.ts); here it is observed.
-const { prepareParentDeletion } = vi.hoisted(() => ({
-  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
-}));
-vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
-  prepareParentDeletion,
+  fenceParentDelete,
 }));
 
 const { capacityManagementRouter } = await import("./capacity-management");
-const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
-  "@ws-model-proxy/db/parent-deletion"
-);
 const { backfillDiscoveredInferenceCapacities, ensureDiscoveredInferenceCapacity } = await import(
   "../lib/discovered-inference-capacity"
 );
 const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
+  capacityLease: { groupBy: MockInstance };
+  capacityWaiter: { groupBy: MockInstance };
   appSetting: { findUnique: MockInstance };
   inferenceCapacity: {
     findMany: MockInstance;
@@ -64,6 +55,13 @@ const db = prisma as unknown as {
   poolMember: { findUnique: MockInstance; findMany: MockInstance; update: MockInstance };
   capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
 };
+
+/** The fence arrays passed to `wsmp_acquire_fences`, one per call, in call order. */
+function fenceCalls(): string[][] {
+  return db.$queryRaw.mock.calls
+    .filter((call) => (call[0] as readonly string[]).join("?").includes("wsmp_acquire_fences"))
+    .map((call) => call[1] as string[]);
+}
 
 const context: Context = {
   session: {
@@ -125,26 +123,56 @@ describe("capacityManagementRouter", () => {
       callback(db),
     );
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit" });
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
   });
 
   it("lists owner-scoped capacities with aggregate load only", async () => {
-    db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      { id: "cap-a", userId: "owner", label: "A", _count: { ExecutionTargets: 2 } },
+      { id: "cap-b", userId: "owner", label: "B", _count: { ExecutionTargets: 0 } },
+    ]);
+    db.capacityLease.groupBy.mockResolvedValue([{ capacityId: "cap-a", _count: { _all: 3 } }]);
+    db.capacityWaiter.groupBy.mockResolvedValue([{ capacityId: "cap-b", _count: { _all: 1 } }]);
     const client = createRouterClient(capacityManagementRouter, { context });
-    await expect(client.list()).resolves.toEqual([]);
+    await expect(client.list()).resolves.toEqual([
+      {
+        id: "cap-a",
+        userId: "owner",
+        label: "A",
+        _count: { ExecutionTargets: 2, CapacityLeases: 3, CapacityWaiters: 0 },
+      },
+      {
+        id: "cap-b",
+        userId: "owner",
+        label: "B",
+        _count: { ExecutionTargets: 0, CapacityLeases: 0, CapacityWaiters: 1 },
+      },
+    ]);
     expect(db.inferenceCapacity.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { userId: "owner" },
-        include: {
-          _count: {
-            select: {
-              ExecutionTargets: true,
-              CapacityLeases: { where: { state: "ACTIVE" } },
-              CapacityWaiters: { where: { state: "WAITING" } },
-            },
-          },
-        },
+        include: { _count: { select: { ExecutionTargets: true } } },
       }),
     );
+    // Lease and waiter history names its capacity by plain id (no relation):
+    // counted by id, scoped to the owner's capacities.
+    expect(db.capacityLease.groupBy).toHaveBeenCalledWith({
+      by: ["capacityId"],
+      where: { capacityId: { in: ["cap-a", "cap-b"] }, state: "ACTIVE" },
+      _count: { _all: true },
+    });
+    expect(db.capacityWaiter.groupBy).toHaveBeenCalledWith({
+      by: ["capacityId"],
+      where: { capacityId: { in: ["cap-a", "cap-b"] }, state: "WAITING" },
+      _count: { _all: true },
+    });
+
+    // No capacities: no history query at all.
+    vi.clearAllMocks();
+    db.inferenceCapacity.findMany.mockResolvedValue([]);
+    await expect(client.list()).resolves.toEqual([]);
+    expect(db.capacityLease.groupBy).not.toHaveBeenCalled();
+    expect(db.capacityWaiter.groupBy).not.toHaveBeenCalled();
   });
 
   it("writes capacity creation and policy mutation audits in the same transaction", async () => {
@@ -243,17 +271,15 @@ describe("capacityManagementRouter", () => {
       _count: { ExecutionTargets: 1 },
     });
     const client = createRouterClient(capacityManagementRouter, { context });
-    lockCapacityGraphForDelete.mockClear();
-    prepareParentDeletion.mockClear();
-    // Refused by the read-only precheck: nothing is drained or locked.
+    fenceParentDelete.mockClear();
+    // Refused by the read-only precheck: no fence is taken.
     await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
       code: "CONFLICT",
       data: { reason: "still_attached" },
     });
-    expect(prepareParentDeletion).not.toHaveBeenCalled();
-    expect(lockCapacityGraphForDelete).not.toHaveBeenCalled();
+    expect(fenceParentDelete).not.toHaveBeenCalled();
     // A target attached after the precheck is refused by the re-read that
-    // runs after the capacity's delete locks are held.
+    // runs after the parent-delete fences are held.
     db.inferenceCapacity.findUnique
       .mockResolvedValueOnce({ userId: "owner", _count: { ExecutionTargets: 0 } })
       .mockResolvedValueOnce({ userId: "owner" })
@@ -262,11 +288,7 @@ describe("capacityManagementRouter", () => {
       code: "CONFLICT",
       data: { reason: "still_attached" },
     });
-    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
-      userId: "owner",
-      capacityIds: ["capacity"],
-    });
-    expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+    expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
       userId: "owner",
       capacityIds: ["capacity"],
     });
@@ -276,23 +298,25 @@ describe("capacityManagementRouter", () => {
     expect(db.inferenceCapacity.delete).not.toHaveBeenCalled();
   });
 
-  it("tags retained-history and in-flight capacity delete refusals", async () => {
+  it("deletes a detached capacity with a plain delete after its parent-delete fences", async () => {
     db.inferenceCapacity.findUnique.mockResolvedValue({
       userId: "owner",
       _count: { ExecutionTargets: 0 },
     });
+    db.inferenceCapacity.delete.mockResolvedValue({ id: "capacity" });
     const client = createRouterClient(capacityManagementRouter, { context });
-    prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
-    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
-      code: "CONFLICT",
-      data: { reason: "retained_history" },
+    await client.remove({ id: "capacity" });
+    // No history drain and no retained-history refusal: waiter and lease
+    // history keeps the capacity's id; the sweeper handles live orphans.
+    expect(fenceParentDelete).toHaveBeenCalledTimes(1);
+    expect(fenceParentDelete).toHaveBeenCalledWith(db, {
+      userId: "owner",
+      capacityIds: ["capacity"],
     });
-    prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
-    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
-      code: "CONFLICT",
-      data: { reason: "delete_pending" },
-    });
-    expect(db.inferenceCapacity.delete).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.delete).toHaveBeenCalledTimes(1);
+    expect(fenceParentDelete.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
+      db.inferenceCapacity.delete.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
   });
 
   it("rejects lossy collapse through the pool-policy path when adaptation is disabled", async () => {
@@ -427,7 +451,7 @@ describe("capacityManagementRouter", () => {
   });
 
   it("denies cross-owner capacity substitution and reserved overcommit", async () => {
-    db.executionTarget.findUnique.mockResolvedValue({ userId: "owner" });
+    db.executionTarget.findUnique.mockResolvedValue({ id: "target", userId: "owner" });
     db.inferenceCapacity.findUnique
       .mockResolvedValueOnce({ userId: "other", hardConcurrencyLimit: 2 })
       .mockResolvedValueOnce({ userId: "owner", hardConcurrencyLimit: 2 });
@@ -459,6 +483,8 @@ describe("capacityManagementRouter", () => {
       client.updateDirectPolicy({ executionTargetId: "target", directConcurrencyLimit: 3 }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.executionTarget.update).not.toHaveBeenCalled();
+    // Owner fence, then the target's capacity-policy fence (no target row lock).
+    expect(fenceCalls()).toEqual([["00:owner:owner"], ["06:capacity-policy:target"]]);
   });
 
   it("rejects a capacity attachment that invalidates any inherited membership policy", async () => {
@@ -631,6 +657,7 @@ describe("capacityManagementRouter", () => {
       userId: "owner",
       ExecutionTargets: [
         {
+          id: "target",
           directConcurrencyLimit: 4,
           directReservedSlots: 0,
           PoolMembers: [],
@@ -642,6 +669,17 @@ describe("capacityManagementRouter", () => {
       code: "BAD_REQUEST",
     });
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+    // Writer class M: the owner fence, then the attached targets' policy
+    // fences and the capacity fence in one ascending call (no row lock on
+    // inference_capacity), before the policy re-read.
+    expect(fenceCalls()).toEqual([
+      ["00:owner:owner"],
+      ["06:capacity-policy:target", "08:capacity:capacity"],
+    ]);
+    const rowQueries = db.$queryRaw.mock.calls.filter(
+      (call) => !(call[0] as readonly string[]).join("?").includes("wsmp_acquire_fences"),
+    );
+    expect(rowQueries).toEqual([]);
   });
 
   it("requires coherent tagged member limits and normalizes legacy finite writes", async () => {
@@ -668,10 +706,22 @@ describe("capacityManagementRouter", () => {
       }),
     ).rejects.toBeTruthy();
 
+    db.$queryRaw.mockClear();
+    db.poolMember.findUnique.mockClear();
     await client.updateMemberPolicy({
       poolMemberId: "member",
       capacityConcurrencyLimit: 2,
     });
+    // The owner fence before the member read and the pool row lock.
+    const queries = db.$queryRaw.mock.calls.map((call) => (call[0] as readonly string[]).join("?"));
+    expect(queries[0]).toContain("wsmp_acquire_fences");
+    expect(db.$queryRaw.mock.calls[0]?.slice(1)).toEqual([["00:owner:owner"], true]);
+    expect(
+      queries.slice(1).some((sql) => /FROM model_pool[\s\S]*FOR NO KEY UPDATE/.test(sql)),
+    ).toBe(true);
+    expect(db.$queryRaw.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
+      db.poolMember.findUnique.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
     expect(db.poolMember.update).toHaveBeenCalledWith({
       where: { id: "member" },
       data: expect.objectContaining({

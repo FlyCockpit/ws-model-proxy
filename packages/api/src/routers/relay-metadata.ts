@@ -28,13 +28,13 @@ const TERMINAL_ONLY = {
 const RELAY_DELETE_BATCH = 500;
 
 /**
- * Deletes matching (terminal) relay requests in id-ordered batches. Capacity
- * lock order (@ws-model-proxy/db/capacity-lock-order): the DELETE's ON DELETE
- * SET NULL rewrites the referencing admission_request rows, which an
- * admitter locks before it updates their relay rows. The shared helper takes
- * both kinds of row with SKIP LOCKED, so this delete never waits on a row an
- * in-flight admission holds; such a row is left in place (it is reported by
- * the returned count and can be deleted by a later request).
+ * Deletes matching (terminal) relay requests in id-ordered batches, as a
+ * sweeper (writer class S, @ws-model-proxy/db/capacity-lock-order): the
+ * DELETE's ON DELETE SET NULL rewrites the referencing admission_request rows
+ * (an H-internal foreign key), which an admitter locks. The shared helper
+ * takes both kinds of row with SKIP LOCKED, so this delete never waits on a
+ * row an in-flight admission holds; such a row is left in place (it is
+ * reported by the returned count and can be deleted by a later request).
  */
 async function deleteRelayRequestsInLockOrder(where: Prisma.RelayRequestWhereInput) {
   let deletedCount = 0;
@@ -101,9 +101,6 @@ export const relayMetadataRouter = {
           modelApiTokenLookupPrefix: true,
           requestedDiscoveredModelId: true,
           requestedModelPoolId: true,
-          RequestedModelPool: { select: { userId: true } },
-          RequestedExecutionTarget: { select: { userId: true } },
-          RequestedDiscoveredModel: { select: { userId: true } },
           selectedDiscoveredModelId: true,
           requestedExecutionTargetId: true,
           selectedExecutionTargetId: true,
@@ -190,14 +187,37 @@ export const relayMetadataRouter = {
           },
         },
       });
+      // Relay rows name their resource by plain id (hot-path history, no
+      // foreign key): the current owners of the rows still present.
+      const ids = (values: Array<string | null>) => [
+        ...new Set(values.filter((value): value is string => value !== null)),
+      ];
+      const [pools, targets, models] = await Promise.all([
+        prisma.modelPool.findMany({
+          where: { id: { in: ids(rows.map((row) => row.requestedModelPoolId)) } },
+          select: { id: true, userId: true },
+        }),
+        prisma.executionTarget.findMany({
+          where: { id: { in: ids(rows.map((row) => row.requestedExecutionTargetId)) } },
+          select: { id: true, userId: true },
+        }),
+        prisma.discoveredModel.findMany({
+          where: { id: { in: ids(rows.map((row) => row.requestedDiscoveredModelId)) } },
+          select: { id: true, userId: true },
+        }),
+      ]);
+      const ownerOf = (list: Array<{ id: string; userId: string }>, id: string | null) =>
+        id === null ? undefined : list.find((entry) => entry.id === id)?.userId;
       return rows.map((row) => {
         // The request belongs to the caller, but its resource can belong to a
         // pool owner. Deleted resources also fail closed. Never expose those
         // owners' provider/target/member/capacity correlation identities.
         const ownsResource =
-          (row.RequestedModelPool?.userId ??
-            row.RequestedExecutionTarget?.userId ??
-            row.RequestedDiscoveredModel?.userId) === context.session.user.id;
+          (row.requestedModelPoolId !== null
+            ? ownerOf(pools, row.requestedModelPoolId)
+            : row.requestedExecutionTargetId !== null
+              ? ownerOf(targets, row.requestedExecutionTargetId)
+              : ownerOf(models, row.requestedDiscoveredModelId)) === context.session.user.id;
         return {
           id: row.id,
           createdAt: row.createdAt,

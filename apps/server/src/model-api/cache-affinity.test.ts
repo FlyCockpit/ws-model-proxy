@@ -11,8 +11,10 @@ const db = vi.hoisted(() => ({
   },
   capacityLease: { groupBy: vi.fn() },
   capacityWaiter: { groupBy: vi.fn() },
+  modelPool: { findFirst: vi.fn() },
   $transaction: vi.fn(),
   $queryRaw: vi.fn(),
+  $executeRaw: vi.fn(),
 }));
 
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
@@ -114,7 +116,8 @@ describe("cache affinity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.$transaction.mockImplementation((callback) => callback(db));
-    db.$queryRaw.mockResolvedValue([{ id: "pool" }]);
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
     db.cacheAffinityRecord.findMany.mockResolvedValue([]);
     db.cacheAffinityRecord.findFirst.mockResolvedValue(null);
     db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 0 });
@@ -1446,13 +1449,65 @@ describe("cache affinity", () => {
   });
 
   it("sweeps expired rows in bounded batches", async () => {
-    db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "a" }, { id: "b" }]);
-    db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 2 });
+    // Writer class S: one DELETE that takes its rows with SKIP LOCKED.
+    db.$executeRaw.mockResolvedValue(2);
     const now = new Date("2026-08-25T12:00:00.000Z");
     await expect(sweepExpiredAffinity({ now, limit: 2 })).resolves.toBe(2);
-    expect(db.cacheAffinityRecord.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: 2, where: { expiresAt: { lte: now } } }),
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    const [strings, ...values] = db.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      ...unknown[],
+    ];
+    const sql = strings.join("?");
+    expect(sql).toContain("DELETE FROM cache_affinity_record");
+    expect(sql).toContain('"expiresAt" <= ?');
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(values).toEqual([now, 2]);
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+
+    db.$executeRaw.mockClear();
+    await sweepExpiredAffinity({ now, limit: 1_000_000 });
+    expect((db.$executeRaw.mock.calls[0] as unknown[]).at(-1)).toBe(10_000);
+  });
+
+  it("fences the owner's pool before reading it and writes nothing for a missing pool", async () => {
+    const rememberArgs = {
+      ownerId: "owner",
+      resourceOwnerId: "resource-owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload,
+      target: target("target", "runtime"),
+    };
+    await rememberAffinity(rememberArgs);
+    // The cache-affinity fence is the transaction's first statement; the pool
+    // is read afterwards without a row lock.
+    const [strings, fenceNames] = db.$queryRaw.mock.calls[0] as [TemplateStringsArray, string[]];
+    expect(strings.join("?")).toContain("wsmp_acquire_fences");
+    expect(fenceNames).toEqual(["09:cache-affinity:resource-owner:pool"]);
+    for (const call of db.$queryRaw.mock.calls) {
+      expect((call[0] as TemplateStringsArray).join("?")).not.toMatch(/FOR (NO KEY )?UPDATE/);
+    }
+    expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      db.modelPool.findFirst.mock.invocationCallOrder[0] ?? Number.NaN,
     );
+    expect(db.modelPool.findFirst).toHaveBeenCalledWith({
+      where: { id: "pool", userId: "resource-owner" },
+      select: { id: true },
+    });
+    expect(db.cacheAffinityRecord.upsert).toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation((callback) => callback(db));
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    await rememberAffinity(rememberArgs);
+    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).not.toHaveBeenCalled();
   });
 
   it("merges engine cache confirmation with latest-evidence semantics", async () => {

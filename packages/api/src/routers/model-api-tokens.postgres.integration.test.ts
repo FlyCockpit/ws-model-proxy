@@ -4,6 +4,7 @@ import { createRouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
@@ -25,12 +26,12 @@ integration("model API token allowlists with real PostgreSQL", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, router, access] = await Promise.all([
+    const [, router, access] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./model-api-tokens"),
       import("../lib/model-api-token-access"),
     ]);
-    modules = { prisma: db.default, router, access };
+    modules = { prisma: createFixturePrismaClient(databaseUrl!), router, access };
   });
 
   afterAll(() => {

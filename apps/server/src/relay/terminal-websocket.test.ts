@@ -88,7 +88,7 @@ const db = prisma as unknown as {
     upsert: MockInstance;
     updateMany: MockInstance;
   };
-  poolMember: { updateMany: MockInstance };
+  poolMember: { findMany: MockInstance; updateMany: MockInstance };
   executionTarget: { findMany: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
   session: { findUnique: MockInstance };
@@ -427,6 +427,7 @@ describe("terminal browser hub", () => {
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([]);
     db.session.findUnique.mockResolvedValue({
       userId: "user-id",
       expiresAt: new Date("2026-02-01T00:00:00.000Z"),

@@ -1,73 +1,33 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { GRAPH_TABLES, HOT_PATH_TABLES } from "@ws-model-proxy/db/capacity-lock-order";
 import { describe, expect, it } from "vitest";
 
-// Static guard for the capacity-domain lock order documented and enforced in
-// packages/db/src/capacity-lock-order.ts (DL-1). Capacity admission holds the
-// capacity advisory lock and row (L4/L5) while its capacity_lease /
-// capacity_waiter / admission_request / cache_affinity_record inserts take
-// FOR KEY SHARE on their parent rows. A parent row held in a mode that
-// conflicts with KEY SHARE (FOR UPDATE) by a transaction that then waits on a
-// capacity lock is a lock-order inversion. PostgreSQL takes that mode:
-//   1. explicitly: SELECT ... FOR UPDATE on the parent table;
-//   2. implicitly: INSERT ... ON CONFLICT DO UPDATE whose SET list names a
-//      key column (any column of a unique index), even for an unchanged
-//      value (ExecUpdateLockMode) — Prisma compiles a native upsert this way;
-//   3. implicitly: UPDATE that changes a key column value, and DELETE.
-// This guard rejects (1) and (2) everywhere, and (3) for UPDATE except at the
-// reviewed sites listed below. DELETE ordering is enforced at runtime by
-// lockCapacityGraphForDelete and exercised on PostgreSQL; the one explicit
-// user FOR UPDATE (L7) is checked by position (findL7Violations).
-
-// Parent tables whose rows capacity admission references through foreign keys.
-const FK_PARENT_TABLES = [
-  "execution_target",
-  "model_pool",
-  "pool_member",
-  "user",
-  "inference_capacity",
-  "admission_request",
-  "relay_request",
-];
-// inference_capacity (L5) and admission_request (L6) are locked FOR UPDATE by
-// the admitter itself, in the documented order; only the four L1/L2 parents
-// must never be locked FOR UPDATE explicitly.
-const NO_FOR_UPDATE_TABLES = ["execution_target", "model_pool", "pool_member", "user"];
-
-/**
- * UPDATE sites that may change a key-column value on a guarded table, each
- * with its reviewed reason. Key: `<relative file>:<delegate or table>.<column>`.
- */
-const REVIEWED_KEY_COLUMN_UPDATES: Record<string, string> = {
-  "packages/api/src/routers/forwarder-management.ts:modelPool.slug":
-    "updateModelPool renames the slug after every lock wait of its transaction (L1, L2); the statements after it only insert notices.",
-  "packages/api/src/routers/forwarder-management.ts:user.slug":
-    "setUserSlug is an autocommit single-statement write: no lock is held before it and no capacity lock follows it.",
-  "packages/db/scripts/verify-schema-hardening.mjs:execution_target.discoveredModelId":
-    "Schema verification against a disposable database: asserts the identity-immutable trigger rejects this update.",
-  "packages/db/scripts/verify-schema-hardening.mjs:execution_target.userId":
-    "Schema verification against a disposable database: asserts the identity-immutable trigger rejects this update.",
-};
-
-/**
- * Explicit FOR SHARE locks on an L1/L2 parent table (FOR SHARE conflicts with
- * the FOR NO KEY UPDATE of writers and of the deletion mark, unlike the FOR
- * KEY SHARE of child inserts), each with its reviewed reason. Key:
- * `<relative file>:<table>.FOR SHARE`.
- */
-const REVIEWED_SHARE_LOCKS: Record<string, string> = {
-  "packages/api/src/routers/pool-fallback-preferences.ts:model_pool.FOR SHARE":
-    "Own-key preference setter: first lock, then exact grant SHARE, requester account SHARE, model SHARE, preference upsert. No capacity locks. Writers/deletion serialize at the pool; provider writers serialize at the account before reaching model/preference. See capacity-lock-order.ts, preference setter transaction.",
-  "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
-    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no capacity lock and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, an L7 user lock or a user writer is outside the capacity domain and closes no cycle.",
-  "packages/db/src/parent-deletion.ts:user.FOR SHARE":
-    "lockUserDeletionOwner (F2-03): the first lock of a user-deletion drain batch, on its deletion generation. The batch takes no capacity lock; afterwards it takes only history rows with SKIP LOCKED and their cascades, every lock wait bounded by a transaction-local lock_timeout and every statement by a transaction-local statement_timeout. It never waits on an L0-L6 lock, so the ordered user delete waiting for it at L7 closes no cycle; abandon, restore and a new mark wait for the batch and then withdraw the generation.",
-  "packages/api/src/lib/model-api-token-access.ts:model_pool.FOR SHARE":
-    "lockExternalSendConsent (E0 send boundary): the first lock of the send-claim transaction, which starts holding nothing, then takes grant, token and allowlist rows FOR SHARE and provider account/credential rows FOR UPDATE, and no capacity lock. FOR SHARE admits the FOR KEY SHARE of admission's child inserts, so no admitter waits on it; its own wait on an L1 writer or delete closes no cycle (see capacity-lock-order.ts, E0 send-claim transaction).",
-  "packages/api/src/lib/cli-credential-access.ts:user.FOR SHARE":
-    "mintCliDeviceCredentialFromApprovedDeviceCode (F2-04): the owner's marker read, after the device row and before the device-code row, the order the ordered user delete takes them (device L0, user L7, then its cascade into device_code and credentials). No capacity lock is held or taken.",
-};
+// Static guard for DL-1 design (d) (packages/db/src/capacity-lock-order.ts,
+// #78). The deadlock-freedom argument is structural and mostly enforced by
+// PostgreSQL (fence protocol WMPF1/WMPF2, graph-write fence triggers WMPF4,
+// no foreign key across the hot-path boundary; proven in
+// packages/api/src/lib/writer-classes.postgres.integration.test.ts). This
+// file pins the parts only the source can show:
+//
+// 1. `acquireFences` is the only way to take an advisory lock: nothing but
+//    the fence module, the hardening SQL that defines `wsmp_acquire_fences`,
+//    and the deploy entrypoint's session lock names an advisory function or
+//    the fence setting.
+// 2. Writer classes: only hot-path (H) and sweeper (S) modules write H
+//    tables, so a management (M) transaction never holds an H row.
+// 3. Every module that writes graph tables is classified (a census): a new
+//    writer module needs a review of its class.
+// 4. Reviewed FOR SHARE locks on graph parents (the E0 send-claim order).
+//
+// F2-05: the old lexical L7 position check is gone with the ordered delete
+// it checked. What a lexical scan cannot see (a closure defined before a lock
+// and called after it, a lock the caller takes before calling a helper) is
+// refused at run time: a fence after the transaction's first row lock or
+// write raises WMPF1 wherever the code sits (PostgreSQL tests "a deferred
+// closure..." and "a caller-side lock..."). The negative cases below pin what
+// the scan itself must still catch.
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "../../../../..");
@@ -81,240 +41,189 @@ const scannedRoots = [
   "scripts",
 ];
 
-/**
- * PR2-C10 provider writer inventory, including implicit pricing/audit FK locks.
- * Order: budget advisories -> L0 (if needed) -> account -> pricing advisory
- * -> model -> pricing -> credential/attempt -> child inserts -> L2 -> L5.
- * Counts make new writer sites require review, even in an already known file.
- * The five pricing writers have executable sequence/timeout tests in
- * provider-management.test.ts; import has its own sequence tests. This census
- * bounds those proofs; it does not prove arbitrary control-flow lock order.
- */
-const PROVIDER_WRITER_INVENTORY = {
-  "packages/api/src/routers/provider-management.ts": {
-    // Account/credential/policy mutations hold account first; policies first
-    // take budget advisories. createModel uses a fresh id; updateModel takes
-    // L0 -> account -> model -> L2/L5. deleteAccount/Model are account-first.
-    // Five pricing procedures use lockPricingParents. Repair-request audit
-    // is an autocommit INSERT, holding no other lock.
-    "providerAccount.create": 1,
-    "providerAccount.update": 2,
-    "providerAccount.updateMany": 4,
-    "providerModel.create": 1,
-    "providerModel.update": 2,
-    "providerModel.updateMany": 3,
-    "providerPricingVersion.create": 1,
-    "providerPricingVersion.update": 3,
-    "providerPricingVersion.updateMany": 1,
-    "providerPricingVersion.delete": 1,
-    "providerAuditEvent.create": 21,
-  },
-  "packages/api/src/routers/provider-catalog.ts": {
-    // Existing/restore: L0 -> account -> advisory -> model -> pricing;
-    // new model: account -> private model id. Audits re-enter held account.
-    "providerModel.create": 1,
-    "providerModel.update": 2,
-    "providerModel.updateMany": 1,
-    "providerPricingVersion.create": 1,
-    "providerPricingVersion.updateMany": 1,
-    "providerAuditEvent.create": 4,
-  },
-  "apps/server/src/model-api/provider-attempt-runtime.ts": {
-    // All five runtime transactions lock account before model/attempt or
-    // credential. Writes to already-held parents add no reverse wait edge.
-    "providerAccount.update": 3,
-    "providerAccount.updateMany": 2,
-    "providerModel.update": 2,
-    "providerModel.updateMany": 2,
-  },
-  "packages/api/src/routers/forwarder-management.ts": {
-    // Wizard: L1 -> L0 -> target FK KEY SHARE(model) -> budget/audit FK(account).
-    // Tier edit: capacity policy locks -> audit FK(account), no model row lock.
-    // Pricing writers take neither L1 nor capacity locks; their model NO KEY
-    // UPDATE is compatible with target FK KEY SHARE. Import/updateModel share
-    // the wizard/attach L0 fence before their provider rows.
-    "providerAuditEvent.create": 2,
-  },
-};
-// Deferred, not proven safe: provider-budget.ts admission/reservation/ledger
-// inserts acquire account/model FK locks in RI trigger order. Settlement's
-// attempt -> ledger FK parents and user-deletion's L7 user -> provider cascade
-// versus provider child user-FKs remain separate follow-ups. Generic parent
-// deletion delegates/cascades are not direct writers in this census.
-const providerRoots = scannedRoots.slice(0, 4);
-
-function providerWriterInventory(): Record<string, Record<string, number>> {
-  const inventory: Record<string, Record<string, number>> = {};
-  for (const root of providerRoots) {
-    for (const path of sourceFiles(join(repoRoot, root))) {
-      const source = readFileSync(path, "utf8");
-      const counts: Record<string, number> = {};
-      for (const match of source.matchAll(
-        /\.(providerAccount|providerModel|providerPricingVersion|providerAuditEvent)\.(create(?:Many(?:AndReturn)?)?|update(?:Many(?:AndReturn)?)?|delete(?:Many)?|upsert)\s*\(/gu,
-      )) {
-        const site = `${match[1]}.${match[2]}`;
-        counts[site] = (counts[site] ?? 0) + 1;
-      }
-      // A raw-SQL bypass also requires an explicit inventory/proof update.
-      for (const match of source.matchAll(
-        /\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(provider_account|provider_model|provider_pricing_version|provider_audit_event)\b/giu,
-      )) {
-        const site = `${match[2]}.${match[1]}`;
-        counts[site] = (counts[site] ?? 0) + 1;
-      }
-      if (Object.keys(counts).length > 0) inventory[relative(repoRoot, path)] = counts;
-    }
-  }
-  return inventory;
-}
-
 function sourceFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = join(directory, entry.name);
     if (entry.isDirectory())
       return ["node_modules", "generated", "e2e"].includes(entry.name) ? [] : sourceFiles(path);
-    return /\.(tsx?|mjs|sql)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [path] : [];
+    return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)
+      ? [path]
+      : [];
   });
 }
 
-/** Key columns (every column of a unique index or id) per Prisma model. */
-function keyColumnsByModel(): Map<string, { table: string; keys: Set<string> }> {
-  const schemaDir = join(repoRoot, "packages/db/prisma/schema");
-  const models = new Map<string, { table: string; keys: Set<string> }>();
-  for (const file of readdirSync(schemaDir).filter((name) => name.endsWith(".prisma"))) {
-    const source = readFileSync(join(schemaDir, file), "utf8");
-    for (const match of source.matchAll(/^model\s+(\w+)\s*\{([\s\S]*?)^\}/gm)) {
-      const [, model = "", body = ""] = match;
-      const keys = new Set<string>();
-      let table = model;
-      for (const line of body.split("\n")) {
-        const field = line.match(/^\s*(\w+)\s+\S+.*@(id|unique)\b/);
-        if (field?.[1]) keys.add(field[1]);
-        const composite = line.match(/@@(?:unique|id)\(\[([^\]]+)\]/);
-        if (composite?.[1])
-          for (const column of composite[1].split(","))
-            keys.add(column.trim().split(/[\s(]/)[0] ?? "");
-        const mapped = line.match(/@@map\("([^"]+)"\)/);
-        if (mapped?.[1]) table = mapped[1];
-      }
-      models.set(model, { table, keys });
-    }
-  }
-  return models;
+function productionSources(): Array<{ file: string; source: string }> {
+  return scannedRoots.flatMap((root) =>
+    sourceFiles(join(repoRoot, root)).map((path) => ({
+      file: relative(repoRoot, path),
+      source: readFileSync(path, "utf8"),
+    })),
+  );
 }
 
-const MODELS = keyColumnsByModel();
-const GUARDED_MODELS = [...MODELS.entries()].filter(([, model]) =>
-  FK_PARENT_TABLES.includes(model.table),
-);
+// ---------------------------------------------------------------------------
+// 1. Fences
+// ---------------------------------------------------------------------------
 
-function delegateName(model: string): string {
-  return model.charAt(0).toLowerCase() + model.slice(1);
+/** Files allowed to name an advisory-lock function, and why. */
+const ADVISORY_SITES: Record<string, string> = {
+  "packages/db/src/capacity-lock-order.ts":
+    "The fence module: acquireFences calls wsmp_acquire_fences (its docs name pg_advisory*).",
+  "packages/db/prisma/schema-hardening.sql":
+    "Defines wsmp_acquire_fences, the only function that takes a fence's advisory lock.",
+  "scripts/docker-entrypoint.sh":
+    "Writer class D: the deploy's session-level lock serializing schema applies on a dedicated connection that holds nothing else.",
+  "scripts/test-docker-entrypoint-schema.sh": "Test double for the entrypoint's deploy lock.",
+};
+
+/** Files allowed to name the fence protocol (function or setting), and why. */
+const FENCE_PROTOCOL_SITES: Record<string, string> = {
+  "packages/db/src/capacity-lock-order.ts":
+    "acquireFences, the only caller of wsmp_acquire_fences.",
+  "packages/db/prisma/schema-hardening.sql":
+    "Defines the protocol, the graph-write fence triggers and the deploy's bypass marker.",
+  "packages/db/src/test-fixture-client.ts":
+    "Test fixtures only: a client whose connections carry the bypass marker.",
+  "packages/db/scripts/verify-schema-hardening.mjs":
+    "Deploy verification: asserts the hardening SQL still defines the protocol.",
+};
+
+function findAdvisoryReferences(file: string, source: string): string[] {
+  return /\bpg_(?:try_)?advisory(?:_xact)?_(?:lock|unlock)(?:_shared)?\b|\bpg_advisory\b/.test(
+    source,
+  )
+    ? [file]
+    : [];
 }
 
-/** Text of the balanced (...) or {...} group starting at `start`. */
-function balanced(source: string, start: number): string {
-  const open = source[start];
-  const close = open === "(" ? ")" : "}";
-  let depth = 0;
-  let quote: string | null = null;
-  for (let index = start; index < source.length; index++) {
-    const char = source[index];
-    if (quote) {
-      if (char === "\\") index++;
-      else if (char === quote) quote = null;
-      continue;
-    }
-    if (char === '"' || char === "'" || char === "`") quote = char;
-    else if (char === open) depth++;
-    else if (char === close && --depth === 0) return source.slice(start, index + 1);
+function findFenceProtocolReferences(file: string, source: string): string[] {
+  return /\bwsmp_acquire_fences\b|wsmp\.fences\b|wsmp\.fence_last\b/.test(source) ? [file] : [];
+}
+
+// ---------------------------------------------------------------------------
+// 2. Writer classes: hot-path tables
+// ---------------------------------------------------------------------------
+
+function delegateName(table: string): string {
+  return table.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+const WRITE_METHODS =
+  "create|createMany|createManyAndReturn|update|updateMany|updateManyAndReturn|upsert|delete|deleteMany";
+
+/** H tables a source writes, by Prisma delegate or raw SQL. */
+function findTableWrites(
+  source: string,
+  tables: readonly string[],
+): Array<{ table: string; via: string }> {
+  const writes: Array<{ table: string; via: string }> = [];
+  for (const table of tables) {
+    const delegate = delegateName(table);
+    if (new RegExp(`\\.${delegate}\\.(?:${WRITE_METHODS})\\s*\\(`).test(source))
+      writes.push({ table, via: "delegate" });
+    const sql = new RegExp(
+      `\\b(?:INSERT\\s+INTO|UPDATE(?:\\s+ONLY)?|DELETE\\s+FROM)\\s+(?:"?public"?\\.)?"?${table}"?(?![\\w])`,
+      "i",
+    );
+    if (sql.test(source)) writes.push({ table, via: "sql" });
   }
-  return source.slice(start);
+  return writes;
 }
 
 /**
- * Property names an object literal assigns: its own top-level keys plus the
- * top-level keys of object literals spread into it (`...(c ? { a } : {})`).
+ * Modules allowed to write hot-path tables, by writer class. Management (M)
+ * modules are absent by design: an M transaction holds graph rows and owner
+ * fences, and must never also hold an H row.
  */
-function assignedKeys(objectText: string): string[] {
-  const keys: string[] = [];
-  let depth = 0;
-  let spreadDepth: number | null = null;
-  let quote: string | null = null;
-  let expectKey = false;
-  for (let index = 0; index < objectText.length; index++) {
-    const char = objectText[index] ?? "";
-    if (quote) {
-      if (char === "\\") index++;
-      else if (char === quote) quote = null;
-      continue;
-    }
-    if (char === '"' || char === "'" || char === "`") {
-      quote = char;
-      continue;
-    }
-    if (char === "{" || char === "(" || char === "[") {
-      depth++;
-      expectKey = char === "{";
-      continue;
-    }
-    if (char === "}" || char === ")" || char === "]") {
-      depth--;
-      if (spreadDepth !== null && depth < spreadDepth) spreadDepth = null;
-      continue;
-    }
-    if (char === ",") {
-      if (depth === 1) spreadDepth = null;
-      expectKey = true;
-      continue;
-    }
-    if (depth === 1 && objectText.startsWith("...", index)) {
-      spreadDepth = 1;
-      index += 2;
-      continue;
-    }
-    if (!expectKey || /\s/.test(char)) continue;
-    expectKey = false;
-    const inScope =
-      depth === 1 || (spreadDepth !== null && depth >= spreadDepth + 1 && depth <= spreadDepth + 2);
-    if (!inScope) continue;
-    const key = objectText.slice(index).match(/^([A-Za-z_$][\w$]*)\s*[:,}]/);
-    if (key?.[1]) keys.push(key[1]);
-  }
-  return keys;
-}
+const HOT_PATH_WRITERS: Record<string, string> = {
+  "apps/server/src/model-api/capacity/postgres-store.ts": "H: the admission store",
+  "apps/server/src/model-api/capacity/postgres-process-worker.ts":
+    "H: the multi-process admission proof worker (scheduler state under the capacity fence)",
+  "apps/server/src/model-api/cache-affinity.ts":
+    "H: cache affinity (fence) and its expiry sweep (S)",
+  "apps/server/src/model-api/routes.ts": "H: relay status, execution telemetry and stickiness",
+  "apps/server/src/model-api/public-overflow.ts": "H: external-provider relay status",
+  "apps/server/src/model-api/provider-budget.ts": "H: provider budget admission and accounting",
+  "apps/server/src/model-api/provider-attempt-runtime.ts": "H: provider attempt telemetry",
+  "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
+  "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
+  "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
+  "packages/db/src/capacity-lock-order.ts": "S: the SKIP LOCKED relay delete helper",
+  "packages/db/src/parent-deletion.ts": "S: the user-deletion history drain",
+  "packages/db/src/hot-path-sweeps.ts": "S: purge, retention, orphan sweeps; H: affinity clear",
+  "packages/db/src/usage-rollup-requester-drain.ts": "S: requester rollup merge",
+  "packages/db/prisma/schema-hardening.sql": "D: deploy backfills under exclusive table locks",
+  "packages/db/scripts/verify-schema-hardening.mjs":
+    "D: schema verification on a disposable database",
+  "packages/db/scripts/pre-push-null-cleanup.mjs":
+    "D: legacy NULL row cleanup before the schema push",
+};
 
-/** The object literal assigned to `property` at the top level of a call argument. */
-function propertyObject(argument: string, property: string): string | null {
-  const match = new RegExp(`(?:^|[\\s,{])${property}\\s*:\\s*\\{`).exec(argument);
-  if (!match) return null;
-  return balanced(argument, match.index + match[0].length - 1);
-}
+// ---------------------------------------------------------------------------
+// 3. Graph writer census
+// ---------------------------------------------------------------------------
+
+/**
+ * Every module that writes a graph table, with its class. M writers take
+ * owner fences first (the fence triggers refuse their structural writes
+ * otherwise); H status writers change only unfenced status columns, one row
+ * per statement or in the provider account -> model order.
+ */
+const GRAPH_WRITERS: Record<string, string> = {
+  "apps/server/src/relay/registration.ts": "M: relay registration",
+  "apps/server/src/relay/session-manager.ts": "H status: device connection state",
+  "apps/server/src/model-api/provider-attempt-runtime.ts":
+    "H status: provider health and fencing (account -> model)",
+  "apps/server/src/model-api/public-overflow.ts": "H status: credential lastUsedAt",
+  "packages/api/src/lib/model-pool-routing.ts":
+    "H status: pool member health, one row per statement",
+  "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
+  "packages/api/src/lib/discovered-inference-capacity.ts": "M: capacity discovery and backfill",
+  "packages/api/src/lib/cli-credential-access.ts": "M: device login and deletion",
+  "packages/api/src/routers/forwarder-management.ts": "M: dashboard pool/device/model writes",
+  "packages/api/src/routers/capacity-management.ts": "M: capacity policy",
+  "packages/api/src/routers/provider-management.ts": "M: provider management",
+  "packages/api/src/routers/provider-catalog.ts": "M: provider catalog import",
+  "packages/api/src/routers/pool-fallback-preferences.ts": "M: own-key preference",
+  "packages/api/src/routers/model-api-tokens.ts": "M: model API tokens",
+  "packages/api/src/routers/users.ts": "user profile/ban fields (unfenced columns)",
+  "packages/api/src/routers/auth.ts": "user profile fields (unfenced columns)",
+  "packages/api/src/routers/settings.ts": "user settings (unfenced columns)",
+  "packages/db/src/capacity-lock-order.ts": "M: the user delete under owner fences",
+  "packages/db/src/parent-deletion.ts": "user deletion marker writes (unfenced columns)",
+  "packages/db/prisma/schema-hardening.sql": "D: deploy backfills (bypass marker)",
+  "packages/db/scripts/verify-schema-hardening.mjs": "D: schema verification",
+};
+
+// ---------------------------------------------------------------------------
+// 4. Reviewed FOR SHARE locks (E0 send-claim order)
+// ---------------------------------------------------------------------------
+
+/**
+ * Graph parents whose explicit FOR SHARE locks are reviewed: FOR SHARE
+ * conflicts with the FOR NO KEY UPDATE of writers and of the deletion mark,
+ * unlike a foreign key's FOR KEY SHARE.
+ */
+const SHARE_GUARDED_TABLES = ["execution_target", "model_pool", "pool_member", "user"];
+
+/**
+ * Explicit FOR SHARE locks on a guarded graph parent, each with its reviewed
+ * reason. Key: `<relative file>:<table>.FOR SHARE`.
+ */
+const REVIEWED_SHARE_LOCKS: Record<string, string> = {
+  "packages/api/src/routers/pool-fallback-preferences.ts:model_pool.FOR SHARE":
+    "Own-key preference setter: after its owner fence, pool SHARE, then exact grant SHARE, requester account SHARE, model SHARE, preference upsert. No capacity fence. Writers/deletion serialize at the pool; provider writers serialize at the account before reaching model/preference. See capacity-lock-order.ts, preference setter transaction.",
+  "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
+    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no fence and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, the user delete's row lock or a user writer closes no cycle.",
+  "packages/db/src/parent-deletion.ts:user.FOR SHARE":
+    "lockUserDeletionOwner (F2-03): the first lock of a user-deletion drain batch, on its deletion generation. The batch takes no fence; afterwards it takes only history rows with SKIP LOCKED and their H-internal cascades, every lock wait bounded by a transaction-local lock_timeout and every statement by a transaction-local statement_timeout. It never waits on a fence or a graph row, so the user delete (fences, then this row FOR UPDATE) waiting for it closes no cycle; abandon, restore and a new mark wait for the batch and then withdraw the generation.",
+  "packages/api/src/lib/model-api-token-access.ts:model_pool.FOR SHARE":
+    "lockExternalSendConsent (E0 send boundary): the first lock of the send-claim transaction, which starts holding nothing, then takes grant, token and allowlist rows FOR SHARE and provider account/credential rows FOR UPDATE, and no fence. Capacity admission takes no pool row at all; the claim's wait on a pool writer or delete closes no cycle (see capacity-lock-order.ts, E0 send-claim transaction).",
+  "packages/api/src/lib/cli-credential-access.ts:user.FOR SHARE":
+    "mintCliDeviceCredentialFromApprovedDeviceCode (F2-04): the owner's marker read after its owner fence and the device row, before the device-code row. The user delete holds the same owner fence, so the two never interleave.",
+};
 
 type Finding = { file: string; site: string; detail: string };
-
-function findPrismaKeyColumnWrites(file: string, source: string): Finding[] {
-  const findings: Finding[] = [];
-  for (const [model, { keys }] of GUARDED_MODELS) {
-    const delegate = delegateName(model);
-    const call = new RegExp(`\\.${delegate}\\.(upsert|update|updateMany)\\(`, "g");
-    for (const match of source.matchAll(call)) {
-      const method = match[1] ?? "";
-      const argument = balanced(source, (match.index ?? 0) + match[0].length - 1);
-      const object = propertyObject(argument, method === "upsert" ? "update" : "data");
-      if (!object) continue;
-      for (const key of assignedKeys(object)) {
-        if (!keys.has(key)) continue;
-        findings.push({
-          file,
-          site: `${delegate}.${key}`,
-          detail: `${delegate}.${method} assigns key column "${key}"`,
-        });
-      }
-    }
-  }
-  return findings;
-}
 
 function sqlStatements(file: string, source: string): string[] {
   if (file.endsWith(".sql")) return source.split(/;\s*(?:\n|$)/);
@@ -323,295 +232,135 @@ function sqlStatements(file: string, source: string): string[] {
   );
 }
 
-function tableModel(table: string) {
-  return GUARDED_MODELS.find(([, model]) => model.table === table)?.[1];
-}
-
-function setColumns(setList: string): string[] {
-  return [...setList.matchAll(/(?:^|,)\s*"?([A-Za-z_]\w*)"?\s*=/g)].map((match) => match[1] ?? "");
-}
-
 function findSqlLockOrderViolations(file: string, source: string): Finding[] {
   const findings: Finding[] = [];
   for (const raw of sqlStatements(file, source)) {
     const sql = raw.replace(/--[^\n]*/g, " ").replace(/\s+/g, " ");
-    if (/\bFOR\s+UPDATE\b/i.test(sql) && !sql.includes("lock-order:L7"))
-      for (const table of NO_FOR_UPDATE_TABLES) {
-        const from = new RegExp(`\\b(?:FROM|JOIN)\\s+(?:ONLY\\s+)?"?${table}"?(?:\\s|$)`, "i");
-        if (from.test(sql))
-          findings.push({ file, site: `${table}.FOR UPDATE`, detail: sql.slice(0, 140) });
-      }
     if (/\bFOR\s+SHARE\b/i.test(sql))
-      for (const table of NO_FOR_UPDATE_TABLES) {
+      for (const table of SHARE_GUARDED_TABLES) {
         const from = new RegExp(`\\b(?:FROM|JOIN)\\s+(?:ONLY\\s+)?"?${table}"?(?:\\s|$)`, "i");
         if (from.test(sql))
           findings.push({ file, site: `${table}.FOR SHARE`, detail: sql.slice(0, 140) });
       }
-    const upsert = sql.match(
-      /\bINSERT\s+INTO\s+(?:"?public"?\.)?"?(\w+)"?[\s\S]*?\bON\s+CONFLICT\b[\s\S]*?\bDO\s+UPDATE\s+SET\s+([\s\S]*?)(?:\bWHERE\b|\bRETURNING\b|$)/i,
-    );
-    const upsertModel = upsert?.[1] ? tableModel(upsert[1]) : undefined;
-    if (upsert && upsertModel)
-      for (const column of setColumns(upsert[2] ?? ""))
-        if (upsertModel.keys.has(column))
-          findings.push({
-            file,
-            site: `${upsertModel.table}.${column}`,
-            detail: `ON CONFLICT DO UPDATE SET names key column "${column}"`,
-          });
-    const update = sql.match(
-      /\bUPDATE\s+(?:ONLY\s+)?(?:"?public"?\.)?"?(\w+)"?(?:\s+\w+)?\s+SET\s+([\s\S]*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|$)/i,
-    );
-    const updateModel = update?.[1] ? tableModel(update[1]) : undefined;
-    if (update && updateModel && !/\bON\s+CONFLICT\b/i.test(sql))
-      for (const column of setColumns(update[2] ?? ""))
-        if (updateModel.keys.has(column))
-          findings.push({
-            file,
-            site: `${updateModel.table}.${column}`,
-            detail: `UPDATE assigns key column "${column}"`,
-          });
   }
   return findings;
 }
 
-/**
- * The one site allowed to take the user row FOR UPDATE (L7): inside
- * lockCapacityGraphForDelete, after the L0-L6 locks it takes. The
- * `lock-order:L7` annotation alone exempts nothing: a tagged statement
- * elsewhere, or one that precedes an L0-L6 lock in its function, is a
- * finding (the pass-8 inversion carried the tag).
- *
- * Known issue F2-05 (user-accepted): the check is lexical. It compares source
- * positions, so a deliberately deferred closure (defined before L7, called
- * after it) or a lock a caller takes after the helper returns would pass.
- * DL-1 design (d) moves this enforcement into fences and triggers.
- */
-const L7_SITE = {
-  file: "packages/db/src/capacity-lock-order.ts",
-  fn: "lockCapacityGraphForDelete",
-};
-/** Calls and statements that take L0-L6 (directly or through the helper). */
-const L0_L6_LOCKS = [
-  /\blockCapacityGraphForDelete\s*\(/g,
-  /\blockExecutionTargetPolicies\s*\(/g,
-  /\blockCapacityAdmissionResources\s*\(/g,
-  /\blockCapacityRowsForPolicyWrite\s*\(/g,
-  /FROM\s+(?:cli_device|model_pool|admission_request|inference_capacity)\b[^`]*\bFOR\s+(?:NO\s+KEY\s+)?UPDATE/g,
-];
-/** L0-L6 locks the allow-listed site must take before its L7 statement. */
-const L7_SITE_PREREQUISITES = [
-  /\blockExecutionTargetPolicies\s*\(/,
-  /\blockCapacityAdmissionResources\s*\(/,
-];
-
-/** Name and body range of the innermost named function enclosing `offset`. */
-function enclosingFunction(
-  source: string,
-  offset: number,
-): { name: string; start: number; end: number } | null {
-  let found: { name: string; start: number; end: number } | null = null;
-  for (const match of source.matchAll(/\bfunction\s+(\w+)\s*(?:<[^>]*>)?\(/g)) {
-    const paren = (match.index ?? 0) + match[0].length - 1;
-    if (paren > offset) break;
-    const params = balanced(source, paren);
-    const brace = source.indexOf("{", paren + params.length);
-    if (brace < 0) continue;
-    const body = balanced(source, brace);
-    const end = brace + body.length;
-    if (brace < offset && offset < end) found = { name: match[1] ?? "", start: brace, end };
-  }
-  return found;
+function scanShareLocks(): Finding[] {
+  return productionSources()
+    .filter(({ file }) => !file.endsWith(".sh"))
+    .flatMap(({ file, source }) => findSqlLockOrderViolations(file, source));
 }
 
-function findL7Violations(file: string, source: string): Finding[] {
-  if (file.endsWith(".sql")) return [];
-  const findings: Finding[] = [];
-  let from = 0;
-  for (const raw of sqlStatements(file, source)) {
-    const at = source.indexOf(raw, from);
-    if (at >= 0) from = at + raw.length;
-    const sql = raw.replace(/\s+/g, " ");
-    if (!sql.includes("lock-order:L7") || !/\bFOR\s+UPDATE\b/i.test(sql)) continue;
-    const fn = at >= 0 ? enclosingFunction(source, at) : null;
-    if (!fn || file !== L7_SITE.file || fn.name !== L7_SITE.fn) {
-      findings.push({
-        file,
-        site: "user.L7",
-        detail: `L7 user lock outside ${L7_SITE.fn}: ${sql.slice(0, 100)}`,
-      });
-      continue;
+describe("capacity lock order (DL-1 design (d)): writer classes and fences", () => {
+  it("takes advisory locks only through acquireFences (and the deploy entrypoint)", () => {
+    const sites = productionSources().flatMap(({ file, source }) =>
+      findAdvisoryReferences(file, source),
+    );
+    expect(sites.filter((file) => !(file in ADVISORY_SITES))).toEqual([]);
+    // No stale allowance.
+    expect(Object.keys(ADVISORY_SITES).filter((file) => !sites.includes(file))).toEqual([]);
+  });
+
+  it("names the fence protocol only in the fence module, the hardening SQL and the fixture client", () => {
+    const sites = productionSources().flatMap(({ file, source }) =>
+      findFenceProtocolReferences(file, source),
+    );
+    expect(sites.filter((file) => !(file in FENCE_PROTOCOL_SITES))).toEqual([]);
+    expect(Object.keys(FENCE_PROTOCOL_SITES).filter((file) => !sites.includes(file))).toEqual([]);
+  });
+
+  it("writes hot-path tables only from hot-path and sweeper modules", () => {
+    const writers = new Map<string, string[]>();
+    for (const { file, source } of productionSources()) {
+      const writes = findTableWrites(source, HOT_PATH_TABLES);
+      if (writes.length > 0)
+        writers.set(file, [...new Set(writes.map((write) => write.table))].sort());
     }
-    const before = source.slice(fn.start, at);
-    const after = source.slice(at + raw.length, fn.end);
-    for (const lock of L0_L6_LOCKS)
-      if (new RegExp(lock.source, "i").test(after))
-        findings.push({
-          file,
-          site: "user.L7",
-          detail: `L0-L6 lock after the L7 user lock: ${lock.source}`,
-        });
-    for (const lock of L7_SITE_PREREQUISITES)
-      if (!lock.test(before))
-        findings.push({ file, site: "user.L7", detail: `L7 user lock before ${lock.source}` });
-  }
-  return findings;
-}
-
-function scan(): Finding[] {
-  return scannedRoots.flatMap((root) =>
-    sourceFiles(join(repoRoot, root)).flatMap((path) => {
-      const file = relative(repoRoot, path);
-      const source = readFileSync(path, "utf8");
-      return [
-        ...(file.endsWith(".sql") ? [] : findPrismaKeyColumnWrites(file, source)),
-        ...findSqlLockOrderViolations(file, source),
-        ...findL7Violations(file, source),
-      ];
-    }),
-  );
-}
-
-describe("capacity-domain lock order", () => {
-  it("keeps every provider row writer and audit insert in the reviewed inventory", () => {
-    expect(providerWriterInventory()).toEqual(PROVIDER_WRITER_INVENTORY);
+    expect([...writers.keys()].filter((file) => !(file in HOT_PATH_WRITERS)).sort()).toEqual([]);
+    expect(Object.keys(HOT_PATH_WRITERS).filter((file) => !writers.has(file))).toEqual([]);
   });
 
-  it("derives key columns from the Prisma schema", () => {
-    const target = MODELS.get("ExecutionTarget");
-    expect(target?.table).toBe("execution_target");
-    expect([...(target?.keys ?? [])]).toEqual(
-      expect.arrayContaining(["id", "userId", "discoveredModelId", "providerModelId"]),
+  it("classifies every module that writes a graph table", () => {
+    const writers = new Set<string>();
+    for (const { file, source } of productionSources())
+      if (findTableWrites(source, GRAPH_TABLES).length > 0) writers.add(file);
+    expect([...writers].filter((file) => !(file in GRAPH_WRITERS)).sort()).toEqual([]);
+    expect(Object.keys(GRAPH_WRITERS).filter((file) => !writers.has(file))).toEqual([]);
+  });
+
+  it("detects advisory and fence-protocol references in every spelling it can see (negative cases)", () => {
+    expect(
+      findAdvisoryReferences("x.ts", "tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`"),
+    ).toEqual(["x.ts"]);
+    expect(
+      findAdvisoryReferences(
+        "x.ts",
+        'await tx.$executeRawUnsafe("SELECT pg_try_advisory_xact_lock($1)", k)',
+      ),
+    ).toEqual(["x.ts"]);
+    expect(findAdvisoryReferences("x.sql", "PERFORM pg_advisory_lock_shared(7);")).toEqual([
+      "x.sql",
+    ]);
+    expect(findAdvisoryReferences("x.ts", "const f = fences.owner(userId);")).toEqual([]);
+    expect(
+      findFenceProtocolReferences(
+        "x.ts",
+        "tx.$executeRaw`SELECT set_config('wsmp.fences', ',*,', true)`",
+      ),
+    ).toEqual(["x.ts"]);
+    expect(findFenceProtocolReferences("x.ts", "SELECT wsmp_acquire_fences($1, true)")).toEqual([
+      "x.ts",
+    ]);
+  });
+
+  it("detects hot-path writes by delegate and by raw SQL (negative cases)", () => {
+    const tables = (source: string) => findTableWrites(source, HOT_PATH_TABLES);
+    expect(tables("await tx.capacityLease.create({ data })")).toEqual([
+      { table: "capacity_lease", via: "delegate" },
+    ]);
+    expect(tables("await tx.relayRequest.updateMany({ where, data })")).toEqual([
+      { table: "relay_request", via: "delegate" },
+    ]);
+    expect(tables('tx.$executeRaw`UPDATE "capacity_runtime" SET x = 1`')).toEqual([
+      { table: "capacity_runtime", via: "sql" },
+    ]);
+    expect(tables("tx.$executeRaw`INSERT INTO public.admission_request (id) VALUES ($1)`")).toEqual(
+      [{ table: "admission_request", via: "sql" }],
     );
-    expect(target?.keys.has("inferenceCapacityId")).toBe(false);
-    expect(MODELS.get("ModelPool")?.keys.has("slug")).toBe(true);
-    expect(GUARDED_MODELS.map(([model]) => model)).toEqual(
-      expect.arrayContaining(["ExecutionTarget", "ModelPool", "PoolMember", "User"]),
-    );
+    expect(tables("DELETE FROM usage_rollup_minute WHERE ctid IN (...)")).toEqual([
+      { table: "usage_rollup_minute", via: "sql" },
+    ]);
+    // Reads are not writes; a longer table name is not the H table.
+    expect(tables("await tx.capacityLease.findMany({ where })")).toEqual([]);
+    expect(tables("SELECT 1 FROM capacity_lease WHERE id = $1 FOR UPDATE")).toEqual([]);
+    expect(tables("UPDATE relay_request_archive SET x = 1")).toEqual([]);
   });
 
-  it("detects explicit FOR UPDATE on FK parent rows and accepts FOR NO KEY UPDATE", () => {
-    const check = (source: string) => findSqlLockOrderViolations("probe.ts", source);
-    expect(
-      check("tx.$queryRaw`SELECT id FROM execution_target WHERE id = $1 FOR UPDATE`"),
-    ).toHaveLength(1);
-    expect(check("tx.$queryRaw`\n  SELECT id FROM model_pool\n  FOR UPDATE\n`")).toHaveLength(1);
-    expect(check('await client.query("SELECT id FROM pool_member FOR UPDATE")')).toHaveLength(1);
-    expect(
-      check("tx.$queryRaw`SELECT id FROM execution_target WHERE id = $1 FOR NO KEY UPDATE`"),
-    ).toEqual([]);
-    expect(check("tx.$queryRaw`SELECT id FROM inference_capacity FOR UPDATE`")).toEqual([]);
-    expect(
-      check('tx.$queryRaw`SELECT id FROM "user" WHERE id = $1 FOR UPDATE /* lock-order:L7 */`'),
-    ).toEqual([]);
-    expect(
-      findSqlLockOrderViolations("probe.sql", "SELECT 1 FROM model_pool m FOR UPDATE;\n"),
-    ).toHaveLength(1);
+  it("classifies every table: hot-path and graph lists are disjoint and complete against the schema", () => {
+    const schemaDir = join(repoRoot, "packages/db/prisma/schema");
+    const tables = new Set<string>();
+    for (const file of readdirSync(schemaDir).filter((name) => name.endsWith(".prisma"))) {
+      const source = readFileSync(join(schemaDir, file), "utf8");
+      for (const match of source.matchAll(/^model\s+(\w+)\s*\{([\s\S]*?)^\}/gm))
+        tables.add(/@@map\("([^"]+)"\)/.exec(match[2] ?? "")?.[1] ?? match[1] ?? "");
+    }
+    const hot = new Set<string>(HOT_PATH_TABLES);
+    const graph = new Set<string>(GRAPH_TABLES);
+    expect([...hot].filter((table) => graph.has(table))).toEqual([]);
+    expect([...hot, ...graph].filter((table) => !tables.has(table))).toEqual([]);
   });
 
-  it("checks the position of an L7-tagged user lock, not only its tag", () => {
-    // The pass-8 inversion: the tagged user lock precedes the L0-L6 helper.
-    const pass8 = `export async function deleteUserInCapacityLockOrder(
-  db: TransactionRunner,
-  userId: string,
-  deletionRequestedAt: Date,
-): Promise<boolean> {
-  return runCapacityOrderedTransaction(db, async (tx) => {
-    const locked = await tx.$queryRaw<Array<{ id: string }>>\`
-      SELECT id FROM "user"
-       WHERE id = \${userId} AND "deletionRequestedAt" = \${deletionRequestedAt}
-       FOR UPDATE /* lock-order:L7 */\`;
-    if (locked.length === 0) return false;
-    await lockCapacityGraphForDelete(tx, { userId, wholeUser: true });
-    return true;
-  });
-}`;
-    expect(findL7Violations(L7_SITE.file, pass8)).not.toEqual([]);
-    expect(findL7Violations("packages/api/src/probe.ts", pass8)).not.toEqual([]);
-    // The helper's own statement, after L0-L6: accepted.
-    const helper = `export async function lockCapacityGraphForDelete(tx: Tx, scope: S): Promise<void> {
-  await lockExecutionTargetPolicies(tx, planned.targets);
-  await lockCapacityAdmissionResources(tx, planned.capacities);
-  if (scope.wholeUser) {
-    await tx.$queryRaw\`SELECT id FROM "user" WHERE id = \${scope.userId} FOR UPDATE /* lock-order:L7 */\`;
-  }
-}`;
-    expect(findL7Violations(L7_SITE.file, helper)).toEqual([]);
-    // The same statement moved ahead of the capacity locks: rejected.
-    const early = `export async function lockCapacityGraphForDelete(tx: Tx, scope: S): Promise<void> {
-  await tx.$queryRaw\`SELECT id FROM "user" WHERE id = \${scope.userId} FOR UPDATE /* lock-order:L7 */\`;
-  await lockExecutionTargetPolicies(tx, planned.targets);
-  await lockCapacityAdmissionResources(tx, planned.capacities);
-}`;
-    expect(findL7Violations(L7_SITE.file, early)).not.toEqual([]);
-  });
-
-  it("detects key-column SETs in upserts and updates", () => {
-    // The pre-fix registration upsert: SET "userId" on execution_target.
-    expect(
-      findPrismaKeyColumnWrites(
-        "probe.ts",
-        `await tx.executionTarget.upsert({
-          where: { discoveredModelId: id },
-          update: { userId: identity.userId, kind: "DISCOVERED_MODEL" },
-          create: { userId: identity.userId, kind: "DISCOVERED_MODEL", discoveredModelId: id },
-        });`,
-      ).map((finding) => finding.site),
-    ).toEqual(["executionTarget.userId"]);
-    expect(
-      findPrismaKeyColumnWrites(
-        "probe.ts",
-        "await tx.executionTarget.upsert({ where: { providerModelId: id }, update: {}, create: { userId } });",
-      ),
-    ).toEqual([]);
-    expect(
-      findPrismaKeyColumnWrites(
-        "probe.ts",
-        "await tx.modelPool.update({ where: { id }, data: { name, ...(slug ? { slug } : {}) } });",
-      ).map((finding) => finding.site),
-    ).toEqual(["modelPool.slug"]);
-    expect(
-      findPrismaKeyColumnWrites(
-        "probe.ts",
-        "await tx.executionTarget.update({ where: { id }, data: { inferenceCapacityId: c } });",
-      ),
-    ).toEqual([]);
-    expect(
-      findSqlLockOrderViolations(
-        "probe.ts",
-        'db.$executeRaw`INSERT INTO "public"."execution_target" ("id","userId") VALUES ($1,$2) ON CONFLICT ("discoveredModelId") DO UPDATE SET "userId" = $3, "kind" = $4 RETURNING id`',
-      ).map((finding) => finding.site),
-    ).toEqual(["execution_target.userId"]);
-    expect(
-      findSqlLockOrderViolations(
-        "probe.sql",
-        'UPDATE pool_member SET "executionTargetId" = t.id FROM x t WHERE pool_member.id = t.id;\n',
-      ).map((finding) => finding.site),
-    ).toEqual(["pool_member.executionTargetId"]);
-    expect(
-      findSqlLockOrderViolations(
-        "probe.sql",
-        "UPDATE capacity_waiter SET state = 'CANCELLED' WHERE id = 1;\nUPDATE model_pool SET name = 'x';\n",
-      ),
-    ).toEqual([]);
-  });
-
-  it("finds no capacity lock-order violation in production and deploy sources", () => {
-    const unreviewed = scan().filter(
-      (finding) =>
-        !REVIEWED_KEY_COLUMN_UPDATES[`${finding.file}:${finding.site}`] &&
-        !REVIEWED_SHARE_LOCKS[`${finding.file}:${finding.site}`],
+  it("finds no unreviewed FOR SHARE lock on a guarded graph parent", () => {
+    const unreviewed = scanShareLocks().filter(
+      (finding) => !REVIEWED_SHARE_LOCKS[`${finding.file}:${finding.site}`],
     );
     expect(unreviewed.map((finding) => `${finding.file}: ${finding.detail}`)).toEqual([]);
-  });
-
-  it("keeps every reviewed key-column update site live", () => {
-    const sites = new Set(scan().map((finding) => `${finding.file}:${finding.site}`));
-    expect(Object.keys(REVIEWED_KEY_COLUMN_UPDATES).filter((site) => !sites.has(site))).toEqual([]);
+    const sites = new Set(scanShareLocks().map((finding) => `${finding.file}:${finding.site}`));
     expect(Object.keys(REVIEWED_SHARE_LOCKS).filter((site) => !sites.has(site))).toEqual([]);
   });
 
-  it("flags explicit FOR SHARE on an L1/L2 parent row, not FOR KEY SHARE", () => {
+  it("flags explicit FOR SHARE on a guarded graph parent, not FOR KEY SHARE", () => {
     const check = (source: string) =>
       findSqlLockOrderViolations("probe.sql", source).map((finding) => finding.site);
     expect(check('SELECT 1 FROM "user" u WHERE u.id = NEW."userId" FOR SHARE;\n')).toEqual([
