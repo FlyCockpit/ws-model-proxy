@@ -13,7 +13,8 @@ export type McpCommandMode = (typeof MCP_COMMAND_MODES)[number];
 
 /**
  * Why the relay would refuse a command kind right now (see
- * `mcpCommandRefusals` in the API); these are the relay's own error codes.
+ * `mcpCommandRefusals` in the API). These are the relay's error codes, with
+ * its `supervised_only` split by the switch that causes it.
  */
 export type CommandRefusal =
   | "grant_disabled"

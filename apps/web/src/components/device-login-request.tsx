@@ -1,3 +1,5 @@
+import type { DeviceLoginRefusalReason } from "@ws-model-proxy/config/cli-device-login";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
 
@@ -43,6 +45,34 @@ export function DeviceLoginRequestSkeleton() {
       <Skeleton className="h-5 w-3/4" />
       <Skeleton className="h-4 w-1/2" />
       <Skeleton className="h-4 w-full" />
+    </div>
+  );
+}
+
+/**
+ * Why the request cannot be approved and what to do next, in place of the
+ * Approve button (which would only be refused again). A stale page
+ * (`slug_mismatch`) offers a reload; every other reason is final for this
+ * link, so the next step is in the terminal.
+ */
+export function DeviceLoginRefusal({
+  reason,
+  onReload,
+}: {
+  reason: DeviceLoginRefusalReason;
+  onReload: () => void;
+}) {
+  const { t } = useTranslation("auth");
+
+  return (
+    <div role="alert" className="space-y-2 rounded-md border px-3 py-2 text-sm">
+      <p className="font-medium">{t(`device.refusal.${reason}.title`)}</p>
+      <p className="text-muted-foreground">{t(`device.refusal.${reason}.next`)}</p>
+      {reason === "slug_mismatch" ? (
+        <Button type="button" variant="outline" className="min-h-[44px]" onClick={onReload}>
+          {t("device.refusal.reload")}
+        </Button>
+      ) : null}
     </div>
   );
 }

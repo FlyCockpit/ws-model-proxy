@@ -52,6 +52,11 @@ import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
 import { cliCommandsAllowed, isCliCommandTool } from "./cli-command-access";
 import { McpCliCommandRejectedError } from "./cli-command-tools";
 import { mcpSanitizedLog } from "./errors";
+import {
+  collectSchemaPropertyNames,
+  formatValidationIssues,
+  sanitizeValidationIssues,
+} from "./input-errors";
 import { redactSecrets } from "./redaction";
 import { toJsonSafe } from "./serialization";
 import { resolveMcpToolDispatch } from "./tool-dispatch";
@@ -466,7 +471,8 @@ function outputTooLargeError(): ToolResult {
 }
 
 /**
- * Allowlisted oRPC error mapping. `NOT_FOUND` keeps the SAME stable message
+ * Allowlisted oRPC error mapping. `BAD_REQUEST` from input validation adds the
+ * sanitized issue list (input-errors.ts). `NOT_FOUND` keeps the SAME stable message
  * whether the target does not exist or belongs to another user — the
  * ownership-hiding convention survives the bridge intact. The lookup is
  * PROTOTYPE-SAFE (G6): `Object.hasOwn` keeps inherited properties
@@ -492,6 +498,20 @@ function deletionConflictReasonOf(
   return isDeletionConflictReason(reason) ? reason : null;
 }
 
+/** Per-descriptor cache of the property names its advertised schema declares. */
+const declaredKeysCache = new WeakMap<McpToolDescriptor, ReadonlySet<string>>();
+
+function declaredInputKeys(descriptor: McpToolDescriptor): ReadonlySet<string> {
+  let keys = declaredKeysCache.get(descriptor);
+  if (keys === undefined) {
+    keys = collectSchemaPropertyNames(
+      descriptor.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
+    );
+    declaredKeysCache.set(descriptor, keys);
+  }
+  return keys;
+}
+
 function mapToolError(
   error: unknown,
   descriptor: McpToolDescriptor,
@@ -501,6 +521,16 @@ function mapToolError(
     if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
       const stable = ORPC_ERROR_MESSAGES[error.code];
       if (stable !== undefined) {
+        if (error.code === "BAD_REQUEST") {
+          // #117: name the failing field(s). Only sanitized {path, code,
+          // message} triples leave; input values never do.
+          const issues = sanitizeValidationIssues(error.data, declaredInputKeys(descriptor));
+          if (issues !== null) {
+            return toolError(`${stable}: ${formatValidationIssues(issues)}`, {
+              error: { code: error.code, issues },
+            });
+          }
+        }
         const reason = deletionConflictReasonOf(error);
         if (reason !== null) {
           return toolError(`${stable}: ${reason}`, { error: { code: error.code, reason } });

@@ -95,13 +95,13 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.6",
+        protocolVersion: "2.7",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -119,10 +119,12 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
           mcpCommandMode: features.mcpCommandMode,
           terminalApproval: false,
           terminalSupported: false,
+          remoteMetricSources: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
+        nodeTelemetry: true,
       },
     },
     endpoints: [],
@@ -137,6 +139,12 @@ async function connect(
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
   await relaySessionManager.handleTextFrame(socket, hello(slug, features), now);
   return socket;
+}
+
+/** Closes every session and clears the drain flag, which production never clears. */
+async function resetRelaySessions() {
+  await relaySessionManager.closeRelaySessions();
+  Reflect.set(relaySessionManager, "relayDrain", false);
 }
 
 describe("cli commands", () => {
@@ -184,7 +192,7 @@ describe("cli commands", () => {
   });
 
   afterEach(async () => {
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     sweepExpiredTokenCommands(Date.now() + 16 * 60 * 1000);
   });
 
@@ -396,7 +404,7 @@ describe("cli commands", () => {
       userId: "user-id",
       mcpCommandMode: "UNSUPERVISED",
     });
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     await expect(
       startCliCommand({
         userId: "user-id",
@@ -448,7 +456,7 @@ describe("cli commands", () => {
       false,
     );
 
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     const disabled = await connect("desktop", { mcpCommandMode: "off" });
     disabled.sends.length = 0;
     await expect(
@@ -462,7 +470,7 @@ describe("cli commands", () => {
     ).resolves.toEqual({ ok: false, error: "feature_disabled" });
     expect(disabled.sends).toEqual([]);
 
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     const live = await connect();
     const first = await startCliCommand({
       userId: "user-id",

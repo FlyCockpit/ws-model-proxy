@@ -696,6 +696,24 @@ fn endpoints_concurrency_and_engine_round_trip() {
     assert!(value["endpoints"][0].get("concurrencyLimit").is_none());
     assert_eq!(value["endpoints"][0]["engine"], "vllm");
 
+    for engine in ["sglang", "ollama", "lm-studio", "generic"] {
+        cli(&config, &state)
+            .args(["endpoints", "engine", "local", engine])
+            .assert()
+            .success();
+        let mut list = cli(&config, &state);
+        list.args(["endpoints", "--json", "list"]);
+        assert_eq!(json_stdout(list)["endpoints"][0]["engine"], engine);
+    }
+    // `auto` is the default and is not written to the config.
+    cli(&config, &state)
+        .args(["endpoints", "engine", "local", "auto"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    assert!(json_stdout(list)["endpoints"][0].get("engine").is_none());
+
     cli(&config, &state)
         .args(["endpoints", "concurrency", "missing", "2"])
         .assert()

@@ -236,7 +236,11 @@
       "saved": "Se renombró el CLI",
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
-    }
+    },
+    "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
+    "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
+    "upgradeUnknownProtocol": "desconocido",
+    "upgradeUnknownVersion": "(versión desconocida)"
   },
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
@@ -369,19 +373,15 @@
       "checking": "Verificando identidad…",
       "offline": "Sin conexión",
       "unpinned": "Este navegador no pudo guardar la clave. Compara la huella antes de escribir algo sensible.",
-      "unverified": "Sin verificar. Actualiza la CLI para verificar su identidad.",
       "invalid": "Esta CLI no demostró su identidad. Sus terminales están bloqueadas.",
       "changed": "La clave de identidad de esta CLI cambió. Sus terminales están bloqueadas hasta que confíes en la nueva clave.",
-      "downgraded": "Esta CLI ya no demuestra su identidad. Sus terminales están bloqueadas hasta que la permitas.",
       "pinned": "Fijada",
       "new": "Nueva",
       "trustNew": "Confiar en la nueva clave",
-      "allowUnverified": "Permitir sin verificar",
       "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
       "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
       "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
       "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
-      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla.",
       "attention": "La clave de identidad de una CLI necesita revisión. Sus terminales están bloqueadas hasta que la verifiques.",
       "review": "Revisar"
     },
@@ -440,7 +440,14 @@
         "affinityMaxRecords": "Máximo de registros por destino",
         "affinityPrefixWeight": "Peso por profundidad del prefijo de conversación",
         "affinityConversationWeight": "Peso de conversación",
-        "affinityLoadPenaltyWeight": "Penalización por carga activa"
+        "affinityLoadPenaltyWeight": "Penalización por carga activa",
+        "cacheHolderWaitMs": "Esperar al miembro con la caché"
+      },
+      "cacheHolderWait": {
+        "auto": "Automático (tiempo de reprocesamiento ahorrado, hasta 30 s)",
+        "fixed": "Fijo (milisegundos; 0 lo desactiva)",
+        "valueLabel": "Espera por el miembro con la caché en milisegundos",
+        "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
     },
     "capacity": {
@@ -506,6 +513,33 @@
         "template": "Usar un tokenizador y plantilla registrados coincidentes",
         "engineRequirement": "Requiere soporte para contar tokens en el destino seleccionado. WSMP usa una estimación conservadora cuando no está disponible.",
         "registeredRequirement": "Requiere un contador registrado que coincida con esta identidad de runtime. WSMP usa una estimación conservadora cuando no hay coincidencia."
+      },
+      "engineFacts": {
+        "engine": "Motor: {{engine}}",
+        "slots_one": "{{count}} ranura",
+        "slots_other": "{{count}} ranuras",
+        "kvBudget": "Presupuesto KV: {{value}} tokens",
+        "maxModelLen": "Contexto máximo: {{value}} tokens",
+        "preset": "Preajuste: {{preset}}",
+        "kinds": {
+          "GENERIC": "Genérico",
+          "LLAMA_CPP": "llama.cpp",
+          "VLLM": "vLLM",
+          "SGLANG": "SGLang",
+          "OLLAMA": "Ollama",
+          "LM_STUDIO": "LM Studio"
+        },
+        "presets": {
+          "llama.cpp": "llama.cpp (lleno al alcanzar sus ranuras)",
+          "vllm-sglang": "vLLM / SGLang (tu límite y luego la carga del motor)",
+          "ollama-lm-studio": "Ollama / LM Studio (tu ajuste de paralelismo)",
+          "generic": "Genérico (tu límite)"
+        },
+        "sources": {
+          "PROBE": "detectado por la CLI",
+          "CONFIG": "desde la configuración de la CLI",
+          "MIXED": "detectado y configurado"
+        }
       }
     },
     "noneAvailable": "Ninguna disponible",
@@ -545,7 +579,7 @@
       "enabled": "Permitir respaldo externo",
       "forGrantees": "También para usuarios con acceso compartido",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
-      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre (después de cualquier espera por el miembro con la caché). Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",
@@ -1102,6 +1136,7 @@
     "responseBytes": "Bytes de respuesta",
     "attempts": "Intentos",
     "affinity": "Afinidad / puntuación / profundidad",
+    "affinityWait": "esperó {{ms}} ms al miembro con la caché",
     "status": "Estado",
     "title": "Metadatos de relay",
     "tokenPrefix": "Prefijo del token",

@@ -88,7 +88,11 @@
       "saved": "CLI renamed",
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
-    }
+    },
+    "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
+    "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
+    "upgradeUnknownProtocol": "unknown",
+    "upgradeUnknownVersion": "(unknown version)"
   },
   "chatTest": {
     "announcements": {
@@ -369,19 +373,15 @@
       "checking": "Checking identity…",
       "offline": "Offline",
       "unpinned": "This browser could not save the key. Compare the fingerprint before you type anything sensitive.",
-      "unverified": "Unverified. Update the CLI to verify its identity.",
       "invalid": "This CLI did not prove its identity. Its terminals are blocked.",
       "changed": "This CLI's identity key changed. Its terminals are blocked until you trust the new key.",
-      "downgraded": "This CLI no longer proves its identity. Its terminals are blocked until you allow it.",
       "pinned": "Pinned",
       "new": "New",
       "trustNew": "Trust new key",
-      "allowUnverified": "Allow unverified",
       "trustTitle": "Trust the new key for {{label}}?",
       "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
       "trustFailed": "The key could not be trusted. Reload and try again.",
       "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
-      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it.",
       "attention": "A CLI's identity key needs review. Its terminals are blocked until you check it.",
       "review": "Review"
     },
@@ -440,7 +440,14 @@
         "affinityMaxRecords": "Maximum records per target",
         "affinityPrefixWeight": "Conversation prefix-depth weight",
         "affinityConversationWeight": "Conversation weight",
-        "affinityLoadPenaltyWeight": "Active-load penalty"
+        "affinityLoadPenaltyWeight": "Active-load penalty",
+        "cacheHolderWaitMs": "Wait for the cache holder"
+      },
+      "cacheHolderWait": {
+        "auto": "Automatic (re-prefill time saved, up to 30 s)",
+        "fixed": "Fixed (milliseconds; 0 turns it off)",
+        "valueLabel": "Cache-holder wait in milliseconds",
+        "hint": "When a continuation's prefix is warm on a busy member, other members are held back for this long so the warm member can take it. Automatic uses the member's measured prefill speed (2 s until it is measured). Maximum 30000 ms. Local wait budgets and the external fallback wait start counting after this hold."
       }
     },
     "capacity": {
@@ -506,6 +513,33 @@
         "template": "Use a matching registered tokenizer and template",
         "engineRequirement": "Requires count-token support on the selected target. WSMP uses a conservative estimate when that support is unavailable.",
         "registeredRequirement": "Requires a registered counter matching this runtime identity. WSMP uses a conservative estimate when no match is available."
+      },
+      "engineFacts": {
+        "engine": "Engine: {{engine}}",
+        "slots_one": "{{count}} slot",
+        "slots_other": "{{count}} slots",
+        "kvBudget": "KV budget: {{value}} tokens",
+        "maxModelLen": "Max context: {{value}} tokens",
+        "preset": "Preset: {{preset}}",
+        "kinds": {
+          "GENERIC": "Generic",
+          "LLAMA_CPP": "llama.cpp",
+          "VLLM": "vLLM",
+          "SGLANG": "SGLang",
+          "OLLAMA": "Ollama",
+          "LM_STUDIO": "LM Studio"
+        },
+        "presets": {
+          "llama.cpp": "llama.cpp (full at its slot count)",
+          "vllm-sglang": "vLLM / SGLang (your cap, then engine load)",
+          "ollama-lm-studio": "Ollama / LM Studio (your parallel setting)",
+          "generic": "Generic (your cap)"
+        },
+        "sources": {
+          "PROBE": "detected by the CLI",
+          "CONFIG": "from the CLI config",
+          "MIXED": "detected and configured"
+        }
       }
     },
     "noneAvailable": "None available",
@@ -545,7 +579,7 @@
       "enabled": "Allow external fallback",
       "forGrantees": "Also for grantees",
       "externalAfterWaitMs": "Wait for local capacity before going external (ms)",
-      "externalAfterWaitHint": "0 goes external at once when no local member is free. If the local wait budget is shorter, the shorter wait applies.",
+      "externalAfterWaitHint": "0 goes external at once when no local member is free (after any cache-holder hold). If the local wait budget is shorter, the shorter wait applies.",
       "waitInvalid": "Enter a whole number of milliseconds from 0 to 600000.",
       "save": "Save fallback settings",
       "saved": "Fallback settings saved",
@@ -846,6 +880,7 @@
     "responseBytes": "Response bytes",
     "attempts": "Attempts",
     "affinity": "Affinity / score / depth",
+    "affinityWait": "waited {{ms}} ms for the cache holder",
     "status": "Status",
     "title": "Relay Metadata",
     "tokenPrefix": "Token prefix",

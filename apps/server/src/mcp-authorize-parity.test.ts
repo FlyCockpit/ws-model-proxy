@@ -114,7 +114,17 @@ function buildApp({ skipConsent = true }: { skipConsent?: boolean } = {}) {
     baseURL: BASE,
     secret: "parity-test-secret-at-least-thirty-two-characters",
     database: memoryAdapter(memory),
-    emailAndPassword: { enabled: true },
+    // Test-only hasher (the two-factor-lockout.test.ts pattern): this suite
+    // proves the AUTHORIZE boundary parity, never password hashing, and real
+    // scrypt dominated its runtime. No assertion here reads the stored hash
+    // format or the scrypt parameters.
+    emailAndPassword: {
+      enabled: true,
+      password: {
+        hash: async (password) => `fast:${password}`,
+        verify: async ({ hash, password }) => hash === `fast:${password}`,
+      },
+    },
     logger: { disabled: true },
     plugins: resolveMcpPlugins({ enabled: true, baseUrl: BASE }),
   });

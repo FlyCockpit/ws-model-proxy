@@ -25,6 +25,7 @@ import {
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
   type CapacityPolicyFailureReasons,
+  cacheHolderWaitMsSchema,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
@@ -376,6 +377,11 @@ const listCliDevicesSelect = {
   reportedMcpCommandMode: true,
   reportedTerminalApproval: true,
   reportedTerminalSupported: true,
+  rejectedRelayProtocolVersion: true,
+  rejectedCliVersion: true,
+  relayRejectedAt: true,
+  nodeInfoAt: true,
+  nodeMetricsAt: true,
   User: { select: { slug: true } },
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
@@ -682,6 +688,19 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     endpointTargeting: row.endpointTargeting,
     cliVersion: row.cliVersion ?? null,
     relayProtocolVersion: row.relayProtocolVersion ?? null,
+    /**
+     * Set when this device's last hello was refused for an old relay
+     * protocol; the next accepted hello clears it.
+     */
+    upgradeRequired: row.relayRejectedAt
+      ? {
+          protocolVersion: row.rejectedRelayProtocolVersion ?? null,
+          cliVersion: row.rejectedCliVersion ?? null,
+          rejectedAt: row.relayRejectedAt,
+        }
+      : null,
+    nodeInfoAt: row.nodeInfoAt ?? null,
+    nodeMetricsAt: row.nodeMetricsAt ?? null,
     features: {
       terminal: {
         granted: row.allowHumanTerminal === true,
@@ -904,6 +923,7 @@ function serializePool(row: ModelPoolRow) {
       confirmedCacheWeight: row.affinityConfirmedCacheWeight,
       loadPenaltyWeight: row.affinityLoadPenaltyWeight,
     },
+    cacheHolderWaitMs: row.cacheHolderWaitMs,
     compatibility: {
       recommendedSurface,
       suggestedConnectionType: suggestedSurface,
@@ -1334,6 +1354,7 @@ const poolSelect = {
   affinityConversationWeight: true,
   affinityConfirmedCacheWeight: true,
   affinityLoadPenaltyWeight: true,
+  cacheHolderWaitMs: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -2290,6 +2311,51 @@ export const forwarderManagementRouter = {
       return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
     }),
 
+  /**
+   * Relay 2.7 node telemetry for one CLI device: its static `node.info`, the
+   * freshest `node.metrics` (live from the relay session, else the stored
+   * once-a-minute snapshot) and live engine load per endpoint. Read-only.
+   */
+  getCliDeviceMetrics: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const row = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: {
+          id: true,
+          userId: true,
+          slug: true,
+          status: true,
+          nodeInfo: true,
+          nodeInfoAt: true,
+          nodeMetrics: true,
+          nodeMetricsAt: true,
+        },
+      });
+      if (!row || row.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const live = context.services?.getLiveNodeTelemetry?.([row.id]).get(row.id) ?? null;
+      const liveMetrics = live?.nodeMetrics ? live : null;
+      return {
+        cliDeviceId: row.id,
+        slug: row.slug,
+        live: live !== null,
+        nodeInfo: row.nodeInfo ?? null,
+        nodeInfoAt: row.nodeInfoAt ?? null,
+        nodeMetrics: liveMetrics ? liveMetrics.nodeMetrics : (row.nodeMetrics ?? null),
+        nodeMetricsAt: liveMetrics
+          ? liveMetrics.nodeMetricsReceivedAt
+          : (row.nodeMetricsAt ?? null),
+        nodeMetricsSource: liveMetrics
+          ? ("live" as const)
+          : row.nodeMetrics
+            ? ("stored" as const)
+            : null,
+        endpointLoad: live?.endpointLoad ?? [],
+      };
+    }),
+
   setCliDeviceFeatureGrants: protectedProcedure
     .input(
       z
@@ -2507,6 +2573,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2587,6 +2654,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: input.affinityConversationWeight ?? 150,
         affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
         affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
+        cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
       } as const;
       const capacityPolicy = {
         capacityPriority: data.capacityPriority,
@@ -2658,6 +2726,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
         ...modelPoolCapacityPolicyFields,
       }),
     )
@@ -2848,6 +2917,9 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.affinityLoadPenaltyWeight !== undefined
               ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.cacheHolderWaitMs !== undefined
+              ? { cacheHolderWaitMs: input.cacheHolderWaitMs }
               : {}),
             ...(input.capacityPriority !== undefined
               ? { capacityPriority: input.capacityPriority }

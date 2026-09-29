@@ -1022,6 +1022,52 @@ function PoolFallbackSettings({
   );
 }
 
+/** Relay 2.7 engine facts the CLI detected for this capacity, and their source. */
+function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
+  const { t } = useTranslation(["dashboard"]);
+  if (
+    !capacity.engineKind &&
+    capacity.engineSlots === null &&
+    capacity.kvBudgetTokens === null &&
+    capacity.maxModelLen === null
+  ) {
+    return null;
+  }
+  const facts = [
+    capacity.engineKind
+      ? t("dashboard:pools.capacity.engineFacts.engine", {
+          engine: t(`dashboard:pools.capacity.engineFacts.kinds.${capacity.engineKind}`),
+        })
+      : null,
+    capacity.engineSlots !== null
+      ? t("dashboard:pools.capacity.engineFacts.slots", { count: capacity.engineSlots })
+      : null,
+    capacity.kvBudgetTokens !== null
+      ? t("dashboard:pools.capacity.engineFacts.kvBudget", {
+          value: capacity.kvBudgetTokens.toLocaleString(),
+        })
+      : null,
+    capacity.maxModelLen !== null
+      ? t("dashboard:pools.capacity.engineFacts.maxModelLen", {
+          value: capacity.maxModelLen.toLocaleString(),
+        })
+      : null,
+  ].filter((fact): fact is string => fact !== null);
+  return (
+    <div className="mt-2 min-w-0 space-y-1 text-xs text-muted-foreground">
+      <p className="break-words">{facts.join(" · ")}</p>
+      <p className="break-words">
+        {t("dashboard:pools.capacity.engineFacts.preset", {
+          preset: t(`dashboard:pools.capacity.engineFacts.presets.${capacity.enginePreset.preset}`),
+        })}
+        {capacity.engineFactsSource
+          ? ` · ${t(`dashboard:pools.capacity.engineFacts.sources.${capacity.engineFactsSource}`)}`
+          : null}
+      </p>
+    </div>
+  );
+}
+
 export function InferenceCapacityPage() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -1105,6 +1151,7 @@ export function InferenceCapacityPage() {
                       limit: capacity.hardConcurrencyLimit ?? "∞",
                     })}
                   </p>
+                  <CapacityEngineFacts capacity={capacity} />
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button size="touch" variant="outline" onClick={() => setEditingId(capacity.id)}>

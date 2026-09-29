@@ -104,7 +104,7 @@ function capabilities26(features?: {
   terminalSupported?: boolean;
 }) {
   return {
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     inventoryAck: true,
     inventoryReplace: true,
     endpointTargeting: true,
@@ -122,10 +122,12 @@ function capabilities26(features?: {
       mcpCommandMode: features?.mcpCommandMode ?? "unsupervised",
       terminalApproval: features?.terminalApproval ?? false,
       terminalSupported: features?.terminalSupported ?? true,
+      remoteMetricSources: false,
     },
     terminalPublicKey: uncompressedKey(),
     terminalViewers: true,
     supervisedCommands: true,
+    nodeTelemetry: true,
   };
 }
 
@@ -133,7 +135,7 @@ function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -245,6 +247,25 @@ describe("relay drain", () => {
     expect(second.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     expect(settled).toBe(false);
+    manager.dispose();
+  });
+
+  it("refuses a socket accepted after the drain began: shutdown close, never registered", async () => {
+    const manager = new RelaySessionManager();
+    const late = new FakeSocket();
+    manager.beginDrain();
+    expect(manager.acceptAuthenticatedSocket({ socket: late, identity, now })).toBe(false);
+    expect(late.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    // Not registered: its frames are an unknown socket, and no unregistered timer runs.
+    await expect(manager.handleTextFrame(late, helloFrame(), now)).rejects.toThrow(
+      "Unknown relay socket.",
+    );
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    // A socket that was already closed is not closed twice.
+    const gone = new FakeSocket();
+    gone.readyState = 3;
+    expect(manager.acceptAuthenticatedSocket({ socket: gone, identity, now })).toBe(false);
+    expect(gone.closes).toEqual([]);
     manager.dispose();
   });
 
@@ -680,7 +701,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.6",
+      protocolVersion: "2.7",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -930,7 +951,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.6",
+      protocolVersion: "2.7",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -1309,7 +1330,7 @@ function hello24(features?: {
   return JSON.stringify({
     type: "hello",
     id: "hello-24",
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -1348,12 +1369,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, hello24({ mcpCommandMode: "supervised" }));
-    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.6");
+    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.7");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.6",
+          relayProtocolVersion: "2.7",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -1400,6 +1421,20 @@ describe("relay terminal and exec sessions", () => {
   });
 
   it.each([
+    [
+      "a 2.6 hello (a released 0.4.x CLI)",
+      (() => {
+        const frame = JSON.parse(hello24()) as {
+          protocolVersion: string;
+          cli: { capabilities: Record<string, unknown> & { features: Record<string, unknown> } };
+        };
+        frame.protocolVersion = "2.6";
+        frame.cli.capabilities.protocolVersion = "2.6";
+        delete frame.cli.capabilities.nodeTelemetry;
+        delete frame.cli.capabilities.features.remoteMetricSources;
+        return JSON.stringify(frame);
+      })(),
+    ],
     [
       "a 2.5 hello",
       (() => {
@@ -1471,7 +1506,51 @@ describe("relay terminal and exec sessions", () => {
     consoleError.mockRestore();
   });
 
-  it("registers a valid 2.6 hello", async () => {
+  it("records a refused hello's versions on the device a bound credential names", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(hello24()) as {
+      protocolVersion: string;
+      cli: { version?: string; capabilities: Record<string, unknown> };
+    };
+    frame.protocolVersion = "2.6";
+    frame.cli.version = "0.4.0";
+    frame.cli.capabilities.protocolVersion = "2.6";
+    manager.acceptAuthenticatedSocket({
+      socket,
+      identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
+      now,
+    });
+    await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "bound-device", userId: "user-id" },
+      data: {
+        rejectedRelayProtocolVersion: "2.6",
+        rejectedCliVersion: "0.4.0",
+        relayRejectedAt: now,
+      },
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      "[relay] refused a hello older than the minimum relay protocol",
+      { protocolVersion: "2.6", cliVersion: "0.4.0" },
+    );
+
+    // An unbound token names no device: nothing is written.
+    db.cliDevice.updateMany.mockClear();
+    const unbound = new FakeSocket();
+    await register(manager, unbound, JSON.stringify(frame));
+    expect(unbound.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(db.cliDevice.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.6" }),
+      }),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("registers a valid 2.7 hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket);
@@ -1740,19 +1819,19 @@ describe("relay protocol 2.5 terminal viewers", () => {
     });
   }
 
-  it("keeps MCP commands and terminal keys for a 2.6 CLI and persists the version", async () => {
+  it("keeps MCP commands and terminal keys for a 2.7 CLI and persists the version", async () => {
     const { manager } = await setup();
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.6",
+          relayProtocolVersion: "2.7",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.6",
+      protocolVersion: "2.7",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -2118,5 +2197,200 @@ describe("relay protocol 2.5 terminal viewers", () => {
     await manager.removeSession(socket, now);
     expect(events.at(-1)).toMatchObject({ type: "exit", terminalId: second, connIds: ["a"] });
     expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+  });
+});
+
+describe("relay 2.7 telemetry", () => {
+  const metrics = (ts: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "node.metrics",
+      ts,
+      cpu: { usagePercent: 12.5, load1: 0.5 },
+      memory: { totalMiB: 1000, availableMiB: 500 },
+      ...extra,
+    });
+  const load = (endpointSlug: string, running: number, modelSlug?: string) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug,
+      ...(modelSlug ? { modelSlug } : {}),
+      running,
+      waiting: 0,
+      kvUsage: 0.25,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+    });
+  const at = (ms: number) => new Date(now.getTime() + ms);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    seedRegistrationMocks();
+  });
+
+  async function registered() {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    db.cliDevice.updateMany.mockClear();
+    db.cliDevice.update.mockClear();
+    return { manager, socket };
+  }
+
+  function telemetryWrites() {
+    return db.cliDevice.updateMany.mock.calls
+      .map((call) => call[0] as { where: { id: string }; data: Record<string, unknown> })
+      .filter((args) => "nodeInfo" in args.data || "nodeMetrics" in args.data);
+  }
+
+  it("stores node.info once per connection and drops a repeat within a minute", async () => {
+    const { manager, socket } = await registered();
+    const info = JSON.stringify({ type: "node.info", nodeKind: "unified", cliVersion: "0.4.0" });
+    await manager.handleTextFrame(socket, info, now);
+    await manager.handleTextFrame(socket, info, at(30_000));
+    expect(telemetryWrites()).toEqual([
+      {
+        where: { id: "cli-device-id" },
+        data: { nodeInfo: { nodeKind: "unified", cliVersion: "0.4.0" }, nodeInfoAt: now },
+      },
+    ]);
+    await manager.handleTextFrame(socket, info, at(61_000));
+    expect(telemetryWrites()).toHaveLength(2);
+    expect(socket.closes).toEqual([]);
+    manager.dispose();
+  });
+
+  it("keeps the freshest metrics live, drops frames under 4 s apart, and persists once a minute", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:01.000Z"), at(1_000));
+    let live = manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id");
+    expect(live?.nodeMetrics).toMatchObject({ ts: "2026-01-01T00:00:00.000Z" });
+    expect(live?.nodeMetricsReceivedAt).toEqual(now);
+
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:20.000Z"), at(20_000));
+    live = manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id");
+    expect(live?.nodeMetrics).toMatchObject({ ts: "2026-01-01T00:00:20.000Z" });
+    expect(live?.nodeMetrics).not.toHaveProperty("type");
+    // Persisted for the first frame only; the next write waits a minute.
+    expect(telemetryWrites()).toHaveLength(1);
+    expect(telemetryWrites()[0]?.data).toMatchObject({ nodeMetricsAt: now });
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:01:00.000Z"), at(60_000));
+    expect(telemetryWrites()).toHaveLength(2);
+    manager.dispose();
+  });
+
+  it("keeps endpoint.load in memory only, rate-limited per endpoint and model", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, load("vllm", 1), now);
+    await manager.handleTextFrame(socket, load("vllm", 2), at(500));
+    await manager.handleTextFrame(socket, load("vllm", 3, "llama"), at(600));
+    await manager.handleTextFrame(socket, load("sglang", 4), at(700));
+    let loads = manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")?.endpointLoad;
+    expect(loads?.map((entry) => [entry.endpointSlug, entry.modelSlug, entry.running])).toEqual([
+      ["vllm", null, 1],
+      ["vllm", "llama", 3],
+      ["sglang", null, 4],
+    ]);
+    await manager.handleTextFrame(socket, load("vllm", 5), at(1_500));
+    loads = manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")?.endpointLoad;
+    expect(loads?.[0]).toMatchObject({ running: 5, receivedAt: at(1_500) });
+    expect(loads?.[0]).not.toHaveProperty("receivedAtMs");
+    expect(db.cliDevice.updateMany).not.toHaveBeenCalled();
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("bounds the endpoint load keys a session keeps", async () => {
+    const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
+    const { manager, socket } = await registered();
+    for (let index = 0; index <= ENDPOINT_LOAD_MAX_KEYS; index += 1) {
+      await manager.handleTextFrame(socket, load("vllm", index, `m${index}`), now);
+    }
+    const loads = manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id");
+    expect(loads?.endpointLoad).toHaveLength(ENDPOINT_LOAD_MAX_KEYS);
+    manager.dispose();
+  });
+
+  it("drops a telemetry frame outside the strict schema without closing the session", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { manager, socket } = await registered();
+    const rejected = [
+      // An unknown field: nothing from it is stored or logged.
+      metrics("2026-01-01T00:00:00.000Z", { stderr: "leaked" }),
+      // An out-of-range reading (kernel iowait regression can push this past 100).
+      metrics("2026-01-01T00:00:00.000Z", { cpu: { usagePercent: 101.3 } }),
+      JSON.stringify({ type: "node.info", os: { name: "a\u0000b" } }),
+      JSON.stringify({ type: "node.info", gpus: [{ index: 0, uuid: "u".repeat(129) }] }),
+      JSON.stringify({ ...JSON.parse(load("vllm", 1)), running: 1_000_001 }),
+    ];
+    for (const frame of rejected) await manager.handleTextFrame(socket, frame, now);
+    expect(socket.closes).toEqual([]);
+    expect(telemetryWrites()).toEqual([]);
+    expect(manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")).toEqual({
+      nodeMetrics: null,
+      nodeMetricsReceivedAt: null,
+      endpointLoad: [],
+    });
+    // Logged once (per minute per session), by type only.
+    expect(consoleError.mock.calls).toEqual([
+      ["[relay] malformed telemetry frame dropped", "node.metrics"],
+    ]);
+    // The rejected frames spent no rate-limit slot: valid ones still land.
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:01.000Z"), at(1_000));
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "node.info", os: { name: "Ubuntu" } }),
+      at(1_000),
+    );
+    expect(telemetryWrites()).toHaveLength(2);
+    consoleError.mockRestore();
+    manager.dispose();
+  });
+
+  it("persists the metrics snapshot at most once a minute per device, across reconnects", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+    // The write is conditional on the stored timestamp, so a snapshot stored
+    // by an earlier session (or another instance) inside the window wins.
+    expect(telemetryWrites()).toEqual([
+      {
+        where: {
+          OR: [{ nodeMetricsAt: null }, { nodeMetricsAt: { lte: at(-60_000) } }],
+          id: "cli-device-id",
+        },
+        data: expect.objectContaining({ nodeMetricsAt: now }),
+      },
+    ]);
+    manager.dispose();
+  });
+
+  it("requires registration before telemetry", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, load("vllm", 1), now);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(manager.getLiveNodeTelemetry(["cli-device-id"]).size).toBe(0);
+    manager.dispose();
+  });
+
+  it("still closes an unregistered socket that sends malformed telemetry", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(
+      socket,
+      metrics("2026-01-01T00:00:00.000Z", { cpu: { usagePercent: 101.3 } }),
+      now,
+    );
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(consoleError).not.toHaveBeenCalledWith(
+      "[relay] malformed telemetry frame dropped",
+      "node.metrics",
+    );
+    consoleError.mockRestore();
+    manager.dispose();
   });
 });

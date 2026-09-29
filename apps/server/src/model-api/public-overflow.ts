@@ -27,6 +27,7 @@ import {
   surfaceAvailabilityMatrix,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import {
   type AffinityDecision,
@@ -36,6 +37,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
+import { capacityLeaseLostSignal } from "./capacity/lease-loss.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import {
   applyOpenRouterDataCollection,
@@ -87,6 +89,11 @@ export type PublicOverflowSkipReason =
   | "REQUESTER_NOT_VISIBLE"
   /** The requester's account is banned or marked for deletion. */
   | "REQUESTER_ACCESS_BLOCKED"
+  /**
+   * The pool owner's account is banned (active ban) or marked for deletion:
+   * the pool is unavailable to everyone (#76).
+   */
+  | "POOL_OWNER_INACTIVE"
   /** Durable provider admission did not admit within its wait budget. */
   | "PROVIDER_SATURATED"
   | "OWN_KEY_CONSENT_WITHDRAWN"
@@ -104,8 +111,11 @@ export type PublicOverflowSkipReason =
   | "PROVIDER_UNAVAILABLE"
   /**
    * Transient: the send-claim transaction failed before any provider I/O
-   * (lock or connection timeout, credential rotated or revoked meanwhile,
-   * decrypt failure). No provider health verdict is recorded for it.
+   * (lock or connection timeout, including the claim's own `lock_timeout`
+   * (EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS), credential rotated or revoked
+   * meanwhile, decrypt failure). No provider health verdict is recorded for
+   * it; the attempt's budget reservation is settled as not sent. Callers
+   * answer it as temporarily unavailable (503).
    */
   | "SEND_CLAIM_FAILED"
   /**
@@ -128,6 +138,7 @@ export function isExternalConsentDenialReason(reason: PublicOverflowSkipReason):
     reason === "CALLER_CONSENT_WITHDRAWN" ||
     reason === "REQUESTER_NOT_VISIBLE" ||
     reason === "REQUESTER_ACCESS_BLOCKED" ||
+    reason === "POOL_OWNER_INACTIVE" ||
     reason === "OWN_KEY_CONSENT_WITHDRAWN" ||
     reason === "POOL_PRIVATE" ||
     reason === "GRANTEE_NOT_COVERED"
@@ -364,6 +375,11 @@ export function matchesExactResponsesBinding(
 type ListedPublicOverflowTargets = {
   /** Owner's fallback switch (`ModelPool.fallbackEnabled`). */
   enabled: boolean;
+  /**
+   * The pool owner's account is neither banned (active ban) nor marked for
+   * deletion (#76). An early, unlocked read: the send claim re-checks it.
+   */
+  ownerActive: boolean;
   /** Owner pays for grantees' external fallback. */
   fallbackForGrantees: boolean;
   affinityPolicy: AffinityPolicy;
@@ -424,6 +440,7 @@ type ExternalConsentSkipReason = Extract<
   | "CALLER_CONSENT_WITHDRAWN"
   | "REQUESTER_NOT_VISIBLE"
   | "REQUESTER_ACCESS_BLOCKED"
+  | "POOL_OWNER_INACTIVE"
   | "OWN_KEY_CONSENT_WITHDRAWN"
   | "POOL_PRIVATE"
   | "GRANTEE_NOT_COVERED"
@@ -453,14 +470,96 @@ export type PublicProviderSendClaim =
     };
 
 /**
+ * Upper bound on each lock wait of the send-claim transaction (L1b, #64):
+ * a transaction-local `lock_timeout`. While the claim waits on the hot
+ * `provider_account` row (budget admission, settlement and the provider
+ * runtime lock it) it holds the pool, grant, token and allowlist rows FOR
+ * SHARE, which blocks their writers. The bound keeps that hold short; a
+ * timed-out claim throws (SQLSTATE 55P03), nothing is sent, and the
+ * dispatcher settles it as `SEND_CLAIM_FAILED` (transient, 503).
+ */
+export const EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS = 2_000;
+
+/**
+ * E0 send boundary, target part (#64 "decide" item, coordinator decision
+ * 2026-09-28): re-reads, after the claim's last lock wait, whether the target
+ * listed for this attempt is still current.
+ *
+ *   - provider model: exists, not deleted, enabled, same account, upstream
+ *     model and execution target; its account keeps the listed endpoint
+ *     identity and version. The model row is held FOR SHARE (C5) and its
+ *     account FOR UPDATE, and every provider writer takes the account first.
+ *   - pool member (pool fallback only; own-key has none): still in this pool
+ *     for the same execution target, PUBLIC_OVERFLOW tier, routing ACTIVE.
+ *     Read WITHOUT a lock, like the `user` rows: nothing after this read
+ *     waits, and the claim writes no row a member writer reads, so a removal
+ *     or disable committing after the read serializes after the claim.
+ *
+ * Returns null when the target is current. A member, model or endpoint that
+ * no longer matches is `BOUND_TARGET_INVALID` for a stored-response binding
+ * or own-key (never servable again as bound), otherwise
+ * `PROVIDER_UNAVAILABLE`; a disabled model or account is
+ * `PROVIDER_UNAVAILABLE`. These are availability results, not consent
+ * denials: the dispatcher tries the next member only when retry-safe.
+ */
+async function recheckExternalSendTarget(
+  tx: Prisma.TransactionClient,
+  input: {
+    userId: string;
+    target: PublicProviderTarget;
+    consent: ExternalSendConsentIdentity;
+    exactBinding?: boolean;
+  },
+): Promise<"BOUND_TARGET_INVALID" | "PROVIDER_UNAVAILABLE" | null> {
+  const ownKey = Boolean(input.consent.ownKeyProviderModelId);
+  const gone = input.exactBinding || ownKey ? "BOUND_TARGET_INVALID" : "PROVIDER_UNAVAILABLE";
+  const [model, member] = await Promise.all([
+    tx.providerModel.findFirst({
+      where: {
+        id: input.target.providerModelId,
+        userId: input.userId,
+        deletedAt: null,
+        providerAccountId: input.target.providerAccountId,
+        upstreamModelId: input.target.upstreamModelId,
+        ExecutionTarget: { id: input.target.executionTargetId },
+        ProviderAccount: {
+          userId: input.userId,
+          deletedAt: null,
+          endpointIdentity: input.target.endpointIdentity,
+          endpointVersion: input.target.endpointVersion,
+        },
+      },
+      select: { enabled: true, ProviderAccount: { select: { enabled: true } } },
+    }),
+    ownKey
+      ? Promise.resolve({ id: "" })
+      : tx.poolMember.findFirst({
+          where: {
+            id: input.target.poolMemberId,
+            poolId: input.consent.poolId,
+            executionTargetId: input.target.executionTargetId,
+            tier: "PUBLIC_OVERFLOW",
+            routingStatus: "ACTIVE",
+          },
+          select: { id: true },
+        }),
+  ]);
+  if (!model || !member) return gone;
+  if (!model.enabled || !model.ProviderAccount.enabled) return "PROVIDER_UNAVAILABLE";
+  return null;
+}
+
+/**
  * The E0 send boundary: the last step before provider I/O. In one
  * transaction it (1) re-validates every `:external` consent condition while
  * holding the consent rows FOR SHARE (lockExternalSendConsent), (2) takes the
  * provider account and credential locks, the last statements that can wait,
  * and re-reads the account's D9 data-collection policy under the account lock
- * (returned so the dispatcher can tighten the rendered body), (3) re-evaluates the time- and account-dependent validity of the requester
- * (token expiry, ban, deletion mark) at a fresh `now`
- * (recheckExternalSendRequesterValidity), then (4) atomically claims the
+ * (returned so the dispatcher can tighten the rendered body), (3) re-evaluates
+ * the time- and account-dependent validity of the requester (token expiry,
+ * ban, deletion mark), and the pool owner's (ban, deletion mark, #76), at a
+ * fresh `now` (recheckExternalSendRequesterValidity) and that the listed
+ * target is still current (recheckExternalSendTarget), then (4) atomically claims the
  * current credential. `lastUsedAt` is the durable boundary: credential
  * lifecycle changes serialize on the account/credential rows, consent
  * withdrawals on the consent rows, and the actual provider request happens
@@ -468,19 +567,24 @@ export type PublicProviderSendClaim =
  * the corresponding check is observed here; one that commits after it cannot
  * cancel a send that has already been claimed.
  *
- * A throw from this function (lock or connection timeout, credential no
- * longer current, decrypt failure) means nothing was sent; the dispatcher
- * settles it without a provider health verdict.
+ * A throw from this function (lock or connection timeout, including the
+ * transaction-local EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS, credential no longer
+ * current, decrypt failure) means nothing was sent; the dispatcher settles it
+ * without a provider health verdict.
  *
  * Lock order: model_pool -> pool_grant -> model_api_token ->
- * model_api_token_allowlist_entry (FOR SHARE), then provider_account ->
- * provider_credential (FOR UPDATE). See packages/db/src/capacity-lock-order.ts.
+ * model_api_token_allowlist_entry (FOR SHARE), then provider_account FOR
+ * UPDATE -> provider_model FOR SHARE -> provider_credential FOR UPDATE (and,
+ * own-key, pool_fallback_preference FOR SHARE). See
+ * packages/db/src/capacity-lock-order.ts.
  */
 export async function claimPublicProviderCredentialForSend(input: {
   userId: string;
   target: PublicProviderTarget;
   keyring: ReturnType<typeof parseProviderCredentialKeyring>;
   consent: ExternalSendConsentIdentity;
+  /** The attempt serves a stored-response binding (exactResponsesBinding). */
+  exactBinding?: boolean;
 }): Promise<PublicProviderSendClaim> {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
@@ -491,19 +595,22 @@ export async function claimPublicProviderCredentialForSend(input: {
     return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
   return prisma.$transaction(
     async (tx): Promise<PublicProviderSendClaim> => {
+      // First statement: bound every lock wait below (L1b). Not a lock.
+      await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS}ms`}, true)`;
       const denial = await lockExternalSendConsent(tx, input.consent);
       if (denial) return { claimed: false, reason: consentSkipReason(denial) };
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
       // D9: the privacy switch commits under this same account row lock
       // (providerManagement.setAllowDataCollection), so this read sees every
-      // withdrawal that committed before the claim.
+      // withdrawal that committed before the claim. Not a lock.
       const privacyAccount = await tx.providerAccount.findFirst({
         where: { id: input.target.providerAccountId, userId: input.userId, deletedAt: null },
         select: { providerType: true, allowDataCollection: true },
       });
-      if (!privacyAccount) throw new Error("provider account is no longer available");
-      if (input.consent.ownKeyProviderModelId)
-        await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.target.providerModelId} AND "userId" = ${input.userId} FOR SHARE`;
+      // C5: the provider model FOR SHARE on every path (pool fallback and
+      // own-key), so its enabled state and identity re-read below are frozen
+      // until the claim commits.
+      await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.target.providerModelId} AND "userId" = ${input.userId} FOR SHARE`;
       await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
       if (input.consent.ownKeyProviderModelId) {
         await tx.$queryRaw`SELECT id FROM pool_fallback_preference WHERE "poolId" = ${input.consent.poolId} AND "userId" = ${input.userId} FOR SHARE`;
@@ -517,31 +624,20 @@ export async function claimPublicProviderCredentialForSend(input: {
           select: { id: true },
         });
         if (!preference) return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
-        const model = await tx.providerModel.findFirst({
-          where: {
-            id: input.target.providerModelId,
-            userId: input.userId,
-            deletedAt: null,
-            providerAccountId: input.target.providerAccountId,
-            upstreamModelId: input.target.upstreamModelId,
-            ExecutionTarget: { id: input.target.executionTargetId },
-            ProviderAccount: {
-              userId: input.userId,
-              deletedAt: null,
-              endpointIdentity: input.target.endpointIdentity,
-              endpointVersion: input.target.endpointVersion,
-            },
-          },
-          select: { enabled: true, ProviderAccount: { select: { enabled: true } } },
-        });
-        if (!model) return { claimed: false, reason: "BOUND_TARGET_INVALID" };
-        if (!model.enabled || !model.ProviderAccount.enabled)
-          return { claimed: false, reason: "PROVIDER_UNAVAILABLE" };
       }
       // Nothing below waits on a lock: re-evaluate what time or an unlocked
-      // row (the requester's account) can have changed while we waited.
+      // row (the requester's and the pool owner's accounts) can have changed
+      // while we waited.
       const lapsed = await recheckExternalSendRequesterValidity(tx, input.consent);
       if (lapsed) return { claimed: false, reason: consentSkipReason(lapsed) };
+      // Target availability, after consent (a consent denial wins): the
+      // listed member, provider model and endpoint must still be the ones
+      // this attempt was admitted and rendered for.
+      const changed = await recheckExternalSendTarget(tx, input);
+      if (changed) return { claimed: false, reason: changed };
+      // A deleted account is classified by the target re-check above
+      // (C6-3); a missing policy row past it is an invariant break.
+      if (!privacyAccount) throw new Error("provider account is no longer available");
       const current = await tx.providerCredential.findFirst({
         where: {
           id: input.target.credential.id,
@@ -901,6 +997,7 @@ export async function listPublicOverflowTargets(
       affinityConfirmedCacheWeight: true,
       affinityLoadPenaltyWeight: true,
       capacityWaitBudgetMs: true,
+      User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
       PoolMembers: {
         where: {
           tier: "PUBLIC_OVERFLOW",
@@ -938,6 +1035,7 @@ export async function listPublicOverflowTargets(
   if (!pool)
     return {
       enabled: false,
+      ownerActive: false,
       fallbackForGrantees: false,
       affinityPolicy: defaultAffinityPolicy,
       targets: [],
@@ -1062,6 +1160,8 @@ export async function listPublicOverflowTargets(
   });
   return {
     enabled: pool.fallbackEnabled,
+    // Fail closed on a partial row: the owner relation is required.
+    ownerActive: pool.User ? poolOwnerActive(pool.User, now) : false,
     fallbackForGrantees: pool.fallbackForGrantees,
     affinityPolicy: {
       enabled: pool.affinityEnabled,
@@ -1186,12 +1286,16 @@ function replaceModel(body: Uint8Array, model: string): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(parsed));
 }
 
-function terminalReason(signal: AbortSignal, ok: boolean) {
-  return signal.aborted
-    ? ("CANCELLED" as const)
-    : ok
-      ? ("COMPLETED" as const)
-      : ("FAILED" as const);
+/**
+ * Durable facts for a provider attempt whose dispatch signal aborted. The
+ * signal is the capacity lease's: a lost lease is a server-side failure
+ * (F2-CAP-3), recorded as such and never as a client cancellation. Neither
+ * counts against provider health (callers skip health on any abort).
+ */
+function abortedAttemptFacts(signal: AbortSignal) {
+  return capacityLeaseLostSignal(signal)
+    ? ({ reason: "CAPACITY_LEASE_LOST", terminalState: "FAILED", budgetReason: "FAILED" } as const)
+    : ({ reason: "CANCELLED", terminalState: "CANCELLED", budgetReason: "CANCELLED" } as const);
 }
 
 function usageInteger(value: unknown): bigint | undefined {
@@ -1276,12 +1380,10 @@ const OPENROUTER_DETAIL_CONTAINERS = [
 const OPENROUTER_SERVER_TOOL_KEYS = new Set(["web_search_requests"]);
 
 function openRouterMetadataValid(usage: Record<string, unknown>): boolean {
-  if (
-    Object.hasOwn(usage, "is_byok") &&
-    usage.is_byok !== null &&
-    typeof usage.is_byok !== "boolean"
-  )
-    return false;
+  // Every capture carries a boolean. `is_byok` decides whether the upstream
+  // provider cost is added to `cost`, so a missing, null or non-boolean value
+  // is invalid usage, not "not BYOK".
+  if (typeof usage.is_byok !== "boolean") return false;
   if (Object.hasOwn(usage, "cost_details") && usage.cost_details !== null) {
     const details = usageRecord(usage.cost_details);
     if (
@@ -1691,6 +1793,12 @@ function classifyTerminalRecord(
   try {
     const value = JSON.parse(record.data) as Record<string, unknown>;
     const dataType = typeof value.type === "string" ? value.type : undefined;
+    // A terminal needs an explicit `event:` line that agrees with the record's
+    // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
+    // its terminal is deliberately NOT recognised (the stream is read to EOF and
+    // the full hold stays): recognising a data-only record as a terminal cuts
+    // the read off at the first such record, which makes billing depend on
+    // transport chunking and lets a mismatching record's usage stand.
     if (!record.event || record.event !== dataType) return undefined;
     if (record.event === "error") return "FAILED";
     if (surface === "anthropic-messages")
@@ -1764,7 +1872,7 @@ export function retainProviderUsagePrefix(
  *   `message_delta` event; Responses: the non-stream `response` body or the
  *   terminal `response.completed` / `.incomplete` / `.failed` event);
  * - `superseded`: Messages `message_start` usage, a partial snapshot that the
- *   final `message_delta` replaces;
+ *   final `message_delta` replaces (it may never exceed the final usage);
  * - `ambiguous`: usage in any other root carrier (`usage`, `response.usage`,
  *   `message.usage`; nested objects are never read), or in two carriers of
  *   one record;
@@ -1772,7 +1880,7 @@ export function retainProviderUsagePrefix(
  */
 type OpenRouterRecordUsage =
   | { kind: "final"; usage: unknown }
-  | { kind: "superseded" }
+  | { kind: "superseded"; usage: unknown }
   | { kind: "ambiguous" };
 
 const RESPONSES_TERMINAL_EVENTS = new Set([
@@ -1805,7 +1913,8 @@ function openRouterRecordUsage(
   if (carriers.length > 1) return { kind: "ambiguous" };
   const type = typeof root.type === "string" ? root.type : undefined;
   if (surface === "anthropic-messages") {
-    if (type === "message_start" && messageUsage !== null) return { kind: "superseded" };
+    if (type === "message_start" && messageUsage !== null)
+      return { kind: "superseded", usage: messageUsage };
     if ((type === "message_delta" || type === "message") && rootUsage !== null)
       return { kind: "final", usage: rootUsage };
     return { kind: "ambiguous" };
@@ -1831,6 +1940,7 @@ function openRouterRecordUsage(
 export class OpenRouterUsageRecords {
   readonly #surface: ProtocolSurface;
   readonly #finals = new Map<string, unknown>();
+  readonly #snapshots: unknown[] = [];
   #superseded = 0;
   #ambiguous = false;
   #readable = true;
@@ -1843,8 +1953,12 @@ export class OpenRouterUsageRecords {
     const classified = openRouterRecordUsage(this.#surface, value);
     if (!classified) return;
     if (classified.kind === "ambiguous") this.#ambiguous = true;
-    else if (classified.kind === "superseded") this.#superseded += 1;
-    else if (this.#finals.size < 2)
+    else if (classified.kind === "superseded") {
+      this.#superseded += 1;
+      // Only the first snapshot is ever compared (and settlement requires at
+      // most one superseded record), so one slot is enough.
+      if (this.#snapshots.length < 1) this.#snapshots.push(classified.usage);
+    } else if (this.#finals.size < 2)
       this.#finals.set(JSON.stringify(classified.usage), classified.usage);
   }
 
@@ -1873,7 +1987,11 @@ export class OpenRouterUsageRecords {
         ? openRouterAnthropicUsage(usage)
         : usageFromObject({ usage }, "openrouter");
     const only =
-      finals.length === 1 && this.#superseded <= 1 && !this.#ambiguous && this.#readable
+      finals.length === 1 &&
+      this.#superseded <= 1 &&
+      !this.#ambiguous &&
+      this.#readable &&
+      !openRouterUsageRegressed(this.#snapshots[0], finals[0])
         ? normalize(finals[0])
         : undefined;
     const charged =
@@ -1888,6 +2006,33 @@ export class OpenRouterUsageRecords {
       rawUsage: rawUsage.length === 1 ? rawUsage[0] : rawUsage,
     });
   }
+}
+
+const OPENROUTER_MONOTONIC_KEYS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+] as const;
+
+/**
+ * Messages usage only grows: the final `message_delta` counts are at least the
+ * `message_start` snapshot's. A final lower in any counted field cannot be
+ * attributed (rejected, not repaired with a per-field maximum, so a lower
+ * total is never charged); an unreadable snapshot counter fails closed too.
+ */
+function openRouterUsageRegressed(snapshot: unknown, final: unknown): boolean {
+  if (snapshot === undefined) return false;
+  const early = usageRecord(snapshot);
+  const last = usageRecord(final);
+  if (!early || !last) return true;
+  return OPENROUTER_MONOTONIC_KEYS.some((key) => {
+    // An absent counter is zero; a PRESENT one (null included) must be a
+    // readable integer, or the snapshot cannot bound the final.
+    const before = Object.hasOwn(early, key) ? usageInteger(early[key]) : 0;
+    const after = Object.hasOwn(last, key) ? usageInteger(last[key]) : 0;
+    return before === undefined || after === undefined || after < before;
+  });
 }
 
 /**
@@ -2485,6 +2630,9 @@ export async function dispatchPublicOverflow(
     readExternalConsentDenial(sendConsent),
   ]);
   if (callerDenial === "REQUESTER_NOT_VISIBLE") return { dispatched: false, reason: callerDenial };
+  // #76: a banned or deletion-marked owner's pool is unavailable to everyone,
+  // own-key included (request-wide, never a fall-through to another tier).
+  if (!listed.ownerActive) return { dispatched: false, reason: "POOL_OWNER_INACTIVE" };
   if (!listed.enabled)
     return {
       dispatched: false,
@@ -2596,6 +2744,7 @@ export async function dispatchPublicOverflow(
     | "PROVIDER_UNHEALTHY"
     | "SEND_CLAIM_FAILED"
     | "PROVIDER_UNAVAILABLE"
+    | "BOUND_TARGET_INVALID"
     | undefined;
   let attemptCount = 0;
 
@@ -2883,6 +3032,7 @@ export async function dispatchPublicOverflow(
         target,
         keyring,
         consent: sendConsent,
+        exactBinding: Boolean(binding),
       });
     } catch {
       // The claim failed before any provider I/O (lock or connection
@@ -2910,7 +3060,15 @@ export async function dispatchPublicOverflow(
         claim = "FAILED";
       }
     }
-    if (claim === "FAILED" || request.signal.aborted || attemptController.signal.aborted) {
+    // A claim that returned a denial (N6-1) is handled below whatever the
+    // abort state: the denial is request-wide and must be returned as such,
+    // never relabeled SEND_CLAIM_FAILED or followed by another member. Only a
+    // failed claim, or a successful claim whose request or attempt was
+    // aborted meanwhile, is settled here.
+    if (
+      claim === "FAILED" ||
+      (claim.claimed && (request.signal.aborted || attemptController.signal.aborted))
+    ) {
       stopHeartbeat();
       lastSendFailure = "SEND_CLAIM_FAILED";
       await releaseProviderHealthTrial({
@@ -2929,7 +3087,9 @@ export async function dispatchPublicOverflow(
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).budgetReason
+          : "FAILED",
         dispatchOutcome: "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
@@ -2943,12 +3103,16 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         eventType: "TERMINAL",
-        reason: request.signal.aborted ? "CANCELLED" : "SEND_CLAIM_FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).reason
+          : "SEND_CLAIM_FAILED",
         ...providerEventRouting({ request, target, nativeSurface }),
         reservationId: admission.reservationIds[0],
         reservationIds: admission.reservationIds,
         waitDurationMs: providerWaitDurationMs,
-        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        terminalState: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).terminalState
+          : "FAILED",
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
@@ -2956,11 +3120,14 @@ export async function dispatchPublicOverflow(
       continue;
     }
     if (!claim.claimed) {
-      // Nothing was sent. Consent is caller/pool-wide, so no other target
-      // may be tried either: settle this attempt's reservations, hand back
-      // the half-open health trial without a health verdict, and return
-      // the same typed denial as the dispatch-entry check. Callers release
-      // the provider capacity lease and the caller lease on this result.
+      // Nothing was sent. Settle this attempt's reservations and hand back
+      // the half-open health trial without a health verdict. A consent
+      // denial is caller/pool-wide: no other target may be tried, and the
+      // same typed denial as the dispatch-entry check is returned. A target
+      // that changed since listing (member removed, model disabled, endpoint
+      // version changed) is availability: the next member is tried only when
+      // the operation is retry-safe. Callers release the provider capacity
+      // lease and the caller lease on this result.
       stopHeartbeat();
       await releaseProviderHealthTrial({
         userId: request.userId,
@@ -3001,6 +3168,10 @@ export async function dispatchPublicOverflow(
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
+      if (claim.reason === "PROVIDER_UNAVAILABLE" || claim.reason === "BOUND_TARGET_INVALID") {
+        lastSendFailure = claim.reason;
+        if (request.retrySafe && !binding) continue;
+      }
       return {
         dispatched: false,
         reason: claim.reason,
@@ -3261,6 +3432,11 @@ export async function dispatchPublicOverflow(
           // Publish the settled usage before the terminal resolves so the
           // best-effort affinity write observes the same evidence as billing.
           settledUsage = usage;
+          // Snapshot the outcome ONCE: the budget write below awaits, and a
+          // cancel or lease loss landing during it must not split one attempt
+          // into different budget/state/event outcomes.
+          const settleFacts = request.signal.aborted ? abortedAttemptFacts(request.signal) : null;
+          const settleCancelled = clientCancelled && !capacityLeaseLostSignal(request.signal);
           await reconcileProviderBudget({
             userId: request.userId,
             providerAccountId: target.providerAccountId,
@@ -3270,15 +3446,22 @@ export async function dispatchPublicOverflow(
             requestId: request.requestId,
             attemptId,
             fencingToken,
-            reason: clientCancelled ? "CANCELLED" : terminalReason(request.signal, ok),
+            reason: settleCancelled
+              ? "CANCELLED"
+              : (settleFacts?.budgetReason ?? (ok ? "COMPLETED" : "FAILED")),
             revisionSequence: 1n,
             revisionKind: "SNAPSHOT",
             observationComplete,
             usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
             usage,
           });
-          const state =
-            request.signal.aborted || clientCancelled ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+          const state = settleCancelled
+            ? "CANCELLED"
+            : settleFacts
+              ? settleFacts.terminalState
+              : ok
+                ? "COMPLETED"
+                : "FAILED";
           // If client commitment already began, retain event creation order
           // without ever making client delivery wait for telemetry persistence.
           await firstClientBytePersistence;
@@ -3291,7 +3474,7 @@ export async function dispatchPublicOverflow(
             attemptId,
             fencingToken,
             eventType: "TERMINAL",
-            reason: terminalReason(request.signal, ok),
+            reason: settleFacts ? settleFacts.reason : ok ? "COMPLETED" : "FAILED",
             ...providerEventRouting({ request, target, nativeSurface }),
             reservationId: admission.reservationIds[0],
             reservationIds: admission.reservationIds,
@@ -3549,7 +3732,9 @@ export async function dispatchPublicOverflow(
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).budgetReason
+          : "FAILED",
         dispatchOutcome: providerIoStarted ? undefined : "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
@@ -3564,7 +3749,7 @@ export async function dispatchPublicOverflow(
         fencingToken,
         eventType: "TERMINAL",
         reason: request.signal.aborted
-          ? "CANCELLED"
+          ? abortedAttemptFacts(request.signal).reason
           : providerIoStarted
             ? "TRANSPORT"
             : "REQUEST_SETUP_FAILED",
@@ -3572,16 +3757,18 @@ export async function dispatchPublicOverflow(
         reservationId: admission.reservationIds[0],
         reservationIds: admission.reservationIds,
         waitDurationMs: providerWaitDurationMs,
-        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        terminalState: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).terminalState
+          : "FAILED",
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
       if (!request.retrySafe) break;
     }
   }
-  // Every reason below is transient (retry later); none means the target
-  // or a stored-response binding is gone (BOUND_TARGET_INVALID is returned
-  // before any attempt).
+  // Every reason below is transient (retry later), except
+  // BOUND_TARGET_INVALID from a send claim that found the own-key target gone
+  // (a stored-response binding returns it directly, never continues).
   return {
     dispatched: false,
     ...(anyProviderIoStarted ? { providerIoStarted: true as const } : {}),

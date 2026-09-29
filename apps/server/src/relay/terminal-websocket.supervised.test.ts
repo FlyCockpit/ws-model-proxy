@@ -99,13 +99,13 @@ function hello() {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug: "desktop",
       hostname: "desktop.local",
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.6",
+        protocolVersion: "2.7",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -123,10 +123,12 @@ function hello() {
           mcpCommandMode: "supervised",
           terminalApproval: false,
           terminalSupported: true,
+          remoteMetricSources: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
+        nodeTelemetry: true,
       },
     },
     endpoints: [],
@@ -182,7 +184,7 @@ describe("terminal list pushes for supervised requests", () => {
         allowHumanTerminal: false,
         reportedHumanTerminal: false,
         reportedTerminalSupported: true,
-        relayProtocolVersion: "2.6",
+        relayProtocolVersion: "2.7",
       },
     ]);
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken("Agent"));

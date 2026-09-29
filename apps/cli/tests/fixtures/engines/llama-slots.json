@@ -1,0 +1,22 @@
+[
+  {
+    "id": 0,
+    "id_task": 12,
+    "n_ctx": 32768,
+    "speculative": false,
+    "is_processing": true,
+    "params": { "temperature": 0.7, "top_k": 40 },
+    "prompt": "TOP-SECRET-PROMPT: the launch code is 0000",
+    "next_token": { "has_next_token": true, "n_remain": -1, "n_decoded": 17 },
+    "generated": "TOP-SECRET-PROMPT continued"
+  },
+  {
+    "id": 1,
+    "id_task": -1,
+    "n_ctx": 32768,
+    "speculative": false,
+    "is_processing": false,
+    "params": { "temperature": 0.8 },
+    "prompt": ""
+  }
+]

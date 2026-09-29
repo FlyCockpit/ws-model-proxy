@@ -98,10 +98,11 @@ export type McpCommandRefusals = {
 
 /**
  * The ONE place that mirrors the relay's device-state refusal order, for
- * display only. Codes equal the relay's, except `supervised_only`, which is split by switch (it gates nothing; the relay still decides). Both checks run
+ * display only (it gates nothing; the relay still decides). Codes equal the
+ * relay's, except `supervised_only`, which is split by switch. Both checks run
  * in the relay's exact order, so the first refusal here is the one an agent
- * would get. `relay/cli-commands.test.ts` compares this against the real
- * start functions for every state.
+ * would get. `relay/cli-commands.supervised.test.ts` compares this against the
+ * real start functions for every state.
  */
 export function mcpCommandRefusals(input: {
   grant: McpCommandModeName;

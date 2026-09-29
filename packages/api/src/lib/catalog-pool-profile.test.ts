@@ -43,6 +43,8 @@ describe("loadPoolCatalogProfile", () => {
 
   it("unions primary features and caps the widest window by the pool ceiling", async () => {
     db.modelPool.findFirst.mockResolvedValue({
+      userId: "u",
+      User: { banned: null, banExpires: null, deletionRequestedAt: null },
       capacityContextCeiling: 100_000,
       PoolMembers: [
         {
@@ -71,12 +73,50 @@ describe("loadPoolCatalogProfile", () => {
   });
 
   it("has no ceiling and no features for an empty pool without a ceiling", async () => {
-    db.modelPool.findFirst.mockResolvedValue({ capacityContextCeiling: null, PoolMembers: [] });
+    db.modelPool.findFirst.mockResolvedValue({
+      userId: "u",
+      User: { banned: null, banExpires: null, deletionRequestedAt: null },
+      capacityContextCeiling: null,
+      PoolMembers: [],
+    });
     await expect(loadPoolCatalogProfile("u", "p")).resolves.toEqual({
       contextCeiling: null,
       tools: false,
       imageInput: false,
       reasoning: false,
     });
+  });
+
+  // K1a-1 (#76): a grantee does not see a banned or deletion-marked owner's
+  // pool; the owner's own view is unaffected.
+  it.each([
+    [
+      "grantee, owner banned",
+      "grantee",
+      { banned: true, banExpires: null, deletionRequestedAt: null },
+      false,
+    ],
+    [
+      "grantee, owner deletion-marked",
+      "grantee",
+      { banned: false, banExpires: null, deletionRequestedAt: new Date() },
+      false,
+    ],
+    [
+      "grantee, owner's temporary ban expired",
+      "grantee",
+      { banned: true, banExpires: new Date(Date.now() - 60_000), deletionRequestedAt: null },
+      true,
+    ],
+  ] as const)("%s", async (_label, caller, owner, visible) => {
+    db.modelPool.findFirst.mockResolvedValue({
+      userId: "pool-owner",
+      User: owner,
+      capacityContextCeiling: null,
+      PoolMembers: [],
+    });
+    const profile = await loadPoolCatalogProfile(caller, "p");
+    if (visible) expect(profile).not.toBeNull();
+    else expect(profile).toBeNull();
   });
 });

@@ -1,4 +1,5 @@
 import prisma from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { declaredContextWindow } from "./declared-context-window";
 import type { OpenAiCompatibleCapabilities } from "./openai-compatible-capabilities";
 import {
@@ -38,8 +39,8 @@ const discoveredSelect = {
  * verdicts. Features are the optimistic union across members (a feature any
  * member advertises); the context ceiling is the largest known member window,
  * capped by the pool's own context ceiling. Returns null when the pool is not
- * visible to the caller (owner or grantee), and never distinguishes that from
- * a pool that does not exist.
+ * visible to the caller (owner, or grantee while the owner is active, #76),
+ * and never distinguishes that from a pool that does not exist.
  */
 export async function loadPoolCatalogProfile(
   userId: string,
@@ -51,6 +52,8 @@ export async function loadPoolCatalogProfile(
       OR: [{ userId }, { PoolGrants: { some: { granteeUserId: userId } } }],
     },
     select: {
+      userId: true,
+      User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
       capacityContextCeiling: true,
       PoolMembers: {
         where: { tier: "PRIMARY" },
@@ -67,7 +70,8 @@ export async function loadPoolCatalogProfile(
       },
     },
   });
-  if (!pool) return null;
+  // #76: a grantee does not see a pool whose owner is banned or deletion-marked.
+  if (!pool || (pool.userId !== userId && !poolOwnerActive(pool.User, new Date()))) return null;
   let tools = false;
   let imageInput = false;
   let reasoning = false;
