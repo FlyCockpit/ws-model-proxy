@@ -1328,6 +1328,21 @@ describe("model API routes", () => {
       prefixTokens: affineA ? { "member-a-target": 20_000 } : {},
     });
     /**
+     * A conversation-only continuation of member A: the explicit conversation
+     * digest matched, but no prefix did (`prefixDepth` 0). `cache-affinity.ts`
+     * models this whenever a request names a conversation whose stored records
+     * carry no reusable prefix.
+     */
+    const conversationDecision = () => ({
+      orderedTargetIds: ["member-a-target", "member-b-target", "member-c-target"],
+      scores: {},
+      prefixDepths: { "member-a-target": 0 },
+      conversationMatches: { "member-a-target": true },
+      reasons: {},
+      matchedPrefixDepth: 0,
+      prefixTokens: {},
+    });
+    /**
      * Member KV pools (hardConcurrencyLimit 4 in the fixture). PROTECTED:
      * 3 active + 1 warm session of another user (the one idle slot holds it).
      * FULL: 4 active. FREE: idle, nothing warm.
@@ -1621,6 +1636,47 @@ describe("model API routes", () => {
       expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
       expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
+    });
+
+    it("a conversation-only continuation (no prefix hit) is never blocked by protection", async () => {
+      // AC4: a continuation (any affinity hit) is never redirected, including
+      // one that matched only the conversation digest with no reusable prefix
+      // (`cache-affinity.ts:370-373`). A is PROTECTED for a new session but
+      // holds this conversation, and B is FULL: only the conversation-match
+      // arm of `affineMember` (routes.ts:5730-5731) can keep A admissible.
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue(conversationDecision());
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+      // A leads the first admission: it is the cache holder, never deprioritized.
+      expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
+    });
+
+    it("a conversation-only match keeps its member ahead of the PROTECTED one", async () => {
+      // Both members are PROTECTED, but B holds this conversation: the
+      // conversation arm alone makes B a holder, so protection never pushes it
+      // behind A. A's warm session is the older one (200 s vs B's 30 s), so
+      // without the arm the guarded member would win the oldest-first order.
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue({
+        ...conversationDecision(),
+        conversationMatches: { "member-b-target": true },
+      });
+      kvPools({ a: "PROTECTED", b: "PROTECTED" }, { a: 200, b: 30 });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-b", "member-a"]);
     });
 
     it("scores affinity even for a single-member pool (continuation vs new session)", async () => {

@@ -220,6 +220,7 @@
       "reasonLabel": "Reason: {{reason}}",
       "reasons": {
         "local_wait_expired": "local members stayed busy past the wait limit",
+        "local_saturated_protected": "the local members' free capacity holds protected warm conversations",
         "no_local_member": "no compatible local member was available",
         "local_context_ceiling": "the request exceeded the local context limit",
         "local_failure": "the local attempt failed",

@@ -195,6 +195,25 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     });
   });
 
+  it("labels every chat-test fallback reason in both bundles", () => {
+    // The chip renders `dashboard:chatTest.route.reasons.${reason}` for every
+    // reason the model API may report; a missing key leaks the raw code into
+    // the chip (`reasons.other` is the deliberate passthrough for unknowns).
+    expect(keyTree(esDashboard.chatTest.route.reasons)).toEqual(
+      keyTree(enDashboard.chatTest.route.reasons),
+    );
+    const reasons = [
+      "local_wait_expired",
+      "local_saturated_protected",
+      "no_local_member",
+      "local_context_ceiling",
+      "local_failure",
+      "other",
+    ].sort();
+    expect(keyTree(enDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
+    expect(keyTree(esDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
+  });
+
   it("labels every surface the ModelApiSurface union allows", () => {
     for (const surface of modelApiSurfaces) {
       expect(enDashboard.models.surfaces, `en-US missing label for ${surface}`).toHaveProperty(

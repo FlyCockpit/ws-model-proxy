@@ -154,6 +154,7 @@
       "reasonLabel": "Motivo: {{reason}}",
       "reasons": {
         "local_wait_expired": "los miembros locales siguieron ocupados después del límite de espera",
+        "local_saturated_protected": "la capacidad libre de los miembros locales guarda conversaciones activas protegidas",
         "no_local_member": "no había un miembro local compatible disponible",
         "local_context_ceiling": "la solicitud superó el límite de contexto local",
         "local_failure": "el intento local falló",

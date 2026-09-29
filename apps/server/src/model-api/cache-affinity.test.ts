@@ -560,6 +560,40 @@ describe("cache affinity", () => {
     );
   });
 
+  it("refreshes existing records with the call's lastUsedAt (S-C session grouping)", async () => {
+    // The common continuation refreshes records instead of creating them, so
+    // the per-material `update` path must stamp `lastUsedAt` like the create
+    // paths do; otherwise the session ages out of the protection window while
+    // it is still in use (warm-protection.ts groups by `lastUsedAt`).
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-conversation-record" });
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    // The conversation record exists: this call must refresh it, not recreate it.
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).toHaveBeenCalled();
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(0);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
   it("scores a single target so protection can tell a continuation from a new session", async () => {
     const only = target("target-a", "runtime-a");
     const continuation = {
