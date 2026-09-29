@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   collectMediaIds,
   estimateRequestBytes,
+  readChatRouteInfo,
   relayMessages,
   streamChatCompletion,
   withSystemPrompt,
@@ -72,6 +73,78 @@ describe("Chat Test relay wire helpers", () => {
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(JSON.parse(request.body as string)).toMatchObject({ max_tokens: 4096 });
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the route headers for each served route", () => {
+    expect(readChatRouteInfo(new Headers())).toBeUndefined();
+    expect(readChatRouteInfo(new Headers({ "x-wsmp-route": "local" }))).toEqual({
+      route: "local",
+      servedModel: null,
+      fallbackReason: null,
+      externalUnavailable: false,
+    });
+    expect(
+      readChatRouteInfo(
+        new Headers({
+          "x-wsmp-route": "pool-fallback",
+          "x-wsmp-fallback-reason": "local_wait_expired",
+          "x-wsmp-served-model": "openai/gpt-4o-mini",
+        }),
+      ),
+    ).toEqual({
+      route: "pool-fallback",
+      servedModel: "openai/gpt-4o-mini",
+      fallbackReason: "local_wait_expired",
+      externalUnavailable: false,
+    });
+    expect(
+      readChatRouteInfo(
+        new Headers({ "x-wsmp-route": "own-key", "x-wsmp-served-model": "anthropic/claude" }),
+      ),
+    ).toMatchObject({ route: "own-key", servedModel: "anthropic/claude", fallbackReason: null });
+  });
+
+  it("reports external unavailable with or without a local route and ignores unknown routes", () => {
+    expect(readChatRouteInfo(new Headers({ "x-wsmp-fallback": "unavailable" }))).toEqual({
+      route: null,
+      servedModel: null,
+      fallbackReason: null,
+      externalUnavailable: true,
+    });
+    expect(
+      readChatRouteInfo(new Headers({ "x-wsmp-route": "local", "x-wsmp-fallback": "unavailable" })),
+    ).toMatchObject({ route: "local", externalUnavailable: true });
+    expect(readChatRouteInfo(new Headers({ "x-wsmp-route": "somewhere" }))).toBeUndefined();
+  });
+
+  it("reports the route of an error response before throwing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { message: "no external route" } }), {
+          status: 503,
+          headers: { "content-type": "application/json", "x-wsmp-fallback": "unavailable" },
+        }),
+      ),
+    );
+    const onRoute = vi.fn();
+    await expect(
+      streamChatCompletion({
+        model: "owner/pool:external",
+        messages: [{ role: "user", content: "hello" }],
+        routingMode: "PREFER_NATIVE",
+        surface: "OPENAI_CHAT_COMPLETIONS",
+        reasoning: {},
+        anthropicMaxTokens: 1024,
+        signal: new AbortController().signal,
+        fallbackErrorMessage: "failed",
+        onDelta: () => undefined,
+        onThinkingDelta: () => undefined,
+        onRoute,
+      }),
+    ).rejects.toThrow("HTTP 503: no external route");
+    expect(onRoute).toHaveBeenCalledWith(expect.objectContaining({ externalUnavailable: true }));
     vi.unstubAllGlobals();
   });
 });

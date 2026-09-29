@@ -206,7 +206,22 @@
     "stop": "Stop",
     "title": "Chat Test",
     "transcript": "Chat transcript",
-    "user": "User"
+    "user": "User",
+    "route": {
+      "local": "Local",
+      "poolFallback": "Pool fallback · {{model}}",
+      "ownKey": "Your key · {{model}}",
+      "unknownModel": "unknown model",
+      "externalUnavailable": "External unavailable",
+      "reasonLabel": "Reason: {{reason}}",
+      "reasons": {
+        "local_wait_expired": "local members stayed busy past the wait limit",
+        "no_local_member": "no compatible local member was available",
+        "local_context_ceiling": "the request exceeded the local context limit",
+        "local_failure": "the local attempt failed",
+        "other": "{{reason}}"
+      }
+    }
   },
   "deploymentFeatures": {
     "unavailable": "Not available on this deployment.",
@@ -275,6 +290,7 @@
     "cliSearch": "Search CLIs",
     "cliSearchEmpty": "No CLIs match your search.",
     "reconnecting": "Reconnecting to the terminal service…",
+    "signedOut": "You were signed out or your terminal access was revoked. Reload to sign in again.",
     "exited": "The shell exited.",
     "gone": "This terminal ended while you were disconnected.",
     "rejected": "The CLI rejected this terminal ({{reason}}).",
@@ -385,15 +401,21 @@
   },
   "pools": {
     "notFound": "This pool was not found or is no longer available to you.",
-    "privacyBadge": {
-      "private": "local",
-      "external": "external",
-      "ownerProviders": "Owner’s providers",
-      "hint": "External fallback available: {{providers}}. Use :external with a token that allows external providers; plain names stay local."
+    "fallbackBadge": {
+      "local": "Local only",
+      "label": "Fallback available",
+      "title": "External fallback",
+      "intro": "Plain pool names always stay on this deployment. Requests to this pool's :external name can leave it when no local member can serve them, through:",
+      "routePoolFallback": "The pool's fallback providers: {{providers}}",
+      "routePoolFallbackUnnamed": "The pool's fallback providers",
+      "routeOwnKey": "Your own provider key, billed to your account",
+      "consent": "For API requests, the token must also allow external providers.",
+      "description": "{{intro}} {{routes}}. {{consent}}",
+      "routeSeparator": "; "
     },
     "affinity": {
       "title": "Cache-aware routing",
-      "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
+      "description": "New sessions go to the member with the best availability score (load, health, external fallback, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still moves the request to another member.",
       "enabled": "Enable optional cache affinity",
       "stats": "{{records}} active records across {{targets}} targets",
       "clear": "Clear affinity records",
@@ -413,23 +435,14 @@
       "settingsLoading": "Deployment settings are still loading. Capacity controls are unavailable until they finish.",
       "settingsFailed": "Could not load deployment settings. Capacity controls are unavailable until settings can be loaded.",
       "create": "Add capacity",
-      "createTitle": "Configure shared capacity",
-      "createDescription": "Identify one local runtime and set conservative physical limits. You can attach models after saving.",
       "created": "Capacity created",
       "updated": "Capacity updated",
-      "deleted": "Capacity deleted",
       "edit": "Edit capacity",
-      "delete": "Delete capacity",
-      "editTitle": "Edit shared capacity",
-      "editDescription": "Update the physical limits and runtime identity used for global admission.",
       "deleteTitle": "Delete shared capacity",
       "deleteDescription": "This cannot be undone. Attached models must be reassigned before this capacity can be deleted.",
-      "deleteConflict": "This capacity is still attached to one or more models. Reassign them and try again.",
       "typeName": "Type the capacity name to confirm",
       "empty": "No shared capacity is configured. Add one before enabling global admission.",
       "active": "{{count}} / {{limit}} active",
-      "waiting": "{{count}} waiting",
-      "targets": "{{count}} targets",
       "safeDefaults": "Start with one concurrent request and a context limit your runtime can reliably serve. Raise limits after observing stable load.",
       "advanced": "Advanced runtime matching",
       "poolPolicy": "Capacity and wait policy",
@@ -480,16 +493,6 @@
         "registeredRequirement": "Requires a registered counter matching this runtime identity. WSMP uses a conservative estimate when no match is available."
       }
     },
-    "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
-    "compatibilityDetails": "Protocol compatibility matrix",
-    "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
-    "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
-    "limitations": {
-      "native_extensions_unavailable": "native extensions unavailable",
-      "anthropic_instruction_authority_collapse": "developer instructions use Anthropic's single instruction authority tier",
-      "strict_common_subset": "strict common subset only",
-      "surface_unavailable": "surface unavailable"
-    },
     "noneAvailable": "None available",
     "protocolCompatibility": "Protocol compatibility",
     "protocolCompatibilityHint": "Adaptation is opt-in and rejects features outside the documented strict common subset.",
@@ -515,7 +518,7 @@
     "detailNavAriaLabel": "Pool sections",
     "tabs": {
       "overview": "Overview",
-      "fallback": "Fallback & overflow",
+      "fallback": "External fallback",
       "routing": "Routing",
       "capacity": "Capacity",
       "media": "Media",
@@ -535,8 +538,26 @@
       "enableBlockedDeployment": "Turning fallback or grantee coverage on is unavailable while external providers are disabled for this deployment.",
       "granteesHint": "You pay provider charges for people you share this pool with. Their requests still need :external and a token that allows external providers."
     },
+    "fallbackHistory": {
+      "title": "Fallback change history",
+      "empty": "No fallback changes recorded yet.",
+      "failed": "Fallback change history could not be loaded.",
+      "sourceMcp": "Changed by an MCP client",
+      "sourceDashboard": "Changed in the dashboard",
+      "sourceUnknown": "Changed",
+      "change": "{{field}}: {{before}} → {{after}}",
+      "on": "on",
+      "off": "off",
+      "unset": "not set (new pool)",
+      "milliseconds": "{{value}} ms",
+      "fields": {
+        "fallbackEnabled": "External fallback",
+        "fallbackForGrantees": "Also for grantees",
+        "externalAfterWaitMs": "Wait before going external"
+      }
+    },
     "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment. You can still turn fallback and grantee coverage off and change wait times; turning them on is unavailable until providers are enabled.",
-    "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
+    "fallbackEmpty": "No fallback providers yet. Without them, requests fail when your local members are at capacity or unhealthy, even with :external.",
     "fallbackSteps": {
       "account": "Add a provider account and credential",
       "model": "Add a model and its pricing",
@@ -544,26 +565,15 @@
       "enable": "Allow external fallback in this pool’s settings, then attach the provider model"
     },
     "addFallbackProvider": "Add fallback provider",
-    "streaming": "streaming",
-    "surfaceCounts": "{{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
-    "surfaceTierCounts": "{{tier}}: {{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
-    "warnings": {
-      "adaptation_strict_subset": "Adaptation uses a strict subset",
-      "developer_role_collapse_lossy": "Lossy developer-role collapse enabled",
-      "recommended_surface_unavailable": "Recommended API is unavailable"
-    },
     "addMember": "Add member",
     "addMemberDescription": "Add one of your direct discovered models to this pool.",
-    "addMemberTitle": "Add pool member",
     "attachmentLimit": "Attachment limit (MiB)",
     "attachmentLimitHint": "Leave blank to inherit the global limit. A pool limit cannot exceed it.",
     "attachmentLimitInherit": "Inherit",
     "attachmentLimitInvalid": "Enter a whole number of MiB, or leave it blank.",
     "created": "Pool created",
-    "create": "Create pool",
     "advancedCreate": "Advanced setup",
     "wizard": {
-      "advancedHint": "After creation, Advanced setup exposes borrowing, context margins, count strategy, affinity, adaptation, and target ordering.",
       "advanced": {
         "title": "Advanced capacity, adaptation, and affinity",
         "capacityDescription": "These settings are saved with the pool. The count strategy applies to the selected physical capacities; member overrides remain specific to this pool.",
@@ -574,11 +584,10 @@
         "unlimitedWarning": "Explicitly unlimited: this protective ceiling is removed."
       },
       "back": "Back",
-      "capacityHint": "These finite defaults protect the physical runtime. Reserved slots are kept for this pool when others fill the runtime, and other pools cannot take them while a higher-priority queued request of this pool needs one; WHEN_IDLE borrowing lets this pool use idle slots others reserved.",
       "capacityDistinctHint": "The existing physical capacity mapping remains unchanged. These pool-member limits separately control how much of that shared capacity this pool may use.",
       "atomicFailure": "Nothing was enabled. Pool setup was rolled back because one or more safeguards could not be created.",
       "createErrors": {
-        "PROVIDER_EGRESS_DISABLED": "Provider egress is disabled for this deployment, so provider targets cannot be attached. Ask the operator to enable the WMP_PUBLIC_PROVIDER_EGRESS_ENABLED setting first.",
+        "PROVIDER_EGRESS_DISABLED": "External providers are disabled for this deployment, so provider targets cannot be attached. Ask the operator to enable the WMP_PUBLIC_PROVIDER_EGRESS_ENABLED setting first.",
         "LOSSY_COLLAPSE_REQUIRES_ADAPTATION": "Lossy developer-role collapse requires strict protocol adaptation. Enable protocol adaptation on the capacity step or turn off lossy collapse.",
         "POOL_POLICY_INVALID": "The pool capacity policy is not valid. Reserved slots cannot exceed the pool's concurrency ceiling, and the context margin must be smaller than the context ceiling.",
         "SLUG_INVALID": "Enter a valid pool slug using lowercase letters, numbers, dots, and hyphens.",
@@ -596,33 +605,28 @@
         "RESERVED_EXCEEDS_PHYSICAL": "Reserved slots exceed the physical concurrency capacity of the shared runtime. Lower the reserved slots."
       },
       "atomicReview": "Create {{local}} local member(s) and {{providers}} ordered provider target(s), each with explicit concurrency and a {{spend}} daily spending ceiling.",
-      "atomicRollback": "Pool, capacities, members, provider attachments, budgets, and egress activation are committed together. If any step fails, none of them remain enabled.",
+      "atomicRollback": "Pool, capacities, members, provider attachments, budgets, and external fallback settings are committed together. If any step fails, none of them remain enabled.",
       "create": "Create protected pool",
       "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
-      "disabled": "Disabled",
-      "enabled": "Enabled",
       "fields": {
         "concurrency": "Physical concurrency ceiling",
         "contextCeiling": "Maximum context tokens",
         "dailySpendLimit": "Daily spend ceiling",
-        "localWaitBudgetMs": "Local wait before provider overflow (ms)",
-        "localWaitBudgetMsHint": "A request queued for local capacity waits at most this long before guarded routing may try public providers; the request's own deadline can end the wait sooner.",
+        "localWaitBudgetMs": "Local wait before external fallback (ms)",
+        "localWaitBudgetMsHint": "A request queued for local capacity waits at most this long before a :external request may use external fallback providers; the request's own deadline can end the wait sooner.",
         "nameHint": "Display-only label for this pool. It never appears in API requests or routes and can be changed later.",
         "slugHint": "Identifier used in API requests and routes. Changing it later changes how the pool is addressed, so keep it stable.",
         "memberConcurrencyLimit": "Concurrency ceiling for this pool",
         "memberConcurrencyLimitHint": "Pool-wide cap on the total concurrent requests this pool may run on the shared physical runtime. Members inherit this pool cap by default; a per-member override gives only that member its own ceiling.",
         "memberContextCeiling": "Pool context ceiling (optional)",
         "memberContextCeilingHint": "Optional cap on counted request context for admission. Members without their own ceiling inherit this one; ceiling plus margin must fit the physical maximum.",
-        "physicalConcurrencyLimit": "Physical runtime concurrency ceiling",
         "physicalMaxContext": "Physical runtime maximum context",
         "providerConcurrencyLimit": "Provider concurrency ceiling",
         "providerTier": "Provider member tier",
-        "finiteSpendProtection": "I will configure a finite provider spending limit before attaching a public target.",
         "recommendedSurface": "Recommended API",
         "recommendedSurfaceHint": "Auto-set once when the pool first has primary members: the best-ranked API shared by those primary members, native support preferred with strict adaptation as fallback. It is not recomputed afterward except auto-repair. Any API that every primary member can serve natively or through strict adaptation is valid.",
         "reservedSlots": "Reserved slots on the shared runtime",
         "reservedSlotsHint": "Reserves this many slots of the shared physical runtime for this pool. Other pools may use them only when idle, only under their borrowing policy, and never while a higher-priority queued request of this pool needs the slot. Cannot exceed this pool's ceiling.",
-        "waitMs": "Local wait before overflow (ms)",
         "physicalCountStrategy": "Physical token count strategy",
         "physicalCountStrategyHint": "How the runtime counts request tokens before the context-ceiling check. The default, conservative estimate, deliberately overcounts (serialized UTF-8 bytes ÷ 3 with a 1.2 safety factor) instead of trusting tokenizer or engine counts; the other strategies use the configured tokenizer, a template-aware counter, or the engine's reported count.",
         "contextMargin": "Pool context safety margin (defaults to 0)",
@@ -675,19 +679,14 @@
         "UNLIMITED": "Unlimited"
       },
       "localModels": "Local models",
-      "capacityAssigned": "Physical capacity assigned",
       "capacityAssignedDetail": "Physical: {{concurrency}} concurrent · {{context}} tokens · {{strategy}}",
       "capacityRequired": "Assign physical capacity first",
-      "localModelsHint": "Select at least one connected model. These remain the primary tier.",
-      "localRequired": "Select at least one local model.",
       "next": "Continue",
       "noReadyProviders": "No enabled provider model has an active credential and pricing version.",
       "open": "Guided setup",
-      "progress": "Pool setup progress",
-      "providerOrderHint": "Public providers are tried only after the local wait, in the explicit order you set in Provider operations. Each attachment also requires a concurrency policy and finite spend protection.",
       "providerOrder": "Guarded provider order",
       "providerOrderExact": "Select providers in fallback order. Arrow controls change the durable order.",
-      "providerEgressDisabled": "Provider egress is disabled for this deployment (the WMP_PUBLIC_PROVIDER_EGRESS_ENABLED setting is off), so provider targets cannot be attached until the deployment enables it.",
+      "providerEgressDisabled": "External providers are disabled for this deployment (the WMP_PUBLIC_PROVIDER_EGRESS_ENABLED setting is off), so provider targets cannot be attached until the deployment enables them.",
       "selectLocalModel": "Select local model {{name}}",
       "selectProvider": "Select provider model {{name}}",
       "moveProviderUp": "Move provider earlier",
@@ -701,9 +700,8 @@
         "name": "Enter a pool name.",
         "providerConcurrencyLimit": "Enter a whole-number provider concurrency ceiling from 1 to 10000.",
         "providerModelIds": "Select no more than 32 provider models.",
-        "providerEgressBlocked": "Provider targets cannot be attached while this deployment disables provider egress.",
+        "providerEgressBlocked": "Provider targets cannot be attached while external providers are disabled for this deployment.",
         "recommendedSurface": "Choose an API that every selected primary member can serve, natively or through protocol adaptation. It defaults to the best-ranked API shared by the pool's first primary members.",
-        "physicalConcurrencyLimit": "Enter a physical concurrency limit from 1 to 10000.",
         "physicalMaxContext": "Enter a physical context limit from 1 to 100000000.",
         "reservedSlots": "Reserved slots cannot exceed this pool's concurrency ceiling.",
         "slug": "Enter a valid, available-style pool slug.",
@@ -722,15 +720,7 @@
         "tokenLifetimeLimit": "Enter a positive token limit or choose UNLIMITED.",
         "spendMonthLimit": "Enter a positive spend limit or choose UNLIMITED."
       },
-      "reservationInvalid": "Reserved slots cannot exceed the concurrency ceiling.",
-      "reviewSafe": "This setup keeps concurrency, context, waiting, and spending protections finite. Public targets are not usable until their provider policy and order are configured.",
-      "spendRequired": "Confirm finite spending protection before enabling public overflow.",
       "step": "Step {{current}} of {{total}}",
-      "steps": {
-        "capacity": "Protect local capacity",
-        "models": "Choose local models",
-        "review": "Review safeguards"
-      },
       "surfaces": {
         "ANTHROPIC_MESSAGES": "Anthropic Messages",
         "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
@@ -741,66 +731,38 @@
     },
     "createDescription": "Create an OpenAI-compatible pooled model ID.",
     "createTitle": "Create pool",
-    "deleted": "Pool deleted",
     "deleteDescription": "Deleting this pool also removes its members and grants.",
     "deleteTitle": "Delete pool",
     "description": "Create pooled model IDs and share pools with exact email grants.",
     "descriptionField": "Description",
     "directModel": "Direct model",
-    "editDescription": "Update the pool slug, display name, description, or media transformer.",
     "editMemberDescription": "Change member routing controls.",
     "editMemberTitle": "Edit pool member",
     "editPool": "Edit {{pool}}",
-    "editTitle": "Edit pool",
     "email": "Email",
     "empty": "No model pools yet.",
     "exactEmailOnly": "Enter the collaborator's exact email. This does not search or suggest users.",
     "grant": "Grant access",
     "grantAdded": "Pool access granted",
     "grantDescription": "Share this pool with a user by exact email match only.",
-    "granted": "Granted",
     "granting": "Granting…",
     "grantsLabel": "grants",
     "grantsTitle": "Grants",
-    "grantRevoked": "Pool access revoked",
     "grantTitle": "Grant pool access",
-    "memberTestSurface": "Member test API surface",
-    "memberTestMode": "Member test execution mode",
-    "memberTestSurfaces": {
-      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
-      "OPENAI_RESPONSES": "OpenAI Responses",
-      "ANTHROPIC_MESSAGES": "Anthropic Messages"
-    },
-    "memberTestPreferred": "Native preferred",
-    "memberTestNative": "Require native",
-    "memberTestAdapted": "Require adapted",
     "health": "Health",
     "invalidSlug": "Use lowercase letters, numbers, hyphens, or dots. Slugs cannot start or end with a separator and cannot contain slashes.",
     "loadFailed": "Failed to load pools.",
     "memberAdded": "Pool member added",
-    "memberRemoved": "Pool member removed",
-    "membersLabel": "members",
     "membersTitle": "Members",
     "memberUpdated": "Pool member updated",
-    "memberCapabilities": "Native and adapted APIs",
-    "memberPolicyDetails": "Capacity and routing details",
     "memberTarget": "Execution target",
     "memberTier": "Routing tier",
     "memberTierDisclosure": "Primary members are always local and serve the plain pool name, which never leaves this deployment. External fallback members receive request data only for requests that name owner/pool:external, when the caller's token allows it and local members are busy, unavailable, or too small for the request.",
-    "moveOverflowEarlier": "Move overflow provider earlier",
-    "moveOverflowLater": "Move overflow provider later",
-    "reorderFailed": "Could not reorder overflow providers",
     "memberTiers": {
       "PRIMARY": "Primary",
-      "PUBLIC_OVERFLOW": "Public overflow"
+      "PUBLIC_OVERFLOW": "External fallback"
     },
     "publicOrder": "Provider order {{order}}",
-    "costUnavailable": "No active pricing version",
-    "memberCost": "Pricing {{version}} · {{currency}}",
-    "memberLoad": "{{active}} active / {{waiting}} waiting / {{limit}} physical limit",
-    "memberPhysicalCapacity": "Current physical load",
-    "memberPhysicalContext": "Physical context and counting",
-    "memberPhysicalContextValue": "{{context}} maximum · {{strategy}}",
     "inherited": "Inherited",
     "name": "Name",
     "noDirectModels": "No direct models are available to add.",
@@ -846,12 +808,6 @@
     "transformerMaxToolChars": "Max tool text characters",
     "transformerTimeoutMs": "Transformer timeout (ms)",
     "transformerMaxAssets": "Max attachments per request",
-    "testMember": "Test chat",
-    "testMemberSuccess": "Chat probe succeeded; health reset to healthy.",
-    "testMemberFailed": "Chat probe failed: {{error}}",
-    "typeEmail": "Type the email to confirm",
-    "typeModelId": "Type the model ID to confirm",
-    "typePoolName": "Type the pool name to confirm",
     "updated": "Pool updated",
     "weight": "Weight"
   },
@@ -898,7 +854,8 @@
       "createAllow": "Allow external providers",
       "createFailed": "Token created, but its external-access update could not be confirmed. Copy the secret now and check its permissions below before using it.",
       "disabledDeployment": "External providers are disabled on this deployment. Your saved permissions are kept. You can turn external access off and withdraw per-pool consent; turning access on or adding pools is unavailable while providers are disabled.",
-      "savedPoolsHint": "Choose which pools may use external providers. The first time you enable access, check each pool individually; none are included automatically. Turning external access off and on preserves these choices."
+      "createDisabledDeployment": "External providers are disabled on this deployment, so this token will be created private-only. You can allow external providers later, once the deployment enables them.",
+      "savedPoolsHint": "Only checked pools may use external providers; the others stay local. Pools are never added automatically, so check each pool you want. Turning external access off and on keeps these choices."
     },
     "allVisible": "All visible",
     "allowlist": "Allowlist",
@@ -1176,7 +1133,8 @@
       "PRICING_ACTIVATED": "Pricing activated",
       "PRICING_RETIRED": "Pricing retired",
       "PRICING_DELETED": "Pricing deleted",
-      "ACCOUNTING_REPAIR_REQUESTED": "Accounting repair requested"
+      "ACCOUNTING_REPAIR_REQUESTED": "Accounting repair requested",
+      "POOL_FALLBACK_UPDATED": "Pool fallback updated"
     },
     "table": {
       "time": "Time",
@@ -1188,7 +1146,12 @@
     "disabledDeployment": "External providers are disabled on this deployment. Stored accounts and key details remain available; you can revoke keys and delete configuration. Creation, edits, and credential tests are disabled.",
     "externalFallbackHint": "Enable “Allow external fallback” in the pool’s Fallback settings before attaching a provider. Provider models never serve plain pool names.",
     "externalRequestHint": "Only <pool>:external requests with token permission can use these providers when local members cannot serve the request. Provider charges apply.",
-    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting."
+    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting.",
+    "dataCollection": {
+      "label": "Allow OpenRouter providers that may collect data",
+      "deniedHint": "Off: requests carry data_collection: \"deny\", so OpenRouter uses only providers that do not store or train on prompts. Some models may then have no provider.",
+      "allowedHint": "On: OpenRouter may route requests to providers that store or train on prompts."
+    }
   },
   "providerCatalog": {
     "presets": {
@@ -1227,7 +1190,7 @@
       "NO_IMAGE_INPUT": "No image input, but this pool accepts images",
       "NO_REASONING": "No reasoning, but this pool supports it",
       "UNKNOWN_PRICE": "Price unknown or variable",
-      "FREE_MODEL": "Free model: prompts may be logged or used for training, and it has its own rate limits",
+      "FREE_MODEL": "Free model: prompts may be logged or used for training, and it has its own rate limits. With data collection denied (the default), OpenRouter may find no provider for it.",
       "EXPIRING": "Scheduled for removal",
       "MODERATED": "Moderated: responses may be filtered"
     },
@@ -1245,6 +1208,7 @@
       "pricingUserKept": "Your own price stays active, so the catalog price was not applied.",
       "pricingUpdated": "The catalog price changed: the earlier catalog price was retired and the new one is active.",
       "pricingTiered": "Tiered pricing: imported the maximum rate for each parsed token category across the base price and override tiers. Non-token charges (such as web search) and unparsed token types (such as 1-hour cache writes and audio) are not covered.",
+      "pricingAsOf": "Catalog price as of {{time}}, when this server last fetched the OpenRouter catalog. OpenRouter's listing can lag its live prices by up to about six hours; check the price before relying on spend limits.",
       "pricingScheduled": "A scheduled price already exists, so the catalog price was not applied.",
       "contextDrift": "The catalog lists a context window of {{catalog}} tokens; this model is set to {{current}}. Edit the model to change it."
     },
@@ -1328,7 +1292,7 @@
       },
       "tier": {
         "PRIMARY": "Primary",
-        "PUBLIC_OVERFLOW": "Overflow"
+        "PUBLIC_OVERFLOW": "Fallback"
       },
       "health": {
         "UNKNOWN": "Unknown",

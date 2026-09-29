@@ -109,6 +109,9 @@ model Session {
   @@unique([token])
   @@index([userId])
   @@index([expiresAt])
+  /// The deletion mark revokes the sessions an admin impersonates through
+  /// (`impersonatedBy`, no foreign key): parent-deletion.ts requestUserDeletion.
+  @@index([impersonatedBy])
   @@map("session")
 }
 

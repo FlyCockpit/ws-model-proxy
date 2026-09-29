@@ -28,9 +28,14 @@ const { providerManagementRouter } = await import("./provider-management");
 const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   $transaction: MockInstance;
-  providerAccount: { create: MockInstance; findFirst: MockInstance };
-  providerModel: { create: MockInstance };
-  providerCredential: { findFirst: MockInstance; updateMany: MockInstance };
+  providerAccount: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
+  };
+  providerCredential: { findFirst: MockInstance; updateMany: MockInstance; count: MockInstance };
+  providerModel: { create: MockInstance; findMany: MockInstance };
+  $queryRaw: MockInstance;
   providerAuditEvent: { create: MockInstance };
 };
 
@@ -63,6 +68,13 @@ const context: Context = {
   } as Session,
 };
 const client = () => createRouterClient(providerManagementRouter, { context });
+/** The synthetic session MCP tool calls run with (apps/server/src/mcp/context.ts). */
+const mcpClient = () =>
+  createRouterClient(providerManagementRouter, {
+    context: {
+      session: { ...context.session!, session: { ...context.session!.session, id: "mcp:owner" } },
+    } as Context,
+  });
 
 const surface = { source: "dashboard", confidence: "exact", operations: ["create"] } as const;
 const modelInput = (surfaces: Record<string, unknown>) => ({
@@ -126,6 +138,157 @@ describe("OpenRouter provider type in provider management", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.providerModel.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("OpenRouter data-collection setting (D9)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("is off by default and a person can allow it, with an audit event", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({ id: "acct", providerType: "openrouter", allowDataCollection: false })
+      .mockResolvedValueOnce({ id: "acct", allowDataCollection: true });
+    await expect(
+      client().setAllowDataCollection({ id: "acct", allowDataCollection: true }),
+    ).resolves.toMatchObject({ allowDataCollection: true });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledWith({
+      where: { id: "acct", userId: "owner", deletedAt: null },
+      data: { allowDataCollection: true },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "ACCOUNT_UPDATED",
+        subjectId: "acct",
+        metadata: { allowDataCollection: true },
+      }),
+    });
+  });
+
+  it("applies only to OpenRouter accounts", async () => {
+    db.providerAccount.findFirst.mockResolvedValueOnce({
+      id: "acct",
+      providerType: "openai",
+      allowDataCollection: false,
+    });
+    await expect(
+      client().setAllowDataCollection({ id: "acct", allowDataCollection: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("is owner-scoped: another user's account is NOT_FOUND", async () => {
+    db.providerAccount.findFirst.mockResolvedValueOnce(null);
+    await expect(
+      client().setAllowDataCollection({ id: "foreign", allowDataCollection: true }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerAccount.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "foreign", userId: "owner", deletedAt: null } }),
+    );
+  });
+
+  it("the general account update ignores the field and a type change resets it", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({
+        id: "acct",
+        providerType: "openrouter",
+        baseUrl: "https://openrouter.ai/api",
+        authType: "BEARER",
+        allowDataCollection: true,
+      })
+      .mockResolvedValueOnce({ id: "acct" });
+    db.providerModel.findMany.mockResolvedValue([]);
+    await client().updateAccount({
+      id: "acct",
+      providerType: "openai-compatible",
+      allowDataCollection: true,
+    } as { id: string; providerType: string });
+    const call = db.providerAccount.updateMany.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(call.data.allowDataCollection).toBe(false);
+    expect(call.data.providerType).toBe("openai-compatible");
+  });
+});
+
+describe("OpenRouter account type changes and legacy spellings (D9)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+    db.providerModel.findMany.mockResolvedValue([]);
+  });
+
+  const openRouterAccount = (providerType = "openrouter") => ({
+    id: "acct",
+    providerType,
+    baseUrl: "https://openrouter.ai/api",
+    authType: "BEARER",
+    allowDataCollection: false,
+  });
+
+  it.each(["openrouter", "OpenRouter "])(
+    "MCP may not move a %j account to another type (it would drop the deny)",
+    async (current) => {
+      db.providerAccount.findFirst.mockResolvedValueOnce(openRouterAccount(current));
+      await expect(
+        mcpClient().updateAccount({ id: "acct", providerType: "openai-compatible" }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it("MCP may still edit other fields and keep the OpenRouter type", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce(openRouterAccount("OpenRouter"))
+      .mockResolvedValueOnce({ id: "acct" });
+    await mcpClient().updateAccount({ id: "acct", providerType: "openrouter", label: "Renamed" });
+    const call = db.providerAccount.updateMany.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(call.data.label).toBe("Renamed");
+    // A spelling normalization is not a type change: nothing is reset.
+    expect(call.data.allowDataCollection).toBeUndefined();
+  });
+
+  it("MCP may change the type of a non-OpenRouter account", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({ ...openRouterAccount("openai"), baseUrl: "https://api.example" })
+      .mockResolvedValueOnce({ id: "acct" });
+    await mcpClient().updateAccount({ id: "acct", providerType: "openai-compatible" });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("a person may still move an OpenRouter account to another type (the opt-out resets)", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce(openRouterAccount())
+      .mockResolvedValueOnce({ id: "acct" });
+    await client().updateAccount({ id: "acct", providerType: "openai-compatible" });
+    const call = db.providerAccount.updateMany.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(call.data.allowDataCollection).toBe(false);
+  });
+
+  it("a legacy non-normalized OpenRouter row can use the opt-out", async () => {
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({ id: "acct", providerType: "OpenRouter", allowDataCollection: false })
+      .mockResolvedValueOnce({ id: "acct", allowDataCollection: true });
+    await expect(
+      client().setAllowDataCollection({ id: "acct", allowDataCollection: true }),
+    ).resolves.toMatchObject({ allowDataCollection: true });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { allowDataCollection: true } }),
+    );
   });
 });
 

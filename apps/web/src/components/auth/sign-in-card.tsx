@@ -20,7 +20,7 @@ import z from "zod";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
 import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
-import { friendly, isRateLimit } from "@/utils/friendly-error";
+import { friendly, isRateLimit, isUserDeletionPending } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
 
@@ -174,7 +174,12 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
         : await authClient.twoFactor.verifyTotp({ code: totpCode });
       if (result.error) {
         console.error("[login.twoFactor.verify]", result.error);
-        toast.error(t("auth:errors.invalidTotp"));
+        // The 2FA step mints the session, so a pending deletion surfaces here.
+        toast.error(
+          isRateLimit(result.error) || isUserDeletionPending(result.error)
+            ? friendly(result.error)
+            : t("auth:errors.invalidTotp"),
+        );
       } else {
         toast.success(t("auth:signedInSuccess"));
         const outcome = resolveOutcome(result.data as Record<string, unknown> | undefined);
@@ -386,7 +391,9 @@ function SignInForm({
       });
       if (result.error) {
         toast.error(
-          isRateLimit(result.error) ? friendly(result.error) : t("auth:errors.invalidCredentials"),
+          isRateLimit(result.error) || isUserDeletionPending(result.error)
+            ? friendly(result.error)
+            : t("auth:errors.invalidCredentials"),
         );
         return;
       }

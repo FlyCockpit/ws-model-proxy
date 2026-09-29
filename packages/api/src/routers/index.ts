@@ -13,6 +13,7 @@ import { mcpGrantsRouter } from "./mcp-grants";
 import { mcpTokensRouter } from "./mcp-tokens";
 import { modelApiTokensRouter } from "./model-api-tokens";
 import { overviewRouter } from "./overview";
+import { poolFallbackRouter } from "./pool-fallback";
 import { poolFallbackPreferencesRouter } from "./pool-fallback-preferences";
 import { providerCatalogRouter } from "./provider-catalog";
 import { providerManagementRouter } from "./provider-management";
@@ -84,6 +85,7 @@ export const appRouter = {
   // Human-only OpenRouter public catalog (search, import, pool equivalent).
   // Never MCP tools; see MCP_TOOL_EXCLUSIONS.
   providerCatalog: providerCatalogRouter,
+  poolFallback: poolFallbackRouter,
   poolFallbackPreferences: poolFallbackPreferencesRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,

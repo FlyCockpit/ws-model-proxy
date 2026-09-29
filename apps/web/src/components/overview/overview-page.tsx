@@ -1,5 +1,6 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
+import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
@@ -8,7 +9,7 @@ import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
-import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
+import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import { useOverviewRange } from "@/hooks/use-overview-range";
@@ -422,7 +423,7 @@ function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth
 }
 
 type TrafficRow = {
-  external?: boolean;
+  routes?: readonly ExternalRouteKind[];
   providers?: readonly string[];
   key: string;
   title: string;
@@ -462,7 +463,7 @@ function SharedPoolsTable({ metrics, t }: { metrics: OverviewMetrics; t: Dashboa
       firstColumn={t("overview.shared.columns.pool")}
       rows={metrics.sharedPools.map((row) => ({
         key: row.poolId,
-        external: row.effectiveProviderEgress,
+        routes: row.externalRoutes,
         providers: row.providerTypes,
         title: row.available && row.name ? row.name : t("overview.shared.unavailable"),
         subtitle: row.ownerSlug ? t("overview.shared.owner", { owner: row.ownerSlug }) : null,
@@ -528,7 +529,9 @@ function TrafficTable({
                 <td className="max-w-64 py-2 pr-3">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="truncate font-medium">{row.title}</span>
-                    {row.external ? <PoolPrivacyBadge external providers={row.providers} /> : null}
+                    {row.routes && row.routes.length > 0 ? (
+                      <PoolFallbackBadge routes={row.routes} providers={row.providers} />
+                    ) : null}
                   </div>
                   {row.subtitle ? (
                     <div className="truncate text-xs text-muted-foreground">{row.subtitle}</div>

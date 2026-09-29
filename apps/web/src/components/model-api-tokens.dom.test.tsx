@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -20,6 +20,7 @@ vi.mock("@/utils/orpc", () => {
     name: id,
     effectiveProviderEgress: true,
     providerAccountLabels: ["Provider"],
+    externalRoutes: ["pool-fallback"],
   }));
   const query = (key: string, data: () => unknown) => ({
     queryOptions: () => ({ queryKey: [key], queryFn: async () => data(), initialData: data() }),
@@ -82,16 +83,14 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import { ModelApiTokensSection } from "./forwarder-dashboard-sections";
 
+let queryClient: QueryClient;
 function mount() {
+  queryClient = new QueryClient({
+    mutationCache: createAppMutationCache((key) => key),
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
   return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({
-          mutationCache: createAppMutationCache((key) => key),
-          defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-        })
-      }
-    >
+    <QueryClientProvider client={queryClient}>
       <ModelApiTokensSection />
     </QueryClientProvider>,
   );
@@ -407,4 +406,92 @@ it("blocks granting external consent when providers are off but allows withdrawa
   submit();
   await waitFor(() => expect(state.calls).toHaveLength(1));
   expect(state.calls[0]?.name).toBe("create");
+});
+
+function isDisabled(element: HTMLElement) {
+  return element.getAttribute("aria-disabled") === "true" || element.hasAttribute("disabled");
+}
+
+it("keeps create-dialog drafts editable when the switch turns off before submitting", async () => {
+  mount();
+  openCreate();
+  fireEvent.click(screen.getByRole("button", { name: "dashboard:tokens.allowlist" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /owner\/one/ }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /owner\/two/ }));
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  // Unchecked, not saved.
+  fireEvent.click(screen.getByRole("checkbox", { name: "two" }));
+  expect(screen.getByRole("checkbox", { name: "two" }).getAttribute("aria-checked")).toBe("false");
+
+  // The deployment switch turns off while the dialog is open.
+  state.providerEgressEnabled = false;
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: ["visible"] });
+  });
+  // Create-specific copy, not the saved-permissions withdrawal sentence.
+  expect(
+    await screen.findByText("dashboard:tokens.externalAccess.createDisabledDeployment"),
+  ).toBeTruthy();
+  expect(screen.queryByText("dashboard:tokens.externalAccess.disabledDeployment")).toBeNull();
+
+  // Restoring the unsaved change is allowed: nothing external is saved at
+  // creation while the switch is off, so it widens nothing.
+  const two = screen.getByRole("checkbox", { name: "two" });
+  expect(isDisabled(two)).toBe(false);
+  fireEvent.click(two);
+  expect(screen.getByRole("checkbox", { name: "two" }).getAttribute("aria-checked")).toBe("true");
+
+  // Consent can still be withdrawn, but not turned back on.
+  const consent = screen.getByRole("checkbox", {
+    name: "dashboard:tokens.externalAccess.createAllow",
+  });
+  expect(isDisabled(consent)).toBe(false);
+  fireEvent.click(consent);
+  const withdrawn = screen.getByRole("checkbox", {
+    name: "dashboard:tokens.externalAccess.createAllow",
+  });
+  expect(withdrawn.getAttribute("aria-checked")).toBe("false");
+  expect(isDisabled(withdrawn)).toBe(true);
+
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]?.name).toBe("create");
+});
+
+it("never saves external consent from a create draft while the switch is off", async () => {
+  mount();
+  openCreate();
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  state.providerEgressEnabled = false;
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: ["visible"] });
+  });
+  await screen.findByText("dashboard:tokens.externalAccess.createDisabledDeployment");
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls.map((call) => call.name)).toEqual(["create"]);
+});
+
+it("centres each stacked preview badge in a non-wrapping 44px row so hit areas do not overlap", async () => {
+  mount();
+  openCreate();
+  const badges = await screen.findAllByRole("button", {
+    name: "dashboard:pools.fallbackBadge.label",
+  });
+  expect(badges.length).toBeGreaterThanOrEqual(2);
+  for (const badge of badges) {
+    const row = badge.parentElement?.className.split(/\s+/) ?? [];
+    expect(row).toEqual(expect.arrayContaining(["min-h-11", "items-center"]));
+    expect(row).not.toContain("flex-wrap");
+  }
+});
+
+it("words the saved-pools hint for tokens that got their pools at creation too", () => {
+  state.tokens = [existingToken()];
+  mount();
+  expect(screen.getByText("dashboard:tokens.externalAccess.savedPoolsHint")).toBeTruthy();
 });

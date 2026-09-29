@@ -401,7 +401,7 @@ describe("terminal list pushes for supervised requests", () => {
     it("answers every Decline by its request id, also one the rate limit refused unread", async () => {
       const request = await spawnedRequest();
       const tab = browser();
-      const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+      const clock = vi.spyOn(performance, "now").mockReturnValue(1_000_000);
       try {
         // Use up the socket's text budget.
         for (let index = 0; index < 20; index += 1) {

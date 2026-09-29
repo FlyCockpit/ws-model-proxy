@@ -60,7 +60,7 @@ const REVIEWED_SHARE_LOCKS: Record<string, string> = {
   "packages/api/src/routers/pool-fallback-preferences.ts:model_pool.FOR SHARE":
     "Own-key preference setter: first lock, then exact grant SHARE, requester account SHARE, model SHARE, preference upsert. No capacity locks. Writers/deletion serialize at the pool; provider writers serialize at the account before reaching model/preference. See capacity-lock-order.ts, preference setter transaction.",
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
-    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no capacity lock and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, an L7 user lock or a user writer is outside the capacity domain and closes no cycle.",
+    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no capacity lock and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, an L7 user lock or a user writer is outside the capacity domain and closes no cycle. For an impersonation session it then reads the impersonating admin's row FOR SHARE (IMP-MARK), owner first: two FOR SHARE locks never conflict, and every user writer either can wait on writes a single user row, so the pair closes no cycle either.",
   "packages/db/src/parent-deletion.ts:user.FOR SHARE":
     "lockUserDeletionOwner (F2-03): the first lock of a user-deletion drain batch, on its deletion generation. The batch takes no capacity lock; afterwards it takes only history rows with SKIP LOCKED and their cascades, every lock wait bounded by a transaction-local lock_timeout and every statement by a transaction-local statement_timeout. It never waits on an L0-L6 lock, so the ordered user delete waiting for it at L7 closes no cycle; abandon, restore and a new mark wait for the batch and then withdraw the generation.",
   "packages/api/src/lib/model-api-token-access.ts:model_pool.FOR SHARE":
@@ -96,10 +96,12 @@ const PROVIDER_WRITER_INVENTORY = {
     // take budget advisories. createModel uses a fresh id; updateModel takes
     // L0 -> account -> model -> L2/L5. deleteAccount/Model are account-first.
     // Five pricing procedures use lockPricingParents. Repair-request audit
-    // is an autocommit INSERT, holding no other lock.
+    // is an autocommit INSERT, holding no other lock. setAllowDataCollection
+    // (D9) holds the account FOR UPDATE before its write and audit, exactly
+    // like setAccountEnabled.
     "providerAccount.create": 1,
     "providerAccount.update": 2,
-    "providerAccount.updateMany": 4,
+    "providerAccount.updateMany": 5,
     "providerModel.create": 1,
     "providerModel.update": 2,
     "providerModel.updateMany": 3,
@@ -107,7 +109,14 @@ const PROVIDER_WRITER_INVENTORY = {
     "providerPricingVersion.update": 3,
     "providerPricingVersion.updateMany": 1,
     "providerPricingVersion.delete": 1,
-    "providerAuditEvent.create": 21,
+    "providerAuditEvent.create": 22,
+  },
+  "packages/api/src/lib/pool-fallback-settings.ts": {
+    // POOL_FALLBACK_UPDATED (issue #67): written inside the pool write
+    // transaction after the model_pool row lock (L1). providerAccountId is
+    // null, so the insert's only FK lock is KEY SHARE on the owner's user row,
+    // after L1, matching the L1 -> L7 order; no provider row is touched.
+    "providerAuditEvent.create": 1,
   },
   "packages/api/src/routers/provider-catalog.ts": {
     // Existing/restore: L0 -> account -> advisory -> model -> pricing;

@@ -314,6 +314,7 @@ describe("providerManagementRouter security boundary", () => {
       client.testCredential({ providerAccountId: "foreign-account" }),
       client.repairExpiredAttempts({ providerAccountId: "foreign-account" }),
       client.listAuditEvents({ providerAccountId: "foreign-account", limit: 10 }),
+      client.listAuditEvents({ poolId: "foreign-pool", limit: 10 }),
       client.listUsageReport({ providerAccountId: "foreign-account", limit: 10 }),
       client.listBudgetActivity({ providerAccountId: "foreign-account", limit: 10 }),
       client.listProviderAttemptEvents({ providerAccountId: "foreign-account", limit: 10 }),
@@ -861,6 +862,28 @@ describe("providerManagementRouter security boundary", () => {
       expect.objectContaining({
         where: { userId: "owner" },
         select: expect.not.objectContaining({ ciphertext: true, nonce: true, authTag: true }),
+      }),
+    );
+  });
+
+  it("lists one owned pool's fallback history (pool events carry no provider account)", async () => {
+    envMock.enabled = false;
+    db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
+    db.providerAuditEvent.findMany.mockResolvedValue([
+      { id: "audit", action: "POOL_FALLBACK_UPDATED" },
+    ]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listAuditEvents({ poolId: "pool", limit: 10 })).resolves.toEqual([
+      { id: "audit", action: "POOL_FALLBACK_UPDATED" },
+    ]);
+    expect(db.modelPool.findFirst).toHaveBeenCalledWith({
+      where: { id: "pool", userId: "owner" },
+      select: { id: true },
+    });
+    expect(db.providerAuditEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: "owner", action: "POOL_FALLBACK_UPDATED", subjectId: "pool" },
+        take: 10,
       }),
     );
   });

@@ -25,6 +25,8 @@ export const TERMINAL_BROWSER_JSON_BUDGET = 16;
  * network delivers it in one burst. Only a non-conforming client, or relay
  * handlers that fall a whole window behind, can pass it; such a frame is
  * answered `rate_limited` (refused unread: the browser sends it again) and
- * the frames accepted before it run on. The socket is not closed.
+ * the frames accepted before it run on. The socket is not closed. A `detach`
+ * is the exception: it is queued past this cap and past the rate window (up
+ * to a fixed bound per socket), so a viewer is never left attached.
  */
 export const TERMINAL_BROWSER_TEXT_PENDING_LIMIT = 20;

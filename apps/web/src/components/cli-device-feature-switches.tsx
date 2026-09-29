@@ -100,6 +100,9 @@ function CommandModeControl({
   const reasons = MCP_COMMAND_MODES.map((mode) => commandModeOptionState(feature, mode).reason);
   const firstReason = reasons.find((reason) => reason !== null) ?? null;
   const reasonId = `${id}-reason`;
+  // F2: the Unsupervised option always names its danger, also before it is
+  // picked (the visible help below describes the selected mode).
+  const dangerId = `${id}-unsupervised-danger`;
   return (
     <fieldset className="min-w-0 flex-1" aria-describedby={firstReason ? reasonId : undefined}>
       <legend className="flex min-h-11 items-center text-sm font-medium">
@@ -139,6 +142,7 @@ function CommandModeControl({
                 className={cn("size-4", dangerous ? "accent-destructive" : "accent-primary")}
                 checked={checked}
                 disabled={state.disabled || pending}
+                aria-describedby={dangerous ? dangerId : undefined}
                 onChange={() => onSelect(mode)}
               />
               {dangerous ? <TriangleAlert className="size-4 shrink-0" aria-hidden="true" /> : null}
@@ -152,14 +156,20 @@ function CommandModeControl({
           );
         })}
       </div>
-      <p
-        className={cn(
-          "mt-1 text-xs",
-          selected === "unsupervised" ? "text-destructive" : "text-muted-foreground",
-        )}
-      >
-        {t(`dashboard:clis.features.commandModeHelp.${selected}`)}
-      </p>
+      {selected === "unsupervised" ? (
+        <p id={dangerId} className="mt-1 text-xs text-destructive">
+          {t("dashboard:clis.features.commandModeHelp.unsupervised")}
+        </p>
+      ) : (
+        <>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t(`dashboard:clis.features.commandModeHelp.${selected}`)}
+          </p>
+          <p id={dangerId} className="sr-only">
+            {t("dashboard:clis.features.commandModeHelp.unsupervised")}
+          </p>
+        </>
+      )}
       {firstReason ? (
         <p id={reasonId} className="text-xs text-muted-foreground">
           {t(featureReasonKey(firstReason))}

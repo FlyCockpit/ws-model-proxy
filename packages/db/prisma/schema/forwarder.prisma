@@ -121,6 +121,9 @@ enum ProviderAuditAction {
   PRICING_RETIRED
   PRICING_DELETED
   ACCOUNTING_REPAIR_REQUESTED
+  /// A pool's external-fallback settings changed (fallbackEnabled,
+  /// fallbackForGrantees, externalAfterWaitMs). subjectId is the pool id.
+  POOL_FALLBACK_UPDATED
 }
 
 enum ExecutionTargetKind {
@@ -464,6 +467,11 @@ model ProviderAccount {
   status                     ProviderAccountStatus        @default(DISABLED)
   enabled                    Boolean                      @default(false)
   safeConfiguration          Json?
+  /// OpenRouter only: when false (the default), every request carries
+  /// `provider.data_collection: "deny"` so OpenRouter routes only to upstream
+  /// providers that do not store or train on prompts. Human-only setting
+  /// (dashboard), never writable through MCP.
+  allowDataCollection        Boolean                      @default(false)
   currentCredentialId        String?                      @unique
   healthStatus               ProviderHealthStatus         @default(UNKNOWN)
   healthCheckedAt            DateTime?
@@ -1522,6 +1530,12 @@ model RelayRequest {
   auxiliaryAttemptCount      Int                     @default(0)
   auxiliaryRequestBytes      BigInt                  @default(0)
   auxiliaryResponseBytes     BigInt                  @default(0)
+  /// Durable owner of the requested resource, for usage attribution: the
+  /// requested pool's owner, else the requester. Derived by the database at
+  /// insert (schema-hardening.sql, derive_relay_request_resource_owner) and
+  /// immutable afterwards, so it survives the pool's deletion. Deliberately a
+  /// plain id, not a foreign key: readers tolerate a deleted owner.
+  resourceOwnerUserId        String?
   User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)

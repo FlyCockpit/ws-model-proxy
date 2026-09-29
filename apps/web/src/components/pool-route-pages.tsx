@@ -33,10 +33,10 @@ import {
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
-import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
+import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
-
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
+import { poolMutationFailureReason } from "@/lib/pool-mutation-failure-reason";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -189,8 +189,8 @@ export function PoolsListPage({ lang }: { lang: string }) {
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                       <h3 className="font-medium">{pool.name}</h3>
-                      <PoolPrivacyBadge
-                        external={pool.effectiveProviderEgress}
+                      <PoolFallbackBadge
+                        routes={ownerFallbackRoutes(pool.effectiveProviderEgress)}
                         providers={pool.members.flatMap((member) =>
                           member.tier === "PUBLIC_OVERFLOW" &&
                           member.providerModel?.ProviderAccount.label
@@ -359,8 +359,8 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
           title={pool.name}
           description={pool.description || pool.slug}
           badge={
-            <PoolPrivacyBadge
-              external={pool.effectiveProviderEgress}
+            <PoolFallbackBadge
+              routes={ownerFallbackRoutes(pool.effectiveProviderEgress)}
               providers={pool.members.flatMap((member) =>
                 member.tier === "PUBLIC_OVERFLOW" && member.providerModel?.ProviderAccount.label
                   ? [member.providerModel.ProviderAccount.label]
@@ -718,6 +718,7 @@ export function PoolDetailTab({
         pool={pool}
         providerEgressEnabled={fallbackEnabled}
       />
+      <PoolFallbackHistory poolId={pool.id} />
       {overflowMembers.length ? (
         <ol className="space-y-2">
           {overflowMembers.map((member, index) => (
@@ -756,6 +757,103 @@ export function PoolDetailTab({
   );
 }
 
+const POOL_FALLBACK_FIELDS = [
+  "fallbackEnabled",
+  "fallbackForGrantees",
+  "externalAfterWaitMs",
+] as const;
+
+const poolFallbackAuditMetadata = z.object({
+  source: z.enum(["mcp", "dashboard"]).optional(),
+  changes: z
+    .record(
+      z.string(),
+      z.object({
+        before: z.union([z.boolean(), z.number(), z.null()]),
+        after: z.union([z.boolean(), z.number()]),
+      }),
+    )
+    .optional(),
+});
+
+/**
+ * The pool's external-fallback change history (POOL_FALLBACK_UPDATED audit
+ * events). MCP agents change these settings without per-change confirmation
+ * (owner decision on #67), so every change, and where it came from, is shown
+ * here next to the settings.
+ */
+function PoolFallbackHistory({ poolId }: { poolId: string }) {
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
+  const events = useQuery({
+    ...orpc.providerManagement.listAuditEvents.queryOptions({ input: { poolId, limit: 20 } }),
+    retry: false,
+  });
+  const dateTime = new Intl.DateTimeFormat(i18n.language, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  const showValue = (value: boolean | number | null) =>
+    value === null
+      ? t("dashboard:pools.fallbackHistory.unset")
+      : typeof value === "boolean"
+        ? t(value ? "dashboard:pools.fallbackHistory.on" : "dashboard:pools.fallbackHistory.off")
+        : t("dashboard:pools.fallbackHistory.milliseconds", { value });
+  return (
+    <div className="min-w-0 space-y-2 rounded-md border p-4">
+      <h4 className="text-sm font-medium">{t("dashboard:pools.fallbackHistory.title")}</h4>
+      {events.isError ? (
+        <InlineRetry
+          message={t("dashboard:pools.fallbackHistory.failed")}
+          onRetry={() => void events.refetch()}
+        />
+      ) : events.isPending ? (
+        <Skeleton className="h-16" />
+      ) : events.data.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          {t("dashboard:pools.fallbackHistory.empty")}
+        </p>
+      ) : (
+        <ol className="space-y-2">
+          {events.data.map((event) => {
+            const metadata = poolFallbackAuditMetadata.safeParse(event.metadata);
+            const source = metadata.success ? metadata.data.source : undefined;
+            const changes = metadata.success ? (metadata.data.changes ?? {}) : {};
+            return (
+              <li
+                key={event.id}
+                className="min-w-0 border-t pt-2 text-sm first:border-t-0 first:pt-0"
+              >
+                <p className="text-xs text-muted-foreground">
+                  {dateTime.format(new Date(event.createdAt))}
+                  {" · "}
+                  {source === "mcp"
+                    ? t("dashboard:pools.fallbackHistory.sourceMcp")
+                    : source === "dashboard"
+                      ? t("dashboard:pools.fallbackHistory.sourceDashboard")
+                      : t("dashboard:pools.fallbackHistory.sourceUnknown")}
+                </p>
+                <ul className="mt-1 space-y-1">
+                  {POOL_FALLBACK_FIELDS.filter((field) => changes[field] !== undefined).map(
+                    (field) => (
+                      <li key={field} className="break-words">
+                        {t("dashboard:pools.fallbackHistory.change", {
+                          field: t(`dashboard:pools.fallbackHistory.fields.${field}`),
+                          before: showValue(changes[field]!.before),
+                          after: showValue(changes[field]!.after),
+                        })}
+                      </li>
+                    ),
+                  )}
+                </ul>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 /**
  * Owner fallback settings. Callers opt in per request with
  * `owner/pool:external`; the plain name never leaves the deployment.
@@ -773,9 +871,20 @@ function PoolFallbackSettings({
     ...orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        // The save wrote a POOL_FALLBACK_UPDATED event: refresh the history.
+        void queryClient.invalidateQueries({
+          queryKey: orpc.providerManagement.listAuditEvents.key(),
+        });
         toast.success(t("dashboard:pools.fallbackSettings.saved"));
       },
       onError: (error) => {
+        // The deployment switch turned off after this form loaded: the server
+        // refuses turning fallback on. Say so, and refresh the switch state.
+        if (poolMutationFailureReason(error) === "PROVIDER_EGRESS_DISABLED") {
+          toast.error(t("dashboard:pools.fallbackSettings.enableBlockedDeployment"));
+          void queryClient.invalidateQueries({ queryKey: orpc.deploymentFlags.key() });
+          return;
+        }
         toast.error(friendly(error, t("dashboard:pools.fallbackSettings.failed")));
       },
     }),

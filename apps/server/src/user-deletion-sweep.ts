@@ -25,6 +25,23 @@
  * see {@link sweepPendingUserDeletions}), so no set of failing users, even
  * ones whose backoff write fails too, keeps the others from their turn.
  *
+ * Throughput limit: at most {@link USER_DELETION_SWEEP_BATCH} (10) users per
+ * tick of {@link USER_DELETION_SWEEP_INTERVAL_MS} (5 minutes), i.e. 120 per
+ * hour per process. The sweep is the fallback for completions that failed
+ * transiently; a request that completes its own delete never reaches it. If
+ * more than 10 marks per tick keep failing (and become eligible again after
+ * their backoff), users behind the cursor wait until the cursor wraps past
+ * the tail: every eligible user is still attempted within
+ * `ceil(eligible / 10)` ticks, but that wait grows with the backlog.
+ *
+ * Health: the loop records its tick outcomes
+ * ({@link getUserDeletionSweepHealth}); the readiness probe (`/ready`,
+ * apps/server/src/app.ts) reports `userDeletionSweep: "failing"` once
+ * {@link USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION} consecutive ticks
+ * failed, the same point the log escalates to an ALERT, so operators see it
+ * without reading logs. It does not change the probe's status code: a
+ * background job failing is no reason to route traffic away or restart.
+ *
  * Concurrency: a sweep and a request (or two replicas) completing the same
  * user interleave safely. Drain batches take rows with SKIP LOCKED, the
  * ordered delete serializes on the user row, and the loser finds the user
@@ -366,6 +383,30 @@ export type StopUserDeletionSweep = () => Promise<void>;
 let activeUserDeletionSweepStop: StopUserDeletionSweep | null = null;
 
 /**
+ * Coarse health of the running sweep loop, for the readiness probe:
+ * - `"not_running"`: no loop is started in this process (or it was stopped);
+ * - `"ok"`: fewer than {@link USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION}
+ *   consecutive ticks failed (including a loop that has not ticked yet);
+ * - `"failing"`: at least that many consecutive ticks failed outright; no
+ *   marked user is being deleted until a tick succeeds.
+ *
+ * Deliberately coarse: the probe is unauthenticated, so it carries no counts,
+ * timestamps or error details (the log lines have those).
+ */
+export type UserDeletionSweepHealth = "not_running" | "ok" | "failing";
+
+/** Failed-tick count of the active loop; null while no loop runs. */
+let userDeletionSweepHealthState: { failedTicks: number } | null = null;
+
+/** Health of this process's sweep loop (see {@link UserDeletionSweepHealth}). */
+export function getUserDeletionSweepHealth(): UserDeletionSweepHealth {
+  if (userDeletionSweepHealthState === null) return "not_running";
+  return userDeletionSweepHealthState.failedTicks >= USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION
+    ? "failing"
+    : "ok";
+}
+
+/**
  * Starts the periodic sweep on `prisma`, the sweep's own client
  * ({@link createUserDeletionSweepClient}). The caller keeps the client and
  * shuts it down with {@link shutDownUserDeletionSweep} (shutdown order: stop,
@@ -384,14 +425,17 @@ export function startUserDeletionSweep({
   if (activeUserDeletionSweepStop !== null) return activeUserDeletionSweepStop;
   let stopped = false;
   let inFlight: Promise<void> | null = null;
-  let failedTicks = 0;
   // Round-robin position of this loop (in memory; a restart begins again at
   // the oldest marked user).
   const queue: UserDeletionSweepQueue = {};
+  // Consecutive failed ticks of this loop, published for the readiness probe
+  // while this loop is the active one (getUserDeletionSweepHealth).
+  const health = { failedTicks: 0 };
+  userDeletionSweepHealthState = health;
   const tick = async () => {
     try {
       const result = await sweep({ prisma, shouldStop: () => stopped, queue });
-      failedTicks = 0;
+      health.failedTicks = 0;
       if (result.deleted + result.abandoned > 0)
         console.log(
           `[auth] user deletion sweep: deleted ${result.deleted}, archived ${result.abandoned} after a refusal.`,
@@ -403,7 +447,8 @@ export function startUserDeletionSweep({
         logShutdownStop();
         return;
       }
-      failedTicks += 1;
+      health.failedTicks += 1;
+      const failedTicks = health.failedTicks;
       if (failedTicks >= USER_DELETION_SWEEP_FAILED_TICKS_ESCALATION) {
         // A tick that fails outright (typically its queue read: the database
         // is unreachable or connects slower than the connect bound) deletes
@@ -431,6 +476,7 @@ export function startUserDeletionSweep({
     stopped = true;
     clearInterval(timer);
     if (activeUserDeletionSweepStop === stop) activeUserDeletionSweepStop = null;
+    if (userDeletionSweepHealthState === health) userDeletionSweepHealthState = null;
     await inFlight;
   };
   activeUserDeletionSweepStop = stop;

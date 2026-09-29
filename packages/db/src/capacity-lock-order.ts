@@ -99,10 +99,18 @@
  *
  * Outside the capacity domain: the `session_refuse_deleting_user` trigger
  * (schema-hardening.sql) reads the session owner's `user` row FOR SHARE on
- * every session INSERT (DEL-STATE commit point). A session inserter holds no
- * capacity lock and takes none afterwards, so its waits (on a deletion mark,
- * an L7 user lock or another user writer) close no cycle. Two more
- * transactions outside the capacity domain take the user row FOR SHARE:
+ * every session INSERT (DEL-STATE commit point), and for an impersonation
+ * session (Better Auth `impersonatedBy`) then the impersonating admin's
+ * `user` row FOR SHARE too (IMP-MARK), owner first. A session inserter holds
+ * no capacity lock and takes none afterwards, so its waits (on a deletion
+ * mark, an L7 user lock or another user writer) close no cycle. The two
+ * reads are FOR SHARE on user rows: they never conflict with each other, and
+ * each user writer they can wait on (the mark, the ordered delete's L7 lock,
+ * an abandon, a ban or role write) writes one user row and never waits on a
+ * session inserter's rows, so the owner-then-impersonator pair adds no edge
+ * either; the mark deletes the admin's impersonation sessions after its own
+ * UPDATE, the same order. Two more transactions outside the capacity domain
+ * take the user row FOR SHARE:
  *
  * - A user-deletion drain batch (./parent-deletion.ts,
  *   `runParentDeletionDrainBatch`) takes it first, on its deletion
@@ -702,25 +710,106 @@ export async function lockCapacityGraphForDelete(
 type TransactionRunner = Pick<PrismaClient, "$transaction">;
 
 /**
+ * Upper bound on any single lock wait inside a capacity-ordered transaction
+ * (`lock_timeout`, transaction-local, set as the transaction's first
+ * statement). The ordered delete waits on L0-L7 holders (live admissions,
+ * policy writers, relay registration); past this bound it gives up instead
+ * of queueing behind them, and every later admission queued behind it is
+ * released. SQLSTATE 55P03, surfaced as
+ * {@link CapacityOrderedTransactionTimeoutError}.
+ */
+export const CAPACITY_ORDERED_LOCK_TIMEOUT_MS = 2_000;
+
+/**
+ * Upper bound on any single statement inside a capacity-ordered transaction
+ * (`statement_timeout`, transaction-local). `lock_timeout` bounds each lock
+ * acquisition; a DELETE whose cascade waits on several rows in turn can
+ * outlast it, so this bounds the statement as a whole. It is server-side:
+ * unlike Prisma's client-side 15 s transaction cap it cancels the statement
+ * and releases its locks. SQLSTATE 57014, surfaced as
+ * {@link CapacityOrderedTransactionTimeoutError}.
+ *
+ * On the user-deletion sweep's client this transaction-local value
+ * overrides the connection's session `statement_timeout`, so it must also
+ * let the statement settle inside the sweep's shutdown join
+ * (apps/server/src/shutdown-timeouts.test.ts checks it). The whole ordered
+ * final phase measured 52 ms on a 20,000-row history, so 3 s only cuts off
+ * a statement stuck behind other sessions' locks.
+ */
+export const CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS = 3_000;
+
+/**
+ * A capacity-ordered transaction hit its own server-side bound
+ * ({@link CAPACITY_ORDERED_LOCK_TIMEOUT_MS} or
+ * {@link CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS}): the transaction rolled
+ * back, nothing was deleted. Not retried here (a retry would queue behind the
+ * same holders again); request paths answer `delete_contended`, and the
+ * user-deletion sweep treats it as transient (backoff, marker kept).
+ */
+export class CapacityOrderedTransactionTimeoutError extends Error {
+  readonly code = "CAPACITY_ORDERED_TIMEOUT";
+  readonly sqlState: "55P03" | "57014";
+  constructor(sqlState: "55P03" | "57014", options?: { cause?: unknown }) {
+    super(
+      sqlState === "55P03"
+        ? "The ordered delete waited too long for a lock held by live traffic. Retry."
+        : "An ordered delete statement ran past its bound. Retry.",
+      options,
+    );
+    this.name = "CapacityOrderedTransactionTimeoutError";
+    this.sqlState = sqlState;
+  }
+}
+
+/**
+ * The SQLSTATE of a server-side timeout this session raised: 55P03
+ * (`lock_timeout`) or 57014 (`statement_timeout`, or a cancel request),
+ * looked up through Prisma's and the driver adapter's wrappers.
+ */
+export function serverTimeoutSqlState(error: unknown): "55P03" | "57014" | undefined {
+  const pending: unknown[] = [error];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    for (const key of ["code", "originalCode"]) {
+      const code = Reflect.get(candidate, key);
+      if (code === "55P03" || code === "57014") return code;
+    }
+    for (const key of ["meta", "driverAdapterError", "cause"])
+      pending.push(Reflect.get(candidate, key));
+  }
+  return undefined;
+}
+
+/**
  * Runs `work` in a READ COMMITTED transaction and retries deadlock,
  * serialization and lock-set-change failures with a fresh transaction. Used
  * by ordered deletes: their correctness comes from the explicit lock order,
  * and READ COMMITTED lets each post-lock read see the committed rows.
  *
- * The 15 s cap bounds how long the capacity locks can be held. It holds for
- * any history size only because every ordered delete drains its request
- * history first (./parent-deletion.ts, DL1-TXBOUND); a new ordered delete
- * must do the same.
+ * Server-side bounds: the transaction's first statement sets a
+ * transaction-local `lock_timeout` ({@link CAPACITY_ORDERED_LOCK_TIMEOUT_MS})
+ * and `statement_timeout` ({@link CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS}),
+ * so every statement of `work` (the L0-L7 lock reads, the re-plan, the
+ * residual recount and the final DELETE with its cascade) is cancelled by
+ * PostgreSQL at that bound, on every client: the shared request client (which
+ * has no session bound of its own) and the sweep's statement-bounded client
+ * alike. A cancelled statement aborts the transaction, which rolls back and
+ * releases every lock it held. The timeout is not retried and surfaces as
+ * {@link CapacityOrderedTransactionTimeoutError}; request paths map it to
+ * the `delete_contended` CONFLICT (packages/api `runCapacityDeleteTransaction`
+ * and the CLI device delete), the sweep backs off.
  *
- * The cap is Prisma's client-side transaction timeout, so it does not cancel
- * the server-side statement: on the shared client a statement that has not
- * returned when the cap fires can still be running, with its locks still held
- * (the known issue on the request paths' capacity-ordered final delete in the
- * release notes). The user-deletion sweep runs this on its own client, whose
- * connections carry a server-side `statement_timeout`
- * (apps/server/src/user-deletion-sweep.ts), so there every statement is
- * cancelled server-side at that bound; the resulting 57014 is not retried
- * here and the sweep backs off. That client is also fenced at dispatch
+ * The 15 s cap is Prisma's client-side transaction timeout, a backstop for
+ * JavaScript time between statements: with every statement bounded
+ * server-side, the capacity locks are held at most a few statements' bounds.
+ * It holds for any history size only because every ordered delete drains its
+ * request history first (./parent-deletion.ts, DL1-TXBOUND); a new ordered
+ * delete must do the same.
+ *
+ * The user-deletion sweep's client is also fenced at dispatch
  * (./client-factory.ts): once the shutdown fence arms it sends no further
  * statement but the `COMMIT` / `ROLLBACK`, including the separate queries a
  * single Prisma call issues (the admission read in
@@ -731,8 +820,7 @@ type TransactionRunner = Pick<PrismaClient, "$transaction">;
  * wait on synchronous replication); shutdown waits on the sweep for its
  * join deadline and then quarantines the sweep's connections
  * (`shutDownUserDeletionSweep`), so the server finishes that transaction by
- * commit or rollback after the process leaves. The drain batches set a
- * transaction-local `statement_timeout` for every caller.
+ * commit or rollback after the process leaves.
  */
 export async function runCapacityOrderedTransaction<T>(
   db: TransactionRunner,
@@ -741,8 +829,18 @@ export async function runCapacityOrderedTransaction<T>(
 ): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await db.$transaction(work, { isolationLevel: "ReadCommitted", timeout: 15_000 });
+      return await db.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${CAPACITY_ORDERED_LOCK_TIMEOUT_MS}ms`}, true), set_config('statement_timeout', ${`${CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS}ms`}, true)`;
+          return work(tx);
+        },
+        { isolationLevel: "ReadCommitted", timeout: 15_000 },
+      );
     } catch (error) {
+      const timeout = serverTimeoutSqlState(error);
+      if (timeout !== undefined) {
+        throw new CapacityOrderedTransactionTimeoutError(timeout, { cause: error });
+      }
       if (attempt >= maxAttempts || !isRetryableCapacityTransactionError(error)) throw error;
       await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 8 * attempt)));
     }

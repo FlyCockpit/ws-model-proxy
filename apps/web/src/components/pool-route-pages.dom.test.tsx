@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   capacityEnabled: true,
@@ -19,10 +19,12 @@ const state = vi.hoisted(() => ({
   capacities: [] as Array<Record<string, unknown>>,
   nextReject: null as { name: string; error: unknown } | null,
   mutationCalls: [] as Array<{ name: string; variables: unknown }>,
+  fallbackAudits: [] as Array<Record<string, unknown>>,
+  auditQueryInputs: [] as unknown[],
 }));
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -132,9 +134,12 @@ vi.mock("@/utils/orpc", () => {
   });
   return {
     orpc: {
-      deploymentFlags: query("deploymentFlags", () => ({
-        providerEgressEnabled: state.providerEgressEnabled,
-      })),
+      deploymentFlags: {
+        ...query("deploymentFlags", () => ({
+          providerEgressEnabled: state.providerEgressEnabled,
+        })),
+        key: () => ["deploymentFlags"],
+      },
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
         listCliDevices: query("devices", () => []),
@@ -147,6 +152,15 @@ vi.mock("@/utils/orpc", () => {
         grantPoolAccessByEmail: mutation(),
         revokePoolAccessByEmail: mutation(),
       },
+      providerManagement: {
+        listAuditEvents: {
+          key: () => ["providerManagement", "listAuditEvents"],
+          queryOptions: (options?: { input?: unknown }) => {
+            state.auditQueryInputs.push(options?.input);
+            return query("poolFallbackAudits", () => state.fallbackAudits).queryOptions();
+          },
+        },
+      },
       capacityManagement: {
         key: () => ["capacityManagement"],
         list: deferredQuery("capacities", () => state.capacities),
@@ -157,6 +171,15 @@ vi.mock("@/utils/orpc", () => {
 });
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import i18next from "i18next";
+import enErrors from "@/locales/en-US/errors.json";
+
+// `friendly()` reads the default i18next instance, which the app's i18n
+// module initializes; this test does not load that module.
+beforeAll(async () => {
+  await i18next.init({ lng: "en-US", resources: { "en-US": { errors: enErrors } } });
+});
+
 import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import {
   InferenceCapacityPage,
@@ -187,6 +210,8 @@ afterEach(() => {
   state.capacities = [];
   state.nextReject = null;
   state.mutationCalls = [];
+  state.fallbackAudits = [];
+  state.auditQueryInputs = [];
   vi.mocked(toast.error).mockClear();
 });
 
@@ -221,12 +246,16 @@ describe("dedicated pool pages", () => {
 
     mount(<PoolsListPage lang="en-US" />);
 
-    expect(screen.getByText("dashboard:pools.privacyBadge.private")).toBeTruthy();
-    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackBadge.local")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
 
     cleanup();
     mount(<PoolDetailPage poolId="pool-external" />);
-    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "dashboard:pools.fallbackBadge.label" }),
+    ).toBeTruthy();
   });
 
   it("links the list edit action to the pool detail route instead of opening a sheet", () => {
@@ -338,6 +367,48 @@ describe("dedicated pool pages", () => {
     ).toBe("2000");
   });
 
+  it("shows the pool's fallback change history with its source (C1b-3)", () => {
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.fallbackAudits = [
+      {
+        id: "audit-1",
+        createdAt: new Date("2026-09-28T12:00:00Z"),
+        action: "POOL_FALLBACK_UPDATED",
+        subjectId: "pool-1",
+        providerAccountId: null,
+        metadata: {
+          source: "mcp",
+          changes: { fallbackForGrantees: { before: false, after: true } },
+        },
+      },
+    ];
+    mount(<PoolDetailPage poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.fallbackHistory.title")).toBeTruthy();
+    expect(screen.getByText(/dashboard:pools\.fallbackHistory\.sourceMcp/)).toBeTruthy();
+    expect(screen.getAllByText("dashboard:pools.fallbackHistory.change")).toHaveLength(1);
+    // Scoped to this pool: never the owner's whole audit trail.
+    expect(state.auditQueryInputs).toContainEqual({ poolId: "pool-1", limit: 20 });
+    expect(
+      state.auditQueryInputs.every((input) => (input as { poolId?: string }).poolId === "pool-1"),
+    ).toBe(true);
+  });
+
   describe("fallback settings form", () => {
     const fallbackPool = () => ({
       id: "pool-1",
@@ -396,6 +467,24 @@ describe("dedicated pool pages", () => {
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", fallbackForGrantees: true });
     });
 
+    it("refreshes the fallback change history after a save (C2a-2)", async () => {
+      const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+      state.providerEgressEnabled = true;
+      state.tab = "fallback";
+      state.pools = [fallbackPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.forGrantees" }),
+      );
+      submit();
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({
+          queryKey: ["providerManagement", "listAuditEvents"],
+        }),
+      );
+      invalidate.mockRestore();
+    });
+
     it("enables fallback in one save without a grantee confirmation", async () => {
       state.providerEgressEnabled = true;
       state.tab = "fallback";
@@ -428,6 +517,85 @@ describe("dedicated pool pages", () => {
       await waitFor(() => expect(toast.error).toHaveBeenCalled());
       expect(updateCalls()[0]?.variables).toEqual({ id: "pool-1", externalAfterWaitMs: 500 });
     });
+  });
+
+  it("says fallback is unavailable when the server refuses enabling it after the switch turned off", async () => {
+    // The form loaded with the switch on; it turned off before the save.
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.nextReject = {
+      name: "updateModelPool",
+      error: {
+        code: "NOT_FOUND",
+        status: 404,
+        message: "Provider egress is not enabled for this deployment.",
+        data: { reason: "PROVIDER_EGRESS_DISABLED" },
+      },
+    };
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "dashboard:pools.fallbackSettings.enableBlockedDeployment",
+      ),
+    );
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(state.mutationCalls).toEqual([
+      { name: "updateModelPool", variables: { id: "pool-1", fallbackEnabled: true } },
+    ]);
+  });
+
+  it("keeps the generic save error for a NOT_FOUND without the switch reason", async () => {
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: false,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.nextReject = {
+      name: "updateModelPool",
+      error: { code: "NOT_FOUND", status: 404, message: "Model pool not found." },
+    };
+    mount(<PoolDetailPage poolId="pool-1" />);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "dashboard:pools.fallbackSettings.enabled" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.fallbackSettings.save" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(toast.error).not.toHaveBeenCalledWith(
+      "dashboard:pools.fallbackSettings.enableBlockedDeployment",
+    );
   });
 
   it("allows fallback withdrawal and wait-time edits when provider egress is off", async () => {
@@ -717,8 +885,6 @@ describe("delete conflicts on pool pages", () => {
       screen.getByRole("button", { name: "confirm dashboard:pools.capacity.deleteTitle" }),
     );
 
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("That conflicts with an existing record."),
-    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(enErrors.friendly.conflict));
   });
 });

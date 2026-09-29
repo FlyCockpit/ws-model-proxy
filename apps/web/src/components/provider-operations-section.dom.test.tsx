@@ -19,6 +19,9 @@ const state = vi.hoisted(() => ({
   updateModelPayloads: [] as Array<Record<string, unknown>>,
   allowPrivateNetworks: true,
   testResult: undefined as Record<string, unknown> | undefined,
+  pools: [] as Array<Record<string, unknown>>,
+  mutationFailures: {} as Record<string, unknown>,
+  dataCollectionPayloads: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("@/hooks/use-deployment-audience", () => ({
@@ -37,6 +40,9 @@ vi.mock("react-i18next", () => ({
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
+
+// The OpenRouter catalog import has its own DOM test; stub it here.
+vi.mock("./provider-catalog-import", () => ({ ProviderCatalogImport: () => null }));
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: () => unknown) => ({
@@ -58,11 +64,13 @@ vi.mock("@/utils/orpc", () => {
       ...options,
       mutationFn: async (input: Record<string, unknown>) => {
         state.calls.push(name);
+        if (name in state.mutationFailures) throw state.mutationFailures[name];
         if (name === "createAccount") {
           state.accountPayload = input;
           return { id: "created-account" };
         }
         if (name === "createBudgetPolicy") state.budgetPayload = input;
+        if (name === "setAllowDataCollection") state.dataCollectionPayloads.push(input);
         if (name === "testCredential") return state.testResult ?? {};
         if (name === "updateModel") {
           state.updateModelPayloads.push(input);
@@ -102,6 +110,7 @@ vi.mock("@/utils/orpc", () => {
     "retirePricingVersion",
     "revokeCredential",
     "setAccountEnabled",
+    "setAllowDataCollection",
     "testCredential",
     "updateAccount",
     "updateModel",
@@ -121,7 +130,7 @@ vi.mock("@/utils/orpc", () => {
       },
       forwarderManagement: {
         key: () => ["forwarderManagement"],
-        listModelPools: query("pools", () => []),
+        listModelPools: query("pools", () => state.pools),
         addProviderPoolMember: mutation("addProviderPoolMember"),
         removePoolMember: mutation("removePoolMember"),
         reorderProviderPoolMember: mutation("reorderProviderPoolMember"),
@@ -133,10 +142,15 @@ vi.mock("@/utils/orpc", () => {
 });
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import { ProviderOperationsSection } from "./provider-operations-section";
 
-function mount() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function mount({ appToasts = false }: { appToasts?: boolean } = {}) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    // The app's global mutation toast, with keys shown as `t(key)`.
+    ...(appToasts ? { mutationCache: createAppMutationCache((key) => `t(${key})`) } : {}),
+  });
   return render(
     <QueryClientProvider client={client}>
       <ProviderOperationsSection />
@@ -160,6 +174,8 @@ afterEach(() => {
   state.allowPrivateNetworks = true;
   state.credentials = [];
   state.testResult = undefined;
+  state.pools = [];
+  state.mutationFailures = {};
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.warning).mockClear();
@@ -461,6 +477,134 @@ describe("ProviderOperationsSection mounted forms", () => {
     );
     expect(toast.warning).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("provider pool member removal", () => {
+  function withAttachedMember() {
+    state.accounts = [
+      {
+        id: "account-a",
+        label: "Primary",
+        providerType: "openai",
+        baseUrl: "https://api.example.com/v1",
+        authType: "BEARER",
+        enabled: true,
+        healthStatus: "HEALTHY",
+        healthCheckedAt: null,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    state.models = [
+      {
+        id: "model-a",
+        upstreamModelId: "gpt-example",
+        displayName: "Example",
+        pricingVersion: "v1",
+        healthStatus: "HEALTHY",
+        enabled: true,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    state.pools = [
+      {
+        id: "pool-a",
+        name: "Team pool",
+        grants: [],
+        members: [
+          {
+            id: "member-a",
+            tier: "PRIMARY",
+            publicOrder: null,
+            routingStatus: "ACTIVE",
+            providerModel: {
+              displayName: "Example",
+              upstreamModelId: "gpt-example",
+              ProviderAccount: { id: "account-a" },
+            },
+          },
+        ],
+      },
+    ];
+  }
+
+  const conflict = (reason: string) => ({
+    status: 409,
+    code: "CONFLICT",
+    message: "raw server message",
+    data: { reason },
+  });
+
+  it.each([
+    ["retained_history", "t(errors:deletionConflict.retainedHistory.poolMember)"],
+    ["delete_pending", "t(errors:deletionConflict.deletePending)"],
+    ["delete_contended", "t(errors:deletionConflict.deleteContended)"],
+  ])("toasts the localized %s copy once when detaching is refused", async (reason, copy) => {
+    withAttachedMember();
+    state.mutationFailures = { removePoolMember: conflict(reason) };
+    mount({ appToasts: true });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "dashboard:providers.actions.detachProvider" }),
+    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(copy));
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(state.calls).toContain("removePoolMember");
+  });
+
+  it("falls back to the providers failure copy without a deletion reason", async () => {
+    withAttachedMember();
+    state.mutationFailures = { removePoolMember: { status: 500, code: "INTERNAL_SERVER_ERROR" } };
+    mount({ appToasts: true });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "dashboard:providers.actions.detachProvider" }),
+    );
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("t(dashboard:providers.feedback.failed)"),
+    );
+    expect(toast.error).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpenRouter data-collection setting (D9)", () => {
+  const account = (providerType: string, allowDataCollection = false) => ({
+    id: "account-a",
+    label: "Provider",
+    providerType,
+    baseUrl: "https://openrouter.ai/api",
+    authType: "BEARER",
+    enabled: false,
+    allowDataCollection,
+    healthStatus: "HEALTHY",
+    healthCheckedAt: null,
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+  });
+
+  it("is off by default on OpenRouter accounts and a person can allow it", async () => {
+    state.dataCollectionPayloads = [];
+    state.accounts = [account("openrouter")];
+    mount();
+    const toggle = (await screen.findByRole("checkbox", {
+      name: "dashboard:providers.dataCollection.label",
+    })) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    expect(screen.getByText("dashboard:providers.dataCollection.deniedHint")).toBeTruthy();
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(state.dataCollectionPayloads).toEqual([
+        { id: "account-a", allowDataCollection: true },
+      ]),
+    );
+  });
+
+  it("shows the allowed state and is absent for other provider types", async () => {
+    state.accounts = [account("openrouter", true)];
+    mount();
+    expect(await screen.findByText("dashboard:providers.dataCollection.allowedHint")).toBeTruthy();
+    cleanup();
+    state.accounts = [account("openai")];
+    mount();
+    await screen.findByRole("button", { name: /dashboard:providers\.actions\.test/u });
+    expect(screen.queryByText("dashboard:providers.dataCollection.label")).toBeNull();
   });
 });
 

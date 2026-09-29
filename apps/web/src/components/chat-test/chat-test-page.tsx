@@ -119,6 +119,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
         effectiveProviderEgress: pool.effectiveProviderEgress,
         providerAccountLabels: pool.providerAccountLabels,
         providerTypes: pool.providerTypes,
+        externalRoutes: pool.externalRoutes,
       };
       return pool.effectiveProviderEgress
         ? [option, { ...option, modelId: `${pool.modelId}:external` }]
@@ -747,6 +748,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
               ),
             );
           },
+          onRoute: (route) => updateAssistant(assistantId, { route }),
         });
         updateAssistant(assistantId, { status: "ready", metrics });
         setAnnouncement(t("dashboard:chatTest.announcements.completed"));
@@ -990,6 +992,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
                   thinking: undefined,
                   status: "streaming",
                   errorMessage: undefined,
+                  route: undefined,
                 }
               : message,
           ),

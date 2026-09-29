@@ -2,6 +2,7 @@ import { env } from "@ws-model-proxy/env/web";
 import type {
   ChatAttachment,
   ChatMessage,
+  ChatRouteInfo,
   ChatTestRoutingMode,
   ChatTestSurface,
   ChatTimingMetrics,
@@ -87,6 +88,33 @@ function standardizedCompletionTokens(value: unknown): number | undefined {
   return "tokenizer" in metrics && metrics.tokenizer === "cl100k_base" ? tokens : undefined;
 }
 
+/** Route headers set by the model API (apps/server/src/model-api/external-route.ts). */
+const ROUTE_HEADER = "x-wsmp-route";
+const FALLBACK_REASON_HEADER = "x-wsmp-fallback-reason";
+const SERVED_MODEL_HEADER = "x-wsmp-served-model";
+const FALLBACK_HEADER = "x-wsmp-fallback";
+const KNOWN_ROUTES: readonly ChatRouteInfo["route"][] = ["local", "pool-fallback", "own-key"];
+
+/**
+ * Reads the route the server chose for one Chat Test response. Returns
+ * undefined when the response carries no route headers (direct models, and
+ * plain pool names served before any external decision).
+ */
+export function readChatRouteInfo(headers: Headers): ChatRouteInfo | undefined {
+  const rawRoute = headers.get(ROUTE_HEADER)?.trim().toLowerCase() ?? "";
+  const route = KNOWN_ROUTES.find((known) => known === rawRoute) ?? null;
+  const externalUnavailable = headers.get(FALLBACK_HEADER)?.trim().toLowerCase() === "unavailable";
+  if (route === null && !externalUnavailable) return undefined;
+  const servedModel = headers.get(SERVED_MODEL_HEADER)?.trim() || null;
+  const fallbackReason = headers.get(FALLBACK_REASON_HEADER)?.trim() || null;
+  return {
+    route,
+    servedModel: route === "local" ? null : servedModel,
+    fallbackReason: route === "local" ? null : fallbackReason,
+    externalUnavailable,
+  };
+}
+
 async function readErrorMessage(response: Response, fallback: string) {
   const statusPrefix = `HTTP ${response.status}`;
   try {
@@ -115,6 +143,7 @@ export async function streamChatCompletion({
   onDelta,
   onThinkingDelta,
   onTransformDebug,
+  onRoute,
   fallbackErrorMessage,
   anthropicMaxTokens,
 }: {
@@ -127,10 +156,16 @@ export async function streamChatCompletion({
   onDelta: (delta: string) => void;
   onThinkingDelta: (delta: string) => void;
   onTransformDebug?: (debug: TransformDebug) => void;
+  /** Called once per response (including error responses) that carries route headers. */
+  onRoute?: (route: ChatRouteInfo) => void;
   fallbackErrorMessage: string;
   anthropicMaxTokens: number;
 }): Promise<ChatTimingMetrics> {
   const startedAt = performance.now();
+  const reportRoute = (response: Response) => {
+    const route = readChatRouteInfo(response.headers);
+    if (route) onRoute?.(route);
+  };
   if (surface !== "OPENAI_CHAT_COMPLETIONS") {
     const isResponses = surface === "OPENAI_RESPONSES";
     const body = isResponses
@@ -159,6 +194,7 @@ export async function streamChatCompletion({
         signal,
       },
     );
+    reportRoute(response);
     if (!response.ok) throw new Error(await readErrorMessage(response, fallbackErrorMessage));
     const payload = (await response.json()) as Record<string, unknown>;
     const transcript = isResponses ? responsesTranscript(payload) : anthropicTranscript(payload);
@@ -174,6 +210,7 @@ export async function streamChatCompletion({
     body: JSON.stringify({ model, messages, stream: true, ...reasoning }),
     signal,
   });
+  reportRoute(response);
   if (!response.ok) throw new Error(await readErrorMessage(response, fallbackErrorMessage));
   if (!response.body) throw new Error(fallbackErrorMessage);
   const reader = response.body.getReader();

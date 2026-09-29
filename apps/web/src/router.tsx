@@ -31,7 +31,7 @@ export function getRouter() {
       onError: (error, query) => {
         toast.error(friendly(error), {
           action: {
-            label: "retry",
+            label: i18n.t("common:actions.retry"),
             onClick: query.invalidate,
           },
         });

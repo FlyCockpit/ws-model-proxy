@@ -98,6 +98,11 @@ catalog:
   "@types/ws": ^8.18.1
   # Types for pg (packages/db); keep on the pg 8.x line of packages/db.
   "@types/pg": ^8.23.1
+  # Exact pin: packages/db/src/pg-internals.ts and client-factory.ts rely on
+  # pg (and pg-pool) internals by source line (release guard, dispatch fence,
+  # query_timeout normalization). Bump deliberately, re-check those lines,
+  # and run the PostgreSQL suites that pg-internals.ts names.
+  pg: 8.23.0
   hono: ^4.13.7
   "@orpc/server": ^1.15.0
   "@orpc/openapi": ^1.15.0

@@ -150,7 +150,13 @@ Required production values:
 
 Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), rate-limit settings (including per-recipient email caps and failed-password caps), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
 
-Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys.
+Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys. Each release's notes say which setting it needs; see [`docs/release-notes/`](docs/release-notes/).
+
+### Deployment requirements
+
+- **Stop grace of at least 52 s.** On `SIGTERM` the server drains HTTP, closes relay sessions and stops its background sweeps, and exits within 47 s (`PROCESS_SHUTDOWN_DEADLINE_MS` in `apps/server/src/shutdown-timeouts.ts`). Docker's default stop grace is 10 s, which cuts that sequence short with `SIGKILL`. Use `docker stop -t 52`, compose `stop_grace_period: 52s` (the shipped `docker-compose.agent.yml` app services set it), or your platform's equivalent (for example Kubernetes `terminationGracePeriodSeconds: 52`).
+- **Database sessions run in UTC.** Every Prisma connection the server opens (all application queries, including the sweepers) is forced to `TimeZone=UTC` on connect (`packages/db/src/client-factory.ts`), whatever the URL options, `PGOPTIONS`, or role/database/server defaults say. Raw-SQL clocks (`now()`, `clock_timestamp()`) are compared with `timestamp without time zone` columns written from JavaScript in UTC, so do not change `TimeZone` from application SQL.
+- **No transaction-mode poolers.** PgBouncer `pool_mode=transaction` (and other transaction-mode poolers) is unsupported: session settings such as `TimeZone` and the sweeper's `statement_timeout` must persist for the life of the connection. Connect directly to Postgres or use session pooling.
 
 Schema sync never queues behind live traffic for long. `prisma db push` runs with a 5s `lock_timeout` and is retried as a whole on a lock timeout or deadlock (`packages/db/scripts/push-schema.mjs`). Schema hardening locks every table it touches up front with `NOWAIT` and retries until it gets them all at once, and it is skipped entirely when neither `schema-hardening.sql` nor the database catalog changed since its last apply (`SCHEMA_HARDENING_FORCE=1` re-applies anyway).
 

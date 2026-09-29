@@ -180,6 +180,7 @@ integration("own-key preference integrity and requester capacity", () => {
         effectiveProviderEgress: true,
         providerAccountLabels: [],
         providerTypes: [],
+        externalRoutes: [],
         allowLossyDeveloperRoleCollapse: false,
         recommendedSurfaceOverride: null,
         externalEquivalentModel: pool.externalEquivalentModel,
@@ -192,9 +193,12 @@ integration("own-key preference integrity and requester capacity", () => {
         return {
           ...actual,
           // CHAT_TEST avoids a synthetic token FK in real relay_request rows.
-          listVisibleModelTargetsForUser: async () => ({
+          // As in production, the owner sees their own pool without a grant.
+          listVisibleModelTargetsForUser: async (userId: string) => ({
             directModels: [],
-            modelPools: [visiblePool],
+            modelPools: [
+              userId === owner.id ? { ...visiblePool, accessGrantId: null } : visiblePool,
+            ],
           }),
         };
       });
@@ -214,6 +218,7 @@ integration("own-key preference integrity and requester capacity", () => {
         endpointVersion: account.endpointVersion,
         concurrencyLimit: 1,
         providerVersion: null,
+        dataCollectionPolicy: null,
         baseUrl: account.baseUrl,
         authType: "BEARER",
         healthStatus: "HEALTHY",
@@ -956,8 +961,8 @@ integration("own-key preference integrity and requester capacity", () => {
         }
         expect(await db.modelPool.findUnique({ where: { id: pool.id } })).toBeNull();
         // PENDING rows are deliberately skipped by the drain; the final FK
-        // cascade still erases their cross-tenant selection. P3C-2's later
-        // in-flight finalizer/attribution policy is a separate deferred issue.
+        // cascade still erases their cross-tenant selection and keeps the
+        // durable owner for attribution (P3C-2, grantee-stickiness suite).
         expect(
           await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
         ).toMatchObject({
@@ -966,6 +971,7 @@ integration("own-key preference integrity and requester capacity", () => {
           selectedDiscoveredModelId: null,
           selectedPoolMemberId: null,
           status: "PENDING",
+          resourceOwnerUserId: owner.id,
         });
         expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
           {

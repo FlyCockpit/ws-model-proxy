@@ -37,6 +37,12 @@ import {
   rememberAffinity,
 } from "./cache-affinity.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
+import {
+  applyOpenRouterDataCollection,
+  mapOpenRouterDataPolicyRefusal,
+  type OpenRouterDataCollectionPolicy,
+  openRouterDataCollectionPolicy,
+} from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
@@ -226,6 +232,14 @@ export interface PublicProviderTarget {
   endpointVersion: number;
   concurrencyLimit: number | null;
   providerVersion: string | null;
+  /**
+   * OpenRouter privacy preference forced into every body sent to this
+   * target (`provider.data_collection`); null for other provider types and
+   * for OpenRouter accounts that allow data collection. Required so every
+   * target builder decides it explicitly. This is the policy at listing
+   * time; the send claim re-reads the locked account and can only tighten it.
+   */
+  dataCollectionPolicy: OpenRouterDataCollectionPolicy;
   baseUrl: string;
   authType: "API_KEY" | "BEARER";
   healthStatus: "UNKNOWN" | "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
@@ -420,7 +434,15 @@ function consentSkipReason(denial: ExternalSendConsentDenial): ExternalConsentSk
 }
 
 export type PublicProviderSendClaim =
-  | { claimed: true; secret: string }
+  | {
+      claimed: true;
+      secret: string;
+      /**
+       * D9 policy of the provider account as read under its send-claim row
+       * lock. An opt-out withdrawn after listing is observed here.
+       */
+      dataCollectionPolicy: OpenRouterDataCollectionPolicy;
+    }
   | {
       claimed: false;
       reason:
@@ -435,7 +457,8 @@ export type PublicProviderSendClaim =
  * transaction it (1) re-validates every `:external` consent condition while
  * holding the consent rows FOR SHARE (lockExternalSendConsent), (2) takes the
  * provider account and credential locks, the last statements that can wait,
- * (3) re-evaluates the time- and account-dependent validity of the requester
+ * and re-reads the account's D9 data-collection policy under the account lock
+ * (returned so the dispatcher can tighten the rendered body), (3) re-evaluates the time- and account-dependent validity of the requester
  * (token expiry, ban, deletion mark) at a fresh `now`
  * (recheckExternalSendRequesterValidity), then (4) atomically claims the
  * current credential. `lastUsedAt` is the durable boundary: credential
@@ -471,6 +494,14 @@ export async function claimPublicProviderCredentialForSend(input: {
       const denial = await lockExternalSendConsent(tx, input.consent);
       if (denial) return { claimed: false, reason: consentSkipReason(denial) };
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+      // D9: the privacy switch commits under this same account row lock
+      // (providerManagement.setAllowDataCollection), so this read sees every
+      // withdrawal that committed before the claim.
+      const privacyAccount = await tx.providerAccount.findFirst({
+        where: { id: input.target.providerAccountId, userId: input.userId, deletedAt: null },
+        select: { providerType: true, allowDataCollection: true },
+      });
+      if (!privacyAccount) throw new Error("provider account is no longer available");
       if (input.consent.ownKeyProviderModelId)
         await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.target.providerModelId} AND "userId" = ${input.userId} FOR SHARE`;
       await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
@@ -547,7 +578,11 @@ export async function claimPublicProviderCredentialForSend(input: {
         where: { id: current.id },
         data: { lastUsedAt: new Date() },
       });
-      return { claimed: true, secret };
+      return {
+        claimed: true,
+        secret,
+        dataCollectionPolicy: openRouterDataCollectionPolicy(privacyAccount),
+      };
     },
     { maxWait: 5_000, timeout: 10_000 },
   );
@@ -716,6 +751,12 @@ export type PublicOverflowResult =
       /** Record commitment only when the final rendered response emits a byte. */
       markFirstClientByte: () => Promise<void>;
       affinity: PublicProviderTarget["affinity"];
+      /**
+       * D9: `response` is WMP's mapped 503 for OpenRouter's data-policy 404.
+       * The route layer renders its own surface-shaped error for it instead
+       * of sanitizing it like an untrusted provider body. In-process only.
+       */
+      dataPolicyRefusal?: true;
     }
   | {
       dispatched: false;
@@ -814,6 +855,7 @@ const providerTargetModelSelect = {
       userId: true,
       providerType: true,
       providerVersion: true,
+      allowDataCollection: true,
       baseUrl: true,
       endpointIdentity: true,
       endpointVersion: true,
@@ -1005,6 +1047,7 @@ export async function listPublicOverflowTargets(
           maxOutputTokens: model.maxOutputTokens,
           concurrencyLimit: model.concurrencyLimit,
           providerVersion: account.providerVersion,
+          dataCollectionPolicy: openRouterDataCollectionPolicy(account),
           baseUrl: account.baseUrl,
           authType: account.authType,
           healthStatus: model.healthStatus,
@@ -1120,6 +1163,21 @@ function providerAuth(target: PublicProviderTarget, secret: string): ProviderEgr
   return target.authType === "API_KEY"
     ? { type: "API_KEY", apiKey: secret }
     : { type: "BEARER", token: secret };
+}
+
+/**
+ * D9: OpenRouter's "no endpoints match your data policy" 404 becomes a clear
+ * 503 only for requests that were sent with `data_collection: "deny"`.
+ */
+async function mapDataPolicyRefusal(
+  sentPolicy: OpenRouterDataCollectionPolicy,
+  response: Response,
+): Promise<{ response: Response; dataPolicyRefusal?: true }> {
+  if (sentPolicy !== "deny") return { response };
+  const mapped = await mapOpenRouterDataPolicyRefusal(response);
+  return mapped.refused
+    ? { response: mapped.response, dataPolicyRefusal: true }
+    : { response: mapped.response };
 }
 
 function replaceModel(body: Uint8Array, model: string): Uint8Array {
@@ -2590,6 +2648,13 @@ export async function dispatchPublicOverflow(
               body: replaceModel(request.body, target.upstreamModelId),
             }
           : await request.renderForTarget!(target, nativeSurface);
+      // D9: every body sent to an OpenRouter account carries the account's
+      // data-collection preference, whichever path rendered it. A body that
+      // cannot carry it is never sent (REQUEST_RENDER_FAILED below).
+      upstream = {
+        ...upstream,
+        body: applyOpenRouterDataCollection(upstream.body, target.dataCollectionPolicy),
+      };
     } catch {
       await recordProviderAttemptEvent({
         userId: request.userId,
@@ -2825,6 +2890,25 @@ export async function dispatchPublicOverflow(
       // That is no evidence about the provider: hand the health trial back
       // without a verdict and settle the attempt as never sent.
       claim = "FAILED";
+    }
+    // D9: the policy read under the send-claim account lock can only
+    // tighten what was rendered at listing time. An opt-out withdrawn after
+    // listing adds the deny now; a body that cannot carry it is never sent
+    // (settled as a failed claim, before any provider I/O). A later opt-in
+    // never relaxes a body already rendered with the deny.
+    let sentDataCollectionPolicy = target.dataCollectionPolicy;
+    if (
+      claim !== "FAILED" &&
+      claim.claimed &&
+      claim.dataCollectionPolicy === "deny" &&
+      sentDataCollectionPolicy !== "deny"
+    ) {
+      try {
+        upstream = { ...upstream, body: applyOpenRouterDataCollection(upstream.body, "deny") };
+        sentDataCollectionPolicy = "deny";
+      } catch {
+        claim = "FAILED";
+      }
     }
     if (claim === "FAILED" || request.signal.aborted || attemptController.signal.aborted) {
       stopHeartbeat();
@@ -3418,14 +3502,17 @@ export async function dispatchPublicOverflow(
         }),
         markFirstClientByte,
         affinity: target.affinity,
-        response: new Response(bodyForbidden ? null : heldBody, {
-          status,
-          headers: providerResponseHeaders(
-            response.headers,
-            nativeSurface === request.requestedSurface &&
-              target.resolvedExecution?.mode !== "adapted",
-          ),
-        }),
+        ...(await mapDataPolicyRefusal(
+          sentDataCollectionPolicy,
+          new Response(bodyForbidden ? null : heldBody, {
+            status,
+            headers: providerResponseHeaders(
+              response.headers,
+              nativeSurface === request.requestedSurface &&
+                target.resolvedExecution?.mode !== "adapted",
+            ),
+          }),
+        )),
       };
     } catch {
       stopHeartbeat();

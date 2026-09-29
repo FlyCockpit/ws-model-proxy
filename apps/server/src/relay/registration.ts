@@ -197,7 +197,7 @@ export async function persistRelayRegistration({
           if (!user) {
             throw new RelayRegistrationError("Credential owner no longer exists.", "access_denied");
           }
-          if (userCredentialAccessBlocked(user, new Date())) {
+          if (userCredentialAccessBlocked(user, now)) {
             throw new RelayRegistrationError("Credential owner is not active.", "access_denied");
           }
 

@@ -185,6 +185,77 @@ ceremonial confirmation. The exact per-tool policy is in the
 [coverage artifact](./mcp-tool-coverage.md); the wrapper strips the
 confirmation field before the underlying procedure runs.
 
+## External fallback tools
+
+`forwarder_pool_fallback_get` (read) returns a pool's external-fallback state.
+Owners get `fallbackEnabled`, `fallbackForGrantees`, `externalAfterWaitMs`,
+`externalEquivalentModel`, the external members in fallback order and the
+aggregate own-key request count. Grantees get whether owner-paid fallback is
+available to them (provider types only, never the owner's account labels) and
+their own-key route.
+
+`forwarder_pool_fallback_update` (write, literal `mcp:write`, no confirmation
+literal) changes `fallbackEnabled`, `fallbackForGrantees` and
+`externalAfterWaitMs`. These settings cost money: turning fallback on sends
+`:external` requests to the owner's paid provider accounts, and
+`fallbackForGrantees` makes the owner pay for every grantee's external use.
+The tool description states this. The procedure applies the same checks as the
+dashboard (deployment switch, audited protection policy on every external
+member, wait within the local budget), and every change, from MCP or the
+dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
+(`metadata.source` is `mcp` or `dashboard`), readable with
+`provider_audit_events_list` (`poolId` filters one pool's history) and shown
+as the fallback change history on the pool's Fallback tab in the dashboard.
+The tool description also lists the preconditions an agent otherwise sees only
+as "Invalid input". The general pool tools reject the two switches and point to
+this tool; they still accept `externalAfterWaitMs`, and their descriptions
+state its cost.
+
+Still human-only: token external consent (`allowExternal`, `includeExternal`),
+own-key preferences, the pool external-equivalent picker, catalog search,
+the OpenRouter "providers that may collect data" account setting, and moving
+an OpenRouter account to another provider type (`provider_account_update`
+refuses it, since the privacy preference is keyed on the type).
+
+No tool output can contain a secret value WMP holds (provider API keys,
+encrypted credential material, token secrets or hashes, device-flow and 2FA
+backup codes). Projections pick safe fields, a recursive redactor removes
+secret-bearing keys and product credentials under any key, and the serializer
+elides byte values. A test drives every tool with secret-laden results and
+searches the output for every seeded secret value in every encoding. The CLI
+command tools return what a command printed on your own CLI device (behind the
+separate `allowCliCommands` consent); WMP credentials in that text are
+scrubbed, but other device content is returned as printed.
+
+## Tool errors
+
+A failed tool call returns `isError: true`, a short stable text, and
+`structuredContent.error.code`. Application messages are never copied into
+tool output. Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
+`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `TOO_MANY_REQUESTS`);
+anything else is `INTERNAL_ERROR` with a `requestId`. Wrapper-level errors
+use their own codes (for example `INSUFFICIENT_SCOPE`, `CONFIRMATION_REQUIRED`,
+`INVALID_INPUT`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
+
+A deletion-related `CONFLICT` also carries a stable `reason`
+(`@ws-model-proxy/config/deletion-conflict`), in the text (`Conflict:
+<reason>`) and in `structuredContent`:
+
+```json
+{ "error": { "code": "CONFLICT", "reason": "retained_history" } }
+```
+
+| `reason` | Meaning | What to do |
+| --- | --- | --- |
+| `retained_history` | Capacity or provider history must be kept, so the item can never be deleted. | Disable or archive it instead. |
+| `delete_pending` | Requests are still in flight on the item; nothing was deleted. | Retry once they finish. |
+| `delete_contended` | The delete kept losing its locks to live traffic; nothing was deleted. | Retry. |
+| `still_attached` | A capacity is still attached to a pool member. | Detach it first. |
+| `not_stale` | A stale-only delete found the item reporting recently. | Nothing; it is live. |
+| `deletion_in_progress` | The user is being deleted and cannot be restored. | Nothing. |
+
+Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
+
 ## Login, consent, and scope step-up
 
 The authorization flow uses Better Auth's signed OAuth transaction

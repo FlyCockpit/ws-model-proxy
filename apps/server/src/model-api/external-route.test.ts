@@ -51,6 +51,7 @@ const pool: VisibleModelPoolTarget = {
   effectiveProviderEgress: true,
   providerAccountLabels: [],
   providerTypes: [],
+  externalRoutes: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };
@@ -290,6 +291,21 @@ describe("client-facing errors and headers", () => {
     await expect(anthropic.json()).resolves.toEqual({
       type: "error",
       error: { type: "permission_error", message: "disabled" },
+    });
+  });
+
+  it("D9: renders the data-policy refusal as a 503 in both surface shapes", async () => {
+    const error = { code: "provider_data_policy_unavailable" as const, message: "no endpoint" };
+    const openAi = externalRouteErrorResponse("chat.completions", error);
+    expect(openAi.status).toBe(503);
+    await expect(openAi.json()).resolves.toMatchObject({
+      error: { code: "provider_data_policy_unavailable", message: "no endpoint" },
+    });
+    const anthropic = externalRouteErrorResponse("messages", error);
+    expect(anthropic.status).toBe(503);
+    await expect(anthropic.json()).resolves.toEqual({
+      type: "error",
+      error: { type: "api_error", message: "no endpoint" },
     });
   });
 

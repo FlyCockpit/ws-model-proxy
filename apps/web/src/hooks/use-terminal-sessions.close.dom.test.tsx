@@ -28,16 +28,16 @@ class FakeWebSocket {
   sent: string[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
   constructor(_url: string) {
     FakeWebSocket.instances.push(this);
   }
   send(data: string) {
     this.sent.push(data);
   }
-  close() {
+  close(code = 1005) {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
   open() {
     this.readyState = FakeWebSocket.OPEN;

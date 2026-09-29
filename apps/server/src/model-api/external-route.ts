@@ -67,7 +67,9 @@ export type ExternalRouteErrorCode =
   | "forced_member_requires_external"
   | "external_required"
   | "external_unavailable"
-  | "local_members_required";
+  | "local_members_required"
+  /** D9: OpenRouter has no upstream provider that accepts `data_collection: "deny"`. */
+  | "provider_data_policy_unavailable";
 
 export type ExternalRouteError = { code: ExternalRouteErrorCode; message: string };
 
@@ -81,6 +83,7 @@ const errorStatus: Record<ExternalRouteErrorCode, number> = {
   external_required: 400,
   external_unavailable: 503,
   local_members_required: 400,
+  provider_data_policy_unavailable: 503,
 };
 
 /**

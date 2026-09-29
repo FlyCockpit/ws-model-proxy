@@ -45,6 +45,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
   "forwarder_model_pools_list",
+  "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
   "forwarder_models_visible_list",
   "provider_accounts_list",
@@ -78,6 +79,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_affinity_clear",
   "forwarder_model_pool_create",
   "forwarder_model_pool_update",
+  "forwarder_pool_fallback_update",
   "forwarder_model_pool_delete",
   "forwarder_pool_member_add",
   "forwarder_provider_member_add",
@@ -154,6 +156,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
+  forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
   forwarder_models_visible_list: "forwarderManagement.visibleModels",
   provider_accounts_list: "providerManagement.listAccounts",
@@ -183,6 +186,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_affinity_clear: "forwarderManagement.clearCacheAffinity",
   forwarder_model_pool_create: "forwarderManagement.createModelPool",
   forwarder_model_pool_update: "forwarderManagement.updateModelPool",
+  forwarder_pool_fallback_update: "poolFallback.update",
   forwarder_model_pool_delete: "forwarderManagement.deleteModelPool",
   forwarder_pool_member_add: "forwarderManagement.addPoolMember",
   forwarder_provider_member_add: "forwarderManagement.addProviderPoolMember",
@@ -254,13 +258,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 25 read + 50 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 26 read + 51 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(25);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(50);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(75);
+    expect(PLAN_READ_TOOLS).toHaveLength(26);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(51);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(77);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -335,6 +339,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "modelApiTokens.create",
       // Human-only external-provider consent (fallback redesign C1).
       "modelApiTokens.updateExternalAccess",
+      // Human-only OpenRouter privacy opt-out (D9).
+      "providerManagement.setAllowDataCollection",
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
       "cliCredentials.deviceLoginRequest",
@@ -440,9 +446,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 75 catalog entries − 5 extracted cores = 70 procedure dispatches.
-    expect(dispatched).toBe(70);
-    expect(invoked).toHaveLength(70);
+    // 77 catalog entries − 5 extracted cores = 72 procedure dispatches.
+    expect(dispatched).toBe(72);
+    expect(invoked).toHaveLength(72);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -462,6 +468,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       [],
     );
     expect(invoked).not.toContain("modelApiTokens.updateExternalAccess");
+    // Human-only proof: no tool can relax an OpenRouter account's privacy routing.
+    expect(toolTargets).not.toContain("providerManagement.setAllowDataCollection");
+    expect(invoked).not.toContain("providerManagement.setAllowDataCollection");
   });
 });
 
@@ -507,7 +516,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     ]);
   });
 
-  it("D-K: MCP pool tools cannot change the owner's external fallback switches", async () => {
+  it("D-K: the general pool tools route fallback switches to the dedicated tool", async () => {
     const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
     for (const name of ["forwarder_model_pool_create", "forwarder_model_pool_update"]) {
       const schema = byName.get(name)!.inputSchema;
@@ -517,7 +526,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
             issues?: { message: string; path?: readonly PropertyKey[] }[];
           };
           expect(result.issues?.[0]?.path).toEqual([key]);
-          expect(result.issues?.[0]?.message).toContain("only by a person");
+          expect(result.issues?.[0]?.message).toContain("forwarder_pool_fallback_update");
         }
       // Other owner settings, including the external wait, still pass through.
       const allowed = await schema["~standard"].validate({
@@ -526,6 +535,13 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         externalAfterWaitMs: 500,
       });
       expect(allowed).not.toHaveProperty("issues");
+      // K1-1: the external wait they still accept carries its cost statement.
+      for (const phrase of [
+        "externalAfterWaitMs",
+        "lower values spend more",
+        "POOL_FALLBACK_UPDATED",
+      ])
+        expect(byName.get(name)!.descriptionNote).toContain(phrase);
       const { toJSONSchema } = await import("zod");
       const json: unknown = toJSONSchema(schema as unknown as Parameters<typeof toJSONSchema>[0]);
       expect(json).toMatchObject({
@@ -542,6 +558,68 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     expect(
       await guarded["~standard"].validate({ localModelIds: ["model"], providerModels: [] }),
     ).not.toHaveProperty("issues");
+  });
+
+  it("issue #67: fallback switches are an ordinary mcp:write tool that states its cost", async () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    const update = byName.get("forwarder_pool_fallback_update")!;
+    // Owner decision: gated by literal mcp:write, NO per-change confirmation.
+    expect(update.scope).toBe("write");
+    expect(update.confirmation).toBeNull();
+    expect(update.featureDependencies).toEqual([PROVIDER_EGRESS]);
+    // The description states the cost effect of each switch and the audit.
+    for (const phrase of [
+      "fallbackEnabled=true",
+      "fallbackForGrantees=true",
+      "externalAfterWaitMs",
+      "YOU pay",
+      "POOL_FALLBACK_UPDATED",
+      // C1b-6: the preconditions an agent otherwise sees only as "Invalid input".
+      "PRECONDITIONS",
+      "concurrency policy",
+      "local wait budget",
+    ])
+      expect(update.descriptionNote).toContain(phrase);
+    for (const value of [true, false]) {
+      expect(
+        await update.inputSchema["~standard"].validate({
+          poolId: "pool",
+          fallbackEnabled: value,
+          fallbackForGrantees: value,
+          externalAfterWaitMs: 0,
+        }),
+      ).not.toHaveProperty("issues");
+    }
+    const badWait = (await update.inputSchema["~standard"].validate({
+      poolId: "pool",
+      externalAfterWaitMs: -1,
+    })) as { issues?: unknown[] };
+    expect(badWait.issues?.length).toBeGreaterThan(0);
+    const read = byName.get("forwarder_pool_fallback_get")!;
+    expect(read.scope).toBe("read");
+    expect(read.confirmation).toBeNull();
+  });
+
+  it("D9: MCP account tools cannot relax the OpenRouter data-collection setting", async () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    for (const name of ["provider_account_create", "provider_account_update"]) {
+      const schema = byName.get(name)!.inputSchema;
+      for (const value of [true, false]) {
+        const result = (await schema["~standard"].validate({
+          id: "account",
+          allowDataCollection: value,
+        })) as { issues?: { message: string; path?: readonly PropertyKey[] }[] };
+        expect(result.issues?.[0]?.path).toEqual(["allowDataCollection"]);
+        expect(result.issues?.[0]?.message).toContain("only by a person");
+      }
+      expect(
+        await schema["~standard"].validate({ id: "account", label: "OpenRouter" }),
+      ).not.toHaveProperty("issues");
+    }
+    // C1b-2: the type-change refusal (enforced in the procedure) is stated.
+    expect(byName.get("provider_account_update")!.descriptionNote).toContain(
+      "only a person can do that",
+    );
   });
 
   it("tools without runtime feature gates advertise none", () => {

@@ -46,8 +46,11 @@
  * tick has at most one of these in flight:
  *
  * - a statement (any stage of the tick), cut off by the connection's
- *   server-side `statement_timeout` or a drain batch's transaction-local one,
- *   which remains the primary bound for ordinary statements; then the
+ *   server-side `statement_timeout`, or inside a drain batch or the ordered
+ *   final delete by that transaction's local one
+ *   (`PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS`,
+ *   `CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS`), which remains the primary
+ *   bound for ordinary statements; then the
  *   `COMMIT` or `ROLLBACK` ending its transaction, normally one round trip;
  * - or a connect, cut off by the connect bound, after which the connection's
  *   first statement is refused.
@@ -73,10 +76,12 @@ export const USER_DELETION_SWEEP_JOIN_TIMEOUT_MS = 7_500;
 /**
  * Server-side `statement_timeout` of every connection of the user-deletion
  * sweep's client (a connection parameter, so it applies to every statement
- * the tick issues, inside or outside a transaction). A drain batch's own
- * transaction-local `statement_timeout`
- * (`PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS`) overrides it inside the
- * batch, so the join arithmetic uses the larger of the two.
+ * the tick issues, inside or outside a transaction). Two transaction-local
+ * `statement_timeout`s override it inside their transactions: a drain
+ * batch's (`PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS`) and the ordered
+ * final delete's (`CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS`,
+ * `runCapacityOrderedTransaction` in @ws-model-proxy/db/capacity-lock-order),
+ * so the join arithmetic uses the largest of the three.
  *
  * Kept well above normal statements: on 20,000-row histories the largest
  * drain batch measured 570 ms and the whole ordered final phase 52 ms. A
@@ -144,9 +149,11 @@ export const USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS = 1_000;
 export const SHARED_DISCONNECT_TIMEOUT_MS = 2_000;
 
 /**
- * Bound on step 1's awaited work in `stopPeriodicJobs` (index.ts): capacity
- * maintenance stop closes the LISTEN client's socket via `Client.end()`, which
- * otherwise waits indefinitely for the peer to close the connection.
+ * Bound on step 1's awaited work in `stopPeriodicJobs` (server-shutdown.ts):
+ * capacity maintenance stop closes the LISTEN client's socket via
+ * `Client.end()`, which otherwise waits indefinitely for the peer to close the
+ * connection, and relay maintenance stop waits for its sweeps already running
+ * (./relay-maintenance.ts). Both are awaited together under this bound.
  */
 export const PERIODIC_JOBS_STOP_TIMEOUT_MS = 2_000;
 
@@ -166,8 +173,12 @@ export const RELAY_CLOSE_TIMEOUT_MS = 5_000;
 export const CAPACITY_RUNTIME_CLOSE_TIMEOUT_MS = 5_000;
 
 /**
- * Cap on the MCP close's shadow-await of admitted exchanges
- * (apps/server/src/mcp/auth.ts), the longest wait of the MCP close step.
+ * Cap on the MCP admission gate's shadow-await of admitted exchanges
+ * (apps/server/src/mcp/auth.ts). It bounds the gate's `close()` only: the MCP
+ * close step also awaits `mcpHandler.close()` (closing the per-request
+ * servers), which has no explicit bound of its own. It normally settles at
+ * once; if it ever hangs, the process watchdog (`PROCESS_SHUTDOWN_DEADLINE_MS`)
+ * ends the process. The watchdog sum counts this cap for the MCP step.
  */
 export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
 
@@ -175,26 +186,35 @@ export const MCP_CLOSE_SHADOW_AWAIT_MS = 10_000;
  * Process watchdog deadline, armed at the start of `shutdown()` before
  * anything is awaited (`runProcessShutdown`, ./graceful-shutdown.ts): at this
  * deadline the process logs and exits with status 1, whatever is still
- * pending. It is the sum of the step bounds plus a margin, so it never fires
- * before a bounded step finishes:
+ * pending. It is the sum of the step waits plus a margin:
  *
  *   periodic-job stop 2 s + HTTP drain 10 s + relay close 5 s
  *   + capacity runtime close 5 s + MCP close 10 s + sweep join 7.5 s
  *   + sweep disconnect 1 s + shared disconnect 2 s = 42.5 s, plus a 4.5 s
  *   margin (browser socket close, JavaScript continuations) = 47 s.
  *
- * Any future step that waits without a bound still ends here. The timer is
+ * Not every term is a bound the sequence enforces. The periodic-job stop,
+ * relay close, capacity runtime close, the sweep's join and disconnect and
+ * the shared disconnect are each awaited under `runWithDeadline` (the
+ * sequence moves on at the deadline; the work may keep running), and the
+ * HTTP drain under its own deadline. The MCP close step is not: its 10 s
+ * term is the admission gate's shadow-await cap (`MCP_CLOSE_SHADOW_AWAIT_MS`),
+ * while `mcpHandler.close()`, awaited alongside it, has no bound of its own,
+ * and the browser socket close is synchronous with none either. So the
+ * watchdog never fires before a step that finishes within its term, and it
+ * is what ends the process if the MCP close (or any future step that waits
+ * without a bound) hangs. The timer is
  * unref'd, so it never keeps an otherwise finished process alive, and it uses
  * `process.exit`, not an event-loop drain: abandoned pg sockets and timers
  * must not keep the process alive. `shutdown-timeouts.test.ts` pins the
  * arithmetic.
  *
- * Container stop grace: the repository sets none (Dockerfile, entrypoint and
- * compose files have none), and Docker's default is 10 s, after which SIGKILL
- * can land anywhere in the sequence (for the sweep, the same uncertain-outcome
- * case as a quarantine; the durable marker and generation make it
- * recoverable). A deployment that wants every step to finish sets its
- * platform's stop grace to at least this deadline plus a margin, 52 s
- * (`docker stop -t 52`, compose `stop_grace_period: 52s`).
+ * Container stop grace: a Dockerfile cannot set one, and Docker's default is
+ * 10 s, after which SIGKILL can land anywhere in the sequence (for the sweep,
+ * the same uncertain-outcome case as a quarantine; the durable marker and
+ * generation make it recoverable). Deployments must set their platform's stop
+ * grace to at least this deadline plus a margin, 52 s (`docker stop -t 52`,
+ * compose `stop_grace_period: 52s`). The shipped compose app services set it,
+ * and README.md "Deployment requirements" documents it.
  */
 export const PROCESS_SHUTDOWN_DEADLINE_MS = 47_000;

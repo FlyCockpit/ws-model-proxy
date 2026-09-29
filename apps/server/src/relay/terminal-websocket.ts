@@ -35,6 +35,23 @@ import {
 import { settleSocketHandler } from "./socket-handler.js";
 
 const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
+/**
+ * A browser socket whose outbound buffer is past this when the relay sends it
+ * a JSON frame is closed with {@link BROWSER_BACKPRESSURE_CLOSE}: the browser
+ * is not reading, and dropping a control frame would desynchronize it. Above
+ * the sealed-output detach threshold, so a slow viewer is first detached from
+ * its terminals (and keeps its socket) before it is closed.
+ */
+const BROWSER_BUFFER_CLOSE_BYTES = 8 * 1024 * 1024;
+/** 1013 "try again later": the browser reconnects with backoff and re-lists. */
+const BROWSER_BACKPRESSURE_CLOSE = { code: 1013, reason: "slow_consumer" } as const;
+/**
+ * Detach frames one socket may have queued past the pending cap or the rate
+ * window. A detach is never refused while it fits: dropping one would leave
+ * the viewer attached on the relay. A conforming browser has one detach per
+ * tab at most, so only a non-conforming client reaches this bound.
+ */
+const BROWSER_DETACH_OVERFLOW_LIMIT = 64;
 const BROWSER_JSON_MAX_BYTES = 64 * 1024;
 const BROWSER_JSON_LIMIT = TERMINAL_BROWSER_JSON_LIMIT;
 const BROWSER_JSON_WINDOW_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
@@ -142,6 +159,28 @@ function frameRefOf(parsed: unknown): FrameRef {
   };
 }
 
+/**
+ * True for a well-formed `detach` frame. Read only for a frame about to be
+ * refused, and bounded in size like {@link rawFrameRef}.
+ */
+function isDetachFrame(frame: string): boolean {
+  if (frame.length > BROWSER_JSON_ECHO_MAX_BYTES) return false;
+  try {
+    const parsed = browserClientMessageSchema.safeParse(JSON.parse(frame));
+    return parsed.success && parsed.data.type === "detach";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The hub's clock for rate windows. Monotonic, so a wall-clock step (NTP,
+ * a VM resume, an operator setting the date) cannot open or close a window.
+ */
+function monotonicNow(): number {
+  return performance.now();
+}
+
 /** `frameRefOf` for a raw frame refused before parsing; bounded in size. */
 function rawFrameRef(frame: string): FrameRef {
   if (frame.length > BROWSER_JSON_ECHO_MAX_BYTES) return {};
@@ -189,6 +228,11 @@ type BrowserConn = {
   admission: { promise: Promise<void>; settle: () => void };
   /** Accepted text frames not yet finished. Bounded by BROWSER_TEXT_QUEUE_LIMIT. */
   pendingText: number;
+  /**
+   * Detach frames admitted past the pending cap or the rate window and not
+   * yet finished. Bounded by BROWSER_DETACH_OVERFLOW_LIMIT.
+   */
+  overflowDetach: number;
 };
 
 type BrowserConnInput = {
@@ -370,6 +414,7 @@ export class TerminalBrowserHub {
       admitted: false,
       admission: admissionGate(),
       pendingText: 0,
+      overflowDetach: 0,
     };
     const previous = this.bySocket.get(input.socket);
     if (previous) this.forgetConn(previous);
@@ -429,7 +474,19 @@ export class TerminalBrowserHub {
     // Registered synchronously on open and forgotten on close, so an unknown
     // socket is one that already closed.
     if (!conn) return Promise.resolve();
-    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
+    const overCap = conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT;
+    if ((overCap || !this.jsonWindowOpen(conn)) && isDetachFrame(frame)) {
+      // DETACH-1: a detach is never refused for load. It takes no rate slot
+      // and waits its turn behind the frames already accepted (an attach
+      // queued before it runs first), so the viewer is always released.
+      if (conn.overflowDetach < BROWSER_DETACH_OVERFLOW_LIMIT) {
+        conn.overflowDetach += 1;
+        return this.enqueueText(conn, frame, () => {
+          conn.overflowDetach -= 1;
+        });
+      }
+    }
+    if (overCap) {
       // Refused unread, like a rate-limited frame, and answered so the
       // browser can send it again. The frames already accepted keep running;
       // the socket stays open. Checked before the rate window so a refused
@@ -449,18 +506,32 @@ export class TerminalBrowserHub {
       return Promise.resolve();
     }
     conn.pendingText += 1;
-    const previous = this.textChain.get(socket) ?? Promise.resolve();
+    return this.enqueueText(conn, frame, () => {
+      conn.pendingText -= 1;
+    });
+  }
+
+  /** Runs one accepted frame after the ones before it on this socket. */
+  private enqueueText(conn: BrowserConn, frame: string, done: () => void): Promise<void> {
+    const previous = this.textChain.get(conn.socket) ?? Promise.resolve();
     const run = previous
       .catch(() => undefined)
       .then(() => this.handleTextExclusive(conn, frame))
-      .finally(() => {
-        conn.pendingText -= 1;
-      });
-    this.textChain.set(socket, run);
+      .finally(done);
+    this.textChain.set(conn.socket, run);
     return run;
   }
 
-  private allowJson(conn: BrowserConn, now = Date.now()): boolean {
+  /** Whether the JSON window has room, without taking a slot. */
+  private jsonWindowOpen(conn: BrowserConn, now = monotonicNow()): boolean {
+    const stamps = this.jsonAt.get(conn.id);
+    if (!stamps) return true;
+    let recent = 0;
+    for (const stamp of stamps) if (now - stamp < BROWSER_JSON_WINDOW_MS) recent += 1;
+    return recent < BROWSER_JSON_LIMIT;
+  }
+
+  private allowJson(conn: BrowserConn, now = monotonicNow()): boolean {
     const recent = (this.jsonAt.get(conn.id) ?? []).filter(
       (stamp) => now - stamp < BROWSER_JSON_WINDOW_MS,
     );
@@ -473,7 +544,7 @@ export class TerminalBrowserHub {
     return true;
   }
 
-  private allowBinary(conn: BrowserConn, terminalId: string, now = Date.now()): boolean {
+  private allowBinary(conn: BrowserConn, terminalId: string, now = monotonicNow()): boolean {
     let byTerminal = this.binaryAt.get(conn.id);
     if (!byTerminal) {
       byTerminal = new Map();
@@ -492,7 +563,7 @@ export class TerminalBrowserHub {
   }
 
   /** Checks the per-terminal aggregate without recording, so unknown ids add no entry. */
-  private terminalInputAllowed(terminalId: string, now = Date.now()): boolean {
+  private terminalInputAllowed(terminalId: string, now = monotonicNow()): boolean {
     const stamps = this.terminalBinaryAt.get(terminalId);
     if (!stamps) return true;
     const recent = stamps.filter((stamp) => now - stamp < BROWSER_BINARY_WINDOW_MS);
@@ -504,7 +575,7 @@ export class TerminalBrowserHub {
     return recent.length < TERMINAL_BINARY_LIMIT;
   }
 
-  private recordTerminalInput(terminalId: string, now = Date.now()) {
+  private recordTerminalInput(terminalId: string, now = monotonicNow()) {
     const stamps = this.terminalBinaryAt.get(terminalId) ?? [];
     stamps.push(now);
     this.terminalBinaryAt.set(terminalId, stamps);
@@ -716,9 +787,11 @@ export class TerminalBrowserHub {
 
   async recheckSessions(now = Date.now()) {
     // A terminal can end without an exit event reaching here (an unspawned
-    // open that was refused). Its input stamps age out on this sweep.
+    // open that was refused). Its input stamps age out on this sweep. Rate
+    // stamps are monotonic; `now` is wall-clock, for session expiry only.
+    const monotonic = monotonicNow();
     for (const terminalId of [...this.terminalBinaryAt.keys()]) {
-      this.terminalInputAllowed(terminalId, now);
+      this.terminalInputAllowed(terminalId, monotonic);
     }
     const conns = [...this.bySocket.values()];
     if (conns.length === 0) return;
@@ -1064,9 +1137,30 @@ export class TerminalBrowserHub {
     });
   }
 
+  /**
+   * CI-1: a JSON frame to a socket backed up past BROWSER_BUFFER_CLOSE_BYTES
+   * is not sent; the socket is closed instead (1013 `slow_consumer`) and its
+   * viewers are released, like a closed socket. The browser reconnects and
+   * lists again. Teardown runs in a microtask, so a caller iterating
+   * viewers or terminals (an exit fan-out, a viewers push) is not re-entered.
+   */
   private send(conn: BrowserConn, message: unknown) {
     if (conn.socket.readyState !== 1) return;
+    if ((conn.socket.bufferedAmount ?? 0) > BROWSER_BUFFER_CLOSE_BYTES) {
+      this.closeSlowConsumer(conn);
+      return;
+    }
     conn.socket.send(JSON.stringify(message));
+  }
+
+  private closeSlowConsumer(conn: BrowserConn) {
+    console.error("[terminal] browser socket backed up past the send limit; closing");
+    conn.socket.close(BROWSER_BACKPRESSURE_CLOSE.code, BROWSER_BACKPRESSURE_CLOSE.reason);
+    queueMicrotask(() => {
+      if (this.bySocket.get(conn.socket) !== conn) return;
+      this.detachAll(conn);
+      this.forgetConn(conn);
+    });
   }
 }
 
@@ -1092,10 +1186,18 @@ registerTerminalBridge({
  * Fails closed: a missing or foreign or expired session, a missing user row, a
  * deletion marker or an active ban close the socket (4401), and a read error
  * closes it (1011) before rethrowing for the caller's log. A socket that
- * closed or was revoked during the read is never registered.
+ * closed or was revoked during the read is never registered. A socket that
+ * opens once the shutdown drain began is closed (1001) without a read.
  */
 export async function admitBrowserConnection(input: BrowserConnInput): Promise<void> {
   const conn = terminalBrowserHub.register(input);
+  // Shutdown sets the drain flag and runs closeAll() in one synchronous turn.
+  // An upgrade that passed the middleware's drain check before that registers
+  // here after closeAll() already ran, so nothing else would close it.
+  if (relaySessionManager.isDraining()) {
+    terminalBrowserHub.refuse(conn, 1001, "shutdown");
+    return;
+  }
   let row: {
     userId: string;
     expiresAt: Date;

@@ -76,6 +76,16 @@ const requiredFragments = [
   "primary pool members must be local discovered models",
   "model_pool_external_after_wait_check",
   "relay_request_fallback_route_check",
+  // #66: grantee local stickiness and durable relay owner attribution.
+  "stickiness pool binding requires the pool owner or the exact grant",
+  "stickiness selection must be a local member of its pool",
+  "stickiness pool grant row=%s",
+  '"selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",\n  "routingVersion" ON response_stickiness_record',
+  "derive_relay_request_resource_owner",
+  'BEFORE INSERT OR UPDATE OF "requestedModelPoolId", "resourceOwnerUserId" ON relay_request',
+  'WHERE request."resourceOwnerUserId" IS NULL;',
+  'AND NEW."resourceOwnerUserId" IS DISTINCT FROM NEW."userId"',
+  "IF TG_OP = 'UPDATE' AND OLD.status = 'PENDING'\n       AND NEW.\"requestedModelPoolId\" IS NULL",
   "enforce_response_stickiness_provider_binding_immutable",
   "activated provider pricing billing fields are immutable",
   "provider pricing lifecycle timestamps are immutable",
@@ -94,6 +104,9 @@ const requiredFragments = [
   // IMP-MARK: an impersonation session is refused for a pending or deleted impersonator.
   'WHERE u.id = NEW."impersonatedBy"\n       FOR SHARE;\n    IF NOT FOUND OR pending THEN',
   "RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';",
+  // Single writer of the deletion marker (parent-deletion.ts abandonUserDeletion).
+  'BEFORE UPDATE OF "deletionRequestedAt", "deletionGeneration" ON "user"',
+  "current_setting('wsmp.user_deletion_writer', true) IS DISTINCT FROM 'on'",
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -569,10 +582,14 @@ try {
       'pre-model', NULL, 'OPENAI_RESPONSES',
       'fghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcde',
       NOW() + INTERVAL '1 hour'),
+    -- Cross-wired graph: the target serves a different provider model than
+    -- the binding records. (A target that is merely not, or no longer, a
+    -- member of the pool is not an audit failure: membership is checked when
+    -- a binding is written, and follow-ups re-list the members live.)
     ('pre-invalid-cross-wire', NOW(), NOW(), 'owner-b', 'pre-provider-token',
       'pre-invalid-cross-wire-digest', 3, 'pre-provider-pool', 'pre-other-provider-target',
-      'pre-provider-account', 'pre-other-provider-model', 'https://pre.example.test/v1', 1,
-      'pre-other-model', NULL, 'OPENAI_RESPONSES',
+      'pre-provider-account', 'pre-provider-model', 'https://pre.example.test/v1', 1,
+      'pre-model', NULL, 'OPENAI_RESPONSES',
       'ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdef',
       NOW() + INTERVAL '1 hour');
 
@@ -675,6 +692,49 @@ try {
        "selectedDiscoveredModelId", "selectedExecutionTargetId")
     VALUES ('invalid-preexisting-stickiness', NOW(), NOW(), 'owner-b', 'invalid',
       'model-b', 'preexisting-target-a', 'model-b', 'preexisting-target-a');
+    -- Local (v2) pool bindings predating the triggers: the owner without a
+    -- grant and a grantee with the exact grant are valid; a grantee without a
+    -- grant, or with a grant for another pool, is not.
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest", "routingVersion",
+       "targetModelPoolId", "poolGrantId", "selectedDiscoveredModelId",
+       "selectedExecutionTargetId", "expiresAt")
+    VALUES
+      ('pre-v2-owner-binding', NOW(), NOW(), 'owner-a', 'pre-v2-owner', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', NOW() + INTERVAL '1 hour'),
+      ('pre-v2-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-v2-grantee', 2,
+        'pre-provider-pool', 'pre-provider-grant', 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-ungranted-binding', NOW(), NOW(), 'owner-b', 'pre-v2-ungranted', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', NOW() + INTERVAL '1 hour'),
+      ('pre-v2-foreign-grant-binding', NOW(), NOW(), 'owner-b', 'pre-v2-foreign-grant', 2,
+        'conflict-pool', 'pre-provider-grant', 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour');
+    -- Another grantee's grant on the same pool, a grant row whose owner is
+    -- not the pool owner, and a pool binding that also names a direct target.
+    INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug)
+    VALUES ('owner-c', NOW(), NOW(), 'C', 'c@example.test', 'owner-c');
+    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    VALUES ('pre-v2-pool', NOW(), NOW(), 'owner-a', 'pre-v2', 'Pre v2');
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('pre-v2-c-grant', NOW(), NOW(), 'conflict-pool', 'owner-a', 'owner-c'),
+           ('pre-v2-misowned-grant', NOW(), NOW(), 'pre-v2-pool', 'owner-b', 'owner-c');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest", "routingVersion",
+       "targetModelPoolId", "poolGrantId", "targetDiscoveredModelId",
+       "targetExecutionTargetId", "selectedDiscoveredModelId",
+       "selectedExecutionTargetId", "expiresAt")
+    VALUES
+      ('pre-v2-other-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-v2-other-grantee', 2,
+        'conflict-pool', 'pre-v2-c-grant', NULL, NULL, 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-misowned-grant-binding', NOW(), NOW(), 'owner-c', 'pre-v2-misowned', 2,
+        'pre-v2-pool', 'pre-v2-misowned-grant', NULL, NULL, 'model-a', 'preexisting-target-a',
+        NOW() + INTERVAL '1 hour'),
+      ('pre-v2-mixed-binding', NOW(), NOW(), 'owner-a', 'pre-v2-mixed', 2,
+        'conflict-pool', NULL, 'model-a', 'preexisting-target-a', 'model-a',
+        'preexisting-target-a', NOW() + INTERVAL '1 hour');
     INSERT INTO relay_request
       (id, "createdAt", "updatedAt", "userId", "requestedDiscoveredModelId",
        "requestedExecutionTargetId", "selectedDiscoveredModelId",
@@ -697,7 +757,13 @@ try {
         "invalid-preexisting-stickiness",
         "invalid-preexisting-relay",
         "pre-invalid-cross-wire",
-      ].every((id) => error?.detail?.includes(id))
+        "stickiness pool grant row=pre-v2-ungranted-binding",
+        "stickiness pool grant row=pre-v2-foreign-grant-binding",
+        "stickiness pool grant row=pre-v2-other-grantee-binding",
+        "stickiness pool grant row=pre-v2-misowned-grant-binding",
+        "stickiness mixed target row=pre-v2-mixed-binding",
+      ].every((id) => error?.detail?.includes(id)) ||
+      ["pre-v2-owner-binding", "pre-v2-grantee-binding"].some((id) => error?.detail?.includes(id))
     ) {
       throw error;
     }
@@ -727,11 +793,24 @@ try {
     DELETE FROM model_api_token_allowlist_entry WHERE id = 'invalid-preexisting-access'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'invalid-preexisting-stickiness'; -- policy: bounded-delete
     DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-ungranted-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-foreign-grant-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-other-grantee-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-misowned-grant-binding'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-v2-mixed-binding'; -- policy: bounded-delete
+    DELETE FROM pool_grant WHERE id = 'pre-v2-misowned-grant'; -- policy: bounded-delete
     DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay'; -- policy: bounded-delete
   `);
 
   await client.query(sql);
   await client.query(sql);
+  const preservedV2Bindings = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id IN ('pre-v2-owner-binding', 'pre-v2-grantee-binding')
+  `);
+  if (preservedV2Bindings.rows[0]?.count !== 2) {
+    throw new Error("Hardening did not keep valid pre-existing local pool bindings");
+  }
   const constraint = await client.query(`
     SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
      WHERE conrelid = 'execution_target'::regclass
@@ -985,6 +1064,18 @@ try {
     invalidatedBinding.rows[0]?.current_version !== 2
   ) {
     throw new Error("Provider endpoint change did not preserve an invalidated binding snapshot");
+  }
+  // Pool membership is a write-time invariant of a v3 binding: removing the
+  // member it was written against is a normal operation (follow-ups re-list
+  // members live), so it must not block the next hardening apply.
+  await client.query(`DELETE FROM pool_member WHERE id = 'sticky-provider-member'`); // policy: bounded-delete
+  await client.query(sql);
+  const bindingsAfterMemberRemoval = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id IN ('sticky-provider-binding', 'grantee-provider-binding')
+  `);
+  if (bindingsAfterMemberRemoval.rows[0]?.count !== 2) {
+    throw new Error("Re-applied hardening changed v3 bindings after their member was removed");
   }
   await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`); // policy: bounded-delete
   const deletedTokenBinding = await client.query(`

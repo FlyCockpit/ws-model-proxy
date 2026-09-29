@@ -1,3 +1,4 @@
+import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 
 import type { AttachmentModalities, AttachmentModality } from "@/lib/image-attachments";
@@ -19,6 +20,8 @@ export type ModelOption = {
   effectiveProviderEgress?: boolean;
   providerAccountLabels?: readonly string[];
   providerTypes?: readonly string[];
+  /** External routes `:external` can take for this viewer. */
+  externalRoutes?: readonly ExternalRouteKind[];
 };
 
 export type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
@@ -58,6 +61,17 @@ export type TransformDebug = {
   error: string | null;
 };
 
+/** Which route served one assistant turn (from the `x-wsmp-*` response headers). */
+export type ChatRouteInfo = {
+  route: "local" | "pool-fallback" | "own-key" | null;
+  /** Provider model that answered; external routes only. */
+  servedModel: string | null;
+  /** Why the request left the local members, e.g. `local_wait_expired`. */
+  fallbackReason: string | null;
+  /** `:external` was asked for but no external route could serve it. */
+  externalUnavailable: boolean;
+};
+
 export type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -68,6 +82,7 @@ export type ChatMessage = {
   attachments?: ChatAttachment[];
   metrics?: ChatTimingMetrics;
   transformDebug?: TransformDebug;
+  route?: ChatRouteInfo;
   thinking?: string;
 };
 

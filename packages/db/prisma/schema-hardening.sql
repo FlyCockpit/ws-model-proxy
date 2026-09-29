@@ -363,7 +363,9 @@ ALTER TABLE response_stickiness_record
     ("routingVersion" < 3 AND "providerAccountId" IS NULL AND "providerModelId" IS NULL
       AND "providerEndpointIdentity" IS NULL AND "providerEndpointVersion" IS NULL
       AND "providerUpstreamModelId" IS NULL AND "nativeSurface" IS NULL
-      AND "upstreamResponseIdDigest" IS NULL AND "poolGrantId" IS NULL)
+      AND "upstreamResponseIdDigest" IS NULL
+      -- Local (v2) grantee bindings carry their exact pool grant.
+      AND ("poolGrantId" IS NULL OR "targetModelPoolId" IS NOT NULL))
     OR
     ("routingVersion" >= 3 AND "providerAccountId" IS NOT NULL AND "providerModelId" IS NOT NULL
       AND "selectedExecutionTargetId" IS NOT NULL AND "targetModelPoolId" IS NOT NULL
@@ -1150,13 +1152,43 @@ BEGIN
         OR (record."targetDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM record."targetDiscoveredModelId"))
     UNION ALL
+    -- Local pool bindings belong to the pool owner's graph: the requester is
+    -- the owner (no grant) or holds the exact grant. Membership is checked only
+    -- when a selection is written, so it is not re-audited here.
     SELECT format('stickiness selection row=%s', record.id)
       FROM response_stickiness_record record
       JOIN execution_target target ON target.id = record."selectedExecutionTargetId"
+      LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
      WHERE record."routingVersion" < 3
-       AND (target."userId" <> record."userId"
+       AND (target."userId" IS DISTINCT FROM CASE
+              WHEN record."targetModelPoolId" IS NULL THEN record."userId"
+              ELSE pool."userId"
+            END
         OR (record."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM record."selectedDiscoveredModelId"))
+    UNION ALL
+    SELECT format('stickiness mixed target row=%s', record.id)
+      FROM response_stickiness_record record
+     WHERE record."routingVersion" < 3
+       AND record."targetModelPoolId" IS NOT NULL
+       AND (record."targetExecutionTargetId" IS NOT NULL
+         OR record."targetDiscoveredModelId" IS NOT NULL)
+    UNION ALL
+    SELECT format('stickiness pool grant row=%s', record.id)
+      FROM response_stickiness_record record
+      LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
+     WHERE record."routingVersion" < 3
+       AND record."targetModelPoolId" IS NOT NULL
+       AND (pool.id IS NULL
+         OR (record."poolGrantId" IS NULL AND pool."userId" IS DISTINCT FROM record."userId")
+         OR (record."poolGrantId" IS NOT NULL AND (
+           pool."userId" IS NOT DISTINCT FROM record."userId"
+           OR NOT EXISTS (
+             SELECT 1 FROM pool_grant grant_row
+              WHERE grant_row.id = record."poolGrantId"
+                AND grant_row."poolId" = record."targetModelPoolId"
+                AND grant_row."ownerUserId" = pool."userId"
+                AND grant_row."granteeUserId" = record."userId"))))
     UNION ALL
     SELECT format('provider stickiness graph row=%s', record.id)
       FROM response_stickiness_record record
@@ -1179,17 +1211,12 @@ BEGIN
            target."userId" IS DISTINCT FROM record."userId"
            OR pool."userId" IS NOT DISTINCT FROM record."userId"
            OR record."poolGrantId" IS NULL))
-         OR (record."fallbackRoute" IS DISTINCT FROM 'own-key' AND (
-         pool."userId" IS DISTINCT FROM target."userId"
-         OR NOT EXISTS (
-           SELECT 1 FROM pool_member member
-            WHERE member."poolId" = record."targetModelPoolId"
-              AND member."executionTargetId" = record."selectedExecutionTargetId"
-              AND member.tier IN (
-                'PRIMARY'::"PoolMemberTier",
-                'PUBLIC_OVERFLOW'::"PoolMemberTier"
-              )
-         )))
+         -- Membership is checked only when the binding is written (the row
+         -- is immutable afterwards, and follow-up routing re-lists the pool's
+         -- members live). Removing a member or changing its tier is a normal
+         -- operation, so it is not re-audited here.
+         OR (record."fallbackRoute" IS DISTINCT FROM 'own-key'
+           AND pool."userId" IS DISTINCT FROM target."userId")
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
@@ -1523,6 +1550,57 @@ BEGIN
       END IF;
       RETURN NEW;
     END IF;
+    -- Local (v1/v2) bindings. A pool binding belongs to the pool owner's
+    -- graph, like a pool relay_request: the requester is the owner (no grant)
+    -- or holds the exact grant, whose deletion cascades the binding away.
+    -- Without a pool the binding is direct and the requester owns the target.
+    -- These are write-time rules. An UPDATE that changes no identity column
+    -- and at most clears a reference (such as the SET NULL action of a
+    -- deleted discovered model while the pool owner's whole account is
+    -- deleted in one cascade, after its pool and grant rows are gone)
+    -- authorizes nothing new, so it is not re-checked.
+    IF TG_OP = 'UPDATE'
+       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+       AND NEW."routingVersion" IS NOT DISTINCT FROM OLD."routingVersion"
+       AND NEW."targetModelPoolId" IS NOT DISTINCT FROM OLD."targetModelPoolId"
+       AND NEW."poolGrantId" IS NOT DISTINCT FROM OLD."poolGrantId"
+       AND (NEW."targetExecutionTargetId" IS NULL
+            OR NEW."targetExecutionTargetId" IS NOT DISTINCT FROM OLD."targetExecutionTargetId")
+       AND (NEW."targetDiscoveredModelId" IS NULL
+            OR NEW."targetDiscoveredModelId" IS NOT DISTINCT FROM OLD."targetDiscoveredModelId")
+       AND (NEW."selectedExecutionTargetId" IS NULL
+            OR NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId")
+       AND (NEW."selectedDiscoveredModelId" IS NULL
+            OR NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId") THEN
+      RETURN NEW;
+    END IF;
+    consumer_owner := NEW."userId";
+    IF NEW."targetModelPoolId" IS NOT NULL THEN
+      -- A binding targets a pool or a direct model, never both: routing
+      -- would take the direct branch and skip the pool's checks.
+      IF NEW."targetExecutionTargetId" IS NOT NULL OR NEW."targetDiscoveredModelId" IS NOT NULL THEN
+        RAISE EXCEPTION 'stickiness binding targets either a pool or a direct model'
+          USING ERRCODE = '23514';
+      END IF;
+      SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."targetModelPoolId";
+      IF pool_owner IS NULL
+         OR (NEW."poolGrantId" IS NULL AND pool_owner IS DISTINCT FROM NEW."userId")
+         OR (NEW."poolGrantId" IS NOT NULL AND (
+           pool_owner IS NOT DISTINCT FROM NEW."userId"
+           OR NOT EXISTS (
+             SELECT 1 FROM pool_grant grant_row
+              WHERE grant_row.id = NEW."poolGrantId"
+                AND grant_row."poolId" = NEW."targetModelPoolId"
+                AND grant_row."ownerUserId" = pool_owner
+                AND grant_row."granteeUserId" = NEW."userId"))) THEN
+        RAISE EXCEPTION 'stickiness pool binding requires the pool owner or the exact grant'
+          USING ERRCODE = '23514';
+      END IF;
+      consumer_owner := pool_owner;
+    ELSIF NEW."poolGrantId" IS NOT NULL THEN
+      RAISE EXCEPTION 'stickiness pool binding requires the pool owner or the exact grant'
+        USING ERRCODE = '23514';
+    END IF;
     IF NEW."targetExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."targetExecutionTargetId";
@@ -1536,10 +1614,25 @@ BEGIN
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      IF target_owner IS NULL OR target_owner <> NEW."userId"
+      IF target_owner IS NULL OR target_owner IS DISTINCT FROM consumer_owner
          OR (NEW."selectedDiscoveredModelId" IS NOT NULL
              AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'stickiness selection must match its owner and discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+      -- The served member must be a local member of the pool when the
+      -- selection is written. Membership is mutable, so unchanged historical
+      -- rows are not re-checked; follow-up routing re-checks it live.
+      IF NEW."targetModelPoolId" IS NOT NULL
+         AND (TG_OP = 'INSERT'
+           OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
+           OR NEW."targetModelPoolId" IS DISTINCT FROM OLD."targetModelPoolId")
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = NEW."targetModelPoolId"
+              AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+              AND member.tier = 'PRIMARY'::"PoolMemberTier") THEN
+        RAISE EXCEPTION 'stickiness selection must be a local member of its pool'
           USING ERRCODE = '23514';
       END IF;
     END IF;
@@ -1552,6 +1645,38 @@ BEGIN
              AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
         RAISE EXCEPTION 'relay request target must match its owner and discovered model'
           USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    -- A PENDING pool request whose pool is already gone (deleted while the
+    -- request was in flight) keeps its durable resource owner but no
+    -- ownership anchor. Its late finalizer, which re-writes the pool owner's
+    -- selection (route identity, pool member), must still commit its status
+    -- and counters, so that selection is dropped, never persisted. A terminal
+    -- row, and a target of anyone else, are still rejected below.
+    -- resourceOwnerUserId is derived and pinned by
+    -- a_relay_request_resource_owner, which runs before this trigger.
+    IF TG_OP = 'UPDATE' AND OLD.status = 'PENDING'
+       AND NEW."requestedModelPoolId" IS NULL
+       AND OLD."requestedModelPoolId" IS NULL
+       AND NEW."resourceOwnerUserId" IS NOT NULL
+       AND NEW."resourceOwnerUserId" IS DISTINCT FROM NEW."userId"
+       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+       AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+       AND (NEW."selectedExecutionTargetId" IS NOT NULL OR NEW."selectedPoolMemberId" IS NOT NULL) THEN
+      -- A target that no longer exists (deleted with the owner's account or
+      -- device) can never be persisted either, so it is dropped the same way.
+      target_owner := NULL;
+      IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
+        SELECT "userId" INTO target_owner
+          FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
+      END IF;
+      IF NEW."selectedExecutionTargetId" IS NULL
+         OR target_owner IS NULL
+         OR target_owner IS NOT DISTINCT FROM NEW."resourceOwnerUserId" THEN
+        NEW."selectedExecutionTargetId" := NULL;
+        NEW."selectedDiscoveredModelId" := NULL;
+        NEW."selectedPoolMemberId" := NULL;
+        RETURN NEW;
       END IF;
     END IF;
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
@@ -1611,8 +1736,51 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 DROP TRIGGER IF EXISTS stickiness_execution_target_consistency ON response_stickiness_record;
 CREATE TRIGGER stickiness_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "targetDiscoveredModelId", "targetExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId" ON response_stickiness_record
+  "selectedDiscoveredModelId", "selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",
+  "routingVersion" ON response_stickiness_record
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
+-- Durable usage attribution for relay requests (#66, P3C-2). Derived here,
+-- never trusted from the writer: the requested pool's owner, else the
+-- requester (a direct target must belong to the requester). Pinned once set,
+-- so the pool's deletion (SET NULL drain or cascade) keeps the owner; only
+-- attaching a different live pool re-derives it. A plain id, not a foreign
+-- key: rollup writers skip an owner that no longer exists.
+CREATE OR REPLACE FUNCTION derive_relay_request_resource_owner()
+RETURNS trigger LANGUAGE plpgsql AS $relay_resource_owner$
+DECLARE
+  pool_owner TEXT;
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD."resourceOwnerUserId" IS NOT NULL
+     AND (NEW."requestedModelPoolId" IS NULL
+       OR NEW."requestedModelPoolId" IS NOT DISTINCT FROM OLD."requestedModelPoolId") THEN
+    NEW."resourceOwnerUserId" := OLD."resourceOwnerUserId";
+    RETURN NEW;
+  END IF;
+  IF NEW."requestedModelPoolId" IS NOT NULL THEN
+    SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+  END IF;
+  NEW."resourceOwnerUserId" := COALESCE(
+    pool_owner,
+    CASE WHEN TG_OP = 'UPDATE' THEN OLD."resourceOwnerUserId" END,
+    NEW."userId"
+  );
+  RETURN NEW;
+END;
+$relay_resource_owner$;
+
+DROP TRIGGER IF EXISTS a_relay_request_resource_owner ON relay_request;
+CREATE TRIGGER a_relay_request_resource_owner
+BEFORE INSERT OR UPDATE OF "requestedModelPoolId", "resourceOwnerUserId" ON relay_request
+FOR EACH ROW EXECUTE FUNCTION derive_relay_request_resource_owner();
+
+-- One-time backfill (a no-op once applied; writes no status). Rows whose pool
+-- is already gone fall back to the requester, as their rollup already did.
+UPDATE relay_request AS request
+   SET "resourceOwnerUserId" = COALESCE(
+         (SELECT pool."userId" FROM model_pool pool WHERE pool.id = request."requestedModelPoolId"),
+         request."userId")
+ WHERE request."resourceOwnerUserId" IS NULL;
 
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
@@ -2611,6 +2779,39 @@ $session_refuse_deleting_user$;
 DROP TRIGGER IF EXISTS session_refuse_deleting_user ON session;
 CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session
 FOR EACH ROW EXECUTE FUNCTION refuse_session_for_deleting_user();
+
+-- DEL-STATE single writer of the deletion marker: only the user-deletion
+-- subsystem (packages/db/src/parent-deletion.ts abandonUserDeletion) clears
+-- "deletionRequestedAt" or rewrites the generation of a pending deletion.
+-- It does so inside a transaction that first sets the transaction-local
+-- setting wsmp.user_deletion_writer = 'on'; any other writer (a Better Auth
+-- admin route writing arbitrary user fields, a future dashboard write, an
+-- ad-hoc UPDATE) is refused with SQLSTATE WMPD2, so a pending deletion can
+-- never be silently withdrawn while its worker still runs. Setting the
+-- marker (requestUserDeletion, which also gives a marker left without a
+-- generation its first one) and moving its timestamp are not guarded: they
+-- never withdraw a deletion. A row DELETE is not an UPDATE.
+-- The check reads only NEW/OLD of the row being updated: no lock, so it adds
+-- nothing to any lock order.
+CREATE OR REPLACE FUNCTION refuse_user_deletion_marker_clear()
+RETURNS trigger LANGUAGE plpgsql AS $user_deletion_marker_guard$
+BEGIN
+  IF OLD."deletionRequestedAt" IS NOT NULL
+     AND (NEW."deletionRequestedAt" IS NULL
+          OR (OLD."deletionGeneration" IS NOT NULL
+              AND NEW."deletionGeneration" IS DISTINCT FROM OLD."deletionGeneration"))
+     AND current_setting('wsmp.user_deletion_writer', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'only the user deletion subsystem clears a pending deletion'
+      USING ERRCODE = 'WMPD2';
+  END IF;
+  RETURN NEW;
+END;
+$user_deletion_marker_guard$;
+
+DROP TRIGGER IF EXISTS user_deletion_marker_guard ON "user";
+CREATE TRIGGER user_deletion_marker_guard
+BEFORE UPDATE OF "deletionRequestedAt", "deletionGeneration" ON "user"
+FOR EACH ROW EXECUTE FUNCTION refuse_user_deletion_marker_clear();
 
 -- PR3: preferences are grantee-only configuration. The composite FKs bind
 -- the exact grant and requester-owned model; no nullable composite SET NULL.

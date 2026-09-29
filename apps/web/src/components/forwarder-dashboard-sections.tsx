@@ -1,10 +1,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { grantPoolAccessServerMessage } from "@ws-model-proxy/api/lib/effective-provider-egress";
-import {
-  type GuardedPoolCreateFailureReason,
-  isGuardedPoolCreateFailureReason,
-} from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
+import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
   parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
@@ -47,7 +44,7 @@ import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switch
 import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
-import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
+import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -59,6 +56,7 @@ import {
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
+import { poolMutationFailureReason } from "@/lib/pool-mutation-failure-reason";
 
 import {
   egressProviderAccountLabels,
@@ -128,19 +126,6 @@ type PoolSurface = (typeof poolSurfaceValues)[number];
 
 function poolSurfaceOverrideValue(value: string | null | undefined): PoolSurface | "" {
   return value && poolSurfaceValues.includes(value as PoolSurface) ? (value as PoolSurface) : "";
-}
-
-/**
- * Extracts the machine-readable failure reason from a pool mutation error,
- * mirroring the wizard's create-path extraction: never trust the envelope
- * shape and never surface `error.message` directly.
- */
-function poolMutationFailureReason(error: unknown): GuardedPoolCreateFailureReason | null {
-  if (!error || typeof error !== "object") return null;
-  const { data } = error as { data?: unknown };
-  if (!data || typeof data !== "object") return null;
-  const { reason } = data as { reason?: unknown };
-  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 
 function copyToClipboard(value: string, message: string) {
@@ -3599,7 +3584,9 @@ function ModelApiTokenCreateForm({
               ) : null}
               <label className="flex min-h-11 items-center gap-3 text-sm">
                 <Checkbox
-                  disabled={!visibleModels.providerEgressEnabled}
+                  // With the switch off it can still be turned off (nothing
+                  // external is saved at creation then), never on.
+                  disabled={!visibleModels.providerEgressEnabled && !values.allowExternal}
                   checked={values.allowExternal}
                   onCheckedChange={(checked) =>
                     form.setFieldValue("allowExternal", checked === true)
@@ -3612,7 +3599,7 @@ function ModelApiTokenCreateForm({
               </p>
               {!visibleModels.providerEgressEnabled ? (
                 <p role="note" className="text-sm text-muted-foreground">
-                  {t("dashboard:tokens.externalAccess.disabledDeployment")}
+                  {t("dashboard:tokens.externalAccess.createDisabledDeployment")}
                 </p>
               ) : null}
               {values.allowExternal && values.scopeMode === "ALLOWLIST" ? (
@@ -3624,8 +3611,10 @@ function ModelApiTokenCreateForm({
                     .filter((pool) => values.modelIds.includes(pool.modelId))
                     .map((pool) => (
                       <label key={pool.id} className="flex min-h-11 items-center gap-3 text-sm">
+                        {/* Draft only: nothing is saved until submit, and with
+                            the switch off submit saves no external access, so
+                            re-checking an unchecked pool never widens anything. */}
                         <Checkbox
-                          disabled={!visibleModels.providerEgressEnabled}
                           checked={!values.excludedPoolIds.includes(pool.id)}
                           onCheckedChange={(checked) =>
                             form.setFieldValue(
@@ -3802,7 +3791,12 @@ function VisibleModelChecklist({
   onSelectedModelIdsChange: (ids: string[]) => void;
 }) {
   const { t } = useTranslation("dashboard");
-  const rows = [
+  const rows: Array<{
+    id: string;
+    label: string;
+    kind: string;
+    externalRoutes?: readonly ExternalRouteKind[];
+  }> = [
     ...visibleModels.directModels.map((model) => ({
       id: model.modelId,
       label: model.modelId,
@@ -3812,7 +3806,7 @@ function VisibleModelChecklist({
       id: pool.modelId,
       label: pool.modelId,
       kind: t("tokens.pool"),
-      external: pool.effectiveProviderEgress,
+      externalRoutes: pool.externalRoutes,
     })),
   ];
 
@@ -3840,8 +3834,8 @@ function VisibleModelChecklist({
                 <span className="min-w-0">
                   <span className="flex flex-wrap items-center gap-2 text-xs font-medium">
                     {row.kind}
-                    {"external" in row ? (
-                      <PoolPrivacyBadge external={row.external === true} />
+                    {row.externalRoutes ? (
+                      <PoolFallbackBadge routes={row.externalRoutes} interactive={false} />
                     ) : null}
                   </span>
                   <code className="block break-all font-mono text-xs text-muted-foreground">
@@ -3872,9 +3866,12 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
           </code>
         ))}
         {preview.modelPools.map((pool) => (
-          <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
-            <PoolPrivacyBadge
-              external={pool.effectiveProviderEgress === true}
+          // A 44px row with the chip centred keeps its 44px hit area inside the
+          // row; no flex-wrap, so a long id wraps beside the chip instead of
+          // pushing it to the top of a taller row.
+          <div key={pool.id} className="flex min-h-11 min-w-0 items-center gap-2">
+            <PoolFallbackBadge
+              routes={pool.externalRoutes}
               providers={
                 pool.providerAccountLabels?.length ? pool.providerAccountLabels : pool.providerTypes
               }
