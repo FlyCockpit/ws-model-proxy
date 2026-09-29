@@ -867,6 +867,19 @@ describe("cli commands", () => {
       });
     });
 
+    it("stores an unknown device for a token_inactive refusal raised before the ownership check", async () => {
+      await connect();
+      await startCliCommand({
+        ...base,
+        expiresAt: new Date(Date.now() - 1),
+        cliDeviceId: "NAME=AUDIT_MARKER",
+        command: "pwd",
+      });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ reason: "token_inactive", cliDeviceId: "unknown" });
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
     it("stores an unknown device, never the request's text, when the device is not verified", async () => {
       await connect();
       db.cliDevice.findUnique.mockResolvedValue(null);

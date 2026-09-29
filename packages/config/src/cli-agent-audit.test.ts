@@ -178,6 +178,32 @@ describe("commandProgram", () => {
     },
   );
 
+  // C3b-1: only sh's own leading blanks and newlines are trimmed; any other
+  // leading whitespace character is part of the first shell word, so the word
+  // after it is an argument.
+  it.each([
+    "\r",
+    "\v",
+    "\f",
+    "\u00a0",
+    "\u1680",
+    "\u2000",
+    "\u200a",
+    "\u2028",
+    "\u2029",
+    "\u202f",
+    "\u205f",
+    "\u3000",
+    "\ufeff",
+  ])("does not trim leading %j: the next word is an argument", (character) => {
+    expect(commandProgram(`${character} /home/u/hunter2Secret`)).toBe(UNKNOWN);
+    expect(commandProgram(`${character}/home/u/hunter2Secret`)).toBe(UNKNOWN);
+  });
+
+  it("trims leading blanks and newlines like sh", () => {
+    expect(commandProgram(" \t\n\n /usr/bin/git push")).toBe("git");
+  });
+
   it("returns the unknown program for non-string and non-well-formed input", () => {
     expect(commandProgram(undefined)).toBe(UNKNOWN);
     expect(commandProgram(null)).toBe(UNKNOWN);

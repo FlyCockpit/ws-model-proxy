@@ -193,13 +193,14 @@ const ASSIGNMENT_START_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * Splits a command into tokens at spaces and tabs ONLY. There is no quote or
  * escape handling on purpose: a word is never re-assembled, so no piece of an
  * argument or assignment value can be mistaken for the program. Any other
- * whitespace (LF, CR, VT, FF, Unicode spaces) stays inside its token, which
- * then fails the program charset. Leading whitespace of any kind is trimmed
- * first.
+ * whitespace (CR, VT, FF, Unicode spaces, BOM) stays inside its token, which
+ * then fails the program charset. Only what sh itself skips before the first
+ * word is trimmed first (blanks and newlines): a wider trim would drop an
+ * invisible first word that sh runs as the program and store the next word.
  */
 function tokenizeCommand(command: string): string[] {
   return command
-    .replace(/^\s+/u, "")
+    .replace(/^[ \t\n]+/, "")
     .split(/[ \t]+/)
     .filter((token) => token.length > 0);
 }
