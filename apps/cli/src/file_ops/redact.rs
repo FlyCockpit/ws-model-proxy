@@ -1632,10 +1632,15 @@ mod tests {
         }
         // an END binds to its own label; a mismatched END closes nothing (fail closed);
         // nested and same-line transitions keep every open block masked
-        let ec_open = "-----BEGIN EC PRIVATE KEY-----";
-        let rsa_open = "-----BEGIN RSA PRIVATE KEY-----";
-        let ec_end = "-----END EC PRIVATE KEY-----";
-        let rsa_end = "-----END RSA PRIVATE KEY-----";
+        let marker = |kind: &str, label: &str| format!("-----{kind} {label}-----");
+        let (ec_open, rsa_open) = (
+            marker("BEGIN", "EC PRIVATE KEY"),
+            marker("BEGIN", "RSA PRIVATE KEY"),
+        );
+        let (ec_end, rsa_end) = (
+            marker("END", "EC PRIVATE KEY"),
+            marker("END", "RSA PRIVATE KEY"),
+        );
         for (text, must_end_visible) in [
             (format!("{ec_open}\nBODYA\n{rsa_end}\nBODYB\n"), false),
             (
