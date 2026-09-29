@@ -470,9 +470,6 @@ pub struct RunnerSettings {
     pub allow_remote: bool,
     /// Config file for local sources and approvals (re-read on change).
     pub config_path: Option<PathBuf>,
-    /// Stored remote definitions (read once at start; later updates arrive
-    /// through [`Runner::set_remote`]).
-    pub remote_path: Option<PathBuf>,
 }
 
 impl RunnerSettings {
@@ -480,7 +477,6 @@ impl RunnerSettings {
         Self {
             allow_remote,
             config_path: crate::paths::config_file().ok(),
-            remote_path: remote_sources_path().ok(),
         }
     }
 }
@@ -522,20 +518,16 @@ impl Drop for Runner {
 impl Runner {
     pub fn new(settings: RunnerSettings) -> Self {
         let (results_tx, results_rx) = mpsc::channel();
-        let remote = settings
-            .remote_path
-            .as_deref()
-            .map(load_remote_sources_from)
-            .transpose()
-            .unwrap_or_else(|error| {
-                tracing::warn!(error = %format!("{error:#}"), "stored remote metric sources are unreadable; ignored");
-                None
-            })
-            .unwrap_or_default();
+        // Remote definitions come ONLY from this session's
+        // `metrics.sources.set` ([`Runner::set_remote`]): the server sends
+        // one after every hello and fails closed with an empty list, so a
+        // definition stored by an earlier session (mode since downgraded,
+        // another server) never runs before the server's word arrives. The
+        // stored file is only for `wsmp metrics list` / `approve`.
         let mut runner = Self {
             settings,
             metrics: MetricsConfig::default(),
-            remote,
+            remote: Vec::new(),
             config_mtime: None,
             next_reload_check: Instant::now(),
             states: BTreeMap::new(),
@@ -831,7 +823,6 @@ mod tests {
         RunnerSettings {
             allow_remote,
             config_path: None,
-            remote_path: None,
         }
     }
 

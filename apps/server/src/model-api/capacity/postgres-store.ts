@@ -892,22 +892,41 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           admissionRequestId: true,
           poolMemberId: true,
           deadlineAt: true,
-          AdmissionRequest: { select: { deadlineAt: true } },
+          notBefore: true,
+          AdmissionRequest: { select: { deadlineAt: true, heartbeatAt: true } },
         },
       });
-      const siblings = siblingRows.filter((sibling) =>
-        inWindow(
-          {
-            waiterId: sibling.id,
-            admissionRequestId: sibling.admissionRequestId,
-            deadlineAt: sibling.deadlineAt,
-            requestDeadlineAt: sibling.AdmissionRequest.deadlineAt,
-          },
-          now,
-          window.creatingRequestId,
-          window.lastChance,
-        ),
-      );
+      // A sibling is live by the planner's window for THIS pass, or because
+      // its owner is still owed the last-chance check (release and reclaim
+      // passes do not carry the owner's last-chance set, so it is derived
+      // from the rows exactly as `acquire` derives it: deferred, `notBefore`
+      // after the owner's previous poll, deadline reached). Such a waiter
+      // stays WAITING until its owner polls, so it is still a real
+      // alternative to the metric-FULL member.
+      const siblings = siblingRows.filter((sibling) => {
+        const requestOpen =
+          sibling.AdmissionRequest.deadlineAt === null || sibling.AdmissionRequest.deadlineAt > now;
+        const owedLastChance =
+          requestOpen &&
+          sibling.notBefore !== null &&
+          sibling.notBefore > sibling.AdmissionRequest.heartbeatAt &&
+          sibling.deadlineAt !== null &&
+          sibling.deadlineAt <= now;
+        return (
+          owedLastChance ||
+          inWindow(
+            {
+              waiterId: sibling.id,
+              admissionRequestId: sibling.admissionRequestId,
+              deadlineAt: sibling.deadlineAt,
+              requestDeadlineAt: sibling.AdmissionRequest.deadlineAt,
+            },
+            now,
+            window.creatingRequestId,
+            window.lastChance,
+          )
+        );
+      });
       const unknownMembers = [
         ...new Set(
           siblings.flatMap((sibling) =>

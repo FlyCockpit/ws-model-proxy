@@ -244,6 +244,77 @@ integration("PostgreSQL metric routing at grant time", () => {
     }
   });
 
+  it("a release-driven fill pass does not fail open past a sibling still owed its last chance", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const f = await fixture(db);
+    try {
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "metric-proof");
+      const holdA = admitted(await store.acquire(f.attempt([f.a])));
+      const holdB = admitted(await store.acquire(f.attempt([f.b])));
+      // Candidate A is ordinary; candidate B is a deferred zero-budget spill
+      // candidate (eligible only at its notBefore, deadline = notBefore).
+      const request = f.attempt([f.a, f.b]);
+      request.candidates = request.candidates.map((candidate, index) =>
+        index === 1 ? { ...candidate, notBeforeMs: 400, waitBudgetMs: 0 } : candidate,
+      );
+      expect((await store.acquire(request)).state).toBe("WAITING");
+      // B's capacity frees before B's notBefore; the owner does not poll, so
+      // B's deadline passes with B still WAITING and owed its last chance.
+      await store.release(holdB);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await f.setVerdict(f.a, "FULL");
+      // A frees up: the release-driven fill pass runs without the owner's
+      // last-chance set. B is a live alternative, so it must NOT fail open
+      // onto the metric-FULL member A.
+      await store.release(holdA);
+      expect(await requestState(db, request.attemptId)).toEqual({
+        state: "WAITING",
+        poolMemberId: null,
+      });
+      // The owner's poll gives B its last chance and grants it.
+      const polled = await store.acquire({ ...request, candidates: [] });
+      expect(admitted(polled).poolMemberId).toBe(f.b.id);
+    } finally {
+      await f.cleanup();
+      await db.$disconnect();
+    }
+  });
+
+  it("an out-of-window sibling on another capacity does not block the fail-open", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const f = await fixture(db);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "metric-proof");
+      const holdA = admitted(await store.acquire(f.attempt([f.a])));
+      admitted(await store.acquire(f.attempt([f.b])));
+      // Candidate B's own deadline is short: it has passed by the time A frees,
+      // but B's waiter is still WAITING (only B's capacity would expire it).
+      const request = f.attempt([f.a, f.b]);
+      request.candidates = request.candidates.map((candidate, index) =>
+        index === 1 ? { ...candidate, deadlineAt: new Date(Date.now() + 300) } : candidate,
+      );
+      expect((await store.acquire(request)).state).toBe("WAITING");
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      await f.setVerdict(f.a, "FULL");
+      // B is not FULL but no longer a candidate: every LIVE candidate (A) is
+      // FULL, so the request fails open onto A.
+      await store.release(holdA);
+      expect(await requestState(db, request.attemptId)).toEqual({
+        state: "ADMITTED",
+        poolMemberId: f.a.id,
+      });
+    } finally {
+      warn.mockRestore();
+      await f.cleanup();
+      await db.$disconnect();
+    }
+  });
+
   it("keeps an :external shortened-phase request waiting instead of failing open", async () => {
     if (!databaseUrl) return;
     const db = createPrismaClient(databaseUrl);
