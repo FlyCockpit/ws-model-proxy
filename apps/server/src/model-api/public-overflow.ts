@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import type { ReadableStreamReadResult } from "node:stream/web";
 import {
   type ExternalSendConsentDenial,
   lockExternalSendConsent,
@@ -72,6 +73,10 @@ import {
   type ProviderPricingSchedule,
   resolveActiveProviderPricing,
 } from "./provider-pricing.js";
+
+/** Bound accounting observation after a client terminal; an incomplete drain keeps liability. */
+export const POST_TERMINAL_DRAIN_MAX_BYTES = 256 * 1024;
+export const POST_TERMINAL_DRAIN_MAX_MS = 2_000;
 
 export type PublicOverflowReason =
   | "NO_COMPATIBLE_HEALTHY_PRIMARY"
@@ -1802,10 +1807,9 @@ function classifyTerminalRecord(
     const dataType = typeof value.type === "string" ? value.type : undefined;
     // A terminal needs an explicit `event:` line that agrees with the record's
     // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
-    // its terminal is deliberately NOT recognised (the stream is read to EOF and
-    // the full hold stays): recognising a data-only record as a terminal cuts
-    // the read off at the first such record, which makes billing depend on
-    // transport chunking and lets a mismatching record's usage stand.
+    // its terminal is deliberately NOT recognised (the surface is unclaimed
+    // and the full hold stays). Reading to EOF for accounting does not itself
+    // certify protocol completion.
     if (!record.event || record.event !== dataType) return undefined;
     if (record.event === "error") return "FAILED";
     if (surface === "anthropic-messages")
@@ -3325,10 +3329,11 @@ export async function dispatchPublicOverflow(
       let protocolTerminal = false;
       let protocolFailed = false;
       let deliveredProtocolTerminal = false;
+      let accountingIncomplete = request.stream;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
-      // OpenRouter usage settles only from the records the whole stream
-      // carried (not the retained prefix and tail windows): see
-      // `OpenRouterUsageRecords.settle`.
+      // Observe every record through EOF, including after a client terminal.
+      // A bounded post-terminal drain that cannot reach EOF keeps liability;
+      // OpenRouter never settles from only the retained prefix/tail windows.
       const openRouterStreamRecords =
         terminalDecoder && target.usageDialect === "openrouter"
           ? new OpenRouterUsageRecords(nativeSurface ?? request.requestedSurface)
@@ -3424,6 +3429,7 @@ export async function dispatchPublicOverflow(
             : combinedUsage;
           const observationComplete =
             transportComplete &&
+            !accountingIncomplete &&
             (request.stream
               ? protocolTerminal && !protocolFailed
               : nonstreamEnvelope !== undefined && !nonstreamOverflow);
@@ -3515,12 +3521,45 @@ export async function dispatchPublicOverflow(
             return;
           }
           let reachedEof = false;
+          let heldTerminalChunk: Uint8Array | undefined;
+          let postTerminalBytes = 0;
+          let drainDeadline: number | undefined;
           try {
             while (true) {
-              const chunk = await reader.read();
+              const remainingMs =
+                drainDeadline === undefined ? undefined : drainDeadline - Date.now();
+              let chunk: ReadableStreamReadResult<Uint8Array> | undefined;
+              let drainTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                if (remainingMs === undefined) {
+                  chunk = await reader.read();
+                } else if (remainingMs > 0 && postTerminalBytes < POST_TERMINAL_DRAIN_MAX_BYTES) {
+                  chunk = await Promise.race([
+                    reader.read(),
+                    new Promise<undefined>((resolve) => {
+                      drainTimer = setTimeout(() => resolve(undefined), remainingMs);
+                    }),
+                  ]);
+                }
+              } finally {
+                if (drainTimer !== undefined) clearTimeout(drainTimer);
+              }
+              // A client cancel resolved this read (cancel() cancelled the reader and
+              // owns the settlement); never touch the cancelled controller.
+              if (clientCancelled) return;
+              if (!chunk) {
+                accountingIncomplete = true;
+                openRouterStreamRecords?.markUnreadable();
+                await reconcile(true);
+                deliveredProtocolTerminal = true;
+                controller.enqueue(heldTerminalChunk!);
+                await reader.cancel().catch(() => undefined);
+                response.destroy();
+                return;
+              }
               if (chunk.done) {
                 reachedEof = true;
-                if (terminalDecoder && !protocolTerminal) {
+                if (terminalDecoder) {
                   const records = terminalDecoder.finish();
                   for (const record of records) {
                     openRouterStreamRecords?.observeData(record.data);
@@ -3532,9 +3571,18 @@ export async function dispatchPublicOverflow(
                     protocolFailed ||= outcome === "FAILED";
                   }
                 }
+                if (terminalDecoder && response.complete) accountingIncomplete = false;
+                else if (protocolTerminal && !response.complete) {
+                  openRouterStreamRecords?.markUnreadable();
+                }
                 // Do not expose either a streaming terminal event or EOF until
                 // correctness-required settlement and health release are durable.
                 await reconcile(response.complete);
+                if (heldTerminalChunk) {
+                  deliveredProtocolTerminal = true;
+                  controller.enqueue(heldTerminalChunk);
+                  return;
+                }
                 if (response.complete || !httpOk) {
                   controller.close();
                 } else
@@ -3543,6 +3591,7 @@ export async function dispatchPublicOverflow(
                   );
                 return;
               }
+              if (heldTerminalChunk) postTerminalBytes += chunk.value.byteLength;
               responseBytes += chunk.value.byteLength;
               if (!request.stream && !nonstreamOverflow) {
                 if (nonstreamBytes + chunk.value.byteLength <= 8 * 1024 * 1024) {
@@ -3575,17 +3624,20 @@ export async function dispatchPublicOverflow(
                 }
               }
               if (protocolTerminal) {
-                await reconcile(true);
-                deliveredProtocolTerminal = true;
-                controller.enqueue(chunk.value);
-                await reader.cancel().catch(() => undefined);
-                response.destroy();
-                return;
+                heldTerminalChunk ??= chunk.value;
+                drainDeadline ??= Date.now() + POST_TERMINAL_DRAIN_MAX_MS;
+                continue;
               }
               controller.enqueue(chunk.value);
               return;
             }
           } catch (error) {
+            if (terminalDecoder) {
+              accountingIncomplete = true;
+              openRouterStreamRecords?.markUnreadable();
+              await reader.cancel().catch(() => undefined);
+              response.destroy();
+            }
             if (reachedEof && reconciliation) {
               // A failed durable success terminal remains ACTIVE for retry or
               // crash repair; never rewrite it as a transport failure.

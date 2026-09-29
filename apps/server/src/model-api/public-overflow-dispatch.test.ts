@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
@@ -135,6 +135,8 @@ import {
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   orderChatTestProviderTargets,
+  POST_TERMINAL_DRAIN_MAX_BYTES,
+  POST_TERMINAL_DRAIN_MAX_MS,
   providerResponseHeaders,
   rankPublicOverflowTargets,
   targetsForForcedPoolMember,
@@ -3189,11 +3191,12 @@ describe("own-key dispatch and authoritative send claim", () => {
 
 describe("OpenRouter owner-paid settlement", () => {
   const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
-  async function settleOwnerStream(
+  async function startOwnerStream(
     providerType: string,
-    upstream: Buffer[],
+    upstream: Buffer[] | Readable,
     requester: "owner" | "grantee" = "owner",
     surface: "openai-chat" | "openai-responses" | "anthropic-messages" = "openai-chat",
+    transportComplete = true,
   ) {
     const protocol = surface === "anthropic-messages" ? "anthropic" : "openai";
     reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
@@ -3232,10 +3235,10 @@ describe("OpenRouter owner-paid settlement", () => {
       callback(tx),
     );
     providerHttpsRequest.mockResolvedValueOnce(
-      Object.assign(Readable.from(upstream), {
+      Object.assign(Array.isArray(upstream) ? Readable.from(upstream) : upstream, {
         statusCode: 200,
         headers: { "content-type": "text/event-stream" },
-        complete: true,
+        complete: transportComplete,
       }),
     );
     const result = await dispatchPublicOverflow({
@@ -3264,6 +3267,16 @@ describe("OpenRouter owner-paid settlement", () => {
       retrySafe: false,
     });
     if (!result.dispatched) throw new Error("expected dispatch");
+    return result;
+  }
+
+  async function settleOwnerStream(
+    providerType: string,
+    upstream: Buffer[],
+    requester: "owner" | "grantee" = "owner",
+    surface: "openai-chat" | "openai-responses" | "anthropic-messages" = "openai-chat",
+  ) {
+    const result = await startOwnerStream(providerType, upstream, requester, surface);
     await result.response.text();
     await result.terminal;
     expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
@@ -3290,6 +3303,512 @@ describe("OpenRouter owner-paid settlement", () => {
       additionalAllowanceTokens: 0,
       unknownCategories: "FAIL_CLOSED",
     },
+  });
+
+  describe("terminal billing drain (#140)", () => {
+    beforeEach(() => {
+      db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+    });
+    afterEach(() => {
+      db.providerPricingVersion.findFirst.mockReset();
+    });
+
+    const record = (type: string, payload: Record<string, unknown> = {}) =>
+      Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
+    const responsesUsage = (output: number, cost: number) => ({
+      input_tokens: 10,
+      output_tokens: output,
+      total_tokens: 10 + output,
+      cost,
+      is_byok: false,
+    });
+    const messagesUsage = (output: number, cost: number) => ({
+      input_tokens: 10,
+      output_tokens: output,
+      cost,
+      is_byok: false,
+    });
+    const responsesTerminal = record("response.completed", {
+      response: { status: "completed", usage: responsesUsage(14, 0.00008) },
+    });
+    const lowResponsesTerminal = record("response.completed", {
+      response: { status: "completed", usage: responsesUsage(1, 0.000015) },
+    });
+    const messageDelta = (output: number, cost: number) =>
+      record("message_delta", { usage: messagesUsage(output, cost) });
+    const messageStop = record("message_stop");
+    const done = Buffer.from("data: [DONE]\n\n");
+    const providers = [
+      { providerType: "openrouter", surface: "openai-responses" },
+      { providerType: "openrouter", surface: "anthropic-messages" },
+      { providerType: "openai-compatible", surface: "openai-responses" },
+    ] as const;
+    const scenarios = [
+      "conflicting usage",
+      "trailing failure",
+      "invalid JSON",
+      "partial record",
+      "invalid UTF-8",
+      "unfinished UTF-8",
+      "clean EOF",
+      "clean sentinel",
+    ] as const;
+    const cases = providers.flatMap((provider) =>
+      scenarios.map((scenario) => ({ ...provider, scenario })),
+    );
+
+    // The clean controls intentionally pass on master: an honest provider that
+    // closes promptly must still settle fully and deliver its terminal bytes.
+    // Every adverse row detects discarded records or skipped decoder.finish().
+    it.each(cases)(
+      "$providerType $surface: $scenario settles identically across byte boundaries",
+      async ({ providerType, surface, scenario }) => {
+        const messages = surface === "anthropic-messages";
+        const terminalRecords = messages
+          ? [messageDelta(14, 0.00008), messageStop]
+          : [responsesTerminal];
+        let records: Buffer[];
+        if (scenario === "conflicting usage") {
+          records = messages
+            ? [messageDelta(1, 0.000015), messageStop, messageDelta(14, 0.00008)]
+            : [lowResponsesTerminal, responsesTerminal];
+        } else {
+          const tail = {
+            "trailing failure": record(messages ? "error" : "response.failed", {
+              error: { type: "upstream_error" },
+            }),
+            "invalid JSON": Buffer.from("data: {invalid JSON}\n\n"),
+            "partial record": Buffer.from('data: {"usage":'),
+            "invalid UTF-8": Buffer.concat([
+              Buffer.from("data: "),
+              Buffer.from([0xff]),
+              Buffer.from("\n\n"),
+            ]),
+            "unfinished UTF-8": Buffer.from([0xe2, 0x82]),
+            "clean EOF": Buffer.alloc(0),
+            "clean sentinel": done,
+          }[scenario];
+          records = [...terminalRecords, ...(tail.length ? [tail] : [])];
+        }
+        const bytes = Buffer.concat(records);
+        const splits = [
+          [bytes],
+          records,
+          // One extra transport boundary inside each record, not just at SSE boundaries.
+          records.flatMap((frame) => {
+            const mid = Math.max(1, Math.floor(frame.length / 2));
+            return [frame.subarray(0, mid), frame.subarray(mid)];
+          }),
+        ];
+        const snapshots = [];
+        for (const chunks of splits) {
+          expect(Buffer.concat(chunks)).toEqual(bytes);
+          const result = await startOwnerStream(providerType, chunks, "owner", surface);
+          let streamError: unknown;
+          let delivered = "";
+          try {
+            delivered = await result.response.text();
+          } catch (error) {
+            streamError = error;
+          }
+          const terminal = await result.terminal;
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          const settled = reconcileProviderBudget.mock.calls[0]![0];
+          const usage = settled.usage;
+          // Undecodable bytes in a single chunk can yield no usage at all,
+          // while split bytes retain audit evidence. Neither has settleable
+          // categories; compare the billing facts, with absence represented as false.
+          snapshots.push({
+            observationComplete: settled.observationComplete,
+            categoriesComplete: usage?.categoriesComplete ?? false,
+            billableTokens: usage ? providerBillableTokens(usage) : undefined,
+            cost: usage?.reportedCost?.toString(),
+            calculatedCost: usage?.calculatedCost?.toString(),
+            reason: settled.reason,
+            ok: terminal.ok,
+            error: streamError instanceof Error ? streamError.message : undefined,
+          });
+          if (scenario.startsWith("clean")) {
+            const terminalFrame = terminalRecords.at(-1)!;
+            expect(delivered).toContain(terminalFrame.toString());
+            expect(settled.observationComplete).toBe(true);
+            expect(terminal.ok).toBe(true);
+            if (providerType === "openrouter") {
+              expect(usage.categoriesComplete).toBe(true);
+              expect(providerBillableTokens(usage)).toBe(24n);
+              expect(usage.reportedCost.toString()).toBe("0.00008");
+            }
+          } else if (scenario === "conflicting usage") {
+            expect(usage.categoriesComplete).toBe(false);
+            expect(providerBillableTokens(usage)).toBeUndefined();
+            // The generic dialect rejects OpenRouter's token vocabulary, but
+            // still retains the latest reported cost. It must see the real cost.
+            expect(usage.reportedCost?.toString()).toBe(
+              providerType === "openrouter" ? undefined : "0.00008",
+            );
+            expect(settled.observationComplete).toBe(true);
+            expect(terminal.ok).toBe(true);
+          } else if (scenario === "trailing failure") {
+            expect(settled).toMatchObject({ reason: "FAILED", observationComplete: false });
+            expect(terminal.ok).toBe(false);
+          } else if (scenario === "invalid JSON") {
+            // Non-JSON data is valid SSE: the existing OpenRouter collector
+            // rejects usage. The generic row is a control that also passes on
+            // master: that dialect ignores JSON errors and keeps audit usage.
+            expect(streamError).toBeUndefined();
+            if (providerType === "openrouter") {
+              expect(usage.categoriesComplete).toBe(false);
+              expect(usage.reportedCost).toBeUndefined();
+            }
+          } else {
+            expect(settled).toMatchObject({ reason: "FAILED", observationComplete: false });
+            expect(terminal.ok).toBe(false);
+            expect(streamError).toBeInstanceOf(Error);
+          }
+        }
+        expect(snapshots[1]).toEqual(snapshots[0]);
+        expect(snapshots[2]).toEqual(snapshots[0]);
+      },
+    );
+
+    it.each([false, true])(
+      "keeps native compatible-provider accounting (conflict %s)",
+      async (conflict) => {
+        const nativeTerminal = (output: number, cost: number) =>
+          record("response.completed", {
+            response: {
+              status: "completed",
+              usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output, cost },
+            },
+          });
+        const final = nativeTerminal(14, 0.00008);
+        const records = conflict ? [nativeTerminal(1, 0.000015), final] : [final, done];
+        // The no-conflict row is an inverse-failure control that passes on master.
+        // The generic parser accepts the final snapshot in its own vocabulary.
+        for (const chunks of [[Buffer.concat(records)], records]) {
+          const result = await startOwnerStream(
+            "openai-compatible",
+            chunks,
+            "owner",
+            "openai-responses",
+          );
+          expect(await result.response.text()).toContain("event: response.completed");
+          expect(await result.terminal).toMatchObject({ ok: true });
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          const settled = reconcileProviderBudget.mock.calls[0]![0];
+          expect(settled.observationComplete).toBe(true);
+          expect(settled.usage.categoriesComplete).toBe(true);
+          expect(providerBillableTokens(settled.usage)).toBe(24n);
+          expect(settled.usage.reportedCost.toString()).toBe("0.00008");
+        }
+      },
+    );
+
+    it("retains liability when EOF follows a terminal without transport completion", async () => {
+      const result = await startOwnerStream(
+        "openrouter",
+        [responsesTerminal],
+        "owner",
+        "openai-responses",
+        false,
+      );
+      expect(await result.response.text()).toBe(responsesTerminal.toString());
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: "FAILED",
+          observationComplete: false,
+          usage: expect.objectContaining({ categoriesComplete: false }),
+        }),
+      );
+    });
+
+    it("holds a clean EOF terminal until settlement is durable", async () => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ read() {} });
+      let releaseSettlement!: () => void;
+      const durable = new Promise<void>((resolve) => {
+        releaseSettlement = resolve;
+      });
+      try {
+        const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        reconcileProviderBudget.mockImplementationOnce(() => durable);
+        let delivered = false;
+        const body = result.response.text().then((text) => {
+          delivered = true;
+          return text;
+        });
+        upstream.push(responsesTerminal);
+        upstream.push(null);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(delivered).toBe(false);
+        releaseSettlement();
+        expect(await body).toBe(responsesTerminal.toString());
+        expect(await result.terminal).toMatchObject({ ok: true });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: "COMPLETED",
+            observationComplete: true,
+            usage: expect.objectContaining({ categoriesComplete: true }),
+          }),
+        );
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        releaseSettlement();
+        upstream.destroy();
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not restart the drain deadline when post-terminal bytes arrive", async () => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ objectMode: true, read() {} });
+      let body: Promise<string> | undefined;
+      try {
+        upstream.push(responsesTerminal);
+        const result = await startOwnerStream(
+          "openrouter",
+          upstream,
+          "owner",
+          "openai-responses",
+          false,
+        );
+        body = result.response.text();
+        void body.catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(2);
+        await vi.advanceTimersByTimeAsync(POST_TERMINAL_DRAIN_MAX_MS / 2);
+        upstream.push(Buffer.from(": still open\n\n"));
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(POST_TERMINAL_DRAIN_MAX_MS / 2 - 1);
+        expect(reconcileProviderBudget).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(await body).toBe(responsesTerminal.toString());
+        expect(await result.terminal).toMatchObject({ ok: true });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({ observationComplete: false }),
+        );
+        expect(upstream.destroyed).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        upstream.destroy();
+        // A failed assertion (including under mutation) must not leave this
+        // drain settling into the next case's fresh mocks.
+        await body?.catch(() => undefined);
+        vi.useRealTimers();
+      }
+    });
+
+    it("holds the terminal through the time bound and durable settlement, then cancels", async () => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ read() {} });
+      const destroy = vi.spyOn(upstream, "destroy");
+      const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      let releaseSettlement!: () => void;
+      const durable = new Promise<void>((resolve) => {
+        releaseSettlement = resolve;
+      });
+      try {
+        expect(POST_TERMINAL_DRAIN_MAX_MS).toBe(2_000);
+        heartbeatProviderAttempt.mockClear();
+        upstream.push(responsesTerminal);
+        const result = await startOwnerStream(
+          "openrouter",
+          upstream,
+          "owner",
+          "openai-responses",
+          false,
+        );
+        reconcileProviderBudget.mockImplementationOnce(() => durable);
+        const reader = result.response.body!.getReader();
+        let delivered = false;
+        const first = reader.read().then((chunk) => {
+          delivered = true;
+          return chunk;
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(2); // heartbeat plus pending accounting read
+        await vi.advanceTimersByTimeAsync(POST_TERMINAL_DRAIN_MAX_MS - 1);
+        expect(reconcileProviderBudget).not.toHaveBeenCalled();
+        expect(delivered).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(delivered).toBe(false); // even at the bound, billing must become durable first
+        releaseSettlement();
+        expect(Buffer.from((await first).value!).toString()).toBe(responsesTerminal.toString());
+        expect(await reader.read()).toMatchObject({ done: true });
+        expect(await result.terminal).toMatchObject({ ok: true });
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: "COMPLETED",
+            observationComplete: false,
+            usage: expect.objectContaining({ categoriesComplete: false }),
+          }),
+        );
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(destroy).toHaveBeenCalled();
+        expect(upstream.destroyed).toBe(true);
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(heartbeatProviderAttempt).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseSettlement();
+        upstream.destroy();
+        cancel.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("stops a post-terminal flood at the byte bound and retains liability", async () => {
+      vi.useFakeTimers();
+      // Object mode preserves the intentional transport boundaries and avoids
+      // Node prefetch coalescing the terminal and the flood into one read.
+      const upstream = new Readable({ objectMode: true, read() {} });
+      const destroy = vi.spyOn(upstream, "destroy");
+      const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      try {
+        expect(POST_TERMINAL_DRAIN_MAX_BYTES).toBe(256 * 1024);
+        heartbeatProviderAttempt.mockClear();
+        upstream.push(responsesTerminal);
+        const block = Buffer.from(`: ${"x".repeat(1020)}\n\n`);
+        expect(block.length).toBe(1024);
+        for (let bytes = 0; bytes <= POST_TERMINAL_DRAIN_MAX_BYTES; bytes += block.length)
+          upstream.push(block);
+        const result = await startOwnerStream(
+          "openrouter",
+          upstream,
+          "owner",
+          "openai-responses",
+          false,
+        );
+        expect(await result.response.text()).toBe(responsesTerminal.toString());
+        const terminal = await result.terminal;
+        expect(terminal).toMatchObject({
+          ok: true,
+          responseBytes: responsesTerminal.length + POST_TERMINAL_DRAIN_MAX_BYTES,
+        });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            observationComplete: false,
+            usage: expect.objectContaining({ categoriesComplete: false }),
+          }),
+        );
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(destroy).toHaveBeenCalled();
+        expect(upstream.destroyed).toBe(true);
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(heartbeatProviderAttempt).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        upstream.destroy();
+        cancel.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels the upstream when the post-terminal drain hits a decode error", async () => {
+      const upstream = new Readable({ objectMode: true, read() {} });
+      const destroy = vi.spyOn(upstream, "destroy");
+      const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      try {
+        upstream.push(responsesTerminal);
+        upstream.push(
+          Buffer.concat([Buffer.from("data: "), Buffer.from([0xff]), Buffer.from("\n\n")]),
+        );
+        const result = await startOwnerStream(
+          "openrouter",
+          upstream,
+          "owner",
+          "openai-responses",
+          false,
+        );
+        await expect(result.response.text()).rejects.toBeInstanceOf(Error);
+        expect(await result.terminal).toMatchObject({ ok: false });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: "FAILED", observationComplete: false }),
+        );
+        // The upstream stays open (never ended): only the cleanup can close it.
+        expect(cancel).toHaveBeenCalled();
+        expect(destroy).toHaveBeenCalled();
+        expect(upstream.destroyed).toBe(true);
+      } finally {
+        upstream.destroy();
+        cancel.mockRestore();
+      }
+    });
+
+    it("cancels a pending accounting drain once without touching the cancelled controller", async () => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ read() {} });
+      const destroy = vi.spyOn(upstream, "destroy");
+      const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+      const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+      const close = vi.spyOn(ReadableStreamDefaultController.prototype, "close");
+      try {
+        heartbeatProviderAttempt.mockClear();
+        upstream.push(responsesTerminal);
+        const result = await startOwnerStream(
+          "openrouter",
+          upstream,
+          "owner",
+          "openai-responses",
+          false,
+        );
+        const reader = result.response.body!.getReader();
+        const pending = reader.read();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(2);
+        expect(reconcileProviderBudget).not.toHaveBeenCalled();
+        await reader.cancel("client disconnected during drain");
+        expect(await pending).toMatchObject({ done: true });
+        expect(await result.terminal).toMatchObject({ ok: false });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: "CANCELLED",
+            observationComplete: false,
+          }),
+        );
+        expect(cancel).toHaveBeenCalledTimes(2); // caller reader and upstream reader
+        expect(cancel).toHaveBeenLastCalledWith("client disconnected during drain");
+        expect(destroy).toHaveBeenCalled();
+        expect(upstream.destroyed).toBe(true);
+        // Node's upstream adapter may report its own cancellation AbortError
+        // on an already cancelled controller. It must not mask a pull touching
+        // the cancelled client controller (a controller-state error).
+        expect(
+          error.mock.calls.filter(
+            ([cause]) => !(cause instanceof Error && cause.name === "AbortError"),
+          ),
+        ).toEqual([]);
+        // The held terminal is never delivered, and the cancelled controller is
+        // never closed or fed after the client went away. Node's upstream
+        // adapter owns one enqueue (the terminal chunk it read); a second one
+        // would be the held body delivering to its cancelled client.
+        expect(enqueue).toHaveBeenCalledTimes(1);
+        expect(close).toHaveBeenCalledTimes(0);
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(heartbeatProviderAttempt).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      } finally {
+        upstream.destroy();
+        cancel.mockRestore();
+        enqueue.mockRestore();
+        close.mockRestore();
+        error.mockRestore();
+        vi.useRealTimers();
+      }
+    });
   });
 
   // #62 AC: pool fallback settles against the pool owner's budget even when a

@@ -525,7 +525,9 @@ root `usage` (final chunk when streaming); Messages, the `message` body or the
 a final below that snapshot in any token count is a regression that keeps the
 liability);
 Responses, the `response` body or the terminal `response.completed` event
-(`usage: null` is absence). OpenRouter's native Responses stream sends no
+(`usage: null` is absence). A recognised terminal is held until the rest of the
+response is read, bounded by 256 KiB and 2 seconds after recognition. If either
+bound is reached, the liability stays. OpenRouter's native Responses stream sends no
 `event:` lines and its terminal is not recognised: the stream is read to EOF and
 the full hold stays (the surface is unclaimed). Several different authoritative usages, usage in
 any other root carrier (`usage`, `response.usage`, `message.usage`; nested
