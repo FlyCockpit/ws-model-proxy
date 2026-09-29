@@ -246,6 +246,101 @@ describe("adminObservabilityRouter", () => {
     expect(serialized).not.toContain("endpoint-secret");
   });
 
+  it("derives endpoint status from device presence and filters by the derived status", async () => {
+    const row = (id: string, deviceStatus: string, heartbeatAgoMs: number) => ({
+      id,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+      slug: id,
+      label: id,
+      kind: "OPENAI_COMPATIBLE",
+      status: "ONLINE",
+      defaultCapabilities: [],
+      capabilityMetadata: null,
+      probeSuggestions: null,
+      lastSeenAt: null,
+      lastHealthCheckAt: null,
+      statusChangedAt: null,
+      failureReasonCode: null,
+      User: owner(),
+      CliDevice: {
+        id: `${id}-cli`,
+        slug: `${id}-cli`,
+        name: null,
+        reportedHostname: "host",
+        status: deviceStatus,
+        lastHeartbeatAt: new Date(Date.now() - heartbeatAgoMs),
+      },
+      _count: { DiscoveredModels: 0 },
+    });
+    db.endpoint.count.mockResolvedValue(3);
+    db.endpoint.findMany.mockResolvedValue([
+      row("live", "CONNECTED", 1_000),
+      row("gone", "DISCONNECTED", 1_000),
+      row("stale", "CONNECTED", 5 * 60_000),
+    ]);
+
+    const result = await client().listEndpoints({ status: "OFFLINE" });
+
+    expect(result.items.map((item) => [item.slug, item.status, item.healthState])).toEqual([
+      ["live", "ONLINE", "HEALTHY"],
+      ["gone", "OFFLINE", "ATTENTION"],
+      ["stale", "OFFLINE", "ATTENTION"],
+    ]);
+    expect(result.items[1]).toMatchObject({ reportedStatus: "ONLINE" });
+    const where = db.endpoint.findMany.mock.calls.at(-1)?.[0]?.where;
+    expect(where.OR).toEqual(
+      expect.arrayContaining([
+        { status: "OFFLINE" },
+        expect.objectContaining({ CliDevice: expect.anything() }),
+      ]),
+    );
+  });
+
+  it("marks models of a disconnected CLI UNAVAILABLE with an OFFLINE endpoint status", async () => {
+    db.discoveredModel.count.mockResolvedValue(1);
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "model-id",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+        slug: null,
+        upstreamModelId: "llama",
+        encodedModelId: "x",
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrides: [],
+        capabilityOverrideMetadata: null,
+        probeSuggestions: null,
+        lastSeenAt: null,
+        User: owner(),
+        Endpoint: {
+          id: "endpoint-id",
+          slug: "local",
+          label: "Local",
+          status: "ONLINE",
+          defaultCapabilities: [],
+          capabilityMetadata: null,
+          CliDevice: {
+            id: "cli-id",
+            slug: "desk",
+            name: null,
+            reportedHostname: "host",
+            status: "DISCONNECTED",
+            lastHeartbeatAt: new Date(Date.now() - 1_000),
+          },
+        },
+        _count: { PoolMembers: 0 },
+      },
+    ]);
+
+    const result = await client().listModels();
+
+    expect(result.items[0]).toMatchObject({
+      healthState: "UNAVAILABLE",
+      endpoint: { status: "OFFLINE" },
+    });
+  });
+
   it("returns effective model capability summaries and applies capability filters", async () => {
     db.discoveredModel.count.mockResolvedValue(1);
     db.discoveredModel.findMany.mockResolvedValue([

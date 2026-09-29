@@ -15,6 +15,7 @@ import {
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
+  markPoolMembersDueAfterCliReconnect,
   markPoolMembersForCliUnavailable,
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
@@ -678,6 +679,13 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        // Members opened only by this device's disconnect are probed now, not
+        // after the disconnect cooldown. Best effort: on failure the normal
+        // scheduled retry still recovers them.
+        await markPoolMembersDueAfterCliReconnect({
+          cliDeviceId: registration.cliDeviceId,
+          now: new Date(),
+        }).catch(() => 0);
         this.poolMemberRecovery.wake();
         socket.send(
           encodeRelayServerControlMessage({

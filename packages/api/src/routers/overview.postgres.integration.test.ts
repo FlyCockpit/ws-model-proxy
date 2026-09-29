@@ -158,3 +158,112 @@ integration("overview metrics with real PostgreSQL", () => {
     });
   });
 });
+
+integration("CLI presence health with real PostgreSQL", () => {
+  it("makes only disconnect-opened members due and derives endpoint status from the device", async () => {
+    process.env.DATABASE_URL = databaseUrl;
+    process.env.NODE_ENV = "test";
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    const { overviewRouter } = await import("./overview");
+    const { markPoolMembersDueAfterCliReconnect } = await import("../lib/model-pool-routing");
+    const { endpointEffectiveStatusWhere } = await import("../lib/cli-presence");
+    const suffix = crypto.randomUUID();
+    const user = await prisma.user.create({
+      data: {
+        name: "Presence",
+        email: `presence-${suffix}@example.test`,
+        slug: `presence-${suffix}`,
+      },
+    });
+    try {
+      const now = new Date();
+      const device = await prisma.cliDevice.create({
+        data: {
+          userId: user.id,
+          slug: "desk",
+          status: "DISCONNECTED",
+          lastHeartbeatAt: new Date(now.getTime() - 1_000),
+        },
+      });
+      const endpoint = await prisma.endpoint.create({
+        data: {
+          userId: user.id,
+          cliDeviceId: device.id,
+          slug: "ep",
+          label: "ep",
+          status: "ONLINE",
+        },
+      });
+      const pool = await prisma.modelPool.create({
+        data: { userId: user.id, slug: `pool-${suffix}`.slice(0, 60), name: "pool" },
+      });
+      const later = new Date(now.getTime() + 60_000);
+      const member = async (
+        failure: "WEBSOCKET_DISCONNECTED" | "STALE_SESSION" | "RELAY_TIMEOUT",
+      ) => {
+        const model = await prisma.discoveredModel.create({
+          data: {
+            userId: user.id,
+            endpointId: endpoint.id,
+            upstreamModelId: failure,
+            encodedModelId: failure,
+          },
+        });
+        return prisma.poolMember.create({
+          data: {
+            poolId: pool.id,
+            discoveredModelId: model.id,
+            healthStatus: "UNHEALTHY",
+            lastFailureClass: failure,
+            consecutiveRetryableFailures: 3,
+            nextRetryAt: later,
+          },
+        });
+      };
+      const [dropped, stale, real] = await Promise.all([
+        member("WEBSOCKET_DISCONNECTED"),
+        member("STALE_SESSION"),
+        member("RELAY_TIMEOUT"),
+      ]);
+
+      const asUser = createRouterClient(overviewRouter, {
+        context: { session: { user } as unknown as Session } as Context,
+      });
+      const before = await asUser.health();
+      expect(before.endpoints.unhealthy).toMatchObject([{ id: endpoint.id, status: "OFFLINE" }]);
+      expect(
+        await prisma.endpoint.count({ where: endpointEffectiveStatusWhere("OFFLINE", now) }),
+      ).toBeGreaterThanOrEqual(1);
+      expect(
+        await prisma.endpoint.count({
+          where: { id: endpoint.id, ...endpointEffectiveStatusWhere("ONLINE", now) },
+        }),
+      ).toBe(0);
+
+      const count = await markPoolMembersDueAfterCliReconnect({ cliDeviceId: device.id, now });
+      expect(count).toBe(2);
+      const rows = await prisma.poolMember.findMany({
+        where: { id: { in: [dropped.id, stale.id, real.id] } },
+        select: { id: true, nextRetryAt: true, healthStatus: true, lastFailureClass: true },
+      });
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      expect(byId.get(dropped.id)).toMatchObject({ nextRetryAt: now, healthStatus: "UNHEALTHY" });
+      expect(byId.get(stale.id)?.nextRetryAt).toEqual(now);
+      expect(byId.get(real.id)?.nextRetryAt).toEqual(later);
+
+      await prisma.cliDevice.update({
+        where: { id: device.id },
+        data: { status: "CONNECTED", lastHeartbeatAt: new Date() },
+      });
+      const after = await asUser.health();
+      expect(after.endpoints.unhealthy).toEqual([]);
+      expect(
+        await prisma.endpoint.count({
+          where: { id: endpoint.id, ...endpointEffectiveStatusWhere("ONLINE", new Date()) },
+        }),
+      ).toBe(1);
+    } finally {
+      await prisma.user.deleteMany({ where: { id: user.id } });
+    }
+  });
+});

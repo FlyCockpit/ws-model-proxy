@@ -874,6 +874,52 @@ describe("RelaySessionManager", () => {
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
   });
 
+  it("makes disconnect-opened pool members due on a reconnect hello", async () => {
+    const manager = new RelaySessionManager();
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.removeSession(first, new Date(now.getTime() + 1_000));
+
+    db.poolMember.updateMany.mockClear();
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity, now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+
+    const dueCall = db.poolMember.updateMany.mock.calls.find(
+      ([arg]) => arg?.data && "nextRetryAt" in arg.data && arg.where.healthStatus === "UNHEALTHY",
+    );
+    expect(dueCall?.[0]).toMatchObject({
+      where: {
+        healthStatus: "UNHEALTHY",
+        lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
+        nextRetryAt: { gt: expect.any(Date) },
+      },
+      data: { nextRetryAt: expect.any(Date) },
+    });
+    // Only the due time moves: a real failure state is never cleared here.
+    expect(Object.keys(dueCall?.[0].data)).toEqual(["nextRetryAt"]);
+    expect(JSON.parse(String(second.sends[0])).type).toBe("hello.ok");
+  });
+
+  it("still accepts a hello when the reconnect health update fails", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    db.poolMember.updateMany.mockImplementation(
+      async (arg: { where: { healthStatus?: string } }) => {
+        if (arg.where.healthStatus === "UNHEALTHY") throw new Error("db down");
+        return { count: 0 };
+      },
+    );
+    try {
+      await manager.handleTextFrame(socket, helloFrame(), now);
+    } finally {
+      db.poolMember.updateMany.mockReset();
+    }
+    expect(JSON.parse(String(socket.sends[0])).type).toBe("hello.ok");
+  });
+
   it("marks stale sessions and their pool members unavailable", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

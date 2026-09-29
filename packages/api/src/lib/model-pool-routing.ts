@@ -713,3 +713,38 @@ export async function markPoolMembersForCliUnavailable({
     data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
   });
 }
+
+/**
+ * A CLI reconnected (hello accepted): members that were circuit-opened only
+ * because the device was away become due now, so the recovery probe runs at
+ * once instead of after the disconnect cooldown. Members whose last failure
+ * was anything else (a real upstream/transport failure) keep their state.
+ * Nothing is marked healthy here; the probe decides.
+ */
+export async function markPoolMembersDueAfterCliReconnect({
+  cliDeviceId,
+  now = new Date(),
+}: {
+  cliDeviceId: string;
+  now?: Date;
+}): Promise<number> {
+  const result = await prisma.poolMember.updateMany({
+    where: {
+      healthStatus: "UNHEALTHY",
+      lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
+      nextRetryAt: { gt: now },
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId } } },
+        },
+        {
+          executionTargetId: null,
+          DiscoveredModel: { Endpoint: { cliDeviceId } },
+        },
+      ],
+    },
+    data: { nextRetryAt: now },
+  });
+  return result.count;
+}

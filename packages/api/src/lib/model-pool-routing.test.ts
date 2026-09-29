@@ -11,6 +11,7 @@ const {
   isRetryablePoolMemberRelayFailure,
   markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
+  markPoolMembersDueAfterCliReconnect,
   markPoolMembersForCliUnavailable,
   poolMemberFailureClassForRelayFailure,
   recordPoolMemberRelayFailure,
@@ -380,6 +381,29 @@ describe("modelPoolRouting", () => {
         routingStatus: { not: "DISABLED" },
       },
       data: resetPoolMemberHealth(),
+    });
+  });
+
+  it("makes only disconnect-opened members of the device due on reconnect", async () => {
+    db.poolMember.updateMany.mockResolvedValue({ count: 2 });
+
+    const count = await markPoolMembersDueAfterCliReconnect({ cliDeviceId: "cli-1", now });
+
+    expect(count).toBe(2);
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: {
+        healthStatus: "UNHEALTHY",
+        lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
+        nextRetryAt: { gt: now },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+          },
+          { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+        ],
+      },
+      data: { nextRetryAt: now },
     });
   });
 
