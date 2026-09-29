@@ -583,7 +583,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       expect(
         await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
       ).toMatchObject({
-        requestedModelPoolId: pool.id,
+        requestedModelPoolId: inflightPool.id,
         resourceOwnerUserId: owner.id,
         selectedExecutionTargetId: pending.selectedExecutionTargetId,
         selectedPoolMemberId: pending.selectedPoolMemberId,
@@ -599,7 +599,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
         ).toMatchObject({
           status: "SUCCEEDED",
-          requestedModelPoolId: pool.id,
+          requestedModelPoolId: inflightPool.id,
           resourceOwnerUserId: owner.id,
         }),
       );
@@ -625,7 +625,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       await reconcileStaleLocalRelayTelemetry();
       expect(await db.relayRequest.findUniqueOrThrow({ where: { id: orphan.id } })).toMatchObject({
         status: "FAILED",
-        requestedModelPoolId: pool.id,
+        requestedModelPoolId: inflightPool.id,
         resourceOwnerUserId: owner.id,
       });
       await db.$transaction(async (tx) => {

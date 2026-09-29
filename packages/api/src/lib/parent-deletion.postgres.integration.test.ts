@@ -3863,10 +3863,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
   }, 60_000);
 
-  // #79 item 4: a waiter drain batch that exceeds the drain statement bound
-  // (a 5 000-row DELETE right after a bulk insert on a loaded host) is
-  // retried at half the size down to the floor instead of reporting pending.
-  // A statement trigger makes a batch slow above a row threshold.
+  // #79 item 4: a drain batch that exceeds the drain statement bound (a
+  // 5 000-row DELETE right after a bulk insert on a loaded host) is retried at
+  // half the size down to the floor instead of reporting pending. A statement
+  // trigger on admission_request makes a batch slow above a row threshold. (DL-1 (d): only a whole-user delete drains, so
+  // this runs the user drain's admission step.)
   it.each([
     ["completes at a smaller batch", 1_000],
     ["reports pending when even the floor batch times out", 100],
@@ -3912,19 +3913,25 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           RETURN NULL;
         END $$`);
       await observer.$executeRawUnsafe(`
-        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON capacity_waiter
+        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON admission_request
           FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_count_waiter_batch()`);
       await observer.$executeRawUnsafe(`
-        CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON capacity_waiter
+        CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON admission_request
           REFERENCING OLD TABLE AS gone
           FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_slow_waiter_batch()`);
       try {
+        const mark = await deletion.requestUserDeletion(prisma, g.user.id);
+        if (!mark) throw new Error("deletion mark was not taken");
         const parents = await deletion.resolveDeletedParents(prisma, {
           userId: g.user.id,
-          poolIds: [g.pool.id],
+          wholeUser: true,
         });
         const started = Date.now();
-        const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
+        const outcome = await settle(
+          deletion.drainParentDeletionHistory(prisma, parents, {
+            owner: { userId: g.user.id, generation: mark.generation },
+          }),
+        );
         const elapsed = Date.now() - started;
         const [slow] = await observer.$queryRawUnsafe<
           Array<{ tried: bigint; attempts: bigint; lastSize: bigint }>
@@ -3947,7 +3954,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           // observations are only reported: a loaded host can cancel a DELETE
           // before its AFTER trigger runs.)
           expect(outcome.value["batch.halved"]).toBe(3);
-          expect(outcome.value["capacity_waiter.delete"]).toBe(waiters);
+          expect(outcome.value["admission_request.delete"]).toBe(waiters);
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
         } else {
           expect(outcome.ok).toBe(false);
@@ -3968,11 +3975,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         );
       } finally {
         await observer.$executeRawUnsafe(
-          "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON capacity_waiter",
+          "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON admission_request",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_waiter_batch()");
         await observer.$executeRawUnsafe(
-          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON capacity_waiter",
+          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON admission_request",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_count_waiter_batch()");
         await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_waiter_attempts");
