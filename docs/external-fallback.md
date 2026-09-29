@@ -254,8 +254,10 @@ Audio rates bound both input/output and additional-token accounting.
 Usage from `openrouter` provider accounts is parsed with an OpenRouter-specific
 dialect, checked against live captures (Chat Completions, Messages and Responses,
 2026-09-29). `prompt_tokens_details.cache_write_tokens` (Messages:
-`cache_creation_input_tokens`) is settled as cache-write tokens; on Chat and
-Responses it is a subset of the prompt count, like `cached_tokens`. One-hour
+`cache_creation_input_tokens`) is settled as cache-write tokens; on Chat
+(verified by a cache-write capture) and Responses (inferred from Chat: the
+captured Responses calls had no cache activity) it is a subset of the prompt
+count, like `cached_tokens`. One-hour
 cache writes (`cache_creation.ephemeral_1h_input_tokens`), positive
 `video_tokens` / `image_tokens`, two spellings of the same count, a non-object
 detail container, and any other unrecognized or malformed field keep the
@@ -268,8 +270,9 @@ A response settles only from its one authoritative usage record: Chat, the
 root `usage` (final chunk when streaming); Messages, the `message` body or the
 `message_delta` event (the partial `message_start` snapshot is superseded);
 Responses, the `response` body or the terminal `response.completed` event
-(`usage: null` is absence). Several different authoritative usages, usage
-anywhere else, a second usage container in one record, a non-JSON `data:`
+(`usage: null` is absence). Several different authoritative usages, usage in
+any other root carrier (`usage`, `response.usage`, `message.usage`; nested
+objects are never read), a second usage container in one record, a non-JSON `data:`
 record, or a stream that stops being valid SSE keep the usage as audit evidence
 only: no charge and no total from it settles below the liability. Usage-looking
 text outside a record (for example in SSE comments or a truncated body) is

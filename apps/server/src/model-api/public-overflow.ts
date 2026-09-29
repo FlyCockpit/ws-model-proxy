@@ -1374,8 +1374,9 @@ export function usageFromObject(
   // have no priced category here, so only an explicit zero is accepted; a
   // positive count keeps the observation incomplete (fail closed).
   // `cache_write_tokens` is a subset of `prompt_tokens` (verified by a live
-  // capture, 2026-09-29: prompt 7671 = 9 uncached + 7662 cache writes) and is
-  // settled as cache-write tokens.
+  // Chat capture, 2026-09-29: prompt 7671 = 9 uncached + 7662 cache writes;
+  // inferred for Responses `input_tokens`, whose captures had no cache
+  // activity) and is settled as cache-write tokens.
   const openRouterZeroOnlyDetails = [
     [promptDetails, "video_tokens"],
     [completionDetails, "image_tokens"],
@@ -1706,7 +1707,9 @@ export function retainProviderUsagePrefix(
  *   terminal `response.completed` / `.incomplete` / `.failed` event);
  * - `superseded`: Messages `message_start` usage, a partial snapshot that the
  *   final `message_delta` replaces;
- * - `ambiguous`: usage anywhere else, or in two containers of one record;
+ * - `ambiguous`: usage in any other root carrier (`usage`, `response.usage`,
+ *   `message.usage`; nested objects are never read), or in two carriers of
+ *   one record;
  * - undefined: no usage (null usage is absence).
  */
 type OpenRouterRecordUsage =
