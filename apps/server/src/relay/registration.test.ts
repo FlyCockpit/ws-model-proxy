@@ -8,7 +8,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  const { Prisma } = await import("../../../../packages/db/prisma/generated/client");
+  return { default: mockDeep(), Prisma };
 });
 
 const { persistRelayRegistration, shouldPreserveDashboardCapabilityOverride } = await import(
@@ -23,7 +24,12 @@ const db = prisma as unknown as {
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
+  endpoint: {
+    findMany: MockInstance;
+    upsert: MockInstance;
+    findUnique: MockInstance;
+    updateMany: MockInstance;
+  };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
@@ -171,6 +177,7 @@ describe("capability override origin", () => {
       inventoryAcknowledgedAt: now,
     });
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
     db.endpoint.updateMany.mockResolvedValue({ count: 0 });
     db.discoveredModel.findUnique.mockResolvedValue(null);
@@ -451,8 +458,7 @@ describe("capability override origin", () => {
         userId: "user-id",
         DiscoveredModel: {
           is: {
-            Endpoint: { cliDeviceId: "cli-device-id" },
-            OR: [{ Endpoint: { slug: "local-openai" }, upstreamModelId: { in: ["llava/local"] } }],
+            Endpoint: { cliDeviceId: "cli-device-id", slug: { in: ["local-openai"] } },
           },
         },
       },
@@ -461,6 +467,94 @@ describe("capability override origin", () => {
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
       isolationLevel: "ReadCommitted",
     });
+  });
+
+  it("fences shared, own-key and orphan rows, including an unlisted target, before writing", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-device-id" });
+    db.endpoint.findMany.mockResolvedValue([{ id: "endpoint-id" }]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "execution-target-id",
+        discoveredModelId: "model-id",
+        inferenceCapacityId: "capacity-id",
+      },
+      { id: "unlisted", discoveredModelId: "missing-model", inferenceCapacityId: "shared" },
+    ]);
+    db.inferenceCapacity.findMany.mockImplementation(
+      async (args: {
+        where?: { runtimeIdentityKey?: { in?: string[] }; ExecutionTargets?: object };
+      }) => {
+        const keys = args.where?.runtimeIdentityKey?.in;
+        if (keys?.includes("engine-process:endpoint-id")) return [{ id: "shared" }];
+        if (keys?.includes("discovered-model:model-id")) return [{ id: "own" }];
+        if (keys?.includes("discovered-model:missing-model")) return [{ id: "missing-own" }];
+        if (args.where?.ExecutionTargets) return [{ id: "orphan" }];
+        return [];
+      },
+    );
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints(),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const fenceCalls = db.$queryRaw.mock.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) =>
+        (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+      );
+    expect(fenceCalls.map(({ call }) => call[1])).toEqual([
+      ["00:owner:user-id"],
+      [
+        "06:capacity-policy:execution-target-id",
+        "06:capacity-policy:unlisted",
+        "08:capacity:capacity-id",
+        "08:capacity:missing-own",
+        "08:capacity:orphan",
+        "08:capacity:own",
+        "08:capacity:shared",
+      ],
+    ]);
+    expect(db.$queryRaw.mock.invocationCallOrder[fenceCalls[1]!.index]).toBeLessThan(
+      db.cliDevice.upsert.mock.invocationCallOrder[0]!,
+    );
+    expect(db.inferenceCapacity.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        take: 200,
+        orderBy: { id: "asc" },
+        where: expect.objectContaining({
+          userId: "user-id",
+          hardConcurrencyLimitSource: "AUTO",
+          ExecutionTargets: { none: {} },
+        }),
+      }),
+    );
+  });
+
+  it("fences an empty shared destination independently of the orphan batch", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-device-id" });
+    db.endpoint.findMany.mockResolvedValue([{ id: "endpoint-id" }]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockImplementation(
+      async (args: { where?: { runtimeIdentityKey?: { in?: string[] } } }) =>
+        args.where?.runtimeIdentityKey?.in?.includes("engine-process:endpoint-id")
+          ? [{ id: "shared" }]
+          : [],
+    );
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints(),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const calls = db.$queryRaw.mock.calls.filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+    );
+    expect(calls.map((call) => call[1])).toEqual([["00:owner:user-id"], ["08:capacity:shared"]]);
   });
 
   it("fences only the owner for a device it has never seen", async () => {
@@ -1014,7 +1108,11 @@ describe("capability override origin", () => {
         hardConcurrencyLimit: null,
         hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
-          in: ["execution-target:execution-target-id", "discovered-model:model-id"],
+          in: [
+            "execution-target:execution-target-id",
+            "discovered-model:model-id",
+            "engine-process:endpoint-id",
+          ],
         },
       },
       data: { hardConcurrencyLimit: 4, hardConcurrencyLimitSource: "AUTO" },

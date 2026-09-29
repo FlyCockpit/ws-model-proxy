@@ -83,7 +83,9 @@ function storedInt(fact: WireFact<number> | undefined): number | null {
 
 /**
  * The capacity columns for one model's facts, or null when the CLI reported
- * none that a capacity stores.
+ * none that a capacity stores. servedModelAliases is process identity proof
+ * consumed by planEngineProcessCapacity directly from endpoint wire facts;
+ * it must not be projected away before that decision.
  */
 export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEngineFacts | null {
   if (!facts) return null;

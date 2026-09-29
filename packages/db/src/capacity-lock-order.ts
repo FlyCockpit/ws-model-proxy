@@ -39,7 +39,7 @@
  *   row then model row (the provider order below). It reads the graph without
  *   row locks, after its fences, and never takes an `owner` fence.
  * - M (management): relay registration, dashboard and MCP writes, provider
- *   management, parent deletes, startup backfills. It first takes the `owner`
+ *   management, parent deletes, startup backfills and auto-capacity cleanup. It first takes the `owner`
  *   fence of every user whose graph rows it writes (sorted; cascades
  *   included, see {@link fenceParentDelete}), then the policy/capacity fences
  *   of the policy it changes, and only then locks and writes graph rows. It
@@ -311,6 +311,13 @@ import {
 } from "./parent-deletion-residual";
 
 type Tx = Prisma.TransactionClient;
+
+/** Reserved keys of capacities created by discovery, never owner-created keys. */
+export const AUTO_CAPACITY_RUNTIME_KEY_PREFIXES = [
+  "discovered-model:",
+  "execution-target:",
+  "engine-process:",
+] as const;
 
 /**
  * The hot-path (writer class H) tables. None has a foreign key to or from a
@@ -728,7 +735,7 @@ export async function resolveDeletionOwners(
  * transaction holds. A parent with admission or lease history is deletable;
  * the history keeps plain ids and the sweepers terminalize live orphans.
  */
-export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Promise<void> {
+export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Promise<string[]> {
   if (scope.wholeUser && scope.userDeletionGeneration === undefined)
     throw new ParentDeletionOwnerRequiredError();
   const planned = await resolveDeletionOwners(
@@ -741,7 +748,28 @@ export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Pro
   const current = await resolveDeletionOwners(tx, scope.userId, parents);
   const held = new Set(planned);
   if (current.some((owner) => !held.has(owner))) throw new FenceSetChangedError();
-  if (!scope.wholeUser) return;
+  if (!scope.wholeUser) {
+    // Cleanup after the cascade may delete these graph rows. Fence them
+    // before the caller's first write; no H rows are locked or written.
+    const capacities = await tx.inferenceCapacity.findMany({
+      where: {
+        userId: scope.userId,
+        hardConcurrencyLimitSource: "AUTO",
+        OR: AUTO_CAPACITY_RUNTIME_KEY_PREFIXES.map((prefix) => ({
+          runtimeIdentityKey: { startsWith: prefix },
+        })),
+        ExecutionTargets: { some: { id: { in: parents.execution_target } } },
+      },
+      select: { id: true },
+    });
+    const ids = capacities.map((capacity) => capacity.id);
+    await acquireFences(
+      tx,
+      ids.map((id) => fences.capacity(id)),
+    );
+    return ids;
+  }
+  // The whole-user cascade removes capacities; it needs no separate cleanup.
   const pools = sortedIds([
     ...parents.model_pool,
     ...(
@@ -765,6 +793,7 @@ export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Pro
      WHERE id = ${scope.userId} AND "deletionGeneration" = ${scope.userDeletionGeneration}
      FOR UPDATE`;
   if (locked.length === 0) throw new UserDeletionGenerationChangedError();
+  return [];
 }
 
 type TransactionRunner = Pick<PrismaClient, "$transaction">;

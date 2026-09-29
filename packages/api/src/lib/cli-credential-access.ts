@@ -17,6 +17,7 @@ import {
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
 import { deletionConflict } from "./deletion-conflict";
+import { deleteOrphanAutoCapacities } from "./engine-process-capacity";
 import { throwCapacityDeleteConflict } from "./serializable-transaction";
 
 export type CliCredentialKind = "cliToken" | "deviceCredential";
@@ -348,7 +349,7 @@ async function deleteCliDeviceInCapacityLockOrder({
   now: Date;
 }): Promise<{ revoked: RevokedCliCredentials[] }> {
   return runCapacityOrderedTransaction(prisma, async (tx) => {
-    await fenceParentDelete(tx, { userId, cliDeviceIds: [cliDeviceId] });
+    const orphanCapacityIds = await fenceParentDelete(tx, { userId, cliDeviceIds: [cliDeviceId] });
     const locked = await tx.cliDevice.updateMany({
       where: { id: cliDeviceId, userId },
       data: { updatedAt: now },
@@ -382,6 +383,7 @@ async function deleteCliDeviceInCapacityLockOrder({
       });
     }
     await tx.cliDevice.delete({ where: { id: cliDeviceId }, select: { id: true } });
+    await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
 
     return {
       revoked: [

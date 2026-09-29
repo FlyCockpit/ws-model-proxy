@@ -2648,6 +2648,33 @@ mod relay_27_vectors {
     }
 
     #[test]
+    fn llama_alias_probe_survives_endpoint_inventory_wire_projection() {
+        for (props, expected) in [
+            (r#"{"total_slots":4}"#, Some(vec!["a", "b"])),
+            (r#"{"role":"router","total_slots":4}"#, None),
+        ] {
+            let detected = crate::engine::detect_with(
+                None,
+                &[("a".to_string(), None), ("b".to_string(), None)],
+                |route, _| (route == "props").then(|| props.to_string()),
+            );
+            let endpoint = EndpointConfig {
+                last_probe: probed(detected, &["a", "b"]),
+                ..EndpointConfig::default()
+            };
+            let encoded = serde_json::to_value(inventory(&endpoint)).expect("inventory wire");
+            let aliases = encoded["engineFacts"].get("servedModelAliases");
+            match expected {
+                Some(ids) => assert_eq!(
+                    aliases,
+                    Some(&serde_json::json!({"value": ids, "source": "probe"}))
+                ),
+                None => assert!(aliases.is_none()),
+            }
+        }
+    }
+
+    #[test]
     fn hello_with_engine_facts_matches_the_shared_vector() {
         let vllm = EndpointConfig {
             slug: "vllm".to_string(),

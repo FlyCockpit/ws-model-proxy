@@ -410,8 +410,9 @@ describe("discovered inference capacity", () => {
             hardConcurrencyLimit: null,
             hardConcurrencyLimitSource: "AUTO",
             OR: [
-              { runtimeIdentityKey: { startsWith: "execution-target:" } },
               { runtimeIdentityKey: { startsWith: "discovered-model:" } },
+              { runtimeIdentityKey: { startsWith: "execution-target:" } },
+              { runtimeIdentityKey: { startsWith: "engine-process:" } },
             ],
           },
         },
@@ -421,6 +422,7 @@ describe("discovered inference capacity", () => {
         userId: true,
         discoveredModelId: true,
         inferenceCapacityId: true,
+        DiscoveredModel: { select: { endpointId: true } },
         InferenceCapacity: {
           select: {
             runtimeIdentityKey: true,
@@ -430,6 +432,44 @@ describe("discovered inference capacity", () => {
         },
       },
     });
+  });
+
+  it("fills only the exact endpoint's shared AUTO key at startup", async () => {
+    for (const [key, source, expected] of [
+      ["engine-process:ep", "AUTO", 1],
+      ["engine-process:other", "AUTO", null],
+      ["engine-process:ep", "USER", null],
+    ] as const) {
+      const row = {
+        id: "shared",
+        userId: "user-id",
+        runtimeIdentityKey: key,
+        hardConcurrencyLimit: null as number | null,
+        hardConcurrencyLimitSource: source,
+      };
+      db.executionTarget.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+        {
+          id: "target",
+          userId: "user-id",
+          discoveredModelId: "model",
+          inferenceCapacityId: "shared",
+          DiscoveredModel: { endpointId: "ep" },
+          InferenceCapacity: row,
+        },
+      ]);
+      db.executionTarget.findUnique.mockResolvedValue({
+        id: "target",
+        userId: "user-id",
+        kind: "DISCOVERED_MODEL",
+        discoveredModelId: "model",
+        inferenceCapacityId: "shared",
+      });
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+      await backfillDiscoveredInferenceCapacities();
+      expect(row.hardConcurrencyLimit).toBe(expected);
+    }
   });
 
   it("does not rewrite a pre-attached auto capacity whose hard limit is 4", async () => {

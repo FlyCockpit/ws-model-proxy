@@ -52,6 +52,7 @@ import {
   effectiveProviderEgress,
   grantPoolAccessServerMessages,
 } from "../lib/effective-provider-egress";
+import { deleteOrphanAutoCapacities } from "../lib/engine-process-capacity";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   lowestMcpCommandMode,
@@ -1318,7 +1319,7 @@ async function removeOwnedRow({
   // it (no stale target plan). Request and admission history keeps the
   // deleted ids; the capacity sweeper terminalizes live orphans.
   return runCapacityDeleteTransaction(async (tx) => {
-    await fenceParentDelete(
+    const orphanCapacityIds = await fenceParentDelete(
       tx,
       kind === "endpoint" ? { userId, endpointIds: [id] } : { userId, discoveredModelIds: [id] },
     );
@@ -1339,6 +1340,7 @@ async function removeOwnedRow({
         throw deletionConflict("not_stale", "Endpoint is not stale.");
       }
       await tx.endpoint.delete({ where: { id } });
+      await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
       return { deleted: true };
     }
 
@@ -1358,6 +1360,7 @@ async function removeOwnedRow({
       throw deletionConflict("not_stale", "Discovered model is not stale.");
     }
     await tx.discoveredModel.delete({ where: { id } });
+    await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
     return { deleted: true };
   });
 }

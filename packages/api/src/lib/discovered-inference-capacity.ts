@@ -1,5 +1,9 @@
 import prisma, { type Prisma } from "@ws-model-proxy/db";
-import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  AUTO_CAPACITY_RUNTIME_KEY_PREFIXES,
+  acquireFences,
+  fences,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { retryableSerializableTransactionCode } from "./serializable-transaction";
 
 /**
@@ -12,6 +16,12 @@ const HARD_CONCURRENCY_MAX = 10_000;
 const CAPACITY_LABEL_MAX = 120;
 const RUNTIME_MODEL_MAX = 500;
 const BACKFILL_ATTEMPTS = 3;
+
+export { AUTO_CAPACITY_RUNTIME_KEY_PREFIXES };
+
+export function engineProcessRuntimeIdentityKey(endpointId: string): string {
+  return `engine-process:${endpointId}`;
+}
 
 export function discoveredRuntimeIdentityKey(discoveredModelId: string): string {
   return `discovered-model:${discoveredModelId}`;
@@ -26,12 +36,14 @@ export function legacyExecutionTargetRuntimeIdentityKey(executionTargetId: strin
 function autoDiscoveredCapacityRuntimeKeys(input: {
   discoveredModelId: string;
   executionTargetId?: string | null;
+  endpointId?: string;
 }): string[] {
   const keys: string[] = [];
   if (input.executionTargetId) {
     keys.push(legacyExecutionTargetRuntimeIdentityKey(input.executionTargetId));
   }
   keys.push(discoveredRuntimeIdentityKey(input.discoveredModelId));
+  if (input.endpointId) keys.push(engineProcessRuntimeIdentityKey(input.endpointId));
   return keys;
 }
 
@@ -39,6 +51,7 @@ function isExactAutoDiscoveredRuntimeKey(input: {
   runtimeIdentityKey: string;
   discoveredModelId: string;
   executionTargetId: string;
+  endpointId?: string;
 }): boolean {
   return autoDiscoveredCapacityRuntimeKeys(input).includes(input.runtimeIdentityKey);
 }
@@ -102,6 +115,7 @@ export async function fillNullAutoDiscoveredCapacityLimit(
     discoveredModelId: string;
     executionTargetId?: string | null;
     reportedConcurrency?: number | null;
+    endpointId?: string;
   },
 ): Promise<number> {
   const updated = await tx.inferenceCapacity.updateMany({
@@ -114,6 +128,7 @@ export async function fillNullAutoDiscoveredCapacityLimit(
         in: autoDiscoveredCapacityRuntimeKeys({
           discoveredModelId: input.discoveredModelId,
           executionTargetId: input.executionTargetId,
+          endpointId: input.endpointId,
         }),
       },
     },
@@ -291,6 +306,7 @@ async function fillAttachedAutoCapacityLimit(input: {
   userId: string;
   discoveredModelId: string;
   inferenceCapacityId: string;
+  endpointId?: string;
 }): Promise<number> {
   return prisma.$transaction(async (tx) => {
     // Same fences as attach: owner, then the target's capacity-policy fence
@@ -323,6 +339,7 @@ async function fillAttachedAutoCapacityLimit(input: {
     return fillNullAutoDiscoveredCapacityLimit(tx, {
       userId: current.userId,
       capacityId: input.inferenceCapacityId,
+      endpointId: input.endpointId,
       discoveredModelId: input.discoveredModelId,
       executionTargetId: current.id,
       reportedConcurrency: null,
@@ -344,7 +361,7 @@ async function withCapacityWriteRetries(work: () => Promise<number>): Promise<nu
 /**
  * Idempotent startup repair for discovered execution targets. Null foreign
  * keys are attached. An attached auto capacity (`execution-target:<id>` or
- * `discovered-model:<id>`) whose hard limit is still null and AUTO-sourced is
+ * `discovered-model:<id>` or `engine-process:<endpointId>`) whose hard limit is still null and AUTO-sourced is
  * set to the discovered default, because startup has no CLI report. Does not
  * delete rows, does not replace a foreign key that is already set, and does
  * not change a non-null limit, a USER-sourced limit (a USER null is an
@@ -400,10 +417,9 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         is: {
           hardConcurrencyLimit: null,
           hardConcurrencyLimitSource: "AUTO",
-          OR: [
-            { runtimeIdentityKey: { startsWith: "execution-target:" } },
-            { runtimeIdentityKey: { startsWith: "discovered-model:" } },
-          ],
+          OR: AUTO_CAPACITY_RUNTIME_KEY_PREFIXES.map((prefix) => ({
+            runtimeIdentityKey: { startsWith: prefix },
+          })),
         },
       },
     },
@@ -412,6 +428,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
       userId: true,
       discoveredModelId: true,
       inferenceCapacityId: true,
+      DiscoveredModel: { select: { endpointId: true } },
       InferenceCapacity: {
         select: {
           runtimeIdentityKey: true,
@@ -433,6 +450,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         runtimeIdentityKey: capacity.runtimeIdentityKey,
         discoveredModelId,
         executionTargetId: target.id,
+        endpointId: target.DiscoveredModel?.endpointId,
       })
     ) {
       continue;
@@ -443,6 +461,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         userId: target.userId,
         discoveredModelId,
         inferenceCapacityId: capacityId,
+        endpointId: target.DiscoveredModel?.endpointId,
       }),
     );
   }

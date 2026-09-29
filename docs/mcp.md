@@ -22,6 +22,17 @@ every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
+Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
+when the CLI proves that at least two inventory model ids are aliases served
+by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
+capacities. User assignments and USER limits are preserved. An alias that is
+removed from the process splits back to its own capacity on the next inventory.
+Old capacity rows remain while their leases or waiters are live; runtime cleanup
+cancels moved-target waiters and releases leases using their original capacity.
+Empty AUTO discovery capacities are removed with model, endpoint, and device
+deletes, and an idempotent startup sweep repairs existing idle orphans.
+Owner-created empty capacities remain visible in `capacity_records_list`.
+
 ## Setup
 
 Required environment:

@@ -20,7 +20,7 @@ const testEnv = vi.hoisted(() => ({
 // The parent-delete fence prelude runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
 const { fenceParentDelete } = vi.hoisted(() => ({
-  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown): Promise<string[]> => []),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
@@ -5016,7 +5016,7 @@ describe("forwarderManagementRouter", () => {
           });
         } finally {
           fenceParentDelete.mockReset();
-          fenceParentDelete.mockImplementation(async () => undefined);
+          fenceParentDelete.mockImplementation(async () => []);
         }
         // Retried with a fresh plan each time, never deleting.
         expect(db.$transaction).toHaveBeenCalledTimes(5);

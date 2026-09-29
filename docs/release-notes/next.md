@@ -9,6 +9,16 @@ release body (the generated installer notes follow them).
 
 Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md).
 
+## Discovery capacity lifecycle (#91, #114)
+
+Slot-sharing llama.cpp, vLLM and SGLang processes now share a capacity when the
+CLI reports multiple served aliases. Removed aliases split on the next inventory;
+Ollama, LM Studio, router mode, and owner assignments stay independent. Discovery
+moves take both capacity fences; live leases retain their original capacity and
+moved-target waiters are cancelled by runtime cleanup. Parent deletes remove empty
+AUTO discovery rows in the same transaction. Startup repairs existing idle orphans
+with bounded batches; owner-created empty rows remain. No schema change is needed.
+
 ## Before you deploy
 
 - **Set a stop grace of at least 52 s.** The server can take up to 47 s to shut
