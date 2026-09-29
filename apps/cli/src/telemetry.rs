@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn label_keys_reject_the_reserved_names_and_keep_their_look_alikes() {
+    fn label_keys_reject_the_reserved_names_and_keep_similar_names() {
         assert!(!is_label_key("__proto__"));
         for key in [
             "proto",
