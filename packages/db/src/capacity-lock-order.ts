@@ -245,11 +245,12 @@
  * continuously renewed ban. Transaction now() predates the C5 wait. No `user`
  * lock is needed, for the requester or the owner: every statement after that
  * read is non-blocking (the credential row is already held) and none writes a
- * row the ban or deletion-mark writers read, so a mark committing after the
- * read serializes after the claim, the same order a FOR SHARE would force,
- * and the `user` rows stay out of this order. The `lock_timeout` does not
- * change this: every condition is still re-read after the last lock wait, so
- * E0 holds.
+ * row the ban or deletion-mark writers read. A mark committing after the read
+ * cannot affect the claim's decision (the send was already decided under the
+ * earlier state); its commit may land before or after the claim commits, the
+ * same send-level outcome a FOR SHARE would force, and the `user` rows stay
+ * out of this order. The `lock_timeout` does not change this: every condition
+ * is still re-read after the last lock wait, so E0 holds.
  *
  * Then, still after the last lock wait, it re-reads the target it was
  * admitted for (`recheckExternalSendTarget`, public-overflow.ts): the
@@ -259,12 +260,14 @@
  * `pool_member` row (same pool and target, PUBLIC_OVERFLOW, routing ACTIVE)
  * WITHOUT a lock. The member row stays out of this order for the same reason
  * as the `user` rows: nothing after the read waits and the claim writes no
- * row a member writer reads, so a removal or disable committing after the
- * read serializes after the claim. A changed target is availability
- * (`PROVIDER_UNAVAILABLE`, or `BOUND_TARGET_INVALID` for a stored-response
- * binding or own-key), not a consent denial: nothing is sent, and the
- * dispatcher tries the next member only for a retry-safe operation. The
- * static guard (apps/server/src/model-api/capacity/lock-order.test.ts)
+ * row a member writer reads. A removal or disable committing after the read
+ * cannot affect the claim's decision (the send was already decided under the
+ * earlier state); its commit may land before or after the claim commits. A
+ * changed target is availability (`PROVIDER_UNAVAILABLE`, or
+ * `BOUND_TARGET_INVALID` for a stored-response binding or own-key), not a
+ * consent denial: nothing is sent, and the dispatcher tries the next member
+ * only for a retry-safe operation. The static guard
+ * (apps/server/src/model-api/capacity/lock-order.test.ts)
  * checks this statement sequence, that neither post-wait re-read takes a
  * lock, and that no lock-taking or raw SQL statement follows them in the
  * claim.
