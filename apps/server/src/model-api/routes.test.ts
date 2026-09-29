@@ -5,6 +5,7 @@ import type {
   VisibleDirectModelTarget,
   VisibleModelPoolTarget,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
+import { POOL_MEMBER_HALF_OPEN_LEASE_MS } from "@ws-model-proxy/api/lib/model-pool-routing";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
@@ -21,6 +22,7 @@ import type {
   CapacityAdmissionStore,
 } from "./capacity/types.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
+import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 import type { PublicOverflowRequest, PublicProviderTarget } from "./public-overflow.js";
 
@@ -2454,7 +2456,9 @@ describe("model API routes", () => {
       ),
     );
     expect(
-      db.poolMember.update.mock.calls.filter(([call]) => call?.where?.id === "responses-member"),
+      db.poolMember.updateMany.mock.calls.filter(
+        ([call]) => call?.where?.id === "responses-member",
+      ),
     ).toHaveLength(1);
   });
 
@@ -2542,7 +2546,9 @@ describe("model API routes", () => {
       ),
     );
     expect(
-      db.poolMember.update.mock.calls.filter(([call]) => call?.where?.id === "responses-member"),
+      db.poolMember.updateMany.mock.calls.filter(
+        ([call]) => call?.where?.id === "responses-member",
+      ),
     ).toHaveLength(0);
   });
 
@@ -2823,7 +2829,7 @@ describe("model API routes", () => {
     await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
     // Not a protocol failure of the member: no health write for it.
     expect(
-      db.poolMember.update.mock.calls.filter(
+      db.poolMember.updateMany.mock.calls.filter(
         ([call]) => call?.where?.id === "first-responses-member",
       ),
     ).toHaveLength(0);
@@ -3161,7 +3167,7 @@ describe("model API routes", () => {
         ([call]) => call?.data?.attemptCount === 1 && call?.data?.status === "CANCELED",
       ),
     ).toHaveLength(1);
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   it("filters adapted pool candidates against both tool and image requirements", async () => {
@@ -8231,6 +8237,269 @@ describe("model API routes", () => {
       });
     });
 
+    // #120: a client abort after dispatch settles neither success nor a
+    // member failure, so the served attempt gives the claimed trial back
+    // (fenced on the claim's timestamp) instead of stranding the member.
+    it("releases a claimed half-open trial when the client aborts after dispatch", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const controller = new AbortController();
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      controller.abort();
+      await Promise.resolve(responsePromise).catch(() => undefined);
+
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.halfOpenTrialStartedAt === null)).toBe(true),
+      );
+      const claim = writes().find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+      expect(claim).toBeDefined();
+      expect(writes().find((write) => write.data.halfOpenTrialStartedAt === null)).toEqual({
+        where: {
+          id: "member-a",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+        },
+        data: { halfOpenTrialStartedAt: null },
+      });
+    });
+
+    // #120: the client cancels a stream already being served. The served
+    // attempt's finalizer writes neither success nor failure for a cancel, so
+    // it must give the trial back too.
+    it("releases a claimed half-open trial when the client cancels a served stream", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const controller = new AbortController();
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          stream: true,
+          messages: [{ role: "user", content: "secret prompt" }],
+        }),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const { requestId } = requireSent(manager);
+      manager.headers(requestId, 200, { "content-type": "text/event-stream" });
+      manager.body(requestId, 'data: {"choices":[]}\n\n');
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      controller.abort();
+      await response.body?.cancel().catch(() => undefined);
+
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.halfOpenTrialStartedAt === null)).toBe(true),
+      );
+    });
+
+    // #120 design pass: the attempt's failure write is owner-fenced. It must
+    // apply to the claim this attempt holds and be dropped after a take-over.
+    it.each([
+      ["applies to its own claim", true],
+      ["is dropped after another request took the claim over", false],
+    ])("a member failure %s", async (_name, ownsClaim) => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const claimDate = () =>
+        updateMany.mock.calls
+          .map(([arg]) => arg as { data: Record<string, unknown> })
+          .find((write) => write.data.halfOpenTrialStartedAt instanceof Date)?.data
+          .halfOpenTrialStartedAt as Date;
+      db.poolMember.findUnique.mockImplementation(async () => ({
+        healthStatus: "HALF_OPEN",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: ownsClaim ? claimDate() : new Date(claimDate().getTime() + 1),
+      }));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      await Promise.resolve(responsePromise).catch(() => undefined);
+      const failureWrites = () =>
+        updateMany.mock.calls
+          .map(([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> })
+          .filter((write) => write.data.healthStatus === "UNHEALTHY");
+      if (ownsClaim) {
+        await vi.waitFor(() => expect(failureWrites()).toHaveLength(1));
+        expect(failureWrites()[0]?.where).toMatchObject({
+          id: "member-a",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claimDate(),
+        });
+      } else {
+        await vi.waitFor(() => expect(db.poolMember.findUnique).toHaveBeenCalled());
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(failureWrites()).toHaveLength(0);
+      }
+    });
+
+    // #120: the served-success finalizer and the precommit-5xx site pass the
+    // attempt's own claim to the (owner-fenced) outcome writers.
+    it.each([
+      ["a served success", 200, { healthStatus: "HEALTHY" }],
+      ["a precommit 5xx", 500, { healthStatus: "UNHEALTHY" }],
+    ])("%s carries the attempt's own trial claim", async (_name, status, outcome) => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      const claimDate = () =>
+        writes().find((write) => write.data.halfOpenTrialStartedAt instanceof Date)?.data
+          .halfOpenTrialStartedAt as Date;
+      db.poolMember.findUnique.mockImplementation(async () => ({
+        healthStatus: "HALF_OPEN",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: claimDate(),
+      }));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, status, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(sent.requestId);
+      await Promise.resolve(responsePromise).then((response) => response.text().catch(() => ""));
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.healthStatus === outcome.healthStatus)).toBe(
+          true,
+        ),
+      );
+      const outcomeWrite = writes().find(
+        (write) => write.data.healthStatus === outcome.healthStatus,
+      );
+      expect(outcomeWrite?.where).toMatchObject({
+        id: "member-a",
+        healthStatus: "HALF_OPEN",
+        halfOpenTrialStartedAt: claimDate(),
+      });
+    });
+
+    // #120: an expired trial lease is routable again and the claim itself
+    // carries the expiry clause (deterministic clock: Date only is faked).
+    it("re-claims a half-open trial whose lease expired", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const clock = new Date("2026-06-01T12:00:00.000Z");
+        vi.setSystemTime(clock);
+        const claimedAt = new Date(clock.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS);
+        const stranded = poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        });
+        db.poolMember.findMany.mockResolvedValue([
+          { ...stranded, halfOpenTrialStartedAt: claimedAt },
+        ]);
+        const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+        updateMany.mockResolvedValue({ count: 1 });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const controller = new AbortController();
+        const responsePromise = appWith(manager).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(poolTarget.modelId),
+          signal: controller.signal,
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        controller.abort();
+        await Promise.resolve(responsePromise).catch(() => undefined);
+        const claim = updateMany.mock.calls
+          .map(([arg]) => arg as { where: { OR?: unknown[] }; data: Record<string, unknown> })
+          .find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+        const claimedNow = claim?.data.halfOpenTrialStartedAt as Date;
+        expect(claimedNow.getTime() - clock.getTime()).toBeLessThan(5_000);
+        expect(claim?.where.OR).toContainEqual({
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: {
+            lte: new Date(claimedNow.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS),
+          },
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps the pool trial lease longer than the relay budget", () => {
+      expect(POOL_MEMBER_HALF_OPEN_LEASE_MS).toBeGreaterThan(MODEL_API_RELAY_TIMEOUT_MS);
+    });
+
     // C4-3: a refused send ends the request; no other member is admitted.
     it("admits no other member after the owner gate refuses a send", async () => {
       const { acquire, runtime, manager } = twoMemberPool(["ADMITTED", "ADMITTED"]);
@@ -9377,8 +9646,8 @@ describe("model API routes", () => {
       requestId: failed.requestId,
       reason: "upstream_5xx",
     });
-    expect(db.poolMember.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "member-a" } }),
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
     );
 
     manager.headers(retried.requestId, 200, { "content-type": "application/json" });
@@ -9491,8 +9760,8 @@ describe("model API routes", () => {
       reason: "cancelled",
     });
     // A DB-side event is never the member's fault.
-    expect(db.poolMember.update).not.toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "member-a" } }),
+    expect(db.poolMember.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
     );
 
     manager.headers(retried.requestId, 200, { "content-type": "application/json" });
@@ -9955,8 +10224,8 @@ describe("model API routes", () => {
         expect(response.status).toBe(200);
         await response.text();
         // A DB-side event is never the member's fault.
-        expect(db.poolMember.update).not.toHaveBeenCalledWith(
-          expect.objectContaining({ where: { id: "member-a" } }),
+        expect(db.poolMember.updateMany).not.toHaveBeenCalledWith(
+          expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
         );
         return;
       }

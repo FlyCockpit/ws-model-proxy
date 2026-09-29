@@ -6090,6 +6090,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6203,6 +6204,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6227,6 +6229,7 @@ async function relayPool({
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure: "upstream_5xx",
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
@@ -6256,6 +6259,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
@@ -6304,6 +6308,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6359,6 +6364,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6584,14 +6590,20 @@ async function relayPool({
             : "identity_unavailable";
           const terminalWrites = await Promise.allSettled([
             terminal.ok
-              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
+                  trialStartedAt: claimedTrialAt,
+                })
               : adaptationOutcome === "protocol_error" &&
                   upstreamTerminal.failure !== "capacity_lease_lost"
                 ? recordPoolMemberRelayFailure({
                     poolMemberId: candidate.poolMemberId,
+                    trialStartedAt: claimedTrialAt,
                     failure: "protocol_error",
                   })
-                : Promise.resolve(),
+                : // A served attempt that settled neither way (client abort
+                  // mid-stream, non-member failure) gives its trial back; a
+                  // no-op once success/failure already cleared it.
+                  releaseUnusedTrial(),
             updatePoolRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
               status: terminalStatus(terminal),
@@ -6680,6 +6692,13 @@ async function relayPool({
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
       finalFailure = failure;
+      // Only a retryable operation with a member-attributable failure writes
+      // member health below (which clears the trial). Every other exit (client
+      // abort, lease loss, non-member failure, or a non-retryable operation such
+      // as a stateful follow-up that breaks before the failure write) gives the
+      // claimed trial back instead of waiting out the lease.
+      if (!(operationRetryable && memberRetryable && isPoolRelayFailureClass(failure)))
+        await releaseUnusedTrial();
       if (!operationRetryable) break;
       if (leaseLost) {
         await releaseCapacityAttempt();
@@ -6688,6 +6707,7 @@ async function relayPool({
       if (memberRetryable && isPoolRelayFailureClass(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure,
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
