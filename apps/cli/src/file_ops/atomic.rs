@@ -147,7 +147,14 @@ pub(crate) fn replace(
     ops.step(Step::EtagRechecked)?;
     cancel.check()?;
 
-    commit_stage(dir, guard.name.as_os_str(), name, orig_stat)?;
+    commit_stage(
+        dir,
+        guard.name.as_os_str(),
+        name,
+        orig_stat,
+        &new_stat,
+        &mut guard.armed,
+    )?;
     guard.armed = false;
     // Committed: hook errors below cannot undo the rename.
     let _ = ops.step(Step::Renamed);
@@ -161,13 +168,22 @@ pub(crate) fn replace(
 /// Linux: `RENAME_EXCHANGE`, then the staged name holds whatever was at `name`;
 /// if that is not the original object (a successor slipped in after the final
 /// re-check) the exchange is undone and the caller gets a conflict, so an
-/// unapproved successor is never overwritten. Crash states: between the exchange
-/// and the unlink the old file is under the staging name (no data is lost).
-/// Elsewhere (and on filesystems without exchange) a plain rename is used and the
-/// re-check above is the only guard: a documented residual.
-fn commit_stage(dir: &OwnedFd, stage: &OsStr, name: &OsStr, orig_stat: &Stat) -> FileResult<()> {
+/// unapproved successor is never overwritten. After an exchange the guard is
+/// disarmed: the staged name is unlinked here, and only when it still holds the
+/// object we put there (a double race must not delete a third object). Crash
+/// states: between the exchange and the unlink the old file is under the staging
+/// name (no data is lost). Elsewhere (and on filesystems without exchange) a plain
+/// rename is used and the re-check is the only guard: a documented residual.
+fn commit_stage(
+    dir: &OwnedFd,
+    stage: &OsStr,
+    name: &OsStr,
+    orig_stat: &Stat,
+    staged_stat: &Stat,
+    armed: &mut bool,
+) -> FileResult<()> {
     #[cfg(not(target_os = "linux"))]
-    let _ = orig_stat;
+    let _ = (orig_stat, staged_stat, &armed);
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{RenameFlags, renameat2};
@@ -180,18 +196,26 @@ fn commit_stage(dir: &OwnedFd, stage: &OsStr, name: &OsStr, orig_stat: &Stat) ->
                 RenameFlags::RENAME_EXCHANGE,
             )
         };
+        let holds = |expected: &Stat| {
+            fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
+                .is_ok_and(|held| Stat::from_raw(&held).same_object(expected))
+        };
         match swap() {
             Ok(()) => {
-                let held = fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
-                    .map_err(FileError::errno)?;
-                if Stat::from_raw(&held).same_object(orig_stat) {
-                    // the original: it is replaced, drop it
-                    unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir)
-                        .map_err(FileError::errno)?;
+                // the guard must not unlink a name that now holds someone else's file
+                *armed = false;
+                if holds(orig_stat) {
+                    // the original: it is replaced, drop it (already committed: a
+                    // failed cleanup is not a failed edit)
+                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
                     return Ok(());
                 }
-                // a successor: restore it and refuse
+                // a successor: restore it, and drop our staged file only when the
+                // stage name holds it again
                 let _ = swap();
+                if holds(staged_stat) {
+                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
+                }
                 return Err(FileError::conflict("replaced"));
             }
             Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),

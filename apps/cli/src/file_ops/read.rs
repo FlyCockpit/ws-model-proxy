@@ -719,9 +719,17 @@ fn tail_window(
         ));
     }
     let eol = text::detect_eol(&chunk);
+    let mut text = masked[drop..].join("\n");
+    if drop > 0 {
+        // the output cap cut the OLDEST requested lines: say so (line numbers are
+        // unknown in a file this large, so there is no startLine to offer)
+        text = format!(
+            "…[truncated: {drop} earlier line(s) omitted; ask for fewer lines or a larger maxBytes]\n{text}"
+        );
+    }
     Ok((
         Window {
-            text: masked[drop..].join("\n"),
+            text,
             start_line: 0,
             end_line: 0,
             more: None,

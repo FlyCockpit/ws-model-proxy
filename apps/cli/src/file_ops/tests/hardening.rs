@@ -1374,3 +1374,45 @@ fn a_compact_json_environment_array_masks_reversed_pairs_on_following_lines() {
     let r = fx.read("task.json").text;
     assert!(!r.contains("compactsecret"), "{r}");
 }
+
+// ---- the large-file tail contract: complete, marked, or refused -------------------
+
+#[test]
+fn a_large_file_tail_marks_lines_cut_by_the_output_cap_and_refuses_an_unscannable_tail() {
+    let fx = Fx::new();
+    let path = fx.root.join("marked.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..68 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    for i in 0..50 {
+        writeln!(file, "tail line {i:02} {}", "z".repeat(1_000)).unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    let r = fx.read_with(json!({ "path": fx.p("marked.log"), "startLine": -50 }));
+    assert!(
+        r.text.starts_with("\u{2026}[truncated: "),
+        "{}",
+        r.text.get(..80).unwrap_or(&r.text)
+    );
+    assert!(r.text.contains("tail line 49"), "the newest line is kept");
+    // three 12 MiB lines: the raw tail is beyond the scan bound
+    let path = fx.root.join("unscannable.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    for _ in 0..68 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    for _ in 0..3 {
+        file.write_all("w".repeat(12 << 20).as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    let r = fx.ops.read(
+        &args(json!({ "path": fx.p("unscannable.log"), "startLine": -3 })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::TooLarge);
+}

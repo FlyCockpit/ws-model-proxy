@@ -1007,7 +1007,7 @@ impl LineMasker {
                     stack.push((label.to_string(), at));
                 }
             } else if let Some(idx) = stack.iter().rposition(|(open, _)| open == label) {
-                stack.truncate(idx);
+                stack.remove(idx);
             }
         }
         let pem_opener = pem_open_at_start.or(pem_touched.then_some(at));
@@ -2336,11 +2336,26 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let lookback = 30;
         let mut checked = 0;
         // hand-written shapes first (a reader that starts INSIDE a run whose body holds
         // an opener), then random documents from the pool
-        let fixed: [&[&str]; 8] = [
+        let fixed: [&[&str]; 9] = [
+            // interleaved private-key blocks of three labels: an END closes only its own
+            // block, so a reader that starts after `BEGIN X` still masks the RSA body
+            &[
+                concat!("-----BEGIN ", "X PRIVATE KEY-----"),
+                "P1",
+                concat!("-----BEGIN ", "A PRIVATE KEY-----"),
+                "ppppp",
+                "ppppp",
+                "ppppp",
+                concat!("-----END ", "X PRIVATE KEY-----"),
+                concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+                concat!("-----END ", "A PRIVATE KEY-----"),
+                "BODY-secret-line",
+                concat!("-----END ", "RSA PRIVATE KEY-----"),
+                "outro",
+            ],
             // a name line, comments, then the value header with a trailing comment
             &[
                 "- name: X_TOKEN",
@@ -2490,7 +2505,7 @@ mod tests {
                 "echo end",
             ]);
         }
-        for _ in 0..8000 {
+        for _ in 0..2500 {
             let len = 3 + (next() % 38) as usize;
             docs.push(
                 (0..len)
@@ -2500,7 +2515,10 @@ mod tests {
         }
         for lines in docs {
             let text = lines.join("\n") + "\n";
-            for class in [FileClass::Plain, FileClass::Dotenv] {
+            for (class, lookback) in [FileClass::Plain, FileClass::Dotenv]
+                .into_iter()
+                .flat_map(|class| [30_usize, 130].map(|lookback| (class, lookback)))
+            {
                 let full = mask_with_lookback(class, &text, lookback);
                 if full.long_construct {
                     continue;

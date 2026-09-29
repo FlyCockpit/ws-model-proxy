@@ -190,9 +190,11 @@ fn is_staging_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let Some(rest) = name.strip_prefix('.') else {
+    let lower = name.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix('.') else {
         return false;
     };
+    // (case-insensitive: a casefold directory resolves `.WSMP-` to the staged name)
     rest.rsplit_once(".wsmp-").is_some_and(|(_, suffix)| {
         suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
     })
