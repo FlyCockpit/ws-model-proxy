@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -297,6 +297,7 @@ fn open_dir_at(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
 fn fd_path(fd: &OwnedFd) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
+        use std::os::fd::AsRawFd;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()?;
         // A directory unlinked after the walk reads as "<path> (deleted)".
         if path.as_os_str().as_bytes().ends_with(b" (deleted)") {
