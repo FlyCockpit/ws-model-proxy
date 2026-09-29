@@ -285,6 +285,7 @@ integration("own-key preference integrity and requester capacity", () => {
       });
       const list = vi.fn(async (_owner: string, _pool: string, _ownKey?: unknown) => ({
         enabled: true,
+        ownerActive: true,
         fallbackForGrantees: true,
         affinityPolicy: { enabled: false },
         targets: [provider],
@@ -509,6 +510,7 @@ integration("own-key preference integrity and requester capacity", () => {
         vi.mocked(manager.getActiveCliDeviceIds).mockReturnValue([]);
         list.mockImplementation(async (_owner, _pool, ownKey) => ({
           enabled: true,
+          ownerActive: true,
           fallbackForGrantees: true,
           affinityPolicy: { enabled: false },
           targets: [ownKey ? provider : paid],
@@ -573,6 +575,7 @@ integration("own-key preference integrity and requester capacity", () => {
         vi.mocked(manager.getActiveCliDeviceIds).mockReturnValue([cli.id]);
         list.mockImplementation(async (_owner, _pool, ownKey) => ({
           enabled: Boolean(ownKey),
+          ownerActive: true,
           fallbackForGrantees: false,
           affinityPolicy: { enabled: false },
           targets: ownKey ? [provider] : [],

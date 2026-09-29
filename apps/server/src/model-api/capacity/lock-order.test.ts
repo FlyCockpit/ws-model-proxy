@@ -229,6 +229,26 @@ const REVIEWED_SHARE_LOCKS: Record<string, string> = {
 
 type Finding = { file: string; site: string; detail: string };
 
+/** Text of the balanced (...) or {...} group starting at `start`. */
+function balanced(source: string, start: number): string {
+  const open = source[start];
+  const close = open === "(" ? ")" : "}";
+  let depth = 0;
+  let quote: string | null = null;
+  for (let index = start; index < source.length; index++) {
+    const char = source[index];
+    if (quote) {
+      if (char === "\\") index++;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") quote = char;
+    else if (char === open) depth++;
+    else if (char === close && --depth === 0) return source.slice(start, index + 1);
+  }
+  return source.slice(start);
+}
+
 function sqlStatements(file: string, source: string): string[] {
   if (file.endsWith(".sql")) return source.split(/;\s*(?:\n|$)/);
   return [...source.matchAll(/`[^`]*`|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g)].map(
@@ -374,5 +394,75 @@ describe("capacity lock order (DL-1 design (d)): writer classes and fences", () 
       "model_pool.FOR SHARE",
     ]);
     expect(check('SELECT 1 FROM "user" WHERE id = 1 FOR KEY SHARE;\n')).toEqual([]);
+  });
+
+  // E0 send claim (capacity-lock-order.ts, "E0 send-claim transaction"):
+  // its locks appear in the documented C-order, every re-read of unlocked
+  // rows (requester/owner accounts, pool member) follows the last lock, and
+  // the target re-read itself takes no lock.
+  it("keeps the E0 send claim's lock sequence and lock-free post-lock re-reads", () => {
+    const file = "apps/server/src/model-api/public-overflow.ts";
+    const source = readFileSync(join(repoRoot, file), "utf8");
+    const claimStart = source.indexOf(
+      "export async function claimPublicProviderCredentialForSend(",
+    );
+    const claim = balanced(
+      source,
+      source.indexOf("{", source.indexOf("): Promise<PublicProviderSendClaim> {", claimStart)),
+    );
+    const position = (needle: string) => {
+      const index = claim.indexOf(needle);
+      expect(index, needle).toBeGreaterThanOrEqual(0);
+      return index;
+    };
+    const sequence = [
+      "set_config('lock_timeout'",
+      "lockExternalSendConsent(",
+      "FROM provider_account WHERE id",
+      "FROM provider_model WHERE id",
+      "FROM provider_credential WHERE id",
+      "FROM pool_fallback_preference WHERE",
+      "recheckExternalSendRequesterValidity(",
+      "recheckExternalSendTarget(",
+      "providerCredential.update(",
+    ].map(position);
+    expect(sequence).toEqual([...sequence].sort((left, right) => left - right));
+    const recheckStart = source.indexOf("async function recheckExternalSendTarget(");
+    const recheck = balanced(
+      source,
+      source.indexOf("{", source.indexOf("): Promise<", recheckStart)),
+    );
+    expect(recheck).toContain("poolMember.findFirst(");
+    expect(recheck).toContain("providerModel.findFirst(");
+    expect(recheck).not.toMatch(/FOR (NO KEY )?(SHARE|UPDATE)|\$queryRaw|\$executeRaw/);
+    // G1a-2: nothing after the post-wait re-reads may wait on a lock. The
+    // rest of the claim has no raw SQL and no lock clause, and its only write
+    // is `lastUsedAt` on the credential row it already holds FOR UPDATE.
+    const lockClause = /FOR (NO KEY |KEY )?(SHARE|UPDATE)|NOWAIT|SKIP LOCKED|LOCK TABLE/;
+    const tail = claim.slice(claim.indexOf("recheckExternalSendRequesterValidity("));
+    expect(tail).not.toMatch(lockClause);
+    expect(tail).not.toMatch(/\$queryRaw|\$executeRaw/);
+    expect(
+      tail.match(/\.(update|updateMany|upsert|create|createMany|delete|deleteMany)\(/g),
+    ).toEqual([".update("]);
+    expect(tail).toContain("tx.providerCredential.update(");
+    // The requester/owner re-read is one lock-free statement.
+    const accessFile = "packages/api/src/lib/model-api-token-access.ts";
+    const access = readFileSync(join(repoRoot, accessFile), "utf8");
+    const body = (signature: string) => {
+      const start = access.indexOf(signature);
+      expect(start, signature).toBeGreaterThanOrEqual(0);
+      const params = access.indexOf("(", start);
+      const afterParams = params + balanced(access, params).length;
+      return balanced(access, access.indexOf("{", afterParams));
+    };
+    const requesterRecheck = body("export async function recheckExternalSendRequesterValidity(");
+    expect(requesterRecheck).toContain("readRequesterValidity(");
+    expect(requesterRecheck).not.toMatch(lockClause);
+    expect(requesterRecheck).not.toMatch(/\$queryRaw|\$executeRaw|tx\.[a-zA-Z]+\./);
+    const requesterRead = body("async function readRequesterValidity(");
+    expect(requesterRead).not.toMatch(lockClause);
+    expect(requesterRead.match(/\$queryRaw/g)).toHaveLength(1);
+    expect(requesterRead).not.toMatch(/\$executeRaw/);
   });
 });

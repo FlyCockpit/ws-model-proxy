@@ -669,6 +669,26 @@ export async function markPoolMemberHalfOpenTrial({
   return result.count;
 }
 
+/**
+ * Give back a half-open trial whose claimant sent nothing (for example the
+ * #76 owner gate refused the send): the member is not at fault and becomes a
+ * half-open candidate again. Fenced on the claim's own timestamp, so a later
+ * claimant's (or the recovery sweeper's) trial is never cleared.
+ */
+export async function releasePoolMemberHalfOpenTrial({
+  poolMemberId,
+  trialStartedAt,
+}: {
+  poolMemberId: string;
+  trialStartedAt: Date;
+}): Promise<boolean> {
+  const result = await prisma.poolMember.updateMany({
+    where: { id: poolMemberId, healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
+    data: { halfOpenTrialStartedAt: null },
+  });
+  return result.count === 1;
+}
+
 /** Hot-path health reset: one single-row statement per member (see below). */
 export async function resetPoolMemberHealthForDiscoveredModels(
   discoveredModelIds: string[],

@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import type {
   ModelApiTokenIdentity,
   VisibleDirectModelTarget,
@@ -141,6 +143,7 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
   };
   modelPool: {
     findFirst: MockInstance;
@@ -163,6 +166,9 @@ const db = prisma as unknown as {
     upsert: MockInstance;
   };
   appSetting: {
+    findUnique: MockInstance;
+  };
+  user: {
     findUnique: MockInstance;
   };
   mediaAsset: {
@@ -211,6 +217,8 @@ function mockStickyRecord(fixture: StickyFixture | null) {
     return otherTargets ? otherTargets(args) : undefined;
   });
 }
+
+const ACTIVE_POOL_OWNER = { banned: false, banExpires: null, deletionRequestedAt: null };
 
 const mockedTokenAccess = tokenAccess as unknown as {
   authenticateModelApiTokenSecret: MockInstance;
@@ -359,10 +367,11 @@ const EXTERNAL_MODEL_ID = `${externalPoolTarget.modelId}:external`;
 
 function listedExternalTargets(
   targets: ReturnType<typeof externalProviderTarget>[],
-  overrides: { enabled?: boolean; fallbackForGrantees?: boolean } = {},
+  overrides: { enabled?: boolean; fallbackForGrantees?: boolean; ownerActive?: boolean } = {},
 ) {
   return {
     enabled: overrides.enabled ?? true,
+    ownerActive: overrides.ownerActive ?? true,
     fallbackForGrantees: overrides.fallbackForGrantees ?? false,
     affinityPolicy: {
       enabled: false,
@@ -782,6 +791,8 @@ describe("model API routes", () => {
       return Promise.all(input as Promise<unknown>[]);
     });
     db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
+    // #76: the pool owner is read again before every local dispatch.
+    db.user.findUnique.mockResolvedValue(ACTIVE_POOL_OWNER);
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(token);
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [directTarget],
@@ -836,6 +847,7 @@ describe("model API routes", () => {
     externalConsent.poolIds = [];
     publicOverflow.list.mockResolvedValue({
       enabled: false,
+      ownerActive: true,
       fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
@@ -6069,8 +6081,13 @@ describe("model API routes", () => {
       );
       expect(response.headers.get("retry-after")).toBeNull();
       expect(response.headers.get("x-wsmp-route")).toBeNull();
-      if (outcome === "disabled" || outcome === "uncovered")
-        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      // F-C (#64): owner flags gate provider admission. A pool whose owner
+      // turned fallback (or grantee coverage) off never takes or waits for
+      // an owner provider capacity slot, and nothing is dispatched.
+      if (outcome === "disabled" || outcome === "uncovered") {
+        expect(capacity.acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      }
       if (outcome === "missing-member") expect(capacity.release).toHaveBeenCalledOnce();
     },
   );
@@ -7843,6 +7860,832 @@ describe("model API routes", () => {
       expect(manager.sent).toHaveLength(0);
     });
 
+    // #64 telemetry: the client leaves during the resumed local wait after a
+    // saturated external attempt. That is a cancel (499), not rate_limited.
+    it("records a client cancel (499), not 429, when the client leaves after a saturated external attempt", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "EXPIRED"],
+        provider: "EXPIRED",
+      });
+      const controller = new AbortController();
+      const scripted = acquire.getMockImplementation()!;
+      acquire.mockImplementation(async (attempt) => {
+        const result = await scripted(attempt);
+        // The resumed local wait (third admission) ends because the client left.
+        if (acquire.mock.calls.length === 3) controller.abort();
+        return result;
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      expect(response.status).toBe(499);
+      const terminal = db.relayRequest.update.mock.calls
+        .map(([arg]) => arg as { data: Record<string, unknown> })
+        .find((arg) => arg.data.status !== undefined);
+      expect(terminal?.data).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    /**
+     * Local admission answers from `local`; the provider admission aborts
+     * the client (the client leaves while the external phase waits) and
+     * then reports the provider as saturated.
+     */
+    const cancellingProviderRuntime = (
+      controller: AbortController,
+      local: Array<"ADMITTED" | "EXPIRED">,
+    ) => {
+      const { acquire, runtime } = scriptedRuntime({ local, provider: "EXPIRED" });
+      const scripted = acquire.getMockImplementation()!;
+      acquire.mockImplementation(async (attempt) => {
+        if (attempt.candidates[0]?.poolMemberId !== "local-primary") controller.abort();
+        return scripted(attempt);
+      });
+      return { acquire, runtime };
+    };
+    const terminalRelayUpdate = () =>
+      db.relayRequest.update.mock.calls
+        .map(([arg]) => arg as { data: Record<string, unknown> })
+        .find((arg) => arg.data.status !== undefined)?.data;
+
+    // G1b-1 (#64 telemetry): every external phase that ends because the
+    // client left is a cancel (499), whichever branch finalizes it.
+    it("records a client cancel (499) when the client leaves during a provider-only pool's external phase", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { runtime } = cancellingProviderRuntime(controller, []);
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499), not 503, when no local member is healthy and the client leaves", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { acquire, runtime } = cancellingProviderRuntime(controller, []);
+      const manager = new FakeRelayManager();
+      // The local member's CLI is offline: no healthy local route.
+      manager.activeCliDeviceIds = [];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(localBudgets(acquire)).toEqual([]);
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499), not the local failure, when the client leaves during the final external phase", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const controller = new AbortController();
+      const { acquire, runtime } = cancellingProviderRuntime(controller, ["ADMITTED"]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      // A retryable pre-first-byte local failure triggers the external phase.
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(localBudgets(acquire)).toEqual([2_000]);
+      expect(acquire).toHaveBeenCalledTimes(2);
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    it("records a client cancel (499) when the client leaves before a second trigger replays the recorded external outcome", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      // Shortened wait expires, the provider is saturated (client still
+      // there), the resumed local wait admits, and the local send fails.
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "EXPIRED",
+      });
+      const controller = new AbortController();
+      // The client leaves while the failed local attempt is recorded, before
+      // the second trigger replays the recorded (saturated) outcome.
+      db.relayExecutionAttempt.updateMany.mockImplementation(async () => {
+        controller.abort();
+        return { count: 1 };
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+      // One external phase per request: the second trigger does not retry.
+      expect(acquire).toHaveBeenCalledTimes(3);
+      expect(response.status).toBe(499);
+      expect(terminalRelayUpdate()).toMatchObject({ status: "CANCELED", httpStatusCode: 499 });
+    });
+
+    // C1a-1 (#76): an external phase that finds the pool owner (or the
+    // requester) without access ends the request. It never resumes the
+    // local wait and never sends to the owner's machine.
+    it.each([
+      ["the listing sees the owner inactive", "listing", 404],
+      ["the send boundary sees the owner inactive", "POOL_OWNER_INACTIVE", 404],
+      ["the send boundary sees the requester blocked", "REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)(
+      "ends the request without resuming locally when %s",
+      async (_label, source, status) => {
+        db.poolMember.findMany.mockResolvedValue([localMember()]);
+        publicOverflow.list.mockResolvedValue(
+          listedExternalTargets([externalProviderTarget("overflow-member")], {
+            ownerActive: source !== "listing",
+          }),
+        );
+        if (source !== "listing")
+          publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason: source });
+        const { acquire, runtime } = scriptedRuntime({
+          local: ["EXPIRED", "ADMITTED"],
+          provider: "ADMITTED",
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const response = await appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+
+        expect(response.status).toBe(status);
+        // Answered like arrival: no route or fallback headers.
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+        expect(localBudgets(acquire)).toEqual([2_000]);
+        expect(manager.sent).toHaveLength(0);
+        expect(runtime.release).toHaveBeenCalledTimes(source === "listing" ? 0 : 1);
+        expect(terminalRelayUpdate()).toMatchObject({ status: "FAILED" });
+      },
+    );
+
+    // Design pass (authz-boundaries, #76): every send to the pool owner's
+    // machines is gated by the local-send gate. Rows: the owner's row as read
+    // at the native-count fan-out and then at the local dispatch.
+    const BANNED = { banned: true, banExpires: null, deletionRequestedAt: null };
+    const ACTIVE = { banned: false, banExpires: null, deletionRequestedAt: null };
+    it.each([
+      ["banned before the native count", [BANNED], 404, "none"],
+      [
+        "temporarily banned before the native count",
+        [{ banned: true, banExpires: new Date(Date.now() + 60_000), deletionRequestedAt: null }],
+        404,
+        "none",
+      ],
+      [
+        "deletion-marked before the native count",
+        [{ banned: false, banExpires: null, deletionRequestedAt: new Date() }],
+        404,
+        "none",
+      ],
+      ["missing before the native count", [null], 404, "none"],
+      ["unreadable before the native count", [new Error("db down")], 500, "none"],
+      ["banned while the request waited for admission", [ACTIVE, BANNED], 404, "released"],
+      [
+        "banned while an :external request waited for admission",
+        [ACTIVE, BANNED],
+        404,
+        "released-external",
+      ],
+      ["unreadable at the local dispatch", [ACTIVE, new Error("db down")], 500, "released"],
+      [
+        "past a temporary ban",
+        [{ banned: true, banExpires: new Date(Date.now() - 60_000), deletionRequestedAt: null }],
+        200,
+        "served",
+      ],
+    ] as const)(
+      "gates every send to the owner's machines: owner %s",
+      async (_label, reads, status, outcome) => {
+        db.poolMember.findMany.mockResolvedValue([localMember()]);
+        db.user.findUnique.mockReset();
+        for (const read of reads) {
+          if (read instanceof Error) db.user.findUnique.mockRejectedValueOnce(read);
+          else db.user.findUnique.mockResolvedValueOnce(read);
+        }
+        db.user.findUnique.mockResolvedValue(reads.at(-1) instanceof Error ? null : reads.at(-1));
+        if (outcome === "released-external")
+          publicOverflow.list.mockResolvedValue(
+            listedExternalTargets([externalProviderTarget("overflow-member")]),
+          );
+        const { acquire, runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          // The plain name unless the row asks for the external tier.
+          body: requestBody(
+            outcome === "released-external" ? EXTERNAL_MODEL_ID : externalPoolTarget.modelId,
+          ),
+        });
+        if (outcome === "served") {
+          await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+          await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        }
+        const response = await responsePromise;
+
+        expect(db.user.findUnique).toHaveBeenCalledWith(
+          expect.objectContaining({ where: { id: externalPoolTarget.ownerUserId } }),
+        );
+        expect(response.status).toBe(status);
+        // A refused send (inactive owner, failed read) sent nothing: no route header.
+        if (outcome !== "served") expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(manager.sent).toHaveLength(outcome === "served" ? 1 : 0);
+        expect(acquire).toHaveBeenCalledTimes(outcome === "none" ? 0 : 1);
+        if (outcome === "released" || outcome === "released-external") {
+          expect(runtime.release).toHaveBeenCalledOnce();
+          // The pool is unavailable to everyone: no external phase either.
+          expect(publicOverflow.list).not.toHaveBeenCalled();
+        }
+        if (outcome !== "served") {
+          expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+          expect(terminalRelayUpdate()).toMatchObject({
+            status: "FAILED",
+            httpStatusCode: status,
+          });
+        }
+      },
+    );
+
+    // CF-a1: the gate runs after the last awaited preparation, immediately
+    // before the send. A ban committed while the attempt's telemetry is
+    // being written still stops the send.
+    it("sends nothing when the owner is banned during the attempt's telemetry write", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const { runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+
+      expect(db.relayExecutionAttempt.create).toHaveBeenCalled();
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      expect(runtime.release).toHaveBeenCalledOnce();
+    });
+
+    // C4-1: a refused send gives back the half-open trial it claimed, fenced
+    // on the claim's timestamp, so the member is routable again when the
+    // owner's ban ends.
+    it("releases a claimed half-open trial when the owner gate refuses the send", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const { runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      const writes = db.poolMember.updateMany.mock.calls.map(
+        ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+      );
+      const claim = writes.find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+      expect(claim).toBeDefined();
+      expect(writes.at(-1)).toEqual({
+        where: {
+          id: "local-primary",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+        },
+        data: { halfOpenTrialStartedAt: null },
+      });
+    });
+
+    // C4-3: a refused send ends the request; no other member is admitted.
+    it("admits no other member after the owner gate refuses a send", async () => {
+      const { acquire, runtime, manager } = twoMemberPool(["ADMITTED", "ADMITTED"]);
+      db.relayExecutionAttempt.create.mockImplementation(async () => {
+        db.user.findUnique.mockResolvedValue(BANNED);
+        return { id: "attempt" };
+      });
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(0);
+      expect(acquire).toHaveBeenCalledOnce();
+    });
+
+    // C4-2 + CF-a2: the ONE gate reads BOTH accounts. A banned owner makes
+    // the pool unavailable (404); a requester banned while the request waited
+    // is refused (401 access_denied) instead of being served locally.
+    it.each([
+      ["the owner is banned and the requester active", "owner", 404],
+      ["the requester is banned and the owner active", "requester", 401],
+    ] as const)("gates on both accounts when %s", async (_label, banned, status) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...externalPoolTarget, ownerUserId: "pool-owner-id", accessGrantId: "grant-id" },
+        ],
+      });
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      // The early gate (before the native count) reads both accounts active;
+      // the ban lands while the request waits for admission, so the send gate
+      // (owner read first, requester read right after it) sees it.
+      let gateRuns = 0;
+      db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+        const isOwner = args.where.id === "pool-owner-id";
+        if (isOwner) gateRuns += 1;
+        if (gateRuns < 2) return ACTIVE;
+        return isOwner === (banned === "owner") ? BANNED : ACTIVE;
+      });
+      const { acquire, runtime } = scriptedRuntime({ local: ["ADMITTED"], provider: "ADMITTED" });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      expect(response.status).toBe(status);
+      // Nothing reached the owner's machine; the admitted lease was released.
+      expect(manager.sent).toHaveLength(0);
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(runtime.release).toHaveBeenCalledOnce();
+      // Neither answer carries route headers, and no external phase follows.
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(publicOverflow.list).not.toHaveBeenCalled();
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "user-id" } }),
+      );
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "pool-owner-id" } }),
+      );
+    });
+
+    // C4-2: the native context count is gated too: a ban committed while the
+    // count's telemetry is written sends no count frame to the owner.
+    // CF2-1: the refusal is TERMINAL whatever admission would have answered
+    // afterwards (an expired wait used to turn it into a 429, or an external
+    // phase for :external); it carries no route headers.
+    it.each([
+      ["admitted capacity", "ADMITTED", false],
+      ["expired capacity wait", "EXPIRED", false],
+      ["expired capacity wait on an :external request", "EXPIRED", true],
+    ] as const)(
+      "sends no native count once the owner is banned during the count's telemetry: %s",
+      async (_label, admission, external) => {
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "local-primary",
+            discoveredModelId: "local-model",
+            upstreamModelId: "local-upstream",
+            cliDeviceId: "cli-local",
+            countStrategy: "ENGINE_REPORTED",
+            capabilityOverrideMetadata: {
+              version: 3,
+              protocol: "anthropic-compatible",
+              surfaces: {
+                anthropicMessages: {
+                  source: "declared",
+                  confidence: "exact",
+                  supported: true,
+                  countTokens: true,
+                  protocolVersion: "2023-06-01",
+                },
+              },
+            },
+          }),
+        ]);
+        db.relayExecutionAttempt.create.mockImplementation(async () => {
+          db.user.findUnique.mockResolvedValue(BANNED);
+          return { id: "attempt" };
+        });
+        if (external)
+          publicOverflow.list.mockResolvedValue(
+            listedExternalTargets([externalProviderTarget("overflow-member")]),
+          );
+        const { acquire, runtime } = scriptedRuntime({ local: [admission], provider: "ADMITTED" });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-local"];
+
+        const response = await appWith(manager, runtime).request("/messages", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer wsmp_model_test",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: external ? EXTERNAL_MODEL_ID : externalPoolTarget.modelId,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        expect(db.relayExecutionAttempt.create).toHaveBeenCalled();
+        expect(manager.sent).toHaveLength(0);
+        expect(response.status).toBe(404);
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
+        expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+        // Ended before admission and any external phase.
+        expect(acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.list).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+      10_000,
+    );
+
+    // CF-b1 (F-C): the owner's flags and account are read again before every
+    // later member's provider admission, not only the first.
+    it.each([
+      ["the owner turned fallback off", { enabled: false }],
+      ["the owner was banned", { ownerActive: false }],
+    ] as const)("admits no further provider member once %s", async (_label, overrides) => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list
+        .mockResolvedValueOnce(
+          listedExternalTargets([
+            externalProviderTarget("overflow-member"),
+            externalProviderTarget("overflow-second"),
+          ]),
+        )
+        .mockResolvedValue(
+          listedExternalTargets(
+            [externalProviderTarget("overflow-member"), externalProviderTarget("overflow-second")],
+            overrides,
+          ),
+        );
+      // The first member's attempt fails without sending (retry-safe).
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "SEND_CLAIM_FAILED",
+      });
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await response.text();
+
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(publicOverflow.list).toHaveBeenCalledTimes(2);
+    });
+
+    // CF-b3: an owner-inactive refusal at the send boundary ends the external
+    // phase for every member.
+    it("does not try another provider member after POOL_OWNER_INACTIVE", async () => {
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          externalProviderTarget("overflow-member"),
+          externalProviderTarget("overflow-second"),
+        ]),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: "POOL_OWNER_INACTIVE",
+      });
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(404);
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+    });
+
+    /** Two local members; admissions answer from `states` in order. */
+    const twoMemberPool = (states: Array<"ADMITTED" | "EXPIRED">) => {
+      db.poolMember.findMany.mockResolvedValue([
+        localMember(),
+        poolMemberRow({
+          id: "local-second",
+          discoveredModelId: "local-second-model",
+          upstreamModelId: "local-second-upstream",
+          cliDeviceId: "cli-second",
+          externalAfterWaitMs: 2_000,
+        }),
+      ]);
+      const queue = [...states];
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        // The provider member is admitted; local members follow the script.
+        if (candidate.poolMemberId !== "overflow-member" && queue.shift() !== "ADMITTED")
+          return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local", "cli-second"];
+      return { acquire, runtime, manager };
+    };
+
+    // C3-2: the owner is re-read before a retry on another member, not only
+    // before the first attempt.
+    it("sends no retry to another member once the owner is banned", async () => {
+      const { runtime, manager } = twoMemberPool(["ADMITTED", "ADMITTED"]);
+      db.user.findUnique.mockReset();
+      db.user.findUnique
+        .mockResolvedValueOnce(ACTIVE) // native count
+        .mockResolvedValueOnce(ACTIVE) // first member
+        .mockResolvedValue(BANNED); // retry on the second member
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(externalPoolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(1);
+      expect(db.user.findUnique).toHaveBeenCalledTimes(3);
+    });
+
+    // C2-3 m4: an access loss seen by the external phase inside the retry
+    // loop (shortened wait for the next member) ends the request; the next
+    // member is never admitted or sent.
+    it.each([
+      ["POOL_OWNER_INACTIVE", 404],
+      ["REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)("does not resume the retry loop after %s", async (reason, status) => {
+      const { acquire, runtime, manager } = twoMemberPool(["ADMITTED", "EXPIRED", "ADMITTED"]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      const response = await responsePromise;
+
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(response.status).toBe(status);
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(manager.sent).toHaveLength(1);
+      // First member, the in-loop shortened wait and the provider slot; no
+      // resumed local admission.
+      expect(
+        acquire.mock.calls.filter(
+          ([attempt]) => attempt.candidates[0]?.poolMemberId !== "overflow-member",
+        ),
+      ).toHaveLength(2);
+    });
+
+    // C2-3: fallback-only withdrawals keep independently authorized local
+    // service (no over-refusal); only access losses end the request.
+    it.each([
+      "POOL_PRIVATE",
+      "GRANTEE_NOT_COVERED",
+      "CALLER_CONSENT_WITHDRAWN",
+      "OWN_KEY_CONSENT_WITHDRAWN",
+      "REQUESTER_NOT_VISIBLE",
+      "PROVIDER_SATURATED",
+    ] as const)("resumes locally after a fallback-only outcome: %s", async (reason) => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+    });
+
+    // C2-3: an access loss seen by the external phase ends the request at
+    // every trigger site, without route headers.
+    it.each([
+      ["the final phase after a local failure", "final", "POOL_OWNER_INACTIVE", 404],
+      ["the final phase after a local failure", "final", "REQUESTER_ACCESS_BLOCKED", 401],
+      ["the no-healthy-member phase", "no-healthy", "POOL_OWNER_INACTIVE", 404],
+      ["the no-compatible-member phase", "no-compatible", "POOL_OWNER_INACTIVE", 404],
+      ["the context-ceiling phase", "context", "REQUESTER_ACCESS_BLOCKED", 401],
+    ] as const)("ends the request when %s sees %s", async (_label, site, reason, status) => {
+      const member =
+        site === "context"
+          ? poolMemberRow({
+              id: "local-primary",
+              discoveredModelId: "local-model",
+              upstreamModelId: "local-upstream",
+              cliDeviceId: "cli-local",
+              physicalMaxContext: 8,
+            })
+          : localMember();
+      db.poolMember.findMany.mockResolvedValue([
+        site === "no-compatible"
+          ? poolMemberRow({
+              id: "local-primary",
+              discoveredModelId: "local-model",
+              upstreamModelId: "local-upstream",
+              cliDeviceId: "cli-local",
+              // Serves Responses only: no compatible member for chat.
+              capabilityOverrideMetadata: {
+                version: 3,
+                protocol: "openai-compatible",
+                surfaces: {
+                  openaiResponses: { source: "declared", confidence: "exact", supported: true },
+                },
+              },
+            })
+          : member,
+      ]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
+      const { runtime } = scriptedRuntime({
+        local: site === "final" ? ["ADMITTED"] : [],
+        provider: "ADMITTED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = site === "no-healthy" ? [] : ["cli-local"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      if (site === "final") {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        manager.error(requireSent(manager).requestId, "transport");
+      }
+      const response = await responsePromise;
+      expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+      expect(response.status).toBe(status);
+      expect(response.headers.get("x-wsmp-fallback")).toBeNull();
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(manager.sent).toHaveLength(site === "final" ? 1 : 0);
+    });
+
+    // F-C (#64) and #76: owner flags and the owner's account gate provider
+    // admission; no provider capacity slot is taken or waited for.
+    // A fallback withdrawal is a 503 with the header; an inactive owner makes
+    // the pool unavailable to everyone (404, as at arrival).
+    it.each([
+      ["the owner turned fallback off", { enabled: false }, 503, "unavailable"],
+      ["the owner's account is banned or deletion-marked", { ownerActive: false }, 404, null],
+    ] as const)(
+      "never admits provider capacity when %s",
+      async (_label, overrides, status, header) => {
+        db.poolMember.findMany.mockResolvedValue([]);
+        publicOverflow.list.mockResolvedValue(
+          listedExternalTargets([externalProviderTarget("overflow-member")], overrides),
+        );
+        const { acquire, runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+        const response = await appWith(new FakeRelayManager(), runtime).request(
+          "/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: requestBody(EXTERNAL_MODEL_ID),
+          },
+        );
+
+        expect(response.status).toBe(status);
+        expect(response.headers.get("x-wsmp-fallback")).toBe(header);
+        expect(acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      },
+    );
+
     it("answers 429 (not 400) with the header on a provider-only pool whose provider is saturated", async () => {
       db.poolMember.findMany.mockResolvedValue([]);
       publicOverflow.list.mockResolvedValue(
@@ -8987,6 +9830,51 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(0);
   });
 
+  it.each([
+    ["the pool owner becomes inactive", "POOL_OWNER_INACTIVE", false, 404],
+    ["the requester becomes blocked", "REQUESTER_ACCESS_BLOCKED", false, 401],
+    ["the client cancels", "PROVIDER_UNAVAILABLE", true, 499],
+  ] as const)(
+    "C7-1: after every local lease is lost, %s beats capacity_lease_lost",
+    async (_label, reason, abortClient, expectedStatus) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      const controller = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        if (abortClient) controller.abort(new Error("client disconnected"));
+        return { dispatched: false as const, reason };
+      });
+      const { runtime } = controllableCapacityRuntime(
+        (candidate) => candidate.poolMemberId === "local-primary",
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(response.status).toBe(expectedStatus);
+      expect(manager.sent).toHaveLength(0);
+    },
+  );
+
   it("F2-CAP-3: a client abort is not a lease loss even when the hand-off refuses", async () => {
     const setup = setupLocalLeaseRoute("direct");
     const { runtime, controllers } = controllableCapacityRuntime(() => false);
@@ -9882,6 +10770,7 @@ describe("model API routes", () => {
     };
     publicOverflow.list.mockResolvedValue({
       enabled: true,
+      ownerActive: true,
       fallbackForGrantees: false,
       affinityPolicy: {
         enabled: false,
@@ -11070,6 +11959,10 @@ describe("model API routes", () => {
           },
         ],
       });
+      // The owner still pays for grantees (checked before provider admission).
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([boundProvider()], { fallbackForGrantees: true }),
+      );
       mockStickyRecord(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
@@ -11096,6 +11989,46 @@ describe("model API routes", () => {
           accessGrantId: "binding-grant",
         }),
       });
+    });
+
+    // C1b-3 (F-C, #64): a grantee's bound operation after the owner stopped
+    // covering grantees is refused before provider admission (403).
+    it("answers a grantee's bound operation without admission when grantee coverage is off", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "binding-grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([boundProvider()], { fallbackForGrantees: false }),
+      );
+      mockStickyRecord(
+        consentedProviderBinding({
+          poolGrantId: "binding-grant",
+          PoolGrant: {
+            id: "binding-grant",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+      const runtime = admittingCapacityRuntime();
+
+      const response = await appWith(new FakeRelayManager(), runtime).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(403);
+      expect(runtime.acquire).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
     });
 
     // R4: the cooldown shortcut applies the full binding match. A cooling
@@ -11147,6 +12080,34 @@ describe("model API routes", () => {
       expect(runtime.acquire).not.toHaveBeenCalled();
     });
 
+    // F-C (#64) and #76 on the bound path: owner flags and the owner's
+    // account are checked before provider admission, with the dispatcher's
+    // reasons (403 consent withdrawn, 404 pool no longer available), never a
+    // 429 after a wasted capacity wait.
+    it.each([
+      ["the owner turned fallback off", { enabled: false }, 403],
+      ["the owner's account is banned or deletion-marked", { ownerActive: false }, 404],
+    ] as const)(
+      "answers a bound operation without admission when %s",
+      async (_label, overrides, status) => {
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()], overrides));
+        const limiter = new ModelApiConcurrencyLimiter();
+        const callerRelease = vi.fn();
+        vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+        const runtime = admittingCapacityRuntime();
+
+        const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+          "/responses/resp_provider",
+          boundRequest("GET", false),
+        );
+
+        expect(response.status).toBe(status);
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(callerRelease).toHaveBeenCalledTimes(1);
+      },
+    );
+
     // R3: only a permanently invalid binding is "gone". Every transient
     // dispatcher outcome after listing is 503 with both leases released.
     it.each([
@@ -11160,6 +12121,8 @@ describe("model API routes", () => {
       ["GRANTEE_NOT_COVERED", 403],
       ["CALLER_CONSENT_WITHDRAWN", 403],
       ["REQUESTER_ACCESS_BLOCKED", 403],
+      // #76: the owner was banned or deletion-marked at the send boundary.
+      ["POOL_OWNER_INACTIVE", 404],
     ] as const)("maps a bound dispatch result %s to %i", async (reason, status) => {
       publicOverflow.dispatch.mockResolvedValueOnce({ dispatched: false, reason });
       const limiter = new ModelApiConcurrencyLimiter();
@@ -11773,6 +12736,10 @@ describe("model API routes", () => {
           memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
         ]);
         if (isFollowUp) mockStickyRecord(granteeBinding());
+        // The early gate (before the native count fan-out) passes on an admitted
+        // create; the read fails at the send gate after admission.
+        if (withRuntime && !isFollowUp)
+          db.poolGrant.findFirst.mockResolvedValueOnce({ id: "grant-id" });
         db.poolGrant.findFirst.mockRejectedValue(new Error("connection pool timeout"));
         const limiter = new ModelApiConcurrencyLimiter();
         const outstanding = trackLeases(limiter);
@@ -11795,6 +12762,8 @@ describe("model API routes", () => {
           },
         );
         expect(response.status).toBe(500);
+        // A refused send is not a local route: no route header (CF2-2).
+        expect(response.headers.get("x-wsmp-route")).toBeNull();
         expect(manager.sent).toEqual([]);
         expect(outstanding()).toBe(0);
         if (withRuntime) {
@@ -11806,31 +12775,65 @@ describe("model API routes", () => {
       },
     );
 
-    it("checks the send boundary before claiming a half-open trial", async () => {
-      db.poolMember.findMany.mockResolvedValue([
-        poolMemberRow({
+    // The one send gate runs after the half-open claim, so EVERY denial kind
+    // gives the claimed trial back (fenced on the claim's timestamp).
+    it.each([
+      ["its grant is revoked", 404],
+      ["the pool owner is banned", 404],
+      ["the requester is banned", 401],
+      ["the member is removed", 404],
+      ["the account read fails", 500],
+    ] as const)(
+      "releases a claimed half-open trial when the send gate refuses: %s",
+      async (name, status) => {
+        const halfOpen = poolMemberRow({
           id: "member-a",
           discoveredModelId: "model-a",
           upstreamModelId: "upstream-a",
           cliDeviceId: "cli-a",
           healthStatus: "HALF_OPEN",
-        }),
-      ]);
-      db.poolGrant.findFirst.mockResolvedValue(null);
-      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
-      updateMany.mockResolvedValue({ count: 1 });
-      const manager = new FakeRelayManager();
-      manager.activeCliDeviceIds = ["cli-a"];
-      const response = await appWith(manager).request("/responses", {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
-      });
-      expect(response.status).toBe(404);
-      expect(manager.sent).toEqual([]);
-      // No trial was claimed, so none is left stranded.
-      expect(updateMany).not.toHaveBeenCalled();
-    });
+        });
+        db.poolMember.findMany.mockResolvedValue([halfOpen]);
+        const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+        updateMany.mockResolvedValue({ count: 1 });
+        // The refusal lands while the claim is being written: after routing.
+        updateMany.mockImplementationOnce(async () => {
+          if (name === "its grant is revoked") db.poolGrant.findFirst.mockResolvedValue(null);
+          if (name === "the member is removed") db.poolMember.findMany.mockResolvedValue([]);
+          if (name === "the pool owner is banned" || name === "the requester is banned")
+            db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) =>
+              (args.where.id === "pool-owner-id") === (name === "the pool owner is banned")
+                ? { banned: true, banExpires: null, deletionRequestedAt: null }
+                : { banned: false, banExpires: null, deletionRequestedAt: null },
+            );
+          if (name === "the account read fails")
+            db.user.findUnique.mockRejectedValue(new Error("db down"));
+          return { count: 1 };
+        });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const response = await appWith(manager).request("/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+        });
+        expect(response.status).toBe(status);
+        expect(manager.sent).toEqual([]);
+        const writes = updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+        const claim = writes.find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+        expect(claim).toBeDefined();
+        expect(writes.at(-1)).toEqual({
+          where: {
+            id: "member-a",
+            healthStatus: "HALF_OPEN",
+            halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+          },
+          data: { halfOpenTrialStartedAt: null },
+        });
+      },
+    );
 
     it("skips a member removed before the send and serves the request from the next member", async () => {
       const memberB = poolMemberRow({
@@ -11987,12 +12990,133 @@ describe("model API routes", () => {
     });
   });
 
+  // C1a-1 (#76): a follow-up pinned to a local pool member is not sent once
+  // the pool owner is banned or deletion-marked, even after admission.
+  // C3-3: both the GET/DELETE lifecycle path and the POST follow-up path
+  // answer like arrival, without x-wsmp-route.
+  it.each(["GET", "POST"] as const)(
+    "does not send a sticky pool %s follow-up once the pool owner lost access",
+    async (method) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      mockStickyRecord({
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        targetDiscoveredModelId: null,
+        targetModelPoolId: "pool-id",
+        selectedDiscoveredModelId: "model-a",
+        selectedExecutionTargetId: "target-a",
+        SelectedExecutionTarget: { discoveredModelId: "model-a" },
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      const member = directRow({
+        id: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(member);
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async (attempt) => {
+          const candidate = attempt.candidates[0]!;
+          return {
+            state: "ADMITTED" as const,
+            lease: {
+              leaseId: "pool-sticky-lease",
+              attemptId: attempt.attemptId,
+              capacityId: candidate.capacityId,
+              executionTargetId: candidate.executionTargetId,
+              poolMemberId: candidate.poolMemberId,
+              fencingToken: 1n,
+              expiresAt: new Date(Date.now() + 30_000),
+            },
+          };
+        }),
+        release: vi.fn().mockResolvedValue(true),
+        hold: vi.fn((response) => response),
+      };
+
+      const response =
+        method === "GET"
+          ? await appWith(manager, capacityRuntime).request("/responses/resp_123", {
+              headers: { authorization: "Bearer wsmp_model_test" },
+            })
+          : await appWith(manager, capacityRuntime).request("/responses", {
+              method: "POST",
+              headers: {
+                authorization: "Bearer wsmp_model_test",
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({
+                model: poolTarget.modelId,
+                previous_response_id: "resp_123",
+                input: "follow-up prompt",
+              }),
+            });
+
+      expect(response.status).toBe(404);
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: member.userId } }),
+      );
+      expect(manager.sent).toHaveLength(0);
+      expect(capacityRuntime.release).toHaveBeenCalledOnce();
+    },
+  );
+
+  // C2-1 (#76): a local-member follow-up to a pool that is no longer visible
+  // (owner banned or deletion-marked, or grant lost) is not found, as at
+  // arrival and for provider bindings; never 401.
+  it("answers 404 for a sticky follow-up to a pool that is no longer visible", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [],
+    });
+    mockStickyRecord({
+      routingVersion: 2,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      selectedExecutionTargetId: "target-a",
+      SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/responses/resp_123", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+
+    expect(response.status).toBe(404);
+    expect(manager.sent).toHaveLength(0);
+  });
+
   describe("pool media transformer", () => {
     const transformerId = "transformer-model-id";
     const transformerUpstream = "vlm-upstream";
 
     function enablePoolTransformer(overrides: Record<string, unknown> = {}) {
       db.modelPool.findUnique.mockResolvedValue({
+        userId: poolTarget.ownerUserId,
         transformerDiscoveredModelId: transformerId,
         transformerSystemPrompt: null,
         transformerImages: true,
@@ -12027,6 +13151,110 @@ describe("model API routes", () => {
         };
       });
     }
+
+    // C2-2 (#76): every transformer hop hands the grantee's media to the pool
+    // owner's machine; a banned owner stops the prepass before any hop.
+    it("sends no transformer hop once the pool owner is banned", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer({ userId: poolTarget.ownerUserId });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const response = await appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "what is this?" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+              ],
+            },
+          ],
+        }),
+      });
+
+      expect(response.status).toBe(404);
+      expect(db.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: poolTarget.ownerUserId } }),
+      );
+      expect(manager.sent).toHaveLength(0);
+    });
+
+    // C3-2: the owner is re-read before EVERY hop; a ban saved during the
+    // prepass stops the next hop.
+    it("stops the transformer prepass at the next hop once the owner is banned", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer({ userId: poolTarget.ownerUserId });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      db.user.findUnique.mockReset();
+      db.user.findUnique
+        .mockResolvedValueOnce({ banned: false, banExpires: null, deletionRequestedAt: null })
+        .mockResolvedValue({ banned: true, banExpires: null, deletionRequestedAt: null });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+      const image = (text: string) => ({
+        role: "user",
+        content: [
+          { type: "text", text },
+          { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+        ],
+      });
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [image("first"), { role: "assistant", content: "ok" }, image("second")],
+        }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const hop = requireSent(manager, 0);
+      manager.headers(hop.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        hop.requestId,
+        JSON.stringify({ choices: [{ message: { role: "assistant", content: "A cat." } }] }),
+      );
+      manager.complete(hop.requestId);
+      const response = await responsePromise;
+
+      expect(response.status).toBe(404);
+      expect(manager.sent).toHaveLength(1);
+      expect(db.user.findUnique).toHaveBeenCalledTimes(2);
+    });
 
     it("transforms media then forwards rewritten chat to the pool primary", async () => {
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
@@ -12466,6 +13694,7 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
   return {
     fallbackEnabled: true,
     fallbackForGrantees: false,
+    User: { banned: false, banExpires: null, deletionRequestedAt: null },
     PoolMembers: [
       {
         id: "member-cooldown",
@@ -12521,3 +13750,199 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
     ],
   };
 }
+
+// Design pass (authz-boundaries, #76, #95): assertLocalSendAllowed is THE enforcement
+// point for work handed to a pool owner's machines. Every relay send site in
+// apps/server/src must be listed here (with its count); a gated site must be
+// preceded by the gate with no wait, admission or loop head in between. See
+// prs/64-76/design-authz-boundaries.md.
+describe("local send gate (static)", () => {
+  const sendCall = /\b(startRelayAttempt|sendRelayRequest|nativeContextCount)\(\{/g;
+  const srcRoot = new URL("../", import.meta.url);
+  const source = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
+  const { parse } = createRequire(import.meta.url)(
+    "@babel/parser",
+  ) as typeof import("@babel/parser");
+  const listSources = (dir: URL): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory()
+        ? listSources(new URL(`${entry.name}/`, dir)).map((file) => `${entry.name}/${file}`)
+        : entry.name.endsWith(".ts") &&
+            !entry.name.endsWith(".test.ts") &&
+            !entry.name.endsWith(".test-helper.ts")
+          ? [entry.name]
+          : [],
+    );
+
+  it("lists every relay send site in the server sources", () => {
+    // Other modules: exact counts, all exempt from the local-send gate.
+    const exemptFiles: Record<string, number> = {
+      // The executor itself (definition and its one manager send).
+      "model-api/relay-executor.ts": 2,
+      // The manager's own definition and the owner's system health probe (no grantee data).
+      "relay/session-manager.ts": 2,
+      // Owner-only member diagnostics: the caller is the authenticated owner.
+      "model-api/diagnostics.ts": 1,
+    };
+    const counts: Record<string, number> = {};
+    for (const file of listSources(srcRoot)) {
+      if (file === "model-api/routes.ts") continue;
+      const found = [...readFileSync(new URL(file, srcRoot), "utf8").matchAll(sendCall)].length;
+      if (found > 0) counts[file] = found;
+    }
+    expect(counts).toEqual(exemptFiles);
+  });
+
+  type AstNode = { type: string; start: number; end: number; [key: string]: unknown };
+  const isAstNode = (value: unknown): value is AstNode =>
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { type?: unknown }).type === "string" &&
+    typeof (value as { start?: unknown }).start === "number";
+  const astChildren = (node: AstNode): AstNode[] =>
+    Object.entries(node).flatMap(([key, value]) =>
+      key === "loc" || key === "extra"
+        ? []
+        : Array.isArray(value)
+          ? value.filter(isAstNode)
+          : isAstNode(value)
+            ? [value]
+            : [],
+    );
+  const program = parse(source, {
+    sourceType: "module",
+    plugins: ["typescript"],
+  }).program as unknown as AstNode;
+  const parents = new Map<AstNode, AstNode>();
+  const calls: AstNode[] = [];
+  const indexAst = (node: AstNode) => {
+    if (node.type === "CallExpression") calls.push(node);
+    for (const child of astChildren(node)) {
+      parents.set(child, node);
+      indexAst(child);
+    }
+  };
+  indexAst(program);
+  const calleeName = (call: AstNode) => {
+    const callee = call.callee as AstNode;
+    return callee.type === "Identifier" ? (callee.name as string) : null;
+  };
+  const isFunctionNode = (node: AstNode) =>
+    node.type === "FunctionDeclaration" ||
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ObjectMethod" ||
+    node.type === "ClassMethod";
+  const ancestorsOf = (node: AstNode) => {
+    const chain: AstNode[] = [];
+    for (let current = parents.get(node); current; current = parents.get(current))
+      chain.push(current);
+    return chain;
+  };
+
+  /**
+   * AST proof that `assertLocalSendAllowed` runs before `send` on every path
+   * that reaches it (CF2-3; a matching string is not an executed gate): an
+   * awaited expression statement whose ancestors are (a) ancestors of the
+   * send too, or (b) an `if` whose test text is listed for the site and whose
+   * then-branch holds the gate; with no await, `for` or `while` between the
+   * gate and the send. `if (false)`, an un-awaited call, or a gate in a
+   * sibling branch all fail.
+   */
+  const gateDominatesSend = (send: AstNode, allowedConditions: readonly string[]) => {
+    const fn = ancestorsOf(send).find(isFunctionNode);
+    if (!fn) return false;
+    const sendAncestors = new Set(ancestorsOf(send));
+    return calls.some((gate) => {
+      if (calleeName(gate) !== "assertLocalSendAllowed" || gate.end > send.start) return false;
+      if (ancestorsOf(gate).find(isFunctionNode) !== fn) return false;
+      const awaited = parents.get(gate);
+      const statement = awaited && parents.get(awaited);
+      if (awaited?.type !== "AwaitExpression" || statement?.type !== "ExpressionStatement")
+        return false;
+      const path = [statement, ...ancestorsOf(statement)];
+      for (const [index, node] of path.entries()) {
+        if (node === fn) break;
+        // A plain block only groups statements; the `if` above it is what gates.
+        if (node === statement || node.type === "BlockStatement" || sendAncestors.has(node))
+          continue;
+        // Not shared with the send: only a listed `if` with the gate in its then-branch.
+        const listed =
+          node.type === "IfStatement" &&
+          path[index - 1] === node.consequent &&
+          allowedConditions.includes(
+            source.slice((node.test as AstNode).start, (node.test as AstNode).end),
+          );
+        if (!listed) return false;
+      }
+      return !/\bawait\b|\bfor \(|\bwhile \(/.test(source.slice(gate.end, send.start));
+    });
+  };
+
+  it("gates every pool-scoped local send in routes.ts", () => {
+    const sendNodes = new Map<number, AstNode>(
+      calls.map((call) => [(call.callee as AstNode).start, call] as const),
+    );
+    const declarations = [
+      ...source.matchAll(/^(?:export )?(?:(?:async )?function (\w+)\(|const (\w+) =)/gm),
+    ].map((match) => ({ name: (match[1] ?? match[2])!, index: match.index }));
+    const enclosing = (index: number) =>
+      declarations.filter((declaration) => declaration.index < index).at(-1)!;
+    // Per function: how many relay sends (startRelayAttempt) and native-count
+    // calls it has, and whether its sends reach a pool owner's machine.
+    type SiteEntry = {
+      gated: boolean;
+      sends: number;
+      counts: number;
+      /** The only `if` conditions the gate may sit under (pool-scoped variants of a shared function). */
+      conditions?: readonly string[];
+    };
+    const table: Record<string, SiteEntry> = {
+      // Pool member attempts and retries; the native-count fan-out passes
+      // pool.ownerUserId and pool.accessGrantId (required by the type) and is gated inside.
+      relayPool: { gated: true, sends: 1, counts: 1 },
+      // Stored-Responses follow-up pinned to a pool member.
+      relaySelectedModelNoFailover: {
+        gated: true,
+        sends: 1,
+        counts: 0,
+        conditions: ["requestedModelPoolId"],
+      },
+      // Every media-transformer hop (owner-owned transformer model).
+      maybeApplyPoolMediaTransformer: { gated: true, sends: 1, counts: 0 },
+      // Gated when counting for a pool member (pool.ownerUserId).
+      nativeContextCount: { gated: true, sends: 1, counts: 0, conditions: ["pool"] },
+      // The requester's own direct models; a banned requester cannot authenticate.
+      relayDirect: { gated: false, sends: 1, counts: 1 },
+    };
+    const found: Record<string, SiteEntry> = {};
+    for (const match of source.matchAll(sendCall)) {
+      if (source.slice(Math.max(0, match.index - 15), match.index).includes("function")) continue;
+      const fn = enclosing(match.index);
+      const entry = table[fn.name];
+      expect(entry, `${match[1]} in ${fn.name} is not a listed send site`).toBeDefined();
+      found[fn.name] ??= {
+        gated: entry?.gated ?? false,
+        sends: 0,
+        counts: 0,
+        ...(entry?.conditions ? { conditions: entry.conditions } : {}),
+      };
+      const tally = found[fn.name]!;
+      if (match[1] === "nativeContextCount") {
+        tally.counts += 1;
+        continue;
+      }
+      tally.sends += 1;
+      if (!entry?.gated) continue;
+      // The gate must DOMINATE the send (CF2-3): a matching string is not an
+      // executed gate. See gateDominatesSend.
+      const sendNode = sendNodes.get(match.index);
+      expect(sendNode, `${match[1]} in ${fn.name}: send call not found in the AST`).toBeDefined();
+      expect(
+        gateDominatesSend(sendNode!, entry.conditions ?? []),
+        `${match[1]} in ${fn.name}: no awaited unconditional assertLocalSendAllowed before the send (allowed conditions: ${(entry.conditions ?? []).join(", ") || "none"}), or an await/loop head between them`,
+      ).toBe(true);
+    }
+    expect(found).toEqual(table);
+  });
+});

@@ -180,16 +180,21 @@
  * packages/api/src/lib/model-api-token-access.ts `lockExternalSendConsent`
  * then apps/server/src/model-api/public-overflow.ts
  * `claimPublicProviderCredentialForSend`) is also outside the capacity
- * domain. It starts holding nothing and takes, in this order:
+ * domain. It starts holding nothing, and its first statement sets a
+ * transaction-local `lock_timeout` (`EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS`,
+ * 2 s; L1b, #64) that bounds every lock wait below. It then takes, in this
+ * order:
  *
  *   C1  `model_pool` FOR SHARE (the pool being sent for);
  *   C2  `pool_grant` FOR SHARE (the requester's grant, grantees only);
  *   C3  `model_api_token` FOR SHARE (the requester's token, if any);
  *   C4  `model_api_token_allowlist_entry` FOR SHARE (that token's entry for
  *       the pool);
- *   C5  `provider_account` FOR UPDATE, then (own-key only) `provider_model`
- *       FOR SHARE, then `provider_credential` FOR UPDATE
- *       (the order every provider lifecycle writer uses).
+ *   C5  `provider_account` FOR UPDATE, then `provider_model` FOR SHARE (every
+ *       path: pool fallback and own-key), then `provider_credential` FOR
+ *       UPDATE (the order every provider lifecycle writer uses; writers of
+ *       the model take the account first, so the model SHARE never waits
+ *       while the claim holds the account).
  *
  *   C6  own-key only: `pool_fallback_preference` FOR SHARE. Preference writers
  *       take pool -> grant -> account -> model -> preference, and deletes
@@ -208,17 +213,61 @@
  * only preference. No holder of preference waits for a parent. The setter
  * neither holds nor later acquires a capacity lock, so adds no reverse edge.
  *
+ * Bounded waits (L1b): the claim waits on the hot `provider_account` row
+ * (C5; budget admission and settlement hold it, or KEY SHARE on it, while
+ * they write attempt, reservation and ledger rows) while holding C1-C4 FOR
+ * SHARE, which blocks the writers of those rows. `lock_timeout` caps each
+ * wait, so each C1-C4 share hold lasts at most one bounded wait per level plus
+ * the non-blocking remainder. A timed-out claim throws (55P03) before any
+ * claim is written: the dispatcher settles the attempt as not sent
+ * (`SEND_CLAIM_FAILED`, transient 503) and releases its budget reservation.
+ * The per-request token `lastUsedAt` write never waits on the claim's C3
+ * share lock: it is debounced and takes the token row FOR NO KEY UPDATE SKIP
+ * LOCKED (packages/api/src/lib/model-api-token-access.ts,
+ * `touchModelApiTokenLastUsedAt`), an autocommit statement holding nothing
+ * else, so local traffic on a token never queues behind provider contention.
+ * Consent editors (grant revoke, token external-access edits, pool flag
+ * writes) still serialize behind a claim, which is the E0 guarantee, and wait
+ * at most the claim's bounded duration. The whole claim is also capped by its
+ * interactive-transaction timeout (10 s, public-overflow.ts): several waits
+ * that each succeed just under 2 s end there (P2028, the same not-sent
+ * settlement), so no claim holds C1-C4 longer than that ceiling plus the
+ * rollback of a statement still in flight.
+ *
  * After C6 (C5 for pool fallback; the last statement that can wait) it re-reads the requester's
- * token and `user` row WITHOUT a lock in one SQL statement that evaluates
- * token expiry, ban and deletion mark against statement_timestamp()
- * (`recheckExternalSendRequesterValidity`). The snapshot and its clock must
- * be coherent: comparing a returned ban expiry with a later JS clock could
- * accept a continuously renewed ban. Transaction now() predates the C5 wait.
- * No `user` lock is needed: every statement after that read is non-blocking
- * (the credential row is already held) and none writes a row the ban or
- * deletion-mark writers read, so a mark committing after the read serializes
- * after the claim, the same order a FOR SHARE would force, and the `user`
- * row stays out of this order.
+ * token, the requester's `user` row and the pool owner's `user` row (#76)
+ * WITHOUT a lock in one SQL statement that evaluates token expiry, ban and
+ * deletion mark against statement_timestamp()
+ * (`recheckExternalSendRequesterValidity`). An owner whose ban is active or
+ * whose deletion is pending makes the pool unavailable to every requester
+ * (`POOL_OWNER_INACTIVE`). The snapshot and its clock must be coherent:
+ * comparing a returned ban expiry with a later JS clock could accept a
+ * continuously renewed ban. Transaction now() predates the C5 wait. No `user`
+ * lock is needed, for the requester or the owner: every statement after that
+ * read is non-blocking (the credential row is already held) and none writes a
+ * row the ban or deletion-mark writers read, so a mark committing after the
+ * read serializes after the claim, the same order a FOR SHARE would force,
+ * and the `user` rows stay out of this order. The `lock_timeout` does not
+ * change this: every condition is still re-read after the last lock wait, so
+ * E0 holds.
+ *
+ * Then, still after the last lock wait, it re-reads the target it was
+ * admitted for (`recheckExternalSendTarget`, public-overflow.ts): the
+ * provider model (held FOR SHARE at C5: enabled, not deleted, same account,
+ * upstream model and execution target; its account, held FOR UPDATE, keeps
+ * the listed endpoint identity and version) and, for pool fallback, the
+ * `pool_member` row (same pool and target, PUBLIC_OVERFLOW, routing ACTIVE)
+ * WITHOUT a lock. The member row stays out of this order for the same reason
+ * as the `user` rows: nothing after the read waits and the claim writes no
+ * row a member writer reads, so a removal or disable committing after the
+ * read serializes after the claim. A changed target is availability
+ * (`PROVIDER_UNAVAILABLE`, or `BOUND_TARGET_INVALID` for a stored-response
+ * binding or own-key), not a consent denial: nothing is sent, and the
+ * dispatcher tries the next member only for a retry-safe operation. The
+ * static guard (apps/server/src/model-api/capacity/lock-order.test.ts)
+ * checks this statement sequence, that neither post-wait re-read takes a
+ * lock, and that no lock-taking or raw SQL statement follows them in the
+ * claim.
  *
  * It takes no capacity lock and writes only the credential's `lastUsedAt`, so
  * no admitter ever waits on it (FOR SHARE does not conflict with the FOR KEY

@@ -252,6 +252,25 @@ describe("relay drain", () => {
     manager.dispose();
   });
 
+  it("refuses a socket accepted after the drain began: shutdown close, never registered", async () => {
+    const manager = new RelaySessionManager();
+    const late = new FakeSocket();
+    manager.beginDrain();
+    expect(manager.acceptAuthenticatedSocket({ socket: late, identity, now })).toBe(false);
+    expect(late.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    // Not registered: its frames are an unknown socket, and no unregistered timer runs.
+    await expect(manager.handleTextFrame(late, helloFrame(), now)).rejects.toThrow(
+      "Unknown relay socket.",
+    );
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    // A socket that was already closed is not closed twice.
+    const gone = new FakeSocket();
+    gone.readyState = 3;
+    expect(manager.acceptAuthenticatedSocket({ socket: gone, identity, now })).toBe(false);
+    expect(gone.closes).toEqual([]);
+    manager.dispose();
+  });
+
   it("closes idle CLI sockets and keeps a socket until its model request finishes", async () => {
     const manager = new RelaySessionManager();
     const idle = new FakeSocket();

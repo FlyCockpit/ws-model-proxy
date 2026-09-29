@@ -19,6 +19,7 @@ import {
   type RelayFailureClass,
   recordPoolMemberRelayFailure,
   relayFailureClasses,
+  releasePoolMemberHalfOpenTrial,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   normalizeTranscriptionCapabilities,
@@ -32,6 +33,10 @@ import {
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
+import {
+  poolOwnerActive,
+  userCredentialAccessBlocked,
+} from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
 import { getMediaConfig } from "../media/config.js";
@@ -482,7 +487,14 @@ async function nativeContextCount({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   relayRequestId: string;
   requester: RelayRequester;
-  pool?: { id: string; memberId: string; tier: "PRIMARY" | "PUBLIC_OVERFLOW" };
+  /** A pool member's count; `ownerUserId` + `accessGrantId` feed the send gate (#76, #95). */
+  pool?: {
+    id: string;
+    memberId: string;
+    tier: "PRIMARY" | "PUBLIC_OVERFLOW";
+    ownerUserId: string;
+    accessGrantId: string | null;
+  };
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.ExecutionTarget?.InferenceCapacity;
@@ -560,6 +572,15 @@ async function nativeContextCount({
     built = await operation.buildRequest(selected.upstreamModelId);
     if (!(built.body instanceof Uint8Array)) return countWithConfiguredCounter();
     await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+    // The count sends the full request to the pool owner's machine.
+    if (pool)
+      await assertLocalSendAllowed({
+        poolId: pool.id,
+        ownerUserId: pool.ownerUserId,
+        requesterUserId: requester.userId,
+        accessGrantId: pool.accessGrantId,
+        poolMemberId: pool.tier === "PRIMARY" ? pool.memberId : null,
+      });
     attempt = startRelayAttempt({
       requestId: localExecution.localAttemptId,
       manager,
@@ -606,15 +627,27 @@ async function nativeContextCount({
       terminal,
     );
     return exactCount;
-  } catch {
+  } catch (error) {
     attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
     if (attempt) {
       const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
       await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
         metadataUpdateError,
       );
+    } else if (error instanceof LocalSendRefused) {
+      // Nothing was sent; the dispatch gate ends the request later.
+      await recordLocalTerminal(
+        relayRequestId,
+        requester.userId,
+        localExecution,
+        rejectedRelayTerminal(),
+      ).catch(metadataUpdateError);
     }
     if (request.signal.aborted) throw request.signal.reason;
+    // An authorization refusal is terminal, never a reason to fall back to
+    // the estimate (the caller ends the request); only a member that became
+    // unavailable, or an ordinary counter error, keeps the estimate.
+    if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") throw error;
     return countWithConfiguredCounter();
   }
 }
@@ -3259,7 +3292,10 @@ async function resolveStickyRoute({
       targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null;
     // Honor a local pool binding only through the access that created it: the
     // owner's own (no grant), or the grantee's same live exact grant. A
-    // replaced grant never resurrects an older binding.
+    // replaced grant never resurrects an older binding. A pool no longer
+    // visible (grant lost, or #76 owner banned or deletion-marked) is not
+    // found, as at arrival and for provider bindings; a visible pool reached
+    // through different access than the binding's is access_denied (#95).
     const recordGrantId = record.poolGrantId ?? null;
     const sameAccess =
       visibleTarget !== null &&
@@ -3270,7 +3306,13 @@ async function resolveStickyRoute({
           record.PoolGrant.poolId === visibleTarget.id &&
           record.PoolGrant.ownerUserId === visibleTarget.ownerUserId &&
           record.PoolGrant.granteeUserId === requester.userId);
-    if (!visibleTarget || !sameAccess) {
+    if (!visibleTarget) {
+      return openAiFailureJsonResponse(
+        "not_found",
+        "Response routing metadata is no longer accessible.",
+      );
+    }
+    if (!sameAccess) {
       return openAiFailureJsonResponse(
         "access_denied",
         "Response routing metadata is no longer accessible.",
@@ -3316,47 +3358,106 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
 }
 
 /**
- * The local pool send boundary: the last step before a local pool attempt is
- * dispatched, after every wait (capacity admission, limiter). Pool access is
- * resolved at arrival, so a revocation or member removal that committed while
- * the request waited would otherwise still be served. Re-reads from current
- * state that the requester still reaches the pool through the exact access
- * the request was resolved under (the owner with no grant, or the grantee's
- * same grant row: a replacement grant is different access), and that the
- * member is still a local (PRIMARY) member of the pool and not DISABLED.
- *
+ * The ONE local-send authorization gate (#76 owner, #95 grantee/sticky access,
+ * requester re-validation). Every pool-scoped send of a request to a local
+ * (owner's) machine goes through it, immediately before `startRelayAttempt`,
+ * after every wait and after any half-open trial claim. Reads current state
+ * (JS clock, the same rules as arrival):
+ *  - the pool owner is active (`poolOwnerActive`: not banned, not deletion-marked);
+ *  - the REQUESTER is not banned or deletion-marked (one extra row read;
+ *    none when the requester is the owner);
+ *  - the requester still reaches the pool through the exact access the
+ *    request was resolved under (the owner with no grant, or the grantee's
+ *    same grant row: a replacement grant is different access);
+ *  - the member (when given) is still a PRIMARY member of the pool, not DISABLED.
  * Unlocked on purpose: nothing may hold database locks across relay I/O. A
- * revoke or removal that commits before these reads is refused here; one
- * that commits afterwards is ordered after the send, as for the provider send
- * boundary (claimPublicProviderCredentialForSend).
+ * change that commits before these reads is refused; one that commits
+ * afterwards is ordered after the send (as for claimPublicProviderCredentialForSend).
+ * A failed read is a denial, never a pass.
  */
-async function localPoolSendDenial(input: {
+type LocalSendInput = {
   poolId: string;
   ownerUserId: string;
   requesterUserId: string;
   accessGrantId: string | null;
-  poolMemberId: string;
-}): Promise<"ACCESS_REVOKED" | "MEMBER_UNAVAILABLE" | null> {
-  const requesterIsOwner = input.requesterUserId === input.ownerUserId;
-  if (requesterIsOwner !== (input.accessGrantId === null)) return "ACCESS_REVOKED";
-  const [grant, members] = await Promise.all([
-    input.accessGrantId === null
-      ? null
-      : prisma.poolGrant.findFirst({
-          where: {
-            id: input.accessGrantId,
-            poolId: input.poolId,
-            ownerUserId: input.ownerUserId,
-            granteeUserId: input.requesterUserId,
-          },
-          select: { id: true },
-        }),
-    poolMemberRows(input.poolId),
-  ]);
-  if (input.accessGrantId !== null && grant?.id !== input.accessGrantId) return "ACCESS_REVOKED";
-  const member = members.find((row) => row.id === input.poolMemberId);
-  if (!member || member.routingStatus === "DISABLED") return "MEMBER_UNAVAILABLE";
-  return null;
+  /** The member about to be used; null for gates that send to no single member. */
+  poolMemberId: string | null;
+};
+type LocalSendDenial =
+  | "OWNER_INACTIVE"
+  | "REQUESTER_BLOCKED"
+  | "ACCESS_REVOKED"
+  | "MEMBER_UNAVAILABLE"
+  | "CHECK_FAILED";
+
+const LOCAL_SEND_DENIAL_FAILURE: Record<LocalSendDenial, RelayFailure> = {
+  OWNER_INACTIVE: "not_found",
+  REQUESTER_BLOCKED: "access_denied",
+  ACCESS_REVOKED: "not_found",
+  MEMBER_UNAVAILABLE: "not_found",
+  CHECK_FAILED: "unknown",
+};
+
+async function localSendDenial(input: LocalSendInput): Promise<LocalSendDenial | null> {
+  try {
+    const requesterIsOwner = input.requesterUserId === input.ownerUserId;
+    if (requesterIsOwner !== (input.accessGrantId === null)) return "ACCESS_REVOKED";
+    const userAccessRow = (id: string) =>
+      prisma.user.findUnique({
+        where: { id },
+        select: { banned: true, banExpires: true, deletionRequestedAt: true },
+      });
+    const [owner, requester, grant, members] = await Promise.all([
+      userAccessRow(input.ownerUserId),
+      // The requester row: the one extra read. The owner is read once when
+      // it is also the requester.
+      requesterIsOwner ? null : userAccessRow(input.requesterUserId),
+      input.accessGrantId === null
+        ? null
+        : prisma.poolGrant.findFirst({
+            where: {
+              id: input.accessGrantId,
+              poolId: input.poolId,
+              ownerUserId: input.ownerUserId,
+              granteeUserId: input.requesterUserId,
+            },
+            select: { id: true },
+          }),
+      input.poolMemberId === null ? null : poolMemberRows(input.poolId),
+    ]);
+    const now = new Date();
+    if (!owner || !poolOwnerActive(owner, now)) return "OWNER_INACTIVE";
+    const requesterRow = requesterIsOwner ? owner : requester;
+    if (!requesterRow || userCredentialAccessBlocked(requesterRow, now)) return "REQUESTER_BLOCKED";
+    if (input.accessGrantId !== null && grant?.id !== input.accessGrantId) return "ACCESS_REVOKED";
+    if (input.poolMemberId !== null) {
+      const member = members?.find((row) => row.id === input.poolMemberId);
+      if (!member || member.routingStatus === "DISABLED") return "MEMBER_UNAVAILABLE";
+    }
+    return null;
+  } catch {
+    return "CHECK_FAILED";
+  }
+}
+
+/** Thrown by assertLocalSendAllowed; `failure` ends the request (MEMBER_UNAVAILABLE skips the member). */
+class LocalSendRefused extends Error {
+  readonly failure: RelayFailure;
+  constructor(readonly denial: LocalSendDenial) {
+    super(`local send refused: ${denial}`);
+    this.failure = LOCAL_SEND_DENIAL_FAILURE[denial];
+  }
+}
+
+/**
+ * The gate as the statement IMMEDIATELY before `startRelayAttempt` at every
+ * pool-scoped send site: nothing is awaited between it and the send (static
+ * guard in routes.test.ts). Each site's catch cleans up and, after a
+ * half-open claim, releases the unused trial.
+ */
+async function assertLocalSendAllowed(input: LocalSendInput): Promise<void> {
+  const denial = await localSendDenial(input);
+  if (denial) throw new LocalSendRefused(denial);
 }
 
 /**
@@ -4137,12 +4238,19 @@ async function relayPool({
     releaseLocalCapacity: () => Promise<void>,
   ): Promise<ExternalAttemptOutcome> => {
     if (!external.consent) return { kind: "not_applicable" };
+    // A client that disconnected after an earlier external phase is a cancel,
+    // whatever that phase's own outcome was.
     if (externalAttempt.unavailable)
-      return { kind: "unavailable", reason: externalAttempt.unavailable };
+      return {
+        kind: "unavailable",
+        reason: request.signal.aborted ? "CANCELLED" : externalAttempt.unavailable,
+      };
     const outcome = await attemptPublicOverflow(external.consent, reason, releaseLocalCapacity);
     if (outcome instanceof Response) return { kind: "response", response: outcome };
     const unavailable = externalUnavailableReason(outcome.reason, request.signal.aborted);
     externalAttempt.unavailable = unavailable;
+    if (unavailable === "POOL_UNAVAILABLE" || unavailable === "REQUESTER_BLOCKED")
+      externalAttempt.accessLost = true;
     return { kind: "unavailable", reason: unavailable };
   };
   const attemptPublicOverflow = async (
@@ -4301,26 +4409,32 @@ async function relayPool({
             adaptationEnabled: false,
           }
         : providerRequest;
-      const listed = ownKey
-        ? await listPublicOverflowTargets(target.ownerUserId, target.id, {
-            requesterUserId: requester.userId,
-            providerModelId: consent.ownKeyProviderModelId!,
-            accessGrantId: consent.accessGrantId,
-          })
-        : await listPublicOverflowTargets(target.ownerUserId, target.id);
-      if (ownKey && !listed.enabled)
-        return { dispatched: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
-      // These tier distinctions preserve an earlier own-key outcome. Requests
-      // without own-key retain the existing compatibility/dispatcher decisions.
-      if (!ownKey && consent.ownKeyProviderModelId && !listed.enabled)
-        return { dispatched: false, reason: "POOL_PRIVATE" };
-      if (
-        !ownKey &&
-        consent.ownKeyProviderModelId &&
-        !consent.requesterIsOwner &&
-        !listed.fallbackForGrantees
-      )
-        return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
+      const listTier = () =>
+        ownKey
+          ? listPublicOverflowTargets(target.ownerUserId, target.id, {
+              requesterUserId: requester.userId,
+              providerModelId: consent.ownKeyProviderModelId!,
+              accessGrantId: consent.accessGrantId,
+            })
+          : listPublicOverflowTargets(target.ownerUserId, target.id);
+      // Owner and pool flags gate provider admission (F-C, #64; #76): a
+      // request whose consent no longer holds must not take or wait for a
+      // provider capacity slot. These are early exits with the dispatcher's
+      // own reasons; the send claim still re-checks every condition. They are
+      // read again before every later member's admission (CF-b1).
+      const flagDenial = (
+        current: Awaited<ReturnType<typeof listTier>>,
+      ): PublicOverflowSkipReason | null => {
+        if (!current.ownerActive) return "POOL_OWNER_INACTIVE";
+        if (ownKey && !current.enabled) return "OWN_KEY_CONSENT_WITHDRAWN";
+        if (!ownKey && !current.enabled) return "POOL_PRIVATE";
+        if (!ownKey && !consent.requesterIsOwner && !current.fallbackForGrantees)
+          return "GRANTEE_NOT_COVERED";
+        return null;
+      };
+      const listed = await listTier();
+      const denied = flagDenial(listed);
+      if (denied) return { dispatched: false, reason: denied };
       const compatibleTargets = (providerTargets: typeof listed.targets) =>
         providerTargets.flatMap((providerTarget) => {
           if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
@@ -4368,11 +4482,17 @@ async function relayPool({
         dispatched: false,
         reason: "PROVIDER_UNAVAILABLE",
       };
+      let firstAdmission = true;
       while (
         remaining.length > 0 &&
         !request.signal.aborted &&
         remainingRelayBudgetMs(relayDeadlineMs) > 0
       ) {
+        if (!firstAdmission) {
+          const withdrawn = flagDenial(await listTier());
+          if (withdrawn) return { dispatched: false, reason: withdrawn };
+        }
+        firstAdmission = false;
         const admission = await acquireCapacityWithTelemetry({
           runtime: capacityRuntime,
           relayRequestId,
@@ -5042,8 +5162,13 @@ async function relayPool({
   const providerOnlyUnavailableResponse = async (
     reason: ExternalUnavailableReason,
   ): Promise<Response> => {
+    // `reason` already reads as CANCELLED when the client left during the
+    // external phase (externalUnavailableReason): a cancel (499), not the
+    // phase's own rate_limited / 429.
+    const terminal = terminalExternalFailure({ kind: "unavailable", reason });
     const failure: ModelApiFailure =
-      reason === "NO_COMPATIBLE"
+      terminal ??
+      (reason === "NO_COMPATIBLE"
         ? "unsupported_capability"
         : reason === "SATURATED"
           ? "rate_limited"
@@ -5051,13 +5176,14 @@ async function relayPool({
             ? "cancelled"
             : externalLeaseLost && !externalFailure
               ? "capacity_lease_lost"
-              : "disconnected";
+              : "disconnected");
     await operation.dispose?.();
     // Final attribution is telemetry, not permission to send or switch tiers.
     // Write it with the terminal transition; a failure must not change the
     // already-decided response. Only own-key preserves upstream failure facts.
     if (externalFailure) routeIdentity = providerRouteIdentity(externalFailure.target);
-    const providerStatus = failure === "cancelled" ? undefined : externalFailure?.status;
+    // A cancel or a lost access is never reported with a provider status.
+    const providerStatus = terminal ? undefined : externalFailure?.status;
     await failPoolRelayMetadata({
       relayRequestId,
       startedAt,
@@ -5065,7 +5191,7 @@ async function relayPool({
       upstreamStatusCode: externalFailure?.status,
       httpStatusCode: providerStatus,
     }).catch(metadataUpdateError);
-    if (externalFailure) {
+    if (externalFailure && !terminal) {
       const response = operationFailureResponse(operation, failure);
       const headers = new Headers(response.headers);
       if (reason === "SATURATED") headers.set("retry-after", "1");
@@ -5092,36 +5218,66 @@ async function relayPool({
   };
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
-    await Promise.all(
-      members.map(async (member) => {
-        const selected = {
-          ...member.DiscoveredModel,
-          optimisticBasicTranscription: false,
-          ExecutionTarget: member.ExecutionTarget,
-          Endpoint: {
-            ...member.DiscoveredModel.Endpoint,
-            status: member.DiscoveredModel.Endpoint.status ?? null,
-            CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
-          },
-        } satisfies ContextCountModelRow;
-        if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
-        try {
-          const count = await nativeContextCount({
-            request,
-            selected,
-            operation,
-            manager,
-            relayRequestId,
-            requester,
-            pool: { id: target.id, memberId: member.id, tier: "PRIMARY" },
-          });
-          if (count) nativeCounts.set(member.id, count);
-        } catch {
-          // The request-level abort is handled by admission/relay below; an
-          // individual unavailable counter safely retains the estimate.
-        }
-      }),
-    );
+    // The native count sends the full request to the owner's machines: the
+    // same gate as the send, as an early exit before the count fan-out.
+    let countRefusal: LocalSendDenial | null = await localSendDenial({
+      poolId: target.id,
+      ownerUserId: target.ownerUserId,
+      requesterUserId: requester.userId,
+      accessGrantId: target.accessGrantId,
+      poolMemberId: null,
+    });
+    if (!countRefusal) {
+      await Promise.all(
+        members.map(async (member) => {
+          const selected = {
+            ...member.DiscoveredModel,
+            optimisticBasicTranscription: false,
+            ExecutionTarget: member.ExecutionTarget,
+            Endpoint: {
+              ...member.DiscoveredModel.Endpoint,
+              status: member.DiscoveredModel.Endpoint.status ?? null,
+              CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
+            },
+          } satisfies ContextCountModelRow;
+          if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
+          try {
+            const count = await nativeContextCount({
+              request,
+              selected,
+              operation,
+              manager,
+              relayRequestId,
+              requester,
+              pool: {
+                id: target.id,
+                memberId: member.id,
+                tier: "PRIMARY",
+                ownerUserId: target.ownerUserId,
+                accessGrantId: target.accessGrantId,
+              },
+            });
+            if (count) nativeCounts.set(member.id, count);
+          } catch (error) {
+            // A refused count send (owner or requester lost access, grant
+            // revoked, failed check) ends the request below. The request-level
+            // abort is handled by admission/relay; an individual unavailable
+            // counter safely retains the estimate.
+            if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE")
+              countRefusal ??= error.denial;
+          }
+        }),
+      );
+    }
+    if (countRefusal) {
+      // Same exit as the early refusal: nothing admitted, no external phase,
+      // answered like arrival without route headers.
+      const countFailure = LOCAL_SEND_DENIAL_FAILURE[countRefusal];
+      externalAttempt.accessLost = true;
+      await operation.dispose?.();
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: countFailure });
+      return operationFailureResponse(operation, countFailure);
+    }
   }
   const configuredContextCeilingForMember = (member: PoolMemberRelayRow) =>
     member.capacityContextCeilingMode === "UNLIMITED"
@@ -5232,6 +5388,12 @@ async function relayPool({
     // go external. A plain name keeps the context error.
     const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
     if (overflow.kind === "response") return overflow.response;
+    const lostAccess = terminalExternalFailure(overflow);
+    if (lostAccess) {
+      await operation.dispose?.();
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
+      return operationFailureResponse(operation, lostAccess);
+    }
     // Not dispatched: the plain-name context error (plus the D5 header).
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
@@ -5279,13 +5441,10 @@ async function relayPool({
     if (overflow.kind === "response") return overflow.response;
     if (providerOnly && overflow.kind === "unavailable")
       return providerOnlyUnavailableResponse(overflow.reason);
+    const failure = terminalExternalFailure(overflow) ?? "unsupported_capability";
     await operation.dispose?.();
-    await failPoolRelayMetadata({
-      relayRequestId,
-      startedAt,
-      failure: "unsupported_capability",
-    });
-    return operationFailureResponse(operation, "unsupported_capability");
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
+    return operationFailureResponse(operation, failure);
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
@@ -5336,9 +5495,10 @@ async function relayPool({
       async () => undefined,
     );
     if (overflow.kind === "response") return overflow.response;
+    const failure = terminalExternalFailure(overflow) ?? "disconnected";
     await operation.dispose?.();
-    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
-    return operationFailureResponse(operation, "disconnected");
+    await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
+    return operationFailureResponse(operation, failure);
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
@@ -5595,20 +5755,23 @@ async function relayPool({
         async () => undefined,
       );
       if (overflow.kind === "response") return overflow.response;
+      // A cancel or a lost access (#76) observed by the external phase, or a
+      // client that left meanwhile, is terminal and outranks the lease loss.
+      const leaseLostFailure: ModelApiFailure = request.signal.aborted
+        ? "cancelled"
+        : (terminalExternalFailure(overflow) ?? "capacity_lease_lost");
       await operation.dispose?.();
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "capacity_lease_lost" });
-      return operationFailureResponse(operation, "capacity_lease_lost");
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: leaseLostFailure });
+      return operationFailureResponse(operation, leaseLostFailure);
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
       // (a) Local wait expired (member/pool budget, or externalAfterWaitMs
       // for a consented `:external` caller), measured on the database clock.
       const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
       if (overflow.kind === "response") return overflow.response;
-      if (
-        overflow.kind === "unavailable" &&
-        overflow.reason !== "CANCELLED" &&
-        localWaitMode === "shortened"
-      ) {
+      // A cancel or a lost access (#76) ends the request; never resume.
+      const lostAccess = terminalExternalFailure(overflow);
+      if (overflow.kind === "unavailable" && !lostAccess && localWaitMode === "shortened") {
         // External did not dispatch: resume the local wait for the same
         // candidates with the rest of the budget (queue position is not kept).
         localWaitMode = "remaining";
@@ -5628,8 +5791,12 @@ async function relayPool({
         }
       }
       if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
-        const failure =
-          capacityLease.state === "LEASE_LOST" ? "capacity_lease_lost" : "rate_limited";
+        // A client that left during the (resumed) local wait is a cancel
+        // (499), not the wait's own rate_limited / 429.
+        const failure: ModelApiFailure = request.signal.aborted
+          ? "cancelled"
+          : (lostAccess ??
+            (capacityLease.state === "LEASE_LOST" ? "capacity_lease_lost" : "rate_limited"));
         await operation.dispose?.();
         await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
         return operationFailureResponse(operation, failure);
@@ -5687,6 +5854,9 @@ async function relayPool({
   // H1: set when the caller's own per-token/per-user cap stopped the retry
   // loop. That is never a fallback trigger; the caller gets 429.
   let callerLimitReached = false;
+  // #76: set when the pool owner lost access while this request waited. The
+  // pool is then unavailable to everyone, the external tier included.
+  let poolOwnerLostAccess = false;
   let attemptCount = 0;
   // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
   // and retry bookkeeping. Pool size never multiplies the public timeout.
@@ -5731,7 +5901,7 @@ async function relayPool({
         // (a) inside the retry loop: this round's shortened wait expired.
         const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
         if (overflow.kind === "response") return overflow.response;
-        if (overflow.kind === "unavailable" && overflow.reason !== "CANCELLED") {
+        if (overflow.kind === "unavailable" && !terminalExternalFailure(overflow)) {
           localWaitMode = "remaining";
           try {
             capacityLease = await admitLocalCandidates(
@@ -5814,48 +5984,24 @@ async function relayPool({
       break;
     }
 
-    // Send boundary: pool access and membership were resolved before the
-    // admission and limiter waits, which are all behind us now. It runs
-    // before a half-open trial is claimed, so a denial never strands a
-    // claim. A revoked grant ends the request; a member removed or disabled
-    // meanwhile is skipped like any other unavailable member. A failed read
-    // is a denial (never a pass) and ends the request.
-    let sendDenial: Awaited<ReturnType<typeof localPoolSendDenial>> | "CHECK_FAILED";
-    try {
-      sendDenial = await localPoolSendDenial({
-        poolId: target.id,
-        ownerUserId: target.ownerUserId,
-        requesterUserId: requester.userId,
-        accessGrantId: target.accessGrantId,
-        poolMemberId: member.id,
-      });
-    } catch {
-      sendDenial = "CHECK_FAILED";
-    }
-    if (sendDenial) {
-      await settleRelayCleanup([() => cliLease.release()]);
-      await releaseCapacityAttempt();
-      if (sendDenial === "MEMBER_UNAVAILABLE") {
-        finalFailure = "not_found";
-        continue;
-      }
-      const failure: RelayFailure = sendDenial === "CHECK_FAILED" ? "unknown" : "not_found";
-      await settleRelayCleanup([() => globalLease?.release(), () => operation.dispose?.()]);
-      await failPoolRelayMetadata({
-        relayRequestId,
-        startedAt,
-        failure,
-        attemptCount,
-        requestBytes: cumulativeRequestBytes,
-        responseBytes: cumulativeResponseBytes,
-      }).catch(metadataUpdateError);
-      return operationFailureResponse(operation, failure);
-    }
-
+    // The half-open trial this attempt claimed, if any; given back on every
+    // exit that sends nothing (C4-1), fenced on its own timestamp.
+    let claimedTrialAt: Date | null = null;
+    const releaseUnusedTrial = async () => {
+      const trialStartedAt = claimedTrialAt;
+      claimedTrialAt = null;
+      if (trialStartedAt)
+        await releasePoolMemberHalfOpenTrial({
+          poolMemberId: candidate.poolMemberId,
+          trialStartedAt,
+        }).catch(metadataUpdateError);
+    };
     if (candidate.healthStatus === "HALF_OPEN") {
       let claimed: number;
+      const trialStartedAt = new Date();
       try {
         claimed = await markPoolMemberHalfOpenTrial({
+          now: trialStartedAt,
           poolMemberId: candidate.poolMemberId,
           // `buildPoolRouteSequence` emits this only when the full configured
           // pool contains one member. Passing explicit authority keeps a
@@ -5873,6 +6019,7 @@ async function relayPool({
         await releaseCapacityAttempt();
         continue;
       }
+      claimedTrialAt = trialStartedAt;
     }
     let builtRequest: BuiltRelayRequest;
     const execution = executionByMember.get(member.id);
@@ -5911,6 +6058,7 @@ async function relayPool({
         };
       }
     } catch (error) {
+      await releaseUnusedTrial();
       if (error instanceof AdapterError && operation.adaptation) {
         await settleRelayCleanup([
           () => cliLease.release(),
@@ -5953,6 +6101,7 @@ async function relayPool({
         : null;
     const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
+      await releaseUnusedTrial();
       await settleRelayCleanup([
         () => cliLease.release(),
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
@@ -5993,6 +6142,16 @@ async function relayPool({
       capacityLease?.state === "ADMITTED" ? capacityLease.lease.signal : undefined;
     try {
       await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+      // The one send gate, immediately before every local attempt (retries
+      // included), after every wait and the half-open claim: owner, requester,
+      // exact access and member are read again.
+      await assertLocalSendAllowed({
+        poolId: target.id,
+        ownerUserId: target.ownerUserId,
+        requesterUserId: requester.userId,
+        accessGrantId: target.accessGrantId,
+        poolMemberId: member.id,
+      });
       attempt = startRelayAttempt({
         requestId: localExecution.localAttemptId,
         manager,
@@ -6012,8 +6171,10 @@ async function relayPool({
           responseIdCapture?.push(chunk, operation.stream);
         },
       });
-    } catch {
+    } catch (error) {
       attempt?.cancel("unknown");
+      // Nothing was sent unless the attempt started: the trial goes back.
+      if (!attempt) await releaseUnusedTrial();
       // Attempt-only finalization (the request moves on to the next member
       // or the post-loop finalizer); a no-op claim if no row was written.
       await recordLocalTerminal(
@@ -6026,6 +6187,19 @@ async function relayPool({
         () => cliLease.release(),
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
+      if (error instanceof LocalSendRefused) {
+        await releaseCapacityAttempt();
+        finalFailure = error.failure;
+        if (error.denial === "MEMBER_UNAVAILABLE") {
+          // Removed or disabled meanwhile: skipped like any unavailable member.
+          continue;
+        }
+        // Owner or requester lost access, grant revoked, or the check failed:
+        // no other member, no external phase. The member is not at fault.
+        poolOwnerLostAccess = true;
+        externalAttempt.accessLost = true;
+        break;
+      }
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
@@ -6552,14 +6726,19 @@ async function relayPool({
     finalFailure === "rate_limited" || finalFailure === "timeout"
       ? "LOCAL_WAIT_EXPIRED"
       : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
-  const overflow: ExternalAttemptOutcome = callerLimitReached
-    ? { kind: "not_applicable" }
-    : await tryPublicOverflow(overflowReason, async () => {
-        const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
-        capacityLease = undefined;
-        await settleRelayCleanup([() => (lease ? capacityRuntime?.release(lease) : undefined)]);
-      });
+  const overflow: ExternalAttemptOutcome =
+    callerLimitReached || poolOwnerLostAccess
+      ? { kind: "not_applicable" }
+      : await tryPublicOverflow(overflowReason, async () => {
+          const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+          capacityLease = undefined;
+          await settleRelayCleanup([() => (lease ? capacityRuntime?.release(lease) : undefined)]);
+        });
   if (overflow.kind === "response") return overflow.response;
+  // The client left during or after an external phase that did not dispatch
+  // (499), or the pool or requester lost access (#76): that, not the local
+  // failure that triggered the phase.
+  finalFailure = terminalExternalFailure(overflow) ?? finalFailure;
 
   await settleRelayCleanup([
     () => globalLease?.release(),
@@ -6758,42 +6937,6 @@ async function relaySelectedModelNoFailover({
     });
     return operationFailureResponse(operation, "unknown");
   }
-  // Send boundary: the binding's pool access and member were resolved before
-  // the admission wait. A grant revoked or replaced, or a member removed or
-  // disabled meanwhile, is refused like at arrival (404), before any send.
-  // A failed read is a denial, never a pass.
-  if (requestedModelPoolId) {
-    let failure: RelayFailure | null = "not_found";
-    if (poolAccess && selectedPoolMember) {
-      try {
-        failure = (await localPoolSendDenial({
-          poolId: requestedModelPoolId,
-          ownerUserId: poolAccess.ownerUserId,
-          requesterUserId: requester.userId,
-          accessGrantId: poolAccess.accessGrantId,
-          poolMemberId: selectedPoolMember.id,
-        }))
-          ? "not_found"
-          : null;
-      } catch {
-        failure = "unknown";
-      }
-    }
-    if (failure) {
-      await settleRelayCleanup([
-        () => cliLease.release(),
-        () => globalLease.release(),
-        () =>
-          capacityLease?.state === "ADMITTED"
-            ? capacityRuntime?.release(capacityLease.lease)
-            : undefined,
-        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
-        () => operation.dispose?.(),
-      ]);
-      await failRelayMetadata({ relayRequestId, startedAt, failure });
-      return operationFailureResponse(operation, failure);
-    }
-  }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
@@ -6818,9 +6961,43 @@ async function relaySelectedModelNoFailover({
           }
         : undefined,
   };
+  let attempt: ReturnType<typeof startRelayAttempt>;
   try {
     await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-  } catch {
+    // The one send gate, as in relayPool: the binding's pool access, owner,
+    // requester and member were resolved before the admission wait and are
+    // read again after every wait. Missing access facts fail closed.
+    if (requestedModelPoolId) {
+      if (!poolAccess || !selectedPoolMember) throw new LocalSendRefused("ACCESS_REVOKED");
+      await assertLocalSendAllowed({
+        poolId: requestedModelPoolId,
+        ownerUserId: poolAccess.ownerUserId,
+        requesterUserId: requester.userId,
+        accessGrantId: poolAccess.accessGrantId,
+        poolMemberId: selectedPoolMember.id,
+      });
+    }
+    attempt = startRelayAttempt({
+      requestId: localExecution.localAttemptId,
+      manager,
+      cliDeviceId: selected.Endpoint.cliDeviceId,
+      endpointSlug: selected.Endpoint.slug,
+      family: operation.family,
+      method: operation.method,
+      path: operation.path,
+      headers: builtRequest.headers,
+      ...relayAttemptBody(builtRequest.body),
+      timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
+      abortSignal:
+        capacityLease?.state === "ADMITTED"
+          ? (capacityLease.lease.signal ?? request.signal)
+          : request.signal,
+      onResponseBodyChunk: responseIdCapture
+        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+        : undefined,
+    });
+  } catch (error) {
+    const failure: RelayFailure = error instanceof LocalSendRefused ? error.failure : "unknown";
     cliLease.release();
     globalLease.release();
     if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
@@ -6829,34 +7006,17 @@ async function relaySelectedModelNoFailover({
     await failRelayMetadata({
       relayRequestId,
       startedAt,
-      failure: "unknown",
+      failure,
       selectedDiscoveredModelId: selected.id,
       attemptCount: 1,
       localExecution,
       userId: requester.userId,
       localTerminal: rejectedRelayTerminal(),
     });
-    return operationFailureResponse(operation, "unknown");
+    const refused = operationFailureResponse(operation, failure);
+    if (error instanceof LocalSendRefused) poolAccessLostResponses.add(refused);
+    return refused;
   }
-  const attempt = startRelayAttempt({
-    requestId: localExecution.localAttemptId,
-    manager,
-    cliDeviceId: selected.Endpoint.cliDeviceId,
-    endpointSlug: selected.Endpoint.slug,
-    family: operation.family,
-    method: operation.method,
-    path: operation.path,
-    headers: builtRequest.headers,
-    ...relayAttemptBody(builtRequest.body),
-    timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-    abortSignal:
-      capacityLease?.state === "ADMITTED"
-        ? (capacityLease.lease.signal ?? request.signal)
-        : request.signal,
-    onResponseBodyChunk: responseIdCapture
-      ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-      : undefined,
-  });
 
   try {
     const started = await attempt.started;
@@ -6976,6 +7136,7 @@ async function maybeApplyPoolMediaTransformer({
   request,
   requester,
   poolId,
+  access,
   prepared,
   operationFamily,
   manager,
@@ -6984,6 +7145,8 @@ async function maybeApplyPoolMediaTransformer({
   request: Request;
   requester: RelayRequester;
   poolId: string;
+  /** How the requester reaches the pool: re-checked at every hop's send gate. */
+  access: { accessGrantId: string | null };
   prepared: PreparedModeledRequest;
   operationFamily: ModelApiEndpointFamily;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
@@ -6995,6 +7158,7 @@ async function maybeApplyPoolMediaTransformer({
   const pool = await prisma.modelPool.findUnique({
     where: { id: poolId },
     select: {
+      userId: true,
       transformerDiscoveredModelId: true,
       transformerSystemPrompt: true,
       transformerImages: true,
@@ -7240,36 +7404,49 @@ async function maybeApplyPoolMediaTransformer({
       localAttemptId: crypto.randomUUID(),
       poolId,
     };
+    let attempt: ReturnType<typeof startRelayAttempt>;
     try {
       await startLocalExecutionTelemetry(transformRelayRequestId, requester.userId, localExecution);
+      // Every hop hands the grantee's media to the pool owner's machine; the
+      // one send gate runs immediately before each one.
+      await assertLocalSendAllowed({
+        poolId,
+        ownerUserId: pool.userId,
+        requesterUserId: requester.userId,
+        accessGrantId: access.accessGrantId,
+        poolMemberId: null,
+      });
+      attempt = startRelayAttempt({
+        requestId: localExecution.localAttemptId,
+        manager,
+        cliDeviceId: transformer.Endpoint.cliDeviceId,
+        endpointSlug: transformer.Endpoint.slug,
+        family: "chat.completions",
+        method: "POST",
+        path: "/v1/chat/completions",
+        headers: transformerRelayRequestHeaders(request),
+        body: transformerBody,
+        timeoutMs: callTimeoutMs,
+        abortSignal: request.signal,
+      });
     } catch (error) {
       cliLease.release();
       globalLease.release();
+      const failure: RelayFailure = error instanceof LocalSendRefused ? error.failure : "unknown";
       await failRelayMetadata({
         relayRequestId: transformRelayRequestId,
         startedAt: hopStartedAt,
-        failure: "unknown",
+        failure,
         selectedDiscoveredModelId: transformer.id,
-        transformerErrorClass: "unknown",
+        transformerErrorClass: failure,
         localExecution,
         userId: requester.userId,
         localTerminal: rejectedRelayTerminal(),
       }).catch(metadataUpdateError);
+      // The pool is unavailable (#76) or the requester blocked: answered like arrival.
+      if (error instanceof LocalSendRefused) return openAiFailureJsonResponse(error.failure);
       throw error;
     }
-    const attempt = startRelayAttempt({
-      requestId: localExecution.localAttemptId,
-      manager,
-      cliDeviceId: transformer.Endpoint.cliDeviceId,
-      endpointSlug: transformer.Endpoint.slug,
-      family: "chat.completions",
-      method: "POST",
-      path: "/v1/chat/completions",
-      headers: transformerRelayRequestHeaders(request),
-      body: transformerBody,
-      timeoutMs: callTimeoutMs,
-      abortSignal: request.signal,
-    });
 
     try {
       const started = await attempt.started;
@@ -7549,9 +7726,21 @@ const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, 
  *                    provider health cooldown, precommit failure, owner or
  *                    caller consent withdrawn at dispatch or at the send
  *                    boundary, ...);
- *   CANCELLED     -> the client went away; stays a cancel.
+ *   CANCELLED     -> the client went away; stays a cancel (499).
+ *   POOL_UNAVAILABLE  -> 404 not_found: the pool owner is banned or
+ *                        deletion-marked (#76);
+ *   REQUESTER_BLOCKED -> 401 access_denied: the requester is.
+ * The last two are request-wide access losses, not fallback outcomes, on
+ * every pool shape: the request ends there and never resumes on a local
+ * member (terminalExternalFailure).
  */
-type ExternalUnavailableReason = "NO_COMPATIBLE" | "SATURATED" | "UNAVAILABLE" | "CANCELLED";
+type ExternalUnavailableReason =
+  | "NO_COMPATIBLE"
+  | "SATURATED"
+  | "UNAVAILABLE"
+  | "CANCELLED"
+  | "POOL_UNAVAILABLE"
+  | "REQUESTER_BLOCKED";
 
 /**
  * Typed result of one external fallback attempt in relayPool:
@@ -7571,6 +7760,11 @@ type ExternalAttemptRecord = {
   unavailable: ExternalUnavailableReason | null;
   /** Set when the request commits to the local member path (for response headers). */
   localRouteDecided?: boolean;
+  /**
+   * Set when the pool (#76 owner) or the requester lost access mid-request:
+   * the answer then looks like arrival's, without route headers.
+   */
+  accessLost?: boolean;
 };
 
 function externalUnavailableReason(
@@ -7578,9 +7772,30 @@ function externalUnavailableReason(
   aborted: boolean,
 ): ExternalUnavailableReason {
   if (aborted) return "CANCELLED";
+  if (reason === "POOL_OWNER_INACTIVE") return "POOL_UNAVAILABLE";
+  if (reason === "REQUESTER_ACCESS_BLOCKED") return "REQUESTER_BLOCKED";
   if (reason === "NO_COMPATIBLE_PROVIDER") return "NO_COMPATIBLE";
   if (reason === "PROVIDER_SATURATED") return "SATURATED";
   return "UNAVAILABLE";
+}
+
+/** Failures from the local-send gate that must not carry route headers (#76). */
+const poolAccessLostResponses = new WeakSet<Response>();
+
+/**
+ * The relay failure that ends the request after an external phase, or null
+ * when the local path may still serve it. A client cancel is 499; a pool
+ * whose owner lost access is not found (404, as at arrival, #76); a
+ * requester who lost access is denied. Fallback-only withdrawals (owner
+ * turned fallback off, token consent withdrawn) keep independently
+ * authorized local service.
+ */
+function terminalExternalFailure(outcome: ExternalAttemptOutcome): RelayFailure | null {
+  if (outcome.kind !== "unavailable") return null;
+  if (outcome.reason === "CANCELLED") return "cancelled";
+  if (outcome.reason === "POOL_UNAVAILABLE") return "not_found";
+  if (outcome.reason === "REQUESTER_BLOCKED") return "access_denied";
+  return null;
 }
 
 /**
@@ -7787,6 +8002,7 @@ async function relayPreparedModeledRequest({
     request,
     requester,
     poolId: poolTarget.id,
+    access: { accessGrantId: poolTarget.accessGrantId },
     prepared,
     operationFamily: operation.family,
     manager,
@@ -7857,8 +8073,9 @@ async function relayPreparedModeledRequest({
   // for and not served externally because there was no consent (owner-side
   // denial), no external members, or a needed external dispatch did not
   // happen. A consented request served locally before any trigger fired
-  // carries no header.
-  if (!response.headers.has(ROUTE_HEADER)) {
+  // carries no header. A request that ended because the pool (#76 owner) or
+  // the requester lost access answers like arrival, without either header.
+  if (!response.headers.has(ROUTE_HEADER) && !externalAttempt.accessLost) {
     const noExternalPlan =
       external.requested &&
       (!external.consent ||
@@ -8145,6 +8362,13 @@ async function relayBoundProviderResponse(input: {
           input.stickyRoute.visibleTarget.ownerUserId,
           input.stickyRoute.visibleTarget.id,
         );
+    // Owner and pool flags gate provider admission (F-C, #64; #76), with the
+    // dispatcher's reasons: consent withdrawn is 403, not a 429 after a
+    // wasted capacity wait. The send claim still re-checks every condition.
+    if (!listed.ownerActive) return { dispatched: false, reason: "POOL_OWNER_INACTIVE" };
+    if (!ownKey && !listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
+    if (!ownKey && !input.externalConsent.requesterIsOwner && !listed.fallbackForGrantees)
+      return { dispatched: false, reason: "GRANTEE_NOT_COVERED" };
     if (ownKey && !listed.enabled) {
       const model = await prisma.providerModel.findFirst({
         where: {
@@ -8264,7 +8488,9 @@ async function relayBoundProviderResponse(input: {
         ? "access_denied"
         : result.reason === "PROVIDER_SATURATED"
           ? "rate_limited"
-          : result.reason === "BOUND_TARGET_INVALID" || result.reason === "REQUESTER_NOT_VISIBLE"
+          : result.reason === "BOUND_TARGET_INVALID" ||
+              result.reason === "REQUESTER_NOT_VISIBLE" ||
+              result.reason === "POOL_OWNER_INACTIVE"
             ? "not_found"
             : boundLeaseLost
               ? "capacity_lease_lost"
@@ -8474,7 +8700,9 @@ function boundDispatchDenial(
   reason: PublicOverflowSkipReason,
   pool: Pick<VisibleModelPoolTarget, "modelId">,
 ): ExternalRouteError | null {
-  if (reason === "REQUESTER_NOT_VISIBLE") return null;
+  // The pool is no longer visible to this caller (lost grant, or #76 owner
+  // banned or deletion-marked): answered as not found, as at arrival.
+  if (reason === "REQUESTER_NOT_VISIBLE" || reason === "POOL_OWNER_INACTIVE") return null;
   if (reason === "DEPLOYMENT_GATE_DISABLED")
     return externalDenialError("DEPLOYMENT_DISABLED", pool);
   if (isExternalConsentDenialReason(reason))
@@ -8668,7 +8896,8 @@ export async function responsesCreateHandler({
     limiter,
     capacityRuntime,
   });
-  return stickyRoute.target === "MODEL_POOL"
+  // A pool that became unavailable (#76) answers like arrival: no route header.
+  return stickyRoute.target === "MODEL_POOL" && !poolAccessLostResponses.has(response)
     ? withResponseHeaders(response, { [ROUTE_HEADER]: "local" })
     : response;
 }

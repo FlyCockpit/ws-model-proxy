@@ -7,7 +7,10 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
-import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import {
+  poolOwnerActive,
+  userCredentialAccessBlocked,
+} from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { externalFallbackMemberWhere, poolProviderDisclosure } from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
@@ -143,7 +146,9 @@ const modelPoolSelect = {
       },
     },
   },
-  User: { select: { slug: true } },
+  // Owner lifecycle (#76): a banned or deletion-marked owner's pools are
+  // unavailable to every grantee.
+  User: { select: { slug: true, banned: true, banExpires: true, deletionRequestedAt: true } },
 } satisfies Prisma.ModelPoolSelect;
 
 type DirectModelRow = Prisma.DiscoveredModelGetPayload<{
@@ -269,7 +274,13 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
 
   const directModels = directModelRows.map(serializeDirectModel);
   const ownedPools = ownedPoolRows.map((row) => serializeModelPool(row, userId));
-  const grantedPools = grantedPoolRows.map((grant) => {
+  // A granted pool whose owner is banned (active ban) or marked for deletion
+  // is hidden: it is not listed, cannot be resolved by name, and so cannot be
+  // used by any grantee (#76). The send claim re-checks the owner at the
+  // E0 boundary (recheckExternalSendRequesterValidity).
+  const now = new Date();
+  const grantedPools = grantedPoolRows.flatMap((grant) => {
+    if (!poolOwnerActive(grant.ModelPool.User, now)) return [];
     const pool = serializeModelPool(grant.ModelPool, userId, grant.id);
     const ownKeyProviderModelId = grant.FallbackPreferences?.[0]?.providerModelId ?? null;
     const ownKey = Boolean(
@@ -277,12 +288,14 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         pool.externalEquivalentModel &&
         ownKeyProviderModelId,
     );
-    return {
-      ...pool,
-      ownKeyProviderModelId,
-      effectiveProviderEgress: pool.effectiveProviderEgress || ownKey,
-      externalRoutes: ownKey ? [...pool.externalRoutes, "own-key" as const] : pool.externalRoutes,
-    };
+    return [
+      {
+        ...pool,
+        ownKeyProviderModelId,
+        effectiveProviderEgress: pool.effectiveProviderEgress || ownKey,
+        externalRoutes: ownKey ? [...pool.externalRoutes, "own-key" as const] : pool.externalRoutes,
+      },
+    ];
   });
 
   return {
@@ -410,7 +423,12 @@ export type ExternalConsentStateDenial =
   | "TOKEN_CONSENT_WITHDRAWN"
   | "REQUESTER_NOT_VISIBLE"
   /** The requester's account is banned or marked for deletion. */
-  | "REQUESTER_ACCESS_BLOCKED";
+  | "REQUESTER_ACCESS_BLOCKED"
+  /**
+   * The pool owner's account is banned (active ban) or marked for deletion:
+   * the pool is unavailable to everyone, own-key sends included (#76).
+   */
+  | "POOL_OWNER_INACTIVE";
 
 /** Why an `:external` send is refused at the send boundary (lockExternalSendConsent). */
 export type ExternalSendConsentDenial =
@@ -448,6 +466,8 @@ type RequesterValidity = {
   tokenValid: boolean;
   scopeMode: string | null;
   requesterValid: boolean;
+  /** The pool owner's account is not banned (active ban) and not deletion-marked (#76). */
+  ownerValid: boolean;
 };
 
 /**
@@ -457,6 +477,12 @@ type RequesterValidity = {
  * expired even though the requester was continuously banned. Transaction
  * now() is also too old after a provider-lock wait; statement_timestamp()
  * advances for the post-lock recheck.
+ *
+ * The pool owner's row is evaluated by the same rule in the same statement
+ * (#76): an owner whose ban is active or whose deletion is pending makes the
+ * pool unavailable to every requester. Ban semantics match
+ * `isUserBanned` (@ws-model-proxy/db/user-deletion-access): an expiry exactly
+ * at the statement timestamp is still an active ban.
  */
 async function readRequesterValidity(db: RequesterValidityClient, input: ExternalConsentIdentity) {
   const [validity] = await db.$queryRaw<RequesterValidity[]>`
@@ -467,10 +493,14 @@ async function readRequesterValidity(db: RequesterValidityClient, input: Externa
       t."scopeMode" AS "scopeMode",
       (u.id IS NOT NULL AND u."deletionRequestedAt" IS NULL
         AND (u.banned IS NOT TRUE
-          OR (u."banExpires" IS NOT NULL AND u."banExpires" < statement_timestamp()))) AS "requesterValid"
+          OR (u."banExpires" IS NOT NULL AND u."banExpires" < statement_timestamp()))) AS "requesterValid",
+      (o.id IS NOT NULL AND o."deletionRequestedAt" IS NULL
+        AND (o.banned IS NOT TRUE
+          OR (o."banExpires" IS NOT NULL AND o."banExpires" < statement_timestamp()))) AS "ownerValid"
     FROM (VALUES (1)) AS singleton(value)
     LEFT JOIN model_api_token t ON t.id = ${input.modelApiTokenId}
-    LEFT JOIN "user" u ON u.id = ${input.requesterUserId}`;
+    LEFT JOIN "user" u ON u.id = ${input.requesterUserId}
+    LEFT JOIN "user" o ON o.id = ${input.ownerUserId}`;
   return validity;
 }
 
@@ -507,6 +537,7 @@ function requesterValidityDenial(
 ): ExternalConsentStateDenial | null {
   if (input.modelApiTokenId && validity?.tokenValid !== true) return "TOKEN_CONSENT_WITHDRAWN";
   if (validity?.requesterValid !== true) return "REQUESTER_ACCESS_BLOCKED";
+  if (validity?.ownerValid !== true) return "POOL_OWNER_INACTIVE";
   return null;
 }
 
@@ -543,6 +574,8 @@ function callerConsentDenial(
  *     for ALLOWLIST tokens still lists this pool with `includeExternal`;
  *   - account (every requester, including Chat Test): the requester's user
  *     row exists, is not banned and has no deletion mark;
+ *   - owner (#76): the pool owner's user row exists, is not banned (active
+ *     ban) and has no deletion mark;
  *   - visibility (any requester that is not the pool owner, including Chat
  *     Test): the requester still holds the exact grant (`accessGrantId`) the
  *     request was resolved under, from this pool's owner.
@@ -566,7 +599,7 @@ export async function readExternalConsentDenial(
  * `:external` send (owner's `fallbackEnabled`, `fallbackForGrantees` for a
  * grantee, the requester's exact grant, the token's `allowExternal`,
  * revocation, expiry and ALLOWLIST `includeExternal`, and the requester's
- * account state) inside the caller's send-claim transaction, holding the
+ * and the pool owner's account state) inside the caller's send-claim transaction, holding the
  * pool, grant, token and allowlist rows FOR SHARE until it commits.
  *
  * Serialization: every consent withdrawal on those rows is an UPDATE or
@@ -579,8 +612,8 @@ export async function readExternalConsentDenial(
  * grant plus an INSERT of another id, so it is seen as the id mismatch.
  *
  * Two conditions are not frozen by these locks: time (token `expiresAt`, ban
- * expiry) and the requester's user row (ban, deletion mark), which this
- * transaction deliberately does not lock. Both are evaluated here as an early
+ * expiry) and the requester's and the pool owner's user rows (ban, deletion
+ * mark), which this transaction deliberately does not lock. Both are evaluated here as an early
  * refusal and evaluated again by {@link recheckExternalSendRequesterValidity}
  * after the last lock wait of the transaction.
  *
@@ -626,10 +659,11 @@ export async function lockExternalSendConsent(
  * E0 send boundary, part 2: the caller runs this after the last statement of
  * the send-claim transaction that can wait on a lock (the provider
  * account/credential FOR UPDATE) and before the durable claim. It re-reads
- * the token and the requester's account and evaluates their validity in one
- * SQL statement against statement_timestamp(), so a token that expired, or an
- * account that was banned or marked for deletion while the transaction waited on provider
- * locks is refused before anything is claimed or sent.
+ * the token, the requester's account and the pool owner's account and
+ * evaluates their validity in one SQL statement against
+ * statement_timestamp(), so a token that expired, or a requester or owner
+ * account that was banned or marked for deletion while the transaction waited
+ * on provider locks is refused before anything is claimed or sent.
  *
  * No user-row lock: every statement after this read (the credential re-read,
  * the `lastUsedAt` write on a row this transaction already holds FOR UPDATE,
@@ -689,29 +723,48 @@ export async function authenticateModelApiTokenSecret(
     return null;
   }
 
-  const updated = await prisma.modelApiToken.update({
-    where: { id: token.id },
-    data: { lastUsedAt: new Date() },
-    select: {
-      id: true,
-      userId: true,
-      scopeMode: true,
-      allowExternal: true,
-      lookupPrefix: true,
-      expiresAt: true,
-      lastUsedAt: true,
-    },
-  });
+  const lastUsedAt = await touchModelApiTokenLastUsedAt(token.id, token.lastUsedAt);
 
   return {
-    id: updated.id,
-    userId: updated.userId,
-    scopeMode: String(updated.scopeMode) as ModelApiTokenScopeMode,
-    allowExternal: updated.allowExternal === true,
-    lookupPrefix: updated.lookupPrefix,
-    expiresAt: updated.expiresAt,
-    lastUsedAt: updated.lastUsedAt,
+    id: token.id,
+    userId: token.userId,
+    scopeMode: String(token.scopeMode) as ModelApiTokenScopeMode,
+    allowExternal: token.allowExternal === true,
+    lookupPrefix: token.lookupPrefix,
+    expiresAt: token.expiresAt,
+    lastUsedAt,
   };
+}
+
+/** `lastUsedAt` is display metadata: record it at most once per this interval. */
+export const MODEL_API_TOKEN_LAST_USED_DEBOUNCE_MS = 60_000;
+
+/**
+ * Records token use without ever waiting on a row lock (L1b, #64). The E0
+ * send claim holds the token row FOR SHARE while it waits on the provider
+ * account (capacity-lock-order.ts, C3), and FOR SHARE conflicts with the FOR
+ * NO KEY UPDATE of this write. A token that serves local traffic must never
+ * queue behind provider contention, so the write is debounced (at most once
+ * per MODEL_API_TOKEN_LAST_USED_DEBOUNCE_MS) and skips a locked row: a skipped
+ * or debounced request leaves the previous value, and a later request records
+ * it. Takes no other lock and holds nothing afterwards (autocommit).
+ */
+async function touchModelApiTokenLastUsedAt(
+  tokenId: string,
+  previous: Date | null,
+): Promise<Date | null> {
+  const now = new Date();
+  if (previous && now.getTime() - previous.getTime() < MODEL_API_TOKEN_LAST_USED_DEBOUNCE_MS)
+    return previous;
+  const threshold = new Date(now.getTime() - MODEL_API_TOKEN_LAST_USED_DEBOUNCE_MS);
+  const updated = await prisma.$executeRaw`
+    UPDATE model_api_token SET "lastUsedAt" = ${now}
+     WHERE id = (
+       SELECT id FROM model_api_token
+        WHERE id = ${tokenId}
+          AND ("lastUsedAt" IS NULL OR "lastUsedAt" <= ${threshold})
+        FOR NO KEY UPDATE SKIP LOCKED)`;
+  return updated > 0 ? now : previous;
 }
 
 export function digestModelApiTokenSecret(rawSecret: string): string {
