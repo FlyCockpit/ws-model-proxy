@@ -1638,20 +1638,28 @@ mod signal_shutdown {
         assert_clean_shutdown(&mut setup, &shell, &grand, 15);
     }
 
-    /// Daemon exit during a custom metric source run must not orphan the
-    /// command's process group (it runs arbitrary commands, in its own group).
-    #[test]
-    fn sigterm_kills_a_running_metric_source_group() {
+    /// A relay whose custom metric source is running: hello.ok has been sent
+    /// (which starts telemetry), and the command's shell and background child
+    /// pids are known.
+    struct SourceRun {
+        setup: Setup,
+        socket: TcpStream,
+        shell: String,
+        grand: String,
+        _pids: tempfile::TempDir,
+    }
+
+    fn start_relay_with_running_source() -> SourceRun {
         // The source's environment is scrubbed, so the command names its files.
         let pids = tempfile::tempdir().expect("tempdir");
-        let pids = pids.path().canonicalize().expect("canonical tempdir");
-        let mut setup = start_relay_with(
+        let dir = pids.path().canonicalize().expect("canonical tempdir");
+        let setup = start_relay_with(
             &["connect"],
             json!({ "metrics": { "sources": { "slow": {
                 "command": format!(
                     "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
-                    pids.join("shell.pid").display(),
-                    pids.join("grand.pid").display()
+                    dir.join("shell.pid").display(),
+                    dir.join("grand.pid").display()
                 ),
                 "intervalSecs": 5,
                 "timeoutSecs": 300,
@@ -1679,24 +1687,58 @@ mod signal_shutdown {
             })
             .to_string(),
         );
-        let shell = wait_for_file(&pids.join("shell.pid"));
-        let grand = wait_for_file(&pids.join("grand.pid"));
+        let shell = wait_for_file(&dir.join("shell.pid"));
+        let grand = wait_for_file(&dir.join("grand.pid"));
         assert!(process_alive(&shell) && process_alive(&grand));
-        signal(setup.child.id(), "TERM");
-        let status = wait_for_exit(&mut setup.child);
+        SourceRun {
+            setup,
+            socket,
+            shell,
+            grand,
+            _pids: pids,
+        }
+    }
+
+    /// Daemon exit by a signal during a custom metric source run must not
+    /// orphan the command's process group (it runs arbitrary commands, in its
+    /// own group).
+    #[test]
+    fn sigterm_kills_a_running_metric_source_group() {
+        let mut run = start_relay_with_running_source();
+        signal(run.setup.child.id(), "TERM");
+        let status = wait_for_exit(&mut run.setup.child);
         assert!(
             status.signal() == Some(15) || status.code() == Some(143),
             "unexpected relay status {status:?}"
         );
-        wait_until_gone(&shell);
-        wait_until_gone(&grand);
+        wait_until_gone(&run.shell);
+        wait_until_gone(&run.grand);
+    }
+
+    /// The same for an exit that is not a signal: a fatal relay error ends the
+    /// daemon at once, before the sampler thread notices its session is gone.
+    #[test]
+    fn a_fatal_relay_error_kills_a_running_metric_source_group() {
+        let mut run = start_relay_with_running_source();
+        write_text(
+            &mut run.socket,
+            &json!({ "type": "protocol.error", "failure": "protocol_error", "message": "boom" })
+                .to_string(),
+        );
+        let status = wait_for_exit(&mut run.setup.child);
+        assert!(
+            status.code().is_some_and(|code| code != 0),
+            "the daemon exits with an error: {status:?}"
+        );
+        wait_until_gone(&run.shell);
+        wait_until_gone(&run.grand);
     }
 
     /// `wsmp metrics test` runs the command in its own process group, which a
-    /// terminal's Ctrl-C does not reach: the signal must still end it.
+    /// terminal's Ctrl-C does not reach: a signal must still end it.
     #[test]
-    fn sigint_during_metrics_test_kills_the_command_group() {
-        if inherited_ignored(2) {
+    fn a_signal_during_metrics_test_kills_the_command_group() {
+        if inherited_ignored(15) {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1728,10 +1770,10 @@ mod signal_shutdown {
             .expect("start metrics test");
         let shell = wait_for_file(&dir.join("shell.pid"));
         let grand = wait_for_file(&dir.join("grand.pid"));
-        signal(child.id(), "INT");
+        signal(child.id(), "TERM");
         let status = wait_for_exit(&mut child);
         assert!(
-            status.signal() == Some(2) || status.code() == Some(130),
+            status.signal() == Some(15) || status.code() == Some(143),
             "unexpected status {status:?}"
         );
         wait_until_gone(&shell);

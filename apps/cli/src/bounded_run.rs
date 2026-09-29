@@ -36,7 +36,7 @@
 //!
 //! # Daemon exit
 //! Each live run's process group is in a process-wide registry.
-//! [`kill_all_active`] (called on every way the process ends) kills them all
+//! [`kill_all_active`] (called on the first shutdown signal and by `main` before it exits) kills them all
 //! and refuses later runs, so an exiting daemon does not orphan the group of
 //! a command that was running. `SIGKILL` of the daemon itself cannot be
 //! caught and can still leave a group behind for up to its timeout.
@@ -109,6 +109,11 @@ fn register(pid: u32) -> bool {
 
 fn unregister(pid: u32) {
     registry().groups.remove(&pid);
+}
+
+/// Runs in flight (registered and not yet finished).
+pub fn active_runs() -> usize {
+    registry().groups.len()
 }
 
 /// Kill the process group of every run in flight and refuse later runs. Call

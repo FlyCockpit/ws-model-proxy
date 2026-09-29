@@ -50,6 +50,9 @@ export function parseLabelText(text: string): Record<string, string> | null {
     const [key, value, ...rest] = part.split("=").map((piece) => piece.trim());
     if (rest.length > 0 || !key || value === undefined) return null;
     if (!METRIC_NAME.test(key) || !METRIC_NAME.test(value)) return null;
+    // `labels.__proto__ = "x"` would set nothing and silently widen the rule;
+    // the server rejects this key too.
+    if (key === "__proto__") return null;
     labels[key] = value;
   }
   return Object.keys(labels).length <= 16 ? labels : null;

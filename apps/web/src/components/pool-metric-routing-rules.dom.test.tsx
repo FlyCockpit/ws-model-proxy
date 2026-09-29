@@ -196,5 +196,9 @@ describe("parseLabelText", () => {
     expect(parseLabelText("gpu")).toBeNull();
     expect(parseLabelText("gpu=0=1")).toBeNull();
     expect(parseLabelText('gpu="0"')).toBeNull();
+    // `__proto__` would be dropped, widening the rule: refuse it like the server.
+    expect(parseLabelText("__proto__=x")).toBeNull();
+    expect(parseLabelText("gpu=0, __proto__=x")).toBeNull();
+    expect(parseLabelText("_proto__=x")).toEqual({ _proto__: "x" });
   });
 });

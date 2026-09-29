@@ -60,9 +60,6 @@ pub fn signal_of(err: &anyhow::Error) -> Option<i32> {
 /// End the process the way `signal` would have: re-raise it with its default
 /// action, falling back to exit status `128 + signal`.
 pub fn terminate_by_signal(signal: i32) -> ! {
-    // A custom metric source or `nvidia-smi` may be running: end its process
-    // group now, whichever path (graceful or forced) got here.
-    crate::bounded_run::kill_all_active();
     #[cfg(unix)]
     unix::raise_default(signal);
     std::process::exit(128_i32.saturating_add(signal))
