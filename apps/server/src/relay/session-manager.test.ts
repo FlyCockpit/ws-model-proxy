@@ -832,6 +832,66 @@ describe("revoked credentials", () => {
     manager.dispose();
   });
 
+  it("does not install an older hello over a newer generation that was detached and settled first", async () => {
+    // A commits generation 1 but its result is delayed. B commits generation 2
+    // and its socket closes mid-registration, so B settles (no owner installed
+    // yet) and records the device DISCONNECTED at generation 2. When A resumes
+    // it must not become the owner: its heartbeats (fenced at generation 1)
+    // would be refused forever while the row says DISCONNECTED.
+    const row = { generation: 0, status: "CONNECTED" };
+    db.cliDevice.upsert.mockImplementation(async () => {
+      row.generation += 1;
+      row.status = "CONNECTED";
+      return {
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        connectionGeneration: row.generation,
+      };
+    });
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const { where, data } = arg as {
+        where: { connectionGeneration?: number };
+        data: { status?: string };
+      };
+      if (where.connectionGeneration !== undefined && where.connectionGeneration !== row.generation)
+        return { count: 0 };
+      if (data.status) row.status = data.status;
+      return { count: 1 };
+    });
+    const manager = new RelaySessionManager();
+    const a = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: a, identity: deviceIdentity("a"), now });
+    let releaseA: () => void = () => {};
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      const committed = await callback(db);
+      await gateA;
+      return committed;
+    });
+    const helloA = manager.handleTextFrame(a, helloFrame(), now);
+    await vi.waitFor(() => expect(row.generation).toBe(1));
+
+    const b = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: b, identity: deviceIdentity("b"), now });
+    const heldB = holdNextRegistration();
+    const helloB = manager.handleTextFrame(b, helloFrame(), now);
+    await heldB.started;
+    await manager.removeSession(b, now);
+    heldB.release();
+    await helloB;
+    expect(row).toEqual({ generation: 2, status: "DISCONNECTED" });
+
+    releaseA();
+    await helloA;
+    expect(a.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(a.sends.some((frame) => String(frame).includes("hello.ok"))).toBe(false);
+    manager.dispose();
+  });
+
   it("refuses a heartbeat write whose session generation was superseded", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

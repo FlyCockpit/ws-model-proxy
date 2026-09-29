@@ -718,6 +718,16 @@ describe("modelPoolRouting", () => {
       });
       expect(tx.$transaction).toHaveBeenCalledTimes(13);
 
+      // Lock timeouts do not use up the cap for other retryable errors: a
+      // single transient error after many lock timeouts still retries.
+      tx.$transaction.mockReset();
+      for (let i = 0; i < 6; i += 1) tx.$transaction.mockRejectedValueOnce(lockTimeout);
+      tx.$transaction.mockRejectedValueOnce(expired).mockResolvedValueOnce(true);
+      await expect(settle(disconnectCliDeviceAtGeneration(input))).resolves.toEqual({
+        value: true,
+      });
+      expect(tx.$transaction).toHaveBeenCalledTimes(8);
+
       // A lock that never clears is given up after the budget.
       tx.$transaction.mockReset();
       tx.$transaction.mockRejectedValue(lockTimeout);

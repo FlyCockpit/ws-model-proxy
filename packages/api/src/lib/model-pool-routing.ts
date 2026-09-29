@@ -945,6 +945,7 @@ export async function disconnectCliDeviceAtGeneration({
   // the disconnect (device left CONNECTED with no session).
   const lockRetryDeadline = Date.now() + DISCONNECT_LOCK_RETRY_BUDGET_MS;
   let failures = 0;
+  let otherFailures = 0;
   for (;;) {
     try {
       return await prisma.$transaction(
@@ -970,9 +971,12 @@ export async function disconnectCliDeviceAtGeneration({
       failures += 1;
       // Lock timeouts retry until the time budget ends; every other retryable
       // error is capped by count.
-      const exhausted = isLockTimeout(error)
+      const lockTimeout = isLockTimeout(error);
+      if (!lockTimeout) otherFailures += 1;
+      const exhausted = lockTimeout
         ? Date.now() >= lockRetryDeadline
-        : failures >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS || !isRetryableDisconnectError(error);
+        : otherFailures >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS ||
+          !isRetryableDisconnectError(error);
       if (exhausted) throw error;
       await new Promise((resolve) =>
         setTimeout(resolve, DISCONNECT_RETRY_BACKOFF_MS * Math.min(failures, 10)),

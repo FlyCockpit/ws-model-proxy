@@ -543,6 +543,14 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  /**
+   * Highest connection generation this process has installed or settled per
+   * device. Hello results can complete out of order, so an older-committed
+   * hello may resume after a newer one was detached and settled while no owner
+   * was installed; this remembers that the newer generation exists so the
+   * older one is not installed over it. Bounded (oldest entries evicted).
+   */
+  private latestGenerationByCliDeviceId = new Map<string, number>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
   /**
    * Shutdown drain flag, shared by the relay and the browser terminal hub.
@@ -692,11 +700,11 @@ export class RelaySessionManager {
           return;
         }
         const installed = this.sessionsByCliDeviceId.get(registration.cliDeviceId);
-        if (
-          installed &&
-          installed !== session &&
-          (installed.connectionGeneration ?? 0) > registration.connectionGeneration
-        ) {
+        const knownGeneration = Math.max(
+          installed && installed !== session ? (installed.connectionGeneration ?? 0) : 0,
+          this.latestGenerationByCliDeviceId.get(registration.cliDeviceId) ?? 0,
+        );
+        if (knownGeneration > registration.connectionGeneration) {
           // Hello results can complete out of order: a later-committed hello
           // already owns the device. This older one is superseded; it must
           // not replace the newer owner (whose durable fence is higher, so its
@@ -707,6 +715,7 @@ export class RelaySessionManager {
           socket.close(1000, "replaced");
           return;
         }
+        this.noteConnectionGeneration(registration.cliDeviceId, registration.connectionGeneration);
         session.cliDeviceId = registration.cliDeviceId;
         session.connectionGeneration = registration.connectionGeneration;
         session.cli = { slug: message.cli.slug };
@@ -1113,11 +1122,24 @@ export class RelaySessionManager {
    * session. Adoption never lowers a generation, and a later hello (any
    * replica) still increments past it.
    */
+  private noteConnectionGeneration(cliDeviceId: string, generation: number) {
+    const known = this.latestGenerationByCliDeviceId.get(cliDeviceId) ?? 0;
+    if (generation <= known) return;
+    // Re-insert so eviction (oldest first) tracks recency.
+    this.latestGenerationByCliDeviceId.delete(cliDeviceId);
+    this.latestGenerationByCliDeviceId.set(cliDeviceId, generation);
+    if (this.latestGenerationByCliDeviceId.size > 4096) {
+      const oldest = this.latestGenerationByCliDeviceId.keys().next().value;
+      if (oldest !== undefined) this.latestGenerationByCliDeviceId.delete(oldest);
+    }
+  }
+
   private async settleDetachedRegistration(
     cliDeviceId: string,
     now: Date,
     connectionGeneration: number,
   ) {
+    this.noteConnectionGeneration(cliDeviceId, connectionGeneration);
     const owner = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (owner) {
       if ((owner.connectionGeneration ?? 0) < connectionGeneration)
