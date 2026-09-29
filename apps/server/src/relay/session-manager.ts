@@ -15,8 +15,8 @@ import {
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
+  disconnectCliDeviceAtGeneration,
   markPoolMembersDueAfterCliReconnect,
-  markPoolMembersForCliUnavailable,
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
@@ -691,6 +691,22 @@ export class RelaySessionManager {
           );
           return;
         }
+        const installed = this.sessionsByCliDeviceId.get(registration.cliDeviceId);
+        if (
+          installed &&
+          installed !== session &&
+          (installed.connectionGeneration ?? 0) > registration.connectionGeneration
+        ) {
+          // Hello results can complete out of order: a later-committed hello
+          // already owns the device. This older one is superseded; it must
+          // not replace the newer owner (whose durable fence is higher, so its
+          // own disconnect would then be refused with no session serving the
+          // device). No await between this check and the install below.
+          this.sessionsBySocket.delete(socket);
+          clearTimeout(session.unauthenticatedTimer);
+          socket.close(1000, "replaced");
+          return;
+        }
         session.cliDeviceId = registration.cliDeviceId;
         session.connectionGeneration = registration.connectionGeneration;
         session.cli = { slug: message.cli.slug };
@@ -817,11 +833,18 @@ export class RelaySessionManager {
 
     if (message.type === "heartbeat") {
       session.lastHeartbeatAt = now;
-      await prisma.cliDevice.update({
-        where: { id: session.cliDeviceId },
-        data: { status: "CONNECTED", lastHeartbeatAt: now },
-        select: { id: true },
-      });
+      // Same durable fence as the disconnect: a heartbeat only refreshes the
+      // row while it still describes THIS session's connection (its
+      // generation, and not already disconnected/stale). A heartbeat whose
+      // dispatch was delayed past its own detach, or past a successor's
+      // registration, matches nothing instead of resurrecting CONNECTED.
+      // Fail closed: a session with no claimed generation writes nothing.
+      const generation = session.connectionGeneration;
+      if (generation !== null && Number.isInteger(generation) && generation >= 1)
+        await prisma.cliDevice.updateMany({
+          where: { id: session.cliDeviceId, connectionGeneration: generation, status: "CONNECTED" },
+          data: { lastHeartbeatAt: now },
+        });
       socket.send(
         encodeRelayServerControlMessage({
           type: "heartbeat.pong",
@@ -1062,18 +1085,14 @@ export class RelaySessionManager {
       connectionGeneration < 1
     )
       return;
-    const claimed = await prisma.cliDevice.updateMany({
-      where: { id: cliDeviceId, connectionGeneration },
-      data: { status: cliStatus, lastDisconnectedAt: now },
-    });
-    if (claimed.count === 0) return;
-    await markPoolMembersForCliUnavailable({
+    const applied = await disconnectCliDeviceAtGeneration({
       cliDeviceId,
-      failureClass,
       generation: connectionGeneration,
+      cliStatus,
+      failureClass,
       now,
     });
-    this.poolMemberRecovery.wake();
+    if (applied) this.poolMemberRecovery.wake();
   }
 
   /**
@@ -1084,20 +1103,27 @@ export class RelaySessionManager {
    *
    * The write is fenced by the registration's own generation: any successor —
    * in this process or another replica — has incremented the stored generation
-   * and this write matches no row. The in-memory check is a cheap in-process
-   * fast path for that same case, kept from before the fence.
+   * and this write matches no row (the row is left as the successor wrote it).
    *
-   * A process restart loses `sessionsByCliDeviceId`; then only the generation
-   * orders the writers, and a successor that had already committed before this
-   * stale undo leaves the row DISCONNECTED until its next heartbeat (the same
-   * self-healing window a stale hello always had).
+   * In-memory fast path: a live owner here was accepted under an OLDER
+   * generation than this registration (generations follow commit order, owners
+   * follow hello-processing order), so this commit superseded the owner's
+   * fence. The owner adopts the higher generation; otherwise its own later
+   * disconnect would match no row and the device would stay CONNECTED with no
+   * session. Adoption never lowers a generation, and a later hello (any
+   * replica) still increments past it.
    */
   private async settleDetachedRegistration(
     cliDeviceId: string,
     now: Date,
     connectionGeneration: number,
   ) {
-    if (this.sessionsByCliDeviceId.has(cliDeviceId)) return;
+    const owner = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (owner) {
+      if ((owner.connectionGeneration ?? 0) < connectionGeneration)
+        owner.connectionGeneration = connectionGeneration;
+      return;
+    }
     await this.writeDeviceDisconnected(cliDeviceId, {
       now,
       cliStatus: "DISCONNECTED",

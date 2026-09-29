@@ -578,6 +578,7 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
+        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
         OR: [
           {
             executionTargetId: { not: null },
@@ -599,6 +600,52 @@ describe("modelPoolRouting", () => {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
       }),
+    });
+  });
+
+  it("drops a relay disconnect outcome: the fenced device write owns that health", async () => {
+    db.poolMember.updateMany.mockReset();
+    db.poolMember.findUnique.mockReset();
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    const claimed = new Date(now.getTime() - 1_000);
+    const result = await recordPoolMemberRelayFailure({
+      poolMemberId: "member-id",
+      failure: "disconnected",
+      trialStartedAt: claimed,
+      now,
+    });
+    expect(result).toEqual({ retryable: true, update: null });
+    expect(db.poolMember.findUnique).not.toHaveBeenCalled();
+    // The only write is the trial giving itself back, fenced on its timestamp.
+    expect(db.poolMember.updateMany).toHaveBeenCalledTimes(1);
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "member-id", healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: claimed },
+      data: { halfOpenTrialStartedAt: null },
+    });
+    db.poolMember.updateMany.mockClear();
+    await recordPoolMemberRelayFailure({
+      poolMemberId: "member-id",
+      failure: "disconnected",
+      trialStartedAt: null,
+      now,
+    });
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps real failure provenance out of the disconnect write", async () => {
+    db.poolMember.updateMany.mockReset();
+    db.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    await markPoolMembersForCliUnavailable({
+      cliDeviceId: "cli-1",
+      failureClass: "STALE_SESSION",
+      generation: 2,
+      now,
+    });
+    const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
+    expect(where?.NOT).toEqual({
+      healthStatus: "UNHEALTHY",
+      nextRetryAt: { gt: now },
+      lastFailureClass: { not: null, notIn: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
     });
   });
 

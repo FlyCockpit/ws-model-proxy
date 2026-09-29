@@ -37,6 +37,8 @@ export const poolMemberFailureClasses = [
   "UPSTREAM_5XX",
 ] as const;
 export type PoolMemberFailureClass = (typeof poolMemberFailureClasses)[number];
+/** Failure classes that mean "the device is away", not an upstream/transport failure. */
+const cliUnavailableFailureClasses = ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] as const;
 
 export const relayFailureClasses = [
   "transport",
@@ -576,6 +578,17 @@ export async function recordPoolMemberRelayFailure({
   const failureClass = poolMemberFailureClassForRelayFailure(failure);
   if (!failureClass) return { retryable: false, update: null };
 
+  // A relay `disconnected` outcome is the in-flight echo of a device detach,
+  // and the detach's own fenced write (`disconnectCliDeviceAtGeneration`) is
+  // the single owner of "device unavailable" member health. Writing it here
+  // too, from a request that outlived its connection, would land after a
+  // reconnect and re-impose a cooldown the fence exists to prevent. Give any
+  // claimed trial back (its own timestamp fence) and record nothing.
+  if (failureClass === "WEBSOCKET_DISCONNECTED") {
+    if (trialStartedAt) await releasePoolMemberHalfOpenTrial({ poolMemberId, trialStartedAt });
+    return { retryable: true, update: null };
+  }
+
   // Read-modify-write, versioned on the fields the transition reads: a
   // concurrent writer makes the update match 0 rows and we re-read (bounded to
   // 3 rounds; a writer that loses all of them implies >= 3 committed failures,
@@ -788,21 +801,42 @@ export async function resetPoolMemberHealthForDiscoveredModels(
  * in this process or another replica) matches no member row instead of
  * re-imposing the cooldown over the successor's due-write. There is no
  * unfenced variant, so a disconnect can never be written without the fence.
+ *
+ * Isolation: the `EXISTS` on the device row is read from the statement's
+ * snapshot, so on its own it does not stop a write that waited on a member row
+ * lock across a successor's commit. The caller MUST run this inside the same
+ * transaction as its fenced `cliDevice` update (device row locked first, then
+ * member rows: DL-1 order L0 then L7); the successor's registration then waits
+ * for that transaction and its due-write always runs after this write.
  */
 export async function markPoolMembersForCliUnavailable({
   cliDeviceId,
   failureClass,
   generation,
   now = new Date(),
+  db = prisma,
 }: {
   cliDeviceId: string;
   failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
   generation: number;
   now?: Date;
+  db?: Pick<typeof prisma, "poolMember">;
 }): Promise<void> {
   const endpointScope = { cliDeviceId, CliDevice: { connectionGeneration: generation } };
-  await prisma.poolMember.updateMany({
+  await db.poolMember.updateMany({
     where: {
+      // Real failure provenance survives a disconnect: a member circuit-open
+      // for a real upstream/transport failure with its cooldown still running
+      // keeps that class and cooldown, so the reconnect due-write (which only
+      // touches disconnect-class members) cannot cut it short. Members that
+      // were healthy, degraded, or whose cooldown ended are opened as before.
+      NOT: {
+        healthStatus: "UNHEALTHY",
+        nextRetryAt: { gt: now },
+        // `not: null` keeps a NULL class out of the exclusion: SQL `NOT (NULL AND ..)`
+        // would otherwise skip the row instead of opening it.
+        lastFailureClass: { not: null, notIn: [...cliUnavailableFailureClasses] },
+      },
       OR: [
         {
           executionTargetId: { not: null },
@@ -815,6 +849,43 @@ export async function markPoolMembersForCliUnavailable({
       ],
     },
     data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
+  });
+}
+
+/**
+ * The ONE persistence point for "no session serves this device" (status + pool
+ * member circuit-open). Returns false, writing nothing, when the device's
+ * stored `connectionGeneration` is no longer `generation` (a successor hello
+ * committed, in this process or another replica).
+ *
+ * One transaction, device row first: the fenced UPDATE locks `cli_device`, so
+ * a successor's registration upsert waits for this transaction and its
+ * reconnect due-write always runs after our member write; member rows are
+ * locked only afterwards (DL-1 order L0 then L7). Two autocommit statements
+ * would let the member UPDATE, blocked on a member row lock, land after the
+ * successor committed (its `EXISTS` reads the statement snapshot).
+ */
+export async function disconnectCliDeviceAtGeneration({
+  cliDeviceId,
+  generation,
+  cliStatus,
+  failureClass,
+  now = new Date(),
+}: {
+  cliDeviceId: string;
+  generation: number;
+  cliStatus: "DISCONNECTED" | "STALE";
+  failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+  now?: Date;
+}): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    const claimed = await tx.cliDevice.updateMany({
+      where: { id: cliDeviceId, connectionGeneration: generation },
+      data: { status: cliStatus, lastDisconnectedAt: now },
+    });
+    if (claimed.count === 0) return false;
+    await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, generation, now, db: tx });
+    return true;
   });
 }
 

@@ -569,6 +569,183 @@ describe("revoked credentials", () => {
     manager.dispose();
   });
 
+  describe("device generation follows commit order, owners follow hello order", () => {
+    /** A stateful CliDevice row: upsert bumps the generation, updateMany applies only on a match. */
+    function modelDeviceRow() {
+      const row = { generation: 0, status: "CONNECTED" };
+      db.cliDevice.upsert.mockImplementation(async () => {
+        row.generation += 1;
+        row.status = "CONNECTED";
+        return {
+          id: "cli-device-id",
+          userId: "user-id",
+          slug: "desktop",
+          connectionGeneration: row.generation,
+        };
+      });
+      db.cliDevice.updateMany.mockImplementation(async (arg) => {
+        const { where, data } = arg as {
+          where: { connectionGeneration?: number };
+          data: { status?: string };
+        };
+        if (
+          where.connectionGeneration !== undefined &&
+          where.connectionGeneration !== row.generation
+        )
+          return { count: 0 };
+        if (data.status) row.status = data.status;
+        return { count: 1 };
+      });
+      return row;
+    }
+
+    // Each row: which hello ends up detached, and whether it commits before
+    // or after the live owner's hello. Every row leaves the row CONNECTED
+    // with a stale owner fence on the old code; the owner's own later
+    // disconnect must still be recorded.
+    it.each([
+      {
+        name: "a detached hello commits above a live owner that predates it",
+        run: async (m: InstanceType<typeof RelaySessionManager>, owner: FakeSocket) => {
+          const detached = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: detached, identity, now });
+          const held = holdNextRegistration();
+          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          await held.started;
+          await m.removeSession(detached, now);
+          held.release();
+          await hello;
+          return owner;
+        },
+        ownerFirst: true,
+      },
+      {
+        name: "a detached hello commits after the owner's hello took over",
+        run: async (m: InstanceType<typeof RelaySessionManager>) => {
+          const detached = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: detached, identity: deviceIdentity("old"), now });
+          const held = holdNextRegistration();
+          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          await held.started;
+          await m.removeSession(detached, now);
+          const current = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
+          await m.handleTextFrame(current, helloFrame(), now);
+          held.release();
+          await hello;
+          return current;
+        },
+        ownerFirst: false,
+      },
+    ])("records the owner's disconnect when $name", async ({ run, ownerFirst }) => {
+      const row = modelDeviceRow();
+      const manager = new RelaySessionManager();
+      const first = new FakeSocket();
+      if (ownerFirst) {
+        manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+        await manager.handleTextFrame(first, helloFrame(), now);
+      }
+      const owner = await run(manager, first);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+      // The detached registration committed above the owner's accepted generation.
+      expect(row.generation).toBe(2);
+
+      const closedAt = new Date(now.getTime() + 2_000);
+      await manager.removeSession(owner, closedAt);
+
+      expect(manager.getActiveCliDeviceIds()).toEqual([]);
+      expect(row.status).toBe("DISCONNECTED");
+      expect(db.cliDevice.updateMany).toHaveBeenLastCalledWith({
+        where: { id: "cli-device-id", connectionGeneration: 2 },
+        data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
+      });
+      manager.dispose();
+    });
+  });
+
+  it("does not let an older hello result replace a newer committed owner", async () => {
+    // Hello results complete out of order: generation 2 commits but its
+    // continuation is delayed; generation 3 commits and installs. The older
+    // result must not close the newer socket or take ownership, or the newer
+    // owner's disconnect (fenced at 3) would be the one refused later.
+    const row = { generation: 0, status: "CONNECTED" };
+    db.cliDevice.upsert.mockImplementation(async () => {
+      row.generation += 1;
+      return {
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        connectionGeneration: row.generation,
+      };
+    });
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const { where, data } = arg as {
+        where: { connectionGeneration?: number };
+        data: { status?: string };
+      };
+      if (where.connectionGeneration !== undefined && where.connectionGeneration !== row.generation)
+        return { count: 0 };
+      if (data.status) row.status = data.status;
+      return { count: 1 };
+    });
+    const manager = new RelaySessionManager();
+    const older = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: older, identity: deviceIdentity("old"), now });
+    let releaseOlder: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      const committed = await callback(db);
+      await gate; // committed at generation 1, result returned late
+      return committed;
+    });
+    const olderHello = manager.handleTextFrame(older, helloFrame(), now);
+    await vi.waitFor(() => expect(row.generation).toBe(1));
+
+    const newer = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: newer, identity: deviceIdentity("new"), now });
+    await manager.handleTextFrame(newer, helloFrame(), now);
+    expect(row.generation).toBe(2);
+    releaseOlder();
+    await olderHello;
+
+    expect(newer.closes).toEqual([]);
+    expect(older.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+    expect(older.sends.some((frame) => String(frame).includes("hello.ok"))).toBe(false);
+
+    await manager.removeSession(newer, new Date(now.getTime() + 1_000));
+    expect(row.status).toBe("DISCONNECTED");
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("refuses a heartbeat write whose session generation was superseded", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    // The stored row moved to generation 2 (successor) or is no longer
+    // CONNECTED: the fenced heartbeat matches nothing and cannot resurrect it.
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const where = (arg as { where: { connectionGeneration?: number; status?: string } }).where;
+      return { count: where.connectionGeneration === 2 && where.status === "CONNECTED" ? 1 : 0 };
+    });
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "heartbeat", id: "hb" }),
+      new Date(now.getTime() + 1_000),
+    );
+    expect(db.cliDevice.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1, status: "CONNECTED" },
+      data: { lastHeartbeatAt: new Date(now.getTime() + 1_000) },
+    });
+    // Still answers the CLI, so a fenced write never turns into a fatal error.
+    expect(JSON.parse(String(socket.sends.at(-1))).type).toBe("heartbeat.pong");
+    manager.dispose();
+  });
+
   it("does not answer an inventory update whose socket was closed mid-write", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
@@ -846,10 +1023,10 @@ describe("RelaySessionManager", () => {
       heartbeatAt,
     );
 
-    expect(db.cliDevice.update).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
-      data: { status: "CONNECTED", lastHeartbeatAt: heartbeatAt },
-      select: { id: true },
+    // Fenced by this session's connection generation and a still-CONNECTED row.
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1, status: "CONNECTED" },
+      data: { lastHeartbeatAt: heartbeatAt },
     });
     expect(JSON.parse(String(socket.sends.at(-1)))).toEqual({
       type: "heartbeat.pong",
@@ -873,6 +1050,7 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
+        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
         OR: [
           {
             executionTargetId: { not: null },
@@ -1172,6 +1350,7 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
+        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
         OR: [
           {
             executionTargetId: { not: null },
