@@ -2878,9 +2878,11 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines: the record's
-    // `type` is its terminal event, so the observation completes.
-    expect(settled.observationComplete).toBe(true);
+    // OpenRouter's Responses stream sends no `event:` lines and its terminal is
+    // deliberately not recognised (read to EOF, full hold): the observation
+    // completes only where the terminal is named (Messages `message_stop`,
+    // Chat `[DONE]`).
+    expect(settled.observationComplete).toBe(surface !== "openai-responses");
   });
 
   it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
@@ -2906,14 +2908,13 @@ describe("OpenRouter owner-paid settlement", () => {
     expect(settled.observationComplete).toBe(false);
   });
 
-  // AC 13: the event-less Responses terminal fallback is provider-agnostic.
-  // `classifyTerminalRecord` is keyed on the surface, so a non-OpenRouter
-  // Responses stream that omits `event:` lines completes the same way.
-  it.each(["openai", "openai-compatible"] as const)(
-    "completes an event-less Responses terminal for the %s provider type",
+  // AC 13: an event-less (data-only) Responses record is never a terminal, for
+  // any provider type: recognising one would cut the read off at the first
+  // such record and make billing depend on transport chunking.
+  it.each(["openrouter", "openai", "openai-compatible"] as const)(
+    "does not complete an event-less Responses terminal for the %s provider type",
     async (providerType) => {
-      // Strip the trailing `data: [DONE]` sentinel: it is a terminal on other
-      // surfaces and would mask a missing Responses recognition.
+      // Strip the trailing `data: [DONE]` sentinel so nothing else ends the stream.
       const raw = readFileSync(
         new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
         "utf8",
@@ -2926,11 +2927,7 @@ describe("OpenRouter owner-paid settlement", () => {
         "owner",
         "openai-responses",
       );
-      expect(settled).toMatchObject({
-        userId: "owner",
-        poolId: "pool",
-        observationComplete: true,
-      });
+      expect(settled.observationComplete).toBe(false);
     },
   );
 
@@ -2955,28 +2952,6 @@ describe("OpenRouter owner-paid settlement", () => {
       "anthropic-messages",
     );
     expect(settled.observationComplete).toBe(false);
-  });
-
-  // G1-1: a type-only Responses `error` record is a terminal FAILED. The
-  // stream carries a later `response.completed`, so a regression that stops
-  // classifying the error would settle the success instead.
-  it("fails a Responses stream whose type-only error record precedes a success", async () => {
-    const raw = readFileSync(
-      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
-      "utf8",
-    );
-    const withError = raw.replace(
-      /data: \{"type":"response\.completed"/,
-      'data: {"type":"error","error":{"message":"upstream failed"}}\n\ndata: {"type":"response.completed"',
-    );
-    expect(withError).not.toBe(raw);
-    const settled = await settleOwnerStream(
-      "openrouter",
-      [Buffer.from(withError)],
-      "owner",
-      "openai-responses",
-    );
-    expect(settled).toMatchObject({ reason: "FAILED", observationComplete: false });
   });
 
   it.each([

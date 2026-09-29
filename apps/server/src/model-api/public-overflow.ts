@@ -1689,15 +1689,18 @@ function classifyTerminalRecord(
   try {
     const value = JSON.parse(record.data) as Record<string, unknown>;
     const dataType = typeof value.type === "string" ? value.type : undefined;
-    // Messages names its events; a Responses record may omit the `event:`
-    // line (OpenRouter's stream does), and its `type` is then the event. An
-    // explicit `event:` that disagrees with `type` is never a terminal.
-    const event = record.event ?? (surface === "openai-responses" ? dataType : undefined);
-    if (!event || event !== dataType) return undefined;
-    if (event === "error") return "FAILED";
-    if (surface === "anthropic-messages") return event === "message_stop" ? "SUCCESS" : undefined;
-    if (event === "response.completed") return "SUCCESS";
-    if (["response.failed", "response.cancelled", "response.incomplete"].includes(event))
+    // A terminal needs an explicit `event:` line that agrees with the record's
+    // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
+    // its terminal is deliberately NOT recognised (the stream is read to EOF and
+    // the full hold stays): recognising a data-only record as a terminal cuts
+    // the read off at the first such record, which makes billing depend on
+    // transport chunking and lets a mismatching record's usage stand.
+    if (!record.event || record.event !== dataType) return undefined;
+    if (record.event === "error") return "FAILED";
+    if (surface === "anthropic-messages")
+      return record.event === "message_stop" ? "SUCCESS" : undefined;
+    if (record.event === "response.completed") return "SUCCESS";
+    if (["response.failed", "response.cancelled", "response.incomplete"].includes(record.event))
       return "FAILED";
   } catch {
     return undefined;
@@ -1920,8 +1923,10 @@ function openRouterUsageRegressed(snapshot: unknown, final: unknown): boolean {
   const last = usageRecord(final);
   if (!early || !last) return true;
   return OPENROUTER_MONOTONIC_KEYS.some((key) => {
-    const before = usageInteger(early[key] ?? 0);
-    const after = usageInteger(last[key] ?? 0);
+    // An absent counter is zero; a PRESENT one (null included) must be a
+    // readable integer, or the snapshot cannot bound the final.
+    const before = Object.hasOwn(early, key) ? usageInteger(early[key]) : 0;
+    const after = Object.hasOwn(last, key) ? usageInteger(last[key]) : 0;
     return before === undefined || after === undefined || after < before;
   });
 }

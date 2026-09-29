@@ -249,6 +249,24 @@ describe("OpenRouter usage dialect", () => {
           return records;
         },
       ],
+      // C1a-1: an explicit null (or other unreadable) snapshot counter is not
+      // zero; only an ABSENT optional counter is.
+      ...(
+        [
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_creation_input_tokens",
+        ] as const
+      ).map((key): [string, () => unknown[]] => [
+        `a null message_start ${key}`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const start = records.find((record) => record.type === "message_start")!;
+          (start.message as { usage: Record<string, unknown> }).usage[key] = null;
+          return records;
+        },
+      ]),
       // C7-4 fail-closed: a non-object usage shape on either Messages usage
       // record cannot be read, so monotonicity cannot be verified and the
       // stream must not settle (an inverted shape check would settle the
