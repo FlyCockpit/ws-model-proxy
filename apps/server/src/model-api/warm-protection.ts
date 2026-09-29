@@ -393,11 +393,13 @@ type WarmSessionRow = {
 /**
  * Reads the warm set of the given member KV pools with one bounded,
  * non-locking query (indexed by `[executionTargetId, lastUsedAt]`). A session
- * is the set of records that carry one `sessionId` (a row without one is its
- * own session): its age is its newest record's, its size the largest
- * `estimatedTokens` among the records of that newest instant (every record of
- * a request carries the whole prompt estimate). Records from every pool of
- * the owner count, since they share the physical KV pool; each session's
+ * is the set of durable conversation/snapshot rows carrying one `sessionId`
+ * (a legacy row without one is its own session). Shared linked prefix and
+ * instruction hints do not establish warmth or ownership. Its age is its
+ * newest record's, its size the largest estimate at the newest eligible
+ * instant (including the snapshot's bounded size samples). A newer sub-floor
+ * turn refreshes the session's age while retaining the older eligible size.
+ * Records from every pool of the owner count, since they share the physical KV pool; each session's
  * override comes from its own pool (the tenant's grant, or the pool's owner
  * percent when the tenant is the owner). A session is `inFlight` when an
  * active lease of the same member holds a request that continues it.
@@ -425,30 +427,54 @@ export async function loadWarmSessions({
   const rows = await prisma.$queryRaw<WarmSessionRow[]>(Prisma.sql`
     WITH candidate AS (
       SELECT r.id, COALESCE(r."sessionId", r.id) AS "sessionKey",
-             r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
-             r."estimatedTokens", t."inferenceCapacityId" AS "capacityId"
+             r."tenantUserId", r."poolId", r."userId", r."executionTargetId",
+             r."bindingDigest", r."targetIdentity", size."lastUsedAt",
+             size."estimatedTokens", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
+        CROSS JOIN LATERAL (
+          SELECT r."lastUsedAt", r."estimatedTokens"
+          UNION ALL
+          -- Each snapshot contributes only its latest estimate and its newest
+          -- eligible sample, rather than expanding all 64 into the window sort.
+          (SELECT sample.time, sample.tokens
+             FROM unnest(r."sessionTokenTimes", r."sessionTokenEstimates") AS sample(time, tokens)
+            WHERE sample.time >= ${since}
+              AND sample.time + (r."expiresAt" - r."lastUsedAt") > ${now}
+              AND sample.tokens >= ${policy.minTokens}
+            ORDER BY sample.time DESC, sample.tokens DESC
+            LIMIT 1)
+        ) size
        WHERE r."userId" = ${ownerId}
          AND t."userId" = ${ownerId}
          AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
-         -- Sub-floor records never make a session eligible on their own, so
-         -- they are dropped here to keep the scan cheap. (A session whose
-         -- latest turn shrank below the floor keeps its older, larger turn as
-         -- its size: the engine still holds that longer prefix.)
-         AND r."estimatedTokens" >= ${policy.minTokens}
+         -- Shared hints can change owner on refresh. Only durable conversation
+         -- rows represent linked sessions; null-session legacy rows stand alone.
+         AND (r."prefixDigest" IS NULL OR r."sessionId" IS NULL)
+    ),
+    dated AS (
+      SELECT c.*,
+             MAX(c."lastUsedAt") OVER (
+               PARTITION BY c."sessionKey", c."capacityId", c."tenantUserId", c."poolId",
+                            c."executionTargetId", c."bindingDigest", c."targetIdentity"
+             ) AS "newestUsedAt"
+        FROM candidate c
     ),
     session AS (
-      -- One session per session id: its latest turn (the newest instant of
-      -- its records; the largest estimate among that instant's records, since
-      -- every record of a request carries the whole prompt estimate).
-      SELECT DISTINCT ON (c."sessionKey")
+      -- A sub-floor latest turn refreshes age but keeps the previous eligible
+      -- size: the engine may still hold the larger prefix. Same-instant sizes
+      -- use MAX via the ordering. Scope keys prevent aliased ids crossing pools.
+      SELECT DISTINCT ON (c."sessionKey", c."capacityId", c."tenantUserId", c."poolId",
+                          c."executionTargetId", c."bindingDigest", c."targetIdentity")
              c."sessionKey", c."capacityId", c."tenantUserId", c."poolId", c."userId",
-             c."lastUsedAt", c."estimatedTokens" AS tokens
-        FROM candidate c
-       ORDER BY c."sessionKey", c."lastUsedAt" DESC, c."estimatedTokens" DESC
+             c."newestUsedAt" AS "lastUsedAt", c."estimatedTokens" AS tokens
+        FROM dated c
+       WHERE c."estimatedTokens" >= ${policy.minTokens}
+       ORDER BY c."sessionKey", c."capacityId", c."tenantUserId", c."poolId",
+                c."executionTargetId", c."bindingDigest", c."targetIdentity",
+                c."lastUsedAt" DESC, c."estimatedTokens" DESC
     ),
     served AS (
       -- Sessions an active lease of the same member is serving right now.

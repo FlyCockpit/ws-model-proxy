@@ -917,6 +917,7 @@ describe("model API routes", () => {
         ownerId: "user-id",
         resourceOwnerId: "user-id",
         accessGrantId: null,
+        requestId: "relay-request-id",
         target: expect.objectContaining({ executionTargetId: "member-b-target" }),
       }),
     );

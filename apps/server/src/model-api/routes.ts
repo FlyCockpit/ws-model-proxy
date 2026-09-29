@@ -6747,6 +6747,7 @@ async function relayPool({
                   policy: affinityPolicy,
                   surface: requestedSurface,
                   payload: affinityPayload,
+                  requestId: relayRequestId,
                   target: affinityTarget,
                   engineCacheConfirmed,
                   estimatedTokens: operation.contextCount?.tokens,

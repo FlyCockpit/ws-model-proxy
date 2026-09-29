@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import {
   asJson,
@@ -11,6 +11,72 @@ import {
 const DIGEST_VERSION = 4;
 const MAX_PREFIXES_PER_REQUEST = 64;
 const MAX_INSTRUCTION_PREFIXES = 8;
+const SESSION_RECORD_SELECT = {
+  id: true,
+  sessionId: true,
+  historyDigests: true,
+  explicitConversationDigest: true,
+  writeDigest: true,
+  lastUsedAt: true,
+  executionTargetId: true,
+  targetIdentity: true,
+  bindingDigest: true,
+  prefixDigest: true,
+  conversationDigest: true,
+  prefixDepth: true,
+  digestVersion: true,
+  engineCacheConfirmed: true,
+  estimatedTokens: true,
+} satisfies Prisma.CacheAffinityRecordSelect;
+
+type HistoryLookupScope = {
+  userId: string;
+  tenantUserId: string;
+  poolId: string;
+  executionTargetId: string;
+  targetIdentity: string;
+  bindingDigest: string;
+  now: Date;
+};
+
+type SnapshotMatch = Prisma.CacheAffinityRecordGetPayload<{ select: typeof SESSION_RECORD_SELECT }>;
+
+async function matchingHistorySnapshots(
+  client: Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw">,
+  scope: HistoryLookupScope,
+  historyDigests: readonly string[],
+) {
+  // Call only inside a transaction. Keep the GIN predicate separate from
+  // scope filters and discourage sequential scans locally: sparse array stats,
+  // a GIN pending list and LIMIT 2 otherwise let the planner scan every history.
+  // Digests already HMAC-bind the full scope; verify it outside the materialized
+  // index candidate query too. Its outer limit consumes only two matching rows,
+  // enough to prove ambiguity with one snapshot per session.
+  // At most 64 indexed probes return at most two snapshots per target.
+  await client.$executeRaw`SET LOCAL enable_seqscan = off`;
+  for (const digest of [...historyDigests].reverse()) {
+    const rows = await client.$queryRaw<SnapshotMatch[]>(Prisma.sql`
+      WITH matching AS MATERIALIZED (
+        SELECT id, "userId", "tenantUserId", "poolId", "expiresAt",
+               "sessionId", "historyDigests", "explicitConversationDigest", "writeDigest",
+               "lastUsedAt", "executionTargetId", "targetIdentity", "bindingDigest",
+               "prefixDigest", "conversationDigest", "prefixDepth", "digestVersion",
+               "engineCacheConfirmed", "estimatedTokens"
+          FROM cache_affinity_record
+         WHERE "historyDigests" && ARRAY[${digest}]::text[]
+      ) SELECT * FROM matching
+         WHERE "userId" = ${scope.userId} AND "tenantUserId" = ${scope.tenantUserId}
+           AND "poolId" = ${scope.poolId} AND "executionTargetId" = ${scope.executionTargetId}
+           AND "targetIdentity" = ${scope.targetIdentity} AND "bindingDigest" = ${scope.bindingDigest}
+           AND "digestVersion" = ${DIGEST_VERSION} AND "expiresAt" > ${scope.now}
+           AND "prefixDigest" IS NULL AND "sessionId" IS NOT NULL
+           AND "explicitConversationDigest" IS NULL
+         LIMIT 2
+    `);
+    if (rows.length) return rows;
+  }
+  return [];
+}
 const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
 
 export type AffinityPolicy = {
@@ -65,54 +131,86 @@ export type SessionIdentityRecord = {
   sessionId: string | null;
   prefixDigest: string | null;
   conversationDigest: string | null;
+  historyDigests?: readonly string[];
+  explicitConversationDigest?: string | null;
+  writeDigest?: string | null;
   lastUsedAt?: Date;
 };
 
 /**
- * The ONE place that decides which existing warm session a request continues
- * (routing reads it to link a lease to its session, and `rememberAffinity` to
- * stamp the records it writes). `records` are the target's stored records that
- * share the request's binding. Order of authority:
- * 1. the explicit conversation's own record (a caller-supplied conversation id
- *    is the session, whatever the history or the request parameters do);
- * 2. only for a continuation, the deepest cumulative-prefix record the
- *    request's history still contains (an edited or shortened history still
- *    shares its earlier prefix); most recently used among equal depths.
- * Instruction-layer records are not conversation evidence and never link.
- * Returns the record's `sessionId`, or its own id for rows from before
- * session ids existed; null = a new session.
+ * ONE identity decision for routing's lease link and rememberAffinity's writes.
+ * Callers scope live records to the tenant, pool, target, binding and version.
+ * Explicit ids only join their own conversation. Implicit continuations use
+ * the deepest shared cumulative history, independent of params/instructions.
+ * Exact prefixes also support legacy rows without history snapshots. Multiple
+ * sessions at the deepest depth are ambiguous: never guess by recency.
+ *
+ * Shared routing hints are mutable and cannot establish session ownership.
+ * New evidence comes from each session's latest durable snapshot; legacy
+ * null-session prefixes stand for their own row. Instruction digests are never
+ * supplied.
  */
 export function continuedSessionKey(
   records: readonly SessionIdentityRecord[],
   request: {
     conversationDigest: string | null;
     isContinuation: boolean;
-    /** Cumulative prefix digests of the request's conversation, depth = index + 1. */
     digests: readonly string[];
+    historyDigests: readonly string[];
+    /** Successful-request write identity, only supplied by rememberAffinity. */
+    writeDigest?: string;
   },
 ): string | null {
   const key = (record: SessionIdentityRecord) => record.sessionId ?? record.id;
-  const newest = (left: SessionIdentityRecord, right: SessionIdentityRecord) =>
-    (right.lastUsedAt?.getTime() ?? 0) - (left.lastUsedAt?.getTime() ?? 0);
+  const unique = (keys: Set<string>) => (keys.size === 1 ? [...keys][0]! : null);
+  if (request.writeDigest) {
+    const remembered = new Set(
+      records
+        .filter(
+          (record) =>
+            record.prefixDigest === null &&
+            record.writeDigest === request.writeDigest &&
+            (record.explicitConversationDigest ?? null) === request.conversationDigest,
+        )
+        .map(key),
+    );
+    if (remembered.size > 0) return unique(remembered);
+  }
   if (request.conversationDigest) {
-    const own = records
-      .filter(
-        (record) =>
-          record.prefixDigest === null && record.conversationDigest === request.conversationDigest,
-      )
-      .sort(newest)[0];
-    if (own) return key(own);
+    return unique(
+      new Set(
+        records
+          .filter((record) => {
+            if (record.prefixDigest !== null) return false;
+            return (
+              (record.explicitConversationDigest ?? record.conversationDigest) ===
+              request.conversationDigest
+            );
+          })
+          .map(key),
+      ),
+    );
   }
   if (!request.isContinuation) return null;
-  const depthByDigest = new Map(request.digests.map((digest, index) => [digest, index + 1]));
-  let best: { depth: number; record: SessionIdentityRecord } | null = null;
+  const prefixes = new Map(request.digests.map((digest, index) => [digest, index + 1]));
+  const history = new Map(request.historyDigests.map((digest, index) => [digest, index + 1]));
+  let bestDepth = 0;
+  const matches = new Set<string>();
   for (const record of records) {
-    const depth = record.prefixDigest ? (depthByDigest.get(record.prefixDigest) ?? 0) : 0;
-    if (depth === 0) continue;
-    if (!best || depth > best.depth || (depth === best.depth && newest(best.record, record) > 0))
-      best = { depth, record };
+    if (record.explicitConversationDigest) continue;
+    const snapshot = record.prefixDigest === null && record.sessionId !== null;
+    if (!snapshot && (record.sessionId !== null || record.prefixDigest === null)) continue;
+    const depth = snapshot
+      ? Math.max(0, ...(record.historyDigests ?? []).map((digest) => history.get(digest) ?? 0))
+      : (prefixes.get(record.prefixDigest!) ?? 0);
+    if (depth === 0 || depth < bestDepth) continue;
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      matches.clear();
+    }
+    matches.add(key(record));
   }
-  return best ? key(best.record) : null;
+  return unique(matches);
 }
 
 export function buildAffinityTargetIdentity(parts: {
@@ -195,6 +293,12 @@ export function affinityPrefixDigests({
   bindingDigest: string;
   instructionDigests: string[];
   digests: string[];
+  /**
+   * Cumulative digests of the conversation bound to the target binding only
+   * (not to tools, instructions or parameters): they link the turns of one
+   * conversation whose parameters changed (warm-session identity).
+   */
+  historyDigests: string[];
   conversationDigest: string | null;
   hasExplicitConversation: boolean;
   isContinuation: boolean;
@@ -236,6 +340,10 @@ export function affinityPrefixDigests({
     (index, cumulative) =>
       hmacValue(`prefix-binding:${prefixBindingDigest}\nprefix:${index}\n${cumulative}`),
   );
+  const historyDigests = cumulativePrefixDigests(
+    layers.conversationUnits.slice(0, MAX_PREFIXES_PER_REQUEST),
+    (index, cumulative) => hmacValue(`history-v4:${bindingDigest}\nprefix:${index}\n${cumulative}`),
+  );
   const textCap =
     layers.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
   const hmacInstructionUnits =
@@ -250,6 +358,7 @@ export function affinityPrefixDigests({
     bindingDigest,
     instructionDigests,
     digests,
+    historyDigests,
     isContinuation: layers.isContinuation,
     hasExplicitConversation: conversationSource !== undefined,
     conversationDigest:
@@ -333,7 +442,7 @@ export async function rankAffinityTargets({
       [...materialByIdentity.values()].flatMap(({ instructionDigests }) => instructionDigests),
     ),
   ];
-  const sessionDigests = [
+  const explicitDigests = [
     ...new Set(
       [...materialByIdentity.values()]
         .filter(({ hasExplicitConversation }) => hasExplicitConversation)
@@ -346,12 +455,12 @@ export async function rankAffinityTargets({
   if (
     conversationPrefixDigests.length === 0 &&
     instructionPrefixDigests.length === 0 &&
-    sessionDigests.length === 0
+    explicitDigests.length === 0
   ) {
     return unchanged;
   }
 
-  const [records, activeLoads, waitingLoads] = await Promise.all([
+  const [hintRecords, historyRecords, activeLoads, waitingLoads] = await Promise.all([
     prisma.cacheAffinityRecord.findMany({
       where: {
         userId: resourceOwnerId,
@@ -360,26 +469,52 @@ export async function rankAffinityTargets({
         digestVersion: DIGEST_VERSION,
         expiresAt: { gt: now },
         executionTargetId: { in: targets.map(({ executionTargetId }) => executionTargetId) },
+        // Explicit ids do not encode the runtime binding. Scope that indexed
+        // lookup here too, rather than fetching snapshots from obsolete runtimes.
+        AND: [
+          {
+            OR: targets.map((target) => ({
+              executionTargetId: target.executionTargetId,
+              targetIdentity: target.targetIdentity,
+              bindingDigest: materialByIdentity.get(target.targetIdentity)!.bindingDigest,
+            })),
+          },
+        ],
         OR: [
           ...(prefixQueryDigests.length ? [{ prefixDigest: { in: prefixQueryDigests } }] : []),
-          ...(sessionDigests.length ? [{ conversationDigest: { in: sessionDigests } }] : []),
+          ...(explicitDigests.length
+            ? [
+                { explicitConversationDigest: { in: explicitDigests } },
+                // Existing explicit conversation rows remain an indexed fallback.
+                { conversationDigest: { in: explicitDigests } },
+              ]
+            : []),
         ],
       },
-      select: {
-        id: true,
-        sessionId: true,
-        lastUsedAt: true,
-        executionTargetId: true,
-        targetIdentity: true,
-        bindingDigest: true,
-        prefixDigest: true,
-        conversationDigest: true,
-        prefixDepth: true,
-        digestVersion: true,
-        engineCacheConfirmed: true,
-        estimatedTokens: true,
-      },
+      select: SESSION_RECORD_SELECT,
     }),
+    Promise.all(
+      targets.map((target) => {
+        const material = materialByIdentity.get(target.targetIdentity)!;
+        return material.isContinuation && !material.hasExplicitConversation
+          ? prisma.$transaction((tx) =>
+              matchingHistorySnapshots(
+                tx,
+                {
+                  userId: resourceOwnerId,
+                  tenantUserId: ownerId,
+                  poolId,
+                  executionTargetId: target.executionTargetId,
+                  targetIdentity: target.targetIdentity,
+                  bindingDigest: material.bindingDigest,
+                  now,
+                },
+                material.historyDigests,
+              ),
+            )
+          : [];
+      }),
+    ),
     prisma.capacityLease.groupBy({
       by: ["capacityId"],
       where: {
@@ -401,7 +536,9 @@ export async function rankAffinityTargets({
   ]);
   const activeByCapacity = new Map(activeLoads.map((row) => [row.capacityId, row._count._all]));
   const waitingByCapacity = new Map(waitingLoads.map((row) => [row.capacityId, row._count._all]));
-  const currentRecords = records.filter((record) => record.digestVersion === DIGEST_VERSION);
+  const currentRecords = [...hintRecords, ...historyRecords.flat()].filter(
+    (record) => record.digestVersion === DIGEST_VERSION,
+  );
   const scored = targets.map((target, originalIndex) => {
     const material = materialByIdentity.get(target.targetIdentity)!;
     const conversationDepthByDigest = new Map(
@@ -433,9 +570,13 @@ export async function rankAffinityTargets({
       0,
     );
     const scoredPrefixDepth = material.isContinuation ? conversationDepth : 0;
-    const conversation =
-      material.hasExplicitConversation &&
-      compatible.some((record) => record.conversationDigest === material.conversationDigest);
+    const sessionId = continuedSessionKey(compatible, {
+      conversationDigest: material.hasExplicitConversation ? material.conversationDigest : null,
+      isContinuation: material.isContinuation,
+      digests: material.digests,
+      historyDigests: material.historyDigests,
+    });
+    const conversation = material.hasExplicitConversation && sessionId !== null;
     const confirmed = compatible.some(
       (record) =>
         scoredPrefixDepth > 0 &&
@@ -454,14 +595,18 @@ export async function rankAffinityTargets({
     const matchedRecord =
       matchedPrefixRecord ??
       (conversation
-        ? compatible.find((record) => record.conversationDigest === material.conversationDigest)
+        ? compatible
+            .filter(
+              (record) =>
+                (record.sessionId ?? record.id) === sessionId && record.prefixDigest === null,
+            )
+            .sort(
+              (left, right) =>
+                (right.lastUsedAt?.getTime() ?? 0) - (left.lastUsedAt?.getTime() ?? 0) ||
+                (right.estimatedTokens ?? 0) - (left.estimatedTokens ?? 0),
+            )[0]
         : undefined);
     const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
-    const sessionId = continuedSessionKey(compatible, {
-      conversationDigest: material.hasExplicitConversation ? material.conversationDigest : null,
-      isContinuation: material.isContinuation,
-      digests: material.digests,
-    });
     const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
     const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
     const normalizedLoad = target.hardConcurrencyLimit
@@ -552,6 +697,7 @@ export async function rememberAffinity({
   payload,
   target,
   estimatedTokens,
+  requestId,
   engineCacheConfirmed,
   now = new Date(),
 }: {
@@ -565,6 +711,8 @@ export async function rememberAffinity({
   payload: Record<string, unknown>;
   target: AffinityTarget;
   estimatedTokens?: number;
+  /** Stable relay request id: repeated completion writes must not create sessions. */
+  requestId?: string;
   /**
    * Latest engine cache evidence from the served response. `true` (cached
    * prompt tokens reported) and `false` (cache fields reported with zero)
@@ -592,11 +740,16 @@ export async function rememberAffinity({
   ) {
     return;
   }
+  const writeDigest = requestId
+    ? hmacValue(
+        `affinity-session-write-v1:${material.bindingDigest}:${target.executionTargetId}:${requestId}`,
+      )
+    : undefined;
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
-  // Every record this call writes (created or refreshed) carries the same
-  // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
-  // ./warm-protection.ts) groups records into one session by the id, dates it
-  // by its newest record and sizes it by that instant's `estimatedTokens`.
+  // Shared prefix/instruction rows are routing hints, not durable identity.
+  // One snapshot per session retains ownership, age and size even when
+  // another conversation refreshes every shared hint. All writes and identity
+  // lookup run under the pool lock, including explicit conversation anchors.
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
     // requests cannot race past the configured bound. FOR NO KEY UPDATE still
@@ -619,40 +772,75 @@ export async function rememberAffinity({
     });
     // The session this request continues (or a new one), read under the pool
     // lock so concurrent writers of one conversation agree on it.
-    const sessionId =
-      continuedSessionKey(
-        await tx.cacheAffinityRecord.findMany({
-          where: {
-            userId: resourceOwnerId,
-            tenantUserId: ownerId,
-            poolId,
-            executionTargetId: target.executionTargetId,
-            targetIdentity: target.targetIdentity,
-            bindingDigest: material.bindingDigest,
-            digestVersion: DIGEST_VERSION,
-            expiresAt: { gt: now },
-            OR: [
-              ...(material.digests.length ? [{ prefixDigest: { in: material.digests } }] : []),
-              ...(material.conversationDigest
-                ? [{ conversationDigest: material.conversationDigest }]
-                : []),
-            ],
-          },
-          select: {
-            id: true,
-            sessionId: true,
-            prefixDigest: true,
-            conversationDigest: true,
-            lastUsedAt: true,
-          },
-        }),
-        {
-          conversationDigest: material.conversationDigest,
-          isContinuation: material.isContinuation,
-          digests: material.digests,
-        },
-      ) ?? randomUUID();
+    const hintRecords = await tx.cacheAffinityRecord.findMany({
+      where: {
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
+        poolId,
+        executionTargetId: target.executionTargetId,
+        targetIdentity: target.targetIdentity,
+        bindingDigest: material.bindingDigest,
+        digestVersion: DIGEST_VERSION,
+        expiresAt: { gt: now },
+        OR: [
+          ...([...material.digests, ...material.instructionDigests].length
+            ? [{ prefixDigest: { in: [...material.digests, ...material.instructionDigests] } }]
+            : []),
+          ...(material.conversationDigest
+            ? [
+                { explicitConversationDigest: material.conversationDigest },
+                { conversationDigest: material.conversationDigest },
+              ]
+            : []),
+          ...(writeDigest ? [{ writeDigest }] : []),
+        ],
+      },
+      select: SESSION_RECORD_SELECT,
+    });
+    const historyRecords =
+      material.isContinuation && !material.hasExplicitConversation
+        ? await matchingHistorySnapshots(
+            tx,
+            {
+              userId: resourceOwnerId,
+              tenantUserId: ownerId,
+              poolId,
+              executionTargetId: target.executionTargetId,
+              targetIdentity: target.targetIdentity,
+              bindingDigest: material.bindingDigest,
+              now,
+            },
+            material.historyDigests,
+          )
+        : [];
+    const records = [...hintRecords, ...historyRecords];
+    const continuedSessionId = continuedSessionKey(records, {
+      conversationDigest: material.conversationDigest,
+      isContinuation: material.isContinuation,
+      digests: material.digests,
+      historyDigests: material.historyDigests,
+      writeDigest,
+    });
+    // A retried completion is a no-op, including TTL, sizes and shared hints.
+    if (
+      writeDigest &&
+      records.some(
+        (record) =>
+          record.prefixDigest === null &&
+          record.writeDigest === writeDigest &&
+          (record.explicitConversationDigest ?? null) === material.conversationDigest,
+      )
+    )
+      return;
+    const sessionId = continuedSessionId ?? randomUUID();
+    const previousSnapshot = records.find(
+      (record) => record.prefixDigest === null && record.sessionId === sessionId,
+    );
+    if (previousSnapshot && previousSnapshot.lastUsedAt > now) return;
     const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
+      // A delayed completion must not move a newer hint's clock backwards.
+      const previous = records.find((record) => record.prefixDigest === prefixDigest);
+      if (previous && previous.lastUsedAt > now) return;
       await tx.cacheAffinityRecord.upsert({
         where: {
           tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest: {
@@ -678,6 +866,7 @@ export async function rememberAffinity({
           digestVersion: DIGEST_VERSION,
           estimatedTokens,
           engineCacheConfirmed: engineCacheConfirmed ?? false,
+          createdAt: now,
           lastUsedAt: now,
           expiresAt,
         },
@@ -690,13 +879,49 @@ export async function rememberAffinity({
         },
       });
     };
-    for (const [index, prefixDigest] of material.instructionDigests.entries()) {
-      await upsertPrefix(prefixDigest, index + 1);
+    const prefixes = [...material.instructionDigests, ...material.digests].map(
+      (prefixDigest, index) => ({
+        prefixDigest,
+        prefixDepth:
+          index < material.instructionDigests.length
+            ? index + 1
+            : index - material.instructionDigests.length + 1,
+      }),
+    );
+    if (prefixes.length > MAX_INSTRUCTION_PREFIXES) {
+      // Long histories still use one hint write, rather than up to 72 Prisma
+      // upsert round trips. Preserve the same per-row monotone clock and latest
+      // evidence semantics, under the same pool lock and uniqueness constraint.
+      await tx.$executeRaw(Prisma.sql`
+        INSERT INTO cache_affinity_record
+          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
+           "bindingDigest", "prefixDigest", "prefixDepth", "sessionId", "digestVersion",
+           "estimatedTokens", "engineCacheConfirmed", "createdAt", "lastUsedAt", "expiresAt")
+        VALUES ${Prisma.join(
+          prefixes.map(
+            ({ prefixDigest, prefixDepth }) => Prisma.sql`
+          (${randomUUID()}, ${resourceOwnerId}, ${ownerId}, ${poolId}, ${target.executionTargetId},
+           ${target.targetIdentity}, ${material.bindingDigest}, ${prefixDigest}, ${prefixDepth},
+           ${sessionId}, ${DIGEST_VERSION}, ${estimatedTokens ?? null}, ${engineCacheConfirmed ?? false},
+           ${now}, ${now}, ${expiresAt})
+        `,
+          ),
+        )}
+        ON CONFLICT ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "prefixDigest")
+        DO UPDATE SET "lastUsedAt" = EXCLUDED."lastUsedAt", "expiresAt" = EXCLUDED."expiresAt",
+                      "sessionId" = EXCLUDED."sessionId",
+                      "estimatedTokens" = COALESCE(EXCLUDED."estimatedTokens", cache_affinity_record."estimatedTokens")
+                      ${engineCacheConfirmed === undefined ? Prisma.empty : Prisma.sql`, "engineCacheConfirmed" = EXCLUDED."engineCacheConfirmed"`}
+        WHERE cache_affinity_record."lastUsedAt" <= EXCLUDED."lastUsedAt"
+      `);
+    } else {
+      for (const { prefixDigest, prefixDepth } of prefixes)
+        await upsertPrefix(prefixDigest, prefixDepth);
     }
-    for (const [index, prefixDigest] of material.digests.entries()) {
-      await upsertPrefix(prefixDigest, index + 1);
-    }
-    if (material.conversationDigest) {
+    if (material.digests.length > 0 || material.conversationDigest) {
+      // The immutable conversation-row identity is derived ONLY from sessionId,
+      // domain-separated from caller ids. Every turn updates the same row; the
+      // indexed history list holds only the latest snapshot (at most 64 digests).
       const identity = {
         tenantUserId: ownerId,
         poolId,
@@ -704,54 +929,109 @@ export async function rememberAffinity({
         targetIdentity: target.targetIdentity,
         bindingDigest: material.bindingDigest,
         prefixDigest: null,
-        conversationDigest: material.conversationDigest,
+        conversationDigest: hmacValue(`affinity-session-snapshot-v1:${sessionId}`),
       };
       const existing = await tx.cacheAffinityRecord.findFirst({
         where: identity,
-        select: { id: true },
+        select: {
+          id: true,
+          lastUsedAt: true,
+          sessionTokenEstimates: true,
+          sessionTokenTimes: true,
+        },
       });
+      // Bounded size samples preserve sub-floor age refreshes without keeping
+      // old snapshot rows. Retain at most 64 undominated estimates within TTL;
+      // protection applies its own window and floor when reading these samples.
+      const samples = (existing?.sessionTokenTimes ?? []).flatMap((time, index) => {
+        const tokens = existing?.sessionTokenEstimates[index];
+        return tokens !== undefined &&
+          time.getTime() > now.getTime() - policy.ttlSeconds * 1000 &&
+          // A newer equal/larger estimate covers every floor the older sample
+          // could cover. Keep only undominated sizes before applying the cap,
+          // so repeated sub-floor turns do not push out the eligible sample.
+          (estimatedTokens === undefined || tokens > estimatedTokens)
+          ? [{ time, tokens }]
+          : [];
+      });
+      if (estimatedTokens !== undefined) samples.push({ time: now, tokens: estimatedTokens });
+      const boundedSamples = samples.slice(-MAX_PREFIXES_PER_REQUEST);
+      const data = {
+        sessionId,
+        // Keep an identical list untouched: rewriting its toasted value would
+        // churn the GIN index even on turns that only change tools/parameters.
+        historyDigests:
+          existing &&
+          previousSnapshot?.id === existing.id &&
+          previousSnapshot.historyDigests.length === material.historyDigests.length &&
+          previousSnapshot.historyDigests.every(
+            (digest, index) => digest === material.historyDigests[index],
+          )
+            ? undefined
+            : material.historyDigests.slice(0, MAX_PREFIXES_PER_REQUEST),
+        explicitConversationDigest: material.conversationDigest,
+        writeDigest: writeDigest ?? null,
+        sessionTokenEstimates: boundedSamples.map(({ tokens }) => tokens),
+        sessionTokenTimes: boundedSamples.map(({ time }) => time),
+        estimatedTokens,
+        lastUsedAt: now,
+        expiresAt,
+      };
       if (existing) {
-        await tx.cacheAffinityRecord.update({
-          where: { id: existing.id },
-          data: {
-            lastUsedAt: now,
-            expiresAt,
-            sessionId,
-            estimatedTokens,
-            ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
-          },
-        });
+        if (existing.lastUsedAt <= now)
+          await tx.cacheAffinityRecord.update({
+            where: { id: existing.id },
+            data: {
+              ...data,
+              ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
+            },
+          });
       } else {
         await tx.cacheAffinityRecord.create({
           data: {
             userId: resourceOwnerId,
             ...identity,
-            sessionId,
+            ...data,
+            createdAt: now,
             prefixDepth: 0,
             digestVersion: DIGEST_VERSION,
-            estimatedTokens,
             engineCacheConfirmed: engineCacheConfirmed ?? false,
-            lastUsedAt: now,
-            expiresAt,
           },
         });
       }
     }
-    const overflow = await tx.cacheAffinityRecord.findMany({
-      where: {
-        userId: resourceOwnerId,
-        tenantUserId: ownerId,
-        poolId,
-        executionTargetId: target.executionTargetId,
-      },
-      orderBy: [{ lastUsedAt: "desc" }, { id: "desc" }],
-      skip: policy.maxRecords,
-      select: { id: true },
+    // maxRecords is a shared per-tenant/pool/target budget. Reserve space for
+    // ALL depth-zero snapshots first, ordered by recency, then spend the rest on
+    // hints using their existing recency/depth order. Hints cannot evict their
+    // session; only excess live sessions evict older snapshots. Both eviction
+    // queries return ids only: once bounded, a write adds at most 64 + 8 hints
+    // and one snapshot, so their combined result is at most 73 ids.
+    const retentionScope = {
+      userId: resourceOwnerId,
+      tenantUserId: ownerId,
+      poolId,
+      executionTargetId: target.executionTargetId,
+    };
+    const snapshotCount = await tx.cacheAffinityRecord.count({
+      where: { ...retentionScope, prefixDepth: 0 },
     });
-    if (overflow.length) {
-      await tx.cacheAffinityRecord.deleteMany({
-        where: { id: { in: overflow.map(({ id }) => id) } },
-      });
+    const [snapshotOverflow, hintOverflow] = await Promise.all([
+      tx.cacheAffinityRecord.findMany({
+        where: { ...retentionScope, prefixDepth: 0 },
+        orderBy: [{ lastUsedAt: "desc" }, { id: "desc" }],
+        skip: policy.maxRecords,
+        select: { id: true },
+      }),
+      tx.cacheAffinityRecord.findMany({
+        where: { ...retentionScope, prefixDepth: { gt: 0 } },
+        orderBy: [{ lastUsedAt: "desc" }, { prefixDepth: "asc" }, { id: "desc" }],
+        skip: Math.max(0, policy.maxRecords - snapshotCount),
+        select: { id: true },
+      }),
+    ]);
+    const overflowIds = [...new Set([...snapshotOverflow, ...hintOverflow].map(({ id }) => id))];
+    if (overflowIds.length) {
+      await tx.cacheAffinityRecord.deleteMany({ where: { id: { in: overflowIds } } });
     }
   });
 }

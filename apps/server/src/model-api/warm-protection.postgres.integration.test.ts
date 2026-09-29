@@ -128,7 +128,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       }) => {
         // One request's records: one session.
         const sessionId = crypto.randomUUID();
-        return input.tokens.map((estimatedTokens, index) => ({
+        return input.tokens.map((estimatedTokens) => ({
           sessionId,
           userId: owner.id,
           tenantUserId: input.tenantUserId,
@@ -136,8 +136,9 @@ integration("warm-session protection with real PostgreSQL", () => {
           executionTargetId: input.executionTargetId,
           targetIdentity: "identity",
           bindingDigest: "b".repeat(64),
-          prefixDigest: `prefix-${String(sequence++).padStart(40, "0")}`,
-          prefixDepth: index + 1,
+          prefixDigest: null,
+          conversationDigest: `snapshot-${String(sequence++).padStart(40, "0")}`,
+          prefixDepth: 0,
           estimatedTokens,
           lastUsedAt: input.lastUsedAt,
           createdAt: ago(3_700 + 1_000),
@@ -382,11 +383,10 @@ integration("warm-session protection with real PostgreSQL", () => {
         executionTargetId: target.id,
         targetIdentity: "identity",
         bindingDigest: input.bindingDigest ?? "b".repeat(64),
-        prefixDigest: input.conversationDigest
-          ? null
-          : `prefix-${String(sequence++).padStart(40, "0")}`,
-        conversationDigest: input.conversationDigest ?? null,
-        prefixDepth: input.conversationDigest ? 0 : 1,
+        prefixDigest: null,
+        conversationDigest:
+          input.conversationDigest ?? `snapshot-${String(sequence++).padStart(40, "0")}`,
+        prefixDepth: 0,
         estimatedTokens: input.tokens,
         lastUsedAt: input.lastUsedAt,
         createdAt: ago(1_000),
@@ -547,6 +547,8 @@ integration("warm-session protection with real PostgreSQL", () => {
         tokens: number;
         targetId?: string;
         conversationDigest?: string;
+        hint?: boolean;
+        expiresAt?: Date;
       }) => ({
         sessionId: input.sessionId,
         userId: owner.id,
@@ -555,15 +557,19 @@ integration("warm-session protection with real PostgreSQL", () => {
         executionTargetId: input.targetId ?? targetA.id,
         targetIdentity: "identity",
         bindingDigest: "b".repeat(64),
-        prefixDigest: input.conversationDigest
-          ? null
-          : `prefix-${String(sequence++).padStart(40, "0")}`,
-        conversationDigest: input.conversationDigest ?? null,
-        prefixDepth: input.conversationDigest ? 0 : 1,
+        prefixDigest:
+          input.sessionId === null || input.hint
+            ? `prefix-${String(sequence++).padStart(40, "0")}`
+            : null,
+        conversationDigest:
+          input.sessionId === null || input.hint
+            ? null
+            : (input.conversationDigest ?? `snapshot-${String(sequence++).padStart(40, "0")}`),
+        prefixDepth: input.sessionId === null || input.hint ? 1 : 0,
         estimatedTokens: input.tokens,
         lastUsedAt: input.lastUsedAt,
         createdAt: ago(1_000),
-        expiresAt: new Date(now.getTime() + 3_600_000),
+        expiresAt: input.expiresAt ?? new Date(now.getTime() + 3_600_000),
       });
       await db.cacheAffinityRecord.createMany({
         data: [
@@ -579,6 +585,12 @@ integration("warm-session protection with real PostgreSQL", () => {
             tokens: 12_000,
             conversationDigest: "c".repeat(40),
           }),
+          // Shared hints cannot move a session's age or size to the last writer.
+          record({ sessionId: "long", lastUsedAt: ago(1), tokens: 90_000, hint: true }),
+          // Same-instant duplicate snapshots choose the largest estimate.
+          record({ sessionId: "long", lastUsedAt: ago(20), tokens: 9_000 }),
+          // Expired evidence cannot supersede a live turn.
+          record({ sessionId: "long", lastUsedAt: ago(2), tokens: 80_000, expiresAt: ago(1) }),
           // "shrunk": the newest turn fell below the floor; the older turn's
           // larger prefix is still what the engine holds.
           record({ sessionId: "shrunk", lastUsedAt: ago(90), tokens: 20_000 }),
@@ -679,6 +691,8 @@ integration("warm-session protection with real PostgreSQL", () => {
           .map(({ ageMs, tokens, inFlight }) => ({ age: ageMs / 1000, tokens, inFlight }))
           .sort((left, right) => left.age - right.age || left.tokens - right.tokens);
       expect(summary(capacityA.id)).toEqual([
+        // "shrunk": newest activity, older eligible size.
+        { age: 10, tokens: 20_000, inFlight: false },
         // "long": one session at its newest turn (not two, not 30k).
         { age: 20, tokens: 12_000, inFlight: false },
         // Only the active lease of the same member marks a session in flight.
@@ -690,8 +704,6 @@ integration("warm-session protection with real PostgreSQL", () => {
         // Rows from before session ids existed: one session each.
         { age: 40, tokens: 9_000, inFlight: false },
         { age: 40, tokens: 9_500, inFlight: false },
-        // "shrunk": the older, larger turn stays its size.
-        { age: 90, tokens: 20_000, inFlight: false },
       ]);
       expect(summary(capacityB.id)).toEqual([{ age: 35, tokens: 14_000, inFlight: false }]);
     } finally {
@@ -700,4 +712,160 @@ integration("warm-session protection with real PostgreSQL", () => {
       await db.user.deleteMany({ where: { id: owner.id } });
     }
   }, 60_000);
+  type Turn = {
+    age: number;
+    tokens: number;
+    expired?: boolean;
+    legacy?: boolean;
+    hint?: boolean;
+    target?: number;
+    binding?: string;
+  };
+  const cases: {
+    name: string;
+    turns: Turn[];
+    expected: { target: number; ageMs: number; tokens: number }[];
+  }[] = [
+    {
+      name: "nested snapshots choose newest size, independent of insertion order",
+      turns: [
+        { age: 10, tokens: 12_000 },
+        { age: 90, tokens: 30_000 },
+      ],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 12_000 }],
+    },
+    {
+      name: "same-instant snapshots choose MAX size",
+      turns: [
+        { age: 10, tokens: 9_000 },
+        { age: 10, tokens: 20_000 },
+      ],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 20_000 }],
+    },
+    {
+      name: "sub-floor latest turn refreshes age and retains previous eligible size",
+      turns: [
+        { age: 90, tokens: 20_000 },
+        { age: 10, tokens: 3000 },
+      ],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 20_000 }],
+    },
+    {
+      name: "expired newer snapshots do not win",
+      turns: [
+        { age: 10, tokens: 90_000, expired: true },
+        { age: 90, tokens: 20_000 },
+      ],
+      expected: [{ target: 0, ageMs: 90_000, tokens: 20_000 }],
+    },
+    {
+      name: "shared hint refresh cannot change age or size",
+      turns: [
+        { age: 90, tokens: 20_000 },
+        { age: 1, tokens: 90_000, hint: true },
+      ],
+      expected: [{ target: 0, ageMs: 90_000, tokens: 20_000 }],
+    },
+    {
+      name: "legacy null ids are separate even at the same instant",
+      turns: [
+        { age: 10, tokens: 9000, legacy: true },
+        { age: 10, tokens: 9500, legacy: true },
+      ],
+      expected: [
+        { target: 0, ageMs: 10_000, tokens: 9000 },
+        { target: 0, ageMs: 10_000, tokens: 9500 },
+      ],
+    },
+    {
+      name: "aliased session ids cannot cross KV pools",
+      turns: [
+        { age: 10, tokens: 9000 },
+        { age: 20, tokens: 9500, target: 1 },
+      ],
+      expected: [
+        { target: 0, ageMs: 10_000, tokens: 9000 },
+        { target: 1, ageMs: 20_000, tokens: 9500 },
+      ],
+    },
+    {
+      name: "aliased session ids cannot cross bindings",
+      turns: [
+        { age: 10, tokens: 9000 },
+        { age: 20, tokens: 9500, binding: "different" },
+      ],
+      expected: [
+        { target: 0, ageMs: 10_000, tokens: 9000 },
+        { target: 0, ageMs: 20_000, tokens: 9500 },
+      ],
+    },
+  ];
+  // Same-instant MAX, expiry and legacy cases preserve existing semantics;
+  // ownership, scoping and sub-floor cases regress the first-pass reader.
+  it.each(cases)("$name", async ({ turns, expected }) => {
+    if (!databaseUrl) return;
+    const owner = await user("table");
+    try {
+      const slug = crypto.randomUUID();
+      const device = await db.cliDevice.create({ data: { userId: owner.id, slug } });
+      const endpoint = await db.endpoint.create({
+        data: { userId: owner.id, cliDeviceId: device.id, slug, label: "Table" },
+      });
+      const pool = await db.modelPool.create({ data: { userId: owner.id, slug, name: "Table" } });
+      const targets = await Promise.all(
+        [0, 1].map(async (index) => {
+          const key = `${slug}-${index}`;
+          const capacity = await db.inferenceCapacity.create({
+            data: { userId: owner.id, label: key, runtimeIdentityKey: key, runtimeModel: "m" },
+          });
+          const model = await db.discoveredModel.create({
+            data: {
+              userId: owner.id,
+              endpointId: endpoint.id,
+              upstreamModelId: key,
+              encodedModelId: key,
+            },
+          });
+          const target = await db.executionTarget.update({
+            where: { discoveredModelId: model.id },
+            data: { inferenceCapacityId: capacity.id },
+          });
+          return { id: target.id, capacityId: capacity.id };
+        }),
+      );
+      const now = new Date("2026-09-29T12:00:00Z");
+      await db.cacheAffinityRecord.createMany({
+        data: turns.map((turn, index) => ({
+          userId: owner.id,
+          tenantUserId: owner.id,
+          poolId: pool.id,
+          executionTargetId: targets[turn.target ?? 0]!.id,
+          targetIdentity: "identity",
+          bindingDigest: (turn.binding ?? "binding").padEnd(43, "x"),
+          sessionId: turn.legacy ? null : "same-aliased-session",
+          prefixDigest: turn.hint ? `hint-${String(index).padStart(40, "0")}` : null,
+          conversationDigest: turn.hint ? null : `snapshot-${String(index).padStart(40, "0")}`,
+          prefixDepth: turn.hint ? 1 : 0,
+          createdAt: new Date(now.getTime() - 3_600_000),
+          lastUsedAt: new Date(now.getTime() - turn.age * 1000),
+          expiresAt: new Date(now.getTime() + (turn.expired ? -1000 : 60_000)),
+          estimatedTokens: turn.tokens,
+        })),
+      });
+      const result = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: targets.map((t) => t.capacityId),
+        policy: { windowSeconds: 300, minTokens: 8192 },
+        now,
+      });
+      const actual = targets.flatMap((t, target) =>
+        (result.get(t.capacityId) ?? []).map(({ ageMs, tokens }) => ({ target, ageMs, tokens })),
+      );
+      const compare = (left: (typeof actual)[number], right: (typeof actual)[number]) =>
+        left.target - right.target || left.ageMs - right.ageMs || left.tokens - right.tokens;
+      expect(actual.sort(compare)).toEqual([...expected].sort(compare));
+    } finally {
+      await db.user.deleteMany({ where: { id: owner.id } });
+    }
+  });
 });
