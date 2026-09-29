@@ -846,27 +846,18 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       ).toBe("ok");
     });
 
-    it("re-plans a parent delete whose owner set grew while it waited for its fences", async () => {
+    it("re-plans a user delete whose owner set grew while it waited for its fences", async () => {
       const m = required();
       const { user: owner, suffix } = await userFixture("replan-owner");
       const { user: other } = await userFixture("replan-other");
       const pool = await fixtures.modelPool.create({
         data: { userId: owner.id, slug: `replan-${suffix}`, name: "Replan" },
       });
-      await fixtures.poolGrant.create({
-        data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: other.id },
-      });
-      const token = await fixtures.modelApiToken.create({
-        data: {
-          userId: other.id,
-          name: "Other token",
-          scopeMode: "ALLOWLIST",
-          lookupPrefix: `rp-${suffix}`,
-          secretDigest: `rs-${suffix}`,
-        },
-      });
-      // A writer holding both owners' fences adds an entry on the pool that
-      // names the other owner; the delete plans its owners before it commits.
+      const mark = await m.deletion.requestUserDeletion(m.prisma, owner.id);
+      if (!mark) throw new Error("deletion mark was not taken");
+      // A writer holding both owners' fences grants the pool to another user
+      // after the delete planned its owners (it cannot see the uncommitted
+      // grant) and before the delete holds its fences.
       let release!: () => void;
       const released = new Promise<void>((resolve) => {
         release = resolve;
@@ -878,8 +869,8 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       const writer = strict.$transaction(
         async (tx) => {
           await m.order.fenceOwners(tx, [owner.id, other.id]);
-          await tx.modelApiTokenAllowlistEntry.create({
-            data: { modelApiTokenId: token.id, target: "MODEL_POOL", modelPoolId: pool.id },
+          await tx.poolGrant.create({
+            data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: other.id },
           });
           inserted();
           await released;
@@ -887,10 +878,7 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
         { timeout: 20_000 },
       );
       await hasInserted;
-      const forwarder = createRouterClient(m.forwarder.forwarderManagementRouter, {
-        context: sessionFor(owner),
-      });
-      const deleting = forwarder.deleteModelPool({ id: pool.id });
+      const deleting = m.deletion.completeUserDeletion(m.prisma, owner.id, mark.generation);
       await vi.waitFor(
         async () => {
           const rows = await fixtures.$queryRaw<Array<{ n: bigint }>>`
@@ -903,11 +891,11 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       );
       release();
       await writer;
-      // The first attempt finds an owner it did not fence and retries with it.
-      await expect(deleting).resolves.toEqual({ deleted: true });
-      expect(
-        await fixtures.modelApiTokenAllowlistEntry.count({ where: { modelApiTokenId: token.id } }),
-      ).toBe(0);
+      // The first attempt finds an owner it did not fence (the grantee of
+      // the new grant its cascade deletes) and retries with it.
+      await expect(deleting).resolves.toBe(true);
+      expect(await fixtures.user.count({ where: { id: owner.id } })).toBe(0);
+      expect(await fixtures.poolGrant.count({ where: { poolId: pool.id } })).toBe(0);
     });
 
     it("prunes only terminal admission history and never waits on a waiter another transaction holds", async () => {
