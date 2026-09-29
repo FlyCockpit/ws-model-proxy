@@ -22,18 +22,17 @@ import { describe, expect, it, vi } from "vitest";
  * labeled disposable-PostgreSQL suite (Part K2) deferral.
  */
 
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {
-    NODE_ENV: "test",
-    // Flag ON: the deploy-time superset — the schema must satisfy the FULL
-    // MCP surface (jwt/mcp/cimd tables), never only the dormant subset.
-    WMP_MCP_ENABLED: true,
-    BETTER_AUTH_URL: "https://proxy.example.com",
-    BETTER_AUTH_SECRET: "startup-schema-test-secret-at-least-32-chars",
-    CORS_ORIGIN: undefined,
-    SMTP_HOST: undefined,
-  },
+const envMock = vi.hoisted(() => ({
+  NODE_ENV: "test",
+  // Flag ON: the deploy-time superset — the schema must satisfy the FULL
+  // MCP surface (jwt/mcp/cimd tables), never only the dormant subset.
+  WMP_MCP_ENABLED: true,
+  BETTER_AUTH_URL: "https://proxy.example.com",
+  BETTER_AUTH_SECRET: "startup-schema-test-secret-at-least-32-chars",
+  CORS_ORIGIN: undefined,
+  SMTP_HOST: undefined,
 }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
 
 // Prisma seam: a permissive callable-proxy stub. The 1.7.3 prisma adapter
 // validates client SHAPE asynchronously at construction (the deferred
@@ -126,6 +125,29 @@ describe("startup schema validation — real auth options vs the committed Prism
         additional,
       );
       expect(modelFieldNames("User")).toContain(additional);
+    }
+  });
+});
+
+describe("auth instance plugin wiring (real production instance)", () => {
+  const ALWAYS_ON = ["admin", "two-factor", "device-authorization"];
+  const idsOf = (options: { plugins?: { id: string }[] }) =>
+    (options.plugins ?? []).map((plugin) => plugin.id);
+
+  it("installs the MCP plugins after the three always-on plugins while WMP_MCP_ENABLED is true", () => {
+    const ids = idsOf(auth.options);
+    expect(ids.slice(0, ALWAYS_ON.length)).toEqual(ALWAYS_ON);
+    expect(ids.slice(ALWAYS_ON.length)).toEqual(["jwt", "oauth-provider", "cimd"]);
+  });
+
+  it("installs only the always-on plugins when WMP_MCP_ENABLED is false", async () => {
+    envMock.WMP_MCP_ENABLED = false;
+    try {
+      vi.resetModules();
+      const { auth: disabled } = await import("./index");
+      expect(idsOf(disabled.options)).toEqual(ALWAYS_ON);
+    } finally {
+      envMock.WMP_MCP_ENABLED = true;
     }
   });
 });

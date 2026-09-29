@@ -1,7 +1,7 @@
 import type { TerminalWriterLabel } from "@/lib/terminal-protocol";
 
 /**
- * Writer and size decisions for multi-viewer terminals. The CLI decides who
+ * Writer and size decisions for terminals with several viewers. The CLI decides who
  * the writer is; the browser only mirrors it and follows the PTY size while
  * someone else is typing.
  */
@@ -9,8 +9,6 @@ import type { TerminalWriterLabel } from "@/lib/terminal-protocol";
 export type TerminalSize = { cols: number; rows: number };
 
 export type TerminalWriterState = {
-  /** Protocol 2.5 terminal (v2 crypto). A 2.4 terminal has one viewer, always the writer. */
-  multiViewer: boolean;
   writer: TerminalWriterLabel;
 };
 
@@ -27,10 +25,10 @@ export const TERMINAL_REATTACH_RESET_MS = 60_000;
 
 /** A non-writer renders at the PTY size and sends no resizes. */
 export function isFollowing(state: TerminalWriterState): boolean {
-  return state.multiViewer && state.writer !== "you";
+  return state.writer !== "you";
 }
 
-/** Only the writer (or a 2.4 viewer) reports its size to the CLI. */
+/** Only the writer reports its size to the CLI. */
 export function canSendResize(state: TerminalWriterState): boolean {
   return !isFollowing(state);
 }

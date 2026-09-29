@@ -395,8 +395,6 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const workspace = useTerminalWorkspace();
   const active = workspace.tabs.find((tab) => tab.localId === workspace.activeLocalId) ?? null;
-  const activeUnverified =
-    active !== null && workspace.cliTrust[active.cliDeviceId]?.status === "unverified";
   const attention = cliIdentitiesNeedAttention(workspace.clis, workspace.cliTrust);
 
   return (
@@ -450,13 +448,6 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
             {t("dashboard:terminals.rejected", {
               reason: terminalRejectionLabel(t, active.rejectionReason),
             })}
-          </p>
-        </Banner>
-      ) : null}
-      {activeUnverified && active?.phase !== "rejected" ? (
-        <Banner>
-          <p className="min-w-0 text-(--term-muted)">
-            {t("dashboard:terminals.identity.activeUnverified")}
           </p>
         </Banner>
       ) : null}
@@ -530,7 +521,7 @@ function ApprovalNotice({ code }: { code: string }) {
 function StatusBar({ tab }: { tab: TerminalTab | null }) {
   const { t } = useTranslation(["dashboard"]);
   if (!tab) return null;
-  const writerKey = tab.multiViewer && tab.phase === "live" ? writerStatusKey(tab.writer) : null;
+  const writerKey = tab.phase === "live" ? writerStatusKey(tab.writer) : null;
   const follow = tab.phase === "live" ? followSize(tab) : null;
   const size =
     tab.phase === "live" && tab.ptyCols !== null && tab.ptyRows !== null
@@ -547,7 +538,7 @@ function StatusBar({ tab }: { tab: TerminalTab | null }) {
           {t(writerKey)}
         </span>
       ) : null}
-      {tab.multiViewer && tab.phase === "live" ? (
+      {tab.phase === "live" ? (
         <span>{t("dashboard:terminals.status.viewers", { count: tab.viewerCount })}</span>
       ) : null}
       {follow ? (

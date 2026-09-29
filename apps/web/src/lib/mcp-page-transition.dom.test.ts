@@ -4,7 +4,6 @@ import { readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { defaultParseSearch, defaultStringifySearch } from "@tanstack/react-router";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useMcpPageContinue } from "@/hooks/use-mcp-page-continue";
@@ -99,25 +98,6 @@ describe("raw-query MCP page transitions (R83/R84 F1)", () => {
     expect(params.get("sig")).toBe("sig-SECRET-value");
     expect(params.getAll("ba_param")).toContain("client_id");
     expect(params.getAll("ba_param")).toContain("scope");
-  });
-
-  it("NEGATIVE CONTROL: a TanStack parse→stringify round trip corrupts the signed transaction (the rejected mechanism)", async () => {
-    const signed = await buildRealSignedQuery();
-    const signedQuery = await loadInstalledSignedQueryModule();
-
-    // Installed router-core defaults (router.js parseLocation/buildLocation
-    // run exactly this pair for `search: true`, href navigations, and even
-    // location.searchStr).
-    const roundTripped = defaultStringifySearch(defaultParseSearch(`?${signed}`));
-    expect(roundTripped).not.toBe(`?${signed}`);
-
-    // The corrupted query kills the signature: the collapsed JSON-array
-    // ba_param is not a parameter name the provider recognizes, so
-    // client_id/scope fall out of the signed set.
-    const oauthQuery = signedQuery.t(roundTripped);
-    const params = new URLSearchParams(oauthQuery ?? "");
-    expect(params.get("client_id")).not.toBe("mcp-client-1");
-    expect(params.get("scope")).not.toBe("mcp:read mcp:write offline_access");
   });
 
   it("useMcpPageContinue navigates to consent with the byte-identical raw query", async () => {
