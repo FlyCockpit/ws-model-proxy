@@ -210,6 +210,95 @@ describe("OpenRouter usage dialect", () => {
         },
       ],
       [
+        "a missing is_byok",
+        () =>
+          withDeltaUsage((usage) => {
+            delete usage.is_byok;
+          }),
+      ],
+      [
+        "a null is_byok",
+        () =>
+          withDeltaUsage((usage) => {
+            usage.is_byok = null;
+          }),
+      ],
+      ...(
+        [
+          ["input_tokens", 10],
+          ["output_tokens", 6],
+          ["cache_read_input_tokens", 7663],
+          ["cache_creation_input_tokens", 1],
+        ] as const
+      ).map(([key, snapshot]): [string, () => unknown[]] => [
+        `a final ${key} below the message_start snapshot`,
+        () => {
+          const records = recordsOf("messages-stream-read");
+          const start = records.find((record) => record.type === "message_start")!;
+          const startUsage = (start.message as { usage: Record<string, unknown> }).usage;
+          startUsage[key] = snapshot;
+          return records;
+        },
+      ]),
+      [
+        "an unreadable message_start counter",
+        () => {
+          const records = recordsOf("messages-stream-read");
+          const start = records.find((record) => record.type === "message_start")!;
+          (start.message as { usage: Record<string, unknown> }).usage.output_tokens = 1.5;
+          return records;
+        },
+      ],
+      // C1a-1: an explicit null (or other unreadable) snapshot counter is not
+      // zero; only an ABSENT optional counter is.
+      ...(
+        [
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_creation_input_tokens",
+        ] as const
+      ).map((key): [string, () => unknown[]] => [
+        `a null message_start ${key}`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const start = records.find((record) => record.type === "message_start")!;
+          (start.message as { usage: Record<string, unknown> }).usage[key] = null;
+          return records;
+        },
+      ]),
+      // C7-4 fail-closed: a non-object usage shape on either Messages usage
+      // record cannot be read, so monotonicity cannot be verified and the
+      // stream must not settle (an inverted shape check would settle the
+      // valid final against an unreadable snapshot).
+      ...[
+        ["a string", "not-an-object"],
+        ["a number", 42],
+        ["an array", []],
+      ].map(([label, shape]): [string, () => unknown[]] => [
+        `a ${label} message_start snapshot usage`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const start = records.find((record) => record.type === "message_start")!;
+          (start.message as Record<string, unknown>).usage = shape;
+          return records;
+        },
+      ]),
+      ...[
+        ["a string", "not-an-object"],
+        ["a number", 42],
+        ["an array", []],
+        ["null", null],
+      ].map(([label, shape]): [string, () => unknown[]] => [
+        `a ${label} message_delta usage`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const delta = records.find((record) => record.type === "message_delta")!;
+          delta.usage = shape;
+          return records;
+        },
+      ]),
+      [
         "two message_start snapshots",
         () => {
           const records = recordsOf("messages-stream-write");
@@ -433,6 +522,13 @@ describe("OpenRouter usage dialect", () => {
     ],
     ["a non-object cost_details", (usage) => Object.assign(usage, { cost_details: [0.1] })],
     ["a non-boolean is_byok", (usage) => Object.assign(usage, { is_byok: "yes" })],
+    ["a null is_byok", (usage) => Object.assign(usage, { is_byok: null })],
+    [
+      "a missing is_byok",
+      (usage) => {
+        delete usage.is_byok;
+      },
+    ],
     [
       "an unrecognized server tool counter",
       (usage) => Object.assign(usage, { server_tool_use: { code_runs: 1 } }),
@@ -525,7 +621,13 @@ describe("OpenRouter usage dialect", () => {
 
   it("does not let an unreadable later usage record leave an earlier one to settle", () => {
     const frame = (usage: unknown) => encode(`data: ${JSON.stringify({ usage })}\n\n`);
-    const first = { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, cost: 0.000001 };
+    const first = {
+      prompt_tokens: 1,
+      completion_tokens: 0,
+      total_tokens: 1,
+      cost: 0.000001,
+      is_byok: false,
+    };
     const usage = parseProviderUsage(
       [frame(first), frame(null), frame({ future_tokens: 5000 }), encode("data: [DONE]\n\n")],
       catalogPricing(fullRates),
@@ -829,8 +931,12 @@ describe("OpenRouter usage dialect", () => {
       expect(generic).toBe(preDialectOutputs[index]);
       // OpenRouter (Chat only) reads a root `usage` object; a Responses or
       // Anthropic nesting is evidence only in its dialect.
-      if ((payload as { usage?: unknown }).usage !== undefined) expect(openRouter).toBe(generic);
-      else expect(usageFromObject(payload, "openrouter")?.categoriesComplete).toBe(false);
+      // The dialect additionally requires `is_byok`, which none of these carry:
+      // otherwise complete usage is kept as incomplete evidence.
+      if ((payload as { usage?: unknown }).usage !== undefined) {
+        const parsed = JSON.parse(generic as string) as Record<string, unknown>;
+        expect(JSON.parse(openRouter as string)).toEqual({ ...parsed, categoriesComplete: false });
+      } else expect(usageFromObject(payload, "openrouter")?.categoriesComplete).toBe(false);
       // The default parameter is the generic dialect.
       expect(
         JSON.stringify(usageFromObject(payload), (_key, value) =>

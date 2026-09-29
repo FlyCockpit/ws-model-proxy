@@ -1380,12 +1380,10 @@ const OPENROUTER_DETAIL_CONTAINERS = [
 const OPENROUTER_SERVER_TOOL_KEYS = new Set(["web_search_requests"]);
 
 function openRouterMetadataValid(usage: Record<string, unknown>): boolean {
-  if (
-    Object.hasOwn(usage, "is_byok") &&
-    usage.is_byok !== null &&
-    typeof usage.is_byok !== "boolean"
-  )
-    return false;
+  // Every capture carries a boolean. `is_byok` decides whether the upstream
+  // provider cost is added to `cost`, so a missing, null or non-boolean value
+  // is invalid usage, not "not BYOK".
+  if (typeof usage.is_byok !== "boolean") return false;
   if (Object.hasOwn(usage, "cost_details") && usage.cost_details !== null) {
     const details = usageRecord(usage.cost_details);
     if (
@@ -1795,6 +1793,12 @@ function classifyTerminalRecord(
   try {
     const value = JSON.parse(record.data) as Record<string, unknown>;
     const dataType = typeof value.type === "string" ? value.type : undefined;
+    // A terminal needs an explicit `event:` line that agrees with the record's
+    // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
+    // its terminal is deliberately NOT recognised (the stream is read to EOF and
+    // the full hold stays): recognising a data-only record as a terminal cuts
+    // the read off at the first such record, which makes billing depend on
+    // transport chunking and lets a mismatching record's usage stand.
     if (!record.event || record.event !== dataType) return undefined;
     if (record.event === "error") return "FAILED";
     if (surface === "anthropic-messages")
@@ -1868,7 +1872,7 @@ export function retainProviderUsagePrefix(
  *   `message_delta` event; Responses: the non-stream `response` body or the
  *   terminal `response.completed` / `.incomplete` / `.failed` event);
  * - `superseded`: Messages `message_start` usage, a partial snapshot that the
- *   final `message_delta` replaces;
+ *   final `message_delta` replaces (it may never exceed the final usage);
  * - `ambiguous`: usage in any other root carrier (`usage`, `response.usage`,
  *   `message.usage`; nested objects are never read), or in two carriers of
  *   one record;
@@ -1876,7 +1880,7 @@ export function retainProviderUsagePrefix(
  */
 type OpenRouterRecordUsage =
   | { kind: "final"; usage: unknown }
-  | { kind: "superseded" }
+  | { kind: "superseded"; usage: unknown }
   | { kind: "ambiguous" };
 
 const RESPONSES_TERMINAL_EVENTS = new Set([
@@ -1909,7 +1913,8 @@ function openRouterRecordUsage(
   if (carriers.length > 1) return { kind: "ambiguous" };
   const type = typeof root.type === "string" ? root.type : undefined;
   if (surface === "anthropic-messages") {
-    if (type === "message_start" && messageUsage !== null) return { kind: "superseded" };
+    if (type === "message_start" && messageUsage !== null)
+      return { kind: "superseded", usage: messageUsage };
     if ((type === "message_delta" || type === "message") && rootUsage !== null)
       return { kind: "final", usage: rootUsage };
     return { kind: "ambiguous" };
@@ -1935,6 +1940,7 @@ function openRouterRecordUsage(
 export class OpenRouterUsageRecords {
   readonly #surface: ProtocolSurface;
   readonly #finals = new Map<string, unknown>();
+  readonly #snapshots: unknown[] = [];
   #superseded = 0;
   #ambiguous = false;
   #readable = true;
@@ -1947,8 +1953,12 @@ export class OpenRouterUsageRecords {
     const classified = openRouterRecordUsage(this.#surface, value);
     if (!classified) return;
     if (classified.kind === "ambiguous") this.#ambiguous = true;
-    else if (classified.kind === "superseded") this.#superseded += 1;
-    else if (this.#finals.size < 2)
+    else if (classified.kind === "superseded") {
+      this.#superseded += 1;
+      // Only the first snapshot is ever compared (and settlement requires at
+      // most one superseded record), so one slot is enough.
+      if (this.#snapshots.length < 1) this.#snapshots.push(classified.usage);
+    } else if (this.#finals.size < 2)
       this.#finals.set(JSON.stringify(classified.usage), classified.usage);
   }
 
@@ -1977,7 +1987,11 @@ export class OpenRouterUsageRecords {
         ? openRouterAnthropicUsage(usage)
         : usageFromObject({ usage }, "openrouter");
     const only =
-      finals.length === 1 && this.#superseded <= 1 && !this.#ambiguous && this.#readable
+      finals.length === 1 &&
+      this.#superseded <= 1 &&
+      !this.#ambiguous &&
+      this.#readable &&
+      !openRouterUsageRegressed(this.#snapshots[0], finals[0])
         ? normalize(finals[0])
         : undefined;
     const charged =
@@ -1992,6 +2006,33 @@ export class OpenRouterUsageRecords {
       rawUsage: rawUsage.length === 1 ? rawUsage[0] : rawUsage,
     });
   }
+}
+
+const OPENROUTER_MONOTONIC_KEYS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+] as const;
+
+/**
+ * Messages usage only grows: the final `message_delta` counts are at least the
+ * `message_start` snapshot's. A final lower in any counted field cannot be
+ * attributed (rejected, not repaired with a per-field maximum, so a lower
+ * total is never charged); an unreadable snapshot counter fails closed too.
+ */
+function openRouterUsageRegressed(snapshot: unknown, final: unknown): boolean {
+  if (snapshot === undefined) return false;
+  const early = usageRecord(snapshot);
+  const last = usageRecord(final);
+  if (!early || !last) return true;
+  return OPENROUTER_MONOTONIC_KEYS.some((key) => {
+    // An absent counter is zero; a PRESENT one (null included) must be a
+    // readable integer, or the snapshot cannot bound the final.
+    const before = Object.hasOwn(early, key) ? usageInteger(early[key]) : 0;
+    const after = Object.hasOwn(last, key) ? usageInteger(last[key]) : 0;
+    return before === undefined || after === undefined || after < before;
+  });
 }
 
 /**
