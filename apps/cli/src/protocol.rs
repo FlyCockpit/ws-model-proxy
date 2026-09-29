@@ -723,10 +723,6 @@ pub struct MetricSourceStatus {
     pub interval_secs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<MetricSourceError>,
-    /// How often the source runs; the server treats its series as stale
-    /// after 3x this.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interval_secs: Option<u32>,
 }
 
 /// 2.7 `endpoint.load`.

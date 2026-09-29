@@ -37,6 +37,8 @@ fn main() {
     };
 
     let _ = output::flush_stdout();
+    // No metric-source command may outlive the process.
+    wsmp::bounded_run::kill_all_active();
     std::process::exit(code as i32);
 }
 

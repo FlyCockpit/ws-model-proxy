@@ -11,6 +11,10 @@
 //! drop. The process then dies from the same signal, so the parent sees the
 //! conventional status (143, 130, 129).
 //!
+//! Telemetry runs (`nvidia-smi` and custom metric commands) are killed with
+//! their process groups on every way out, through
+//! [`crate::bounded_run::kill_all_active`].
+//!
 //! Cleanup is bounded by [`SHUTDOWN_DEADLINE`]. When it expires, or when a
 //! second signal arrives, the watcher kills every tracked child directly,
 //! removes the registered runtime files, and exits at once.
@@ -56,6 +60,9 @@ pub fn signal_of(err: &anyhow::Error) -> Option<i32> {
 /// End the process the way `signal` would have: re-raise it with its default
 /// action, falling back to exit status `128 + signal`.
 pub fn terminate_by_signal(signal: i32) -> ! {
+    // A custom metric source or `nvidia-smi` may be running: end its process
+    // group now, whichever path (graceful or forced) got here.
+    crate::bounded_run::kill_all_active();
     #[cfg(unix)]
     unix::raise_default(signal);
     std::process::exit(128_i32.saturating_add(signal))
@@ -112,6 +119,8 @@ mod tracked {
                 deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
                 "shutdown signal received; stopping terminals and commands"
             );
+            // Telemetry commands need no grace: end them (and refuse new ones) now.
+            crate::bounded_run::kill_all_active();
             start_deadline(number);
             return;
         }

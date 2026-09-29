@@ -66,6 +66,19 @@ describe("routing rule schema", () => {
     expect(routingRulesSchema.safeParse([candidate]).success).toBe(false);
   });
 
+  it("rejects the reserved label key __proto__ instead of widening the rule", () => {
+    // JSON.parse makes a real own property named __proto__; a record would
+    // drop it silently and leave a rule that matches every series.
+    const labels = JSON.parse('{"__proto__":"x"}');
+    const rule = { metric: "x", op: ">", threshold: 1, effect: "full" };
+    expect(routingRulesSchema.safeParse([{ ...rule, labels }]).success).toBe(false);
+    for (const key of ["proto", "_proto__", "__proto", "constructor"]) {
+      expect(routingRulesSchema.safeParse([{ ...rule, labels: { [key]: "x" } }]).success).toBe(
+        true,
+      );
+    }
+  });
+
   it("caps the list at 16 rules", () => {
     const rules = Array.from({ length: 17 }, () => ({
       metric: "x",

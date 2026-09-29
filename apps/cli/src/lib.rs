@@ -6,6 +6,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod bounded_run;
 pub mod child_env;
 pub mod cli;
 pub mod commands;

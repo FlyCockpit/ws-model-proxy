@@ -42,11 +42,27 @@ const metricNameSchema = z.string().regex(METRIC_NAME_PATTERN, {
   message: "Use 1-64 characters from A-Z a-z 0-9 _ . : -",
 });
 
+/**
+ * A label key becomes an object key: `__proto__` matches the pattern but
+ * zod's record drops it silently (before any key schema runs), which would
+ * widen a rule's label filter. Reject it on the input. The relay schema and
+ * the CLI reject it too.
+ */
+const RESERVED_LABEL_KEYS = ["__proto__"] as const;
+const labelsSchema = z
+  .custom<Record<string, string>>(
+    (value) =>
+      typeof value === "object" &&
+      value !== null &&
+      !RESERVED_LABEL_KEYS.some((key) => Object.hasOwn(value, key)),
+    { message: "A label key is reserved." },
+  )
+  .pipe(z.record(metricNameSchema, metricNameSchema));
+
 export const routingRuleSchema = z
   .object({
     metric: metricNameSchema,
-    labels: z
-      .record(metricNameSchema, metricNameSchema)
+    labels: labelsSchema
       .refine((labels) => Object.keys(labels).length <= ROUTING_RULE_LABELS_MAX, {
         message: `At most ${ROUTING_RULE_LABELS_MAX} labels per rule.`,
       })

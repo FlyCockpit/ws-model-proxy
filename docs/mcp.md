@@ -43,6 +43,8 @@ Metric routing rules (S-B part 2):
   replaces the whole list (at most 16). A rule is a flat record
   `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
   threshold, effect: "full" | "avoid" }`; there is no expression language.
+  Label keys and values use the metric-name charset, and `__proto__` is not
+  accepted as a label key (the rule is rejected, never widened).
   `full` makes the member FULL: the request queues, goes to another member, or
   (for `:external` callers only) goes external after `externalAfterWaitMs`.
   `avoid` ranks the member last among free members and never makes it

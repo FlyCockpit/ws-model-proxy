@@ -215,7 +215,13 @@ fn test(json: bool, name: &str) -> Result<()> {
             spec.name
         );
     }
-    let outcome = metric_sources::run_source(&spec);
+    // Take shutdown signals so Ctrl-C ends the command's process group (it is
+    // not in the terminal's foreground group) instead of orphaning it.
+    crate::shutdown::install()?;
+    let outcome = metric_sources::run_source(&spec, None);
+    if let Some(signal) = crate::shutdown::requested() {
+        return Err(crate::shutdown::ShutdownRequested { signal }.into());
+    }
     let result = TestResult {
         name: spec.name.clone(),
         ok: outcome.is_ok(),

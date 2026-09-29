@@ -17,9 +17,9 @@
 //! do. Commands run as the OS user that runs wsmp.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -28,12 +28,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::bounded_run::RunError;
 use crate::config::{Config, MetricSourceConfig, MetricsConfig};
 use crate::protocol::{
     CustomMetric, MetricSourceError, MetricSourceFormat, MetricSourceOrigin, MetricSourceState,
     MetricSourceStatus, NODE_METRICS_CUSTOM_MAX, NODE_METRICS_SOURCES_MAX, RemoteMetricSource,
 };
-use crate::telemetry::is_metric_name;
+use crate::telemetry::{is_label_key, is_metric_name};
 
 /// Largest stdout a run may print; more is `output_too_large` and no values.
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -52,7 +53,6 @@ pub const REMOTE_SOURCES_FILE: &str = "remote-metric-sources.json";
 /// How often the runner checks the config file for changed local sources or
 /// approvals.
 const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3);
-const WAIT_POLL: Duration = Duration::from_millis(25);
 
 /// One parsed series.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -83,7 +83,7 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
         && labels.len() <= LABELS_MAX
         && labels
             .iter()
-            .all(|(key, value)| is_metric_name(key) && is_metric_name(value)))
+            .all(|(key, value)| is_label_key(key) && is_metric_name(value)))
     .then(|| Series {
         name: name.to_string(),
         labels,
@@ -205,115 +205,39 @@ fn parse_labels(mut text: &str) -> Option<(BTreeMap<String, String>, &str)> {
     }
 }
 
-/// Run a command once with every limit applied; returns its stdout.
-pub fn run_command(command: &str, timeout: Duration) -> Result<Vec<u8>, MetricSourceError> {
+/// Run a command once with every limit applied; returns its stdout. All of
+/// the process handling (own process group, scrubbed environment, no stdin,
+/// stderr discarded, stdout cap, deadline, bounded reap, daemon-exit kill)
+/// is [`crate::bounded_run::run`]; this maps its errors to the wire codes.
+pub fn run_command(
+    command: &str,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, MetricSourceError> {
     if crate::child_env::validate_command(command).is_err() || command.trim().is_empty() {
         return Err(MetricSourceError::Spawn);
     }
     let (shell, flag) = crate::child_env::exec_shell();
-    let mut builder = Command::new(shell);
-    builder
-        .arg(flag)
-        .arg(command)
-        .env_clear()
-        .envs(crate::child_env::scrub_parent_env(&[]))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // Never read, never uploaded.
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own process group, so a timeout kills everything it started.
-        builder.process_group(0);
-    }
-    let mut child = builder.spawn().map_err(|_| MetricSourceError::Spawn)?;
-    let pid = child.id();
-    let Some(stdout) = child.stdout.take() else {
-        kill_group(&mut child, pid);
-        let _ = child.wait();
-        return Err(MetricSourceError::Spawn);
-    };
-    let (done_tx, done_rx) = mpsc::channel();
-    // The reader owns the pipe so a full pipe cannot stall the child. It
-    // stops one byte past the limit, which is how oversize is detected.
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout
-            .take(OUTPUT_LIMIT as u64 + 1)
-            .read_to_end(&mut buffer);
-        let _ = done_tx.send(buffer);
-    });
-    let deadline = Instant::now() + timeout;
-    let mut early: Option<Vec<u8>> = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(_) => break None,
-        }
-        if early.is_none()
-            && let Ok(buffer) = done_rx.try_recv()
-        {
-            if buffer.len() > OUTPUT_LIMIT {
-                kill_group(&mut child, pid);
-                let _ = child.wait();
-                return Err(MetricSourceError::OutputTooLarge);
-            }
-            early = Some(buffer);
-        }
-        if Instant::now() >= deadline {
-            kill_group(&mut child, pid);
-            let _ = child.wait();
-            return Err(MetricSourceError::Timeout);
-        }
-        thread::sleep(WAIT_POLL);
-    };
-    // Background children left in the group would keep stdout open.
-    kill_group(&mut child, pid);
-    let Some(status) = status else {
-        return Err(MetricSourceError::Spawn);
-    };
-    let buffer = match early {
-        Some(buffer) => buffer,
-        None => done_rx
-            .recv_timeout(Duration::from_millis(500))
-            .map_err(|_| MetricSourceError::Timeout)?,
-    };
-    if buffer.len() > OUTPUT_LIMIT {
-        return Err(MetricSourceError::OutputTooLarge);
-    }
-    if !status.success() {
-        return Err(MetricSourceError::ExitStatus);
-    }
-    Ok(buffer)
-}
-
-#[cfg(unix)]
-fn kill_group(_child: &mut std::process::Child, pid: u32) {
-    let Ok(raw) = i32::try_from(pid) else {
-        return;
-    };
-    if raw <= 1 {
-        return;
-    }
-    // ESRCH (the group is already gone) is fine.
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(raw),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-}
-
-#[cfg(not(unix))]
-fn kill_group(child: &mut std::process::Child, _pid: u32) {
-    let _ = child.kill();
+    let args = [flag.to_string(), command.to_string()];
+    crate::bounded_run::run(shell, &args, timeout, OUTPUT_LIMIT, cancel).map_err(
+        |error| match error {
+            RunError::Spawn | RunError::Resources | RunError::Cancelled => MetricSourceError::Spawn,
+            RunError::Timeout => MetricSourceError::Timeout,
+            RunError::OutputTooLarge => MetricSourceError::OutputTooLarge,
+            RunError::ExitStatus => MetricSourceError::ExitStatus,
+        },
+    )
 }
 
 /// Run a source once and parse its output.
-pub fn run_source(spec: &SourceSpec) -> Result<Vec<Series>, MetricSourceError> {
+pub fn run_source(
+    spec: &SourceSpec,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Series>, MetricSourceError> {
     let output = run_command(
         &spec.command,
         Duration::from_secs(u64::from(spec.timeout_secs)),
+        cancel,
     )?;
     parse_output(spec.format, &spec.name, &output)
 }
@@ -547,12 +471,21 @@ pub struct Runner {
     results_tx: Sender<RunResult>,
     results_rx: Receiver<RunResult>,
     changed: bool,
+    /// Set when the runner is dropped (the session ended): runs in flight
+    /// kill their process group at the next poll instead of running out.
+    cancel: Arc<AtomicBool>,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Runner {
@@ -578,6 +511,7 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         runner.reload_config(true);
         runner.rebuild(Instant::now());
@@ -601,6 +535,7 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         runner.rebuild(Instant::now());
         runner
@@ -717,11 +652,12 @@ impl Runner {
             state.next_due = now + Duration::from_secs(u64::from(state.spec.interval_secs));
             let spec = state.spec.clone();
             let tx = self.results_tx.clone();
+            let cancel = Arc::clone(&self.cancel);
             let source_key = source_key.clone();
             let spawned = thread::Builder::new()
                 .name("wsmp-metric-source".to_string())
                 .spawn(move || {
-                    let outcome = run_source(&spec);
+                    let outcome = run_source(&spec, Some(&cancel));
                     let _ = tx.send(RunResult {
                         key: source_key,
                         command_sha256: spec.command_sha256,
@@ -882,6 +818,28 @@ escaped{v="a\"b"} 1
     }
 
     #[test]
+    fn a_reserved_label_key_drops_the_series_in_every_format() {
+        // `__proto__` matches the name pattern but the server would drop it
+        // silently, so the series never leaves the machine.
+        let prometheus = "bad{__proto__=\"x\"} 1\ngood{proto=\"x\"} 2\n";
+        let parsed =
+            parse_output(MetricSourceFormat::Prometheus, "src", prometheus.as_bytes()).expect("ok");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "good");
+        assert_eq!(
+            parse_output(
+                MetricSourceFormat::Prometheus,
+                "src",
+                b"bad{__proto__=\"x\"} 1\n"
+            ),
+            Err(MetricSourceError::Parse)
+        );
+        let labels = |key: &str| [(key.to_string(), "v".to_string())].into_iter().collect();
+        assert!(series("s", labels("__proto__"), 1.0).is_none());
+        assert!(series("s", labels("_proto__"), 1.0).is_some());
+    }
+
+    #[test]
     fn at_most_fifty_series_and_sixteen_labels() {
         let mut text = String::new();
         for index in 0..80 {
@@ -919,13 +877,14 @@ escaped{v="a\"b"} 1
         let output = run_command(
             "echo 42; echo super-secret-stderr >&2",
             Duration::from_secs(5),
+            None,
         )
         .expect("ran");
         let text = String::from_utf8(output).expect("utf8");
         assert_eq!(text.trim(), "42");
         assert!(!text.contains("super-secret-stderr"));
         assert_eq!(
-            run_command("exit 3", Duration::from_secs(5)),
+            run_command("exit 3", Duration::from_secs(5), None),
             Err(MetricSourceError::ExitStatus)
         );
     }
@@ -934,13 +893,13 @@ escaped{v="a\"b"} 1
     #[test]
     fn oversized_output_is_dropped() {
         assert_eq!(
-            run_command("head -c 70000 /dev/zero", Duration::from_secs(5)),
+            run_command("head -c 70000 /dev/zero", Duration::from_secs(5), None),
             Err(MetricSourceError::OutputTooLarge)
         );
         // An endless writer is stopped at the limit, not at the timeout.
         let started = Instant::now();
         assert_eq!(
-            run_command("yes 1", Duration::from_secs(20)),
+            run_command("yes 1", Duration::from_secs(20), None),
             Err(MetricSourceError::OutputTooLarge)
         );
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -948,7 +907,11 @@ escaped{v="a\"b"} 1
         // soon as the limit is crossed, not at its timeout.
         let started = Instant::now();
         assert_eq!(
-            run_command("head -c 70000 /dev/zero; sleep 30", Duration::from_secs(20)),
+            run_command(
+                "head -c 70000 /dev/zero; sleep 30",
+                Duration::from_secs(20),
+                None
+            ),
             Err(MetricSourceError::OutputTooLarge)
         );
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -962,7 +925,7 @@ escaped{v="a\"b"} 1
         let command = format!("sleep 30 & echo $! > '{}'; sleep 30", pid_file.display());
         let started = Instant::now();
         assert_eq!(
-            run_command(&command, Duration::from_secs(1)),
+            run_command(&command, Duration::from_secs(1), None),
             Err(MetricSourceError::Timeout)
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1098,6 +1061,54 @@ escaped{v="a\"b"} 1
         // Stale after 3 intervals.
         let (custom, _) = runner.report(Instant::now() + Duration::from_secs(31));
         assert!(custom.is_empty());
+    }
+
+    /// The session ended (the runner is dropped): a run in flight is killed
+    /// with its process group at once, not left to run out its timeout.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_runner_kills_runs_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("run.pid");
+        let mut metrics = MetricsConfig::default();
+        metrics.sources.insert(
+            "slow".to_string(),
+            MetricSourceConfig {
+                command: format!("echo $$ > '{}'; sleep 60 & wait", pid_file.display()),
+                interval_secs: 10,
+                timeout_secs: 60,
+                format: MetricSourceFormat::Number,
+            },
+        );
+        let mut runner = Runner::with_inputs(settings(false), metrics, Vec::new());
+        runner.tick(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the command never started");
+            thread::sleep(Duration::from_millis(20));
+        };
+        drop(runner);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|stat| stat.contains(") Z "))
+                    .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a run outlived its dropped runner"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(unix)]

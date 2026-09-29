@@ -273,6 +273,22 @@ export type EndpointInventory = z.infer<typeof endpointInventorySchema>;
 /** Custom metric names, label keys and label values (S-B part 2). */
 export const METRIC_NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
 const metricNameSchema = z.string().regex(METRIC_NAME_PATTERN);
+/**
+ * A label key becomes an object key, and `__proto__` matches the pattern but
+ * zod's record drops it silently (before any key schema runs). Reject it
+ * up front, on the input, as the CLI does (`is_label_key`), so both sides
+ * agree on what a series is.
+ */
+export const RESERVED_LABEL_KEYS = ["__proto__"] as const;
+const labelsSchema = z
+  .custom<Record<string, string>>(
+    (value) =>
+      typeof value === "object" &&
+      value !== null &&
+      !RESERVED_LABEL_KEYS.some((key) => Object.hasOwn(value, key)),
+    { message: "A label key is reserved." },
+  )
+  .pipe(z.record(metricNameSchema, metricNameSchema));
 export const NODE_METRICS_CUSTOM_MAX = 50;
 export const NODE_METRIC_SOURCES_MAX = 50;
 const MIB_MAX = 1_000_000_000;
@@ -371,8 +387,6 @@ const metricSourceStatusSchema = z
     intervalSecs: z.number().int().min(5).max(86_400).optional(),
     /** A reason code only: command output and stderr never leave the CLI. */
     error: z.enum(["spawn", "timeout", "exit_status", "output_too_large", "parse"]).optional(),
-    /** How often the source runs; its series are stale after 3× this (S-B part 2). */
-    intervalSecs: z.number().int().min(5).max(86_400).optional(),
   })
   .strict();
 
@@ -380,8 +394,7 @@ const customMetricSchema = z
   .object({
     source: metricNameSchema,
     name: metricNameSchema,
-    labels: z
-      .record(metricNameSchema, metricNameSchema)
+    labels: labelsSchema
       .refine((labels) => Object.keys(labels).length <= 16, {
         message: "At most 16 labels per series.",
       })
@@ -492,11 +505,6 @@ export const remoteMetricSourceSchema = z
   })
   .strict();
 export type RemoteMetricSource = z.infer<typeof remoteMetricSourceSchema>;
-/** The whole `metrics.sources.set` list, capped like the CLI's reports. */
-export const remoteMetricSourcesSchema = z
-  .array(remoteMetricSourceSchema)
-  .max(NODE_METRIC_SOURCES_MAX);
-
 /** The `metrics.sources.set` payload, bounded like the CLI-side storage. */
 export const remoteMetricSourcesSchema = z
   .array(remoteMetricSourceSchema)
@@ -917,6 +925,17 @@ export function parseRelaySubprotocolHeader(header: string | undefined): {
  * message is not well-formed Unicode: the CLI cannot read such a frame.
  */
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
+  // The one enforcement point for the only outbound message whose payload is
+  // built from stored, user-authored data: a source list that fails the wire
+  // schema is never framed (callers send an empty list instead).
+  if (
+    message.type === "metrics.sources.set" &&
+    !remoteMetricSourcesSchema.safeParse(message.sources).success
+  ) {
+    throw new RelayProtocolError(
+      "metrics.sources.set carries a source list that fails the wire schema.",
+    );
+  }
   return stringifyWellFormed(message);
 }
 

@@ -1522,22 +1522,28 @@ mod signal_shutdown {
     }
 
     fn start_relay(args: &[&str]) -> Setup {
+        start_relay_with(args, json!({}))
+    }
+
+    /// `extra` is merged over the base config (top-level keys).
+    fn start_relay_with(args: &[&str], extra: Value) -> Setup {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical tempdir");
         let config = dir.join("config.json");
         let state = dir.join("state");
         let relay = FakeRelay::start();
-        write_config(
-            &config,
-            json!({
-                "version": 1,
-                "serverUrl": relay.server_url,
-                "cliSlug": "cli-signal-test",
-                "cliTokenEnv": TOKEN_ENV,
-                "allowMcpCommands": true,
-                "endpoints": []
-            }),
-        );
+        let mut value = json!({
+            "version": 1,
+            "serverUrl": relay.server_url,
+            "cliSlug": "cli-signal-test",
+            "cliTokenEnv": TOKEN_ENV,
+            "allowMcpCommands": true,
+            "endpoints": []
+        });
+        if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        write_config(&config, value);
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
             .args(args)
             .env("WSMP_CONFIG", &config)
@@ -1630,6 +1636,106 @@ mod signal_shutdown {
         }
         signal(setup.child.id(), "TERM");
         assert_clean_shutdown(&mut setup, &shell, &grand, 15);
+    }
+
+    /// Daemon exit during a custom metric source run must not orphan the
+    /// command's process group (it runs arbitrary commands, in its own group).
+    #[test]
+    fn sigterm_kills_a_running_metric_source_group() {
+        // The source's environment is scrubbed, so the command names its files.
+        let pids = tempfile::tempdir().expect("tempdir");
+        let pids = pids.path().canonicalize().expect("canonical tempdir");
+        let mut setup = start_relay_with(
+            &["connect"],
+            json!({ "metrics": { "sources": { "slow": {
+                "command": format!(
+                    "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+                    pids.join("shell.pid").display(),
+                    pids.join("grand.pid").display()
+                ),
+                "intervalSecs": 5,
+                "timeoutSecs": 300,
+                "format": "number"
+            } } } }),
+        );
+        let hello = setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        // Registering starts the telemetry thread, which starts the source.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "hello.ok",
+                "id": hello["id"],
+                "protocolVersion": "2.7",
+                "revision": {
+                    "inventorySeq": 1,
+                    "inventoryDigest": "d",
+                    "inventoryAcknowledgedAt": "2026-09-28T12:00:00.000Z"
+                }
+            })
+            .to_string(),
+        );
+        let shell = wait_for_file(&pids.join("shell.pid"));
+        let grand = wait_for_file(&pids.join("grand.pid"));
+        assert!(process_alive(&shell) && process_alive(&grand));
+        signal(setup.child.id(), "TERM");
+        let status = wait_for_exit(&mut setup.child);
+        assert!(
+            status.signal() == Some(15) || status.code() == Some(143),
+            "unexpected relay status {status:?}"
+        );
+        wait_until_gone(&shell);
+        wait_until_gone(&grand);
+    }
+
+    /// `wsmp metrics test` runs the command in its own process group, which a
+    /// terminal's Ctrl-C does not reach: the signal must still end it.
+    #[test]
+    fn sigint_during_metrics_test_kills_the_command_group() {
+        if inherited_ignored(2) {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical tempdir");
+        let config = dir.join("config.json");
+        write_config(
+            &config,
+            json!({
+                "version": 1,
+                "metrics": { "sources": { "slow": {
+                    "command": format!(
+                        "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+                        dir.join("shell.pid").display(),
+                        dir.join("grand.pid").display()
+                    ),
+                    "timeoutSecs": 300
+                } } }
+            }),
+        );
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
+            .args(["metrics", "test", "slow"])
+            .env("WSMP_CONFIG", &config)
+            .env("WSMP_STATE_DIR", dir.join("state"))
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start metrics test");
+        let shell = wait_for_file(&dir.join("shell.pid"));
+        let grand = wait_for_file(&dir.join("grand.pid"));
+        signal(child.id(), "INT");
+        let status = wait_for_exit(&mut child);
+        assert!(
+            status.signal() == Some(2) || status.code() == Some(130),
+            "unexpected status {status:?}"
+        );
+        wait_until_gone(&shell);
+        wait_until_gone(&grand);
     }
 
     #[test]
