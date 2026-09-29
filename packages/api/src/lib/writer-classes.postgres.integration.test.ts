@@ -1,6 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
 // DL-1 design (d) (#78) on real PostgreSQL: the structural claims the lock
@@ -225,6 +225,11 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
           await m.order.acquireFences(tx, [m.order.fences.owner(user.id)]);
         }),
       ).toBe("WMPF2");
+      // A malformed name (no level, or a comma that would forge the held set).
+      for (const name of ["owner:x", "00:owner:a,00:owner:b"])
+        expect(
+          await attempt((tx) => tx.$queryRaw`SELECT wsmp_acquire_fences(ARRAY[${name}], true)`),
+        ).toBe("WMPF3");
       let recorded = "";
       expect(
         await attempt(async (tx) => {
@@ -329,6 +334,16 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
             data: { healthStatus: "DEGRADED", consecutiveRetryableFailures: 2 },
           }),
         ),
+      ).toBe("ok");
+      // A member's owner is its pool's owner (the row has no userId).
+      expect(await attempt((tx) => tx.poolMember.delete({ where: { id: member.id } }))).toBe(
+        "WMPF4",
+      );
+      expect(
+        await attempt(async (tx) => {
+          await m.order.fenceOwners(tx, [user.id]);
+          await tx.poolMember.delete({ where: { id: member.id } });
+        }),
       ).toBe("ok");
     });
 
@@ -815,6 +830,190 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
         await fixtures.discoveredModel.count({ where: { endpointId: local.endpoint.id } }),
       ).toBe(0);
       expect(await fixtures.executionTarget.count({ where: { userId: user.id } })).toBe(0);
+    });
+  });
+
+  describe("guards found by mutation testing", () => {
+    it("refuses an unfenced delete of a user who owns no graph rows (the user trigger itself)", async () => {
+      const m = required();
+      const { user } = await userFixture("bare-user");
+      expect(await attempt((tx) => tx.user.delete({ where: { id: user.id } }))).toBe("WMPF4");
+      expect(
+        await attempt(async (tx) => {
+          await m.order.fenceOwners(tx, [user.id]);
+          await tx.user.delete({ where: { id: user.id } });
+        }),
+      ).toBe("ok");
+    });
+
+    it("re-plans a parent delete whose owner set grew while it waited for its fences", async () => {
+      const m = required();
+      const { user: owner, suffix } = await userFixture("replan-owner");
+      const { user: other } = await userFixture("replan-other");
+      const pool = await fixtures.modelPool.create({
+        data: { userId: owner.id, slug: `replan-${suffix}`, name: "Replan" },
+      });
+      await fixtures.poolGrant.create({
+        data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: other.id },
+      });
+      const token = await fixtures.modelApiToken.create({
+        data: {
+          userId: other.id,
+          name: "Other token",
+          scopeMode: "ALLOWLIST",
+          lookupPrefix: `rp-${suffix}`,
+          secretDigest: `rs-${suffix}`,
+        },
+      });
+      // A writer holding both owners' fences adds an entry on the pool that
+      // names the other owner; the delete plans its owners before it commits.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let inserted!: () => void;
+      const hasInserted = new Promise<void>((resolve) => {
+        inserted = resolve;
+      });
+      const writer = strict.$transaction(
+        async (tx) => {
+          await m.order.fenceOwners(tx, [owner.id, other.id]);
+          await tx.modelApiTokenAllowlistEntry.create({
+            data: { modelApiTokenId: token.id, target: "MODEL_POOL", modelPoolId: pool.id },
+          });
+          inserted();
+          await released;
+        },
+        { timeout: 20_000 },
+      );
+      await hasInserted;
+      const forwarder = createRouterClient(m.forwarder.forwarderManagementRouter, {
+        context: sessionFor(owner),
+      });
+      const deleting = forwarder.deleteModelPool({ id: pool.id });
+      await vi.waitFor(
+        async () => {
+          const rows = await fixtures.$queryRaw<Array<{ n: bigint }>>`
+            SELECT count(*)::bigint AS n FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+               AND query LIKE '%wsmp_acquire_fences%'`;
+          expect(Number(rows[0]?.n ?? 0)).toBeGreaterThanOrEqual(1);
+        },
+        { timeout: 10_000, interval: 20 },
+      );
+      release();
+      await writer;
+      // The first attempt finds an owner it did not fence and retries with it.
+      await expect(deleting).resolves.toEqual({ deleted: true });
+      expect(
+        await fixtures.modelApiTokenAllowlistEntry.count({ where: { modelApiTokenId: token.id } }),
+      ).toBe(0);
+    });
+
+    it("prunes only terminal admission history and never waits on a waiter another transaction holds", async () => {
+      const m = required();
+      const { user, suffix } = await userFixture("prune-guard");
+      const local = await localModel(user.id, suffix, "prune");
+      const pool = await fixtures.modelPool.create({
+        data: { userId: user.id, slug: `prune-${suffix}`, name: "Prune" },
+      });
+      const member = await fixtures.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: local.target.id, tier: "PRIMARY" },
+      });
+      const request = async (label: string, state: "WAITING" | "CANCELLED") => {
+        const id = `${label}-${suffix}`;
+        await fixtures.$executeRawUnsafe(
+          `INSERT INTO admission_request (id, "userId", "requestId", "attemptId", "sourceKind", "poolId",
+             "basePriority", "enqueueSequence", "connectionOwner", "heartbeatAt", state, "terminalAt",
+             "deadlineAt", "updatedAt")
+           VALUES ('${id}', '${user.id}', '${id}', '${id}', 'POOL', '${pool.id}', 16, 1, 'fixture', now(),
+             '${state}', ${state === "WAITING" ? "NULL" : "now()"},
+             ${state === "WAITING" ? "now() + interval '1 hour'" : "NULL"}, now() - interval '30 days')`,
+        );
+        await fixtures.$executeRawUnsafe(
+          `INSERT INTO capacity_waiter (id, "userId", "admissionRequestId", "requestId", "attemptId",
+             "enqueueSequence", "capacityId", "executionTargetId", "poolId", "poolMemberId",
+             "candidateOrder", "effectivePriority", "effectiveConcurrencyScope",
+             "effectiveConcurrencyScopeId", "effectiveReservedSlots", "effectiveBorrowPolicy", state,
+             "deadlineAt")
+           VALUES ('w-${id}', '${user.id}', '${id}', '${id}', '${id}', 1, '${local.capacityId}',
+             '${local.target.id}', '${pool.id}', '${member.id}', 0, 16, 'POOL', '${pool.id}', 0,
+             'WHEN_IDLE', '${state}', now() + interval '1 hour')`,
+        );
+        return id;
+      };
+      const live = await request("prune-live", "WAITING");
+      const held = await request("prune-held", "CANCELLED");
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let locked!: () => void;
+      const isLocked = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      const holder = strict.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM capacity_waiter WHERE id = ${`w-${held}`} FOR UPDATE`;
+          locked();
+          await released;
+        },
+        { timeout: 20_000 },
+      );
+      await isLocked;
+      try {
+        const started = Date.now();
+        await m.sweeps.pruneTerminalCapacityHistory(m.prisma, {
+          before: new Date(Date.now() + 60_000),
+        });
+        // Passed, not waited on (the holder keeps its lock until released).
+        expect(Date.now() - started).toBeLessThan(3_000);
+        expect(await fixtures.admissionRequest.count({ where: { id: { in: [live, held] } } })).toBe(
+          2,
+        );
+      } finally {
+        release();
+        await holder;
+      }
+      await m.sweeps.pruneTerminalCapacityHistory(m.prisma, {
+        before: new Date(Date.now() + 60_000),
+      });
+      expect(
+        (
+          await fixtures.admissionRequest.findMany({
+            where: { id: { in: [live, held] } },
+            select: { id: true },
+          })
+        ).map((row) => row.id),
+      ).toEqual([live]);
+    });
+
+    it("refuses a cache-affinity record naming another owner's pool or target, and tolerates a deleted one", async () => {
+      const { user, suffix } = await userFixture("affinity-owner");
+      const { user: other } = await userFixture("affinity-other");
+      const own = await localModel(user.id, suffix, "affinity");
+      const foreign = await localModel(other.id, suffix, "affinity-foreign");
+      const ownPool = await fixtures.modelPool.create({
+        data: { userId: user.id, slug: `aff-${suffix}`, name: "Aff" },
+      });
+      const foreignPool = await fixtures.modelPool.create({
+        data: { userId: other.id, slug: `aff-f-${suffix}`, name: "Aff foreign" },
+      });
+      const insert = (label: string, poolId: string, targetId: string) =>
+        attempt((tx) =>
+          tx.$executeRawUnsafe(
+            `INSERT INTO cache_affinity_record
+               (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
+                "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
+                "conversationDigest", "prefixDepth")
+             VALUES ('${label}-${suffix}', now(), now(), now() + interval '1 hour', '${user.id}',
+               '${user.id}', '${poolId}', '${targetId}', repeat('t', 32), 3, repeat('d', 43),
+               repeat('${label.length % 10}', 43), NULL, 1)`,
+          ),
+        );
+      expect(await insert("foreign-pool", foreignPool.id, own.target.id)).toContain("23514");
+      expect(await insert("foreign-target", ownPool.id, foreign.target.id)).toContain("23514");
+      expect(await insert("gone-pool", `gone-${suffix}`, own.target.id)).toBe("ok");
     });
   });
 });

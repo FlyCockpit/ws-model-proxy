@@ -1132,7 +1132,18 @@ try {
     throw new Error("Deleted grantee token still anchors a provider Responses binding");
   }
   // Orphaned hot-path rows (bindings whose token, grant or pool is gone) are
-  // legitimate under DL-1 (d): the next hardening apply must accept them.
+  // legitimate under DL-1 (d): the next hardening apply must accept them,
+  // including a pre-v3 binding whose pool was deleted.
+  await client.query(`
+    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    VALUES ('orphan-binding-pool', NOW(), NOW(), 'owner-a', 'orphan-binding', 'Orphan binding');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest", "routingVersion",
+       "targetModelPoolId", "expiresAt")
+    VALUES ('orphan-pool-binding', NOW(), NOW(), 'owner-a', 'orphan-pool-binding-digest', 2,
+      'orphan-binding-pool', NOW() + INTERVAL '1 hour');
+    DELETE FROM model_pool WHERE id = 'orphan-binding-pool'; -- policy: bounded-delete
+  `);
   await client.query(sql);
   const reverseBackfill = await client.query(`
     SELECT "discoveredModelId" FROM pool_member WHERE id = 'conflict-target-row'
