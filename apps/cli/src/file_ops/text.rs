@@ -92,6 +92,20 @@ pub fn floor_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+/// A file name or relative path as one line of a `path:line|text` / `dir_list`
+/// record. Characters the shared [`crate::display_escape`] list hides (NUL, tabs,
+/// bidi controls, invisible characters) are shown as `\u{<hex>}`, and so are line
+/// breaks, which that list keeps but a record separator cannot: a name holding
+/// `\n` must not look like two results. The separators `:` `|` and the `--` group
+/// marker stay ambiguous, which the tool descriptions document.
+pub fn name_for_display(name: &str) -> String {
+    crate::display_escape::escape_for_display(name)
+        .replace('\n', "\\u{a}")
+        .replace('\r', "\\u{d}")
+        .replace('\u{2028}', "\\u{2028}")
+        .replace('\u{2029}', "\\u{2029}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,7 +126,7 @@ mod tests {
             (&[0xff, 0xfe, 0, 0, b'h', 0, 0, 0], Some("utf16")),
             (b"text\0more", Some("unknown")),
             (&safetensors, Some("safetensors")),
-            (b"caf\xc3\xa9 ok\n", None),
+            (b"na\xc3\xafve c\xc3\xa9 ok\n", None),
         ];
         for (bytes, expected) in rows {
             assert_eq!(sniff_binary(bytes), *expected, "{bytes:?}");

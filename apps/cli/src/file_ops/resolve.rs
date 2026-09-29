@@ -31,6 +31,7 @@ use nix::fcntl::{OFlag, openat, readlinkat};
 use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
+use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 use super::policy::{Access, Policy};
 
@@ -358,12 +359,8 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     let mode = opts.make_parents.unwrap_or(0o755);
                     let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
                     opts.policy.check_path(Access::Write, &here.join(&comp))?;
-                    mkdirat(
-                        cur.as_fd(),
-                        comp.as_os_str(),
-                        Mode::from_bits_truncate(mode),
-                    )
-                    .map_err(FileError::errno)?;
+                    mkdirat(cur.as_fd(), comp.as_os_str(), perm_mode(mode))
+                        .map_err(FileError::errno)?;
                     let parent = cur.try_clone()?;
                     created.push(CreatedDir {
                         parent,

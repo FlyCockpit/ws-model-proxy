@@ -247,3 +247,54 @@ fn path_locks_serialize_same_path_only_and_time_out_or_cancel() {
     drop(first);
     assert!(waiter.join().unwrap());
 }
+
+/// Deterministic discriminator for the in-flight limit: one worker holding one
+/// job, `max_in_flight = 1`. The count is at its limit, so the next submit must
+/// be refused even though nothing is queued behind it.
+#[test]
+fn one_held_job_is_the_whole_in_flight_budget() {
+    let pool = FilePool::with_capacity(1, 1);
+    let held = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let started = Arc::new(AtomicUsize::new(0));
+    let (h, r, s) = (
+        Arc::clone(&held),
+        Arc::clone(&release),
+        Arc::clone(&started),
+    );
+    let _first = pool
+        .submit(
+            move || {
+                s.fetch_add(1, Ordering::SeqCst);
+                h.wait();
+                r.wait();
+                Ok(1)
+            },
+            1,
+        )
+        .unwrap();
+    // the worker is now inside the job, so the single slot is taken
+    held.wait();
+    // A failure below must still release the worker: `FilePool::drop` joins the
+    // threads, and a panic while the job holds the `release` barrier would hang.
+    let started_count = started.load(Ordering::SeqCst);
+    let refused = pool.submit(|| Ok(2), 1).map(|_| ()).map_err(|err| err.code);
+    release.wait();
+    assert_eq!(started_count, 1);
+    assert_eq!(refused, Err(ErrorCode::Limit));
+    // the slot is released once the job finishes
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match pool.submit(|| Ok(3), 1) {
+            Ok(rx) => {
+                assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), 3);
+                break;
+            }
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::Limit);
+                assert!(Instant::now() < deadline, "the slot never freed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}

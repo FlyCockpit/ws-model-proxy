@@ -194,17 +194,19 @@ pub fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadO
         total.saturating_sub(start.unsigned_abs() - 1).max(1)
     };
     let offset = line_offset(&bytes, first.saturating_sub(1) as usize);
-    let (context_from, feed_from_start) = match class {
-        FileClass::PemKey => (0, true),
-        _ => (prev_line_start(&bytes, offset), false),
+    // A `.pem`/`KEY` block or a dotenv quoted value opened before the window
+    // masks every following line, so the masker must see the whole prefix (both
+    // classes are small enough for the in-memory path; `read_large` refuses
+    // them above the scan cap). Other classes need one line of context before
+    // the window for the flag-continuation rule.
+    let context_from = if class.needs_prefix() {
+        0
+    } else {
+        prev_line_start(&bytes, offset)
     };
     let mut masker = LineMasker::new(class);
     if offset > 0 {
-        let context = if feed_from_start {
-            &bytes[..offset]
-        } else {
-            &bytes[context_from..offset]
-        };
+        let context = &bytes[context_from..offset];
         for raw in context.split_inclusive(|b| *b == b'\n') {
             if let Ok(line) = std::str::from_utf8(strip_eol(raw)) {
                 let _ = masker.scan(line);
@@ -407,6 +409,10 @@ fn read_large(
         let first = start as u64;
         let mut reader = BufReader::with_capacity(1 << 20, &mut *file);
         let mut scanned = 0_u64;
+        // Feed the masker every line before the window for a class whose masking
+        // can span lines; otherwise the last line is the one line of context the
+        // flag-continuation rule needs.
+        let context_prefix = class.needs_prefix();
         let mut context: Vec<u8> = Vec::new();
         for _ in 1..first {
             let mut buf = Vec::new();
@@ -421,9 +427,15 @@ fn read_large(
                     "startLine is more than 64 MiB into the file; use a negative startLine to read the end",
                 ));
             }
-            context = buf;
+            if context_prefix {
+                if let Ok(line) = std::str::from_utf8(strip_eol(&buf)) {
+                    let _ = masker.scan(line);
+                }
+            } else {
+                context = buf;
+            }
         }
-        if let Ok(line) = std::str::from_utf8(strip_eol(&context)) {
+        if !context_prefix && let Ok(line) = std::str::from_utf8(strip_eol(&context)) {
             let _ = masker.scan(line);
         }
         let mut lines = std::iter::from_fn(|| {

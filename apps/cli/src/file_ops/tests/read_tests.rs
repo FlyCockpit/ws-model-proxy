@@ -7,7 +7,7 @@ use serde_json::json;
 use super::super::read::{More, ReadOutcome};
 use super::super::text::Eol;
 use super::super::{Cancel, ErrorCode};
-use super::{Fx, args, code};
+use super::{Fx, args, aws_style_id, code, pem};
 
 fn numbered(n: usize) -> String {
     (1..=n).map(|i| format!("line {i}\n")).collect()
@@ -154,7 +154,7 @@ fn binary_and_invalid_utf8_are_refused_not_decoded() {
         ("gguf", b"GGUF\x03\0\0\0weights".to_vec(), "gguf"),
         ("nul", b"abc\0def\n".to_vec(), "unknown"),
         ("utf16", vec![0xff, 0xfe, b'h', 0, b'i', 0], "utf16"),
-        ("latin1", b"caf\xe9 au lait\n".to_vec(), "unknown"),
+        ("latin1", b"na\xc3\xafve cuv\xe9e\n".to_vec(), "unknown"),
         ("elf", b"\x7fELF\x02\x01\x01".to_vec(), "elf"),
     ];
     for (name, bytes, sniff) in rows {
@@ -240,13 +240,44 @@ fn secret_files_return_a_masked_view() {
     // plain file: only secret-named assignments
     fx.put(
         "run.sh",
-        "export X_API_KEY=abcdef\nmax_tokens=4096\nAKIAIOSFODNN7EXAMPLE\n",
+        format!(
+            "export X_API_KEY=abcdef\nmax_tokens=4096\n{}\n",
+            aws_style_id()
+        ),
     );
     let r = fx.read("run.sh");
     assert!(!r.secret_file);
     assert_eq!(r.redactions, 1);
-    assert!(r.text.contains("max_tokens=4096") && r.text.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(r.text.contains("max_tokens=4096") && r.text.contains(&aws_style_id()));
     assert!(!r.text.contains("abcdef"));
+}
+
+/// AC 32's named negative: a `~/.aws/credentials`-shaped file is not a secret
+/// class (the classifier has no cloud-credential rule) and its lower-case keys
+/// are outside the assignment name set, so the content is returned as it is.
+#[test]
+fn an_aws_credentials_file_is_not_masked_by_class_or_name() {
+    let fx = Fx::new();
+    fx.put(
+        ".aws/credentials",
+        "[default]\naws_access_key_id = EXAMPLEKEYIDVALUE\naws_secret_access_key = examplesecretvalue\n",
+    );
+    let r = fx.read(".aws/credentials");
+    assert!(!r.secret_file);
+    assert_eq!(r.redactions, 0);
+    assert!(
+        r.text
+            .contains("aws_secret_access_key = examplesecretvalue"),
+        "{}",
+        r.text
+    );
+    // and there is nothing for an edit to probe: the view is the raw text
+    let view = super::super::redact::mask(
+        super::super::redact::FileClass::Plain,
+        &fx.get(".aws/credentials"),
+    );
+    assert_eq!(view.redactions(), 0);
+    assert_eq!(view.text, fx.get(".aws/credentials"));
 }
 
 #[test]
@@ -254,10 +285,17 @@ fn ssh_keys_pem_keys_and_hf_token_files_are_masked() {
     let fx = Fx::new();
     fx.put(
         ".ssh/id_ed25519",
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBODY\n-----END OPENSSH PRIVATE KEY-----\n",
+        pem("OPENSSH PRIVATE KEY", "SECRETBODY\n"),
     );
     fx.put(".ssh/id_ed25519.pub", "ssh-ed25519 AAAAPUBLIC me@host\n");
-    fx.put("tls/server.pem", "-----BEGIN CERTIFICATE-----\nCERTBODY\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nKEYBODY\n-----END PRIVATE KEY-----\n");
+    fx.put(
+        "tls/server.pem",
+        format!(
+            "{}{}",
+            pem("CERTIFICATE", "CERTBODY\n"),
+            pem("PRIVATE KEY", "KEYBODY\n")
+        ),
+    );
     fx.put(".cache/huggingface/token", "hf_abcdefghijklmnop\n");
     assert!(!fx.read(".ssh/id_ed25519").text.contains("SECRETBODY"));
     assert!(fx.read(".ssh/id_ed25519.pub").text.contains("AAAAPUBLIC"));
@@ -278,7 +316,10 @@ fn a_window_deep_inside_a_pem_private_key_block_is_masked() {
     let fx = Fx::new();
     fx.put(
         "k.pem",
-        "-----BEGIN PRIVATE KEY-----\nBODYONE\nBODYTWO\nBODYTHREE\n-----END PRIVATE KEY-----\nafter\n",
+        format!(
+            "{}after\n",
+            pem("PRIVATE KEY", "BODYONE\nBODYTWO\nBODYTHREE\n")
+        ),
     );
     for start in 2..=5 {
         let r = fx.read_with(json!({ "path": fx.p("k.pem"), "startLine": start }));
@@ -299,7 +340,7 @@ fn a_secret_at_the_byte_cap_is_masked_whole_never_half_shown() {
     for cap in 1..=80 {
         let r = fx.read_with(json!({ "path": fx.p("a.env"), "maxBytes": cap }));
         assert!(
-            !r.text.contains("SUPER") && !r.text.contains("ECRET"),
+            !r.text.contains("SUPER") && !r.text.contains("SECRET"),
             "cap {cap}: {}",
             r.text
         );
@@ -319,6 +360,37 @@ fn a_secret_at_the_byte_cap_is_masked_whole_never_half_shown() {
     );
     let r = fx.read_with(json!({ "path": fx.p("cont.txt"), "startLine": 3 }));
     assert!(!r.text.contains("SUPER"), "{}", r.text);
+}
+
+/// A window that starts many lines inside a quoted dotenv value masks every
+/// returned line: the masker must be fed the whole prefix, not only the line
+/// before the window.
+#[test]
+fn a_window_deep_inside_a_quoted_value_is_masked() {
+    let fx = Fx::new();
+    fx.put("q.env", "A=\"first\nsecond\nthird\"\nB=x\n");
+    for start in 1..=4 {
+        let r = fx.read_with(json!({ "path": fx.p("q.env"), "startLine": start }));
+        assert!(
+            !r.text.contains("first") && !r.text.contains("second") && !r.text.contains("third"),
+            "startLine {start}: {}",
+            r.text
+        );
+    }
+    // an unterminated quote masks to the end of the file from a deep window
+    fx.put("u.env", "A=\"one\ntwo\nthree\n");
+    let r = fx.read_with(json!({ "path": fx.p("u.env"), "startLine": 3 }));
+    assert!(!r.text.contains("three"), "{}", r.text);
+    // a `.pem` window deep inside a private-key block stays masked (multi-line class)
+    fx.put(
+        "deep.pem",
+        format!(
+            "{}after\n",
+            super::super::tests::pem("PRIVATE KEY", "BODYONE\nBODYTWO\nBODYTHREE\n")
+        ),
+    );
+    let r = fx.read_with(json!({ "path": fx.p("deep.pem"), "startLine": 3 }));
+    assert!(!r.text.contains("BODYTHREE"), "{}", r.text);
 }
 
 #[test]

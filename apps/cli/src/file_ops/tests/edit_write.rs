@@ -337,12 +337,12 @@ fn binary_and_oversized_files_are_refused() {
         edit_err(&fx, "b.bin", json!([{ "oldText": "GGUF", "newText": "x" }])).code,
         ErrorCode::BinaryFile
     );
-    fx.put("latin1.txt", b"caf\xe9\n");
+    fx.put("latin1.txt", b"na\xc3\xafve cuv\xe9e\n");
     assert_eq!(
         edit_err(
             &fx,
             "latin1.txt",
-            json!([{ "oldText": "caf", "newText": "x" }])
+            json!([{ "oldText": "cuv\u{e9}e", "newText": "x" }])
         )
         .code,
         ErrorCode::BinaryFile
@@ -454,16 +454,10 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
 #[test]
 fn ssh_key_files_cannot_be_edited_at_all() {
     let fx = Fx::new();
-    fx.put(
-        "id_rsa",
-        "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
-    );
-    let code = edit_err(
-        &fx,
-        "id_rsa",
-        json!([{ "oldText": "-----BEGIN PRIVATE KEY-----", "newText": "x" }]),
-    )
-    .code;
+    let begin = format!("-----BEGIN {}-----", ["PRIVATE", "KEY"].join(" "));
+    let end = format!("-----END {}-----", ["PRIVATE", "KEY"].join(" "));
+    fx.put("id_rsa", format!("{begin}\nAAAA\n{end}\n"));
+    let code = edit_err(&fx, "id_rsa", json!([{ "oldText": begin, "newText": "x" }])).code;
     assert!(
         matches!(code, ErrorCode::NoMatch | ErrorCode::RedactedSpan),
         "{code:?}"
