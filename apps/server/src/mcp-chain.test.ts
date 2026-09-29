@@ -1,6 +1,6 @@
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./relay/cli-commands.js", () => ({
   startCliCommand: vi.fn(),
@@ -109,14 +109,43 @@ const memoryAuth = betterAuth({
   logger: { disabled: true },
 });
 
+/**
+ * The REAL production app, built ONCE per MCP flag: no test varies a
+ * construction input, so the two flag fixtures are shared. They stay
+ * SEPARATE instances because app.ts captures the flag at construction time
+ * for the /mcp feature gate and the flag-on OAuth block. The shared env mock
+ * is still assigned on EVERY call — the alias gates and the request-time
+ * authorize guard read it per request, so each test must observe the flag it
+ * asked for (L25: one shared env source for factory and consumers).
+ */
+const appCache = new Map<"on" | "off", Awaited<ReturnType<typeof createApp>>["app"]>();
+
 async function buildApp(mcpEnabled: boolean) {
   envMock.WMP_MCP_ENABLED = mcpEnabled;
+  const key = mcpEnabled ? "on" : "off";
+  const cached = appCache.get(key);
+  if (cached) return cached;
   const { app } = await createApp({ auth: memoryAuth, mcpAuth: memoryAuth });
+  appCache.set(key, app);
   return app;
 }
 
 let logSpy: ReturnType<typeof vi.spyOn>;
 let testCounter = 0;
+
+beforeAll(async () => {
+  // Build both fixtures once, with construction-time console output silenced
+  // (the per-test spy only exists from `beforeEach`).
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await buildApp(false);
+    await buildApp(true);
+  } finally {
+    log.mockRestore();
+    error.mockRestore();
+  }
+});
 
 beforeEach(() => {
   logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -366,8 +395,17 @@ describe("createApp /mcp chain — canonical-authority boundary (F1, invariant 2
     // Local dev runs plain HTTP against a localhost BETTER_AUTH_URL — the
     // boundary must not demand HTTPS-only locally. (CORS_ORIGIN stays set to
     // the app origin: the allowed set is { web origin, server origin }.)
+    //
+    // The flag is asserted explicitly (not inherited from whatever ran
+    // before): app.ts mounts the /mcp feature gate from the env mock at
+    // CONSTRUCTION, so a shared-env read left off by an earlier test would
+    // make this app answer the gate's 404 instead of reaching the boundary.
+    // Restored in `finally` so the shared fixtures built in `beforeAll`
+    // keep observing flag-on.
     const previousUrl = envMock.BETTER_AUTH_URL;
+    const previousFlag = envMock.WMP_MCP_ENABLED;
     envMock.BETTER_AUTH_URL = "http://localhost:3000";
+    envMock.WMP_MCP_ENABLED = true;
     try {
       const localAuth = betterAuth({
         baseURL: "http://localhost:3000",
@@ -395,6 +433,7 @@ describe("createApp /mcp chain — canonical-authority boundary (F1, invariant 2
       expect(hostile.status).toBe(400); // boundary still rejects hostile Origin locally
     } finally {
       envMock.BETTER_AUTH_URL = previousUrl;
+      envMock.WMP_MCP_ENABLED = previousFlag;
     }
   });
 });
