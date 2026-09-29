@@ -364,7 +364,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       const row = (input: {
         tenantUserId: string;
         lastUsedAt: Date;
-        tokens: number;
+        tokens: number | null;
         bindingDigest?: string;
         conversationDigest?: string;
         poolId?: string;
@@ -437,6 +437,20 @@ integration("warm-session protection with real PostgreSQL", () => {
             lastUsedAt: ago(20),
             tokens: 20_000,
             bindingDigest: "f".repeat(64),
+          }),
+          // An estimate-less explicit conversation record covers its group too.
+          row({
+            tenantUserId: mixed.id,
+            lastUsedAt: ago(30),
+            tokens: null,
+            bindingDigest: "h".repeat(64),
+            conversationDigest: "i".repeat(40),
+          }),
+          row({
+            tenantUserId: mixed.id,
+            lastUsedAt: ago(30),
+            tokens: 20_000,
+            bindingDigest: "h".repeat(64),
           }),
           // Two explicit conversations finishing in the same instant, each with
           // its conversation record and the shared prefix records of the request.
