@@ -4,6 +4,7 @@ import {
   CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
   CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE,
   cliSlugFromDeviceLoginScope,
+  type DeviceLoginRefusalReason,
 } from "@ws-model-proxy/config/cli-device-login";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
@@ -187,7 +188,8 @@ export const cliCredentialsRouter = {
    * it would take over, if any. Reading claims nothing: a pending, unclaimed
    * code is visible to any signed-in account holding its user code, so the
    * wrong account opening the link leaves it for the right one. A code another
-   * account approved is NOT_FOUND.
+   * account approved is NOT_FOUND. Refusals carry a `data.reason`
+   * (`DEVICE_LOGIN_REFUSAL_REASONS`) so the page can say what to do next.
    */
   deviceLoginRequest: protectedProcedure
     .input(z.object({ userCode: userCodeSchema }))
@@ -200,9 +202,8 @@ export const cliCredentialsRouter = {
         },
         select: { status: true, expiresAt: true, scope: true },
       });
-      if (!row || row.expiresAt <= new Date()) {
-        throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
-      }
+      if (!row) throw loginRefusal("NOT_FOUND", "not_found", "Device login request not found.");
+      if (row.expiresAt <= new Date()) throw expiredLoginRequest();
       const slug = requireDeviceLoginSlug(row.scope);
       const device = await prisma.cliDevice.findUnique({
         where: { userId_slug: { userId, slug } },
@@ -238,14 +239,16 @@ export const cliCredentialsRouter = {
         select: { id: true, userId: true, status: true, expiresAt: true, scope: true },
       });
       if (!row || (row.userId !== null && row.userId !== userId)) {
-        throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
+        throw loginRefusal("NOT_FOUND", "not_found", "Device login request not found.");
       }
       if (row.expiresAt <= new Date()) throw expiredLoginRequest();
       const slug = requireDeviceLoginSlug(row.scope);
       if (slug !== input.slug) {
-        throw new ORPCError("CONFLICT", {
-          message: "This login request is for a different CLI slug. Reload the page.",
-        });
+        throw loginRefusal(
+          "CONFLICT",
+          "slug_mismatch",
+          "This login request is for a different CLI slug. Reload the page.",
+        );
       }
       if (row.status === "approved" && row.userId === userId) return { status: "approved", slug };
       if (row.status !== "pending") throw alreadyHandled();
@@ -283,6 +286,11 @@ export const cliCredentialsRouter = {
         if (current?.status === "pending" && current.expiresAt <= new Date()) {
           throw expiredLoginRequest();
         }
+        // The row is gone: this request was read as approvable, so it was
+        // approved and redeemed by the CLI between the read and the write, or
+        // it was swept after expiring, or it was denied and then swept by the
+        // denied-poll sweep. Say so, rather than "already handled".
+        if (current === null) throw alreadyUsed();
         throw alreadyHandled();
       }
       return { status: "approved", slug };
@@ -292,21 +300,43 @@ export const cliCredentialsRouter = {
 function requireDeviceLoginSlug(scope: string | null): string {
   const slug = cliSlugFromDeviceLoginScope(scope);
   if (slug === null) {
-    throw new ORPCError("BAD_REQUEST", {
-      message: "This device login request does not name a CLI slug; upgrade wsmp.",
-    });
+    throw loginRefusal(
+      "BAD_REQUEST",
+      "no_slug",
+      "This device login request does not name a CLI slug; upgrade wsmp.",
+    );
   }
   return slug;
 }
 
-function expiredLoginRequest(): ORPCError<"BAD_REQUEST", undefined> {
-  return new ORPCError("BAD_REQUEST", {
-    message: "This login request has expired. Run `wsmp login` again.",
-  });
+function loginRefusal<Code extends "NOT_FOUND" | "BAD_REQUEST" | "CONFLICT">(
+  code: Code,
+  reason: DeviceLoginRefusalReason,
+  message: string,
+): ORPCError<Code, { reason: DeviceLoginRefusalReason }> {
+  return new ORPCError(code, { message, data: { reason } });
 }
 
-function alreadyHandled(): ORPCError<"CONFLICT", undefined> {
-  return new ORPCError("CONFLICT", {
-    message: "This login request was already handled. Run `wsmp login` again if you need to.",
-  });
+function expiredLoginRequest() {
+  return loginRefusal(
+    "BAD_REQUEST",
+    "expired",
+    "This login request has expired. Run `wsmp login` again.",
+  );
+}
+
+function alreadyHandled() {
+  return loginRefusal(
+    "CONFLICT",
+    "already_handled",
+    "This login request was already handled. Run `wsmp login` again if you need to.",
+  );
+}
+
+function alreadyUsed() {
+  return loginRefusal(
+    "CONFLICT",
+    "already_used",
+    "This login request was already approved and used. Nothing more to approve.",
+  );
 }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { cliDeviceLoginScope, cliSlugFromDeviceLoginScope } from "./cli-device-login";
+import {
+  cliDeviceLoginScope,
+  cliSlugFromDeviceLoginScope,
+  DEVICE_LOGIN_REFUSAL_REASONS,
+  deviceLoginRefusalReasonOf,
+} from "./cli-device-login";
 
 describe("CLI device login scope", () => {
   it("round-trips a valid slug", () => {
@@ -21,5 +26,41 @@ describe("CLI device login scope", () => {
     "other cli-slug:desk-01",
   ])("rejects %j", (scope) => {
     expect(cliSlugFromDeviceLoginScope(scope)).toBeNull();
+  });
+});
+
+describe("DEVICE_LOGIN_REFUSAL_REASONS", () => {
+  it("is exactly the six accepted refusal reasons", () => {
+    // Literal, deliberately NOT derived from the constant: this fails if a
+    // reason is removed, added, or reordered without updating the wire
+    // contract the approval page and CLI both classify on.
+    expect(DEVICE_LOGIN_REFUSAL_REASONS).toEqual([
+      "not_found",
+      "expired",
+      "already_handled",
+      "already_used",
+      "slug_mismatch",
+      "no_slug",
+    ]);
+  });
+});
+
+describe("deviceLoginRefusalReasonOf", () => {
+  it.each(DEVICE_LOGIN_REFUSAL_REASONS)("reads %s from data.reason", (reason) => {
+    expect(deviceLoginRefusalReasonOf({ code: "CONFLICT", data: { reason } })).toBe(reason);
+  });
+
+  it.each([
+    null,
+    undefined,
+    "already_used",
+    {},
+    { data: null },
+    { data: "already_used" },
+    { data: { reason: "retained_history" } },
+    { data: { reason: 3 } },
+    { message: "already_used" },
+  ])("is null for %j", (error) => {
+    expect(deviceLoginRefusalReasonOf(error)).toBeNull();
   });
 });
