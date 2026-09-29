@@ -1,6 +1,7 @@
 import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { relaySessionManager } from "../relay/session-manager.js";
+import { capacityRequestScopeMiddleware } from "./capacity/request-scope.js";
 import { type DiagnosticCoreDependencies, diagnosticsCapacityRuntime } from "./diagnostics.js";
 import { modelApiConcurrencyLimiter } from "./limits.js";
 import { openAiFailureJsonResponse } from "./openai-errors.js";
@@ -26,6 +27,8 @@ export function createChatTestRoutes({
   // chat completion test tool. An injected runtime still wins in tests.
   // Admission is always installed; there is no limiter-only fallback.
   const admissionRuntime = capacityRuntime ?? diagnosticsCapacityRuntime();
+  // F2-CAP-6: owners created by a Chat Test request end with its response.
+  app.use("*", capacityRequestScopeMiddleware);
 
   app.post("/chat/completions", async (c) => {
     const session = c.get("session");

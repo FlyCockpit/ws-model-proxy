@@ -1,3 +1,4 @@
+import { type CapacityLeaseLostError, capacityLeaseLostSignal } from "./lease-loss.js";
 import { CapacityLeaseOwner } from "./lease-owner.js";
 import { type CapacityWakeSource, waitWithCapacityPolling } from "./postgres-store.js";
 import { holdCapacityLeaseForResponse } from "./response-lease.js";
@@ -6,10 +7,11 @@ import type {
   AdmissionResult,
   CapacityAdmissionStore,
   CapacityLeaseHandle,
+  RuntimeAdmissionResult,
 } from "./types.js";
 
 export interface CapacityAdmissionRuntime {
-  acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult>;
+  acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<RuntimeAdmissionResult>;
   release(lease: CapacityLeaseHandle): Promise<boolean>;
   hold(response: Response, lease: CapacityLeaseHandle, signal?: AbortSignal): Response;
 }
@@ -89,7 +91,7 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
     }
   }
 
-  async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
+  async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<RuntimeAdmissionResult> {
     // G2n pass 5: maintain() is part of the acquisition flow, so it lives
     // INSIDE the failure boundary — any throw there (fence rejection,
     // connection loss) terminalizes an already-persisted attempt exactly
@@ -102,8 +104,22 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
       if (result.state !== "ADMITTED") return result;
       const lease = await this.adopt(result.lease, signal);
       if (this.closed || lease.signal?.aborted) {
+        // Classify before releasing: release aborts the signal too. A lease
+        // lost while confirming ownership is a server-side failure of this
+        // member (the caller fails over or answers 503), never a cancellation.
+        const lost =
+          !this.closed && !signal?.aborted && lease.signal && capacityLeaseLostSignal(lease.signal)
+            ? (lease.signal.reason as CapacityLeaseLostError)
+            : undefined;
         await this.release(lease);
-        return { state: "CANCELLED" };
+        return lost
+          ? {
+              state: "LEASE_LOST",
+              reason: lost,
+              executionTargetId: lease.executionTargetId,
+              poolMemberId: lease.poolMemberId,
+            }
+          : { state: "CANCELLED" };
       }
       return { state: "ADMITTED", lease };
     } catch (error) {

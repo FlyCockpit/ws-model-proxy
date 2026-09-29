@@ -22,9 +22,40 @@ heartbeat; this also rejects a stale admission received after a delayed poll/not
 owner renews the 30-second database lease every 10 seconds throughout dispatch, including relay
 prefill and provider header waits. Only one renewal may be in flight. A monotonic watchdog aborts
 at the last acknowledged renewal's conservative expiry (query start plus extension), so a stalled
-heartbeat cannot leave dispatch running past its lease. False/rejected renewal, client abort,
-runtime shutdown, or explicit release abort the handle's signal before starting durable release.
-Late heartbeat results cannot restart a stopped owner.
+heartbeat cannot leave dispatch running past its lease. A false renewal, watchdog expiry, client
+abort, runtime shutdown, or explicit release abort the handle's signal before starting durable
+release. Late heartbeat results cannot restart a stopped owner.
+
+A thrown renewal (F2-CAP-5) is retried after 1 s, 2 s, then every 4 s while the last
+*acknowledged* TTL still covers the delay plus a 2 s margin; when no retry fits, the owner releases
+before the TTL ends. An error never extends or re-arms the watchdog: only a successful renewal
+does, measured from that query's start. A `false` result is never retried.
+
+Lease loss has its own abort reason (F2-CAP-3): `CapacityLeaseLostError` (`lease-loss.ts`, with a
+`kind`: `ownership_lost`, `heartbeat_timeout`, `heartbeat_failed`, `max_lifetime`,
+`request_scope_closed`). Dispatches classify on `signal.reason`, never on `signal.aborted`: a lost
+lease is the server-only failure `capacity_lease_lost` (HTTP 503, attempt/relay `errorClass`,
+provider event reason `CAPACITY_LEASE_LOST`), never a 499 cancellation. Before the first client
+byte it is a retryable precommit failure: pool routes fail over to the next member (local and
+external tiers, subject to `retrySafe` and the relay deadline) without a member or provider health
+penalty, and answer 503 when nothing else is available. `hold` refuses a hand-off whose lifetime
+already ended, so the route's precommit path classifies it. The window between a successful
+dispatch and the hand-off counts too, including a non-streaming provider body that is fully read
+before `hold`: the external route re-enters its tier traversal on the loss (never re-admitting the
+member whose lease was lost), and the bound Responses route, which has no failover, answers its
+family's 503 `external_unavailable` envelope. A lease lost while ownership is still being
+confirmed at admission surfaces as the runtime outcome `LEASE_LOST` (naming the member), never as a
+cancellation or rate limit: a pool excludes that member from the admission call and re-admits the
+rest (a later retry in the same request may admit it again under a fresh lease; no health penalty,
+bounded by the relay deadline), direct and sticky routes answer 503. Every route's precommit catch classifies through one predicate
+(`precommitLeaseLost`: typed loss OR a lost lease signal, never a client abort) evaluated before
+cleanup releases the owner, so a completed upstream attempt or a transport error caused by the loss
+is still a lease loss. A provider body that is abandoned by such a loss is cancelled so its
+attempt settles as `FAILED`/`CAPACITY_LEASE_LOST` (never `CANCELLED`), and the bound route's
+request finalizer is scheduled only after a successful hand-off (or when an error that is not a
+lease loss ends the request). After commit the body ends in an
+error, never a clean EOF. The relay wire protocol has no lease-loss reason: the CLI is sent
+`relay.cancel` with `cancelled`.
 
 All five physical dispatch families (direct, local pool, local sticky, external pool, external
 sticky) pass that signal to their existing cancellation-aware transport. Each retry acquires a
@@ -63,11 +94,17 @@ columns, including heartbeat expiry and reclaim. Application SQL must preserve t
 direct PostgreSQL/session-preserving connections are required. A failed initialization refuses
 checkout. Replacement connections run the same initialization.
 
-Renewal intentionally fails closed on the first error or lost fence; it never retries a false
-ownership result. There is no arbitrary owner lifetime cap: long-running responses remain valid
-while renewal succeeds. All route exits must release or hand off to the response wrapper; client
-abort, expiry watchdog and post-drain shutdown are the other termination paths. A future missing
-release would leak until one of those events, so release-path coverage remains load-bearing.
+Renewal fails closed on a lost fence and never retries a false ownership result. Route exits
+must still release or hand off to the response wrapper, but a missing release no longer leaks
+(F2-CAP-6): every owner registers with the `CapacityRequestScope` (`request-scope.ts`, an
+`AsyncLocalStorage` scope installed as middleware on the model API and Chat Test routes, and
+around the MCP chat diagnostic). The scope closes when the handler throws, returns a bodyless
+response, or its response body reaches EOF, errors or is cancelled; it logs and releases any owner
+still alive then (`request_scope_closed`). Correct paths never trip it: the response wrapper marks
+its owner released before exposing EOF or an error. The scope does not close on request abort
+(owners already release on their parent signal as a client cancellation). As a backstop, each
+owner also has a hard lifetime cap of `MODEL_API_RELAY_TIMEOUT_MS` plus 60 s
+(`max_lifetime`). Shutdown still releases every owner exactly once with a shutdown reason.
 
 The isolated runtime and route regressions use fake timers to cover dispatch exceeding 30 seconds,
 ownership loss, stalled renewal, handoff without a duplicate timer, failover/re-entry, EOF/error/
