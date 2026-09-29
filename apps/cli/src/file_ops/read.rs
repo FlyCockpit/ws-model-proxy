@@ -596,6 +596,13 @@ fn aligned_chunk_start(file: &std::fs::File, start: u64) -> FileResult<(u64, boo
     Ok((0, false))
 }
 
+fn too_large_tail() -> FileError {
+    FileError::new(
+        ErrorCode::TooLarge,
+        "a line longer than 16 MiB precedes the end of this file; read with a positive startLine",
+    )
+}
+
 /// The last `count` lines of a huge file, without line numbers.
 #[allow(clippy::too_many_arguments)]
 fn tail_window(
@@ -609,16 +616,12 @@ fn tail_window(
     etag: &str,
 ) -> FileResult<(Window, Eol)> {
     cancel.check()?;
-    let chunk_len =
-        ((max_bytes as u64) * 2 + 64 * 1024 + redact::LOOKBACK_BYTES as u64).min(stat.size);
+    let chunk_len = ((max_bytes as u64) * 2 + 64 * 1024).min(stat.size);
     let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
     if partial_first {
         // A line longer than 16 MiB precedes the tail: its state cannot be known,
         // and serving the lines after it unmasked could show a continued value.
-        return Err(FileError::new(
-            ErrorCode::TooLarge,
-            "a line longer than 16 MiB precedes the end of this file; read with a positive startLine",
-        ));
+        return Err(too_large_tail());
     }
     let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
     file.read_exact_at(&mut chunk, chunk_start)?;
@@ -631,10 +634,37 @@ fn tail_window(
         ));
     }
     let first_index = raw_lines.len() - want;
-    // The lines before the window (up to the lookback) give the masker its state.
-    for raw in &raw_lines[..first_index] {
-        masker.advance_bytes(strip_eol(raw));
+    // The masker's state comes from the lookback before the WINDOW'S first line
+    // (measured in raw bytes from that line, not from the end of the file: a
+    // window of lines that mask short can hold many raw bytes): the line that
+    // contains the byte LOOKBACK before it, and the line before that one.
+    let window_abs = chunk_start
+        + raw_lines[..first_index]
+            .iter()
+            .map(|l| l.len() as u64)
+            .sum::<u64>();
+    let want_from = window_abs.saturating_sub(redact::LOOKBACK_BYTES as u64);
+    let containing = aligned_chunk_start(file, want_from)?;
+    if containing.1 {
+        return Err(too_large_tail());
     }
+    let ctx_start = if containing.0 == 0 {
+        0
+    } else {
+        let previous = aligned_chunk_start(file, containing.0 - 1)?;
+        if previous.1 {
+            return Err(too_large_tail());
+        }
+        previous.0
+    };
+    if ctx_start < window_abs {
+        let mut context = vec![0_u8; (window_abs - ctx_start) as usize];
+        file.read_exact_at(&mut context, ctx_start)?;
+        for raw in context.split_inclusive(|b| *b == b'\n') {
+            masker.advance_bytes(strip_eol(raw));
+        }
+    }
+    cancel.check()?;
     let mut masked: Vec<String> = Vec::with_capacity(want);
     let mut redactions: Vec<u64> = Vec::with_capacity(want);
     for raw in &raw_lines[first_index..] {
@@ -678,4 +708,52 @@ fn tail_window(
         },
         eol,
     ))
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A reader that cancels after handing out its first chunk.
+    struct CancelAfterFirst<'a> {
+        cancel: &'a Cancel,
+        served: bool,
+    }
+
+    impl Read for CancelAfterFirst<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served {
+                return Ok(0);
+            }
+            self.served = true;
+            self.cancel.cancel();
+            let n = buf.len().min(1 << 20);
+            buf[..n].fill(b'a');
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_chunked_reader_observes_a_cancel_between_chunks() {
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        let r = read_to_end_cancellable(
+            CancelAfterFirst {
+                cancel: &cancel,
+                served: false,
+            },
+            &mut out,
+            &cancel,
+        );
+        assert_eq!(r.expect_err("cancelled").code, ErrorCode::Cancelled);
+        assert!(
+            !out.is_empty() && out.len() < 1 << 20,
+            "only the first chunk was read"
+        );
+        // an uncancelled reader reads to the end
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        read_to_end_cancellable(&[7_u8; 3 << 20][..], &mut out, &cancel).unwrap();
+        assert_eq!(out.len(), 3 << 20);
+    }
 }

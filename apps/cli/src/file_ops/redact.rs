@@ -503,20 +503,6 @@ type Candidate = (usize, Construct);
 /// The assignment separators, longest first.
 const SEPARATORS: [&str; 6] = ["::=", "?=", "+=", ":=", "=", ":"];
 
-/// The end offset of every secret-name suffix (`_TOKEN`, `_KEY`, `_SECRET`,
-/// `PASSWORD`) in `line`, in order.
-fn secret_suffix_ends(line: &str) -> Vec<usize> {
-    let mut ends: Vec<usize> = ["_TOKEN", "_KEY", "_SECRET", "PASSWORD"]
-        .into_iter()
-        .flat_map(|suffix| {
-            line.match_indices(suffix)
-                .map(move |(at, _)| at + suffix.len())
-        })
-        .collect();
-    ends.sort_unstable();
-    ends
-}
-
 /// The first secret-named assignment of `line`. Its value is the whole rest of
 /// the line (never "up to the next space or quote"). The name is exactly
 /// `PASSWORD`, or upper case (it may start with `_`) and ends in `_TOKEN`, `_KEY`,
@@ -527,12 +513,24 @@ fn secret_suffix_ends(line: &str) -> Vec<usize> {
 fn first_assignment(line: &str) -> Option<Candidate> {
     let bytes = line.as_bytes();
     let is_name = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_';
-    for end in secret_suffix_ends(line) {
-        // the name: the run of name bytes that ends at `end`
-        let mut start = end;
-        while start > 0 && is_name(bytes[start - 1]) {
-            start -= 1;
+    // One left-to-right pass: `run_start` is the start of the run of name bytes
+    // that contains the current position (a walk back per suffix was quadratic on
+    // `_KEY_KEY_KEY...`).
+    let mut run_start = 0_usize;
+    for (i, byte) in bytes.iter().enumerate() {
+        if !is_name(*byte) {
+            run_start = i + 1;
+            continue;
         }
+        let rest = &line[i..];
+        let Some(suffix) = ["_TOKEN", "_KEY", "_SECRET", "PASSWORD"]
+            .into_iter()
+            .find(|suffix| rest.starts_with(suffix))
+        else {
+            continue;
+        };
+        let end = i + suffix.len();
+        let start = run_start;
         // `_TOKEN`, `_KEY`, `_SECRET` and `PASSWORD` are names by themselves;
         // `TOKEN=` and `KEY=` (no underscore) stay visible
         let first_ok = bytes
@@ -2069,6 +2067,11 @@ mod tests {
             "A_KEY=\"".repeat(40_000),
             "--password ".repeat(40_000),
             "X_KEY:".repeat(60_000),
+            // suffix-heavy names: every suffix end is followed by a name byte
+            "_KEY".repeat(200_000),
+            "PASSWORD".repeat(100_000),
+            "A_TOKENB".repeat(100_000),
+            "_KEY_TOKEN_SECRET".repeat(50_000),
         ];
         for text in &corpora {
             for class in [FileClass::Plain, FileClass::Dotenv] {

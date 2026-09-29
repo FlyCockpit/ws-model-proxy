@@ -130,6 +130,9 @@ struct Namespace {
 struct NsState {
     shared: usize,
     exclusive: bool,
+    /// Exclusive requests waiting: new shared holders queue behind them, so a
+    /// steady stream of edits cannot starve a rename or delete.
+    waiting_exclusive: usize,
 }
 
 pub struct NamespaceGuard<'a> {
@@ -160,21 +163,42 @@ impl Namespace {
         let deadline = std::time::Instant::now() + wait;
         let poisoned = || FileError::new(ErrorCode::IoError, "lock poisoned");
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        while state.exclusive || (exclusive && state.shared > 0) {
-            cancel.check()?;
+        if exclusive {
+            state.waiting_exclusive += 1;
+        }
+        let blocked = |state: &NsState| {
+            state.exclusive
+                || (exclusive && state.shared > 0)
+                || (!exclusive && state.waiting_exclusive > 0)
+        };
+        let result = loop {
+            if !blocked(&state) {
+                break Ok(());
+            }
+            if let Err(err) = cancel.check() {
+                break Err(err);
+            }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(FileError::new(
+                break Err(FileError::new(
                     ErrorCode::Timeout,
                     "another change is still in progress; retry",
                 ));
             }
             let slice = (deadline - now).min(Duration::from_millis(50));
-            state = self
-                .changed
-                .wait_timeout(state, slice)
-                .map_err(|_| poisoned())?
-                .0;
+            state = match self.changed.wait_timeout(state, slice) {
+                Ok((state, _)) => state,
+                Err(_) => return Err(poisoned()),
+            };
+        };
+        if exclusive {
+            state.waiting_exclusive -= 1;
+        }
+        if let Err(err) = result {
+            drop(state);
+            // a departing waiter may unblock shared requests queued behind it
+            self.changed.notify_all();
+            return Err(err);
         }
         if exclusive {
             state.exclusive = true;

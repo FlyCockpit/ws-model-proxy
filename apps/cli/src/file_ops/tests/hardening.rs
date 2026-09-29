@@ -930,7 +930,7 @@ fn renaming_a_parent_waits_for_an_in_flight_edit_below_it() {
 
 #[test]
 fn cancelled_single_file_search_and_stat_hash_stop() {
-    let fx = Arc::new(Fx::new());
+    let fx = Fx::new();
     fx.put("one.txt", "needle\n");
     fx.cancel.cancel();
     let r = fx.ops.search(
@@ -938,32 +938,13 @@ fn cancelled_single_file_search_and_stat_hash_stop() {
         &fx.cancel,
     );
     assert_eq!(code(r), ErrorCode::Cancelled);
-    let big = Arc::new(Fx::new());
-    let path = big.root.join("big.bin");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(&vec![b'a'; 1 << 20]).unwrap();
-    file.set_len(60 << 20).unwrap();
-    drop(file);
-    let canceller = {
-        let big = Arc::clone(&big);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(2));
-            big.cancel.cancel();
-        })
-    };
-    let started = Instant::now();
-    let r = big.ops.stat(
-        &args(json!({ "paths": [big.p("big.bin")], "hash": true })),
-        &big.cancel,
+    let r = fx.ops.stat(
+        &args(json!({ "paths": [fx.p("one.txt")], "hash": true })),
+        &fx.cancel,
     );
-    canceller.join().unwrap();
-    match r {
-        Err(err) => assert_eq!(err.code, ErrorCode::Cancelled),
-        Ok(_) => assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "hashed 60 MiB despite the cancel"
-        ),
-    }
+    assert_eq!(code(r), ErrorCode::Cancelled);
+    // (the between-chunk check itself is pinned by
+    // `read::cancel_tests::the_chunked_reader_observes_a_cancel_between_chunks`)
 }
 
 // ---- edits cannot arrange a layout that a restarted window masker misreads -----
@@ -1127,4 +1108,156 @@ fn a_name_value_pair_is_masked_whatever_the_padding_order_or_name_length() {
     // refused, or applied with the value still masked in every window
     let last = fx.read_with(json!({ "path": fx.p("pad.yaml"), "startLine": -1 }));
     assert!(!last.text.contains("padsecretvalue"), "{}", last.text);
+}
+
+#[test]
+fn a_delete_waits_for_an_in_flight_change_elsewhere_in_the_namespace() {
+    use std::sync::mpsc;
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let reached_tx = std::sync::Mutex::new(reached_tx);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let fx = Arc::new(Fx::new().with_hook(move |step| {
+        if step == Step::EtagRechecked && first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20));
+        }
+        Ok(())
+    }));
+    fx.put("d/f.txt", "one\n");
+    fx.put("d/other.txt", "gone soon\n");
+    let editor = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.edit(
+                &args(json!({ "path": fx.p("d/f.txt"), "edits": [{ "oldText": "one", "newText": "A" }] })),
+                &fx.cancel,
+            )
+        })
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the edit reached its final recheck");
+    // a DIFFERENT path: only the namespace guard (not the per-path lock) can hold it back
+    let deleter = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops
+                .delete(&args(json!({ "path": fx.p("d/other.txt") })), &fx.cancel)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !deleter.is_finished() && fx.root.join("d/other.txt").exists(),
+        "the delete must wait for the edit in flight"
+    );
+    resume_tx.send(()).unwrap();
+    editor.join().unwrap().expect("the edit commits");
+    deleter.join().unwrap().expect("the delete runs after it");
+    assert!(!fx.root.join("d/other.txt").exists());
+}
+
+#[test]
+fn a_waiting_rename_holds_back_later_edits_so_it_cannot_starve() {
+    use std::sync::mpsc;
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let reached_tx = std::sync::Mutex::new(reached_tx);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let fx = Arc::new(Fx::new().with_hook(move |step| {
+        if step == Step::EtagRechecked && first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20));
+        }
+        Ok(())
+    }));
+    fx.put("a/one.txt", "one\n");
+    fx.put("b/two.txt", "two\n");
+    fx.put("d/keep.txt", "k\n");
+    let edit_a = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.edit(
+                &args(json!({ "path": fx.p("a/one.txt"), "edits": [{ "oldText": "one", "newText": "1" }] })),
+                &fx.cancel,
+            )
+        })
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("edit A holds the shared guard");
+    let renamer = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.rename(
+                &args(json!({ "from": fx.p("d"), "to": fx.p("e") })),
+                &fx.cancel,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    // a NEW edit queues behind the waiting rename instead of overtaking it
+    let edit_b = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.edit(
+                &args(json!({ "path": fx.p("b/two.txt"), "edits": [{ "oldText": "two", "newText": "2" }] })),
+                &fx.cancel,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !edit_b.is_finished(),
+        "a later edit must not overtake the waiting rename"
+    );
+    resume_tx.send(()).unwrap();
+    edit_a.join().unwrap().expect("edit A commits");
+    renamer.join().unwrap().expect("the rename runs next");
+    edit_b
+        .join()
+        .unwrap()
+        .expect("edit B runs after the rename");
+    assert_eq!(fx.get("b/two.txt"), "2\n");
+}
+
+#[test]
+fn a_tail_window_of_lines_that_mask_short_still_sees_its_context() {
+    let fx = Fx::new();
+    let path = fx.root.join("shrink.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..68 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    // an open quote, three continuation lines, then secret assignments whose masked
+    // form is tiny: the window's RAW size dwarfs its masked size
+    file.write_all(b"DB_PASSWORD=\"open-quote-start\n").unwrap();
+    for part in ["A", "B", "C"] {
+        file.write_all(format!("LEAKED-CONTINUATION-{part}-{}\n", "x".repeat(3_000)).as_bytes())
+            .unwrap();
+    }
+    for _ in 0..11 {
+        file.write_all(format!("Z_TOKEN={}\n", "a".repeat(20_000)).as_bytes())
+            .unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+    // the window starts at continuation line B: its opener is two lines above it
+    let r =
+        fx.read_with(json!({ "path": fx.p("shrink.log"), "startLine": -13, "maxBytes": 131_072 }));
+    assert!(
+        !r.text.contains("LEAKED-CONTINUATION"),
+        "{}",
+        r.text.get(..120).unwrap_or(&r.text)
+    );
 }
