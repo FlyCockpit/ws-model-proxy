@@ -26,6 +26,12 @@
     "./parent-deletion-residual": {
       "default": "./src/parent-deletion-residual.ts"
     },
+    "./hot-path-sweeps": {
+      "default": "./src/hot-path-sweeps.ts"
+    },
+    "./test-fixture-client": {
+      "default": "./src/test-fixture-client.ts"
+    },
     "./user-deletion-access": {
       "default": "./src/user-deletion-access.ts"
     }

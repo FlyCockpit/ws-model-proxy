@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
@@ -124,7 +125,10 @@ export const poolFallbackPreferencesRouter = {
         throw new ORPCError("FORBIDDEN", { message: "External providers are disabled." });
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
-        // Same parent order as the send claim; no lock on the requester user row.
+        // Writer class M: the requester's owner fence (the preference is the
+        // grantee's own configuration), then the same parent order as the
+        // send claim; no lock on the requester user row.
+        await fenceOwners(tx, [userId]);
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} FOR SHARE`;
         await tx.$queryRaw`SELECT id FROM pool_grant WHERE "poolId" = ${input.poolId} AND "granteeUserId" = ${userId} FOR SHARE`;
         const grant = await tx.poolGrant.findFirst({
@@ -185,8 +189,11 @@ export const poolFallbackPreferencesRouter = {
       });
     }),
   clear: protectedProcedure.input(z.object({ poolId: id })).handler(async ({ context, input }) => {
-    await prisma.poolFallbackPreference.deleteMany({
-      where: { poolId: input.poolId, userId: context.session.user.id },
+    await prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [context.session.user.id]);
+      await tx.poolFallbackPreference.deleteMany({
+        where: { poolId: input.poolId, userId: context.session.user.id },
+      });
     });
     return { cleared: true };
   }),

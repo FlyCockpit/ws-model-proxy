@@ -25,6 +25,7 @@ const db = prisma as unknown as {
     deleteMany: MockInstance;
   };
   inferenceCapacity: {
+    findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
@@ -81,6 +82,15 @@ function applyCapacityWrite(
   return { count: 1 };
 }
 
+/** The fence arrays passed to `wsmp_acquire_fences`, one per call, in call order. */
+function fenceCalls(): string[][] {
+  return db.$queryRaw.mock.calls
+    .filter((call) =>
+      String((call[0] as readonly string[]).join("?")).includes("wsmp_acquire_fences"),
+    )
+    .map((call) => call[1] as string[]);
+}
+
 describe("discovered inference capacity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -88,6 +98,8 @@ describe("discovered inference capacity", () => {
       callback(db),
     );
     db.executionTarget.findMany.mockReset();
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.inferenceCapacity.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findUnique.mockResolvedValue(null);
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "new-capacity" });
     db.inferenceCapacity.updateMany.mockReset();
@@ -137,6 +149,23 @@ describe("discovered inference capacity", () => {
       attached: 1,
       unchanged: 1,
     });
+
+    // Writer class M: the owner fence alone first, then (after reading the
+    // adoptable capacity candidates) the target's capacity-policy fence,
+    // all before the first write.
+    expect(fenceCalls()).toEqual([
+      ["00:owner:user-id"],
+      ["06:capacity-policy:bare-target"],
+      ["00:owner:user-id"],
+      ["06:capacity-policy:kept-target"],
+    ]);
+    const policyFence = db.$queryRaw.mock.invocationCallOrder[1] ?? Number.NaN;
+    expect(policyFence).toBeLessThan(
+      db.inferenceCapacity.upsert.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    expect(policyFence).toBeLessThan(
+      db.executionTarget.updateMany.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
 
     expect(db.executionTarget.findMany).toHaveBeenCalledWith({
       where: {
@@ -214,11 +243,27 @@ describe("discovered inference capacity", () => {
       inferenceCapacityId: null,
     });
     db.inferenceCapacity.findUnique.mockResolvedValue({ id: "legacy-capacity" });
+    db.inferenceCapacity.findMany.mockResolvedValue([{ id: "legacy-capacity" }]);
 
     await expect(backfillDiscoveredInferenceCapacities()).resolves.toEqual({
       attached: 1,
       unchanged: 0,
     });
+
+    // The adoptable capacity is fenced with the target's policy fence.
+    expect(db.inferenceCapacity.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: "user-id",
+        runtimeIdentityKey: {
+          in: ["execution-target:bare-target", "discovered-model:model-bare"],
+        },
+      },
+      select: { id: true },
+    });
+    expect(fenceCalls()).toEqual([
+      ["00:owner:user-id"],
+      ["06:capacity-policy:bare-target", "08:capacity:legacy-capacity"],
+    ]);
 
     expect(db.inferenceCapacity.findUnique).toHaveBeenCalledWith({
       where: {
@@ -330,6 +375,12 @@ describe("discovered inference capacity", () => {
     });
 
     expect(row.hardConcurrencyLimit).toBe(1);
+    expect(fenceCalls()).toEqual([
+      ["00:owner:user-id", "06:capacity-policy:trigger-target", "08:capacity:trigger-capacity"],
+    ]);
+    expect(db.$queryRaw.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
+      db.inferenceCapacity.updateMany.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
     expect(db.executionTarget.updateMany).not.toHaveBeenCalled();

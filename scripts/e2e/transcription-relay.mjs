@@ -111,7 +111,9 @@ try {
   await new Promise((resolveClose) => portProbe.close(resolveClose));
   const serverUrl = `http://127.0.0.1:${serverPort}`;
 
-  db = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  // Seed rows bypass the graph-write fence triggers (test fixtures only), like
+  // createFixturePrismaClient (packages/db/src/test-fixture-client.ts).
+  db = new pg.Pool({ connectionString: databaseUrl, max: 1, options: "-c wsmp.fences=,*," });
   const cliTokenId = randomUUID();
   const modelTokenId = randomUUID();
   await db.query(

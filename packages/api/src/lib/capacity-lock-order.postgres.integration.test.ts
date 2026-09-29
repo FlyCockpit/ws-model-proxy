@@ -1,14 +1,18 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
 // DL-1 lock-order regressions for API writers on real PostgreSQL. Each case
-// runs a production procedure against a concurrent capacity-lock holder that
-// follows the documented order (L1 -> L2 -> L3 -> L4 -> L5 -> L6). The test
-// side sets a short deadlock_timeout, so a lock-order inversion is detected
-// on the test side first and aborts it instead of being absorbed by the
-// procedure's own retry loop.
+// runs a production procedure against a concurrent participant that follows
+// its writer class (@ws-model-proxy/db/capacity-lock-order): the hot-path
+// admitter takes only the capacity fence and hot-path rows; a management
+// writer takes owner fences, then policy fences, then rows. The test side
+// sets a short deadlock_timeout, so a lock-order inversion is detected on the
+// test side first and aborts it instead of being absorbed by the procedure's
+// own retry loop.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -38,6 +42,7 @@ function sessionFor(user: {
         userAgent: "capacity-lock-order-test",
       },
     } as Session,
+    services: undefined,
   };
 }
 
@@ -46,6 +51,13 @@ async function backendPid(tx: Pick<Client, "$queryRaw">): Promise<number> {
   const pid = rows[0]?.pid;
   if (pid === undefined) throw new Error("Backend pid unavailable.");
   return pid;
+}
+
+async function blockedBehind(inspector: Client, pid: number): Promise<number> {
+  const rows = await inspector.$queryRaw<Array<{ blocked: bigint }>>`
+    SELECT count(*) AS blocked FROM pg_stat_activity
+     WHERE ${pid}::int = ANY(pg_blocking_pids(pid))`;
+  return Number(rows[0]?.blocked ?? 0);
 }
 
 async function waitUntilBlockedBy(inspector: Client, pid: number): Promise<void> {
@@ -79,7 +91,7 @@ integration("DL-1 capacity lock order for API writers", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, factory, policy, forwarder, users] = await Promise.all([
+    const [, factory, policy, forwarder, users] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/client-factory"),
       import("./capacity-policy-safety"),
@@ -87,7 +99,7 @@ integration("DL-1 capacity lock order for API writers", () => {
       import("../routers/users"),
     ]);
     modules = {
-      prisma: db.default,
+      prisma: createFixturePrismaClient(databaseUrl!),
       createPrismaClient: factory.createPrismaClient,
       policy,
       forwarder,
@@ -208,9 +220,10 @@ integration("DL-1 capacity lock order for API writers", () => {
   }
 
   /**
-   * The admitter side: capacity advisory lock (L4), capacity row (L5), the
-   * winning admission_request row (L6), then a capacity_lease insert whose FK
-   * checks take FOR KEY SHARE on the user, pool, member and target rows.
+   * The admitter side (writer class H): the capacity fence, the winning
+   * admission_request row, then a capacity_lease insert. Hot-path rows carry
+   * no foreign key to the graph, so the insert locks no user, pool, member or
+   * target row.
    */
   function startAdmitter(
     admitter: Client,
@@ -229,8 +242,7 @@ integration("DL-1 capacity lock order for API writers", () => {
       async (tx) => {
         await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
         const own = await backendPid(tx);
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${fixture.capacity.id}, 0))`;
-        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${fixture.capacity.id} FOR UPDATE`;
+        await acquireFences(tx, [fences.capacity(fixture.capacity.id)]);
         await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${fixture.waiting.id} FOR UPDATE`;
         ready(own);
         await mayInsert;
@@ -263,10 +275,11 @@ integration("DL-1 capacity lock order for API writers", () => {
   }
 
   it("deletes a model pool while an admitter inserts that pool's lease (no 40P01)", async () => {
-    // Parent delete. DELETE model_pool holds the pool tuple exclusively while
-    // its cascade waits on the admission_request row the admitter holds; the
-    // admitter's lease insert then needs FOR KEY SHARE on that pool. The
-    // delete must first take the capacity locks in L-order.
+    // Parent delete (class M) against an admitter (class H). Before DL-1 (d)
+    // the delete's cascade waited on the admission_request row the admitter
+    // held, while the admitter's lease insert needed FOR KEY SHARE on the
+    // pool. Now nothing cascades into the hot path and the lease insert locks
+    // no graph row: both commit, and the lease survives as orphaned history.
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
     const fixture = await capacityFixture(suffix, `dl1-pool-delete-${suffix}@example.test`);
@@ -278,17 +291,28 @@ integration("DL-1 capacity lock order for API writers", () => {
       const client = createRouterClient(modules.forwarder.forwarderManagementRouter, {
         context: sessionFor(fixture.user),
       });
-      const deletion = client.deleteModelPool({ id: fixture.victim.pool.id });
-      await waitUntilBlockedBy(inspector, pid);
+      // The delete does not wait for the admitter at all: it completes while
+      // the admitter still holds its capacity fence and request row.
+      const [deleted] = await Promise.allSettled([
+        client.deleteModelPool({ id: fixture.victim.pool.id }),
+      ]);
+      expect(await blockedBehind(inspector, pid)).toBe(0);
       side.release();
-      const [admitted, deleted] = await Promise.allSettled([side.done, deletion]);
+      const [admitted] = await Promise.allSettled([side.done]);
       expect(admitted.status === "fulfilled" ? "committed" : String(admitted.reason)).toBe(
         "committed",
       );
-      // The admitted lease is retained history (RESTRICT), so the delete
-      // either removes the pool or refuses it cleanly; it never deadlocks.
       if (deleted.status === "rejected")
         expect(isDeadlockOrSerialization(deleted.reason)).toBe(false);
+      expect(deleted.status === "fulfilled" ? "deleted" : String(deleted.reason)).toBe("deleted");
+      expect(
+        await modules.prisma.modelPool.findUnique({ where: { id: fixture.victim.pool.id } }),
+      ).toBeNull();
+      expect(
+        await modules.prisma.capacityLease.count({
+          where: { admissionRequestId: fixture.waiting.id },
+        }),
+      ).toBe(1);
     } finally {
       side.release();
       await Promise.allSettled([side.done]);
@@ -297,9 +321,8 @@ integration("DL-1 capacity lock order for API writers", () => {
   }, 60_000);
 
   it("deletes a user while an admitter inserts that user's lease (no 40P01)", async () => {
-    // Parent delete through the user cascade (pool, member, target, capacity,
-    // requests): the admitter's lease insert needs FOR KEY SHARE on the user
-    // row and every capacity parent.
+    // Parent delete through the whole-user path (class M under owner fences)
+    // against an admitter inserting that user's lease (class H).
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
     const fixture = await capacityFixture(suffix, `dl1-user-delete-${suffix}@example.test`);
@@ -319,15 +342,19 @@ integration("DL-1 capacity lock order for API writers", () => {
       const client = createRouterClient(modules.users.usersRouter, {
         context: sessionFor(admin),
       });
-      const deletion = client.remove({ userId: fixture.user.id });
-      await waitUntilBlockedBy(inspector, pid);
+      const [deleted] = await Promise.allSettled([client.remove({ userId: fixture.user.id })]);
+      expect(await blockedBehind(inspector, pid)).toBe(0);
       side.release();
-      const [admitted, deleted] = await Promise.allSettled([side.done, deletion]);
+      const [admitted] = await Promise.allSettled([side.done]);
       expect(admitted.status === "fulfilled" ? "committed" : String(admitted.reason)).toBe(
         "committed",
       );
       if (deleted.status === "rejected")
         expect(isDeadlockOrSerialization(deleted.reason)).toBe(false);
+      expect(deleted.status === "fulfilled" ? deleted.value : String(deleted.reason)).toEqual({
+        success: true,
+        pending: false,
+      });
     } finally {
       side.release();
       await Promise.allSettled([side.done]);
@@ -336,10 +363,10 @@ integration("DL-1 capacity lock order for API writers", () => {
   }, 60_000);
 
   it("attaches a discovered model whose target has no capacity while a policy writer holds it (no 40P01)", async () => {
-    // L5-before-L2. addPoolMember adopts an existing auto capacity with a
-    // null AUTO limit. The concurrent writer follows L2 -> L5: it holds the
-    // target's policy lock and then locks that capacity row. addPoolMember
-    // must take the target's L2 lock before it writes the capacity row.
+    // Fence-before-row. addPoolMember adopts an existing auto capacity with a
+    // null AUTO limit. The concurrent management writer takes the owner fence
+    // and the target's policy fence, then locks that capacity row.
+    // addPoolMember must take its fences before it writes the capacity row.
     if (!modules) throw new Error("modules unavailable");
     const db = modules.prisma;
     const suffix = crypto.randomUUID();
@@ -409,7 +436,8 @@ integration("DL-1 capacity lock order for API writers", () => {
       async (tx) => {
         await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
         const own = await backendPid(tx);
-        await policy.lockExecutionTargetPolicies(tx, [target.id]);
+        await fenceOwners(tx, [user.id]);
+        await policy.fenceExecutionTargetPolicies(tx, [target.id]);
         ready(own);
         await mayLockCapacity;
         await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
