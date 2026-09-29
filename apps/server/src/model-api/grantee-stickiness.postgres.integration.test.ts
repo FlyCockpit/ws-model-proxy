@@ -279,6 +279,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         fallbackForGrantees: false,
         externalMemberCount: 0,
         effectiveProviderEgress: false,
+        externalRoutes: [],
         providerAccountLabels: [],
         providerTypes: [],
         allowLossyDeveloperRoleCollapse: false,
