@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
+import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import {
   RELAY_RESPONSE_QUEUE_MAX_BYTES,
   sanitizeNativeResponseHeaders,
@@ -52,7 +53,7 @@ describe("native response header sanitizer", () => {
   });
 });
 
-function harness() {
+function harness(abortSignal?: AbortSignal) {
   let handlers: ActiveRelayResponseHandlers | undefined;
   const manager = {
     registerRelayResponseHandlers: vi.fn((input: { handlers: ActiveRelayResponseHandlers }) => {
@@ -72,6 +73,7 @@ function harness() {
     headers: new Headers(),
     body: new Uint8Array([1]),
     timeoutMs: 30_000,
+    abortSignal,
   });
   if (!handlers) throw new Error("relay handlers were not registered");
   return { manager, attempt, handlers };
@@ -203,5 +205,83 @@ describe("G1 — an ALREADY-aborted signal starts nothing (synchronous entry che
     // cancel() on the no-op attempt does not reach the manager either.
     attempt.cancel("cancelled");
     expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+  });
+});
+
+// F2-CAP-3: a lost capacity lease aborts the dispatch with a typed reason. It
+// is classified on signal.reason as a server failure, never a client cancel.
+describe("capacity lease loss is not a client cancellation", () => {
+  it("settles an in-flight attempt as capacity_lease_lost (503) and stops the CLI", async () => {
+    const lease = new AbortController();
+    const { manager, attempt } = harness(lease.signal);
+    const started = expect(attempt.started).rejects.toThrow("capacity_lease_lost");
+    lease.abort(new CapacityLeaseLostError("ownership_lost"));
+    await started;
+    await expect(attempt.terminal).resolves.toMatchObject({
+      ok: false,
+      failure: "capacity_lease_lost",
+      httpStatusCode: 503,
+    });
+    // The wire protocol has no lease-loss reason; the CLI is told to stop.
+    expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
+      cliDeviceId: "cli-1",
+      requestId: attempt.requestId,
+      reason: "cancelled",
+    });
+  });
+
+  it("errors a committed body instead of ending it cleanly", async () => {
+    const lease = new AbortController();
+    const { attempt, handlers } = harness(lease.signal);
+    handlers.onHeaders({
+      type: "relay.response.headers",
+      requestId: attempt.requestId,
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { body } = await attempt.started;
+    lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
+    await expect(body.getReader().read()).rejects.toThrow("capacity_lease_lost");
+    await expect(attempt.terminal).resolves.toMatchObject({ failure: "capacity_lease_lost" });
+  });
+
+  it("keeps a plain abort a 499 cancellation", async () => {
+    const client = new AbortController();
+    const { attempt } = harness(client.signal);
+    void attempt.started.catch(() => undefined);
+    client.abort();
+    await expect(attempt.terminal).resolves.toMatchObject({
+      failure: "cancelled",
+      httpStatusCode: 499,
+    });
+  });
+
+  it("classifies an already-lost lease at entry without dispatching", async () => {
+    const manager = {
+      registerRelayResponseHandlers: vi.fn(),
+      sendRelayRequest: vi.fn(),
+      cancelRelayRequest: vi.fn(),
+      completeRelayRequest: vi.fn(),
+    };
+    const lease = new AbortController();
+    lease.abort(new CapacityLeaseLostError("ownership_lost"));
+    const attempt = startRelayAttempt({
+      manager,
+      cliDeviceId: "cli-1",
+      endpointSlug: "neutral-upstream",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new Uint8Array([1]),
+      timeoutMs: 30_000,
+      abortSignal: lease.signal,
+    });
+    await expect(attempt.started).rejects.toThrow("capacity_lease_lost");
+    await expect(attempt.terminal).resolves.toMatchObject({
+      failure: "capacity_lease_lost",
+      httpStatusCode: 503,
+    });
+    expect(manager.sendRelayRequest).not.toHaveBeenCalled();
   });
 });

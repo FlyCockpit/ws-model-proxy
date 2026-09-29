@@ -46,6 +46,7 @@ import {
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import { withCapacityRequestScope } from "./capacity/request-scope.js";
 import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
@@ -439,7 +440,15 @@ interface ChatCompletionDiagnosticInput {
  * function. Upstream failures surface as the provider's OpenAI error
  * `type`/status (stable enums), never the provider's message text.
  */
-export async function runChatCompletionDiagnostic({
+export function runChatCompletionDiagnostic(
+  input: Parameters<typeof chatCompletionDiagnostic>[0],
+): Promise<ChatCompletionDiagnosticResult> {
+  // F2-CAP-6: the diagnostic reads (or cancels) the whole response before it
+  // returns, so any capacity lease owner still alive at return was leaked.
+  return withCapacityRequestScope(() => chatCompletionDiagnostic(input));
+}
+
+async function chatCompletionDiagnostic({
   userId,
   body,
   signal,

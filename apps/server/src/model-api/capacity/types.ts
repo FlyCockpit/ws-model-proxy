@@ -1,3 +1,5 @@
+import type { CapacityLeaseLostError } from "./lease-loss.js";
+
 export type AdmissionCandidate = {
   capacityId: string;
   executionTargetId: string;
@@ -46,6 +48,21 @@ export type AdmissionResult =
   | { state: "ADMITTED"; lease: CapacityLeaseHandle }
   | { state: "WAITING"; requestId: string }
   | { state: "CANCELLED" | "EXPIRED" };
+
+/**
+ * Runtime-level outcome: a lease that was granted but lost before ownership
+ * could be confirmed (F2-CAP-3). It is a server-side failure of THAT member's
+ * lease, never a client cancellation, and it names the member so callers can
+ * exclude it and fail over.
+ */
+export type CapacityLeaseLostAdmission = {
+  state: "LEASE_LOST";
+  reason: CapacityLeaseLostError;
+  executionTargetId: string;
+  poolMemberId?: string;
+};
+
+export type RuntimeAdmissionResult = AdmissionResult | CapacityLeaseLostAdmission;
 
 export type AdmissionTerminalizationResult =
   | { state: "ADMITTED"; lease: CapacityLeaseHandle }

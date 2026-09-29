@@ -36,6 +36,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
+import { capacityLeaseLostSignal } from "./capacity/lease-loss.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import {
   applyOpenRouterDataCollection,
@@ -1186,12 +1187,16 @@ function replaceModel(body: Uint8Array, model: string): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(parsed));
 }
 
-function terminalReason(signal: AbortSignal, ok: boolean) {
-  return signal.aborted
-    ? ("CANCELLED" as const)
-    : ok
-      ? ("COMPLETED" as const)
-      : ("FAILED" as const);
+/**
+ * Durable facts for a provider attempt whose dispatch signal aborted. The
+ * signal is the capacity lease's: a lost lease is a server-side failure
+ * (F2-CAP-3), recorded as such and never as a client cancellation. Neither
+ * counts against provider health (callers skip health on any abort).
+ */
+function abortedAttemptFacts(signal: AbortSignal) {
+  return capacityLeaseLostSignal(signal)
+    ? ({ reason: "CAPACITY_LEASE_LOST", terminalState: "FAILED", budgetReason: "FAILED" } as const)
+    : ({ reason: "CANCELLED", terminalState: "CANCELLED", budgetReason: "CANCELLED" } as const);
 }
 
 function usageInteger(value: unknown): bigint | undefined {
@@ -2929,7 +2934,9 @@ export async function dispatchPublicOverflow(
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).budgetReason
+          : "FAILED",
         dispatchOutcome: "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
@@ -2943,12 +2950,16 @@ export async function dispatchPublicOverflow(
         attemptId,
         fencingToken,
         eventType: "TERMINAL",
-        reason: request.signal.aborted ? "CANCELLED" : "SEND_CLAIM_FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).reason
+          : "SEND_CLAIM_FAILED",
         ...providerEventRouting({ request, target, nativeSurface }),
         reservationId: admission.reservationIds[0],
         reservationIds: admission.reservationIds,
         waitDurationMs: providerWaitDurationMs,
-        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        terminalState: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).terminalState
+          : "FAILED",
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
@@ -3261,6 +3272,11 @@ export async function dispatchPublicOverflow(
           // Publish the settled usage before the terminal resolves so the
           // best-effort affinity write observes the same evidence as billing.
           settledUsage = usage;
+          // Snapshot the outcome ONCE: the budget write below awaits, and a
+          // cancel or lease loss landing during it must not split one attempt
+          // into different budget/state/event outcomes.
+          const settleFacts = request.signal.aborted ? abortedAttemptFacts(request.signal) : null;
+          const settleCancelled = clientCancelled && !capacityLeaseLostSignal(request.signal);
           await reconcileProviderBudget({
             userId: request.userId,
             providerAccountId: target.providerAccountId,
@@ -3270,15 +3286,22 @@ export async function dispatchPublicOverflow(
             requestId: request.requestId,
             attemptId,
             fencingToken,
-            reason: clientCancelled ? "CANCELLED" : terminalReason(request.signal, ok),
+            reason: settleCancelled
+              ? "CANCELLED"
+              : (settleFacts?.budgetReason ?? (ok ? "COMPLETED" : "FAILED")),
             revisionSequence: 1n,
             revisionKind: "SNAPSHOT",
             observationComplete,
             usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
             usage,
           });
-          const state =
-            request.signal.aborted || clientCancelled ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+          const state = settleCancelled
+            ? "CANCELLED"
+            : settleFacts
+              ? settleFacts.terminalState
+              : ok
+                ? "COMPLETED"
+                : "FAILED";
           // If client commitment already began, retain event creation order
           // without ever making client delivery wait for telemetry persistence.
           await firstClientBytePersistence;
@@ -3291,7 +3314,7 @@ export async function dispatchPublicOverflow(
             attemptId,
             fencingToken,
             eventType: "TERMINAL",
-            reason: terminalReason(request.signal, ok),
+            reason: settleFacts ? settleFacts.reason : ok ? "COMPLETED" : "FAILED",
             ...providerEventRouting({ request, target, nativeSurface }),
             reservationId: admission.reservationIds[0],
             reservationIds: admission.reservationIds,
@@ -3549,7 +3572,9 @@ export async function dispatchPublicOverflow(
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        reason: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).budgetReason
+          : "FAILED",
         dispatchOutcome: providerIoStarted ? undefined : "NOT_SENT",
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
@@ -3564,7 +3589,7 @@ export async function dispatchPublicOverflow(
         fencingToken,
         eventType: "TERMINAL",
         reason: request.signal.aborted
-          ? "CANCELLED"
+          ? abortedAttemptFacts(request.signal).reason
           : providerIoStarted
             ? "TRANSPORT"
             : "REQUEST_SETUP_FAILED",
@@ -3572,7 +3597,9 @@ export async function dispatchPublicOverflow(
         reservationId: admission.reservationIds[0],
         reservationIds: admission.reservationIds,
         waitDurationMs: providerWaitDurationMs,
-        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        terminalState: request.signal.aborted
+          ? abortedAttemptFacts(request.signal).terminalState
+          : "FAILED",
         contextTokens: renderedLiability.tokens,
         streamCommitted: false,
       }).catch(() => undefined);
