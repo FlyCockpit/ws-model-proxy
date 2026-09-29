@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
+import { deviceLoginRefusalReasonOf } from "@ws-model-proxy/config/cli-device-login";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -14,6 +15,7 @@ import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 
 import {
+  DeviceLoginRefusal,
   DeviceLoginRequestDetails,
   DeviceLoginRequestSkeleton,
 } from "@/components/device-login-request";
@@ -85,7 +87,12 @@ function DevicePage() {
     },
     onError: (err) => {
       console.error("[device.approve]", err);
-      toast.error(friendly(err, t("device.approveError")));
+      // A structured refusal is explained on the page (with the next step)
+      // instead of a generic toast over a button that would only be refused
+      // again. Anything else (network, server) stays retryable.
+      if (deviceLoginRefusalReasonOf(err) === null) {
+        toast.error(friendly(err, t("device.approveError")));
+      }
     },
     meta: { skipGlobalErrorToast: true },
   });
@@ -103,7 +110,18 @@ function DevicePage() {
     );
   }
 
-  if (decision === "approved") {
+  // A refusal from the read or from the approve; the latest approve wins.
+  const refusal =
+    deviceLoginRefusalReasonOf(approveMutation.error) ??
+    deviceLoginRefusalReasonOf(requestQuery.error);
+  const reload = () => {
+    approveMutation.reset();
+    void requestQuery.refetch();
+  };
+
+  // Already approved by this account (a second tab, or a retry after the
+  // first approval landed): the same outcome as approving now.
+  if (decision === "approved" || requestQuery.data?.status === "approved") {
     return (
       <DeviceShell>
         <CardHeader>
@@ -148,7 +166,9 @@ function DevicePage() {
         <div className="rounded-md border bg-muted/40 px-3 py-2 font-mono text-sm">
           {t("device.userCodeLabel")} <strong>{userCode}</strong>
         </div>
-        {requestQuery.data ? (
+        {refusal ? (
+          <DeviceLoginRefusal reason={refusal} onReload={reload} />
+        ) : requestQuery.data ? (
           <DeviceLoginRequestDetails request={requestQuery.data} />
         ) : requestQuery.error ? (
           <p role="alert" className="text-sm text-destructive">
@@ -157,29 +177,31 @@ function DevicePage() {
         ) : (
           <DeviceLoginRequestSkeleton />
         )}
-        <div className="flex gap-2">
-          <Button
-            type="button"
-            className="min-h-[44px]"
-            onClick={() => {
-              if (requestQuery.data) {
-                approveMutation.mutate({ userCode, slug: requestQuery.data.slug });
-              }
-            }}
-            disabled={!requestQuery.data || approveMutation.isPending}
-          >
-            {approveMutation.isPending ? t("device.approving") : t("device.approve")}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            className="min-h-[44px]"
-            onClick={() => setDecision("cancelled")}
-            disabled={approveMutation.isPending}
-          >
-            {t("device.cancel")}
-          </Button>
-        </div>
+        {refusal ? null : (
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              className="min-h-[44px]"
+              onClick={() => {
+                if (requestQuery.data) {
+                  approveMutation.mutate({ userCode, slug: requestQuery.data.slug });
+                }
+              }}
+              disabled={!requestQuery.data || approveMutation.isPending}
+            >
+              {approveMutation.isPending ? t("device.approving") : t("device.approve")}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              onClick={() => setDecision("cancelled")}
+              disabled={approveMutation.isPending}
+            >
+              {t("device.cancel")}
+            </Button>
+          </div>
+        )}
       </CardContent>
     </DeviceShell>
   );

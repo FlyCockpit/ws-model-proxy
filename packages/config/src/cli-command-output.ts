@@ -321,8 +321,11 @@ function stepByte(parser: number, decoder: number, byte: number): [number, numbe
  * Every (parser, decoder) state and byte, at `(state << 8) | byte`, where
  * `state = parser * DECODER_STATES + decoder` (126 states). Built once from
  * {@link stepByte}, so each byte costs one table load whatever the output.
+ * Built on first use ({@link byteTransitions}), not at import: the build costs
+ * about 25 ms, and this module is also imported by web code that never feeds
+ * a byte.
  */
-const BYTE_TRANSITIONS = (() => {
+function buildByteTransitions(): Uint8Array {
   const states = (DCS_PASSTHROUGH + 1) * DECODER_STATES;
   const table = new Uint8Array(states << 8);
   for (let parser = 0; parser <= DCS_PASSTHROUGH; parser += 1) {
@@ -335,7 +338,24 @@ const BYTE_TRANSITIONS = (() => {
     }
   }
   return table;
-})();
+}
+
+let byteTransitionTable: Uint8Array | null = null;
+let byteTransitionTableBuilds = 0;
+
+/** The transition table, built by the first byte fed to a {@link TerminalByteState}. */
+function byteTransitions(): Uint8Array {
+  if (byteTransitionTable === null) {
+    byteTransitionTable = buildByteTransitions();
+    byteTransitionTableBuilds += 1;
+  }
+  return byteTransitionTable;
+}
+
+/** How many times the transition table was built (exactly once after first use). Test seam. */
+export function byteTransitionTableBuildCount(): number {
+  return byteTransitionTableBuilds;
+}
 
 /** GROUND with no partial character: the only state a tail may start in. */
 const BOUNDARY = GROUND * DECODER_STATES + DEC_NONE;
@@ -349,7 +369,7 @@ const BOUNDARY = GROUND * DECODER_STATES + DEC_NONE;
  * stream keeps from that point. Without it, a tail that starts inside a DCS,
  * APC, PM or OSC body would show that hidden body as text.
  *
- * One table load per byte ({@link BYTE_TRANSITIONS}): this runs on the
+ * One table load per byte ({@link byteTransitions}): this runs on the
  * server's event loop for every byte of headless exec output, so its cost
  * must not depend on what the output looks like.
  *
@@ -366,7 +386,7 @@ export class TerminalByteState {
 
   /** Feeds one byte. */
   feed(byte: number): void {
-    this.state = BYTE_TRANSITIONS[(this.state << 8) | (byte & 0xff)] as number;
+    this.state = byteTransitions()[(this.state << 8) | (byte & 0xff)] as number;
   }
 
   /**
@@ -378,8 +398,9 @@ export class TerminalByteState {
     const length = bytes.length;
     let state = this.state;
     let index = from;
+    const table = byteTransitions();
     while (index < length && (index < dropUntil || state !== BOUNDARY)) {
-      state = BYTE_TRANSITIONS[(state << 8) | (bytes[index] as number)] as number;
+      state = table[(state << 8) | (bytes[index] as number)] as number;
       index += 1;
     }
     this.state = state;
