@@ -266,7 +266,7 @@ describe("sanitizeValidationIssues", () => {
     expect(issues?.[0]?.path).toEqual(["?"]);
   });
 
-  it("does not throw on hostile getters", () => {
+  it("reads accessor-defined issue fields", () => {
     const hostile = {
       get code(): string {
         return "invalid_type";

@@ -300,7 +300,8 @@ undefined`) and in `structuredContent`:
 ```
 
 `path` names the failing field (array indexes are numbers; a segment that is
-not a field the tool declares is `"?"`), `code` is the validator's issue code,
+not a field the tool declares is `"?"`), `code` is the validator's issue code (anything outside a short allowlist
+of standard codes is reported as `invalid`),
 and `message` is the validator's own text. Input values are never echoed:
 messages that could quote a value (`custom`, `unrecognized_keys`, unknown
 codes) are replaced by fixed text, and at most 20 issues are returned. A

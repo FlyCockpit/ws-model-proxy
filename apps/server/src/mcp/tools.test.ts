@@ -208,7 +208,11 @@ function catalogNames(includeCliCommands: boolean): string[] {
 
 interface WireResult {
   content?: { type: string; text: string }[];
-  structuredContent?: { result?: unknown; error?: { code?: string }; requestId?: string };
+  structuredContent?: {
+    result?: unknown;
+    error?: { code?: string; issues?: { code: string }[] };
+    requestId?: string;
+  };
   isError?: boolean;
 }
 
@@ -275,6 +279,32 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(tool("forwarder_pool_fallback_get")?.inputSchema?.required).toEqual(["poolId"]);
     expect(tool("forwarder_pool_fallback_get")?.inputSchema?.properties).toHaveProperty("poolId");
     expect(tool("model_api_tokens_preview")?.inputSchema?.required).toEqual(["scopeMode"]);
+  });
+
+  it("the real tools/list payload (descriptions included) stays within the client budget", async () => {
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(22), undefined);
+    const raw = await response.text();
+    const bytes = new TextEncoder().encode(raw).length;
+    // Measured 139-142 KB for 75-78 tools; the limit is ours, with headroom.
+    expect(bytes).toBeGreaterThan(50_000);
+    expect(bytes).toBeLessThanOrEqual(200 * 1024);
+  });
+
+  it("an unknown key on a strict procedure is reported as fixed text, never as a path or value", async () => {
+    const PLAIN = "plain-hostile-key-4242";
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_pool_fallback_update", {
+      poolId: "pool-1",
+      fallbackEnabled: true,
+      [PLAIN]: PLAIN,
+    });
+    expect(body.result?.isError).toBe(true);
+    const wire = JSON.stringify(body);
+    expect(wire).not.toContain(PLAIN);
+    const issues = body.result?.structuredContent?.error?.issues ?? [];
+    expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
   });
 
   it("a missing required field is named by path and code, and the procedure stays the authority", async () => {

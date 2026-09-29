@@ -66,20 +66,60 @@ const DATE_FIELDS: Record<string, string[]> = {
   forwarder_endpoint_metadata_remove: ["staleBefore"],
   forwarder_model_metadata_remove: ["staleBefore"],
 };
-/** Extracted cores advertise their MCP-owned argument shape (no procedure). */
-const CORE_PROPERTIES: Record<string, string[]> = {
-  forwarder_pool_member_test: ["memberId", "confirm"],
-  forwarder_chat_completion_test: ["model", "messages", "confirm"],
-  forwarder_cli_command_run: ["cliDeviceId", "command", "cwd", "waitMs", "confirm"],
-  forwarder_cli_supervised_command_start: [
-    "cliDeviceId",
-    "command",
-    "cwd",
-    "reason",
-    "shareOutput",
-    "confirm",
-  ],
-  forwarder_cli_command_result: ["commandId", "progress"],
+const RUN_CONFIRM = {
+  type: "string",
+  const: "RUN",
+  description: 'Must be exactly "RUN" to confirm this call.',
+};
+const coreSchema = (properties: Json, required: string[]): Json => ({
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties,
+  additionalProperties: {},
+  required,
+});
+/**
+ * Extracted cores have no procedure: their MCP-owned argument schemas are
+ * pinned here in full (types, constraints and required fields).
+ */
+const CORE_SCHEMAS: Record<string, Json> = {
+  forwarder_pool_member_test: coreSchema(
+    { memberId: { type: "string", minLength: 1 }, confirm: RUN_CONFIRM },
+    ["memberId", "confirm"],
+  ),
+  forwarder_chat_completion_test: coreSchema(
+    {
+      model: { type: "string", minLength: 1 },
+      messages: { type: "array", items: {} },
+      confirm: RUN_CONFIRM,
+    },
+    ["model", "messages", "confirm"],
+  ),
+  forwarder_cli_command_run: coreSchema(
+    {
+      cliDeviceId: { type: "string" },
+      command: { type: "string" },
+      cwd: { type: "string" },
+      waitMs: { type: "number" },
+      confirm: RUN_CONFIRM,
+    },
+    ["cliDeviceId", "command", "confirm"],
+  ),
+  forwarder_cli_supervised_command_start: coreSchema(
+    {
+      cliDeviceId: { type: "string" },
+      command: { type: "string" },
+      cwd: { type: "string" },
+      reason: { type: "string" },
+      shareOutput: { type: "boolean" },
+      confirm: RUN_CONFIRM,
+    },
+    ["cliDeviceId", "command", "confirm"],
+  ),
+  forwarder_cli_command_result: coreSchema(
+    { commandId: { type: "string" }, progress: { type: "boolean" } },
+    ["commandId"],
+  ),
 };
 
 function advertised(tool: Tool): Json {
@@ -99,44 +139,68 @@ describe("advertised schema equals the procedure schema plus declared overlays",
   it("covers every procedure-backed tool and every core", () => {
     expect(procedureTools.length + coreTools.length).toBe(MCP_TOOL_MANIFEST.length);
     expect(procedureTools.length).toBeGreaterThan(70);
-    expect(coreTools.map((tool) => tool.name).sort()).toEqual(Object.keys(CORE_PROPERTIES).sort());
+    expect(coreTools.map((tool) => tool.name).sort()).toEqual(Object.keys(CORE_SCHEMAS).sort());
   });
 
   it.each(procedureTools.map((tool) => [tool.name, tool] as const))(
-    "%s: every procedure property is advertised verbatim",
+    "%s: the WHOLE advertised schema equals the procedure schema plus declared overlays",
     (_name, tool) => {
       const input = procedureInput(tool.target);
-      const base: Json =
-        input === undefined
-          ? { properties: {} }
-          : (z.toJSONSchema(input, { io: "input", unrepresentable: "any" }) as Json);
-      const baseProps = (base.properties ?? {}) as Record<string, unknown>;
+      // Independent of the generator: straight zod -> JSON Schema, then only
+      // the overlay tables above are applied. Every root keyword (`oneOf`,
+      // `additionalProperties`, `$schema`, ...) stays in the comparison.
+      const base: Json = toInputJsonSchema(input ?? z.looseObject({}));
+      const { properties: baseProperties, required: baseRequiredRaw, ...root } = base;
+      const json = advertised(tool);
+      const props = json.properties as Record<string, unknown>;
+      const forbidden = FORBIDDEN[tool.name]?.fields ?? [];
       const owned = new Set<string>([
-        ...(FORBIDDEN[tool.name]?.fields ?? []),
+        ...forbidden,
         ...(EMPTY_ARRAY[tool.name] ?? []),
         ...(DATE_FIELDS[tool.name] ?? []),
         ...(tool.confirmation === null ? [] : ["confirm"]),
       ]);
-      const json = advertised(tool);
-      const props = json.properties as Record<string, unknown>;
-      // No property is dropped, none invented beyond the declared overlays.
-      expect(Object.keys(props).sort()).toEqual(
-        [...new Set([...Object.keys(baseProps), ...owned])].sort(),
-      );
-      for (const [key, schema] of Object.entries(baseProps)) {
-        if (!owned.has(key)) expect(props[key]).toEqual(schema);
+      // Overlay property SHAPES are pinned by the overlay tests below; here
+      // only their presence is taken from the advertised schema.
+      const expectedProps: Record<string, unknown> = { ...(baseProperties as Json) };
+      for (const key of owned) {
+        expect(props).toHaveProperty(key);
+        expectedProps[key] = props[key];
       }
-      // Required fields survive (a missing one is what #117 fixed).
-      const baseRequired = ((base.required ?? []) as string[]).filter(
-        (key) => !(FORBIDDEN[tool.name]?.fields ?? []).includes(key),
-      );
       const expectedRequired = [
-        ...new Set([...baseRequired, ...(tool.confirmation === null ? [] : ["confirm"])]),
-      ].sort();
-      expect(((json.required ?? []) as string[]).slice().sort()).toEqual(expectedRequired);
-      expect(json.type).toBe("object");
+        ...new Set([
+          ...((baseRequiredRaw ?? []) as string[]).filter((key) => !forbidden.includes(key)),
+          ...(tool.confirmation === null ? [] : ["confirm"]),
+        ]),
+      ];
+      const expected: Json = {
+        ...root,
+        type: "object",
+        properties: expectedProps,
+        ...(expectedRequired.length > 0 ? { required: expectedRequired } : {}),
+      };
+      expect(json).toEqual(expected);
     },
   );
+
+  it("a root-union input keeps its branches (the #117 defect must not return)", () => {
+    const json = advertised(
+      MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_model_capability_profile_set")!,
+    );
+    const branches = (json.oneOf ?? json.anyOf) as Json[];
+    expect(branches.length).toBeGreaterThan(1);
+    for (const branch of branches) {
+      expect(branch.required).toEqual(expect.arrayContaining(["mode"]));
+    }
+    expect(branches.some((branch) => (branch.required as string[]).includes("id"))).toBe(true);
+  });
+
+  it("strict procedures advertise their closed shape", () => {
+    const json = advertised(
+      MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_pool_fallback_update")!,
+    );
+    expect(json.additionalProperties).toBe(false);
+  });
 
   it("the fields agents could not discover before are now required", () => {
     const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
@@ -146,12 +210,9 @@ describe("advertised schema equals the procedure schema plus declared overlays",
   });
 
   it.each(coreTools.map((tool) => [tool.name, tool] as const))(
-    "%s: extracted core advertises its declared argument shape",
+    "%s: extracted core advertises exactly its pinned argument schema",
     (name, tool) => {
-      const json = advertised(tool);
-      expect(Object.keys(json.properties as Json).sort()).toEqual(
-        [...CORE_PROPERTIES[name]!].sort(),
-      );
+      expect(advertised(tool)).toEqual(CORE_SCHEMAS[name]);
     },
   );
 });
@@ -282,8 +343,9 @@ describe("single source", () => {
 });
 
 describe("manifest size stays within MCP client limits", () => {
-  // Measured at this change: largest tool ~24.7 KB, whole manifest ~115 KB
-  // (78 tools). Limits are ours (MCP publishes no cap) with headroom for growth.
+  // Measured at this change: largest tool schema ~24.7 KB, all input schemas
+  // ~112 KB (78 tools). The real `tools/list` payload (descriptions included)
+  // is bounded in tools.test.ts. Limits are ours (MCP publishes no cap).
   const PER_TOOL_MAX_BYTES = 32 * 1024;
   const TOTAL_MAX_BYTES = 160 * 1024;
 
