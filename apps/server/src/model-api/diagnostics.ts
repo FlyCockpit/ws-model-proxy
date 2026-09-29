@@ -79,7 +79,14 @@ function nonEmptyReasoning(message: Record<string, unknown>): boolean {
     if (typeof value === "string" && value.trim() !== "") return true;
   }
   const details = message.reasoning_details;
-  return Array.isArray(details) && details.length > 0;
+  if (!Array.isArray(details)) return false;
+  return details.some((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    return (["text", "summary"] as const).some((key) => {
+      const value = (entry as Record<string, unknown>)[key];
+      return typeof value === "string" && value.trim() !== "";
+    });
+  });
 }
 
 /**
@@ -96,6 +103,7 @@ export function classifyChatProbeReply(status: number, rawText: string): ChatPro
   } catch {
     return "failed";
   }
+  if (typeof parsed !== "object" || parsed === null) return "failed";
   const text = extractAssistantTextFromChatCompletion(parsed);
   if (text) return EXPECTED_PROBE_WORD.test(text) ? "pong" : "failed";
   const choice = (parsed as { choices?: unknown }).choices;

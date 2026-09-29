@@ -959,7 +959,7 @@ async function readSentBody(sent: SendRelayRequestArgs): Promise<string> {
 
 describe("classifyChatProbeReply", () => {
   const reply = (choice: Record<string, unknown>) => JSON.stringify({ choices: [choice] });
-  it.each([
+  it.each<[number, string, ReturnType<typeof classifyChatProbeReply>]>([
     [200, reply({ message: { content: "Pong!" } }), "pong"],
     [200, reply({ message: { content: [{ type: "text", text: "pong" }] } }), "pong"],
     [200, reply({ message: { content: "hello" } }), "failed"],
@@ -987,6 +987,22 @@ describe("classifyChatProbeReply", () => {
       reply({ finish_reason: "length", message: { content: "", reasoning_details: [] } }),
       "failed",
     ],
+    ...[[null], [{}], [{ text: "" }], [{ text: "  " }], [42]].map(
+      (details): [number, string, "failed"] => [
+        200,
+        reply({ finish_reason: "length", message: { content: "", reasoning_details: details } }),
+        "failed",
+      ],
+    ),
+    [
+      200,
+      reply({
+        finish_reason: "length",
+        message: { content: "", reasoning_details: [{}, { summary: "hmm" }] },
+      }),
+      "reasoning-only",
+    ],
+    [200, "null", "failed"],
     [
       200,
       reply({ finish_reason: "stop", message: { content: "", reasoning_content: "hmm" } }),
