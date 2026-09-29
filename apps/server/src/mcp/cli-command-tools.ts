@@ -26,13 +26,22 @@ type CliCommandDeps = {
 export const CLI_COMMAND_OUTPUT_NOTICE =
   "Other secrets in command output are NOT redacted. Only substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed.";
 
+/**
+ * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
+ * token, 2 the device's dashboard grant, 3 the CLI's own
+ * `wsmp config set-mcp-commands`. Each rejection names the switch that
+ * refused, and what to change, so a person can fix the right one.
+ */
 const CLI_REJECTION_MESSAGES = {
   not_found: "Not found",
-  grant_disabled: "CLI commands are disabled for this device",
-  offline: "CLI is offline or does not support this protocol",
-  feature_disabled: "CLI has MCP commands disabled in wsmp config",
+  grant_disabled:
+    "CLI commands are disabled for this device (switch 2 of 3: its MCP commands grant on the dashboard CLIs page is Off; a person must set it to Supervised or Unsupervised)",
+  offline:
+    "CLI is offline or does not support this protocol (the device must be connected and running a wsmp version that supports MCP commands)",
+  feature_disabled:
+    "CLI has MCP commands disabled in wsmp config (switch 3 of 3: on that machine run `wsmp config set-mcp-commands supervised` or `unsupervised`, then restart wsmp; the dashboard grant already allows commands)",
   supervised_only:
-    "This device allows only supervised commands; use forwarder_cli_supervised_command_start so a person confirms the command",
+    "This device allows only supervised commands (its dashboard MCP commands grant or `wsmp config set-mcp-commands` on that machine is Supervised, whichever is stricter); use forwarder_cli_supervised_command_start so a person confirms the command",
   unsupported: "Supervised commands need a CLI with terminal support (Unix)",
   limit: "too many commands",
   invalid_command:
@@ -40,7 +49,7 @@ const CLI_REJECTION_MESSAGES = {
   invalid_reason:
     "reason must be well-formed Unicode text (no unpaired surrogates) of at most 500 characters (Unicode code points) and contain no NUL",
   token_inactive:
-    "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
+    "This MCP token was revoked, has expired, or no longer allows CLI commands (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP)",
 } as const;
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */

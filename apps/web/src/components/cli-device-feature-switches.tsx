@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   type CommandFeature,
+  commandLimit,
   commandModeOptionState,
   type FeatureSwitchReason,
   featureReasonKey,
@@ -73,6 +74,29 @@ function FeatureSwitch({
           {t(featureReasonKey(reason))}
         </p>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * What agents can run right now (the stricter of the dashboard grant and the
+ * CLI's own config) and which of those two, or the connection, holds it down.
+ * The MCP token is the third switch; it is per token, so it is only named.
+ */
+function EffectiveCommandMode({ feature }: { feature: CommandFeature }) {
+  const { t } = useTranslation("dashboard");
+  const limit = commandLimit(feature);
+  return (
+    <div className="mt-2 min-w-0 text-xs text-muted-foreground" data-testid="command-effective">
+      <p>
+        {t("dashboard:clis.features.effective")}:{" "}
+        <span className="font-medium text-foreground">
+          {t(`dashboard:clis.features.commandModes.${feature.effectiveMode}`)}
+        </span>
+      </p>
+      {limit ? <p>{t(`dashboard:clis.features.commandLimit.${limit}`)}</p> : null}
+      {feature.limitedBy === null ? <p>{t("dashboard:clis.features.commandNoLimit")}</p> : null}
+      <p>{t("dashboard:clis.features.commandSwitches")}</p>
     </div>
   );
 }
@@ -175,6 +199,7 @@ function CommandModeControl({
           {t(featureReasonKey(firstReason))}
         </p>
       ) : null}
+      <EffectiveCommandMode feature={feature} />
     </fieldset>
   );
 }

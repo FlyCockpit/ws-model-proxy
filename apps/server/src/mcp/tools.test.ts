@@ -1300,9 +1300,18 @@ describe("CLI command tools", () => {
 
   it.each([
     ["not_found", "Not found"],
-    ["grant_disabled", "CLI commands are disabled for this device"],
-    ["offline", "CLI is offline or does not support this protocol"],
-    ["feature_disabled", "CLI has MCP commands disabled in wsmp config"],
+    [
+      "grant_disabled",
+      "CLI commands are disabled for this device (switch 2 of 3: its MCP commands grant on the dashboard CLIs page is Off; a person must set it to Supervised or Unsupervised)",
+    ],
+    [
+      "offline",
+      "CLI is offline or does not support this protocol (the device must be connected and running a wsmp version that supports MCP commands)",
+    ],
+    [
+      "feature_disabled",
+      "CLI has MCP commands disabled in wsmp config (switch 3 of 3: on that machine run `wsmp config set-mcp-commands supervised` or `unsupervised`, then restart wsmp; the dashboard grant already allows commands)",
+    ],
     ["limit", "too many commands"],
     [
       "invalid_command",
@@ -1310,7 +1319,7 @@ describe("CLI command tools", () => {
     ],
     [
       "token_inactive",
-      "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
+      "This MCP token was revoked, has expired, or no longer allows CLI commands (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP)",
     ],
   ] as const)("maps start error %s to a stable message", async (code, message) => {
     cliRuntime.startCliCommand.mockResolvedValue({ ok: false, error: code });
@@ -1657,6 +1666,7 @@ describe("CLI command tools", () => {
 
     it.each([
       ["supervised_only", "use forwarder_cli_supervised_command_start"],
+      ["supervised_only", "whichever is stricter"],
       ["unsupported", "terminal support"],
       ["invalid_reason", "of at most 500 characters (Unicode code points)"],
     ] as const)("maps %s to a stable message", async (code, fragment) => {

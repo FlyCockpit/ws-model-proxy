@@ -90,7 +90,24 @@
       "lastUsed": "Último uso {{date}}",
       "neverUsed": "Nunca usado",
       "expires": "Caduca {{date}}",
-      "noExpiry": "Sin caducidad"
+      "noExpiry": "Sin caducidad",
+      "cliDevicesTitle": "Dónde pueden ejecutarse los comandos de este token",
+      "cliDevicesHelp": "Un comando se ejecuta solo cuando este token, el permiso del dispositivo en el panel y la configuración propia del CLI lo permiten. Este formulario no cambia los permisos de los dispositivos.",
+      "cliDevicesLoadFailed": "No se pudo cargar la configuración de comandos de tus CLIs.",
+      "cliDevicesEmpty": "Aún no tienes CLIs. Los comandos necesitan un CLI conectado cuyo permiso los autorice.",
+      "cliDevicesNoneAllow": "Ninguno de tus CLIs permite comandos ahora, así que los comandos de este token fallarán hasta que subas un permiso. Abre abajo el ajuste de permiso de un dispositivo.",
+      "cliDeviceMode": {
+        "off": "Desactivado",
+        "supervised": "Supervisado",
+        "unsupervised": "Sin supervisión"
+      },
+      "cliDeviceLimit": {
+        "grant": "limitado por el permiso del panel",
+        "cliConfig": "limitado por la configuración del CLI",
+        "both": "limitado por el permiso y por la configuración del CLI",
+        "offline": "CLI desconectado o demasiado antiguo"
+      },
+      "cliDeviceGrantLink": "Abrir el permiso de {{name}}"
     }
   },
   "profile": {

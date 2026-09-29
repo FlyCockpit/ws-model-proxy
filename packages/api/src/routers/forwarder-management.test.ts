@@ -5140,6 +5140,7 @@ describe("setCliDeviceFeatureGrants", () => {
         supported: true,
         live: false,
         effectiveMode: "off",
+        limitedBy: "offline",
         available: false,
       },
     });
@@ -5176,14 +5177,26 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(live[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "supervised",
+      limitedBy: "cliConfig",
       available: true,
     });
     const liveOff = await liveClient("off").listCliDevices();
     expect(liveOff[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "off",
+      limitedBy: "cliConfig",
       available: false,
     });
+    // A stricter dashboard grant is named as the limit, not the CLI config.
+    const [row] = await db.cliDevice.findMany();
+    db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "SUPERVISED" }]);
+    const grantLimited = await liveClient("unsupervised").listCliDevices();
+    expect(grantLimited[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      limitedBy: "grant",
+    });
+    const both = await liveClient("supervised").listCliDevices();
+    expect(both[0]?.features.commands).toMatchObject({ limitedBy: "both" });
   });
 });
 

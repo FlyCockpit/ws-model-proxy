@@ -54,6 +54,7 @@ import {
   lowestMcpCommandMode,
   MCP_COMMAND_MODES,
   type McpCommandModeName,
+  mcpCommandLimit,
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
@@ -694,6 +695,12 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         live: commandsLive,
         /** What an MCP agent can do right now: the lowest of grant and live CLI mode. */
         effectiveMode: commandsEffective,
+        /** The switch that holds effectiveMode down: grant, offline, cliConfig, both, or null. */
+        limitedBy: mcpCommandLimit({
+          grant: commandsGrant,
+          live: commandsLive,
+          cliMode: liveCommandMode(live),
+        }),
         available: commandsEffective !== "off",
       },
     },

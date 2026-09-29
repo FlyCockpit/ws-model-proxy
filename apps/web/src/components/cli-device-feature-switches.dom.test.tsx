@@ -101,6 +101,59 @@ function modeRadio(mode: string, { hidden = false }: { hidden?: boolean } = {}) 
   });
 }
 
+describe("effective command mode", () => {
+  const cases = [
+    ["grant", "off", "grant"],
+    ["cliConfig", "supervised", "cliConfig"],
+    ["both", "supervised", "both"],
+    ["offline", "off", "offline"],
+  ] as const;
+  it.each(cases)("names the %s limit", (limit, effective, expectedKey) => {
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+      },
+      commands: commands({ effectiveMode: effective, limitedBy: limit }),
+    });
+    const box = screen.getByTestId("command-effective");
+    expect(box.textContent).toContain(`dashboard:clis.features.commandModes.${effective}`);
+    expect(box.textContent).toContain(`dashboard:clis.features.commandLimit.${expectedKey}`);
+    expect(box.textContent).not.toContain("commandNoLimit");
+  });
+
+  it("says nothing limits the device only when the API reports no limit", () => {
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+      },
+      commands: commands({ effectiveMode: "unsupervised", limitedBy: null }),
+    });
+    expect(screen.getByTestId("command-effective").textContent).toContain(
+      "dashboard:clis.features.commandNoLimit",
+    );
+    cleanup();
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+      },
+      commands: commands({ effectiveMode: "unsupervised" }),
+    });
+    expect(screen.getByTestId("command-effective").textContent).not.toContain("commandNoLimit");
+  });
+});
+
 describe("CLI feature switches", () => {
   it("disables the terminal switch on Windows and explains why", () => {
     renderSwitches({

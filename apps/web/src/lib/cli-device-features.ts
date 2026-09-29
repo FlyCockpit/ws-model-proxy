@@ -11,6 +11,13 @@ export type TerminalFeature = {
 export const MCP_COMMAND_MODES = ["off", "supervised", "unsupervised"] as const;
 export type McpCommandMode = (typeof MCP_COMMAND_MODES)[number];
 
+/**
+ * Which switch holds a device's effective mode down (see
+ * `mcpCommandLimit` in the API): the dashboard grant, the CLI's own wsmp
+ * config, both, the CLI being offline, or nothing.
+ */
+export type CommandLimit = "grant" | "offline" | "cliConfig" | "both";
+
 export type CommandFeature = {
   /** The dashboard grant. */
   mode: McpCommandMode;
@@ -20,6 +27,8 @@ export type CommandFeature = {
   supported: boolean | null;
   live: boolean;
   effectiveMode: McpCommandMode;
+  /** null: nothing limits it. Absent: an API that does not report it. */
+  limitedBy?: CommandLimit | null;
   available: boolean;
 };
 
@@ -54,6 +63,7 @@ const EMPTY_COMMANDS: CommandFeature = {
   supported: null,
   live: false,
   effectiveMode: "off",
+  limitedBy: "grant",
   available: false,
 };
 
@@ -99,6 +109,11 @@ export function commandModeOptionState(
     return { disabled: true, reason: "configDisabled" };
   }
   return { disabled: false, reason: null };
+}
+
+/** The limit to explain, or null when nothing limits the device or the API did not say. */
+export function commandLimit(feature: CommandFeature): CommandLimit | null {
+  return feature.limitedBy ?? null;
 }
 
 /** Recommend CLI-side browser approval while agents can ask for supervised commands. */

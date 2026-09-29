@@ -23,6 +23,28 @@ const state = vi.hoisted(() => ({
   createError: null as Error | null,
   updateCalls: [] as unknown[],
   updateError: null as Error | null,
+  devices: [] as unknown[],
+  devicesError: null as Error | null,
+}));
+
+vi.mock("@tanstack/react-router", () => ({
+  Link: ({
+    children,
+    className,
+    params,
+    hash,
+    to,
+  }: {
+    children: React.ReactNode;
+    className?: string;
+    params: { lang: string };
+    hash?: string;
+    to: string;
+  }) => (
+    <a className={className} href={`${to.replace("$lang", params.lang)}#${hash ?? ""}`}>
+      {children}
+    </a>
+  ),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -44,6 +66,17 @@ vi.mock("@/utils/orpc", () => {
   const listQueryKey = ["mcpTokens", "listMine"];
   return {
     orpc: {
+      forwarderManagement: {
+        listCliDevices: {
+          queryOptions: () => ({
+            queryKey: ["forwarderManagement", "listCliDevices"],
+            queryFn: async () => {
+              if (state.devicesError) throw state.devicesError;
+              return state.devices;
+            },
+          }),
+        },
+      },
       mcpTokens: {
         listMine: {
           queryKey: () => listQueryKey,
@@ -149,7 +182,7 @@ function renderPanel(createEnabled = true, allowNoExpiry = true) {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <McpTokensPanel createEnabled={createEnabled} allowNoExpiry={allowNoExpiry} />
+      <McpTokensPanel createEnabled={createEnabled} allowNoExpiry={allowNoExpiry} lang="en-US" />
     </QueryClientProvider>,
   );
 }
@@ -183,6 +216,8 @@ afterEach(() => {
   state.createError = null;
   state.updateCalls = [];
   state.updateError = null;
+  state.devices = [];
+  state.devicesError = null;
 });
 
 describe("McpTokensPanel CLI commands", () => {
@@ -277,6 +312,103 @@ describe("McpTokensPanel CLI commands", () => {
     expect(input.allowWrite).toBe(true);
     expect(input.allowCliCommands).toBe(true);
     expectAboutNinetyDays(input.expiresAt);
+  });
+});
+
+function cliDevice(id: string, name: string, commands: object) {
+  return {
+    id,
+    displayName: name,
+    features: {
+      commands: {
+        mode: "off",
+        deviceMode: "unsupervised",
+        supported: true,
+        live: true,
+        effectiveMode: "off",
+        limitedBy: "grant",
+        available: false,
+        ...commands,
+      },
+    },
+  };
+}
+
+describe("McpTokensPanel CLI command switches", () => {
+  async function openCliCommands(user: ReturnType<typeof userEvent.setup>) {
+    state.listPending = false;
+    state.listResult = [];
+    renderPanel();
+    await screen.findByText("settings:mcp.tokens.empty");
+    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    return {
+      dialog,
+      cli: () =>
+        within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    };
+  }
+
+  it("lists nothing about devices until CLI commands is checked", async () => {
+    state.devices = [cliDevice("cli-1", "desk", {})];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    expect(within(dialog).queryByTestId("cli-command-devices")).toBeNull();
+    await user.click(cli());
+    expect(await within(dialog).findByTestId("cli-command-devices")).toBeTruthy();
+  });
+
+  it("warns when no device allows commands and links each device's grant setting", async () => {
+    state.devices = [
+      cliDevice("cli-1", "desk", { effectiveMode: "off", limitedBy: "grant" }),
+      cliDevice("cli-2", "laptop", { effectiveMode: "off", limitedBy: "offline", live: false }),
+    ];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    expect(await within(dialog).findByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeTruthy();
+    expect(within(dialog).getByText(/settings:mcp.tokens.cliDeviceLimit.grant/)).toBeTruthy();
+    expect(within(dialog).getByText(/settings:mcp.tokens.cliDeviceLimit.offline/)).toBeTruthy();
+    const links = within(dialog).getAllByRole("link");
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "/en-US/dashboard/clis#cli-cli-1",
+      "/en-US/dashboard/clis#cli-cli-2",
+    ]);
+  });
+
+  it("shows each device's effective mode and its limit, and no warning when one allows commands", async () => {
+    state.devices = [
+      cliDevice("cli-1", "desk", { effectiveMode: "supervised", limitedBy: "cliConfig" }),
+      cliDevice("cli-2", "laptop", { effectiveMode: "off", limitedBy: "grant" }),
+    ];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    const list = await within(dialog).findByTestId("cli-command-devices");
+    expect(within(list).getByText(/settings:mcp.tokens.cliDeviceMode.supervised/)).toBeTruthy();
+    expect(within(list).getByText(/settings:mcp.tokens.cliDeviceLimit.cliConfig/)).toBeTruthy();
+    expect(within(list).queryByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeNull();
+  });
+
+  it("warns when the account has no CLIs, and reports a failed load", async () => {
+    state.devices = [];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    expect(await within(dialog).findByText("settings:mcp.tokens.cliDevicesEmpty")).toBeTruthy();
+  });
+
+  it("never sends a device grant change from the token form", async () => {
+    state.devices = [cliDevice("cli-1", "desk", {})];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    await within(dialog).findByTestId("cli-command-devices");
+    expect(within(dialog).queryByRole("radio")).toBeNull();
+    expect(within(dialog).queryByRole("switch")).toBeNull();
   });
 });
 

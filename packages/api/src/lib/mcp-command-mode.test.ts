@@ -4,6 +4,7 @@ import {
   allowsSupervisedCommands,
   isMcpCommandMode,
   lowestMcpCommandMode,
+  mcpCommandLimit,
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
@@ -33,5 +34,44 @@ describe("MCP command mode", () => {
     expect(allowsHeadlessCommands("supervised")).toBe(false);
     expect(mcpCommandModeAtLeast("supervised", "unsupervised")).toBe(false);
     expect(isMcpCommandMode("always")).toBe(false);
+  });
+
+  // grant x cli mode (live) -> the switch that limits, as the relay would refuse it.
+  it.each([
+    ["off", "off", "grant"],
+    ["off", "supervised", "grant"],
+    ["off", "unsupervised", "grant"],
+    ["supervised", "off", "cliConfig"],
+    ["supervised", "supervised", "both"],
+    ["supervised", "unsupervised", "grant"],
+    ["unsupervised", "off", "cliConfig"],
+    ["unsupervised", "supervised", "cliConfig"],
+    ["unsupervised", "unsupervised", null],
+  ] as const)(
+    "names the limiting switch: grant %s, CLI config %s -> %s",
+    (grant, cliMode, want) => {
+      expect(mcpCommandLimit({ grant, live: true, cliMode })).toBe(want);
+    },
+  );
+
+  it("names the connection when the grant allows commands but the CLI is not live", () => {
+    expect(mcpCommandLimit({ grant: "supervised", live: false, cliMode: "unsupervised" })).toBe(
+      "offline",
+    );
+    expect(mcpCommandLimit({ grant: "unsupervised", live: false, cliMode: null })).toBe("offline");
+    // An off grant is refused before the relay looks at the connection.
+    expect(mcpCommandLimit({ grant: "off", live: false, cliMode: null })).toBe("grant");
+  });
+
+  it("agrees with lowestMcpCommandMode: a limit exists exactly when effective < unsupervised", () => {
+    for (const grant of ["off", "supervised", "unsupervised"] as const) {
+      for (const cliMode of ["off", "supervised", "unsupervised"] as const) {
+        for (const live of [true, false]) {
+          const effective = lowestMcpCommandMode(grant, live ? cliMode : "off");
+          const limit = mcpCommandLimit({ grant, live, cliMode });
+          expect(limit === null).toBe(effective === "unsupervised");
+        }
+      }
+    }
   });
 });
