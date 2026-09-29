@@ -339,6 +339,12 @@ static ENV_LIST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^[ \t]*-?[ \t]*["']?(?:env|environment|envs|variables)["']?[ \t]*:[ \t]*[\[{]?[ \t\r]*$"#)
         .expect("env list regex")
 });
+/// A JSON environment array that opens on the same line as its first object
+/// (`"environment": [{`): the header may be anywhere in the line.
+static ENV_LIST_JSON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"["'](?:env|environment|envs|variables)["'][ \t]*:[ \t]*\["#)
+        .expect("json env list regex")
+});
 /// `name: SECRET_NAME` alone on a line (Kubernetes `env:` items, JSON objects):
 /// its `value:` sibling follows.
 static NAME_LINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1030,7 +1036,9 @@ impl LineMasker {
                 });
             }
         }
-        if (line.contains("env") || line.contains("variables")) && ENV_LIST.is_match(line) {
+        if (line.contains("env") || line.contains("variables"))
+            && (ENV_LIST.is_match(line) || ENV_LIST_JSON.is_match(line))
+        {
             let indent = indent_of(line);
             self.env_blocks.retain(|block| block.indent != indent);
             self.env_blocks.push(OpenBlock { indent, opener: at });

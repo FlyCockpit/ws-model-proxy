@@ -147,13 +147,57 @@ pub(crate) fn replace(
     ops.step(Step::EtagRechecked)?;
     cancel.check()?;
 
-    renameat(dir.as_fd(), guard.name.as_os_str(), dir.as_fd(), name).map_err(FileError::errno)?;
+    commit_stage(dir, guard.name.as_os_str(), name, orig_stat)?;
     guard.armed = false;
     // Committed: hook errors below cannot undo the rename.
     let _ = ops.step(Step::Renamed);
     fsync(dir.as_fd()).map_err(FileError::errno)?;
     let _ = ops.step(Step::DirSynced);
     Ok(new_stat)
+}
+
+/// Put the staged file at `name`, replacing only the object that was checked.
+///
+/// Linux: `RENAME_EXCHANGE`, then the staged name holds whatever was at `name`;
+/// if that is not the original object (a successor slipped in after the final
+/// re-check) the exchange is undone and the caller gets a conflict, so an
+/// unapproved successor is never overwritten. Crash states: between the exchange
+/// and the unlink the old file is under the staging name (no data is lost).
+/// Elsewhere (and on filesystems without exchange) a plain rename is used and the
+/// re-check above is the only guard: a documented residual.
+fn commit_stage(dir: &OwnedFd, stage: &OsStr, name: &OsStr, orig_stat: &Stat) -> FileResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{RenameFlags, renameat2};
+        let swap = || {
+            renameat2(
+                dir.as_fd(),
+                stage,
+                dir.as_fd(),
+                name,
+                RenameFlags::RENAME_EXCHANGE,
+            )
+        };
+        match swap() {
+            Ok(()) => {
+                let held = fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map_err(FileError::errno)?;
+                if Stat::from_raw(&held).same_object(orig_stat) {
+                    // the original: it is replaced, drop it
+                    unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir)
+                        .map_err(FileError::errno)?;
+                    return Ok(());
+                }
+                // a successor: restore it and refuse
+                let _ = swap();
+                return Err(FileError::conflict("replaced"));
+            }
+            Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
+            Err(Errno::EINVAL | Errno::ENOSYS) => {}
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+    }
+    renameat(dir.as_fd(), stage, dir.as_fd(), name).map_err(FileError::errno)
 }
 
 /// The name must still point at the file we read, and that file must still

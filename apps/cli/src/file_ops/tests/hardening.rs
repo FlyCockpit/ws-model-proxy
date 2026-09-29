@@ -1326,3 +1326,51 @@ fn another_tool_call_cannot_replace_a_staged_file() {
         )
         .unwrap();
 }
+
+// ---- an atomic replace never overwrites a successor inserted after the last check -----
+
+#[test]
+fn a_successor_inserted_before_the_commit_is_preserved_and_the_edit_conflicts() {
+    let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+    let seen = Arc::clone(&root);
+    let fx = Fx::new().with_hook(once_before_commit(move || {
+        let root = seen.lock().unwrap();
+        std::fs::write(root.join("successor.tmp"), "concurrent update").unwrap();
+        std::fs::rename(root.join("successor.tmp"), root.join("doc.txt")).unwrap();
+    }));
+    *root.lock().unwrap() = fx.root.clone();
+    fx.put("doc.txt", "original\n");
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("doc.txt"), "edits": [{ "oldText": "original", "newText": "edited" }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::Conflict);
+    assert_eq!(
+        fx.get("doc.txt"),
+        "concurrent update",
+        "the successor survives"
+    );
+    assert!(fx.leftovers("").is_empty(), "the staged file is cleaned up");
+    // an uncontended replace still works
+    let fx2 = Fx::new();
+    fx2.put("doc.txt", "original\n");
+    fx2.ops
+        .edit(
+            &args(json!({ "path": fx2.p("doc.txt"), "edits": [{ "oldText": "original", "newText": "edited" }] })),
+            &fx2.cancel,
+        )
+        .unwrap();
+    assert_eq!(fx2.get("doc.txt"), "edited\n");
+    assert!(fx2.leftovers("").is_empty());
+}
+
+#[test]
+fn a_compact_json_environment_array_masks_reversed_pairs_on_following_lines() {
+    let fx = Fx::new();
+    fx.put(
+        "task.json",
+        "{\"containerDefinitions\": [{\"environment\": [{\n      \"value\": \"compactsecret\",\n      \"name\": \"DB_PASSWORD\"\n    }]}]}\n",
+    );
+    let r = fx.read("task.json").text;
+    assert!(!r.contains("compactsecret"), "{r}");
+}
