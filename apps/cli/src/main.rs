@@ -18,6 +18,13 @@ fn main() {
     let cli = Cli::parse();
     tls::install_crypto_provider();
     logging::init(cli.log_format, cli.verbose, cli.quiet);
+    // The release profile aborts on panic (no unwinding, no `main` epilogue):
+    // end every metric-source run first, then let the previous hook report.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        wsmp::bounded_run::kill_all_active_for_panic();
+        previous_hook(info);
+    }));
 
     let code = match run(&cli) {
         Ok(()) => ExitCode::Success,

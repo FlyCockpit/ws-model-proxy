@@ -221,6 +221,48 @@ pub fn kill_all_active() {
     kill_all_in(&ACTIVE);
 }
 
+/// The panic-hook variant of [`kill_all_active`]: never blocks (a panic may
+/// come from a thread that holds the registry lock, and waiting for mid-spawn
+/// runs is pointless when the process is about to abort). It closes the
+/// registry and kills what it can reach without waiting for the lock.
+pub fn kill_all_active_for_panic() {
+    kill_all_for_panic_in(&ACTIVE);
+}
+
+fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
+    let mut registry = match shared.try_lock() {
+        Ok(registry) => registry,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        // Held by another thread: it is between two statements of a
+        // registry operation, so retry briefly rather than block.
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let until = Instant::now() + Duration::from_millis(200);
+            loop {
+                if let Ok(registry) = shared.try_lock() {
+                    break registry;
+                }
+                if Instant::now() >= until {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    registry.closed = true;
+    let groups = std::mem::take(&mut registry.groups);
+    #[cfg(unix)]
+    for pid in groups {
+        kill_run(pid);
+    }
+    #[cfg(not(unix))]
+    {
+        drop(registry);
+        for pid in groups {
+            kill_group(pid);
+        }
+    }
+}
+
 fn kill_all_in(shared: &'static Mutex<Registry>) {
     {
         let mut registry = lock_registry(shared);
@@ -550,8 +592,11 @@ fn kill_group(pid: u32) {
 }
 
 /// Everything a registered run started: its group AND the direct child by pid
-/// (it may have left the group; while registered it is unreaped, so its pid
-/// cannot be recycled, the same argument as for the group id).
+/// (it may have left the group). On Linux a registered run is still an
+/// unreaped zombie or live process (`waitid(WNOWAIT)` in `finish`), so its
+/// pid cannot have been recycled. Other Unix targets reap first, so this
+/// widens the accepted G1-2 window (a recycled pid, in the microseconds
+/// between the reap and `unregister`) from the group kill to this one.
 #[cfg(unix)]
 fn kill_run(pid: u32) {
     kill_group(pid);
@@ -747,6 +792,30 @@ mod tests {
             assert!(Instant::now() < deadline, "the registered child survived");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The panic hook kills registered runs without blocking, even while
+    /// another thread holds the registry lock (it gives up rather than hang).
+    #[cfg(unix)]
+    #[test]
+    fn the_panic_hook_kills_registered_runs_and_never_hangs_on_a_held_lock() {
+        let shared = fresh_registry();
+        assert!(begin_spawn_in(shared));
+        let mut child = own_group_sleeper();
+        assert!(register_in(shared, child.id()));
+        kill_all_for_panic_in(shared);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the panic hook left a run alive");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A lock held elsewhere: the hook returns within its bound.
+        let held = fresh_registry();
+        let guard = lock_registry(held);
+        let started = Instant::now();
+        kill_all_for_panic_in(held);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(guard);
     }
 
     #[test]

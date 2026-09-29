@@ -302,6 +302,20 @@ describe("MetricRoutingEvaluator", () => {
     expect([...h.rows.keys()]).toEqual(["m2"]);
   });
 
+  it("re-writes at once after the pool's verdicts were cleared, even for an unchanged verdict", async () => {
+    const h = harness([member("m1", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    expect(h.rows.has("m1")).toBe(true);
+    // Saving the same rules clears the verdicts; the next frame (one second
+    // later, well inside the refresh interval) must write it back.
+    await h.evaluator.clearPool("pool-of-m1");
+    expect(h.rows.size).toBe(0);
+    h.advance(1_000);
+    await h.evaluator.evaluate(state, metrics(90, h.now()));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "FULL" });
+  });
+
   it("publishes nothing once its session was cancelled mid-evaluation", async () => {
     const h = harness([member("m1", hotRule)]);
     const state = createRoutingEvaluationState("user-1", "device-1");

@@ -47,7 +47,7 @@ export type RoutingEvaluationState = {
   running: boolean;
   rerun: boolean;
   closed: boolean;
-  written: Map<string, { key: string; writtenAtMs: number }>;
+  written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
 };
 
 export function createRoutingEvaluationState(
@@ -91,6 +91,9 @@ type VerdictData = {
 };
 
 export class MetricRoutingEvaluator {
+  /** Bumped when a pool's verdicts are cleared, so cached "already written" entries stop applying. */
+  private clearEpoch = 0;
+
   constructor(
     private readonly db: Db = prisma,
     private readonly clock: () => Date = () => new Date(),
@@ -200,7 +203,12 @@ export class MetricRoutingEvaluator {
       // The rules are part of the key: an edited rule set is always re-written.
       const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${rulesKey(rules)}`;
       const previous = state.written.get(member.id);
-      if (previous && previous.key === key && nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS) {
+      if (
+        previous &&
+        previous.key === key &&
+        previous.epoch === this.clearEpoch &&
+        nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS
+      ) {
         continue;
       }
       const data = {
@@ -216,7 +224,7 @@ export class MetricRoutingEvaluator {
       // The session ended while an earlier write was in flight: publish nothing more.
       if (state.closed) break;
       if (await this.publish(member.id, data)) {
-        state.written.set(member.id, { key, writtenAtMs: nowMs });
+        state.written.set(member.id, { key, writtenAtMs: nowMs, epoch: this.clearEpoch });
         published.push({
           memberId: member.id,
           poolId: member.poolId,
@@ -309,6 +317,9 @@ export class MetricRoutingEvaluator {
    * evaluation still in flight is retracted by `retractIfRulesChanged`.
    */
   async clearPool(poolId: string): Promise<void> {
+    // Every state re-writes its verdicts at once afterwards (also for rules
+    // that were saved unchanged), not only after the refresh interval.
+    this.clearEpoch += 1;
     await this.db.poolMemberRoutingVerdict.deleteMany({ where: { poolId } });
   }
 }

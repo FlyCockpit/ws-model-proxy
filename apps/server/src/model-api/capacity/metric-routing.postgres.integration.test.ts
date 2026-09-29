@@ -125,7 +125,7 @@ async function fixture(db: Db) {
     });
     await db.poolMemberRoutingVerdict.deleteMany({ where: { poolId: pool.id } });
   };
-  return { user, pool, a, b, attempt, setVerdict, cleanup };
+  return { user, device, pool, a, b, attempt, setVerdict, cleanup };
 }
 
 function admitted(result: AdmissionResult): CapacityLeaseHandle {
@@ -311,6 +311,56 @@ integration("PostgreSQL metric routing at grant time", () => {
       });
     } finally {
       warn.mockRestore();
+      await f.cleanup();
+      await db.$disconnect();
+    }
+  });
+
+  it("a cancelled evaluator's same-millisecond write cannot overwrite its successor's verdict", async () => {
+    if (!databaseUrl) return;
+    const db = createFixturePrismaClient(databaseUrl);
+    const f = await fixture(db);
+    try {
+      const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+        "../../relay/metric-routing-evaluator.js"
+      );
+      await db.modelPool.update({
+        where: { id: f.pool.id },
+        data: {
+          routingRules: [
+            { metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect: "full" },
+          ],
+        },
+      });
+      const at = new Date();
+      const evaluator = new MetricRoutingEvaluator(db as never, () => at);
+      const inputs = (temperatureC: number) => ({
+        nodeMetrics: {
+          sample: { ts: at.toISOString(), gpus: [{ index: 0, temperatureC }] },
+          receivedAt: at,
+        },
+        endpointLoad: [],
+      });
+      const successor = createRoutingEvaluationState(f.user.id, f.device.id);
+      const cancelled = createRoutingEvaluationState(f.user.id, f.device.id);
+      // The successor stores NONE first; the cancelled state's delayed FULL,
+      // stamped with the SAME millisecond, must be refused by the database.
+      await evaluator.evaluate(successor, inputs(40));
+      await evaluator.evaluate(cancelled, inputs(90));
+      const rows = await db.poolMemberRoutingVerdict.findMany({ where: { poolId: f.pool.id } });
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row.verdict).toBe("NONE");
+        expect(row.publisherId).toBe(successor.publisherId);
+      }
+      // The owner still refreshes its own rows at that instant.
+      successor.written.clear();
+      await evaluator.evaluate(successor, inputs(90));
+      for (const row of await db.poolMemberRoutingVerdict.findMany({
+        where: { poolId: f.pool.id },
+      }))
+        expect(row.verdict).toBe("FULL");
+    } finally {
       await f.cleanup();
       await db.$disconnect();
     }

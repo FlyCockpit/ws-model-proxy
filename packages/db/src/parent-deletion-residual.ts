@@ -89,9 +89,11 @@ export const HISTORY_DRAIN_EDGES = {
   provider_budget_settlement: { delete: [], internal: ["reservationId"] },
   provider_usage_ledger: { delete: [], internal: ["reservationId"] },
   // An expiring cache of the relay's rule evaluator (metric routing verdicts):
-  // never drained. Its rows carry only rule states and expire within seconds
-  // to minutes; the retention sweep (usage-retention.ts) deletes every row
-  // expired more than an hour ago, including those of a deleted user's pools.
+  // never drained. Its rows carry only rule states and an expiry (90 s for
+  // built-in metrics, up to three source intervals for a custom one); the
+  // retention sweep (usage-retention.ts) deletes every row expired more than
+  // an hour ago, including those of a deleted user's pools, and readers
+  // ignore expired rows.
   pool_member_routing_verdict: { delete: [], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
