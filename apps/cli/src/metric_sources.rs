@@ -660,13 +660,22 @@ impl Runner {
         }
         // A run that never reported (a lost thread) is forgotten after its
         // bound, so its source is not blocked forever.
-        self.attempts.retain(|_, attempt| {
+        let mut given_up = Vec::new();
+        self.attempts.retain(|id, attempt| {
             if now < attempt.give_up_at {
                 return true;
             }
             attempt.cancel.store(true, Ordering::SeqCst);
+            given_up.push((*id, attempt.key.clone()));
             false
         });
+        for (id, key) in given_up {
+            if let Some(state) = self.states.get_mut(&key)
+                && state.attempt == Some(id)
+            {
+                state.attempt = None;
+            }
+        }
         while let Ok(result) = self.results_rx.try_recv() {
             self.attempts.remove(&result.attempt);
             let Some(state) = self.states.get_mut(&result.key) else {
@@ -1238,6 +1247,60 @@ escaped{v="a\"b"} 1
         }
     }
 
+    /// A run whose report never arrives is given up after its bound: the
+    /// attempt is forgotten, its run is cancelled, and the source runs
+    /// again instead of staying blocked forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_report_is_given_up_and_the_source_runs_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("runs.pid");
+        // Exits by itself after 1 s; its 5 s timeout never matters.
+        let command = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
+        let (metrics, definition) = approved_remote(&command);
+        let mut runner = Runner::with_inputs(settings(true), metrics, vec![definition]);
+        let started = Instant::now();
+        runner.tick(started);
+        let _ = wait_for_pid(&pid_file);
+        let (old_id, old_cancel) = runner
+            .attempts
+            .iter()
+            .next()
+            .map(|(id, attempt)| (*id, Arc::clone(&attempt.cancel)))
+            .expect("an attempt");
+        // The report is lost: take it off the channel before the runner sees it.
+        runner
+            .results_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the run reports");
+        // Before the bound the attempt is still owned (nothing restarts).
+        runner.tick(started + Duration::from_secs(12));
+        assert!(runner.attempts.contains_key(&old_id));
+        assert!(!old_cancel.load(Ordering::SeqCst));
+        // Past timeout (5) + reap grace (1) + slack (10): forgotten and cancelled,
+        // and the source (due again) starts a new run.
+        runner.tick(started + Duration::from_secs(17));
+        assert!(
+            old_cancel.load(Ordering::SeqCst),
+            "the lost run was not cancelled"
+        );
+        assert!(
+            !runner.attempts.contains_key(&old_id),
+            "the lost attempt was kept"
+        );
+        assert_eq!(runner.attempts.len(), 1, "the source did not run again");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+        {
+            assert!(Instant::now() < deadline, "the new run never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// A cancelled run reports late. It must neither start alongside the
     /// re-added source's new run, nor strip that run's cancel handle (so a
     /// later withdrawal still ends it).
@@ -1295,6 +1358,17 @@ escaped{v="a\"b"} 1
         let second = pids(2)[1];
         assert!(!is_alive(first), "the cancelled run is still running");
         assert!(is_alive(second));
+        // The old run's `Cancelled` report was drained by those ticks: it must
+        // not have been applied to the successor (attempt id check).
+        let successor = runner.states.values().next().expect("the re-added source");
+        assert!(
+            successor.error.is_none(),
+            "a stale report failed the successor"
+        );
+        assert!(
+            successor.attempt.is_some(),
+            "a stale report cleared the successor's run"
+        );
         // The old run's report must not have disarmed the new run: a later
         // withdrawal still ends it.
         runner.set_remote(Vec::new());

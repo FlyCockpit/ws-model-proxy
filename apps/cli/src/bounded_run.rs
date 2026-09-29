@@ -657,6 +657,7 @@ mod tests {
         assert_eq!(lock(shared).held, 0);
     }
 
+    #[cfg(unix)]
     fn fresh_registry() -> &'static Mutex<Registry> {
         Box::leak(Box::new(Mutex::new(Registry {
             closed: false,
