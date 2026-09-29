@@ -1,6 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -128,7 +129,9 @@ async function granteeView(poolId: string, userId: string) {
           fallbackEnabled: true,
           fallbackForGrantees: true,
           externalEquivalentModel: true,
-          User: { select: { slug: true } },
+          User: {
+            select: { slug: true, banned: true, banExpires: true, deletionRequestedAt: true },
+          },
           PoolMembers: {
             where: externalFallbackMemberWhere,
             select: {
@@ -168,7 +171,9 @@ async function granteeView(poolId: string, userId: string) {
       },
     },
   });
-  if (!grant) return null;
+  // #76: a pool whose owner is banned or deletion-marked is unavailable to
+  // everyone; a grantee sees it as not found, like a missing grant.
+  if (!grant || !poolOwnerActive(grant.ModelPool.User, new Date())) return null;
   const pool = grant.ModelPool;
   const disclosure = poolProviderDisclosure({
     isOwner: false,

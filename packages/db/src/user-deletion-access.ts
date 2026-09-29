@@ -48,3 +48,20 @@ export type UserDeletionAccessRow = BannableUser & {
 export function userCredentialAccessBlocked(row: UserDeletionAccessRow, now: Date): boolean {
   return row.deletionRequestedAt != null || isUserBanned(row, now);
 }
+
+/** Every owner field `poolOwnerActive` reads; values may be null, keys may not be missing. */
+export type PoolOwnerAccessRow = {
+  banned: boolean | null;
+  banExpires: Date | null;
+  deletionRequestedAt: Date | null;
+};
+
+/**
+ * Whether a pool owner's account is active (#76, decided 2026-09-28): while
+ * the owner's ban is active or a deletion is pending, the owner's pools are
+ * unavailable to everyone. Every field is required so that a select which
+ * omits one is a type error rather than a silently active owner.
+ */
+export function poolOwnerActive(owner: PoolOwnerAccessRow, now: Date): boolean {
+  return !userCredentialAccessBlocked(owner, now);
+}

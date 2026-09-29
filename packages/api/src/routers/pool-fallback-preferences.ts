@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -34,7 +35,9 @@ export const poolFallbackPreferencesRouter = {
             name: true,
             slug: true,
             externalEquivalentModel: true,
-            User: { select: { slug: true } },
+            User: {
+              select: { slug: true, banned: true, banExpires: true, deletionRequestedAt: true },
+            },
           },
         },
         FallbackPreferences: {
@@ -72,34 +75,40 @@ export const poolFallbackPreferencesRouter = {
         AllowlistEntries: { where: { includeExternal: true }, select: { modelPoolId: true } },
       },
     });
+    // #76: a pool whose owner is banned or deletion-marked is unavailable to
+    // everyone, so it is hidden here as in /v1/models. Its preference row is
+    // kept and applies again when the owner's access returns.
+    const now = new Date();
     return {
       enabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
-      pools: grants.map(({ ModelPool: pool, FallbackPreferences }) => {
-        const preference = FallbackPreferences[0];
-        const model = preference?.ProviderModel;
-        const account = model?.ProviderAccount;
-        return {
-          id: pool.id,
-          name: pool.name,
-          modelId: `${pool.User.slug}/${pool.slug}`,
-          externalEquivalentModel: pool.externalEquivalentModel,
-          providerModelId: preference?.providerModelId ?? null,
-          protocolAdaptationEnabled: preference?.protocolAdaptationEnabled ?? false,
-          upstreamModelId: model?.upstreamModelId ?? null,
-          ready: Boolean(
-            model?.enabled &&
-              !model.deletedAt &&
-              account?.enabled &&
-              !account.deletedAt &&
-              account.CurrentCredential?.status === "ACTIVE",
-          ),
-          tokenAllowed: tokens.some(
-            (token) =>
-              token.scopeMode === "ALL_VISIBLE" ||
-              token.AllowlistEntries.some((entry) => entry.modelPoolId === pool.id),
-          ),
-        };
-      }),
+      pools: grants
+        .filter(({ ModelPool: pool }) => poolOwnerActive(pool.User, now))
+        .map(({ ModelPool: pool, FallbackPreferences }) => {
+          const preference = FallbackPreferences[0];
+          const model = preference?.ProviderModel;
+          const account = model?.ProviderAccount;
+          return {
+            id: pool.id,
+            name: pool.name,
+            modelId: `${pool.User.slug}/${pool.slug}`,
+            externalEquivalentModel: pool.externalEquivalentModel,
+            providerModelId: preference?.providerModelId ?? null,
+            protocolAdaptationEnabled: preference?.protocolAdaptationEnabled ?? false,
+            upstreamModelId: model?.upstreamModelId ?? null,
+            ready: Boolean(
+              model?.enabled &&
+                !model.deletedAt &&
+                account?.enabled &&
+                !account.deletedAt &&
+                account.CurrentCredential?.status === "ACTIVE",
+            ),
+            tokenAllowed: tokens.some(
+              (token) =>
+                token.scopeMode === "ALL_VISIBLE" ||
+                token.AllowlistEntries.some((entry) => entry.modelPoolId === pool.id),
+            ),
+          };
+        }),
     };
   }),
   set: protectedProcedure
@@ -124,9 +133,18 @@ export const poolFallbackPreferencesRouter = {
             granteeUserId: userId,
             ModelPool: { userId: { not: userId }, externalEquivalentModel: { not: null } },
           },
-          select: { id: true },
+          select: {
+            id: true,
+            ModelPool: {
+              select: {
+                User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
+              },
+            },
+          },
         });
-        if (!grant) throw new ORPCError("NOT_FOUND");
+        // #76: an inactive owner's pool is not found, as everywhere else.
+        if (!grant || !poolOwnerActive(grant.ModelPool.User, new Date()))
+          throw new ORPCError("NOT_FOUND");
         const model = await tx.providerModel.findFirst({
           where: { id: input.providerModelId, userId },
           select: { providerAccountId: true },

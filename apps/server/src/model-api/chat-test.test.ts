@@ -44,6 +44,7 @@ const mockedTokenAccess = tokenAccess as unknown as {
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
+  user: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
   };
@@ -412,6 +413,12 @@ describe("chat test routes", () => {
       return Promise.all(input as Promise<unknown>[]);
     });
     db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
+    // #76: the pool owner is read again before every local dispatch.
+    db.user.findUnique.mockResolvedValue({
+      banned: false,
+      banExpires: null,
+      deletionRequestedAt: null,
+    });
     mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
       directModels: [directTarget],
       modelPools: [poolTarget],

@@ -157,15 +157,7 @@ describe("modelApiTokenAccess", () => {
         revokedAt: null,
         expiresAt: null,
       });
-      db.modelApiToken.update.mockResolvedValue({
-        id: "token-id",
-        userId: "user-id",
-        scopeMode: "ALL_VISIBLE",
-        allowExternal: false,
-        lookupPrefix,
-        expiresAt: null,
-        lastUsedAt: now,
-      });
+      vi.mocked(prisma.$executeRaw).mockResolvedValueOnce(1);
 
       const result = await authenticateModelApiTokenSecret(rawSecret);
 
@@ -177,22 +169,44 @@ describe("modelApiTokenAccess", () => {
         allowExternal: false,
         lookupPrefix,
         expiresAt: null,
-        lastUsedAt: now,
+        lastUsedAt: expect.any(Date),
       });
       expect(JSON.stringify(result)).not.toContain(secretDigest);
-      expect(db.modelApiToken.update).toHaveBeenCalledWith({
-        where: { id: "token-id" },
-        data: { lastUsedAt: expect.any(Date) },
-        select: {
-          id: true,
-          userId: true,
-          scopeMode: true,
-          allowExternal: true,
-          lookupPrefix: true,
-          expiresAt: true,
-          lastUsedAt: true,
-        },
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+      // L1b: the lastUsedAt write never waits on a row lock (the E0 send
+      // claim holds the token FOR SHARE while it waits on provider rows).
+      const [strings, ...values] = vi.mocked(prisma.$executeRaw).mock.calls[0]!;
+      const sql = Array.isArray(strings) ? strings.join("?") : "";
+      expect(sql).toMatch(/UPDATE model_api_token SET "lastUsedAt"/);
+      expect(sql).toContain("FOR NO KEY UPDATE SKIP LOCKED");
+      expect(sql).toContain('"lastUsedAt" <= ?');
+      expect(values[1]).toBe("token-id");
+    });
+
+    it.each([
+      ["a recent use is debounced without a write", 10_000, undefined],
+      ["a locked token row is skipped, keeping the previous value", 120_000, 0],
+    ] as const)("%s", async (_label, ageMs, updatedRows) => {
+      const rawSecret = `${PRODUCT_CREDENTIAL_PREFIXES.modelApiToken}${"e".repeat(43)}`;
+      const previous = new Date(Date.now() - ageMs);
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        scopeMode: "ALL_VISIBLE",
+        allowExternal: true,
+        lookupPrefix: credentialLookupPrefix(rawSecret),
+        secretDigest: hmacDigestForForwarderPurpose({ purpose: "modelApiToken", value: rawSecret }),
+        lastUsedAt: previous,
+        revokedAt: null,
+        expiresAt: null,
       });
+      if (updatedRows !== undefined)
+        vi.mocked(prisma.$executeRaw).mockResolvedValueOnce(updatedRows);
+      const result = await authenticateModelApiTokenSecret(rawSecret);
+      expect(result).toMatchObject({ id: "token-id", allowExternal: true, lastUsedAt: previous });
+      expect(vi.mocked(prisma.$executeRaw)).toHaveBeenCalledTimes(
+        updatedRows === undefined ? 0 : 1,
+      );
     });
 
     it("rejects revoked model API tokens", async () => {
@@ -212,7 +226,7 @@ describe("modelApiTokenAccess", () => {
       });
 
       await expect(authenticateModelApiTokenSecret(rawSecret)).resolves.toBeNull();
-      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+      expect(vi.mocked(prisma.$executeRaw)).not.toHaveBeenCalled();
     });
 
     it("rejects tokens whose digest does not match the presented secret", async () => {
@@ -232,7 +246,7 @@ describe("modelApiTokenAccess", () => {
       });
 
       await expect(authenticateModelApiTokenSecret(rawSecret)).resolves.toBeNull();
-      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+      expect(vi.mocked(prisma.$executeRaw)).not.toHaveBeenCalled();
     });
   });
 
@@ -431,6 +445,54 @@ describe("modelApiTokenAccess", () => {
       expect(afterGrantRemoval.modelPools).toHaveLength(0);
     });
 
+    // #76: a banned (active ban) or deletion-marked owner's pools are hidden
+    // from every grantee; an expired temporary ban no longer hides them.
+    it.each([
+      ["indefinite ban", { banned: true, banExpires: null }, false],
+      [
+        "temporary ban in force",
+        { banned: true, banExpires: new Date(Date.now() + 60_000) },
+        false,
+      ],
+      ["expired temporary ban", { banned: true, banExpires: new Date(Date.now() - 1_000) }, true],
+      ["lifted ban", { banned: false, banExpires: null }, true],
+      ["deletion mark", { deletionRequestedAt: new Date() }, false],
+      [
+        "deletion mark with an expired ban",
+        { banned: true, banExpires: new Date(Date.now() - 1_000), deletionRequestedAt: new Date() },
+        false,
+      ],
+    ] as const)(
+      "hides a granted pool whose owner has a %s: visible=%s",
+      async (_label, owner, visible) => {
+        const row = modelPoolRow({
+          id: "granted-pool-id",
+          userId: "other-user-id",
+          userSlug: "team-a",
+          slug: "shared",
+          name: "Shared",
+        });
+        db.discoveredModel.findMany.mockResolvedValue([]);
+        db.modelPool.findMany.mockResolvedValue([]);
+        db.poolGrant.findMany.mockResolvedValue([
+          { id: "grant", ModelPool: { ...row, User: { ...row.User, ...owner } } },
+        ]);
+        const { listVisibleModelTargetsForUser } = await import("./model-api-token-access");
+        const result = await listVisibleModelTargetsForUser("user-id");
+        expect(result.modelPools.map((pool) => pool.id)).toEqual(
+          visible ? ["granted-pool-id"] : [],
+        );
+        // Hidden pools cannot be named in an allowlist either.
+        if (!visible)
+          await expect(
+            resolveAllowlistedModelTargets({
+              userId: "user-id",
+              modelIds: [poolModelId({ userSlug: "team-a", poolSlug: "shared" })],
+            }),
+          ).rejects.toSatisfy((error: ORPCError) => error.code === "FORBIDDEN");
+      },
+    );
+
     it("preserves pool grant and allowlist visibility across pool slug changes by internal id", async () => {
       const renamedGrantedPool = modelPoolRow({
         id: "granted-pool-id",
@@ -621,7 +683,9 @@ describe("external requester validity SQL", () => {
     );
     const raw = vi
       .mocked(prisma.$queryRaw)
-      .mockResolvedValueOnce([{ tokenValid: false, scopeMode: null, requesterValid: true }]);
+      .mockResolvedValueOnce([
+        { tokenValid: false, scopeMode: null, requesterValid: true, ownerValid: true },
+      ]);
     raw.mockClear();
     const result =
       phase === "entry"
@@ -633,21 +697,28 @@ describe("external requester validity SQL", () => {
     expect(sql).toContain('t."expiresAt" > statement_timestamp()');
     expect(sql).toContain('u."banExpires" < statement_timestamp()');
     expect(sql).toContain('u."deletionRequestedAt" IS NULL');
+    // #76: the pool owner's row, by the same rule in the same statement.
+    expect(sql).toContain('o."banExpires" < statement_timestamp()');
+    expect(sql).toContain('o."deletionRequestedAt" IS NULL');
+    expect(sql).toContain("o.banned IS NOT TRUE");
     expect(sql).toContain('t."revokedAt" IS NULL');
     expect(sql).not.toMatch(/FOR (SHARE|UPDATE)|\bnow\(\)/);
-    expect(values).toEqual(["owner", null, "owner"]);
+    expect(values).toEqual(["owner", null, "owner", "owner"]);
   });
 
   it.each([
-    [true, true, null],
-    [false, true, "TOKEN_CONSENT_WITHDRAWN"],
-    [true, false, "REQUESTER_ACCESS_BLOCKED"],
+    [true, true, true, null],
+    [false, true, true, "TOKEN_CONSENT_WITHDRAWN"],
+    [true, false, true, "REQUESTER_ACCESS_BLOCKED"],
+    [true, true, false, "POOL_OWNER_INACTIVE"],
+    [true, false, false, "REQUESTER_ACCESS_BLOCKED"],
+    [true, true, undefined, "POOL_OWNER_INACTIVE"],
   ] as const)(
-    "consumes tokenValid=%s, requesterValid=%s without a later clock comparison",
-    async (tokenValid, requesterValid, expected) => {
+    "consumes tokenValid=%s, requesterValid=%s, ownerValid=%s without a later clock comparison",
+    async (tokenValid, requesterValid, ownerValid, expected) => {
       const { recheckExternalSendRequesterValidity } = await import("./model-api-token-access");
       vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([
-        { tokenValid, requesterValid, scopeMode: "ALL_VISIBLE" },
+        { tokenValid, requesterValid, ownerValid, scopeMode: "ALL_VISIBLE" },
       ]);
       await expect(
         recheckExternalSendRequesterValidity(prisma, { ...identity, modelApiTokenId: "token" }),
