@@ -61,17 +61,26 @@ pub fn conform(message: &mut ClientControlMessage) {
     }
 }
 
-/// NUL removed, trimmed, cut to `max` bytes on a character boundary (zod
-/// counts UTF-16 units, never more than UTF-8 bytes), `None` when empty.
+/// The characters JavaScript's `String.prototype.trim` (and so zod's
+/// `.trim()` on the server) strips: Unicode `White_Space` except U+0085, plus
+/// U+FEFF. Rust's `str::trim` differs on exactly those two, so text is
+/// trimmed with this set to match what the server will see.
+pub fn is_js_trim_whitespace(character: char) -> bool {
+    (character.is_whitespace() && character != '\u{85}') || character == '\u{FEFF}'
+}
+
+/// NUL removed, trimmed like the server trims, cut to `max` bytes on a
+/// character boundary (zod counts UTF-16 units, never more than UTF-8
+/// bytes), `None` when empty.
 fn text(value: Option<String>, max: usize) -> Option<String> {
     let value = value?;
     let cleaned = value.replace('\0', "");
-    let trimmed = cleaned.trim();
+    let trimmed = cleaned.trim_matches(is_js_trim_whitespace);
     let mut end = trimmed.len().min(max);
     while !trimmed.is_char_boundary(end) {
         end -= 1;
     }
-    let cut = trimmed[..end].trim_end();
+    let cut = trimmed[..end].trim_end_matches(is_js_trim_whitespace);
     (!cut.is_empty()).then(|| cut.to_string())
 }
 
@@ -251,6 +260,12 @@ mod tests {
             ("aé", 2, Some("a")),
             ("€€", 4, Some("€")),
             ("😀x", 3, None),
+            // Trimmed exactly like the server's JS `trim`.
+            ("\u{FEFF}", 256, None),
+            (" \u{FEFF} name \u{FEFF}", 256, Some("name")),
+            ("\u{3000}x\u{2028}", 256, Some("x")),
+            // U+0085 is not JS whitespace: kept, as the server keeps it.
+            ("\u{85}x", 256, Some("\u{85}x")),
         ];
         for (input, cap, expected) in rows {
             assert_eq!(

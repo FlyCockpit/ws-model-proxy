@@ -241,6 +241,9 @@ pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, Engine
 
 /// One endpoint's place in the load scheduler.
 struct LoadSchedule {
+    /// Unique per schedule instance: a result is accepted only by the
+    /// schedule that started it (not by a same-looking one re-added later).
+    epoch: u64,
     target: (EndpointConfig, EngineKind),
     state: LoadState,
     next_due: Instant,
@@ -250,7 +253,7 @@ struct LoadSchedule {
 /// A finished scrape, reported by its worker.
 struct LoadDone {
     slug: String,
-    target: (EndpointConfig, EngineKind),
+    epoch: u64,
     reading: Option<LoadReading>,
     finished: Instant,
     ts: String,
@@ -273,6 +276,7 @@ where
     let mut schedules = BTreeMap::<String, LoadSchedule>::new();
     let mut seen_generation = None;
     let mut in_flight = 0_usize;
+    let mut next_epoch = 0_u64;
     while !stop.load(Ordering::SeqCst) {
         let (generation, endpoints) = match shared.lock() {
             Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
@@ -291,9 +295,11 @@ where
                     .get(&slug)
                     .is_none_or(|schedule| schedule.target != target);
                 if replace {
+                    next_epoch += 1;
                     schedules.insert(
                         slug,
                         LoadSchedule {
+                            epoch: next_epoch,
                             target,
                             state: LoadState::default(),
                             next_due: Instant::now(),
@@ -319,6 +325,7 @@ where
                 continue;
             };
             let target = schedule.target.clone();
+            let epoch = schedule.epoch;
             let done_tx = done_tx.clone();
             let sample = sample.clone();
             let spawned = thread::Builder::new()
@@ -327,7 +334,7 @@ where
                     let reading = sample(&target.0, target.1);
                     let _ = done_tx.send(LoadDone {
                         slug,
-                        target,
+                        epoch,
                         reading,
                         finished: Instant::now(),
                         ts: now_rfc3339(),
@@ -354,7 +361,7 @@ where
             let Some(schedule) = schedules.get_mut(&done.slug) else {
                 continue;
             };
-            if schedule.target != done.target {
+            if schedule.epoch != done.epoch {
                 continue;
             }
             schedule.in_flight = false;
@@ -676,15 +683,19 @@ pub enum Bounded {
 /// Run a program with a scrubbed environment, no stdin, stderr discarded,
 /// stdout capped at `limit` (more is a failure), killed after `timeout`.
 ///
-/// The run ends when stdout closes (every process holding the pipe exited or
-/// closed it) or at the deadline, whichever is first. Then, on every path,
-/// whatever is left of the child's process group is killed before the child
-/// is reaped: the unreaped child keeps its pid, and so the group id, from
-/// being reused, so the group kill can never hit an unrelated process. A
-/// helper the tool left behind (forked into the background, or holding the
-/// pipe after the tool exited) therefore never outlives the call. A program
-/// that closes stdout and keeps running is killed too and counts as failed.
+/// The output is complete when stdout closes (every process holding the pipe
+/// exited or closed it). The run then waits, until the same deadline, for
+/// the program itself to exit: many tools close stdout just before they exit
+/// (coreutils' `close_stdout`), so stdout closing does not mean the program
+/// is done. Only then, on every path, is whatever is left of the child's
+/// process group killed, before the child is reaped where the platform
+/// allows it (see [`finish`]). A helper the tool left behind (forked into
+/// the background, or holding the pipe after the tool exited) never outlives
+/// the call. Success is exactly: stdout closed, the program exited 0 before
+/// the deadline, and at most `limit` bytes of UTF-8. The state table is in
+/// `tests/telemetry_bounded.rs`.
 pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64) -> Bounded {
+    let deadline = Instant::now() + timeout;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -702,7 +713,7 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
         return Bounded::Unavailable;
     };
     let Some(stdout) = child.stdout.take() else {
-        kill_group_and_reap(&mut child);
+        finish(&mut child, Instant::now());
         return Bounded::Failed;
     };
     let (done_tx, done_rx) = mpsc::channel();
@@ -716,8 +727,15 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
             .read_to_end(&mut buffer);
         let _ = done_tx.send(buffer);
     });
-    let output = done_rx.recv_timeout(timeout).ok();
-    let status = kill_group_and_reap(&mut child);
+    let output = done_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok();
+    // Over the limit: the output is refused anyway, so do not wait for exit.
+    let wait_until = match &output {
+        Some(buffer) if buffer.len() as u64 <= limit => deadline,
+        _ => Instant::now(),
+    };
+    let status = finish(&mut child, wait_until);
     let Some(buffer) = output else {
         return Bounded::Failed;
     };
@@ -727,11 +745,20 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
     String::from_utf8(buffer).map_or(Bounded::Failed, Bounded::Output)
 }
 
-/// Kill every process left in the child's group, then reap the child and
-/// return its exit status. The group is signalled while the child is still
-/// unreaped (a zombie at worst), so its pid cannot have been recycled.
+/// The one exit path of [`run_bounded`] after spawn: wait until `until` for
+/// the child to exit (without reaping it where possible), kill every process
+/// left in its group, then reap it and return its status. A child still
+/// running at `until` is killed with its group.
+///
+/// On Linux the wait uses `waitid(WNOWAIT)`, so the child stays a zombie and
+/// its pid (the group id) cannot be recycled before the group kill. Other
+/// Unix targets reap first: POSIX does not reuse a pid while a process group
+/// with that id has members, so a surviving helper keeps the id safe; with no
+/// helper left the kill can only miss (a recycled pid would also have to have
+/// become a group leader in the microseconds between).
 #[cfg(unix)]
-fn kill_group_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+fn finish(child: &mut std::process::Child, until: Instant) -> Option<std::process::ExitStatus> {
+    wait_for_exit(child, until);
     if let Ok(raw) = i32::try_from(child.id())
         && raw > 1
     {
@@ -741,13 +768,43 @@ fn kill_group_and_reap(child: &mut std::process::Child) -> Option<std::process::
         );
     }
     // A child that already exited keeps the status it exited with; SIGKILL
-    // cannot change it.
+    // cannot change it. std caches a status `try_wait` already reaped.
     child.wait().ok()
 }
 
-/// Kill the child (no process-group semantics off Unix), then reap it.
+/// Poll until the child has exited or `until` passes, leaving it unreaped.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_for_exit(child: &mut std::process::Child, until: Instant) {
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return;
+    };
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    loop {
+        match waitid(Id::Pid(nix::unistd::Pid::from_raw(raw)), flags) {
+            Ok(WaitStatus::StillAlive) if Instant::now() < until => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Poll until the child has exited or `until` passes (reaps; see [`finish`]).
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn wait_for_exit(child: &mut std::process::Child, until: Instant) {
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait until `until`, then kill the child if still running (no process
+/// groups off Unix), and reap it.
 #[cfg(not(unix))]
-fn kill_group_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+fn finish(child: &mut std::process::Child, until: Instant) -> Option<std::process::ExitStatus> {
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
     if matches!(child.try_wait(), Ok(None)) {
         let _ = child.kill();
     }
@@ -1338,6 +1395,118 @@ mod tests {
             NODE_METRICS_SOURCES_MAX
         );
         assert_eq!(bounded_remote_sources(&many[..2]).len(), 2);
+    }
+
+    #[test]
+    fn remote_source_statuses_carry_the_source_interval_within_bounds() {
+        let with_interval = |interval_secs: u32| RemoteMetricSource {
+            name: "fans".to_string(),
+            command: "echo 1".to_string(),
+            interval_secs,
+            timeout_secs: 5,
+            format: MetricSourceFormat::Number,
+        };
+        let intervals = [4, 5, 10, 86_400, 86_401]
+            .map(|secs| remote_source_statuses(&[with_interval(secs)])[0].interval_secs);
+        assert_eq!(intervals, [None, Some(5), Some(10), Some(86_400), None]);
+    }
+
+    /// Run the scheduler over one vLLM endpoint whose sampler returns the
+    /// given readings in order (repeating the last), collecting frames.
+    fn run_scheduler_for(
+        endpoints: Vec<EndpointConfig>,
+        tx: SyncSender<FromWorker>,
+        sample: impl Fn(&EndpointConfig, EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
+    ) -> (Arc<AtomicBool>, Arc<Mutex<Shared>>, thread::JoinHandle<()>) {
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoints,
+            ..Shared::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread_stop, thread_shared) = (Arc::clone(&stop), Arc::clone(&shared));
+        let handle = thread::spawn(move || run_loads(&tx, &thread_stop, &thread_shared, sample));
+        (stop, shared, handle)
+    }
+
+    #[test]
+    fn the_scheduler_folds_a_dropped_frames_prefix_delta_into_the_next_frame() {
+        // Queue of one: the first frame fills it, the second is dropped
+        // (queue full), the test then drains, and the third frame's delta
+        // must cover both intervals (100 → 170), not only the last (150 → 170).
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler_calls = Arc::clone(&calls);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (stop, _shared, handle) =
+            run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
+                let call = sampler_calls.fetch_add(1, Ordering::SeqCst);
+                let hits = [100.0, 150.0, 170.0][call.min(2)];
+                Some(reading(1, Some(hits)))
+            });
+        let text = |message: FromWorker| match message {
+            FromWorker::Telemetry(text) => text,
+            _ => String::new(),
+        };
+        // The first frame sits in the queue until the second scrape was
+        // offered and dropped.
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 2 && started.elapsed() < Duration::from_secs(6) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        let first = text(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("first frame"),
+        );
+        assert!(!first.contains("prefixCacheHitsDelta"), "{first}");
+        let third = text(
+            rx.recv_timeout(Duration::from_secs(6))
+                .expect("third frame"),
+        );
+        stop.store(true, Ordering::SeqCst);
+        drop(rx);
+        handle.join().expect("scheduler");
+        assert!(third.contains(r#""prefixCacheHitsDelta":70"#), "{third}");
+    }
+
+    #[test]
+    fn a_result_for_a_removed_then_re_added_endpoint_is_discarded() {
+        // The same endpoint, identical config, is removed and re-added while
+        // its first (slow) scrape is in flight: that stale result belongs to
+        // the old schedule and must not be sent or clear the new one's flag.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler_calls = Arc::clone(&calls);
+        let (tx, rx) = mpsc::sync_channel(256);
+        let (stop, shared, handle) =
+            run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
+                if sampler_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    thread::sleep(Duration::from_millis(700));
+                    return Some(reading(7, None));
+                }
+                Some(reading(1, None))
+            });
+        let set = |endpoints: Vec<EndpointConfig>| {
+            let mut shared = shared.lock().expect("shared");
+            shared.endpoints = endpoints;
+            shared.endpoints_generation += 1;
+        };
+        thread::sleep(Duration::from_millis(100));
+        set(Vec::new());
+        thread::sleep(Duration::from_millis(300));
+        set(vec![load_endpoint("vllm")]);
+        thread::sleep(Duration::from_millis(1_200));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().expect("scheduler");
+        let frames = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                FromWorker::Telemetry(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!frames.is_empty(), "the re-added schedule reported");
+        assert!(
+            frames.iter().all(|text| !text.contains(r#""running":7"#)),
+            "{frames:?}"
+        );
     }
 
     #[test]

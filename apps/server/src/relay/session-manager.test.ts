@@ -2355,4 +2355,23 @@ describe("relay 2.7 telemetry", () => {
     expect(manager.getLiveNodeTelemetry(["cli-device-id"]).size).toBe(0);
     manager.dispose();
   });
+
+  it("still closes an unregistered socket that sends malformed telemetry", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(
+      socket,
+      metrics("2026-01-01T00:00:00.000Z", { cpu: { usagePercent: 101.3 } }),
+      now,
+    );
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(consoleError).not.toHaveBeenCalledWith(
+      "[relay] malformed telemetry frame dropped",
+      "node.metrics",
+    );
+    consoleError.mockRestore();
+    manager.dispose();
+  });
 });
