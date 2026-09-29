@@ -435,10 +435,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       // ("admit only if free now"), so the creating pass admits them before
       // the deadline sweep; afterwards they expire below.
       for (const capacityId of orderedCapacityIds)
-        await this.#admitOne(
+        await this.#offerFreeSlots(
           tx,
           capacityId,
           now,
+          request.id,
           existing ? undefined : request.id,
           lastChanceWaiterIds,
         );
@@ -865,6 +866,52 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       data: { state: "ADMITTED", stateChangedAt: now, terminalReason: null },
     });
     return true;
+  }
+
+  /**
+   * Offers every free slot of one capacity to the polling/creating request
+   * (saturation S-A; design: a free local slot is offered before expiry).
+   * With spill-over, waiters become eligible by time passing, which is not a
+   * release event, so several eligible waiters can sit on a capacity with
+   * more than one free slot. A single #admitOne grants only the DRR winner;
+   * this repeats it (older eligible waiters are served first, exactly as a
+   * release-fill would) until `requestId` holds a lease, nothing more can be
+   * granted, or the shutdown fence arms. Returns whether `requestId` is now
+   * admitted. Same locks as #fillAvailable (L4 plus the L6 pre-lock held by
+   * acquire), so no new lock-order edge.
+   */
+  async #offerFreeSlots(
+    tx: Prisma.TransactionClient,
+    capacityId: string,
+    now: Date,
+    requestId: string,
+    creatingRequestId: string | undefined,
+    lastChanceWaiterIds: readonly string[],
+  ): Promise<boolean> {
+    const capacity = await tx.inferenceCapacity.findUniqueOrThrow({
+      where: { id: capacityId },
+      select: { hardConcurrencyLimit: true },
+    });
+    // Each productive iteration consumes one free slot; the bound only guards
+    // against a winner that makes no progress.
+    const maxIterations = (capacity.hardConcurrencyLimit ?? 63) + 1;
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
+      if (isDbShutdownFenceArmed()) return false;
+      const granted = await this.#admitOne(
+        tx,
+        capacityId,
+        now,
+        creatingRequestId,
+        lastChanceWaiterIds,
+      );
+      const lease = await tx.capacityLease.findUnique({
+        where: { admissionRequestId: requestId },
+        select: { state: true },
+      });
+      if (lease?.state === "ACTIVE") return true;
+      if (!granted) return false;
+    }
+    return false;
   }
 
   async #fillAvailable(tx: Prisma.TransactionClient, capacityId: string, now: Date) {

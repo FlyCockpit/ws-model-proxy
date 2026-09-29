@@ -1100,6 +1100,76 @@ describe("model API routes", () => {
       expect(publicOverflow.dispatch).not.toHaveBeenCalled();
     });
 
+    it(":external retry rounds all anchor to the first attempt, keeping the hold window", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        ...affineMembers(),
+        poolMemberRow({
+          id: "member-c",
+          discoveredModelId: "model-c",
+          upstreamModelId: "upstream-c",
+          cliDeviceId: "cli-c",
+          affinityEnabled: true,
+        }),
+      ]);
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const acquire = vi.mocked(runtime.acquire);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      // The holder and then member B fail before commit; member C serves.
+      for (const index of [0, 1]) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(index + 1), { timeout: 5_000 });
+        manager.headers(requireSent(manager, index).requestId, 500, {
+          "content-type": "application/json",
+        });
+      }
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(3), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 2).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      const attempts = acquire.mock.calls.map(([attempt]) => attempt);
+      expect(attempts).toHaveLength(3);
+      const [first, ...retries] = attempts;
+      // Round 1 holds the cold members back by the 2 s default window.
+      expect(first?.schedule).toBeUndefined();
+      expect(first?.candidates.map(({ notBeforeMs }) => notBeforeMs)).toEqual([
+        undefined,
+        2_000,
+        2_000,
+      ]);
+      for (const retry of retries) {
+        // Every retry (not only the second) re-anchors to the FIRST attempt
+        // and keeps its spill instant (anchor + window) even without the holder.
+        expect(retry?.schedule).toEqual({
+          anchorAttemptId: first?.attemptId,
+          spillDelayMs: 2_000,
+        });
+        expect(retry?.candidates.every(({ waitBudgetMs }) => waitBudgetMs === 2_000)).toBe(true);
+      }
+    });
+
     it("keeps the ordinary affinity outcome when a member serves after a pre-commit failover", async () => {
       db.poolMember.findMany.mockResolvedValue(affineMembers());
       affinity.rank.mockResolvedValue(holderDecision());

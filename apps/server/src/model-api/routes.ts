@@ -905,7 +905,11 @@ export const EXTERNAL_PROVIDER_WAIT_CAP_MS = 10_000;
 export function providerCapacityWaitBudget(
   memberBudgetMs: number | null,
   poolHasLocalMembers: boolean,
-  /** Provider-capacity wait already spent in this external phase (earlier pre-commit rounds). */
+  /**
+   * Time already spent in this external phase: earlier rounds' capacity
+   * waits AND their failed pre-commit dispatches (the cap bounds the whole
+   * phase before the request returns to its local queue).
+   */
   phaseElapsedMs = 0,
 ): number | null {
   if (!poolHasLocalMembers) return memberBudgetMs;
@@ -4329,7 +4333,10 @@ async function relayPool({
         return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
       // Durations only (process monotonic clock): the store turns each
-      // round's remaining budget into a database-clock deadline.
+      // round's remaining budget into a database-clock deadline. A lock wait
+      // before a round's store transaction can stretch that round's deadline
+      // by the wait (bounded; the anchored schedule is used only for the
+      // `:external` local deadline the issue requires to be exact).
       const providerPhaseStartMs = performance.now();
       let remaining = compatible;
       let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
