@@ -89,9 +89,16 @@ export type GrantPlan = {
 
 type Entry = { waiter: PlannerWaiter; candidate: SchedulerCandidate };
 
-/** Waiter passes the deadline filter of one admission pass at `now`. */
-function inWindow(
-  waiter: PlannerWaiter,
+/**
+ * Waiter passes the deadline filter of one admission pass at `now`. The one
+ * definition: the planner and the metric-FULL fail-open sibling check
+ * (postgres-store) both use it, so "live candidate" means the same thing.
+ */
+export function inWindow(
+  waiter: Pick<
+    PlannerWaiter,
+    "waiterId" | "admissionRequestId" | "deadlineAt" | "requestDeadlineAt"
+  >,
   now: Date,
   creatingRequestId: string | undefined,
   lastChance: ReadonlySet<string>,

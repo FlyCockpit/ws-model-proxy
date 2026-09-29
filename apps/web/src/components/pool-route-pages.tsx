@@ -34,6 +34,7 @@ import {
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
 import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
+import { PoolMetricRoutingRules } from "@/components/pool-metric-routing-rules";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
 import { poolMutationFailureReason } from "@/lib/pool-mutation-failure-reason";
@@ -624,7 +625,27 @@ export function PoolDetailTab({
       </div>
     );
   }
-  if (tab === "routing" || tab === "capacity" || tab === "media") {
+  if (tab === "routing") {
+    return (
+      <div className="space-y-8">
+        <PoolForm
+          key={`${pool.id}-${tab}`}
+          mode="edit"
+          pool={pool}
+          directModels={detail.directModels}
+          capacities={detail.capacities}
+          capacityAvailability={detail.capacityAvailability}
+          sections={[tab]}
+          stickySave
+          onSuccess={() => undefined}
+        />
+        <div className="border-t pt-6">
+          <PoolMetricRoutingRules poolId={pool.id} />
+        </div>
+      </div>
+    );
+  }
+  if (tab === "capacity" || tab === "media") {
     return (
       <PoolForm
         key={`${pool.id}-${tab}`}

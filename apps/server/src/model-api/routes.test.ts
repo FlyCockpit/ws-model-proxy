@@ -155,6 +155,7 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
+  poolMemberRoutingVerdict: { findMany: MockInstance };
   modelPool: {
     findFirst: MockInstance;
     findUnique: MockInstance;
@@ -826,6 +827,7 @@ describe("model API routes", () => {
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
     db.executionTarget.findUnique.mockResolvedValue({ id: "execution-target-id" });
     db.modelPool.findMany.mockResolvedValue([]);
+    db.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
     db.modelPool.findUnique.mockResolvedValue({
       transformerDiscoveredModelId: null,
       transformerSystemPrompt: null,
@@ -7959,6 +7961,139 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(0);
     expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
       reason: "LOCAL_WAIT_EXPIRED",
+    });
+  });
+
+  describe("metric routing rules (S-B part 2)", () => {
+    const members = () =>
+      ["m1", "m2", "m3"].map((id) =>
+        poolMemberRow({
+          id,
+          discoveredModelId: `${id}-model`,
+          upstreamModelId: `${id}-upstream`,
+          cliDeviceId: "cli-local",
+        }),
+      );
+
+    it("drops metric-FULL members and ranks avoid members last at candidate build", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      db.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+        { poolMemberId: "m1", verdict: "AVOID" },
+        { poolMemberId: "m2", verdict: "FULL" },
+      ]);
+      const capacityRuntime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const [attempt] = vi.mocked(capacityRuntime.acquire).mock.calls[0]!;
+      expect(attempt.candidates.map((candidate) => candidate.poolMemberId)).toEqual(["m3", "m1"]);
+      // A plain-name caller always fails open at grant time.
+      expect(attempt.metricFailOpen).toBe(true);
+      expect(db.poolMemberRoutingVerdict.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ verdict: { in: ["FULL", "AVOID"] } }),
+        }),
+      );
+    });
+
+    it("keeps every member when all are metric-FULL", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      db.poolMemberRoutingVerdict.findMany.mockResolvedValue(
+        ["m1", "m2", "m3"].map((poolMemberId) => ({ poolMemberId, verdict: "FULL" })),
+      );
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const capacityRuntime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const [attempt] = vi.mocked(capacityRuntime.acquire).mock.calls[0]!;
+      expect(attempt.candidates.map((candidate) => candidate.poolMemberId)).toEqual([
+        "m1",
+        "m2",
+        "m3",
+      ]);
+      expect(warn).toHaveBeenCalledWith(
+        "[model-api] every pool candidate is metric-FULL",
+        expect.objectContaining({ poolId: expect.any(String) }),
+      );
+    });
+
+    it("does not fail open in an :external caller's shortened local phase; the resumed phase does", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      const localStates: Array<"EXPIRED" | "ADMITTED"> = ["EXPIRED", "ADMITTED"];
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        const state =
+          candidate.poolMemberId === "local-primary"
+            ? (localStates.shift() ?? "EXPIRED")
+            : "ADMITTED";
+        if (state === "EXPIRED") return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const local = acquire.mock.calls
+        .map(([attempt]) => attempt)
+        .filter((attempt) => attempt.candidates[0]?.poolMemberId === "local-primary");
+      expect(local.map((attempt) => attempt.metricFailOpen)).toEqual([false, true]);
+      // The external phase ran (and consumed its scripted dispatch).
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
     });
   });
 

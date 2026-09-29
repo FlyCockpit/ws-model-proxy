@@ -3097,6 +3097,239 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  const fansSource = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json",
+  };
+  function sourceFrames(socket: FakeSocket) {
+    return socket.sends
+      .map((send) => JSON.parse(String(send)) as { type: string; sources?: unknown[] })
+      .filter((frame) => frame.type === "metrics.sources.set");
+  }
+
+  it("sends remote metric sources after hello.ok only while the device is unsupervised", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const unsupervised = await registered();
+    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(sourceFrames(unsupervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [fansSource] }),
+    ]);
+    unsupervised.manager.dispose();
+
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const supervised = await registered();
+    expect(sourceFrames(supervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [] }),
+    ]);
+    supervised.manager.dispose();
+  });
+
+  it("orders remote source sends: a withdrawal is never overtaken by an older read", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The first read is slow and sees the old (unsupervised) state; the
+    // mode is then lowered and a second send is requested.
+    const readsBefore = findUnique.mock.calls.length;
+    let release: (value: unknown) => void = () => undefined;
+    findUnique.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    // The first send's read is in flight before the mode changes.
+    await vi.waitFor(() => expect(findUnique).toHaveBeenCalledTimes(1 + readsBefore));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const second = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    release({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    await Promise.all([first, second]);
+    const frames = sourceFrames(socket).map((frame) => frame.sources);
+    expect(frames.at(-1)).toEqual([]);
+    manager.dispose();
+  });
+
+  it("fails closed: a failed device read withdraws the sources and reports no delivery", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const failure of [
+      () => findUnique.mockRejectedValueOnce(new Error("db down")),
+      () => findUnique.mockResolvedValueOnce(null),
+      () =>
+        findUnique.mockResolvedValueOnce({
+          userId: "someone-else",
+          mcpCommandMode: "UNSUPERVISED",
+          remoteMetricSources: [fansSource],
+        }),
+    ]) {
+      socket.sends.length = 0;
+      failure();
+      await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(false);
+      expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    }
+    consoleError.mockRestore();
+    // A healthy read afterwards delivers again.
+    socket.sends.length = 0;
+    await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(true);
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    manager.dispose();
+  });
+
+  it("clears a pool's verdicts through the H module when its rules change", async () => {
+    const deep = prisma as unknown as {
+      poolMemberRoutingVerdict: { deleteMany: MockInstance };
+    };
+    deep.poolMemberRoutingVerdict.deleteMany.mockResolvedValue({ count: 1 });
+    const manager = new RelaySessionManager();
+    await manager.onPoolRoutingRulesChanged("pool-1");
+    expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
+      where: { poolId: "pool-1" },
+    });
+    manager.dispose();
+  });
+
+  it("withdraws the sources on a mode downgrade even when the grant re-read fails", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The downgrade is committed; the hook's own grant read fails, the
+    // push's read (a later call) sees the committed OFF mode.
+    findUnique.mockRejectedValueOnce(new Error("db down"));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await expect(manager.onCliFeatureGrantsChanged("cli-device-id")).rejects.toThrow("db down");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
+  it("never sends an oversized remote source list: the CLI gets an empty one", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: Array.from({ length: 51 }, (_, index) => ({
+        ...fansSource,
+        name: `source-${index}`,
+      })),
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
+  it("withdraws remote metric sources when the MCP command mode is lowered", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await manager.onCliFeatureGrantsChanged("cli-device-id");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource], []]);
+    // Changing the definitions pushes them to the live session.
+    expect(await manager.onRemoteMetricSourcesChanged("cli-device-id")).toBe(true);
+    expect(await manager.onRemoteMetricSourcesChanged("other-device")).toBe(false);
+    manager.dispose();
+  });
+
+  it("evaluates pool routing rules on node.metrics and writes the member verdict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
+      };
+      const routingRules = [
+        { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
+      ];
+      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", routingRules }]);
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          ModelPool: {
+            routingRules,
+          },
+          DiscoveredModel: null,
+          ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
+        }),
+      });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requires registration before telemetry", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

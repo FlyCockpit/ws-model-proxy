@@ -71,6 +71,7 @@ import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "../lib/media-attachment-limits";
+import { describeSeries } from "../lib/metric-routing";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import {
   listVisibleModelTargetsForUser,
@@ -118,6 +119,11 @@ import {
 } from "../lib/surface-capabilities";
 import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
 import { visibleModelReasoning } from "../lib/visible-model-reasoning";
+import {
+  deviceMetricSeries,
+  metricRoutingProcedures,
+  serializeRemoteMetricSources,
+} from "./metric-routing";
 
 let guardedSetupTestFailure: (() => void) | undefined;
 
@@ -1536,6 +1542,7 @@ const poolSelect = {
 } satisfies Prisma.ModelPoolSelect;
 
 export const forwarderManagementRouter = {
+  ...metricRoutingProcedures,
   listGuardedOverflowCandidates: protectedProcedure.handler(async ({ context }) => {
     const now = new Date();
     const rows = await prisma.providerModel.findMany({
@@ -2408,6 +2415,9 @@ export const forwarderManagementRouter = {
           nodeInfoAt: true,
           nodeMetrics: true,
           nodeMetricsAt: true,
+          mcpCommandMode: true,
+          remoteMetricSources: true,
+          remoteMetricSourcesAt: true,
         },
       });
       if (!row || row.userId !== context.session.user.id) {
@@ -2415,7 +2425,25 @@ export const forwarderManagementRouter = {
       }
       const live = context.services?.getLiveNodeTelemetry?.([row.id]).get(row.id) ?? null;
       const liveMetrics = live?.nodeMetrics ? live : null;
+      const now = new Date();
+      const series = liveMetrics
+        ? deviceMetricSeries(liveMetrics.nodeMetrics, liveMetrics.nodeMetricsReceivedAt, now)
+        : deviceMetricSeries(row.nodeMetrics ?? null, row.nodeMetricsAt ?? null, now);
       return {
+        /**
+         * Every metric a routing rule can name on this device right now:
+         * `node.*` built-ins and custom series (endpoint `endpoint.*` series
+         * are per member: see `getPoolRoutingRules`).
+         */
+        series: describeSeries(series),
+        /**
+         * Remote metric source definitions the server holds (sent to the CLI
+         * only while the device is `unsupervised`); `nodeMetrics.sources`
+         * has the CLI's own view of each (active, pending approval, refused).
+         */
+        remoteMetricSources: serializeRemoteMetricSources(row.remoteMetricSources),
+        remoteMetricSourcesAt: row.remoteMetricSourcesAt ?? null,
+        remoteMetricSourcesAllowed: row.mcpCommandMode === "UNSUPERVISED",
         cliDeviceId: row.id,
         slug: row.slug,
         live: live !== null,
