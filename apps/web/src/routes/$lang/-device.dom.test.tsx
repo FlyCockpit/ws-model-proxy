@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ComponentType, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -176,6 +176,27 @@ describe("DevicePage approval refusals", () => {
     expect(screen.queryByText("device.approveTitle")).toBeNull();
   });
 
+  it("shows the approved card after a successful Approve even though the read still says pending", async () => {
+    // The read keeps returning `pending` (the default), so the only thing that
+    // can show the approved card is the local `decision` state the mutation set.
+    // This kills both mutants: dropping `setDecision("approved")` leaves
+    // `decision` null, and dropping the `decision === "approved" ||` term at
+    // device.tsx:124 leaves the card gated on a `pending` read.
+    await mount();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByText("device.approve")).toBeTruthy());
+    expect(screen.getByText("device.cancel")).toBeTruthy();
+    await user.click(screen.getByText("device.approve"));
+
+    await waitFor(() => expect(screen.getByText("device.approved.title")).toBeTruthy());
+    expect(screen.getByText("device.approved.description")).toBeTruthy();
+    expect(screen.queryByText("device.approve")).toBeNull();
+    expect(screen.queryByText("device.cancel")).toBeNull();
+    expect(screen.queryByText("device.approveTitle")).toBeNull();
+    expect(toast.success).toHaveBeenCalledTimes(1);
+  });
+
   it("prefers the approve refusal over a newer read refusal", async () => {
     state.approve = () => Promise.reject(refusal("already_handled"));
     const client = await mount();
@@ -188,11 +209,45 @@ describe("DevicePage approval refusals", () => {
     );
 
     // A later read failure must not mask the approve refusal that caused the card.
+    // Drive the invalidation inside act() so React flushes the re-render that
+    // carries the read failure; otherwise the assertion runs against the stale
+    // DOM and the `??` precedence at device.tsx:114-116 goes untested.
     state.read = () => Promise.reject(refusal("expired"));
-    await client.invalidateQueries({ queryKey: ["deviceLoginRequest"] });
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["deviceLoginRequest"] });
+    });
+
+    // The read query must actually be in an error state before the precedence
+    // assertion means anything.
+    await waitFor(() =>
+      expect(client.getQueryState(["deviceLoginRequest", { userCode: "WXYZ-1234" }])?.status).toBe(
+        "error",
+      ),
+    );
+    // Flush any re-render the error notification scheduled so the assertion is
+    // made against the DOM that carries the read failure.
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     expect(screen.getByText("device.refusal.already_handled.title")).toBeTruthy();
     expect(screen.queryByText("device.refusal.expired.title")).toBeNull();
+  });
+
+  it("surfaces the newer read refusal when no approve refusal is present", async () => {
+    const client = await mount();
+
+    await waitFor(() => expect(screen.getByText("device.approve")).toBeTruthy());
+
+    // No approve error exists, so the read refusal is the only refusal and must
+    // be the one rendered (the inverse of the precedence test above).
+    state.read = () => Promise.reject(refusal("expired"));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["deviceLoginRequest"] });
+    });
+
+    await waitFor(() => expect(screen.getByText("device.refusal.expired.title")).toBeTruthy());
+    expect(screen.queryByText("device.approve")).toBeNull();
   });
 
   it("resets the approve refusal on reload and shows the fresh read outcome", async () => {
