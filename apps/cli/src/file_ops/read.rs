@@ -139,7 +139,7 @@ pub(crate) fn current_etag(
     Ok(ops.key.strong(&bytes))
 }
 
-pub fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
+pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
     let (max_lines, max_bytes) = clamp_window(args)?;
     let start = args.start_line.unwrap_or(1);
     if start == 0 {
@@ -194,11 +194,12 @@ pub fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadO
         total.saturating_sub(start.unsigned_abs() - 1).max(1)
     };
     let offset = line_offset(&bytes, first.saturating_sub(1) as usize);
-    // A `.pem`/`KEY` block or a dotenv quoted value opened before the window
-    // masks every following line, so the masker must see the whole prefix (both
-    // classes are small enough for the in-memory path; `read_large` refuses
-    // them above the scan cap). Other classes need one line of context before
-    // the window for the flag-continuation rule.
+    // A `.pem` `PRIVATE KEY` block or a quoted value opened before the window
+    // masks every following line, so the masker must see the whole prefix (the
+    // in-memory path has the whole file; `read_large` feeds the prefix up to the
+    // scan cap and refuses the classes that cannot be served without it). Only
+    // the whole-line classes get by with one line of context before the window
+    // for the flag-continuation rule.
     let context_from = if class.needs_prefix() {
         0
     } else {
@@ -361,6 +362,29 @@ pub(crate) fn assemble(
     })
 }
 
+/// Longest single line served from a file over 64 MiB. Masking needs the whole
+/// line in memory, so an unbounded line (a sparse or minified file) would be an
+/// allocation the file's owner controls.
+const LARGE_LINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one line (terminator included) of at most [`LARGE_LINE_MAX_BYTES`].
+fn read_line_bounded(
+    reader: &mut BufReader<&mut std::fs::File>,
+    buf: &mut Vec<u8>,
+) -> FileResult<usize> {
+    let n = reader
+        .by_ref()
+        .take(LARGE_LINE_MAX_BYTES + 1)
+        .read_until(b'\n', buf)?;
+    if buf.len() as u64 > LARGE_LINE_MAX_BYTES {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "a line in this file over 64 MiB is longer than 16 MiB and cannot be read",
+        ));
+    }
+    Ok(n)
+}
+
 /// Files over 64 MiB: weak etag, no line count, no whole-file scan.
 #[allow(clippy::too_many_arguments)]
 fn read_large(
@@ -416,7 +440,7 @@ fn read_large(
         let mut context: Vec<u8> = Vec::new();
         for _ in 1..first {
             let mut buf = Vec::new();
-            let n = reader.read_until(b'\n', &mut buf)?;
+            let n = read_line_bounded(&mut reader, &mut buf)?;
             if n == 0 {
                 break;
             }
@@ -440,10 +464,10 @@ fn read_large(
         }
         let mut lines = std::iter::from_fn(|| {
             let mut buf = Vec::new();
-            match reader.read_until(b'\n', &mut buf) {
+            match read_line_bounded(&mut reader, &mut buf) {
                 Ok(0) => None,
                 Ok(_) => Some(Ok(buf)),
-                Err(err) => Some(Err(FileError::io(&err))),
+                Err(err) => Some(Err(err)),
             }
         });
         let window = assemble(&mut masker, &mut lines, &opts_for(first), &etag, stat.size)?;

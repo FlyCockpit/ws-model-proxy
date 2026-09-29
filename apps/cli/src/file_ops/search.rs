@@ -69,7 +69,11 @@ pub struct SearchResult {
     pub more: Option<SearchMore>,
 }
 
-pub fn search(ops: &FileOps, args: &SearchArgs, cancel: &Cancel) -> FileResult<SearchResult> {
+pub(crate) fn search(
+    ops: &FileOps,
+    args: &SearchArgs,
+    cancel: &Cancel,
+) -> FileResult<SearchResult> {
     if args.pattern.is_empty() || args.pattern.len() > MAX_PATTERN_BYTES {
         return Err(FileError::invalid("pattern must be 1 to 1024 bytes"));
     }

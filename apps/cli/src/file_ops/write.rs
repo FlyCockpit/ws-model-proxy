@@ -109,7 +109,7 @@ fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
+pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
     check_reason(&args.reason)?;
     let content = decode_content(args)?;
     let if_exists = args.if_exists.unwrap_or_default();

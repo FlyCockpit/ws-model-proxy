@@ -17,6 +17,14 @@
 //! from `/proc/self/fd` on Linux, which reflects the directory actually held
 //! even if a name was swapped after the walk; on other Unixes the path built
 //! from the names walked is used).
+//!
+//! Residual (owner decision: `openat2` deferred; the plan's threat model is the
+//! MCP agent, not a second process of the same user): the policy verdict is
+//! taken on the held directory at resolution time. A process running as the
+//! same user that renames a traversed directory out of a configured root between
+//! that verdict and the operation can make the operation land outside the root,
+//! because the effect goes through the held fd. Symlink swaps during the walk
+//! cannot, and roots are not a boundary against a shell (see `policy`).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};

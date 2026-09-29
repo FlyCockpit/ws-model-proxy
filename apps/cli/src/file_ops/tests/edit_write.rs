@@ -364,10 +364,13 @@ fn binary_and_oversized_files_are_refused() {
         .code,
         ErrorCode::TooLarge
     );
-    fx.put("grow.txt", "y".repeat(1024 * 1024));
-    let grow =
-        json!([{ "oldText": "y", "newText": "zzzzzzzzzzzzzzzzzzzz", "expectedMatches": "all" }]);
+    fx.put("grow.txt", "y".repeat(100_000));
+    let grow = json!([{ "oldText": "y", "newText": "z".repeat(200), "expectedMatches": "all" }]);
     assert_eq!(edit_err(&fx, "grow.txt", grow).code, ErrorCode::TooLarge);
+    // more matches than the per-edit cap is a match_count error, not a huge plan
+    fx.put("many.txt", "y".repeat(100_001));
+    let many = json!([{ "oldText": "y", "newText": "z", "expectedMatches": "all" }]);
+    assert_eq!(edit_err(&fx, "many.txt", many).code, ErrorCode::MatchCount);
 }
 
 #[test]
