@@ -25,6 +25,10 @@ use super::{Cancel, FileOps, check_reason};
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
 pub const MAX_EDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Longest `newText` of one edit (the write body cap).
+pub const MAX_NEW_TEXT_BYTES: usize = 1024 * 1024;
+/// Most matches one `oldText` may replace (bounds planning memory and time).
+pub const MAX_MATCHES_PER_EDIT: usize = 100_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -75,10 +79,30 @@ pub struct EditResult {
 
 struct Planned {
     orig: Range<usize>,
-    replacement: String,
+    /// Index into the per-edit replacement texts (no per-match copy).
+    edit: usize,
 }
 
-pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+/// Running size of the edited file, checked while the plan is built so an edit
+/// that would exceed the cap fails before any replacement is materialised.
+struct SizeBudget {
+    size: i128,
+}
+
+impl SizeBudget {
+    fn add(&mut self, replaced: usize, with: usize) -> FileResult<()> {
+        self.size += with as i128 - replaced as i128;
+        if self.size > MAX_EDIT_FILE_BYTES as i128 {
+            return Err(FileError::new(
+                ErrorCode::TooLarge,
+                "the edited file would exceed 16 MiB",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     check_reason(&args.reason)?;
     if args.edits.is_empty() || args.edits.len() > MAX_EDITS {
         return Err(FileError::invalid(format!(
@@ -99,6 +123,9 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
                     "each edit is either {oldText,newText[,expectedMatches]} or {startLine,endLine,newText}",
                 ));
             }
+        }
+        if op.new_text.len() > MAX_NEW_TEXT_BYTES {
+            return Err(FileError::invalid("newText is longer than 1 MiB"));
         }
         if op.new_text.contains(MASK_OPEN) {
             return Err(FileError::new(
@@ -122,9 +149,11 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
             access: Access::Write,
         },
     )?;
-    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    // Lock first (as `write` does): a queued edit then opens the file after the
+    // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
+    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
     let previous_etag = ops.key.strong(&original);
@@ -143,21 +172,36 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
     let crlf = text::detect_eol(&original) == Eol::Crlf;
 
     let mut planned: Vec<Planned> = Vec::new();
+    let mut budget = SizeBudget {
+        size: original.len() as i128,
+    };
+    let mut new_texts: Vec<String> = Vec::with_capacity(args.edits.len());
     for (index, op) in args.edits.iter().enumerate() {
-        let new_text = translate_eol(&op.new_text, crlf);
+        new_texts.push(translate_eol(&op.new_text, crlf));
+        let new_text = &new_texts[index];
         match (&op.old_text, op.start_line, op.end_line) {
             (Some(old), _, _) => {
                 plan_exact(
                     &view,
                     &translate_eol(old, crlf),
-                    &new_text,
+                    new_text.len(),
                     op,
                     index,
                     &mut planned,
+                    &mut budget,
+                    cancel,
                 )?;
             }
             (None, Some(start), Some(end)) => {
-                planned.push(plan_lines(&view, &original, start, end, new_text, index)?);
+                planned.push(plan_lines(
+                    &view,
+                    &original,
+                    start,
+                    end,
+                    new_text.len(),
+                    index,
+                    &mut budget,
+                )?);
             }
             _ => return Err(FileError::invalid("malformed edit")),
         }
@@ -175,7 +219,7 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
     let mut cursor = 0;
     for plan in &planned {
         updated.extend_from_slice(&original[cursor..plan.orig.start]);
-        updated.extend_from_slice(plan.replacement.as_bytes());
+        updated.extend_from_slice(new_texts[plan.edit].as_bytes());
         cursor = plan.orig.end;
     }
     updated.extend_from_slice(&original[cursor..]);
@@ -266,16 +310,31 @@ fn line_of(text: &str, byte: usize) -> usize {
     text[..byte].matches('\n').count() + 1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_exact(
     view: &MaskedView,
     old: &str,
-    new_text: &str,
+    new_len: usize,
     op: &EditOp,
     index: usize,
     planned: &mut Vec<Planned>,
+    budget: &mut SizeBudget,
+    cancel: &Cancel,
 ) -> FileResult<()> {
-    let matches: Vec<usize> = view.text.match_indices(old).map(|(at, _)| at).collect();
+    let matches: Vec<usize> = view
+        .text
+        .match_indices(old)
+        .map(|(at, _)| at)
+        .take(MAX_MATCHES_PER_EDIT + 1)
+        .collect();
     let found = matches.len();
+    if found > MAX_MATCHES_PER_EDIT {
+        return Err(FileError::new(
+            ErrorCode::MatchCount,
+            format!("edit {index}: more than {MAX_MATCHES_PER_EDIT} matches; narrow oldText"),
+        )
+        .with_detail(json!({ "edit": index, "found": found })));
+    }
     if found == 0 {
         return Err(FileError::new(
             ErrorCode::NoMatch,
@@ -314,7 +373,10 @@ fn plan_exact(
             json!({ "edit": index, "expected": expected, "found": found, "lines": lines }),
         ));
     }
-    for at in matches {
+    for (n, at) in matches.into_iter().enumerate() {
+        if n % 1024 == 1023 {
+            cancel.check()?;
+        }
         let range = at..at + old.len();
         if view.overlaps_span(&range) {
             return Err(FileError::new(
@@ -323,9 +385,10 @@ fn plan_exact(
             )
             .with_detail(json!({ "edit": index, "line": line_of(&view.text, at) })));
         }
+        budget.add(old.len(), new_len)?;
         planned.push(Planned {
             orig: view.to_orig(range.start)..view.to_orig(range.end),
-            replacement: new_text.to_string(),
+            edit: index,
         });
     }
     Ok(())
@@ -336,8 +399,9 @@ fn plan_lines(
     original: &[u8],
     start: u64,
     end: u64,
-    new_text: String,
+    new_len: usize,
     index: usize,
+    budget: &mut SizeBudget,
 ) -> FileResult<Planned> {
     let total = text::count_lines(original) as u64;
     if start == 0 || end + 1 < start || start > total + 1 || end > total {
@@ -359,9 +423,10 @@ fn plan_lines(
         )
         .with_detail(json!({ "edit": index })));
     }
+    budget.add(range.len(), new_len)?;
     Ok(Planned {
         orig: range,
-        replacement: new_text,
+        edit: index,
     })
 }
 

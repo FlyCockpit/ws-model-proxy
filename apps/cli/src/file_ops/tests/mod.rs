@@ -12,6 +12,7 @@ use super::read::{ReadOutcome, ReadResult};
 use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
 mod edit_write;
+mod hardening;
 mod misc;
 mod read_tests;
 mod resolve_policy;

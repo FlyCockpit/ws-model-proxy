@@ -65,11 +65,11 @@ impl FileClass {
     }
 
     /// Whether serving a window from the middle of the file needs the whole
-    /// prefix fed to the masker first: a dotenv value whose opening quote is on
-    /// an earlier line, or a `.pem`/`.key` `PRIVATE KEY` block opened earlier,
-    /// masks every following line.
+    /// prefix fed to the masker first: a quoted value whose opening quote is on
+    /// an earlier line (any file), or a `.pem`/`.key` `PRIVATE KEY` block opened
+    /// earlier, masks every following line.
     pub fn needs_prefix(self) -> bool {
-        matches!(self, Self::Dotenv | Self::PemKey)
+        !matches!(self, Self::SshPrivateKey | Self::HfToken)
     }
 }
 
@@ -110,6 +110,8 @@ pub struct Span {
 pub struct MaskedView {
     pub text: String,
     pub spans: Vec<Span>,
+    /// `cum[i]`: real-text length minus masked-view length over `spans[..=i]`.
+    cum: Vec<isize>,
 }
 
 impl MaskedView {
@@ -120,13 +122,19 @@ impl MaskedView {
     /// Whether `range` (masked-view bytes) overlaps a masked span. An empty
     /// range overlaps only when strictly inside a span.
     pub fn overlaps_span(&self, range: &Range<usize>) -> bool {
-        self.spans.iter().any(|span| {
-            if range.start == range.end {
-                range.start > span.view.start && range.start < span.view.end
-            } else {
-                range.start < span.view.end && span.view.start < range.end
-            }
-        })
+        // Spans are sorted and disjoint: the first one that ends after
+        // `range.start` is the only candidate.
+        let idx = self
+            .spans
+            .partition_point(|span| span.view.end <= range.start);
+        let Some(span) = self.spans.get(idx) else {
+            return false;
+        };
+        if range.start == range.end {
+            range.start > span.view.start && range.start < span.view.end
+        } else {
+            range.start < span.view.end && span.view.start < range.end
+        }
     }
 
     /// Count of spans whose masked-view range starts inside `range`.
@@ -140,13 +148,21 @@ impl MaskedView {
     /// Map a masked-view position that is not strictly inside a span to the
     /// same position in the real text.
     pub fn to_orig(&self, pos: usize) -> usize {
-        let mut delta: isize = 0;
-        for span in &self.spans {
-            if span.view.end <= pos {
-                delta += span.orig.len() as isize - span.view.len() as isize;
-            }
-        }
+        let idx = self.spans.partition_point(|span| span.view.end <= pos);
+        let delta = if idx == 0 { 0 } else { self.cum[idx - 1] };
         (pos as isize + delta) as usize
+    }
+
+    fn from_parts(text: String, spans: Vec<Span>) -> Self {
+        let mut delta: isize = 0;
+        let cum = spans
+            .iter()
+            .map(|span| {
+                delta += span.orig.len() as isize - span.view.len() as isize;
+                delta
+            })
+            .collect();
+        Self { text, spans, cum }
     }
 }
 
@@ -302,29 +318,37 @@ type LineMask = (Range<usize>, String);
 /// mentions `NAME=value` is over-masked too (safe direction): the local shapes
 /// `Environment="API_KEY=abc"` (required) and `{"note":"X_KEY=x"}` are
 /// indistinguishable without JSON/YAML parsing.
-fn assignment_masks(line: &str, out: &mut Vec<LineMask>) {
+fn assignment_masks(line: &str, out: &mut Vec<LineMask>) -> Option<char> {
     if !(line.contains("TOKEN")
         || line.contains("KEY")
         || line.contains("SECRET")
         || line.contains("PASSWORD"))
     {
-        return;
+        return None;
     }
-    for caps in ASSIGN.captures_iter(line) {
+    // Candidates are visited left to right and each masked value swallows what
+    // follows it, so `covered` keeps the scan linear: a candidate that starts
+    // inside an earlier value is already masked and is skipped without
+    // rescanning its value.
+    let mut covered = 0_usize;
+    let mut pos = 0_usize;
+    let mut open = None;
+    while let Some(caps) = ASSIGN.captures_at(line, pos) {
         let (Some(name), Some(sep), Some(whole)) = (caps.get(1), caps.get(2), caps.get(0)) else {
-            continue;
+            break;
         };
+        // Resume after the match, and after any value it swallowed, so a
+        // covered candidate is never even matched.
+        pos = whole.end().max(covered);
+        if name.start() < covered {
+            continue;
+        }
         let after = &line[whole.end()..];
         if sep.as_str() == "=" && after.starts_with('=') {
             continue;
         }
-        // `NAME::path` is not an assignment, and `NAME:nospace` only counts when
-        // the value is quoted (minified JSON): elsewhere `NAME:value` is how a
-        // scalar key/value line looks.
-        if sep.as_str() == ":"
-            && (after.starts_with(':')
-                || (whole.end() == sep.end() && !after.starts_with(['"', '\''])))
-        {
+        // `NAME::path` is not an assignment (`NAME:value` and `NAME: value` are).
+        if sep.as_str() == ":" && after.starts_with(':') {
             continue;
         }
         if name.start() > 0 && is_word_byte(line.as_bytes()[name.start() - 1]) {
@@ -333,57 +357,87 @@ fn assignment_masks(line: &str, out: &mut Vec<LineMask>) {
             continue;
         }
         let end = value_end(line, whole.end(), enclosing_quote(line, name.start()));
+        covered = end;
+        pos = pos.max(end);
         let value = &line[whole.end()..end];
         if value_is_public(value) {
             continue;
         }
+        if let Some(quote) = unclosed_quote(value) {
+            open = Some(quote);
+        }
         out.push((whole.end()..end, token(value.chars().count())));
     }
+    open
 }
 
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn generic_line_masks(line: &str, out: &mut Vec<LineMask>) {
-    assignment_masks(line, out);
+/// Assignment and flag masks of `line`. Returns the quote of a masked value
+/// that does not close on this line (it continues on the following lines).
+fn generic_line_masks(line: &str, out: &mut Vec<LineMask>) -> Option<char> {
+    let mut open = assignment_masks(line, out);
     if line.contains("--") {
-        for caps in FLAG.captures_iter(line) {
+        let mut covered = 0_usize;
+        let mut pos = 0_usize;
+        while let Some(caps) = FLAG.captures_at(line, pos) {
             let (Some(sep), Some(whole)) = (caps.get(1), caps.get(0)) else {
-                continue;
+                break;
             };
             let start = whole.end();
+            pos = start.max(covered);
+            if start < covered {
+                continue;
+            }
             if sep.as_str() != "=" && line[start..].starts_with('-') {
                 continue;
             }
             let flag_start = whole.start();
             let enclosing = enclosing_quote(line, flag_start + 1);
             let end = value_end(line, start, enclosing);
+            covered = end;
+            pos = pos.max(end);
             let value = &line[start..end];
             if value_is_public(value) {
                 continue;
             }
+            if let Some(quote) = unclosed_quote(value) {
+                open = Some(quote);
+            }
             out.push((start..end, token(value.chars().count())));
         }
     }
+    open
 }
 
 fn merge(mut masks: Vec<LineMask>, line: &str) -> Vec<LineMask> {
     masks.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut merged: Vec<LineMask> = Vec::with_capacity(masks.len());
+    // (range, token, absorbed another mask): a merged range is re-counted once,
+    // after all its members are known, not once per absorbed mask.
+    let mut merged: Vec<(Range<usize>, String, bool)> = Vec::with_capacity(masks.len());
     for (range, tok) in masks {
-        if let Some((last, last_tok)) = merged.last_mut()
+        if let Some((last, _, absorbed)) = merged.last_mut()
             && range.start < last.end
         {
-            if range.end > last.end {
-                last.end = range.end;
-            }
-            *last_tok = token(line[last.clone()].chars().count());
+            last.end = last.end.max(range.end);
+            *absorbed = true;
             continue;
         }
-        merged.push((range, tok));
+        merged.push((range, tok, false));
     }
     merged
+        .into_iter()
+        .map(|(range, tok, absorbed)| {
+            let tok = if absorbed {
+                token(line[range.clone()].chars().count())
+            } else {
+                tok
+            };
+            (range, tok)
+        })
+        .collect()
 }
 
 /// First value token on a continuation line (a flag value or a list item).
@@ -444,7 +498,41 @@ impl LineMasker {
     /// text), sorted and non-overlapping. Advances the state.
     pub fn scan(&mut self, line: &str) -> Vec<(Range<usize>, String)> {
         let mut masks: Vec<LineMask> = Vec::new();
-        let mut open_quote = self.open_quote;
+        let mut from = 0;
+        if let Some(quote) = self.open_quote {
+            // Inside a quoted value that opened on an earlier line (any class):
+            // this line is part of the value, up to the closing quote.
+            self.pending_flag_value = false;
+            match closing_quote_index(line, quote) {
+                None => return vec![(0..line.len(), token_bare())],
+                Some(idx) => {
+                    self.open_quote = None;
+                    if self.class == FileClass::Dotenv {
+                        // Fail closed: nothing after the value is trusted.
+                        return vec![(0..line.len(), token_bare())];
+                    }
+                    from = idx + quote.len_utf8();
+                    masks.push((0..from, token_bare()));
+                }
+            }
+        }
+        let base = masks.len();
+        masks.extend(self.scan_body(&line[from..]));
+        for (range, _) in &mut masks[base..] {
+            range.start += from;
+            range.end += from;
+        }
+        if masks.is_empty() {
+            masks
+        } else {
+            merge(masks, line)
+        }
+    }
+
+    /// The class and generic rules over `line` (ranges relative to `line`).
+    fn scan_body(&mut self, line: &str) -> Vec<LineMask> {
+        let mut masks: Vec<LineMask> = Vec::new();
+        let mut open_quote = None;
         match self.class {
             FileClass::SshPrivateKey => {
                 if !line.trim().is_empty() {
@@ -468,20 +556,6 @@ impl LineMasker {
                 }
             }
             FileClass::Dotenv => {
-                if let Some(quote) = open_quote {
-                    // Inside a quoted value: mask the line, and close the quote
-                    // when an unescaped one appears here.
-                    masks.push((0..line.len(), token_bare()));
-                    if let Some(idx) = closing_quote_index(line, quote) {
-                        let after = &line[idx + quote.len_utf8()..];
-                        if after.trim().is_empty() {
-                            open_quote = None;
-                        }
-                    }
-                    self.open_quote = open_quote;
-                    self.pending_flag_value = false;
-                    return merge(masks, line);
-                }
                 if let Some(m) = DOTENV_ASSIGN.find(line) {
                     let end = line.trim_end().len();
                     if end > m.end() {
@@ -501,17 +575,16 @@ impl LineMasker {
             {
                 masks.push((range.clone(), token(line[range].chars().count())));
             }
-            if TRIGGER.is_match(line) {
-                generic_line_masks(line, &mut masks);
+            if TRIGGER.is_match(line)
+                && let Some(quote) = generic_line_masks(line, &mut masks)
+                && !matches!(self.class, FileClass::SshPrivateKey | FileClass::HfToken)
+            {
+                open_quote = Some(quote);
             }
         }
         self.open_quote = open_quote;
         self.pending_flag_value = line.contains("--") && FLAG_AT_END.is_match(line);
-        if masks.is_empty() {
-            masks
-        } else {
-            merge(masks, line)
-        }
+        masks
     }
 
     /// `line` with its secrets replaced; borrowed when nothing was masked.
@@ -542,10 +615,7 @@ impl LineMasker {
 /// which needs the whole masked view; reads mask only the lines they return.
 pub fn mask(class: FileClass, text: &str) -> MaskedView {
     if class == FileClass::Plain && !TRIGGER.is_match(text) {
-        return MaskedView {
-            text: text.to_string(),
-            spans: Vec::new(),
-        };
+        return MaskedView::from_parts(text.to_string(), Vec::new());
     }
     let mut masker = LineMasker::new(class);
     let mut out = String::with_capacity(text.len());
@@ -569,7 +639,7 @@ pub fn mask(class: FileClass, text: &str) -> MaskedView {
         out.push_str(ending);
         offset += raw.len();
     }
-    MaskedView { text: out, spans }
+    MaskedView::from_parts(out, spans)
 }
 
 #[cfg(test)]
@@ -732,8 +802,39 @@ mod tests {
             // an underscore prefix, and numbers that only look like values
             (Plain, "if PASSWORD == 3\n", "if PASSWORD == 3\n"),
             (Plain, "  HF_TOKEN: keep-me\n", "  HF_TOKEN: ⟦redacted:7⟧\n"),
-            (Plain, "URL_KEY:8080/path\n", "URL_KEY:8080/path\n"),
-            (Plain, "PASSWORD:abc\n", "PASSWORD:abc\n"),
+            // over-masking is the accepted direction: `NAME:value` is an assignment
+            (
+                Plain,
+                "URL_KEY:8080/path\n",
+                "URL_KEY:\u{27E6}redacted:9\u{27E7}\n",
+            ),
+            (
+                Plain,
+                "PASSWORD:abc\n",
+                "PASSWORD:\u{27E6}redacted:3\u{27E7}\n",
+            ),
+            (
+                Plain,
+                "HF_TOKEN:hunter2\n",
+                "HF_TOKEN:\u{27E6}redacted:7\u{27E7}\n",
+            ),
+            // a quoted value that spans lines masks every line of it, in any class,
+            // and text after the closing quote is scanned normally again
+            (
+                Plain,
+                "X_TOKEN=\"first\nsecond\nthird\" tail\nafter\n",
+                "X_TOKEN=\u{27E6}redacted:6\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7} tail\nafter\n",
+            ),
+            (
+                Plain,
+                "X_KEY: 'a\nb'\nY_KEY=z\n",
+                "X_KEY: \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\nY_KEY=\u{27E6}redacted:1\u{27E7}\n",
+            ),
+            (
+                Plain,
+                "--token \"a\nb\"\nplain\n",
+                "--token \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\nplain\n",
+            ),
             (
                 Plain,
                 "DESCRIPTION: \"X_KEY: keep\"\n",
@@ -803,7 +904,11 @@ mod tests {
             (Plain, "if X_KEY == 3\n", "if X_KEY == 3\n"),
             (Plain, "X_KEY==3\n", "X_KEY==3\n"),
             (Plain, "URL_KEY::path\n", "URL_KEY::path\n"),
-            (Plain, "X_KEY:nospace\n", "X_KEY:nospace\n"),
+            (
+                Plain,
+                "X_KEY:nospace\n",
+                "X_KEY:\u{27E6}redacted:7\u{27E7}\n",
+            ),
             (
                 Plain,
                 "sk-ant-api03-abcdefghijklmnop\n",
@@ -1060,6 +1165,52 @@ mod tests {
             out.push_str(block);
         }
         out
+    }
+
+    /// One crafted line of many overlapping candidates must not cost more than
+    /// a linear scan (each candidate's value used to be rescanned to the end).
+    #[test]
+    fn adversarial_lines_are_masked_in_linear_time() {
+        use std::time::{Duration, Instant};
+        let corpora = [
+            "X_KEY=,".repeat(60_000),
+            ",--token=".repeat(50_000),
+            "A_KEY=\"".repeat(40_000),
+            "--password ".repeat(40_000),
+            "X_KEY:".repeat(60_000),
+        ];
+        for text in &corpora {
+            for class in [FileClass::Plain, FileClass::Dotenv] {
+                let started = Instant::now();
+                let view = mask(class, text);
+                std::hint::black_box(&view);
+                let took = started.elapsed();
+                // superlinear behaviour measured minutes here; a linear scan is
+                // milliseconds (seconds is generous for a loaded debug build)
+                assert!(
+                    took < Duration::from_secs(8),
+                    "{class:?} {:?}: {took:?}",
+                    &text[..12]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_masker_carries_an_open_quote_across_lines_for_every_class() {
+        let mut masker = LineMasker::new(FileClass::Plain);
+        assert_eq!(
+            masker.mask_line("K_TOKEN=\"one"),
+            "K_TOKEN=\u{27E6}redacted:4\u{27E7}"
+        );
+        assert!(masker.in_continuation());
+        assert_eq!(masker.mask_line("two"), "\u{27E6}redacted\u{27E7}");
+        assert_eq!(
+            masker.mask_line("three\" ok"),
+            "\u{27E6}redacted\u{27E7} ok"
+        );
+        assert!(!masker.in_continuation());
+        assert_eq!(masker.mask_line("visible"), "visible");
     }
 
     #[test]

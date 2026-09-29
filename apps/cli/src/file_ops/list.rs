@@ -47,7 +47,7 @@ pub struct ListResult {
     pub resolved_path: Option<String>,
 }
 
-pub fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListResult> {
+pub(crate) fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListResult> {
     let depth = args.depth.unwrap_or(1).clamp(1, MAX_DEPTH) as usize;
     let max_entries = args
         .max_entries

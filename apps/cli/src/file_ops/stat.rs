@@ -71,7 +71,7 @@ pub(crate) fn owner_name(uid: u32) -> String {
     }
 }
 
-pub fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResult<StatResult> {
+pub(crate) fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResult<StatResult> {
     if args.paths.is_empty() || args.paths.len() > MAX_STAT_PATHS {
         return Err(FileError::invalid(format!(
             "paths must hold 1 to {MAX_STAT_PATHS} entries"
