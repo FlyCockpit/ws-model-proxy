@@ -5585,9 +5585,14 @@ async function relayPool({
         async () => undefined,
       );
       if (overflow.kind === "response") return overflow.response;
+      // A cancel or a lost access (#76) observed by the external phase, or a
+      // client that left meanwhile, is terminal and outranks the lease loss.
+      const leaseLostFailure: ModelApiFailure = request.signal.aborted
+        ? "cancelled"
+        : (terminalExternalFailure(overflow) ?? "capacity_lease_lost");
       await operation.dispose?.();
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "capacity_lease_lost" });
-      return operationFailureResponse(operation, "capacity_lease_lost");
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: leaseLostFailure });
+      return operationFailureResponse(operation, leaseLostFailure);
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
       // (a) Local wait expired (member/pool budget, or externalAfterWaitMs

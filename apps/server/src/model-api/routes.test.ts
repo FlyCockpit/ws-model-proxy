@@ -9285,6 +9285,51 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(0);
   });
 
+  it.each([
+    ["the pool owner becomes inactive", "POOL_OWNER_INACTIVE", false, 404],
+    ["the requester becomes blocked", "REQUESTER_ACCESS_BLOCKED", false, 401],
+    ["the client cancels", "PROVIDER_UNAVAILABLE", true, 499],
+  ] as const)(
+    "C7-1: after every local lease is lost, %s beats capacity_lease_lost",
+    async (_label, reason, abortClient, expectedStatus) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      const controller = new AbortController();
+      publicOverflow.dispatch.mockImplementationOnce(async () => {
+        if (abortClient) controller.abort(new Error("client disconnected"));
+        return { dispatched: false as const, reason };
+      });
+      const { runtime } = controllableCapacityRuntime(
+        (candidate) => candidate.poolMemberId === "local-primary",
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const response = await appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+        signal: controller.signal,
+      });
+
+      expect(response.status).toBe(expectedStatus);
+      expect(manager.sent).toHaveLength(0);
+    },
+  );
+
   it("F2-CAP-3: a client abort is not a lease loss even when the hand-off refuses", async () => {
     const setup = setupLocalLeaseRoute("direct");
     const { runtime, controllers } = controllableCapacityRuntime(() => false);
