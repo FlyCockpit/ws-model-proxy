@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
@@ -2721,11 +2722,13 @@ describe("OpenRouter owner-paid settlement", () => {
     providerType: string,
     upstream: Buffer[],
     requester: "owner" | "grantee" = "owner",
+    surface: "openai-chat" | "openai-responses" | "anthropic-messages" = "openai-chat",
   ) {
+    const protocol = surface === "anthropic-messages" ? "anthropic" : "openai";
     reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
     providerHttpsRequest.mockReset();
     db.modelPool.findFirst.mockResolvedValue({
-      ...dispatchPoolFixture("openai", "openai-chat", providerType),
+      ...dispatchPoolFixture(protocol, surface, providerType),
       fallbackForGrantees: requester === "grantee",
     });
     if (requester === "grantee") {
@@ -2767,11 +2770,16 @@ describe("OpenRouter owner-paid settlement", () => {
       requestId: `request-openrouter-${providerType}`,
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
       ...ownerConsentFields(requester),
-      requestedProtocol: "openai",
-      requestedSurface: "openai-chat",
+      requestedProtocol: protocol,
+      requestedSurface: surface,
       stream: true,
       requiredFeatures: [],
-      path: "/v1/chat/completions",
+      path:
+        surface === "anthropic-messages"
+          ? "/v1/messages"
+          : surface === "openai-responses"
+            ? "/v1/responses"
+            : "/v1/chat/completions",
       headers: new Headers({ "content-type": "application/json" }),
       body: new TextEncoder().encode('{"model":"pool","stream":true}'),
       signal: new AbortController().signal,
@@ -2832,6 +2840,32 @@ describe("OpenRouter owner-paid settlement", () => {
     } finally {
       resetConsentState();
     }
+  });
+
+  // Live captures: the dispatcher's whole-stream collector is keyed by the
+  // upstream surface (Messages: message_delta; Responses: response.completed).
+  it.each([
+    ["messages-stream-write", "anthropic-messages", "0.0096115"],
+    ["responses-stream", "openai-responses", "0.00008"],
+    ["chat-stream-write", "openai-chat", "0.0096115"],
+  ] as const)("settles the live %s capture through the dispatcher", async (name, surface, cost) => {
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [readFileSync(new URL(`./fixtures/openrouter-live/${name}.raw`, import.meta.url))],
+      "owner",
+      surface,
+    );
+    expect(settled).toMatchObject({
+      userId: "owner",
+      poolId: "pool",
+      usage: { categoriesComplete: true },
+    });
+    expect(settled.usage.reportedCost?.toString()).toBe(cost);
+    // OpenRouter's Responses stream sends no `event:` lines, so the native
+    // Responses terminal is not recognised and the observation stays
+    // incomplete (liability). OpenRouter accounts claim only Chat Completions,
+    // so Responses clients reach OpenRouter adapted to Chat.
+    expect(settled.observationComplete).toBe(surface !== "openai-responses");
   });
 
   it.each([

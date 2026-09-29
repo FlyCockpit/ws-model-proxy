@@ -1192,6 +1192,9 @@ const OPENROUTER_COST_DETAIL_KEYS = new Set([
   "upstream_inference_cost",
   "upstream_inference_prompt_cost",
   "upstream_inference_completions_cost",
+  // Responses API spelling (live capture, 2026-09-29).
+  "upstream_inference_input_cost",
+  "upstream_inference_output_cost",
   "server_tool_cost",
 ]);
 /**
@@ -1370,12 +1373,10 @@ export function usageFromObject(
   // OpenRouter always emits `video_tokens` / `image_tokens` breakdowns. They
   // have no priced category here, so only an explicit zero is accepted; a
   // positive count keeps the observation incomplete (fail closed).
-  // `cache_write_tokens` is documented as a subset of `prompt_tokens`, but #62
-  // requires that subset to be verified against a live response before it is
-  // settled; until a redacted capture confirms it, a positive count is an
-  // unknown category too (fail closed for that field only).
+  // `cache_write_tokens` is a subset of `prompt_tokens` (verified by a live
+  // capture, 2026-09-29: prompt 7671 = 9 uncached + 7662 cache writes) and is
+  // settled as cache-write tokens.
   const openRouterZeroOnlyDetails = [
-    [promptDetails, "cache_write_tokens"],
     [promptDetails, "video_tokens"],
     [completionDetails, "image_tokens"],
   ] as const;
@@ -1504,10 +1505,10 @@ export function parseProviderUsage(
   chunks: readonly Uint8Array[],
   pricing?: ProviderPricingSchedule,
   dialect: ProviderUsageDialect = "generic",
+  surface: ProtocolSurface = "openai-chat",
 ) {
   if (chunks.length === 0) return undefined;
-  if (dialect === "openrouter")
-    return openRouterUsageFromRecords(...openRouterRecords(chunks), pricing);
+  if (dialect === "openrouter") return openRouterRecords(chunks, surface).settle(pricing);
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   const candidates = [text];
   // SSE observations are decoded in wire order below. Tail extraction is for
@@ -1697,35 +1698,97 @@ export function retainProviderUsagePrefix(
 }
 
 /**
- * Identity of the usage an OpenRouter response record carries: every usage
- * container of the root (`usage`, `response`, `message`), or undefined when it
- * carries none. `usage: null` is absence: Chat streams send it in every
- * intermediate chunk.
+ * How one OpenRouter response record relates to usage, per response surface
+ * (design: orchestration design-openrouter-usage.md):
+ * - `final`: the record whose usage is the response's authoritative total
+ *   (Chat: a root `usage`; Messages: the non-stream `message` body or the
+ *   `message_delta` event; Responses: the non-stream `response` body or the
+ *   terminal `response.completed` / `.incomplete` / `.failed` event);
+ * - `superseded`: Messages `message_start` usage, a partial snapshot that the
+ *   final `message_delta` replaces;
+ * - `ambiguous`: usage anywhere else, or in two containers of one record;
+ * - undefined: no usage (null usage is absence).
  */
-export function openRouterUsageEnvelope(value: unknown): string | undefined {
+type OpenRouterRecordUsage =
+  | { kind: "final"; usage: unknown }
+  | { kind: "superseded" }
+  | { kind: "ambiguous" };
+
+const RESPONSES_TERMINAL_EVENTS = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
+function openRouterRecordUsage(
+  surface: ProtocolSurface,
+  value: unknown,
+): OpenRouterRecordUsage | undefined {
   const root = usageRecord(value);
   if (!root) return undefined;
-  const containers = [root.usage ?? null, root.response ?? null, root.message ?? null];
-  return containers.some((item) => item !== null) ? JSON.stringify(containers) : undefined;
+  const rootUsage = root.usage ?? null;
+  if (surface === "openai-chat") {
+    // Chat carries usage only in a root `usage` object; any other root
+    // container (even without usage) is a second representation.
+    const present = [rootUsage, root.response ?? null, root.message ?? null].filter(
+      (item) => item !== null,
+    ).length;
+    if (present === 0) return undefined;
+    if (present > 1 || usageRecord(rootUsage)?.usage != null) return { kind: "ambiguous" };
+    return { kind: "final", usage: rootUsage };
+  }
+  const responseUsage = usageRecord(root.response)?.usage ?? null;
+  const messageUsage = usageRecord(root.message)?.usage ?? null;
+  const carriers = [rootUsage, responseUsage, messageUsage].filter((item) => item !== null);
+  if (carriers.length === 0) return undefined;
+  if (carriers.length > 1) return { kind: "ambiguous" };
+  const type = typeof root.type === "string" ? root.type : undefined;
+  if (surface === "anthropic-messages") {
+    if (type === "message_start" && messageUsage !== null) return { kind: "superseded" };
+    if ((type === "message_delta" || type === "message") && rootUsage !== null)
+      return { kind: "final", usage: rootUsage };
+    return { kind: "ambiguous" };
+  }
+  if (surface === "openai-responses") {
+    if (type !== undefined && RESPONSES_TERMINAL_EVENTS.has(type) && responseUsage !== null)
+      return { kind: "final", usage: responseUsage };
+    if (type === undefined && root.object === "response" && rootUsage !== null)
+      return { kind: "final", usage: rootUsage };
+    return { kind: "ambiguous" };
+  }
+  return { kind: "ambiguous" };
 }
 
 /**
- * Collects the distinct usage-bearing records of one OpenRouter response.
- * Two distinct records already make the response unattributable, so at most
- * two are kept (bounded memory over an arbitrarily long stream).
+ * Collects the usage of one OpenRouter response record by record (bounded
+ * memory over an arbitrarily long stream) and decides, in `settle`, the ONE
+ * place OpenRouter usage becomes settleable: exactly one distinct final usage,
+ * at most one superseded snapshot, nothing ambiguous, every record readable,
+ * and the dialect accepts that usage as complete. Anything else is evidence
+ * only (the admitted liability stays); no usage at all is missing usage.
  */
 export class OpenRouterUsageRecords {
-  readonly #records = new Map<string, unknown>();
+  readonly #surface: ProtocolSurface;
+  readonly #finals = new Map<string, unknown>();
+  #superseded = 0;
+  #ambiguous = false;
   #readable = true;
 
+  constructor(surface: ProtocolSurface) {
+    this.#surface = surface;
+  }
+
   observe(value: unknown) {
-    if (this.#records.size > 1) return;
-    const envelope = openRouterUsageEnvelope(value);
-    if (envelope !== undefined && !this.#records.has(envelope)) this.#records.set(envelope, value);
+    const classified = openRouterRecordUsage(this.#surface, value);
+    if (!classified) return;
+    if (classified.kind === "ambiguous") this.#ambiguous = true;
+    else if (classified.kind === "superseded") this.#superseded += 1;
+    else if (this.#finals.size < 2)
+      this.#finals.set(JSON.stringify(classified.usage), classified.usage);
   }
 
   observeData(data: string) {
-    if (this.#records.size > 1 || data === "[DONE]") return;
+    if (data === "[DONE]") return;
     try {
       this.observe(JSON.parse(data));
     } catch {
@@ -1736,13 +1799,33 @@ export class OpenRouterUsageRecords {
     }
   }
 
-  get records(): readonly unknown[] {
-    return [...this.#records.values()];
+  /** Marks the response as not fully decoded (a record may be missing). */
+  markUnreadable() {
+    this.#readable = false;
   }
 
-  /** False once a `data:` record was not JSON (a record may be missing). */
-  get readable(): boolean {
-    return this.#readable;
+  settle(pricing?: ProviderPricingSchedule): RawProviderUsage | undefined {
+    const finals = [...this.#finals.values()];
+    if (finals.length === 0 && this.#superseded === 0 && !this.#ambiguous) return undefined;
+    const normalize = (usage: unknown) =>
+      this.#surface === "anthropic-messages"
+        ? openRouterAnthropicUsage(usage)
+        : usageFromObject({ usage }, "openrouter");
+    const only =
+      finals.length === 1 && this.#superseded <= 1 && !this.#ambiguous && this.#readable
+        ? normalize(finals[0])
+        : undefined;
+    const charged =
+      only?.categoriesComplete === true ? openRouterCharge(finals[0], only) : undefined;
+    if (charged) return withCalculatedCost(charged, pricing);
+    const evidence = finals.length > 0 ? normalize(finals.at(-1)) : undefined;
+    const rawUsage = finals.map(
+      (usage) => JSON.parse(JSON.stringify(usage)) as Prisma.InputJsonValue,
+    );
+    return unattributableUsage({
+      ...(evidence ?? { accountingVersion: "provider-billable-v1", confidence: "REPORTED" }),
+      rawUsage: rawUsage.length === 1 ? rawUsage[0] : rawUsage,
+    });
   }
 }
 
@@ -1753,11 +1836,11 @@ export class OpenRouterUsageRecords {
  */
 function openRouterRecords(
   chunks: readonly Uint8Array[],
-): [records: readonly unknown[], readable: boolean] {
-  const collected = new OpenRouterUsageRecords();
+  surface: ProtocolSurface,
+): OpenRouterUsageRecords {
+  const collected = new OpenRouterUsageRecords(surface);
   const decoder = new SseDecoder();
   let sawRecord = false;
-  let readable = true;
   try {
     for (const chunk of chunks)
       for (const record of decoder.push(chunk)) {
@@ -1771,9 +1854,9 @@ function openRouterRecords(
   } catch {
     // Not SSE: read the whole body as JSON below. A stream that stops being
     // valid SSE after some records may hide a later record: unreadable.
-    readable = !sawRecord;
+    if (sawRecord) collected.markUnreadable();
   }
-  if (sawRecord) return [collected.records, readable && collected.readable];
+  if (sawRecord) return collected;
   try {
     collected.observe(
       JSON.parse(new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))))),
@@ -1781,37 +1864,115 @@ function openRouterRecords(
   } catch {
     // A truncated or non-JSON body carries no attributable usage.
   }
-  return [collected.records, true];
+  return collected;
+}
+
+const OPENROUTER_ANTHROPIC_USAGE_KEYS = new Set([
+  "input_tokens",
+  "output_tokens",
+  "output_tokens_details",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+  "cache_creation",
+  "inference_geo",
+  "server_tool_use",
+  "service_tier",
+  "speed",
+  "cost",
+  "is_byok",
+  "cost_details",
+]);
+
+/**
+ * OpenRouter's Anthropic Messages usage (Anthropic semantics: `input_tokens`
+ * excludes cache reads and writes; `output_tokens` includes thinking). Only
+ * the captured vocabulary is accepted; anything else is an unknown category.
+ */
+function openRouterAnthropicUsage(value: unknown): RawProviderUsage | undefined {
+  const usage = usageRecord(value);
+  if (!usage) return undefined;
+  const input = usageInteger(usage.input_tokens);
+  const output = usageInteger(usage.output_tokens);
+  const cacheRead = usageInteger(usage.cache_read_input_tokens ?? 0);
+  const cacheWrite = usageInteger(usage.cache_creation_input_tokens ?? 0);
+  const outputDetails =
+    usage.output_tokens_details == null ? {} : usageRecord(usage.output_tokens_details);
+  const thinking = usageInteger(outputDetails?.thinking_tokens ?? 0);
+  const creation = usage.cache_creation == null ? undefined : usageRecord(usage.cache_creation);
+  const fiveMinute = usageInteger(creation?.ephemeral_5m_input_tokens ?? 0);
+  const oneHour = usageInteger(creation?.ephemeral_1h_input_tokens ?? 0);
+  const optionalString = (item: unknown) => item == null || typeof item === "string";
+  const valid =
+    Object.keys(usage).every((key) => OPENROUTER_ANTHROPIC_USAGE_KEYS.has(key)) &&
+    input !== undefined &&
+    output !== undefined &&
+    cacheRead !== undefined &&
+    cacheWrite !== undefined &&
+    outputDetails !== undefined &&
+    Object.keys(outputDetails).every((key) => key === "thinking_tokens") &&
+    thinking !== undefined &&
+    thinking <= output &&
+    (usage.cache_creation == null ||
+      (creation !== undefined &&
+        Object.keys(creation).every(
+          (key) => key === "ephemeral_5m_input_tokens" || key === "ephemeral_1h_input_tokens",
+        ) &&
+        fiveMinute !== undefined &&
+        oneHour !== undefined &&
+        fiveMinute + oneHour === cacheWrite &&
+        // One-hour cache writes have their own rate: not a settled category.
+        oneHour === 0n)) &&
+    optionalString(usage.inference_geo) &&
+    optionalString(usage.service_tier) &&
+    optionalString(usage.speed) &&
+    openRouterMetadataValid(usage);
+  const reportedCost = usageCost(usage.cost);
+  return {
+    inputTokens: input,
+    outputTokens: output !== undefined && thinking !== undefined ? output - thinking : undefined,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    reasoningTokens: thinking,
+    categoriesComplete: valid,
+    rawUsage: JSON.parse(JSON.stringify(usage)),
+    reportedCost,
+    reportedCostSource: reportedCost === undefined ? undefined : "provider-runtime",
+    accountingVersion: "provider-billable-v1",
+    confidence: "REPORTED",
+  };
 }
 
 /**
- * The ONE place OpenRouter usage becomes settleable (design:
- * orchestration design-openrouter-usage.md). Input is every usage-bearing
- * record of the response (`readable: false` when some of it could not be
- * decoded, so a record may be missing). Exactly one distinct record that the dialect
- * accepts as complete settles; several records, or one it does not accept,
- * are evidence only (the admitted liability stays); none is missing usage.
+ * The spend an accepted OpenRouter usage settles. OpenRouter documents `cost`
+ * as "the total amount charged to your account" and
+ * `cost_details.upstream_inference_cost` as "the actual cost charged by the
+ * upstream AI provider" (openrouter.ai/docs/use-cases/usage-accounting,
+ * ResponseUsage in openrouter.ai/docs/api-reference/overview). With BYOK
+ * (`is_byok: true`) the upstream provider bills the key owner directly, so the
+ * spend is their sum (owner decision, #62/#87). A BYOK usage without a valid
+ * upstream cost is unattributable (undefined).
  */
-export function openRouterUsageFromRecords(
-  records: readonly unknown[],
-  readable: boolean,
-  pricing?: ProviderPricingSchedule,
+function openRouterCharge(
+  usage: unknown,
+  normalized: RawProviderUsage,
 ): RawProviderUsage | undefined {
-  if (records.length === 0) return undefined;
-  const observed = records.map((record) => usageFromObject(record, "openrouter"));
-  const only = records.length === 1 && readable ? observed[0] : undefined;
-  if (only?.categoriesComplete === true) return withCalculatedCost(only, pricing);
-  const evidence = observed.at(-1);
-  const rawUsage = records.map((record) => {
-    const root = usageRecord(record);
-    return JSON.parse(
-      JSON.stringify([root?.usage ?? null, root?.response ?? null, root?.message ?? null]),
-    ) as Prisma.InputJsonValue;
-  });
-  return unattributableUsage({
-    ...(evidence ?? { accountingVersion: "provider-billable-v1", confidence: "REPORTED" }),
-    rawUsage: rawUsage.length === 1 ? rawUsage[0] : rawUsage,
-  });
+  const record = usageRecord(usage);
+  if (record?.is_byok !== true) return normalized;
+  const cost = usageCost(record.cost);
+  const details = usageRecord(record.cost_details);
+  const upstream = details?.upstream_inference_cost;
+  if (
+    cost === undefined ||
+    typeof upstream !== "number" ||
+    !Number.isFinite(upstream) ||
+    upstream < 0
+  )
+    return undefined;
+  return {
+    ...normalized,
+    reportedCost: new Prisma.Decimal(cost).plus(upstream).toString(),
+    reportedCostSource: "provider-runtime",
+  };
 }
 
 /** Drops a window's calculated cost; only the merged categories may be priced. */
@@ -1947,6 +2108,7 @@ async function readRetryableProviderUsage(
   response: AsyncIterable<Uint8Array> & { complete: boolean; destroy(error?: Error): void },
   pricing?: ProviderPricingSchedule,
   dialect: ProviderUsageDialect = "generic",
+  surface: ProtocolSurface = "openai-chat",
 ): Promise<RawProviderUsage | undefined> {
   const chunks: Uint8Array[] = [];
   let retainedBytes = 0;
@@ -1978,7 +2140,7 @@ async function readRetryableProviderUsage(
   } catch {
     return undefined;
   }
-  const usage = parseProviderUsage(chunks, pricing, dialect);
+  const usage = parseProviderUsage(chunks, pricing, dialect, surface);
   return usage ? { ...usage, observationComplete: true } : undefined;
 }
 
@@ -2801,7 +2963,12 @@ export async function dispatchPublicOverflow(
         // Failed/rate-limited calls may still be billed. Consume only a strict
         // bounded body before retry, retaining raw usage/cost when present;
         // ambiguous, truncated, or oversized bodies keep conservative liability.
-        const retryUsage = await readRetryableProviderUsage(response, pricing, target.usageDialect);
+        const retryUsage = await readRetryableProviderUsage(
+          response,
+          pricing,
+          target.usageDialect,
+          nativeSurface,
+        );
         const retryAfter = response.headers["retry-after"];
         providerFailure = {
           target,
@@ -2896,10 +3063,10 @@ export async function dispatchPublicOverflow(
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
       // OpenRouter usage settles only from the records the whole stream
       // carried (not the retained prefix and tail windows): see
-      // `openRouterUsageFromRecords`.
+      // `OpenRouterUsageRecords.settle`.
       const openRouterStreamRecords =
         terminalDecoder && target.usageDialect === "openrouter"
-          ? new OpenRouterUsageRecords()
+          ? new OpenRouterUsageRecords(nativeSurface ?? request.requestedSurface)
           : undefined;
       const reconcile = (streamComplete: boolean): Promise<void> => {
         if (reconciliation) return reconciliation;
@@ -2960,16 +3127,12 @@ export async function dispatchPublicOverflow(
             }).catch(() => false);
           }
           const combinedUsage = openRouterStreamRecords
-            ? openRouterUsageFromRecords(
-                openRouterStreamRecords.records,
-                openRouterStreamRecords.readable,
-                pricing,
-              )
+            ? openRouterStreamRecords.settle(pricing)
             : target.usageDialect === "openrouter" && !request.stream
               ? // The whole body is the one record; an overflowing body has none.
                 nonstreamOverflow
                 ? undefined
-                : parseProviderUsage(nonstreamChunks, pricing, "openrouter")
+                : parseProviderUsage(nonstreamChunks, pricing, "openrouter", surface)
               : mergeProviderUsage(
                   responseBytes > 1024 * 1024
                     ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)

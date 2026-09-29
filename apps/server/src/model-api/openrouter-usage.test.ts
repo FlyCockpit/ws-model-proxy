@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 vi.hoisted(() => {
@@ -68,9 +69,11 @@ describe("OpenRouter usage dialect", () => {
   it.each([
     ["non-stream", nonStreamBody],
     ["stream", streamBody],
-  ])("normalizes the %s fixture into complete, priced categories", (_label, body) => {
+  ])("normalizes the %s fixture into complete, priced categories", (label, body) => {
     const pricing = catalogPricing(fullRates);
     const usage = parseProviderUsage(body(), pricing, "openrouter");
+    // The stream fixture is BYOK: spend is cost + upstream_inference_cost.
+    expect(usage?.reportedCost?.toString()).toBe(label === "stream" ? "0.004" : "0.0021");
     expect(usage).toMatchObject({
       inputTokens: 600n,
       outputTokens: 50n,
@@ -79,7 +82,6 @@ describe("OpenRouter usage dialect", () => {
       reasoningTokens: 30n,
       additionalBillableTokens: 0n,
       reportedTotalTokens: 1280n,
-      reportedCost: 0.0021,
       categoriesComplete: true,
     });
     expect(providerBillableTokens(usage!)).toBe(1280n);
@@ -87,17 +89,303 @@ describe("OpenRouter usage dialect", () => {
     expect(usage?.calculatedCost?.toString()).toBe("0.00098");
   });
 
-  it("keeps positive cache writes unknown until a live capture verifies the subset (#62)", () => {
-    const payload = structuredClone(openRouterFixture.nonStream);
-    payload.usage.prompt_tokens_details.cache_write_tokens = 400;
-    const usage = parseProviderUsage(
-      [encode(JSON.stringify(payload))],
-      catalogPricing(fullRates),
-      "openrouter",
+  describe("live captures (anthropic/claude-haiku-4.5 via Amazon Bedrock, 2026-09-29)", () => {
+    const live = (name: string) =>
+      readFileSync(new URL(`./fixtures/openrouter-live/${name}.raw`, import.meta.url));
+    // Claude Haiku 4.5 rates per million, as a catalog import writes them.
+    const haiku = () =>
+      catalogPricing({
+        input: "1",
+        output: "5",
+        cacheRead: "0.1",
+        cacheWrite: "1.25",
+        reasoning: "5",
+      });
+    const write = { cacheReadTokens: 0n, cacheWriteTokens: 7662n, cost: "0.0096115" };
+    const read = { cacheReadTokens: 7662n, cacheWriteTokens: 0n, cost: "0.0008002" };
+    it.each([
+      ["chat-nonstream-write", "openai-chat", 9n, 5n, write],
+      ["chat-stream-write", "openai-chat", 9n, 5n, write],
+      ["chat-nonstream-read", "openai-chat", 9n, 5n, read],
+      ["chat-stream-read", "openai-chat", 9n, 5n, read],
+      ["messages-nonstream-write", "anthropic-messages", 9n, 5n, write],
+      ["messages-stream-write", "anthropic-messages", 9n, 5n, write],
+      ["messages-nonstream-read", "anthropic-messages", 9n, 5n, read],
+      ["messages-stream-read", "anthropic-messages", 9n, 5n, read],
+      [
+        "responses-nonstream",
+        "openai-responses",
+        10n,
+        16n,
+        { cacheReadTokens: 0n, cacheWriteTokens: 0n, cost: "0.00009" },
+      ],
+      [
+        "responses-stream",
+        "openai-responses",
+        10n,
+        14n,
+        { cacheReadTokens: 0n, cacheWriteTokens: 0n, cost: "0.00008" },
+      ],
+    ] as const)(
+      "settles %s (%s) at its real tokens and cost",
+      (name, surface, input, output, cache) => {
+        const usage = parseProviderUsage([live(name)], haiku(), "openrouter", surface);
+        expect(usage).toMatchObject({
+          categoriesComplete: true,
+          inputTokens: input,
+          outputTokens: output,
+          cacheReadTokens: cache.cacheReadTokens,
+          cacheWriteTokens: cache.cacheWriteTokens,
+        });
+        expect(providerBillableTokens(usage!)).toBe(
+          input + output + cache.cacheReadTokens + cache.cacheWriteTokens,
+        );
+        // OpenRouter's `cost` equals the catalog-rate calculation exactly.
+        expect(usage?.reportedCost?.toString()).toBe(cache.cost);
+        expect(usage?.calculatedCost?.toString()).toBe(cache.cost);
+      },
     );
-    expect(usage?.categoriesComplete).toBe(false);
-    expect(usage?.calculatedCost).toBeUndefined();
-    expect(providerBillableTokens(usage!)).toBeUndefined();
+
+    // Messages / Responses grammar edges, derived from the captured shapes.
+    const recordsOf = (name: string) =>
+      live(name)
+        .toString("utf8")
+        .split("\n")
+        .filter((line) => line.startsWith("data: {"))
+        .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+    const asSse = (records: unknown[]) =>
+      encode(
+        `${records.map((record) => `data: ${JSON.stringify(record)}`).join("\n\n")}\n\ndata: [DONE]\n\n`,
+      );
+    const withDeltaUsage = (change: (usage: Record<string, unknown>) => void) => {
+      const records = recordsOf("messages-stream-write");
+      const delta = records.find((record) => record.type === "message_delta")!;
+      change(delta.usage as Record<string, unknown>);
+      return records;
+    };
+    it.each<[string, () => unknown[]]>([
+      [
+        "one-hour cache writes",
+        () =>
+          withDeltaUsage((usage) => {
+            usage.cache_creation = {
+              ephemeral_5m_input_tokens: 0,
+              ephemeral_1h_input_tokens: 7662,
+            };
+          }),
+      ],
+      [
+        "a cache_creation split that does not add up",
+        () =>
+          withDeltaUsage((usage) => {
+            usage.cache_creation = { ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 0 };
+          }),
+      ],
+      [
+        "an unknown usage key",
+        () => withDeltaUsage((usage) => Object.assign(usage, { future_tokens: 1 })),
+      ],
+      [
+        "thinking above output",
+        () =>
+          withDeltaUsage((usage) =>
+            Object.assign(usage, { output_tokens_details: { thinking_tokens: 6 } }),
+          ),
+      ],
+      [
+        "a delta without input counts",
+        () =>
+          withDeltaUsage((usage) => {
+            delete usage.input_tokens;
+          }),
+      ],
+      [
+        "two different message_delta usages",
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const delta = records.find((record) => record.type === "message_delta")!;
+          const second = structuredClone(delta);
+          (second.usage as Record<string, unknown>).output_tokens = 1;
+          return [...records.slice(0, -1), second, records.at(-1)];
+        },
+      ],
+      [
+        "two message_start snapshots",
+        () => {
+          const records = recordsOf("messages-stream-write");
+          return [records[0], ...records];
+        },
+      ],
+      [
+        "usage on a content event",
+        () => {
+          const records = recordsOf("messages-stream-write");
+          return [
+            records[0],
+            { type: "content_block_delta", usage: { output_tokens: 1 } },
+            ...records.slice(1),
+          ];
+        },
+      ],
+    ])("keeps a Messages stream with %s as evidence", (_label, build) => {
+      const usage = parseProviderUsage(
+        [asSse(build())],
+        haiku(),
+        "openrouter",
+        "anthropic-messages",
+      );
+      expect(usage?.categoriesComplete).toBe(false);
+      expect(usage?.reportedCost).toBeUndefined();
+      expect(usage?.calculatedCost).toBeUndefined();
+    });
+
+    it.each<[string, (records: Record<string, unknown>[]) => unknown[]]>([
+      [
+        "usage on a non-terminal response event",
+        (records) => {
+          const created = structuredClone(records[0]!);
+          (created.response as Record<string, unknown>).usage = {
+            input_tokens: 1,
+            output_tokens: 1,
+          };
+          return [created, ...records.slice(1)];
+        },
+      ],
+      [
+        "the only usage on a non-terminal event",
+        (records) => {
+          const completed = structuredClone(records.at(-1)!);
+          const inProgress = structuredClone(records[1]!);
+          (inProgress.response as Record<string, unknown>).usage = (
+            completed.response as Record<string, unknown>
+          ).usage;
+          (completed.response as Record<string, unknown>).usage = null;
+          return [records[0], inProgress, ...records.slice(2, -1), completed];
+        },
+      ],
+      [
+        "a root usage on an event",
+        (records) => [{ type: "response.output_text.delta", usage: {} }, ...records],
+      ],
+      [
+        "two different terminal usages",
+        (records) => {
+          const completed = records.at(-1)!;
+          const second = structuredClone(completed);
+          (
+            (second.response as Record<string, unknown>).usage as Record<string, unknown>
+          ).output_tokens = 1;
+          return [...records, second];
+        },
+      ],
+    ])("keeps a Responses stream with %s as evidence", (_label, build) => {
+      const usage = parseProviderUsage(
+        [asSse(build(recordsOf("responses-stream")))],
+        haiku(),
+        "openrouter",
+        "openai-responses",
+      );
+      expect(usage?.categoriesComplete).toBe(false);
+      expect(usage?.reportedCost).toBeUndefined();
+    });
+
+    it("keeps a stream on the wrong surface as evidence", () => {
+      for (const [name, surface] of [
+        ["messages-stream-write", "openai-chat"],
+        ["responses-stream", "anthropic-messages"],
+        ["chat-stream-write", "openai-responses"],
+      ] as const) {
+        const usage = parseProviderUsage([live(name)], haiku(), "openrouter", surface);
+        expect(usage?.categoriesComplete).toBe(false);
+        expect(usage?.reportedCost).toBeUndefined();
+      }
+    });
+
+    // Owner decision (#87): BYOK spend is cost + cost_details.upstream_inference_cost.
+    const byok = (name: string, change: (usage: Record<string, unknown>) => void) => {
+      // Flip the final (cost-bearing) usage of each record to BYOK.
+      const edit = (record: Record<string, unknown>) => {
+        for (const holder of [record, record.response as Record<string, unknown> | undefined]) {
+          const usage = holder?.usage as Record<string, unknown> | null | undefined;
+          if (usage && "cost" in usage) {
+            usage.is_byok = true;
+            change(usage);
+          }
+        }
+        return record;
+      };
+      const text = live(name).toString("utf8");
+      const edited = text.trimStart().startsWith("{")
+        ? JSON.stringify(edit(JSON.parse(text)))
+        : text
+            .split("\n")
+            .map((line) =>
+              line.startsWith("data: {")
+                ? `data: ${JSON.stringify(edit(JSON.parse(line.slice(6))))}`
+                : line,
+            )
+            .join("\n");
+      return encode(edited);
+    };
+    it.each([
+      ["chat-nonstream-write", "openai-chat", "0.019223"],
+      ["chat-stream-write", "openai-chat", "0.019223"],
+      ["messages-stream-write", "anthropic-messages", "0.019223"],
+      ["responses-stream", "openai-responses", "0.00016"],
+    ] as const)("settles BYOK %s at cost + upstream cost", (name, surface, spend) => {
+      const usage = parseProviderUsage(
+        [byok(name, () => undefined)],
+        haiku(),
+        "openrouter",
+        surface,
+      );
+      expect(usage?.categoriesComplete).toBe(true);
+      expect(usage?.reportedCost?.toString()).toBe(spend);
+    });
+    it.each<[string, (usage: Record<string, unknown>) => void]>([
+      [
+        "a missing upstream cost",
+        (usage) => {
+          usage.cost_details = { upstream_inference_prompt_cost: 0.001 };
+        },
+      ],
+      [
+        "a null upstream cost",
+        (usage) => Object.assign(usage.cost_details as object, { upstream_inference_cost: null }),
+      ],
+      [
+        "a string upstream cost",
+        (usage) => Object.assign(usage.cost_details as object, { upstream_inference_cost: "0.1" }),
+      ],
+      [
+        "a negative upstream cost",
+        (usage) => Object.assign(usage.cost_details as object, { upstream_inference_cost: -1 }),
+      ],
+      [
+        "no cost_details",
+        (usage) => {
+          delete usage.cost_details;
+        },
+      ],
+      ["a malformed cost_details", (usage) => Object.assign(usage, { cost_details: [0.1] })],
+      [
+        "no cost",
+        (usage) => {
+          delete usage.cost;
+        },
+      ],
+    ])("keeps a BYOK usage with %s as evidence", (_label, change) => {
+      for (const [name, surface] of [
+        ["chat-stream-write", "openai-chat"],
+        ["messages-stream-write", "anthropic-messages"],
+        ["responses-stream", "openai-responses"],
+      ] as const) {
+        const usage = parseProviderUsage([byok(name, change)], haiku(), "openrouter", surface);
+        expect(usage?.categoriesComplete).toBe(false);
+        expect(usage?.reportedCost).toBeUndefined();
+        expect(usage?.calculatedCost).toBeUndefined();
+      }
+    });
   });
 
   it.each([
@@ -363,12 +651,12 @@ describe("OpenRouter usage dialect", () => {
         "evidence",
       ],
       [
-        "positive cache writes",
+        "cache writes beyond the prompt",
         sse([
           data({
             usage: {
               ...usage(),
-              prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 1 },
+              prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 601 },
             },
           }),
           done,

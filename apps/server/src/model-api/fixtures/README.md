@@ -15,10 +15,16 @@ aligned with the exact protocol properties the tests consume.
 `openrouter-usage.json` is a synthetic OpenRouter usage fixture derived from the
 published `ResponseUsage` type and usage-accounting example recorded in its
 `provenance.sources`. It is not an upstream capture. It carries every key the
-OpenRouter usage dialect accepts (`is_byok`, `cost_details`, `server_tool_use`,
-zero `cache_write_tokens` / `video_tokens` / `image_tokens`) in non-stream and
-stream (`stream` lines joined with blank lines) form. The stream ends with the
-documented usage chunk whose single content-free choice repeats the
-`finish_reason`. Replace it with a redacted live capture when one is available;
-a capture that confirms the `cache_write_tokens` subset of `prompt_tokens` is
-the precondition for settling positive cache-write counts (#62).
+OpenRouter Chat usage dialect accepts (`is_byok`, `cost_details`,
+`server_tool_use`, zero `video_tokens` / `image_tokens`) in non-stream and
+stream (`stream` lines joined with blank lines) form; its stream is BYOK. The
+stream ends with the documented usage chunk whose single content-free choice
+repeats the `finish_reason`.
+
+`openrouter-live/*.raw` are live OpenRouter responses captured on 2026-09-29
+(`anthropic/claude-haiku-4.5`, provider Amazon Bedrock, a ~7.6k-token cached
+system prompt): for Chat Completions and Messages, a cache-write call and a
+cache-read call, each non-stream and stream; for Responses, one non-stream and
+one stream call. They are unmodified response bodies and contain no
+credentials or prompt text beyond the model's short reply. Tests derive BYOK and
+malformed variants from them in memory.

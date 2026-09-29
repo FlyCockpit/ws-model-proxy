@@ -252,24 +252,28 @@ Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
 Audio rates bound both input/output and additional-token accounting.
 Usage from `openrouter` provider accounts is parsed with an OpenRouter-specific
-dialect. `is_byok`, `cost_details` (finite non-negative numbers or null) and
-`server_tool_use` are accepted as metadata only and never add tokens; `cost`
-stays the reported cost. `prompt_tokens_details.cache_write_tokens`,
-`video_tokens` and `image_tokens` are accepted only when zero: the cache-write
-subset of `prompt_tokens` is documented but not yet verified against a live
-response, so a positive cache-write count keeps that response on the
-conservative liability path until a redacted capture confirms it. Two spellings
-of the same count (for example `prompt_tokens_details` and
-`input_tokens_details`), a non-object detail container, and any other
-unrecognized or malformed field also keep that response on the conservative
-liability path. OpenRouter reports usage once, in a root `usage` object, so a
-response settles only when it carries exactly one distinct usage-bearing record
-(an SSE `data:` record anywhere in the stream, or the whole non-stream body) and
-that record is complete. Several different records, a second usage container in
-one record (`usage.usage`, a root `response` or `message`), or a stream that
-stops being valid SSE keep the usage as audit evidence only: no charge and no
-total from it settles below the liability. Usage-looking text outside a record
-(for example in SSE comments or a truncated body) is never read. Other provider types do not accept this
+dialect, checked against live captures (Chat Completions, Messages and Responses,
+2026-09-29). `prompt_tokens_details.cache_write_tokens` (Messages:
+`cache_creation_input_tokens`) is settled as cache-write tokens; on Chat and
+Responses it is a subset of the prompt count, like `cached_tokens`. One-hour
+cache writes (`cache_creation.ephemeral_1h_input_tokens`), positive
+`video_tokens` / `image_tokens`, two spellings of the same count, a non-object
+detail container, and any other unrecognized or malformed field keep the
+response on the conservative liability path. Spend settles from OpenRouter's
+`cost` ("the total amount charged to your account"). With `is_byok: true` the
+upstream provider also bills the key owner, so spend is `cost +
+cost_details.upstream_inference_cost` ("the actual cost charged by the upstream
+AI provider"); a BYOK usage without a valid upstream cost keeps the liability.
+A response settles only from its one authoritative usage record: Chat, the
+root `usage` (final chunk when streaming); Messages, the `message` body or the
+`message_delta` event (the partial `message_start` snapshot is superseded);
+Responses, the `response` body or the terminal `response.completed` event
+(`usage: null` is absence). Several different authoritative usages, usage
+anywhere else, a second usage container in one record, a non-JSON `data:`
+record, or a stream that stops being valid SSE keep the usage as audit evidence
+only: no charge and no total from it settles below the liability. Usage-looking
+text outside a record (for example in SSE comments or a truncated body) is
+never read. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices

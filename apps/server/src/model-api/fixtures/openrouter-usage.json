@@ -9,7 +9,7 @@
     "assertions": [
       "ResponseUsage.total_tokens is documented as the sum of prompt_tokens and completion_tokens.",
       "prompt_tokens_details.cached_tokens is a breakdown of prompt_tokens.",
-      "prompt_tokens_details.cache_write_tokens is documented as a breakdown of prompt_tokens but is not verified against a live response, so the fixture reports zero; positive counts fail closed.",
+      "prompt_tokens_details.cache_write_tokens is a breakdown of prompt_tokens (verified by the live captures in openrouter-live/); this fixture reports zero.",
       "completion_tokens_details.reasoning_tokens is a breakdown of completion_tokens.",
       "is_byok, cost_details and server_tool_use are metadata; cost is the charged credit amount.",
       "The streaming usage chunk carries a non-empty choices array: one choice with a content-free delta that repeats the stream's finish_reason."
