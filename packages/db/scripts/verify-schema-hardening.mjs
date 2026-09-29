@@ -84,19 +84,27 @@ const requiredFragments = [
   "derive_relay_request_resource_owner",
   'BEFORE INSERT OR UPDATE OF "requestedModelPoolId", "resourceOwnerUserId" ON relay_request',
   'WHERE request."resourceOwnerUserId" IS NULL;',
-  'AND NEW."resourceOwnerUserId" IS DISTINCT FROM NEW."userId"',
-  "IF TG_OP = 'UPDATE' AND OLD.status = 'PENDING'\n       AND NEW.\"requestedModelPoolId\" IS NULL",
+  // DL-1 (d): a request whose pool is gone keeps its ids; its selection is
+  // checked against the durable resource owner instead of being erased.
+  'consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId");',
   "enforce_response_stickiness_provider_binding_immutable",
   "activated provider pricing billing fields are immutable",
   "provider pricing lifecycle timestamps are immutable",
   "pricing retirement preserves activation and sets retirement",
   'btrim("accountingVersion")',
   'AND br."pricingVersion" IS NOT DISTINCT FROM NEW."pricingVersion"',
-  "usage_rollup_detach_requester",
-  'DELETE FROM usage_rollup_minute WHERE "requesterUserId" = OLD.id RETURNING *',
-  'DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *',
-  // Sentinel upserts in the application's rollup key order (usage-rollup.ts).
-  'ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",',
+  // DL-1 (d): the requester merge moved out of the user-delete trigger (into
+  // the drain and the deleted-user purge); the trigger is dropped.
+  'DROP TRIGGER IF EXISTS usage_rollup_detach_requester ON "user";',
+  // DL-1 (d) writer-class fences (capacity-lock-order.ts).
+  "SELECT set_config('wsmp.fences', ',*,', true);",
+  "CREATE OR REPLACE FUNCTION wsmp_acquire_fences(",
+  "txid_current_if_assigned() IS NOT NULL",
+  "CREATE OR REPLACE FUNCTION wsmp_graph_row_owners(",
+  "CREATE OR REPLACE FUNCTION enforce_graph_write_fence()",
+  "z_graph_write_fence",
+  "z_graph_update_fence",
+  "capacity_runtime_scheduler_check",
   // DEL-STATE commit point: the session insert reads its owner FOR SHARE (not
   // FOR KEY SHARE, which does not serialize with the deletion mark).
   "CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session",
@@ -204,6 +212,7 @@ for (const fragment of [
   "runtimeIdentityKey",
   "schedulerDeficits",
   "nextFencingToken",
+  "model CapacityRuntime",
   "model AdmissionRequest",
   "model CapacityWaiter",
   "model CapacityLease",
@@ -471,6 +480,9 @@ try {
   });
   await client.connect();
   await client.query(`SET search_path TO ${schema}`);
+  // Fixture connection: the DL-1 graph-write fence triggers accept its writes
+  // (the deploy/fixture marker; writer-classes.postgres suite proves them).
+  await client.query("SET wsmp.fences = ',*,'");
   await client.query(`
     INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug)
     VALUES ('owner-a', NOW(), NOW(), 'A', 'a@example.test', 'owner-a'),
@@ -1077,21 +1089,30 @@ try {
   if (bindingsAfterMemberRemoval.rows[0]?.count !== 2) {
     throw new Error("Re-applied hardening changed v3 bindings after their member was removed");
   }
+  // DL-1 (d): stickiness records are hot-path history without foreign keys,
+  // so deleting a token or revoking a grant leaves the binding row behind as
+  // an orphan (the retention sweep removes it at expiry). It can never be
+  // served again: a follow-up must present the exact token id (ids are never
+  // reused) and the exact live grant (routes.ts resolveStickyRoute).
+  const bindingAnchors = async (id) =>
+    (
+      await client.query(
+        `SELECT record."poolGrantId" AS grant_id,
+                EXISTS (SELECT 1 FROM model_api_token token
+                         WHERE token.id = record."modelApiTokenId") AS token_live,
+                EXISTS (SELECT 1 FROM pool_grant grant_row
+                         WHERE grant_row.id = record."poolGrantId") AS grant_live
+           FROM response_stickiness_record record WHERE record.id = $1`,
+        [id],
+      )
+    ).rows[0];
   await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`); // policy: bounded-delete
-  const deletedTokenBinding = await client.query(`
-    SELECT COUNT(*)::int AS count FROM response_stickiness_record
-     WHERE id = 'sticky-provider-binding'
-  `);
-  if (deletedTokenBinding.rows[0]?.count !== 0) {
-    throw new Error("Deleted model API token retained a provider Responses binding");
+  if ((await bindingAnchors("sticky-provider-binding"))?.token_live !== false) {
+    throw new Error("Deleted model API token still anchors a provider Responses binding");
   }
   await client.query(`DELETE FROM pool_grant WHERE id = 'sticky-provider-grant'`); // policy: bounded-delete
-  const revokedGrantBinding = await client.query(`
-    SELECT COUNT(*)::int AS count FROM response_stickiness_record
-     WHERE id = 'grantee-provider-binding'
-  `);
-  if (revokedGrantBinding.rows[0]?.count !== 0) {
-    throw new Error("Revoked pool grant retained a provider Responses binding");
+  if ((await bindingAnchors("grantee-provider-binding"))?.grant_live !== false) {
+    throw new Error("Revoked pool grant still anchors a provider Responses binding");
   }
   await client.query(`
     INSERT INTO pool_grant
@@ -1099,21 +1120,20 @@ try {
     VALUES ('replacement-sticky-provider-grant', NOW(), NOW(), 'sticky-provider-pool',
       'owner-a', 'owner-b')
   `);
-  const resurrectedGrantBinding = await client.query(`
-    SELECT COUNT(*)::int AS count FROM response_stickiness_record
-     WHERE id = 'grantee-provider-binding'
-  `);
-  if (resurrectedGrantBinding.rows[0]?.count !== 0) {
+  const afterReplacement = await bindingAnchors("grantee-provider-binding");
+  if (
+    afterReplacement?.grant_live !== false ||
+    afterReplacement?.grant_id === "replacement-sticky-provider-grant"
+  ) {
     throw new Error("Replacement pool grant resurrected an old provider Responses binding");
   }
   await client.query(`DELETE FROM model_api_token WHERE id = 'grantee-provider-token'`); // policy: bounded-delete
-  const deletedGranteeBinding = await client.query(`
-    SELECT COUNT(*)::int AS count FROM response_stickiness_record
-     WHERE id = 'grantee-provider-binding'
-  `);
-  if (deletedGranteeBinding.rows[0]?.count !== 0) {
-    throw new Error("Deleted grantee token retained a provider Responses binding");
+  if ((await bindingAnchors("grantee-provider-binding"))?.token_live !== false) {
+    throw new Error("Deleted grantee token still anchors a provider Responses binding");
   }
+  // Orphaned hot-path rows (bindings whose token, grant or pool is gone) are
+  // legitimate under DL-1 (d): the next hardening apply must accept them.
+  await client.query(sql);
   const reverseBackfill = await client.query(`
     SELECT "discoveredModelId" FROM pool_member WHERE id = 'conflict-target-row'
   `);
@@ -1215,7 +1235,8 @@ try {
       'owner-b', 'pool-a', id, repeat('t', 32), 3, repeat('d', 43), repeat('q', 43), NULL, 1
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `,
-    "23503",
+    // DL-1 (d): the cache_affinity_owner trigger, not a foreign key.
+    "23514",
   );
   await expectConstraintFailure(`
     INSERT INTO cache_affinity_record
@@ -1678,6 +1699,7 @@ try {
   await oldWriter.connect();
   await hardeningClient.connect();
   await oldWriter.query(`SET search_path TO ${schema}`);
+  await oldWriter.query("SET wsmp.fences = ',*,'");
   await hardeningClient.query(`SET search_path TO ${schema}`);
   await oldWriter.query("BEGIN");
   await oldWriter.query(`

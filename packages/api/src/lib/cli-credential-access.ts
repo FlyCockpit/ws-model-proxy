@@ -3,7 +3,8 @@ import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-l
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
-  lockCapacityGraphForDelete,
+  fenceOwners,
+  fenceParentDelete,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
 import {
@@ -16,7 +17,7 @@ import {
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
 import { deletionConflict } from "./deletion-conflict";
-import { drainBeforeParentDelete, throwCapacityDeleteConflict } from "./serializable-transaction";
+import { throwCapacityDeleteConflict } from "./serializable-transaction";
 
 export type CliCredentialKind = "cliToken" | "deviceCredential";
 
@@ -285,11 +286,12 @@ export async function closeRevokedCliCredentialSessions(
  * Deletes a user's CLI device so that nothing can act as it afterwards. One
  * transaction:
  *
- * 1. Lock the device row (owner-scoped write; NOT_FOUND otherwise). Relay
- *    registration and re-login mints take the same lock, so a hello or login
- *    for this device either committed before (and is seen below) or runs
- *    after the delete (and finds no device: a device credential is gone, a
- *    CLI token bound here is revoked).
+ * 1. Take the owner fence (writer class M, fenceParentDelete) and lock the
+ *    device row (owner-scoped write; NOT_FOUND otherwise). Relay
+ *    registration and re-login mints take the same fence, so a hello or
+ *    login for this device either committed before (and is seen below) or
+ *    runs after the delete (and finds no device: a device credential is gone,
+ *    a CLI token bound here is revoked).
  * 2. With `staleBefore`, refuse (CONFLICT) a device that heartbeated since.
  * 3. Revoke every CLI token bound to the device. Tokens are user-managed rows,
  *    so they stay listed (revoked) with their device link cleared by the
@@ -311,8 +313,7 @@ export async function deleteCliDeviceAndCredentials({
   staleBefore?: Date;
   now?: Date;
 }): Promise<{ revoked: RevokedCliCredentials[] }> {
-  // Read-only checks first, so a refused delete drains nothing; the ordered
-  // transaction repeats them under the device lock.
+  // Read-only checks first; the transaction repeats them under its fence.
   const precheck = await prisma.cliDevice.findFirst({
     where: { id: cliDeviceId, userId },
     select: { lastHeartbeatAt: true },
@@ -321,17 +322,12 @@ export async function deleteCliDeviceAndCredentials({
   if (staleBefore && precheck.lastHeartbeatAt && precheck.lastHeartbeatAt >= staleBefore) {
     throw deletionConflict("not_stale", "CLI device is not stale.");
   }
-  // The request history the cascade deletes or detaches (relay requests,
-  // terminal admission history, stickiness records) is drained in short
-  // batches first (DL1-TXBOUND), so the ordered transaction holds the
-  // capacity locks only for the device's graph.
-  await drainBeforeParentDelete({ userId, cliDeviceIds: [cliDeviceId] });
-  // READ COMMITTED with deadlock/lock-set retries: the device delete cascades
-  // into endpoints, models, execution targets, pool members and admission
-  // rows, so it takes the capacity locks in order first (step 4). A residual
-  // above the final-phase bound found by the in-transaction recount rolls it
-  // back and answers CONFLICT, like the pre-lock count; so does a lock wait
-  // or statement past the transaction's server-side bound (delete_contended).
+  // READ COMMITTED with deadlock/fence-set retries: the device delete
+  // cascades into endpoints, models, execution targets and pool members (no
+  // hot-path history: request and admission rows keep the deleted ids), so it
+  // takes the owner fences of every user that cascade writes first. A lock
+  // wait or statement past the transaction's server-side bound answers
+  // CONFLICT (delete_contended).
   try {
     return await deleteCliDeviceInCapacityLockOrder({ cliDeviceId, userId, staleBefore, now });
   } catch (error) {
@@ -352,6 +348,7 @@ async function deleteCliDeviceInCapacityLockOrder({
   now: Date;
 }): Promise<{ revoked: RevokedCliCredentials[] }> {
   return runCapacityOrderedTransaction(prisma, async (tx) => {
+    await fenceParentDelete(tx, { userId, cliDeviceIds: [cliDeviceId] });
     const locked = await tx.cliDevice.updateMany({
       where: { id: cliDeviceId, userId },
       data: { updatedAt: now },
@@ -384,11 +381,6 @@ async function deleteCliDeviceInCapacityLockOrder({
         data: { revokedAt: now },
       });
     }
-    // Capacity lock order: the device row above is L0; take every lock the
-    // cascade can reach (pools, targets, capacities, live admission rows)
-    // before the DELETE, so no admitter holding a capacity lock can be
-    // waiting on a row this delete removes.
-    await lockCapacityGraphForDelete(tx, { userId, cliDeviceIds: [cliDeviceId] });
     await tx.cliDevice.delete({ where: { id: cliDeviceId }, select: { id: true } });
 
     return {
@@ -410,11 +402,10 @@ async function deleteCliDeviceInCapacityLockOrder({
  * Re-login reattaches: when the user already has a device with this slug, the
  * new credential joins that device (id, name, grants, pools, endpoints and
  * model ids are kept) and every other active credential of that device is
- * revoked. One transaction does all of it, in the lock order the ordered
- * user delete uses (device row at L0, user row at L7, then its cascade into
- * `device_code` and the device's credentials; see
- * @ws-model-proxy/db/capacity-lock-order), so the two never wait on each
- * other in a cycle:
+ * revoked. One transaction does all of it, under the owner fence (writer
+ * class M, @ws-model-proxy/db/capacity-lock-order): the user delete, relay
+ * registration and device deletes hold the same fence, so none of them waits
+ * on this transaction in a cycle:
  *
  * 1. Find or create the device. The upsert (a native `INSERT … ON CONFLICT
  *    DO UPDATE`) takes the device row lock, so two logins for one slug (two
@@ -525,6 +516,7 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
   const secret = generateProductCredentialSecret("deviceCredential");
   try {
     return await prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [userId]);
       // Prisma runs this as one native `INSERT … ON CONFLICT ("userId", "slug")
       // DO UPDATE`, so a concurrent first login of the same new slug never
       // fails with a unique violation: it waits for the other transaction and
@@ -583,8 +575,8 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
       };
     });
   } catch (error) {
-    // The ordered user delete committed first: the device upsert found no
-    // user row for its foreign key.
+    // The user delete committed first: the device upsert found no user row
+    // for its foreign key.
     if (isForeignKeyViolation(error)) {
       throw inactiveOwnerRefusal();
     }

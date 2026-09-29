@@ -366,9 +366,10 @@ describe("G2n — durable cleanup permit (capacity release during shutdown)", ()
         findMany: vi.fn(async () => []),
       },
       inferenceCapacity: {
+        findUnique: vi.fn(async () => ({ userId: "user-1", hardConcurrencyLimit: null })),
+      },
+      capacityRuntime: {
         findUniqueOrThrow: vi.fn(async () => ({
-          id: "cap-1",
-          hardConcurrencyLimit: null,
           schedulerCursor: 0,
           schedulerDeficits: null,
           schedulerVersion: null,
@@ -381,7 +382,6 @@ describe("G2n — durable cleanup permit (capacity release during shutdown)", ()
         updateMany: vi.fn(async () => ({ count: 1 })),
         findUnique: vi.fn(async () => null),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     raw.$transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) =>
       callback(tx),
@@ -684,6 +684,7 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     const tx = {
       $executeRaw: txExecute,
       $queryRaw: txQuery,
+      providerBudgetReservation: { findMany: vi.fn(async () => []) },
       providerAttempt: { findUnique: vi.fn(async () => null) },
     };
     raw.$transaction.mockImplementation(async (callback: (txClient: unknown) => Promise<unknown>) =>
@@ -691,9 +692,9 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     );
     const controller = new AbortController();
     controller.abort();
-    // The settlement transaction OPENS and executes its advisory-lock
-    // statements even though the request's abort fence is active
-    // (permit-scoped to the durable transition).
+    // The settlement transaction OPENS and takes its fences (the attempt
+    // fence through wsmp_acquire_fences) even though the request's abort
+    // fence is active (permit-scoped to the durable transition).
     await expect(
       runWithDbAbortFence(controller.signal, () =>
         reconcileProviderBudget({
@@ -712,8 +713,16 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
       ),
     ).rejects.toThrow("No admitted provider attempt exists");
     expect(raw.$transaction).toHaveBeenCalled();
-    expect(txExecute).toHaveBeenCalled();
-    expect(txQuery).toHaveBeenCalled();
+    const fenceCalls = (txQuery.mock.calls as unknown as unknown[][]).filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+    );
+    expect(fenceCalls[0]?.[1]).toEqual(["01:provider-budget-attempt:attempt-1"]);
+    // The attempt row lock ran after the fences.
+    expect(
+      (txQuery.mock.calls as unknown as unknown[][]).some((call) =>
+        (call[0] as TemplateStringsArray).join("?").includes("FROM provider_attempt"),
+      ),
+    ).toBe(true);
   });
 
   it("health-trial release EXECUTES post-abort (permitted): the release transaction runs", async () => {
@@ -754,13 +763,14 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     const { PostgresCapacityAdmissionStore } = await import("../model-api/capacity/postgres-store");
     const { StoreCapacityAdmissionRuntime } = await import("../model-api/capacity/runtime");
     const controller = new AbortController();
-    // The poll transaction aborts the request at its first raw statement;
-    // the transaction's NEXT operation is fence-rejected.
+    // The poll transaction aborts the request at its first raw statement
+    // (the attempt fence); the transaction's NEXT operation is fence-rejected.
     const tx = {
-      $executeRaw: vi.fn(async () => {
+      $queryRaw: vi.fn(async () => {
         controller.abort();
-        return 0;
+        return [{ acquired: true }];
       }),
+      $executeRaw: vi.fn(async () => 0),
       admissionRequest: {
         findUnique: vi.fn(async () => ({
           id: "row",
@@ -839,16 +849,22 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
         create: vi.fn(async () => ({})),
       },
       inferenceCapacity: {
+        findUnique: vi.fn(async () => ({ userId: "user-1", hardConcurrencyLimit: null })),
+      },
+      capacityRuntime: {
         findUniqueOrThrow: vi.fn(async () => ({
-          hardConcurrencyLimit: null,
           schedulerCursor: 0,
           schedulerDeficits: null,
           schedulerVersion: null,
+          nextFencingToken: 1n,
         })),
         update: vi.fn(async () => ({ nextFencingToken: 2n })),
       },
       poolMember: { findMany: vi.fn(async () => []) },
-      executionTarget: { findMany: vi.fn(async () => []) },
+      executionTarget: {
+        findMany: vi.fn(async () => []),
+        findUnique: vi.fn(async () => ({ inferenceCapacityId: "cap-1" })),
+      },
       admissionRequest: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findUnique: vi.fn(async (args: { where: { id?: string } }) =>
@@ -856,7 +872,6 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
         ),
         update: vi.fn(async () => ({})),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     raw.$transaction.mockImplementation(async (callback: (txClient: unknown) => Promise<unknown>) =>
       callback(tx),
@@ -889,7 +904,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
    * loop entry; the enclosing release permit kept authorizing
    * capacityLease.create and WAITING→ADMITTED across the loop's awaits
    * after the fence armed mid-fill. The probes arm the fence inside
-   * inferenceCapacity.findUniqueOrThrow — AFTER fill entry, BEFORE the
+   * inferenceCapacity.findUnique (the capacity read) — AFTER fill entry, BEFORE the
    * durable admission transitions.
    */
   function fillTx(options: { armOnFindUniqueCall: number }) {
@@ -928,21 +943,26 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
         create: vi.fn(async () => ({})),
       },
       inferenceCapacity: {
-        findUniqueOrThrow: vi.fn(async () => {
+        findUnique: vi.fn(async () => {
           findUniqueCalls += 1;
           if (findUniqueCalls >= options.armOnFindUniqueCall) armDbShutdownFence();
-          return {
-            hardConcurrencyLimit: null,
-            schedulerCursor: 0,
-            schedulerDeficits: null,
-            schedulerVersion: null,
-            nextFencingToken: 1n,
-          };
+          return { userId: "user-1", hardConcurrencyLimit: null };
         }),
+      },
+      capacityRuntime: {
+        findUniqueOrThrow: vi.fn(async () => ({
+          schedulerCursor: 0,
+          schedulerDeficits: null,
+          schedulerVersion: null,
+          nextFencingToken: 1n,
+        })),
         update: vi.fn(async () => ({ nextFencingToken: 2n })),
       },
       poolMember: { findMany: vi.fn(async () => []) },
-      executionTarget: { findMany: vi.fn(async () => []) },
+      executionTarget: {
+        findMany: vi.fn(async () => []),
+        findUnique: vi.fn(async () => ({ inferenceCapacityId: "cap-1" })),
+      },
       admissionRequest: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findUnique: vi.fn(async (args: { where: { id?: string } }) =>
@@ -950,7 +970,6 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
         ),
         update: vi.fn(async () => ({})),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     return tx;
   }
@@ -978,7 +997,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     );
     const store = new PostgresCapacityAdmissionStore();
     // Fence NOT armed at release entry — it arms inside the fill's first
-    // inferenceCapacity.findUniqueOrThrow, after fill entry.
+    // inferenceCapacity.findUnique, after fill entry.
     await expect(releaseLease(store)).resolves.toBe(true);
     // The durable release transitions executed under the permit...
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(1);

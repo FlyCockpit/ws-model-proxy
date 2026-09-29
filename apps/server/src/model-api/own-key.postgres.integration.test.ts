@@ -1,5 +1,7 @@
 import type { VisibleModelPoolTarget } from "@ws-model-proxy/api/lib/model-api-token-access";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
 import type { PublicOverflowRequest, PublicProviderTarget } from "./public-overflow.js";
@@ -13,7 +15,7 @@ integration("own-key preference integrity and requester capacity", () => {
   it("ties preferences to the exact grant/model owner, cascades revoke, and admits DIRECT for a cross-tenant pool", async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const owner = await db.user.create({
       data: { name: "Owner", email: `own-key-owner-${suffix}@example.test` },
@@ -714,18 +716,18 @@ integration("own-key preference integrity and requester capacity", () => {
       expect(binding.fallbackRoute).toBe("own-key");
       await db.poolGrant.delete({ where: { id: replacement.id } });
       expect(await db.poolFallbackPreference.count({ where: { poolId: pool.id } })).toBe(0);
+      // DL-1 (d): stickiness is hot-path history with no foreign key to the
+      // grant; the binding stays (its grant id dangling) and the route
+      // re-checks the grant by lookup before using it.
       expect(
         await db.responseStickinessRecord.findUnique({ where: { id: binding.id } }),
-      ).toBeNull();
-      // Real admissions above retain RESTRICT-protected capacity leases. The
-      // app must refuse deleting this graph; deletion behavior is exercised
-      // below with history that has no retained leases or provider accounting.
-      const { prepareParentDeletion, RetainedHistoryError } = await import(
-        "@ws-model-proxy/db/parent-deletion"
-      );
+      ).not.toBeNull();
+      // Admission and lease history (from the real admissions above) no longer
+      // block a pool delete under DL-1 (d): there is nothing to prepare.
+      const { prepareParentDeletion } = await import("@ws-model-proxy/db/parent-deletion");
       await expect(
         prepareParentDeletion(db, { userId: owner.id, poolIds: [pool.id] }),
-      ).rejects.toBeInstanceOf(RetainedHistoryError);
+      ).resolves.toEqual({});
       // Immutable capacity history intentionally remains in the disposable CI database.
     } finally {
       vi.doUnmock("@ws-model-proxy/db");
@@ -737,14 +739,14 @@ integration("own-key preference integrity and requester capacity", () => {
   });
 
   it.each(["pool", "owner"] as const)(
-    "drains grantee local and owner-paid history before deleting its %s through the app path",
+    "keeps grantee local and owner-paid history (dangling ids, durable owner) when its %s is deleted (DL-1 (d))",
     async (parent) => {
       if (!databaseUrl) return;
-      const db = createPrismaClient(databaseUrl);
+      const db = createFixturePrismaClient(databaseUrl);
       const { prepareParentDeletion, requestUserDeletion, completeUserDeletion } = await import(
         "@ws-model-proxy/db/parent-deletion"
       );
-      const { lockCapacityGraphForDelete, runCapacityOrderedTransaction } = await import(
+      const { fenceParentDelete, runCapacityOrderedTransaction } = await import(
         "@ws-model-proxy/db/capacity-lock-order"
       );
       const suffix = crypto.randomUUID();
@@ -761,8 +763,8 @@ integration("own-key preference integrity and requester capacity", () => {
           data: { userId: owner.id, name: "History", slug: `history-${suffix}` },
         });
         const scope = { userId: owner.id, poolIds: [pool.id] };
-        // Empty/default history is a no-op, including repeated preparation.
-        expect((await prepareParentDeletion(db, scope))["relay_request.detach"]).toBe(0);
+        // A non-user parent has no drain: its final delete touches no hot-path row.
+        expect(await prepareParentDeletion(db, scope)).toEqual({});
         const grant = await db.poolGrant.create({
           data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: requester.id },
         });
@@ -887,95 +889,44 @@ integration("own-key preference integrity and requester capacity", () => {
         ).rejects.toThrow(/relay request selection must match/);
 
         const mark = parent === "owner" ? await requestUserDeletion(db, owner.id) : null;
-        const deleteScope = parent === "owner" ? { userId: owner.id, wholeUser: true } : scope;
-        const options = {
-          batch: 1,
-          ...(mark ? { owner: { userId: owner.id, generation: mark.generation } } : {}),
-        };
-        // Same prepare/drain used by drainBeforeParentDelete and the user
-        // sweeper. Crucially the pool still exists when every batch runs.
-        const report = await prepareParentDeletion(db, deleteScope, options);
-        expect(report["relay_request.detach"]).toBeGreaterThanOrEqual(history.length + 1);
-        expect(await db.modelPool.findUnique({ where: { id: pool.id } })).not.toBeNull();
-        for (const row of history) {
-          expect(await db.relayRequest.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
-            requestedModelPoolId: null,
-            selectedExecutionTargetId: null,
-            selectedDiscoveredModelId: null,
-            selectedPoolMemberId: null,
-            userId: requester.id,
-            status: row.status,
-            fallbackRoute: row.fallbackRoute,
-          });
-        }
-        expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
-          {
-            requestedModelPoolId: null,
-            selectedExecutionTargetId: ownTarget.id,
-          },
-        );
-        expect(
-          await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
-        ).toMatchObject({
-          requestedModelPoolId: pool.id,
-          selectedExecutionTargetId: localTarget.id,
-          status: "PENDING",
-        });
-        if (parent === "pool") {
-          expect(
-            await db.relayRequest.findUniqueOrThrow({ where: { id: ownerRow.id } }),
-          ).toMatchObject({
-            requestedModelPoolId: null,
-            selectedExecutionTargetId: localTarget.id,
-            selectedDiscoveredModelId: localModel.id,
-            selectedPoolMemberId: null,
-          });
-        }
-        // A retry after a partial drain must be safe; detached rows cannot
-        // be used to reattach a foreign target once their pool anchor is gone.
-        expect(
-          (await prepareParentDeletion(db, deleteScope, options))["relay_request.detach"],
-        ).toBe(0);
-        await expect(
-          db.relayRequest.update({
-            where: { id: history[0]!.id },
-            data: { selectedExecutionTargetId: localTarget.id },
-          }),
-        ).rejects.toThrow(/relay request selection must match/);
         if (parent === "owner") {
           expect(mark).not.toBeNull();
           expect(await completeUserDeletion(db, owner.id, mark!.generation, { batch: 1 })).toBe(
             true,
           );
           expect(await db.user.findUnique({ where: { id: owner.id } })).toBeNull();
+          // The drain removes the deleted user's own terminal history.
           expect(await db.relayRequest.findUnique({ where: { id: ownerRow.id } })).toBeNull();
         } else {
-          // Exact final transaction used by deleteModelPool, after preparation.
+          // Exact final transaction used by deleteModelPool.
           await runCapacityOrderedTransaction(db, async (tx) => {
-            await lockCapacityGraphForDelete(tx, scope);
+            await fenceParentDelete(tx, scope);
             await tx.modelPool.delete({ where: { id: pool.id } });
           });
           expect(
             await db.executionTarget.findUnique({ where: { id: localTarget.id } }),
           ).not.toBeNull();
+          expect(
+            await db.relayRequest.findUniqueOrThrow({ where: { id: ownerRow.id } }),
+          ).toMatchObject({ requestedModelPoolId: pool.id, selectedPoolMemberId: localMember.id });
         }
         expect(await db.modelPool.findUnique({ where: { id: pool.id } })).toBeNull();
-        // PENDING rows are deliberately skipped by the drain; the final FK
-        // cascade still erases their cross-tenant selection and keeps the
-        // durable owner for attribution (P3C-2, grantee-stickiness suite).
-        expect(
-          await db.relayRequest.findUniqueOrThrow({ where: { id: pending.id } }),
-        ).toMatchObject({
-          requestedModelPoolId: null,
-          selectedExecutionTargetId: null,
-          selectedDiscoveredModelId: null,
-          selectedPoolMemberId: null,
-          status: "PENDING",
-          resourceOwnerUserId: owner.id,
-        });
+        // DL-1 (d): nothing cascades into the hot path. The grantee's history,
+        // terminal or PENDING, keeps its (now dangling) ids and its durable
+        // owner attribution; readers resolve ids by lookup and tolerate misses.
+        for (const row of [...history, pending]) {
+          expect(await db.relayRequest.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({
+            requestedModelPoolId: pool.id,
+            selectedExecutionTargetId: row.selectedExecutionTargetId,
+            selectedPoolMemberId: row.selectedPoolMemberId,
+            userId: requester.id,
+            status: row.status,
+            resourceOwnerUserId: owner.id,
+          });
+        }
         expect(await db.relayRequest.findUniqueOrThrow({ where: { id: ownRow.id } })).toMatchObject(
           {
-            requestedModelPoolId: null,
+            requestedModelPoolId: pool.id,
             selectedExecutionTargetId: ownTarget.id,
           },
         );

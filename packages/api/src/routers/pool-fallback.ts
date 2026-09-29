@@ -1,6 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -291,7 +292,9 @@ export const poolFallbackRouter = {
       });
       if (input.fallbackEnabled === true) await assertPoolFallbackEnableable(existing.id, userId);
       const result = await runSerializableTransaction(async (tx) => {
-        // Lock order: model_pool first, as in updateModelPool.
+        // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
+        // fence first, then the pool row, as in updateModelPool.
+        await fenceOwners(tx, [userId]);
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${existing.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const before = await tx.modelPool.findFirst({
           where: { id: existing.id, userId },

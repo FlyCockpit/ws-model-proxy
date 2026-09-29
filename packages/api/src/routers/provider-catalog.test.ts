@@ -322,7 +322,9 @@ describe("providerCatalog.importModel", () => {
     );
     db.$queryRaw.mockImplementation(async (strings: TemplateStringsArray, ...values: unknown[]) => {
       const text = sql(strings, values);
-      if (text.includes("provider_account")) locks.push("provider_account");
+      if (text.includes("wsmp_acquire_fences"))
+        locks.push(`fences ${(values[0] as string[]).join(" ")}`);
+      else if (text.includes("provider_account")) locks.push("provider_account");
       else if (text.includes("provider_model")) {
         expect(text).toContain("FOR NO KEY UPDATE");
         locks.push("provider_model");
@@ -413,8 +415,9 @@ describe("providerCatalog.importModel", () => {
       contextWindowDrift: null,
       compatibility: { verdict: "ok" },
     });
-    // A new model's id is not visible to others: no identity fence needed.
-    expect(locks[0]).toBe("provider_account");
+    // A new model's id is not visible to others: only the owner fence, no
+    // identity or pricing fence.
+    expect(locks.slice(0, 2)).toEqual(["fences 00:owner:owner", "provider_account"]);
     expect(db.providerModel.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         userId: "owner",
@@ -470,16 +473,18 @@ describe("providerCatalog.importModel", () => {
     ]);
   });
 
-  it("takes the provider-model identity fence before the account row when the model exists", async () => {
+  it("takes the owner, identity and pricing fences before the account row when the model exists", async () => {
     stored = storedModel();
     hasTarget = false;
     await importQwen();
-    expect(locks.slice(0, 2)).toEqual([
-      "advisory execution-target:provider-model:pm-1",
+    // One ascending fence call before any row: owner, identity, pricing;
+    // then the account row and only then the model row. No other advisory.
+    expect(locks.slice(0, 3)).toEqual([
+      "fences 00:owner:owner 02:execution-target:provider-model:pm-1 05:provider-pricing:owner:pm-1",
       "provider_account",
+      "provider_model",
     ]);
-    // ...and only then the pricing lock and the model row.
-    expect(locks.slice(2, 4)).toEqual(["advisory provider-pricing:owner:pm-1", "provider_model"]);
+    expect(locks.filter((lock) => lock.startsWith("advisory"))).toEqual([]);
     expect(db.executionTarget.create).toHaveBeenCalledWith({
       data: { userId: "owner", kind: "PROVIDER_MODEL", providerModelId: "pm-1" },
     });
@@ -685,7 +690,9 @@ describe("providerCatalog.importModel", () => {
     stored = storedModel({ deletedAt: new Date(), displayName: "Mine" });
     const result = await importQwen();
     expect(result.restored).toBe(true);
-    expect(locks[0]).toBe("advisory execution-target:provider-model:pm-1");
+    expect(locks[0]).toBe(
+      "fences 00:owner:owner 02:execution-target:provider-model:pm-1 05:provider-pricing:owner:pm-1",
+    );
     expect(db.providerModel.update).toHaveBeenCalledWith({
       where: { id: "pm-1" },
       data: { deletedAt: null, enabled: false },

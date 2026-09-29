@@ -51,7 +51,15 @@ const db = prisma as unknown as {
     update: MockInstance;
   };
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
 };
+
+/** The fence arrays passed to `wsmp_acquire_fences`, one per call, in call order. */
+function fenceCalls(): string[][] {
+  return db.$queryRaw.mock.calls
+    .filter((call) => (call[0] as readonly string[]).join("?").includes("wsmp_acquire_fences"))
+    .map((call) => call[1] as string[]);
+}
 
 type TokenCreateArgs = {
   data: {
@@ -254,6 +262,8 @@ describe("modelApiTokensRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.appSetting.findUnique.mockResolvedValue({ value: "false" });
+    db.$transaction.mockImplementation(async (run: (tx: typeof db) => unknown) => run(db));
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
   });
 
   describe("create", () => {
@@ -314,6 +324,13 @@ describe("modelApiTokensRouter", () => {
           modelPools: [{ id: "owned-pool-id" }, { id: "granted-pool-id" }],
         }),
       );
+      // Writer class M: the allowlist entries link the caller's token to the
+      // granting owner's pool, so the insert holds both owners' fences
+      // (sorted, one call) before it writes.
+      expect(fenceCalls()).toEqual([["00:owner:other-user-id", "00:owner:user-id"]]);
+      expect(db.$queryRaw.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
+        db.modelApiToken.create.mock.invocationCallOrder[0] ?? Number.NaN,
+      );
     });
 
     it("keeps ALL_VISIBLE tokens dynamic by not persisting visible rows as allowlist entries", async () => {
@@ -337,6 +354,8 @@ describe("modelApiTokensRouter", () => {
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
       expect(createCall.data).not.toHaveProperty("allowExternal");
       expect(createCall.data.AllowlistEntries.create).toEqual([]);
+      // No allowlist entries: only the caller's own owner fence.
+      expect(fenceCalls()).toEqual([["00:owner:user-id"]]);
     });
 
     it("rejects another user's direct model canonical id", async () => {

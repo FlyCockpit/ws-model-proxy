@@ -1,4 +1,5 @@
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { retryableSerializableTransactionCode } from "./serializable-transaction";
 
 /**
@@ -197,8 +198,9 @@ export async function ensureDiscoveredInferenceCapacity(
 /**
  * Existing capacity rows `ensureDiscoveredInferenceCapacity` may adopt and
  * fill for this target (its legacy `execution-target:<id>` row and its
- * `discovered-model:<id>` row). Read-only: callers lock these rows (L5) after
- * their target locks (L2) and before calling `ensureDiscoveredInferenceCapacity`.
+ * `discovered-model:<id>` row). Read-only: callers take their capacity fences
+ * (with the target's capacity-policy fence, after the owner fence) before
+ * calling `ensureDiscoveredInferenceCapacity`.
  */
 export async function existingDiscoveredCapacityCandidates(
   tx: Prisma.TransactionClient,
@@ -236,13 +238,20 @@ async function attachBackfillTarget(input: {
   upstreamModelId: string;
 }): Promise<number> {
   return prisma.$transaction(async (tx) => {
-    // Target row (L2) first, then the capacity row (L5): the capacity lock
-    // order (@ws-model-proxy/db/capacity-lock-order). Registration and
-    // addPoolMember lock the target the same way before any capacity write,
-    // so they serialize here. FOR NO KEY UPDATE does not conflict with
-    // admission's FK FOR KEY SHARE checks, which may already hold this
-    // capacity's lock.
-    await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${input.executionTargetId} AND "userId" = ${input.userId} FOR NO KEY UPDATE`;
+    // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
+    // fence, then the target's capacity-policy fence and the fences of the
+    // capacity rows it may adopt, before any write. Registration and
+    // addPoolMember take the same fences, so they serialize here.
+    await acquireFences(tx, [fences.owner(input.userId)]);
+    const candidates = await existingDiscoveredCapacityCandidates(tx, {
+      userId: input.userId,
+      discoveredModelId: input.discoveredModelId,
+      executionTargetId: input.executionTargetId,
+    });
+    await acquireFences(tx, [
+      fences.capacityPolicy(input.executionTargetId),
+      ...candidates.map((capacityId) => fences.capacity(capacityId)),
+    ]);
     const current = await tx.executionTarget.findUnique({
       where: { id: input.executionTargetId },
       select: {
@@ -284,9 +293,14 @@ async function fillAttachedAutoCapacityLimit(input: {
   inferenceCapacityId: string;
 }): Promise<number> {
   return prisma.$transaction(async (tx) => {
-    // Same lock order as attach: the target row, then the capacity row.
-    // A foreign key that is already set is not replaced.
-    await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${input.executionTargetId} AND "userId" = ${input.userId} FOR NO KEY UPDATE`;
+    // Same fences as attach: owner, then the target's capacity-policy fence
+    // and the capacity's fence. A foreign key that is already set is not
+    // replaced.
+    await acquireFences(tx, [
+      fences.owner(input.userId),
+      fences.capacityPolicy(input.executionTargetId),
+      fences.capacity(input.inferenceCapacityId),
+    ]);
     const current = await tx.executionTarget.findUnique({
       where: { id: input.executionTargetId },
       select: {

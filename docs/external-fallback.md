@@ -175,6 +175,20 @@ local-member fix, are in [`release-notes/next.md`](release-notes/next.md).
   listed, revoked, and deleted.
 
 
+### Legacy storage removed (one `APPLY_SCHEMA=dangerous` deploy)
+
+The release that removes the retired acknowledgement storage requires
+`APPLY_SCHEMA=dangerous` once. Back up the database first. It drops
+`model_pool."publicEgressAcknowledged"` and the `dashboard_notice` table
+(legacy grantee notices, unused since the fallback redesign), and the unused
+`user` index on `("deletionSweepNextAttemptAt", "deletionRequestedAt")`. No
+user-visible behaviour changes. The pool field `fallbackEnabled` keeps its
+stored column name `publicEgressEnabled`. The same deploy carries the capacity
+lock redesign (DL-1): it drops the foreign keys between request history and
+the dashboard graph and moves the capacity scheduler state into
+`capacity_runtime`. Stop every running server before the apply; an old server
+writes columns the apply removes.
+
 ## Dashboard flow
 
 On a pool’s **Fallback** page, enable **Allow external fallback** and optionally

@@ -1,57 +1,45 @@
 /**
- * Parent deletes with a bounded capacity-lock critical section (DL1-TXBOUND).
+ * User deletion and parent deletes under DL-1 design (d) (#78).
  *
- * An ordered parent delete (see `lockCapacityGraphForDelete` in
- * ./capacity-lock-order.ts) takes L0-L6 for everything its cascade can reach
- * and then runs the DELETE inside one READ COMMITTED transaction capped at
- * 15 s. The cascade's size is not bounded by configuration, though: a user,
- * pool, endpoint, model, device, member or capacity drags along its request
- * history (relay requests and their execution rows, terminal admission
- * requests and waiters, response-stickiness records, usage rollups). With a
- * large history the single transaction exceeded its budget on every retry,
- * and it held the capacity locks for the whole history delete.
+ * A parent delete (user, device, endpoint, discovered model, pool, pool
+ * member, capacity) is a plain delete under owner fences
+ * (`fenceParentDelete` in ./capacity-lock-order.ts): it cascades only into
+ * graph and auxiliary rows, each guarded by a fence the delete holds. No
+ * hot-path (H) table has a foreign key to the graph, so a parent with request,
+ * admission or lease history is deletable; that history keeps plain ids of the
+ * deleted rows, readers tolerate them, and the capacity sweepers terminalize
+ * live orphans.
  *
- * So every ordered parent delete runs in three phases:
+ * A user deletion additionally removes the user's own history, for privacy,
+ * in three phases:
  *
- *  1. Preflight ({@link findRetainedHistoryBlocker}). Retained history that
- *     the schema protects with ON DELETE RESTRICT (capacity leases, provider
- *     accounting) makes the final DELETE fail. The check runs before anything
- *     is drained, so a delete that cannot succeed removes nothing.
- *  2. Drain ({@link drainParentDeletionHistory}). The history rows the
- *     cascade would delete or SET NULL are processed in bounded batches, each
- *     batch its own short transaction that takes the rows it deletes or
- *     rewrites with SKIP LOCKED, like the retention sweeper, and takes no
- *     capacity lock. A terminal admission request is deleted only together
+ *  1. Preflight ({@link findRetainedHistoryBlocker}). Provider accounting is
+ *     retained history: a user who has any (attempts, ledger, reservations,
+ *     pricing versions, provider audit, credential rotation) is refused before
+ *     anything is drained or marked. The graph-side rows (pricing versions,
+ *     audit, rotation) are also protected by ON DELETE RESTRICT.
+ *  2. Drain ({@link drainParentDeletionHistory}). The user's H rows (by the
+ *     columns in `HISTORY_DRAIN_EDGES`) are deleted in bounded batches, each
+ *     batch its own short transaction that takes the rows it deletes with
+ *     SKIP LOCKED, like the retention sweeper, and takes no fence: a sweeper
+ *     (writer class S). A terminal admission request is deleted only together
  *     with every one of its waiters, all taken with SKIP LOCKED first, so its
- *     cascade never waits on a waiter the batch skipped. The waits left (the
- *     execution rows of a terminal relay request, whose writers take no
- *     admission or capacity lock, and the requester-rollup merge) are bounded
- *     by a transaction-local `lock_timeout`
- *     ({@link PARENT_DELETION_DRAIN_LOCK_TIMEOUT_MS}); a timeout rolls the
- *     batch back and reports pending. Every statement of a batch is also
- *     bounded by a transaction-local `statement_timeout`
- *     ({@link PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS}): a cascade that
- *     waits on several rows in turn can outlast any single `lock_timeout`
- *     without one wait reaching it, so the statement bound is what stops a
- *     batch growing with the number of locked rows (for a request, which
- *     then answers pending instead of hanging). Batches are idempotent: a crash, a
- *     shutdown fence, a timeout or an error leaves only rows the next run
- *     processes. The drain never touches live rows (PENDING relay requests,
- *     WAITING/ADMITTED admission requests) nor RESTRICT-protected history;
- *     those stay for phase 3.
- *  3. The ordered delete, now over the capacity graph plus the residual
- *     that arrived during the drain. That is what the capacity locks are held
- *     for. The residual is bounded inside that transaction: after its last
- *     lock, `lockCapacityGraphForDelete` re-counts it and refuses (pending /
- *     CONFLICT) above {@link PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS}
- *     (./parent-deletion-residual.ts).
- *
- * The table-level contract (which history tables are drained through which
- * foreign keys, which RESTRICT edges the preflight covers) is data below and
- * is checked against the Prisma schema by
- * packages/api/src/lib/parent-deletion-catalog.test.ts, so a new foreign key
- * into the deleted graph fails a test instead of silently growing the locked
- * cascade.
+ *     cascade (waiters and lease, H-internal foreign keys) never waits on a
+ *     waiter the batch skipped. The waits left (the execution rows of a
+ *     terminal relay request, whose writers take no fence, and the
+ *     requester-rollup merge) are bounded by a transaction-local
+ *     `lock_timeout` ({@link PARENT_DELETION_DRAIN_LOCK_TIMEOUT_MS}); a
+ *     timeout rolls the batch back and reports pending. Every statement of a
+ *     batch is also bounded by a transaction-local `statement_timeout`
+ *     ({@link PARENT_DELETION_DRAIN_STATEMENT_TIMEOUT_MS}). Batches are
+ *     idempotent: a crash, a shutdown fence, a timeout or an error leaves only
+ *     rows the next run processes. The drain never touches live rows (PENDING
+ *     relay requests, WAITING/ADMITTED admission requests).
+ *  3. The delete under owner fences, which also queues the user in
+ *     `deleted_user_purge`: the history sweeper
+ *     (apps/server/src/model-api/hot-path-sweeper.ts) purges what the drain
+ *     could not take (requests still in flight at the delete) once it is
+ *     terminal.
  *
  * Durable intent. A user delete marks the user first
  * ({@link requestUserDeletion}: `deletionRequestedAt`, a ban and the removal
@@ -70,26 +58,21 @@
  * generation first, so an abandon, restore or new mark waits for the batch in
  * flight and no later batch of the withdrawn generation deletes anything
  * ({@link UserDeletionOwner}).
- * Other parents need no marker: until phase 3 commits the parent is intact
- * and fully usable, the drained rows are exactly those its requested delete
- * removes or detaches, and re-issuing the delete resumes the drain.
  */
 import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../prisma/generated/client";
 import { Prisma } from "../prisma/generated/client";
 import {
   deleteTerminalRelayRequestsWithoutWaiting,
-  deleteUserInCapacityLockOrder,
+  deleteUserUnderOwnerFences,
   serverTimeoutSqlState,
   UserDeletionGenerationChangedError,
 } from "./capacity-lock-order";
 import {
-  countFinalPhaseResidualRows,
   type DeletedParents,
   edgeFilters,
   HISTORY_DRAIN_EDGES,
   PARENT_DELETION_DRAIN_BATCH,
-  PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS,
   ParentDeletionDrainPendingError,
   ParentDeletionOwnerRequiredError,
   type ParentDeletionScope,
@@ -118,16 +101,13 @@ type Db = Pick<
   | "providerModel"
 >;
 
-// The contract data, parent resolution and residual count are shared with
-// the in-transaction recount of ./capacity-lock-order.ts.
+// The contract data and parent resolution are shared with the owner-fence
+// planner of ./capacity-lock-order.ts.
 export {
-  countFinalPhaseResidualRows,
   type DeletedParents,
   type DeletedParentTable,
   HISTORY_DRAIN_EDGES,
-  PARENT_DELETE_TRIGGER_WORK,
   PARENT_DELETION_DRAIN_BATCH,
-  PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS,
   ParentDeletionDrainPendingError,
   ParentDeletionOwnerRequiredError,
   type ParentDeletionScope,
@@ -155,43 +135,27 @@ export const PARENT_DELETION_MAX_PASSED_ADMISSIONS = 10_000;
 
 /**
  * Every ON DELETE RESTRICT edge into a deleted graph, and why the final
- * DELETE cannot trip it after a passing preflight. `lease` and
- * `owner-history` are checked by {@link findRetainedHistoryBlocker};
- * `co-deleted` edges point between two rows the same cascade deletes and do
- * not fail it (the P1 fixture: a user with a target on its capacity deletes).
+ * DELETE cannot trip it after a passing preflight. `owner-history` is checked
+ * by {@link findRetainedHistoryBlocker}; `co-deleted` edges point between two
+ * rows the same cascade deletes and do not fail it (a user with a target on
+ * its capacity deletes). No hot-path table has a foreign key into the graph,
+ * so admission and lease history never block a delete.
  */
 export const RETAINED_HISTORY_EDGES = {
-  "capacity_lease.capacityId": "lease",
-  "capacity_lease.executionTargetId": "lease",
-  "capacity_lease.poolId": "lease",
-  "capacity_lease.poolMemberId": "lease",
   "execution_target.inferenceCapacityId": "co-deleted",
   "provider_credential.replacedById": "owner-history",
-  "provider_budget_reservation.policyId": "owner-history",
-  "provider_budget_reservation.ruleId": "owner-history",
-  "provider_budget_reservation.credentialId": "owner-history",
-  "provider_attempt.userId": "owner-history",
-  "provider_attempt.providerAccountId": "owner-history",
-  "provider_attempt.providerModelId": "owner-history",
-  "provider_attempt.credentialId": "owner-history",
-  "public_provider_attempt_event.userId": "owner-history",
-  "public_provider_attempt_event.providerAccountId": "owner-history",
-  "public_provider_attempt_event.providerModelId": "owner-history",
-  "provider_usage_ledger.userId": "owner-history",
-  "provider_usage_ledger.providerAccountId": "owner-history",
-  "provider_usage_ledger.providerModelId": "owner-history",
-  "provider_usage_ledger.credentialId": "owner-history",
   "provider_pricing_version.providerAccountId": "owner-history",
   "provider_pricing_version.providerModelId": "owner-history",
   "provider_audit_event.userId": "owner-history",
-} as const satisfies Record<string, "lease" | "owner-history" | "co-deleted">;
+} as const satisfies Record<string, "owner-history" | "co-deleted">;
 
 /**
- * Provider accounting tables with a RESTRICT edge into a user's graph (each
- * also refuses DELETE by trigger). Every such edge is composite with
- * `userId` or references the user itself, so "no row with this userId" is
- * exactly "no RESTRICT edge fires". `provider_credential.replacedById`
- * (rotation history inside the user's own credentials) is checked apart.
+ * Provider accounting a user deletion refuses to discard (retained history):
+ * the hot-path accounting tables (no foreign key, a policy) and the graph-side
+ * pricing and audit tables (also ON DELETE RESTRICT). Every table carries
+ * `userId`, so "no row with this userId" is exactly "nothing to retain".
+ * `provider_credential.replacedById` (rotation history inside the user's own
+ * credentials) is checked apart.
  */
 export const OWNER_RETAINED_HISTORY_TABLES = [
   "provider_attempt",
@@ -207,8 +171,8 @@ export const OWNER_RETAINED_HISTORY_TABLES = [
 // ---------------------------------------------------------------------------
 
 /**
- * The delete would fail on retained history (ON DELETE RESTRICT). Raised
- * before anything is drained. Permanent: retrying cannot help.
+ * The user has retained provider history ({@link OWNER_RETAINED_HISTORY_TABLES}).
+ * Raised before anything is drained. Permanent: retrying cannot help.
  */
 export class RetainedHistoryError extends Error {
   readonly code = "RETAINED_HISTORY";
@@ -284,27 +248,14 @@ export function isPermanentParentDeletionFailure(error: unknown): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the kind of retained history that makes the final DELETE fail, or
- * null. Covers every RESTRICT edge in {@link RETAINED_HISTORY_EDGES}.
+ * Returns the kind of retained history that refuses the delete, or null.
+ * Covers every RESTRICT edge in {@link RETAINED_HISTORY_EDGES} and the
+ * provider accounting policy ({@link OWNER_RETAINED_HISTORY_TABLES}).
  */
 export async function findRetainedHistoryBlocker(
   db: Db,
   parents: DeletedParents,
 ): Promise<string | null> {
-  const leaseFilters: Prisma.Sql[] = [];
-  const add = (column: string, ids: string[]) => {
-    if (ids.length > 0)
-      leaseFilters.push(Prisma.sql`${Prisma.raw(`"${column}"`)} = ANY(${ids}::text[])`);
-  };
-  add("capacityId", parents.inference_capacity);
-  add("executionTargetId", parents.execution_target);
-  add("poolId", parents.model_pool);
-  add("poolMemberId", parents.pool_member);
-  if (leaseFilters.length > 0) {
-    const leases = await db.$queryRaw<Array<{ one: number }>>`
-      SELECT 1 AS one FROM capacity_lease WHERE ${Prisma.join(leaseFilters, " OR ")} LIMIT 1`;
-    if (leases.length > 0) return "capacity lease";
-  }
   for (const userId of parents.user) {
     for (const table of OWNER_RETAINED_HISTORY_TABLES) {
       const rows = await db.$queryRaw<Array<{ one: number }>>`
@@ -387,10 +338,10 @@ type DrainTx = Prisma.TransactionClient;
  * Takes the user row FOR SHARE when it still carries the owner's deletion
  * generation; throws {@link UserDeletionGenerationChangedError} otherwise.
  * Lock order: this is the first lock of its batch transaction, which takes
- * no capacity lock; the rows the batch takes afterwards are history rows
- * (SKIP LOCKED) and their bounded cascades. The ordered user delete takes
- * the same row FOR UPDATE only after its L0-L6 locks, and no drain batch
- * waits on an L0-L6 lock, so the two cannot wait on each other in a cycle.
+ * no fence; the rows the batch takes afterwards are the user's history rows
+ * (SKIP LOCKED) and their bounded H-internal cascades. The user delete takes
+ * the same row FOR UPDATE after its fences, and no drain batch waits on a
+ * fence or a graph row, so the two cannot wait on each other in a cycle.
  */
 async function lockUserDeletionOwner(tx: DrainTx, owner: UserDeletionOwner): Promise<void> {
   const rows = await tx.$queryRaw<Array<{ id: string }>>`
@@ -490,17 +441,19 @@ async function drainLoop(
     noteDrainWork(budget, processed);
     report[label] = (report[label] ?? 0) + processed;
     // Zero means drained, or only rows another transaction holds remain
-    // (SKIP LOCKED); those go with the ordered delete.
+    // (SKIP LOCKED); the history sweeper purges those after the delete.
     if (processed === 0) return;
   }
 }
 
 /**
- * Drains the history a delete of `parents` would cascade into, in bounded
- * batches that never wait on a row they skipped and wait on any other row
- * lock at most {@link PARENT_DELETION_DRAIN_LOCK_TIMEOUT_MS}. Leaf tables
- * first, so no batch cascades further than its own children. Returns rows
- * processed per step.
+ * Drains the deleted user's own hot-path history (the rows
+ * `HISTORY_DRAIN_EDGES` names by user), in bounded batches that never wait on
+ * a row they skipped and wait on any other row lock at most
+ * {@link PARENT_DELETION_DRAIN_LOCK_TIMEOUT_MS}. Leaf tables first, so no
+ * batch cascades further than its own H-internal children. Returns rows
+ * processed per step. Parents other than a user have no history to drain:
+ * nothing references them by foreign key, and their history keeps plain ids.
  *
  * A drain that includes a whole user must name the deletion generation it
  * works for (`owner`); every batch is then bound to it (see
@@ -557,11 +510,11 @@ export async function drainParentDeletionHistory(
   const inBatch = (work: (tx: DrainTx) => Promise<number>) =>
     runParentDeletionDrainBatch(db, owner, work);
 
-  // response_stickiness_record: CASCADE edges delete; the one SET NULL edge
-  // (selectedDiscoveredModelId) only matters for a row none of the CASCADE
-  // edges removes, handled after the deletes.
-  const stickiness = HISTORY_DRAIN_EDGES.response_stickiness_record;
-  const stickinessDelete = edgeFilters("s", stickiness.cascade, parents);
+  const stickinessDelete = edgeFilters(
+    "s",
+    HISTORY_DRAIN_EDGES.response_stickiness_record.delete,
+    parents,
+  );
   if (stickinessDelete.length > 0)
     await drainLoop(report, "response_stickiness_record.delete", budget, size, () =>
       inBatch(
@@ -574,52 +527,35 @@ export async function drainParentDeletionHistory(
               FOR UPDATE SKIP LOCKED)`,
       ),
     );
-  const stickinessNull = edgeFilters("s", stickiness.setNull, parents);
-  if (stickinessNull.length > 0)
-    await drainLoop(report, "response_stickiness_record.detach", budget, size, () =>
+
+  const affinityDelete = edgeFilters(
+    "a",
+    HISTORY_DRAIN_EDGES.cache_affinity_record.delete,
+    parents,
+  );
+  if (affinityDelete.length > 0)
+    await drainLoop(report, "cache_affinity_record.delete", budget, size, () =>
       inBatch(
         (tx) => tx.$executeRaw`
-        UPDATE response_stickiness_record
-           SET "selectedDiscoveredModelId" = NULL
+        DELETE FROM cache_affinity_record
          WHERE id IN (
-           SELECT s.id FROM response_stickiness_record s
-            WHERE ${Prisma.join(stickinessNull, " OR ")}
+           SELECT a.id FROM cache_affinity_record a
+            WHERE ${Prisma.join(affinityDelete, " OR ")}
             LIMIT ${size.limit}
-              FOR NO KEY UPDATE SKIP LOCKED)`,
+              FOR UPDATE SKIP LOCKED)`,
       ),
     );
 
-  // capacity_waiter rows of terminal requests that reference a deleted
-  // capacity, target, pool or member (their own request may survive).
-  const waiterFilters = edgeFilters("w", HISTORY_DRAIN_EDGES.capacity_waiter.cascade, parents);
-  if (waiterFilters.length > 0)
-    await drainLoop(report, "capacity_waiter.delete", budget, size, () =>
-      inBatch(
-        (tx) => tx.$executeRaw`
-        DELETE FROM capacity_waiter
-         WHERE id IN (
-           SELECT w.id FROM capacity_waiter w
-             JOIN admission_request r ON r.id = w."admissionRequestId"
-            WHERE r.state IN ${TERMINAL_ADMISSION}
-              AND (${Prisma.join(waiterFilters, " OR ")})
-            LIMIT ${size.limit}
-              FOR UPDATE OF w SKIP LOCKED)`,
-      ),
-    );
-
-  // Terminal admission requests the cascade deletes. A request with a lease
-  // is RESTRICT-protected history; the preflight refused such a delete, and
-  // the drain never removes one (the NOT EXISTS keeps it that way if a lease
-  // appears after the preflight: the ordered delete then fails unchanged).
-  //
-  // The DELETE cascades into every waiter of the request, and a waiter another
-  // transaction holds would make it wait (the waiter step above skipped it).
+  // The user's terminal admission requests, with their waiters and lease
+  // (H-internal ON DELETE CASCADE). The DELETE cascades into every waiter of
+  // the request, and a waiter another transaction holds would make it wait.
   // So each batch first takes its requests and then all their waiters with
   // SKIP LOCKED, and deletes only the requests whose every waiter it now
   // holds: the cascade then touches only rows this transaction already
-  // locked. A request with a busy waiter is passed, not retried, in this run
-  // (the ordered delete takes the residual).
-  const admissionFilters = edgeFilters("r", HISTORY_DRAIN_EDGES.admission_request.cascade, parents);
+  // locked, plus the lease, which only an admitter holding the request row
+  // writes. A request with a busy waiter is passed, not retried, in this run
+  // (the history sweeper takes it after the delete).
+  const admissionFilters = edgeFilters("r", HISTORY_DRAIN_EDGES.admission_request.delete, parents);
   if (admissionFilters.length > 0) {
     const passed: string[] = [];
     report["admission_request.passed"] ??= 0;
@@ -634,8 +570,6 @@ export async function drainParentDeletionHistory(
            WHERE r.state IN ${TERMINAL_ADMISSION}
              AND (${Prisma.join(admissionFilters, " OR ")})
              AND NOT (r.id = ANY(${passed}::text[]))
-             AND NOT EXISTS (
-               SELECT 1 FROM capacity_lease l WHERE l."admissionRequestId" = r.id)
            LIMIT ${size.limit}
              FOR UPDATE OF r SKIP LOCKED`;
         if (candidates.length === 0) return 0;
@@ -670,10 +604,7 @@ export async function drainParentDeletionHistory(
         const deletedRows =
           eligible.length > 0
             ? await tx.$executeRaw`
-                DELETE FROM admission_request r
-                 WHERE r.id = ANY(${eligible}::text[])
-                   AND NOT EXISTS (
-                     SELECT 1 FROM capacity_lease l WHERE l."admissionRequestId" = r.id)`
+                DELETE FROM admission_request r WHERE r.id = ANY(${eligible}::text[])`
             : 0;
         report["admission_request.delete"] =
           (report["admission_request.delete"] ?? 0) + deletedRows;
@@ -686,10 +617,10 @@ export async function drainParentDeletionHistory(
   // relay_request owned by a deleted user: delete terminal rows (their
   // execution events and attempts cascade) through the shared helper that
   // takes the referencing admission rows and the relay rows with SKIP LOCKED.
-  // Keyset order over the ("userId", "createdAt") index, so each batch starts
-  // past the rows earlier batches deleted instead of rescanning their dead
-  // index entries. A row the helper skipped (busy) is passed, not retried:
-  // the ordered delete takes the residual.
+  // Keyset order over the ("userId", "createdAt", id) index, so each batch
+  // starts past the rows earlier batches deleted instead of rescanning their
+  // dead index entries. A row the helper skipped (busy) is passed, not
+  // retried: the history sweeper takes the residual after the delete.
   for (const userId of parents.user) {
     let cursor: { createdAt: Date; id: string } | null = null;
     report["relay_request.delete"] ??= 0;
@@ -727,37 +658,6 @@ export async function drainParentDeletionHistory(
     );
   }
 
-  // relay_request rows that reference a deleted parent through a SET NULL
-  // edge: detach them the way the cascade would. The relay ownership trigger
-  // also clears an unchanged cross-tenant selection when its pool anchor is
-  // removed, even if the selected target survives. Other surviving-parent
-  // columns stay unchanged. Setting a foreign key to NULL takes no parent lock.
-  const relayEdges = HISTORY_DRAIN_EDGES.relay_request.setNull.filter(
-    ([, parent]) => parents[parent].length > 0,
-  );
-  if (relayEdges.length > 0) {
-    const assignments = relayEdges.map(
-      ([column, parent]) =>
-        Prisma.sql`${Prisma.raw(`"${column}"`)} = CASE WHEN ${Prisma.raw(
-          `"${column}"`,
-        )} = ANY(${parents[parent]}::text[]) THEN NULL ELSE ${Prisma.raw(`"${column}"`)} END`,
-    );
-    const relayFilters = edgeFilters("q", relayEdges, parents);
-    await drainLoop(report, "relay_request.detach", budget, size, () =>
-      inBatch(
-        (tx) => tx.$executeRaw`
-        UPDATE relay_request
-           SET ${Prisma.join(assignments, ", ")}
-         WHERE id IN (
-           SELECT q.id FROM relay_request q
-            WHERE q.status IN ${TERMINAL_RELAY}
-              AND (${Prisma.join(relayFilters, " OR ")})
-            LIMIT ${size.limit}
-              FOR NO KEY UPDATE SKIP LOCKED)`,
-      ),
-    );
-  }
-
   // Usage rollups owned by a deleted user.
   for (const userId of parents.user) {
     await drainLoop(report, "usage_rollup_minute.delete", budget, size, () =>
@@ -783,8 +683,8 @@ export async function drainParentDeletionHistory(
       ),
     );
     // The merge into other owners' sentinel rows can wait on a destination
-    // row (a finalizer or compaction holds it) or an FK parent; the batch's
-    // lock_timeout bounds that wait and the drain reports pending.
+    // row (a finalizer or compaction holds it); the batch's lock_timeout
+    // bounds that wait and the drain reports pending.
     await drainLoop(report, "usage_rollup_requester", budget, size, () =>
       inBatch((tx) => drainRequesterUsageRollupsBatch(tx, userId, size.limit)),
     );
@@ -794,28 +694,21 @@ export async function drainParentDeletionHistory(
 
 /**
  * Phases 1 and 2 for a delete of `scope`: refuses retained history, then
- * drains. The caller runs its ordered delete (phase 3) next. A whole-user
- * scope needs `options.owner` (see {@link drainParentDeletionHistory}).
+ * drains. The caller runs its delete (phase 3) next. Only a whole-user scope
+ * has anything to check or drain; it needs `options.owner` (see
+ * {@link drainParentDeletionHistory}).
  */
 export async function prepareParentDeletion(
   db: Db,
   scope: ParentDeletionScope,
   options: ParentDeletionDrainOptions = {},
 ): Promise<ParentDeletionDrainReport> {
+  if (scope.wholeUser !== true) return {};
   const parents = await resolveDeletedParents(db, scope);
   assertDrainOwner(parents, options.owner);
   const blocker = await findRetainedHistoryBlocker(db, parents);
   if (blocker) throw new RetainedHistoryError(blocker);
-  const report = await drainParentDeletionHistory(db, parents, options);
-  // Early exit only: rows committed after this count are counted again by
-  // the ordered delete's in-transaction recount (lockCapacityGraphForDelete).
-  const residual = await countFinalPhaseResidualRows(db, parents);
-  if (residual > PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS) {
-    throw new ParentDeletionDrainPendingError(
-      "Parent deletion still has more history rows than the final delete may take; retry later.",
-    );
-  }
-  return report;
+  return drainParentDeletionHistory(db, parents, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -932,8 +825,8 @@ export async function abandonUserDeletion(
  * or no longer carries that generation. Every destructive effect is bound to
  * the generation under the user row lock: the impersonation-session delete
  * and each drain batch take the row FOR SHARE on the generation first (see
- * {@link UserDeletionOwner}), and the final delete checks it under the L7
- * lock (`deleteUserInCapacityLockOrder`). So once an abandon, restore or new
+ * {@link UserDeletionOwner}), and the final delete checks it under the user
+ * row lock (`deleteUserUnderOwnerFences`). So once an abandon, restore or new
  * mark commits, a worker still holding this generation deletes nothing more.
  * Throws {@link RetainedHistoryError}, a permanent database refusal, a
  * {@link ParentDeletionDrainPendingError}, or a transient failure (see
@@ -964,7 +857,7 @@ export async function completeUserDeletion(
     if (error instanceof UserDeletionGenerationChangedError) return false;
     throw error;
   }
-  return deleteUserInCapacityLockOrder(db, userId, generation);
+  return deleteUserUnderOwnerFences(db, userId, generation);
 }
 
 /**

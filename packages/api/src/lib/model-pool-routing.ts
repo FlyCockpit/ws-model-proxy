@@ -669,11 +669,12 @@ export async function markPoolMemberHalfOpenTrial({
   return result.count;
 }
 
+/** Hot-path health reset: one single-row statement per member (see below). */
 export async function resetPoolMemberHealthForDiscoveredModels(
   discoveredModelIds: string[],
 ): Promise<void> {
   if (discoveredModelIds.length === 0) return;
-  await prisma.poolMember.updateMany({
+  const members = await prisma.poolMember.findMany({
     where: {
       OR: [
         {
@@ -684,10 +685,25 @@ export async function resetPoolMemberHealthForDiscoveredModels(
       ],
       routingStatus: { not: "DISABLED" },
     },
-    data: resetPoolMemberHealth(),
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
+  for (const member of members) {
+    await prisma.poolMember.updateMany({
+      where: { id: member.id, routingStatus: { not: "DISABLED" } },
+      data: resetPoolMemberHealth(),
+    });
+  }
 }
 
+/**
+ * Marks every pool member served by a disconnected CLI device. Hot-path
+ * health write (writer class H, @ws-model-proxy/db/capacity-lock-order): one
+ * single-row statement per member, holding nothing else, so it never holds
+ * one member row while it waits on another (a multi-row UPDATE takes its rows
+ * in heap order and could wait on a management transaction that holds a
+ * later row and waits on an earlier one).
+ */
 export async function markPoolMembersForCliUnavailable({
   cliDeviceId,
   failureClass,
@@ -697,7 +713,7 @@ export async function markPoolMembersForCliUnavailable({
   failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
   now?: Date;
 }): Promise<void> {
-  await prisma.poolMember.updateMany({
+  const members = await prisma.poolMember.findMany({
     where: {
       OR: [
         {
@@ -710,6 +726,11 @@ export async function markPoolMembersForCliUnavailable({
         },
       ],
     },
-    data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
+  const data = transitionPoolMemberHealthForCliUnavailable({ failureClass, now });
+  for (const member of members) {
+    await prisma.poolMember.updateMany({ where: { id: member.id }, data });
+  }
 }

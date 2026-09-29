@@ -60,6 +60,7 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   poolMember: {
+    findMany: MockInstance;
     updateMany: MockInstance;
   };
   executionTarget: {
@@ -198,6 +199,7 @@ function seedRegistrationMocks() {
   db.discoveredModel.findMany.mockResolvedValue([]);
   db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
   db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
+  db.poolMember.findMany.mockResolvedValue([{ id: "pool-member-id" }]);
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
   db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
   db.executionTarget.findUnique.mockResolvedValue({
@@ -641,7 +643,7 @@ describe("RelaySessionManager", () => {
     );
   });
 
-  it("retries a serializable inventory conflict so an identical snapshot keeps one revision", async () => {
+  it("retries a write conflict so an identical snapshot keeps one revision", async () => {
     const parsed = parseRelayClientControlFrame(helloFrame());
     if (parsed.type !== "hello") throw new Error("expected hello frame");
     const conflict = Object.assign(new Error("serialization failure"), { code: "P2034" });
@@ -659,8 +661,9 @@ describe("RelaySessionManager", () => {
     });
 
     expect(db.$transaction).toHaveBeenCalledTimes(2);
+    // READ COMMITTED under the owner fence (@ws-model-proxy/db/capacity-lock-order).
     expect(db.$transaction).toHaveBeenLastCalledWith(expect.any(Function), {
-      isolationLevel: "Serializable",
+      isolationLevel: "ReadCommitted",
     });
     expect(registration.revision).toEqual({
       inventorySeq: 1,
@@ -847,7 +850,7 @@ describe("RelaySessionManager", () => {
       where: { id: "cli-device-id" },
       data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
     });
-    expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenLastCalledWith({
       where: {
         OR: [
           {
@@ -860,6 +863,11 @@ describe("RelaySessionManager", () => {
           },
         ],
       },
+      orderBy: { id: "asc" },
+      select: { id: true },
+    });
+    expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "pool-member-id" },
       data: {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
@@ -886,7 +894,7 @@ describe("RelaySessionManager", () => {
       where: { id: "cli-device-id" },
       data: { status: "STALE", lastDisconnectedAt: staleAt },
     });
-    expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenLastCalledWith({
       where: {
         OR: [
           {
@@ -899,6 +907,11 @@ describe("RelaySessionManager", () => {
           },
         ],
       },
+      orderBy: { id: "asc" },
+      select: { id: true },
+    });
+    expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "pool-member-id" },
       data: {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "STALE_SESSION",

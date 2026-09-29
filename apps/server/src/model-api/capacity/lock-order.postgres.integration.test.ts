@@ -1,4 +1,8 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 
 // DL-1 lock-order regressions on real PostgreSQL. Every scenario pairs a
@@ -31,7 +35,7 @@ vi.mock("@ws-model-proxy/api/lib/discovered-inference-capacity", async (importOr
   };
 });
 
-type Client = ReturnType<typeof createPrismaClient>;
+type Client = ReturnType<typeof createFixturePrismaClient>;
 
 function namedUrl(name: string): string {
   if (!databaseUrl) throw new Error("PostgreSQL URL unavailable.");
@@ -104,9 +108,9 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     registrationRetryErrors.length = 0;
     process.env.DATABASE_URL = databaseUrl;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const admitter = createPrismaClient(namedUrl(`dl1-reg-admitter-${suffix}`));
-    const inspector = createPrismaClient(databaseUrl);
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const admitter = createFixturePrismaClient(namedUrl(`dl1-reg-admitter-${suffix}`));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await fixtures.user.create({
       data: {
         name: "Registration lock order",
@@ -202,7 +206,7 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
         async (tx) => {
           await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
           const pid = await backendPid(tx);
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+          await acquireFences(tx, [fences.capacity(capacityId)]);
           await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacityId} FOR UPDATE`;
           admitterReady(pid);
           await admitterMayInsert;
@@ -259,9 +263,9 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     // must never hold the relay row while it waits on the admission row.
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const admitter = createPrismaClient(namedUrl(`dl1-relay-admitter-${suffix}`));
-    const inspector = createPrismaClient(databaseUrl);
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const admitter = createFixturePrismaClient(namedUrl(`dl1-relay-admitter-${suffix}`));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await fixtures.user.create({
       data: { name: "Relay order", email: `dl1-relay-${suffix}@example.test` },
     });
@@ -361,13 +365,13 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     // Admission-request row locks must be taken in one global order.
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const inspector = createPrismaClient(databaseUrl);
-    const gate = createPrismaClient(namedUrl(`dl1-l6-gate-${suffix}`));
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const inspector = createFixturePrismaClient(databaseUrl);
+    const gate = createFixturePrismaClient(namedUrl(`dl1-l6-gate-${suffix}`));
     const names = [`dl1-l6-one-${suffix}`, `dl1-l6-two-${suffix}`];
     const attemptCounts = [0, 0];
     const countingClient = (index: number): Client => {
-      const client = createPrismaClient(namedUrl(names[index] ?? "dl1-l6"));
+      const client = createFixturePrismaClient(namedUrl(names[index] ?? "dl1-l6"));
       return new Proxy(client, {
         get(target, property) {
           const value = Reflect.get(target, property);
@@ -505,17 +509,32 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
         where: { userId: user.id, attemptId: { startsWith: "holder-" }, state: "ADMITTED" },
         data: { state: "TERMINAL", terminalAt: new Date() },
       });
-      // The gate holds A's member on c1 and B's member on c3 so both
+      // The gate pauses A's lease insert on c1 and B's on c3 (a disposable
+      // trigger waiting on an advisory lock the gate holds), so both
       // admitters pause at their first lease insert, after their first
-      // admission-request row lock.
+      // admission-request row lock. (Before DL-1 (d) the lease insert's FK
+      // check on pool_member was the pause point; hot-path rows now carry no
+      // foreign key into the graph.)
+      const gateKey = 16_006_001;
+      await fixtures.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION dl1_l6_gate() RETURNS trigger LANGUAGE plpgsql AS $f$
+        BEGIN
+          IF (NEW."attemptId" = 'a-${suffix}' AND NEW."capacityId" = '${capacities[0]}')
+             OR (NEW."attemptId" = 'b-${suffix}' AND NEW."capacityId" = '${capacities[2]}') THEN
+            PERFORM pg_advisory_xact_lock(${gateKey});
+          END IF;
+          RETURN NEW;
+        END $f$`);
+      await fixtures.$executeRawUnsafe(
+        `CREATE TRIGGER dl1_l6_gate BEFORE INSERT ON capacity_lease FOR EACH ROW EXECUTE FUNCTION dl1_l6_gate()`,
+      );
       let gateReady!: () => void;
       const gateLocked = new Promise<void>((resolve) => {
         gateReady = resolve;
       });
       gateSide = gate.$transaction(
         async (tx) => {
-          const gated = [poolA.candidates[0]?.poolMemberId, poolB.candidates[1]?.poolMemberId];
-          await tx.$queryRaw`SELECT id FROM pool_member WHERE id = ANY(${gated}::text[]) ORDER BY id FOR UPDATE`;
+          await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(${gateKey})`);
           gateReady();
           await gateMayCommit;
         },
@@ -539,6 +558,8 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     } finally {
       releaseGate();
       await Promise.allSettled([gateSide, ...admissions]);
+      await fixtures.$executeRawUnsafe("DROP TRIGGER IF EXISTS dl1_l6_gate ON capacity_lease");
+      await fixtures.$executeRawUnsafe("DROP FUNCTION IF EXISTS dl1_l6_gate()");
       await cleanupLiveCapacityState(fixtures, user.id);
       await Promise.all([
         fixtures.$disconnect(),

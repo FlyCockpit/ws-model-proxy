@@ -17,15 +17,22 @@ BEGIN;
 -- file is missing from this list. An insert that committed before these
 -- locks is included by the backfills below; one that starts after they are
 -- released sees the installed triggers.
-LOCK TABLE "user", discovered_model, execution_target, model_pool, model_api_token,
-  pool_member, pool_grant, pool_fallback_preference, model_api_token_allowlist_entry, response_stickiness_record,
-  relay_request, inference_capacity, admission_request, capacity_waiter,
+LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, model_pool,
+  model_api_token, pool_member, pool_grant, pool_fallback_preference,
+  model_api_token_allowlist_entry, response_stickiness_record,
+  relay_request, inference_capacity, capacity_runtime, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour,
   cache_affinity_record, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+
+-- Deploy writer (class D): the backfills below rewrite graph rows while every
+-- table is locked exclusively, so no fence can be contended. The graph-write
+-- fence triggers (installed further down) accept any write while this
+-- transaction-local marker is set; only this file and test fixtures set it.
+SELECT set_config('wsmp.fences', ',*,', true);
 
 -- Not a table: taken after the lock so the LOCK is the first statement.
 CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 START 1;
@@ -77,12 +84,30 @@ ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limi
 ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
   ("hardConcurrencyLimit" IS NULL OR "hardConcurrencyLimit" > 0)
   AND ("physicalMaxContext" IS NULL OR "physicalMaxContext" > 0)
-  AND "schedulerCursor" BETWEEN 0 AND 31
+);
+
+ALTER TABLE capacity_runtime DROP CONSTRAINT IF EXISTS capacity_runtime_scheduler_check;
+ALTER TABLE capacity_runtime ADD CONSTRAINT capacity_runtime_scheduler_check CHECK (
+  "schedulerCursor" BETWEEN 0 AND 31
   AND "schedulerVersion" > 0
   AND "nextFencingToken" > 0
   AND ((jsonb_typeof("schedulerDeficits") = 'array' AND jsonb_array_length("schedulerDeficits") = 32)
     OR "schedulerDeficits" = '{}'::jsonb)
 );
+
+-- DL-1 design (d) (#78): the scheduler state moved from inference_capacity to
+-- capacity_runtime. The dangerous schema push dropped the old columns, so the
+-- fairness cursor and deficits restart; the fencing token must not. A
+-- capacity's next token starts above every lease token it ever issued
+-- (capacity_lease keeps (capacityId, fencingToken) unique), whether or not
+-- the capacity row still exists. Idempotent: it only ever raises a counter.
+-- The admission store creates a missing row the same way on first use.
+INSERT INTO capacity_runtime ("capacityId", "userId", "nextFencingToken")
+SELECT lease."capacityId", MIN(lease."userId"), MAX(lease."fencingToken") + 1
+  FROM capacity_lease lease
+ GROUP BY lease."capacityId"
+ON CONFLICT ("capacityId") DO UPDATE
+   SET "nextFencingToken" = GREATEST(capacity_runtime."nextFencingToken", EXCLUDED."nextFencingToken");
 
 ALTER TABLE execution_target DROP CONSTRAINT IF EXISTS execution_target_capacity_policy_check;
 ALTER TABLE execution_target ADD CONSTRAINT execution_target_capacity_policy_check CHECK (
@@ -175,6 +200,34 @@ CREATE TRIGGER cache_affinity_identity_immutable
 BEFORE UPDATE ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_identity_immutable();
 
+-- DL-1 (d): cache affinity is hot-path history without foreign keys to the
+-- graph. What the (poolId, userId) and (executionTargetId, userId) foreign
+-- keys enforced is kept here with plain reads: a record's pool and target
+-- belong to its owner. A parent that no longer exists is tolerated (a
+-- concurrent delete; the record is orphaned history, removed at expiry or by
+-- the pool's clear); a parent of another owner is refused.
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_owner()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_owner$
+DECLARE
+  parent_owner TEXT;
+BEGIN
+  SELECT "userId" INTO parent_owner FROM model_pool WHERE id = NEW."poolId";
+  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+    RAISE EXCEPTION 'cache affinity pool must belong to its owner' USING ERRCODE = '23514';
+  END IF;
+  SELECT "userId" INTO parent_owner FROM execution_target WHERE id = NEW."executionTargetId";
+  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+    RAISE EXCEPTION 'cache affinity target must belong to its owner' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cache_affinity_owner$;
+
+DROP TRIGGER IF EXISTS cache_affinity_owner ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_owner
+BEFORE INSERT ON cache_affinity_record
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+
 ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
 ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (
   ("capacityPriority" IS NULL OR "capacityPriority" BETWEEN 0 AND 31)
@@ -205,8 +258,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
 -- only for `owner/pool:external` requests with caller, token, and owner
 -- consent. The owner's fallback switch ("publicEgressEnabled", Prisma
 -- `fallbackEnabled`) is a runtime gate, not a membership precondition, so the
--- owner can turn fallback off without deleting configured members. The legacy
--- "publicEgressAcknowledged" column is no longer required anywhere.
+-- owner can turn fallback off without deleting configured members.
 CREATE OR REPLACE FUNCTION enforce_pool_member_tier_source()
 RETURNS trigger LANGUAGE plpgsql AS $pool_member_tier_source$
 DECLARE
@@ -539,16 +591,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_unique_direct_candidate
 CREATE UNIQUE INDEX IF NOT EXISTS capacity_lease_one_live_attempt
   ON capacity_lease ("admissionRequestId") WHERE state = 'ACTIVE';
 
+-- Hot-path admission rows (writer class H) have no foreign key to the graph
+-- (DL-1 design (d), #78), so these checks are the integrity boundary. They
+-- are plain SELECTs (no row lock, so they add nothing to any lock order) and
+-- tolerate a deleted parent: a waiter or lease that names a pool, member,
+-- target or capacity deleted concurrently is an orphan the capacity sweeper
+-- terminalizes, never a row that contradicts a live parent. A live parent is
+-- always checked.
 CREATE OR REPLACE FUNCTION enforce_capacity_reference_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $capacity_reference_check$
 DECLARE
   request_owner TEXT;
   request_pool TEXT;
   request_direct_target TEXT;
+  target_found BOOLEAN;
   target_owner TEXT;
   target_capacity TEXT;
+  member_found BOOLEAN;
   member_pool TEXT;
   member_target TEXT;
+  parent_owner TEXT;
 BEGIN
   IF TG_TABLE_NAME = 'execution_target' THEN
     IF NEW."inferenceCapacityId" IS NOT NULL AND NOT EXISTS (
@@ -562,19 +624,20 @@ BEGIN
   END IF;
 
   IF TG_TABLE_NAME = 'admission_request' THEN
-    IF NEW."poolId" IS NOT NULL AND NOT EXISTS (
-      SELECT 1 FROM model_pool pool
-       WHERE pool.id = NEW."poolId" AND pool."userId" = NEW."userId"
-    ) THEN
-      RAISE EXCEPTION 'admission request pool must have the same owner'
-        USING ERRCODE = '23514';
+    IF NEW."poolId" IS NOT NULL THEN
+      SELECT "userId" INTO parent_owner FROM model_pool WHERE id = NEW."poolId";
+      IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+        RAISE EXCEPTION 'admission request pool must have the same owner'
+          USING ERRCODE = '23514';
+      END IF;
     END IF;
-    IF NEW."directExecutionTargetId" IS NOT NULL AND NOT EXISTS (
-      SELECT 1 FROM execution_target target
-       WHERE target.id = NEW."directExecutionTargetId" AND target."userId" = NEW."userId"
-    ) THEN
-      RAISE EXCEPTION 'direct admission target must have the same owner'
-        USING ERRCODE = '23514';
+    IF NEW."directExecutionTargetId" IS NOT NULL THEN
+      SELECT "userId" INTO parent_owner FROM execution_target
+       WHERE id = NEW."directExecutionTargetId";
+      IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+        RAISE EXCEPTION 'direct admission target must have the same owner'
+          USING ERRCODE = '23514';
+      END IF;
     END IF;
     RETURN NEW;
   END IF;
@@ -582,10 +645,11 @@ BEGIN
   SELECT "userId", "poolId", "directExecutionTargetId"
     INTO request_owner, request_pool, request_direct_target
     FROM admission_request WHERE id = NEW."admissionRequestId";
-  SELECT "userId", "inferenceCapacityId" INTO target_owner, target_capacity
+  SELECT true, "userId", "inferenceCapacityId" INTO target_found, target_owner, target_capacity
     FROM execution_target WHERE id = NEW."executionTargetId";
   IF request_owner IS NULL OR request_owner <> NEW."userId"
-     OR target_owner <> NEW."userId" OR target_capacity IS DISTINCT FROM NEW."capacityId" THEN
+     OR (target_found AND (target_owner <> NEW."userId"
+       OR target_capacity IS DISTINCT FROM NEW."capacityId")) THEN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
       USING ERRCODE = '23514';
   END IF;
@@ -614,11 +678,11 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   IF NEW."poolMemberId" IS NOT NULL THEN
-    SELECT "poolId", "executionTargetId" INTO member_pool, member_target
+    SELECT true, "poolId", "executionTargetId" INTO member_found, member_pool, member_target
       FROM pool_member WHERE id = NEW."poolMemberId";
-    IF member_pool IS DISTINCT FROM NEW."poolId"
-       OR member_target IS DISTINCT FROM NEW."executionTargetId"
-       OR request_pool IS DISTINCT FROM NEW."poolId" THEN
+    IF request_pool IS DISTINCT FROM NEW."poolId"
+       OR (member_found AND (member_pool IS DISTINCT FROM NEW."poolId"
+         OR member_target IS DISTINCT FROM NEW."executionTargetId")) THEN
       RAISE EXCEPTION 'capacity admission pool candidate is inconsistent'
         USING ERRCODE = '23514';
     END IF;
@@ -631,7 +695,7 @@ BEGIN
   END IF;
 
   IF TG_TABLE_NAME = 'capacity_waiter' THEN
-    IF NEW."poolMemberId" IS NOT NULL AND NOT EXISTS (
+    IF NEW."poolMemberId" IS NOT NULL AND member_found AND NOT EXISTS (
       SELECT 1
         FROM pool_member member
         JOIN model_pool pool ON pool.id = member."poolId"
@@ -651,7 +715,7 @@ BEGIN
     ) THEN
       RAISE EXCEPTION 'capacity waiter policy snapshot must match its pool member policy'
         USING ERRCODE = '23514';
-    ELSIF NEW."poolMemberId" IS NULL AND NOT EXISTS (
+    ELSIF NEW."poolMemberId" IS NULL AND target_found AND NOT EXISTS (
       SELECT 1 FROM execution_target target
        WHERE target.id = NEW."executionTargetId"
          AND NEW."effectivePriority" = target."directPriority"
@@ -1179,16 +1243,19 @@ BEGIN
       LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
      WHERE record."routingVersion" < 3
        AND record."targetModelPoolId" IS NOT NULL
-       AND (pool.id IS NULL
-         OR (record."poolGrantId" IS NULL AND pool."userId" IS DISTINCT FROM record."userId")
+       -- DL-1 (d): stickiness is hot-path history without foreign keys; a
+       -- binding whose pool or grant was deleted is an orphan (never served
+       -- again), not an inconsistency. Only a live parent that disagrees is.
+       AND pool.id IS NOT NULL
+       AND ((record."poolGrantId" IS NULL AND pool."userId" IS DISTINCT FROM record."userId")
          OR (record."poolGrantId" IS NOT NULL AND (
            pool."userId" IS NOT DISTINCT FROM record."userId"
-           OR NOT EXISTS (
+           OR EXISTS (
              SELECT 1 FROM pool_grant grant_row
               WHERE grant_row.id = record."poolGrantId"
-                AND grant_row."poolId" = record."targetModelPoolId"
-                AND grant_row."ownerUserId" = pool."userId"
-                AND grant_row."granteeUserId" = record."userId"))))
+                AND (grant_row."poolId" IS DISTINCT FROM record."targetModelPoolId"
+                  OR grant_row."ownerUserId" IS DISTINCT FROM pool."userId"
+                  OR grant_row."granteeUserId" IS DISTINCT FROM record."userId")))))
     UNION ALL
     SELECT format('provider stickiness graph row=%s', record.id)
       FROM response_stickiness_record record
@@ -1198,10 +1265,12 @@ BEGIN
       LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
       LEFT JOIN model_api_token token ON token.id = record."modelApiTokenId"
      WHERE record."routingVersion" >= 3
-       AND (target.id IS NULL
-         OR model.id IS NULL
+       -- DL-1 (d): an orphaned binding (its target, pool or token deleted) is
+       -- tolerated; provider models and accounts are soft-deleted, never gone.
+       AND target.id IS NOT NULL
+       AND pool.id IS NOT NULL
+       AND (model.id IS NULL
          OR acct.id IS NULL
-         OR pool.id IS NULL
          OR target."providerModelId" IS DISTINCT FROM record."providerModelId"
          OR model."providerAccountId" IS DISTINCT FROM record."providerAccountId"
          OR model."upstreamModelId" IS DISTINCT FROM record."providerUpstreamModelId"
@@ -1217,17 +1286,16 @@ BEGIN
          -- operation, so it is not re-audited here.
          OR (record."fallbackRoute" IS DISTINCT FROM 'own-key'
            AND pool."userId" IS DISTINCT FROM target."userId")
-         OR (record."modelApiTokenId" IS NOT NULL
-           AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
+         OR (token.id IS NOT NULL AND token."userId" IS DISTINCT FROM record."userId")
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
            AND record."poolGrantId" IS NOT NULL)
          OR (record."userId" IS DISTINCT FROM pool."userId" AND (
-           record."poolGrantId" IS NULL OR NOT EXISTS (
+           record."poolGrantId" IS NULL OR EXISTS (
              SELECT 1 FROM pool_grant grant_row
               WHERE grant_row.id = record."poolGrantId"
-                AND grant_row."poolId" = record."targetModelPoolId"
-                AND grant_row."ownerUserId" = pool."userId"
-                AND grant_row."granteeUserId" = record."userId"
+                AND (grant_row."poolId" IS DISTINCT FROM record."targetModelPoolId"
+                  OR grant_row."ownerUserId" IS DISTINCT FROM pool."userId"
+                  OR grant_row."granteeUserId" IS DISTINCT FROM record."userId")
            )
          )))
     UNION ALL
@@ -1242,10 +1310,12 @@ BEGIN
       FROM relay_request request
       JOIN execution_target target ON target.id = request."selectedExecutionTargetId"
       LEFT JOIN model_pool pool ON pool.id = request."requestedModelPoolId"
+     -- DL-1 (d): once the pool is gone the durable resource owner stands in
+     -- for it, as in enforce_execution_target_consumer_consistency.
      WHERE target."userId" IS DISTINCT FROM CASE
              WHEN request."fallbackRoute" = 'own-key' OR request."requestedModelPoolId" IS NULL
                THEN request."userId"
-             ELSE pool."userId"
+             ELSE COALESCE(pool."userId", request."resourceOwnerUserId")
            END
         OR (request."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM request."selectedDiscoveredModelId")
@@ -1637,12 +1707,18 @@ BEGIN
       END IF;
     END IF;
   ELSIF TG_TABLE_NAME = 'relay_request' THEN
+    -- relay_request is hot-path history (DL-1 design (d), #78): it names its
+    -- pool, targets and member by plain id and keeps them after they are
+    -- deleted. A live parent is always checked; a deleted one is not (the
+    -- request's late finalizer must still commit its status and counters).
+    -- Readers fail closed on a deleted parent: they expose an owner's
+    -- target/member/capacity identities only to that owner.
     IF NEW."requestedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
-      IF target_owner IS NULL OR target_owner <> NEW."userId"
+      IF FOUND AND (target_owner IS DISTINCT FROM NEW."userId"
          OR (NEW."requestedDiscoveredModelId" IS NOT NULL
-             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
+             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId")) THEN
         RAISE EXCEPTION 'relay request target must match its owner and discovered model'
           USING ERRCODE = '23514';
       END IF;
@@ -1682,39 +1758,22 @@ BEGIN
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      -- userId is the caller. Local and owner-paid pool targets belong to the
-      -- pool owner; DIRECT and own-key targets belong to the caller. This is
-      -- historical identity, not a live-grant authorization check.
-      consumer_owner := NEW."userId";
-      IF NEW."requestedModelPoolId" IS NOT NULL AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key' THEN
-        SELECT "userId" INTO consumer_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
-      END IF;
-      -- Both the app's terminal-history drain (before the pool is deleted)
-      -- and its SET NULL cascade remove the ownership anchor. Erase the
-      -- unchanged cross-tenant selection with it. This never authorizes a
-      -- new target, model, caller or route, nor changes a terminal state.
-      IF TG_OP = 'UPDATE' AND OLD."requestedModelPoolId" IS NOT NULL
-         AND NEW."requestedModelPoolId" IS NULL
-         AND NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId"
-         AND NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId"
-         AND (NEW."selectedPoolMemberId" IS NULL
-              OR NEW."selectedPoolMemberId" IS NOT DISTINCT FROM OLD."selectedPoolMemberId")
-         AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
-         AND NEW."fallbackRoute" IS NOT DISTINCT FROM OLD."fallbackRoute"
-         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
-         AND target_owner IS DISTINCT FROM NEW."userId"
-         AND ((OLD.status IN ('SUCCEEDED', 'FAILED', 'CANCELED') AND NEW.status = OLD.status)
-              OR NOT EXISTS (SELECT 1 FROM model_pool WHERE id = OLD."requestedModelPoolId")) THEN
-        NEW."selectedExecutionTargetId" := NULL;
-        NEW."selectedDiscoveredModelId" := NULL;
-        NEW."selectedPoolMemberId" := NULL;
-        RETURN NEW;
-      END IF;
-      IF target_owner IS NULL OR target_owner IS DISTINCT FROM consumer_owner
-         OR (NEW."selectedDiscoveredModelId" IS NOT NULL
-             AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
-        RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
-          USING ERRCODE = '23514';
+      IF FOUND THEN
+        -- userId is the caller. Local and owner-paid pool targets belong to
+        -- the pool owner (the durable resource owner once the pool is gone);
+        -- DIRECT and own-key targets belong to the caller. This is
+        -- historical identity, not a live-grant authorization check.
+        consumer_owner := NEW."userId";
+        IF NEW."requestedModelPoolId" IS NOT NULL AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key' THEN
+          SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+          consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId");
+        END IF;
+        IF target_owner IS DISTINCT FROM consumer_owner
+           OR (NEW."selectedDiscoveredModelId" IS NOT NULL
+               AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
+          RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
+            USING ERRCODE = '23514';
+        END IF;
       END IF;
     END IF;
   END IF;
@@ -1743,9 +1802,10 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 -- Durable usage attribution for relay requests (#66, P3C-2). Derived here,
 -- never trusted from the writer: the requested pool's owner, else the
 -- requester (a direct target must belong to the requester). Pinned once set,
--- so the pool's deletion (SET NULL drain or cascade) keeps the owner; only
--- attaching a different live pool re-derives it. A plain id, not a foreign
--- key: rollup writers skip an owner that no longer exists.
+-- so the pool's deletion (the pool id then dangles) keeps the owner; only
+-- attaching a different live pool re-derives it. A plain id, like every
+-- graph reference of relay_request: rollup writers skip an owner that no
+-- longer exists.
 CREATE OR REPLACE FUNCTION derive_relay_request_resource_owner()
 RETURNS trigger LANGUAGE plpgsql AS $relay_resource_owner$
 DECLARE
@@ -2490,8 +2550,8 @@ BEGIN
       RAISE EXCEPTION 'usage ledger credential is inconsistent' USING ERRCODE = '23514';
     END IF;
     IF NEW."reservationId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_budget_reservation br
-      JOIN provider_budget_policy bp ON bp.id = br."policyId" WHERE br.id = NEW."reservationId"
-        AND br."userId" = NEW."userId" AND bp."providerAccountId" = NEW."providerAccountId"
+      WHERE br.id = NEW."reservationId"
+        AND br."userId" = NEW."userId" AND br."providerAccountId" = NEW."providerAccountId"
         AND br."requestId" = NEW."requestId" AND br."attemptId" = NEW."attemptId"
         AND br."fencingToken" = NEW."fencingToken"
         AND br."providerModelId" = NEW."providerModelId"
@@ -2528,20 +2588,26 @@ $provider_budget_graph$;
 DROP TRIGGER IF EXISTS provider_budget_policy_graph_consistency ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_policy
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+-- DL-1 (d): provider_attempt, provider_budget_reservation, provider_usage_ledger
+-- and provider_budget_settlement are hot-path history without foreign keys to
+-- the graph. Their identity is immutable after insert (the *_transition and
+-- *_immutable triggers), so the graph is checked once, at INSERT: a later
+-- state transition (terminalization, settlement) must still commit when a
+-- referenced pool or budget policy was deleted meanwhile.
 DROP TRIGGER IF EXISTS provider_budget_reservation_graph_consistency ON provider_budget_reservation;
-CREATE TRIGGER provider_budget_reservation_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_reservation
+CREATE TRIGGER provider_budget_reservation_graph_consistency BEFORE INSERT ON provider_budget_reservation
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_attempt_graph_consistency ON provider_attempt;
-CREATE TRIGGER provider_attempt_graph_consistency BEFORE INSERT OR UPDATE ON provider_attempt
+CREATE TRIGGER provider_attempt_graph_consistency BEFORE INSERT ON provider_attempt
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_pricing_version_graph_consistency ON provider_pricing_version;
 CREATE TRIGGER provider_pricing_version_graph_consistency BEFORE INSERT OR UPDATE ON provider_pricing_version
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_usage_ledger_graph_consistency ON provider_usage_ledger;
-CREATE TRIGGER provider_usage_ledger_graph_consistency BEFORE INSERT OR UPDATE ON provider_usage_ledger
+CREATE TRIGGER provider_usage_ledger_graph_consistency BEFORE INSERT ON provider_usage_ledger
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_budget_settlement_graph_consistency ON provider_budget_settlement;
-CREATE TRIGGER provider_budget_settlement_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_settlement
+CREATE TRIGGER provider_budget_settlement_graph_consistency BEFORE INSERT ON provider_budget_settlement
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_audit_event_graph_consistency ON provider_audit_event;
 CREATE TRIGGER provider_audit_event_graph_consistency BEFORE INSERT OR UPDATE ON provider_audit_event
@@ -2589,135 +2655,16 @@ DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_poli
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 
--- Usage rollups keep the RESOURCE owner's history when a REQUESTER is deleted.
--- requesterUserId is not a foreign key (a SET NULL / SET DEFAULT action would
--- collide with an existing sentinel row in the composite primary key), so this
--- AFTER DELETE trigger merges the deleted user's requester rows into the ''
--- sentinel requester of the same owner/bucket/pool/member/target/source, and
--- drops rows the user also owned (the owner FK cascade has already removed
--- them).
---
--- Ordering and locks (READ COMMITTED):
---  * The trigger name sorts after PostgreSQL's RI_ConstraintTrigger_*
---    triggers, so it runs after the cascades of this DELETE: the relay_request
---    cascade (requests this user MADE) has waited for any in-flight finalizer
---    holding such a request's row lock and seen its rollup commit, and no
---    later finalizer can write a row with requesterUserId = this user.
---  * Minute rows are moved before hour rows. DELETE ... RETURNING row-locks
---    them, so a concurrent compaction either committed first (its hour rows
---    are then visible to the hour step's fresh statement snapshot) or skips
---    the locked rows (FOR UPDATE SKIP LOCKED).
---  * The '' sentinel upserts run in the application's rollup key order
---    (bucketStart, then the text keys by code point, i.e. COLLATE "C"), the
---    same order writeRollupIncrements uses for finalizers and compaction, so
---    two writers of overlapping sentinel keys never wait on each other in
---    opposite orders.
---
--- Known issue F2-02 (user-accepted; deferred to DL-1 design (d), which makes
--- the history telemetry tables foreign-key free): transient deadlocks, not
--- prevented here, recovered as described below. When the user being
--- deleted is also a resource OWNER, (a) an in-flight finalizer of a request
--- on the user's pool/target holds that relay_request row lock and inserts a
--- new rollup row whose ownerUserId FK takes KEY SHARE on this "user" row,
--- while this DELETE holds the "user" row and its cascade waits for the
--- relay_request row lock; (b) compaction holds minute rows the owner cascade
--- must delete while its hour INSERT's owner FK waits for this "user" row.
--- (Case (a) blocks on the relay_request row because the pool/target cascade
--- sets that request's requestedModelPoolId / execution-target links NULL.)
--- PostgreSQL aborts one transaction of the cycle atomically: an aborted
--- finalizer leaves its request PENDING and uncounted, to be re-run by the
--- deferred local-finalization registry or counted later by crash repair or
--- the abandoned-request reaper; an aborted compaction batch is retried by the
--- next sweep; an aborted user delete surfaces as a retryable error
--- (users.remove).
--- Nothing is lost or double-counted because every side commits or rolls back
--- as a whole.
-CREATE OR REPLACE FUNCTION detach_usage_rollup_requester()
-RETURNS trigger LANGUAGE plpgsql AS $usage_rollup_detach_requester$
-BEGIN
-  WITH moved AS (
-    DELETE FROM usage_rollup_minute WHERE "requesterUserId" = OLD.id RETURNING *
-  )
-  INSERT INTO usage_rollup_minute AS target (
-    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
-    "latencyHistogram", "ttftHistogram"
-  )
-  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
-    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
-    "latencyHistogram", "ttftHistogram"
-    FROM moved
-   WHERE "ownerUserId" <> OLD.id
-   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
-     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
-  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-    "executionTargetId", source)
-  DO UPDATE SET
-      "requests" = target."requests" + EXCLUDED."requests",
-      "successes" = target."successes" + EXCLUDED."successes",
-      "errors" = target."errors" + EXCLUDED."errors",
-      "cancels" = target."cancels" + EXCLUDED."cancels",
-      "retries" = target."retries" + EXCLUDED."retries",
-      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
-      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
-      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
-      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
-      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
-      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
-      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
-      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
-      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
-      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
-      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
-      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
-      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
-      "updatedAt" = now();
-
-  WITH moved AS (
-    DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *
-  )
-  INSERT INTO usage_rollup_hour AS target (
-    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
-    "latencyHistogram", "ttftHistogram"
-  )
-  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
-    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
-    "latencyHistogram", "ttftHistogram"
-    FROM moved
-   WHERE "ownerUserId" <> OLD.id
-   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
-     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
-  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-    "executionTargetId", source)
-  DO UPDATE SET
-      "requests" = target."requests" + EXCLUDED."requests",
-      "successes" = target."successes" + EXCLUDED."successes",
-      "errors" = target."errors" + EXCLUDED."errors",
-      "cancels" = target."cancels" + EXCLUDED."cancels",
-      "retries" = target."retries" + EXCLUDED."retries",
-      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
-      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
-      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
-      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
-      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
-      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
-      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
-      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
-      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
-      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
-      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
-      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
-      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
-      "updatedAt" = now();
-
-  RETURN OLD;
-END;
-$usage_rollup_detach_requester$;
-
+-- DL-1 design (d) (#78): usage rollups have no foreign key to "user" (they
+-- are hot-path history), so a user DELETE no longer writes them. The former
+-- AFTER DELETE trigger that merged a deleted requester's rows into the ''
+-- sentinel requester made the user delete write hot-path rows (F2-02: it
+-- could deadlock with a finalizer or compaction). The same merge now runs in
+-- bounded SKIP LOCKED batches: before the delete in the user-deletion drain,
+-- and after it in the history purge sweeper for rows written by requests
+-- still in flight (packages/db/src/usage-rollup-requester-drain.ts).
 DROP TRIGGER IF EXISTS usage_rollup_detach_requester ON "user";
-CREATE TRIGGER usage_rollup_detach_requester AFTER DELETE ON "user"
-FOR EACH ROW EXECUTE FUNCTION detach_usage_rollup_requester();
+DROP FUNCTION IF EXISTS detach_usage_rollup_requester();
 
 -- DEL-STATE commit-point denial: no browser session commits for a user whose
 -- deletion is pending ("deletionRequestedAt" set). The application's Better
@@ -2831,5 +2778,245 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS pool_fallback_preference_grantee ON pool_fallback_preference;
 CREATE TRIGGER pool_fallback_preference_grantee BEFORE INSERT OR UPDATE ON pool_fallback_preference
 FOR EACH ROW EXECUTE FUNCTION enforce_pool_fallback_preference_grantee();
+
+-- DL-1 design (d) (#78): fences. Every advisory lock the application takes is
+-- a transaction-scoped "fence" named LL:kind:id (LL = a two-digit level that
+-- fixes the global order; see packages/db/src/capacity-lock-order.ts, the
+-- only caller). A fence is taken before the transaction's first row lock or
+-- write: once it has an xid (a row lock or a write) the request is refused
+-- with WMPF1. (nextval takes no lock; it assigns an xid only when it WAL-logs
+-- a new batch of values, so it may or may not trip the check.) Fences are taken in ascending name order across the
+-- whole transaction (WMPF2). The held set is recorded in the
+-- transaction-local setting wsmp.fences (",name,name,") for the graph-write
+-- triggers below. With wait = false (sweepers) a busy fence returns false at
+-- once; the caller then ends its transaction without waiting.
+CREATE OR REPLACE FUNCTION wsmp_acquire_fences(requested TEXT[], wait BOOLEAN)
+RETURNS BOOLEAN LANGUAGE plpgsql AS $wsmp_acquire_fences$
+DECLARE
+  held TEXT := COALESCE(NULLIF(current_setting('wsmp.fences', true), ''), ',');
+  last_fence TEXT := COALESCE(current_setting('wsmp.fence_last', true), '');
+  fence TEXT;
+BEGIN
+  IF txid_current_if_assigned() IS NOT NULL THEN
+    RAISE EXCEPTION 'fences must be taken before the transaction locks or writes a row'
+      USING ERRCODE = 'WMPF1';
+  END IF;
+  FOREACH fence IN ARRAY requested LOOP
+    IF fence IS NULL OR fence !~ '^[0-9]{2}:[a-z][a-z-]*:[^,]+$' THEN
+      RAISE EXCEPTION 'malformed fence %', fence USING ERRCODE = 'WMPF3';
+    END IF;
+    CONTINUE WHEN strpos(held, ',' || fence || ',') > 0;
+    IF last_fence <> '' AND fence COLLATE "C" <= last_fence COLLATE "C" THEN
+      RAISE EXCEPTION 'fence % requested after fence %', fence, last_fence
+        USING ERRCODE = 'WMPF2';
+    END IF;
+    IF wait THEN
+      PERFORM pg_advisory_xact_lock(hashtextextended(substr(fence, 4), 0));
+    ELSIF NOT pg_try_advisory_xact_lock(hashtextextended(substr(fence, 4), 0)) THEN
+      PERFORM set_config('wsmp.fences', held, true);
+      PERFORM set_config('wsmp.fence_last', last_fence, true);
+      RETURN false;
+    END IF;
+    held := held || fence || ',';
+    last_fence := fence;
+  END LOOP;
+  PERFORM set_config('wsmp.fences', held, true);
+  PERFORM set_config('wsmp.fence_last', last_fence, true);
+  RETURN true;
+END;
+$wsmp_acquire_fences$;
+
+CREATE OR REPLACE FUNCTION wsmp_require_fence(fence TEXT, relation TEXT)
+RETURNS VOID LANGUAGE plpgsql AS $wsmp_require_fence$
+DECLARE
+  held TEXT := COALESCE(current_setting('wsmp.fences', true), '');
+BEGIN
+  IF strpos(held, ',' || fence || ',') = 0 AND strpos(held, ',*,') = 0 THEN
+    RAISE EXCEPTION 'write to % requires fence %', relation, fence
+      USING ERRCODE = 'WMPF4',
+            HINT = 'Take it with acquireFences (packages/db/src/capacity-lock-order.ts) before the first row lock or write of the transaction.';
+  END IF;
+END;
+$wsmp_require_fence$;
+
+-- A row version this transaction wrote (inserted, or updated earlier while
+-- holding the fences that update needed). No other transaction can see a row
+-- this transaction inserted, so writing its policy needs no policy fence.
+CREATE OR REPLACE FUNCTION wsmp_written_by_this_transaction(row_xmin XID)
+RETURNS BOOLEAN LANGUAGE sql VOLATILE AS $wsmp_written_here$
+  SELECT row_xmin::text::bigint = txid_current() % 4294967296
+$wsmp_written_here$;
+
+-- The users whose owner fence a write of this graph row needs: the row's
+-- owner, both parties of a pool grant, and for an allowlist entry both the
+-- token owner and the referenced resource's owner (an entry links two
+-- owners' graphs, so a delete of either side reaches it). A parent that no
+-- longer exists contributes nothing: the write is then part of that parent's
+-- cascade, whose own trigger checked its owner, or its foreign key fails.
+CREATE OR REPLACE FUNCTION wsmp_graph_row_owners(relation TEXT, row_data JSONB)
+RETURNS TEXT[] LANGUAGE plpgsql STABLE AS $wsmp_graph_row_owners$
+BEGIN
+  RETURN CASE relation
+    WHEN 'user' THEN ARRAY[row_data ->> 'id']
+    WHEN 'pool_member' THEN ARRAY[
+      (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
+    WHEN 'pool_grant' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
+    WHEN 'model_api_token_allowlist_entry' THEN ARRAY[
+      (SELECT "userId" FROM model_api_token WHERE id = row_data ->> 'modelApiTokenId'),
+      (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'modelPoolId'),
+      (SELECT "userId" FROM discovered_model WHERE id = row_data ->> 'discoveredModelId'),
+      (SELECT "userId" FROM execution_target WHERE id = row_data ->> 'executionTargetId')]
+    WHEN 'provider_budget_rule' THEN ARRAY[
+      (SELECT "userId" FROM provider_budget_policy WHERE id = row_data ->> 'policyId')]
+    ELSE ARRAY[row_data ->> 'userId']
+  END;
+END;
+$wsmp_graph_row_owners$;
+
+-- Graph-write fence (writer class M). An INSERT, a DELETE (a cascaded one
+-- too) or an UPDATE that changes an identity/reference column (TG_ARGV[0]) or
+-- a capacity-policy column (TG_ARGV[1]) of a graph row needs the owner fence
+-- of every owner of the row; a policy change also needs the fences of the
+-- admission views it changes (capacity-policy:<target>, capacity:<capacity>),
+-- unless this transaction created the row. Status columns (health, last-used,
+-- connection state, display fields) are not listed: hot-path writers change
+-- them without a fence, one row per statement. A missing fence raises WMPF4:
+-- a forgotten fence fails deterministically instead of deadlocking.
+-- Plain SELECTs only: the check adds no lock.
+CREATE OR REPLACE FUNCTION enforce_graph_write_fence()
+RETURNS trigger LANGUAGE plpgsql AS $graph_write_fence$
+DECLARE
+  structural TEXT[] := string_to_array(TG_ARGV[0], ',');
+  policy TEXT[] := string_to_array(COALESCE(TG_ARGV[1], ''), ',');
+  row_new JSONB;
+  row_old JSONB;
+  column_name TEXT;
+  changed BOOLEAN := TG_OP <> 'UPDATE';
+  policy_changed BOOLEAN := false;
+  owners TEXT[] := ARRAY[]::TEXT[];
+  owner_id TEXT;
+  target_id TEXT;
+BEGIN
+  IF strpos(COALESCE(current_setting('wsmp.fences', true), ''), ',*,') > 0 THEN
+    RETURN COALESCE(NEW, OLD);
+  END IF;
+  IF TG_OP <> 'DELETE' THEN
+    row_new := to_jsonb(NEW);
+    owners := owners || wsmp_graph_row_owners(TG_TABLE_NAME, row_new);
+  END IF;
+  IF TG_OP <> 'INSERT' THEN
+    row_old := to_jsonb(OLD);
+    owners := owners || wsmp_graph_row_owners(TG_TABLE_NAME, row_old);
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    FOREACH column_name IN ARRAY structural LOOP
+      IF (row_new -> column_name) IS DISTINCT FROM (row_old -> column_name) THEN
+        changed := true;
+      END IF;
+    END LOOP;
+    FOREACH column_name IN ARRAY policy LOOP
+      IF (row_new -> column_name) IS DISTINCT FROM (row_old -> column_name) THEN
+        policy_changed := true;
+      END IF;
+    END LOOP;
+    IF NOT changed AND NOT policy_changed THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+  FOREACH owner_id IN ARRAY owners LOOP
+    CONTINUE WHEN owner_id IS NULL;
+    PERFORM wsmp_require_fence('00:owner:' || owner_id, TG_TABLE_NAME);
+  END LOOP;
+
+  IF TG_TABLE_NAME = 'pool_member' THEN
+    -- Membership and member policy feed the admission view of the member's
+    -- target (and the reservations of its capacity).
+    IF TG_OP = 'INSERT' THEN
+      target_id := NEW."executionTargetId";
+      IF target_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM execution_target target
+         WHERE target.id = target_id AND wsmp_written_by_this_transaction(target.xmin)
+      ) THEN
+        PERFORM wsmp_require_fence('06:capacity-policy:' || target_id, TG_TABLE_NAME);
+      END IF;
+    ELSIF TG_OP = 'UPDATE' AND policy_changed
+          AND NOT wsmp_written_by_this_transaction(OLD.xmin) THEN
+      IF OLD."executionTargetId" IS NOT NULL THEN
+        PERFORM wsmp_require_fence('06:capacity-policy:' || OLD."executionTargetId", TG_TABLE_NAME);
+      END IF;
+      IF NEW."executionTargetId" IS NOT NULL THEN
+        PERFORM wsmp_require_fence('06:capacity-policy:' || NEW."executionTargetId", TG_TABLE_NAME);
+      END IF;
+    END IF;
+  ELSIF policy_changed AND NOT wsmp_written_by_this_transaction(OLD.xmin) THEN
+    IF TG_TABLE_NAME = 'execution_target' THEN
+      PERFORM wsmp_require_fence('06:capacity-policy:' || NEW.id, TG_TABLE_NAME);
+    ELSIF TG_TABLE_NAME = 'inference_capacity' THEN
+      PERFORM wsmp_require_fence('08:capacity:' || NEW.id, TG_TABLE_NAME);
+    ELSIF TG_TABLE_NAME = 'model_pool' THEN
+      FOR target_id IN
+        SELECT DISTINCT member."executionTargetId" FROM pool_member member
+         WHERE member."poolId" = NEW.id AND member."executionTargetId" IS NOT NULL
+      LOOP
+        PERFORM wsmp_require_fence('06:capacity-policy:' || target_id, TG_TABLE_NAME);
+      END LOOP;
+    END IF;
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$graph_write_fence$;
+
+DO $install_graph_write_fences$
+DECLARE
+  spec RECORD;
+BEGIN
+  FOR spec IN SELECT * FROM (VALUES
+    ('user', '', ''),
+    ('cli_device', 'id,userId,slug', ''),
+    ('endpoint', 'id,userId,cliDeviceId,slug', ''),
+    ('discovered_model', 'id,userId,endpointId,upstreamModelId,encodedModelId,slug', ''),
+    ('execution_target', 'id,userId,kind,discoveredModelId,providerModelId',
+      'inferenceCapacityId,directPriority,directConcurrencyLimit,directReservedSlots,directBorrowPolicy,directWaitBudgetMs,directContextCeiling,directContextMargin'),
+    ('inference_capacity', 'id,userId,runtimeIdentityKey', 'hardConcurrencyLimit'),
+    ('model_pool', 'id,userId,slug,transformerDiscoveredModelId',
+      'capacityPriority,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMs,capacityContextCeiling,capacityContextMargin'),
+    ('pool_member', 'id,poolId,discoveredModelId,executionTargetId',
+      'tier,capacityPriority,capacityConcurrencyMode,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMode,capacityWaitBudgetMs,capacityContextCeilingMode,capacityContextCeiling,capacityContextMargin'),
+    ('pool_grant', 'id,poolId,ownerUserId,granteeUserId', ''),
+    ('model_api_token', 'id,userId,lookupPrefix,secretDigest', ''),
+    ('model_api_token_allowlist_entry', 'id,modelApiTokenId,target,discoveredModelId,executionTargetId,modelPoolId', ''),
+    ('provider_account', 'id,userId,currentCredentialId', ''),
+    ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
+    ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),
+    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId', ''),
+    ('provider_budget_rule', 'id,policyId', ''),
+    ('provider_pricing_version', 'id,userId,providerAccountId,providerModelId', ''),
+    ('pool_fallback_preference', 'id,userId,poolId,poolGrantId,providerModelId', '')
+  ) AS t(relation, structural, policy)
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS z_graph_write_fence ON %I', spec.relation);
+    EXECUTE format('DROP TRIGGER IF EXISTS z_graph_update_fence ON %I', spec.relation);
+    IF spec.relation = 'user' THEN
+      -- The user row: only its delete (the root of the user cascade) is fenced.
+      EXECUTE format(
+        'CREATE TRIGGER z_graph_write_fence BEFORE DELETE ON "user" '
+        'FOR EACH ROW EXECUTE FUNCTION enforce_graph_write_fence(%L, %L)', '', '');
+    ELSE
+      EXECUTE format(
+        'CREATE TRIGGER z_graph_write_fence BEFORE INSERT OR DELETE ON %I '
+        'FOR EACH ROW EXECUTE FUNCTION enforce_graph_write_fence(%L, %L)',
+        spec.relation, spec.structural, spec.policy);
+      EXECUTE format(
+        'CREATE TRIGGER z_graph_update_fence BEFORE UPDATE OF %s ON %I '
+        'FOR EACH ROW EXECUTE FUNCTION enforce_graph_write_fence(%L, %L)',
+        (SELECT string_agg(format('%I', column_name), ', ')
+           FROM unnest(string_to_array(
+             spec.structural || CASE WHEN spec.policy = '' THEN '' ELSE ',' || spec.policy END,
+             ',')) AS column_name),
+        spec.relation, spec.structural, spec.policy);
+    END IF;
+  END LOOP;
+END;
+$install_graph_write_fences$;
 
 COMMIT;
