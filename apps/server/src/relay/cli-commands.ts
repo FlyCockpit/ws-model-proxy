@@ -1,11 +1,4 @@
 import { randomBytes } from "node:crypto";
-import {
-  allowsHeadlessCommands,
-  allowsSupervisedCommands,
-  type McpCommandModeDb,
-  mcpCommandModeFromDb,
-} from "@ws-model-proxy/api/lib/mcp-command-mode";
-import { activeMcpPersonalTokenWhere } from "@ws-model-proxy/api/lib/mcp-token-active";
 import type {
   PendingSupervisedRequest,
   SubmitSupervisedOutputResult,
@@ -17,9 +10,12 @@ import {
   cleanText,
   TerminalByteState,
 } from "@ws-model-proxy/config/cli-command-output";
-import prisma from "@ws-model-proxy/db";
-import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
-import { relayProtocolAtLeast } from "./protocol.js";
+import {
+  judgeCliAgentAdmission,
+  readCliAgentAdmission,
+  resetCliAgentAdmissionsForTests,
+  revokeOpenCliAgentAdmissions,
+} from "./cli-agent-admission.js";
 import {
   relaySessionManager,
   type SupervisedTerminalGoneCause,
@@ -28,30 +24,6 @@ import {
   type TrackedSupervisedCommand,
 } from "./session-manager.js";
 import { characterCount, isWellFormedText, truncateCharacters } from "./wire-text.js";
-
-type CliOwnerState = {
-  banned: boolean | null;
-  banExpires: Date | null;
-  deletionRequestedAt: Date | null;
-};
-
-/**
- * The owner's account state, read inside the admission (same `Promise.all`
- * as the device and token reads) so the verdict needs no await after
- * `admitted()`. See `Admission` for why a mark committed after this read is
- * still covered.
- */
-function readCliOwner(userId: string): Promise<CliOwnerState | null> {
-  return prisma.user.findUnique({
-    where: { id: userId },
-    select: { banned: true, banExpires: true, deletionRequestedAt: true },
-  });
-}
-
-/** Synchronous owner verdict: missing, banned (with expiry) or deleting refuses. */
-function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
-  return owner !== null && !userCredentialAccessBlocked(owner, new Date());
-}
 
 const HEAD_MAX_BYTES = 8192;
 const TAIL_MAX_BYTES = 40960;
@@ -280,69 +252,6 @@ function validCommandInput(command: string, cwd: string | undefined): boolean {
   );
 }
 
-/**
- * One start request between its first await and the moment its record is
- * registered (or it is refused). `cancelCommandsForToken` only sees records
- * that exist, so it also marks the open admissions of the token; the start
- * then refuses. Together with the live token read (issued after the
- * admission opened) this orders every revoke or narrowing against a start:
- * - committed before the read: the read sees it and the start refuses;
- * - swept while the admission is open: the mark refuses the start;
- * - swept later: the record exists by then (closing the admission,
- *   registering the record and sending the frame happen in one synchronous
- *   step) and the sweep ends it like any other.
- * The owner read (ban, ban expiry, deletion marker) is issued in the same
- * `Promise.all`, so its verdict is also taken without an await after
- * `admitted()`. A deletion mark is ordered against a start the same way:
- * - committed before the owner read: the read sees it and the start refuses;
- * - committed after it: `notifyUserDeletionMarked` runs the in-process
- *   `closeSessionsForUser`, which tears down and detaches the device socket
- *   synchronously. Before the start's synchronous step the device has no
- *   live session (the start returns `offline`); after it, the registered
- *   record is ended with the session.
- * In memory, single process: the relay sockets and the sweeps live here.
- */
-type Admission = { tokenId: string; revoked: boolean };
-const openAdmissions = new Set<Admission>();
-
-function openAdmission(tokenId: string): Admission {
-  const admission = { tokenId, revoked: false };
-  openAdmissions.add(admission);
-  return admission;
-}
-
-type LiveCliToken = { name: string; expiresAt: Date | null };
-
-/**
- * The PAT as it is now: unrevoked (with its grant), unexpired, still minted
- * with CLI commands and mcp:write. Null when any of that no longer holds.
- */
-async function liveCliToken(tokenId: string, userId: string): Promise<LiveCliToken | null> {
-  const token = await prisma.mcpPersonalToken.findFirst({
-    where: { id: tokenId, ...activeMcpPersonalTokenWhere(userId, new Date()) },
-    select: { name: true, scopes: true, allowCliCommands: true, expiresAt: true },
-  });
-  if (token?.allowCliCommands !== true || !token.scopes.includes("mcp:write")) {
-    return null;
-  }
-  return { name: token.name, expiresAt: token.expiresAt };
-}
-
-/**
- * The admission verdict, taken in the same synchronous step that registers
- * the record: the token must be live, not swept meanwhile, and unexpired now.
- */
-function admitted(
-  admission: Admission,
-  token: LiveCliToken | null,
-  admittedExpiry: Date | null,
-): token is LiveCliToken {
-  if (admission.revoked || token === null) return false;
-  const now = Date.now();
-  if (token.expiresAt !== null && token.expiresAt.getTime() <= now) return false;
-  return admittedExpiry === null || admittedExpiry.getTime() > now;
-}
-
 export async function startCliCommand(input: {
   userId: string;
   tokenId: string;
@@ -351,37 +260,10 @@ export async function startCliCommand(input: {
   command: string;
   cwd?: string;
 }): Promise<{ ok: true; commandId: string } | { ok: false; error: CliCommandRejection }> {
-  const admission = openAdmission(input.tokenId);
-  let device: { id: string; userId: string; mcpCommandMode: McpCommandModeDb } | null;
-  let token: LiveCliToken | null;
-  let owner: CliOwnerState | null;
-  try {
-    [device, token, owner] = await Promise.all([
-      prisma.cliDevice.findUnique({
-        where: { id: input.cliDeviceId },
-        select: { id: true, userId: true, mcpCommandMode: true },
-      }),
-      liveCliToken(input.tokenId, input.userId),
-      readCliOwner(input.userId),
-    ]);
-  } finally {
-    openAdmissions.delete(admission);
-  }
-  // From here to the dispatch nothing awaits (see `Admission`).
-  if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
-  if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
-  if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };
-  const grant = mcpCommandModeFromDb(device.mcpCommandMode);
-  if (grant === "off") return { ok: false, error: "grant_disabled" };
-  // Mode `supervised`: a person must confirm each command. Headless exec is refused.
-  if (!allowsHeadlessCommands(grant)) return { ok: false, error: "supervised_only" };
-
-  const live = relaySessionManager.getLiveCliFeatures([input.cliDeviceId]).get(input.cliDeviceId);
-  if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6")) {
-    return { ok: false, error: "offline" };
-  }
-  if (live.mcpCommandMode === "off") return { ok: false, error: "feature_disabled" };
-  if (!allowsHeadlessCommands(live.mcpCommandMode)) return { ok: false, error: "supervised_only" };
+  // From the verdict to the dispatch nothing awaits (see `Admission`).
+  const verdict = judgeCliAgentAdmission(await readCliAgentAdmission(input), "headless_exec");
+  if (!verdict.ok) return verdict;
+  const { token } = verdict;
 
   const counts = runningCounts(input.userId, input.cliDeviceId);
   if (counts.cli >= COMMANDS_PER_CLI || counts.user >= COMMANDS_PER_USER) {
@@ -506,9 +388,7 @@ export function waitCliCommand(
 
 export function cancelCommandsForToken(tokenId: string) {
   // Starts still between their first await and their record refuse.
-  for (const admission of openAdmissions) {
-    if (admission.tokenId === tokenId) admission.revoked = true;
-  }
+  revokeOpenCliAgentAdmissions(tokenId);
   for (const command of commandsById.values()) {
     if (command.tokenId !== tokenId || command.status !== "running") continue;
     relaySessionManager.dispatchExecCancel(command.cliDeviceId, command.commandId);
@@ -525,7 +405,7 @@ export function resetCliCommandsForTests(): void {
   commandsById.clear();
   for (const record of supervisedById.values()) clearWaitTimer(record);
   supervisedById.clear();
-  openAdmissions.clear();
+  resetCliAgentAdmissionsForTests();
 }
 
 export function sweepExpiredTokenCommands(now = Date.now()): number {
@@ -934,38 +814,10 @@ export async function startSupervisedCommand(input: {
   | { ok: true; commandId: string; terminalId: string; expiresAt: string }
   | { ok: false; error: CliCommandRejection }
 > {
-  const admission = openAdmission(input.tokenId);
-  let device: { id: string; userId: string; mcpCommandMode: McpCommandModeDb } | null;
-  let token: LiveCliToken | null;
-  let owner: CliOwnerState | null;
-  try {
-    [device, token, owner] = await Promise.all([
-      prisma.cliDevice.findUnique({
-        where: { id: input.cliDeviceId },
-        select: { id: true, userId: true, mcpCommandMode: true },
-      }),
-      liveCliToken(input.tokenId, input.userId),
-      readCliOwner(input.userId),
-    ]);
-  } finally {
-    openAdmissions.delete(admission);
-  }
-  // From here to the dispatch nothing awaits (see `Admission`).
-  if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
-  if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
-  if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };
-  if (!allowsSupervisedCommands(mcpCommandModeFromDb(device.mcpCommandMode))) {
-    return { ok: false, error: "grant_disabled" };
-  }
-
-  const live = relaySessionManager.getLiveCliFeatures([input.cliDeviceId]).get(input.cliDeviceId);
-  if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6") || !live.supervisedCommands) {
-    return { ok: false, error: "offline" };
-  }
-  if (!allowsSupervisedCommands(live.mcpCommandMode)) {
-    return { ok: false, error: "feature_disabled" };
-  }
-  if (!live.terminalSupported) return { ok: false, error: "unsupported" };
+  // From the verdict to the dispatch nothing awaits (see `Admission`).
+  const verdict = judgeCliAgentAdmission(await readCliAgentAdmission(input), "supervised");
+  if (!verdict.ok) return verdict;
+  const { token } = verdict;
 
   const counts = supervisedCounts(input.userId, input.cliDeviceId);
   if (
