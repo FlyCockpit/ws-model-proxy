@@ -45,6 +45,13 @@ export type AffinityDecision = {
   conversationMatches: Record<string, boolean>;
   reasons: Record<string, string>;
   matchedPrefixDepth: number;
+  /**
+   * Estimated size, in tokens, of the matched warm prefix per target: the
+   * `estimatedTokens` of the deepest matching prefix record (the conversation
+   * record's when the hit is conversation-only). Absent = unknown. Counts
+   * only; used to size the cache-holder wait (saturation S-A).
+   */
+  prefixTokens?: Record<string, number>;
 };
 
 export function buildAffinityTargetIdentity(parts: {
@@ -299,6 +306,7 @@ export async function rankAffinityTargets({
         prefixDepth: true,
         digestVersion: true,
         engineCacheConfirmed: true,
+        estimatedTokens: true,
       },
     }),
     prisma.capacityLease.groupBy({
@@ -364,6 +372,20 @@ export async function rankAffinityTargets({
         (conversationDepthByDigest.get(record.prefixDigest) ?? 0) === scoredPrefixDepth &&
         record.engineCacheConfirmed,
     );
+    const matchedPrefixRecord =
+      scoredPrefixDepth > 0
+        ? compatible.find(
+            (record) =>
+              record.prefixDigest !== null &&
+              conversationDepthByDigest.get(record.prefixDigest) === scoredPrefixDepth,
+          )
+        : undefined;
+    const matchedRecord =
+      matchedPrefixRecord ??
+      (conversation
+        ? compatible.find((record) => record.conversationDigest === material.conversationDigest)
+        : undefined);
+    const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
     const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
     const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
     const normalizedLoad = target.hardConcurrencyLimit
@@ -388,6 +410,7 @@ export async function rankAffinityTargets({
       active,
       waiting,
       isContinuation: material.isContinuation,
+      prefixTokens,
     };
   });
   scored.sort(
@@ -428,6 +451,11 @@ export async function rankAffinityTargets({
       ),
     ),
     matchedPrefixDepth: Math.max(0, ...scored.map(({ prefixDepth }) => prefixDepth)),
+    prefixTokens: Object.fromEntries(
+      scored.flatMap(({ target, prefixTokens }) =>
+        prefixTokens === undefined ? [] : [[target.executionTargetId, prefixTokens]],
+      ),
+    ),
   };
 }
 

@@ -536,6 +536,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         id: "pool",
         name: "Pool",
         externalAfterWaitMs: 500,
+        cacheHolderWaitMs: 1_500,
       });
       expect(allowed).not.toHaveProperty("issues");
       // K1-1: the external wait they still accept carries its cost statement.

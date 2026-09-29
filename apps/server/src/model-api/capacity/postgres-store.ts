@@ -8,7 +8,14 @@ import {
   lockCrossCapacityAdmissionRequests,
 } from "@ws-model-proxy/db/capacity-lock-order";
 import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
-import { SCHEDULER_VERSION, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
+import {
+  type AdmissionSnapshot,
+  type GrantPlan,
+  type PlannedGrant,
+  type PlannerWaiter,
+  planGrants,
+} from "./admission-planner.js";
+import { SCHEDULER_VERSION } from "./scheduler.js";
 import type {
   AdmissionAttempt,
   AdmissionResult,
@@ -72,6 +79,18 @@ export async function runCapacitySerializable<T>(
   }
 }
 
+/** What the write phase needs of a WAITING waiter to create its lease. */
+type AdmissionWaiterRow = {
+  userId: string;
+  requestId: string;
+  attemptId: string;
+  admissionRequestId: string;
+  executionTargetId: string;
+  poolId: string | null;
+  poolMemberId: string | null;
+  priority: number;
+};
+
 export type CapacityNotifier = { notify(capacityIds: readonly string[]): Promise<void> };
 export type CapacityWakeSource = {
   wait(capacityIds: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<void>;
@@ -105,6 +124,9 @@ export async function waitWithCapacityPolling({
   }
   return { state: signal?.aborted ? "CANCELLED" : "EXPIRED" };
 }
+
+/** Terminal reason of a waiter whose member became unroutable while it queued. */
+export const MEMBER_UNROUTABLE_REASON = "member_unroutable";
 
 export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   constructor(
@@ -204,9 +226,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      // Admission-request rows: this request plus every queued request that
-      // another admitter (one holding a capacity outside this set) can also
-      // lock, in one sorted statement, before #admitOne locks any winner.
+      // L6: this request plus every queued request that another admitter
+      // (one holding a capacity outside this set) can also lock, in one
+      // sorted statement, before #persistGrants locks any winner.
       await lockCrossCapacityAdmissionRequests(tx, capacityIds, existing ? [existing.id] : []);
       if (existing)
         await tx.$queryRaw`SELECT id FROM capacity_waiter WHERE "admissionRequestId" = ${existing.id} FOR UPDATE`;
@@ -299,12 +321,33 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         };
       }
 
+      // Saturation S-A: a deferred waiter (notBefore set) must get at least one
+      // admission check after it becomes eligible, even when this poll was
+      // delayed past its deadline (e.g. by contended capacity locks). Every
+      // poll and the creating pass run admission and stamp heartbeatAt on the
+      // request, so a deferred waiter whose notBefore is later than the
+      // previous poll has never been checked by its owner: it takes part in
+      // this poll's admission pass once ("last chance") and expires after it
+      // if not granted. The request's absolute deadline still applies above.
+      const previousPollAt = existing?.heartbeatAt;
+      const lastChanceWaiterIds = existing
+        ? existing.Waiters.filter(
+            (waiter) =>
+              waiter.state === "WAITING" &&
+              waiter.notBefore !== null &&
+              previousPollAt !== undefined &&
+              waiter.notBefore > previousPollAt &&
+              waiter.deadlineAt !== null &&
+              waiter.deadlineAt <= observedAt,
+          ).map((waiter) => waiter.id)
+        : [];
       if (existing) {
         await tx.capacityWaiter.updateMany({
           where: {
             admissionRequestId: existing.id,
             state: "WAITING",
             deadlineAt: { lte: observedAt },
+            ...(lastChanceWaiterIds.length ? { id: { notIn: lastChanceWaiterIds } } : {}),
           },
           data: {
             state: "EXPIRED",
@@ -316,7 +359,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: {
             admissionRequestId: existing.id,
             state: "WAITING",
-            OR: [{ deadlineAt: null }, { deadlineAt: { gt: observedAt } }],
+            OR: [
+              { deadlineAt: null },
+              { deadlineAt: { gt: observedAt } },
+              ...(lastChanceWaiterIds.length ? [{ id: { in: lastChanceWaiterIds } }] : []),
+            ],
           },
         });
         if (liveWaiters === 0) {
@@ -325,7 +372,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             data: {
               state: "EXPIRED",
               terminalAt: observedAt,
-              terminalReason: "candidate_deadlines",
+              terminalReason: await noLiveCandidateReason(tx, existing.id),
             },
           });
           return {
@@ -349,6 +396,25 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           >`SELECT nextval('admission_enqueue_sequence') AS value`;
       const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
       if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
+      // A retry round may re-anchor to an earlier attempt of the same relay
+      // request (plain read; the anchor row is never locked or written).
+      const anchorRow =
+        !existing && attempt.schedule
+          ? await tx.admissionRequest.findUnique({
+              where: { attemptId: attempt.schedule.anchorAttemptId },
+              select: { enqueuedAt: true, userId: true, relayRequestId: true },
+            })
+          : null;
+      const scheduleAnchor =
+        anchorRow &&
+        attempt.schedule &&
+        anchorRow.userId === attempt.ownerId &&
+        anchorRow.relayRequestId === (attempt.relayRequestId ?? null)
+          ? { at: anchorRow.enqueuedAt, spillDelayMs: attempt.schedule.spillDelayMs }
+          : undefined;
+      const schedules = existing
+        ? []
+        : candidateSchedules(resolvedCandidates, attempt.deadlineAt, now, scheduleAnchor);
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -365,11 +431,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 : undefined,
             basePriority: attempt.basePriority,
             enqueueSequence,
+            // The database-clock schedule anchor of this attempt (see
+            // AdmissionAttempt.schedule); never a process clock. The hardening
+            // check keeps deadlineAt >= enqueuedAt: an attempt already past
+            // its deadline expires at once, so its anchor is never used.
+            enqueuedAt: attempt.deadlineAt < now ? attempt.deadlineAt : now,
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
             Waiters: {
-              create: resolvedCandidates.map((candidate) => ({
+              create: resolvedCandidates.map((candidate, index) => ({
                 userId: attempt.ownerId,
                 requestId: attempt.requestId,
                 attemptId: attempt.attemptId,
@@ -379,7 +450,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 poolId: attempt.poolId,
                 poolMemberId: candidate.poolMemberId,
                 candidateOrder: candidate.candidateOrder,
-                deadlineAt: candidateDeadlineAt(candidate, attempt.deadlineAt, now),
+                deadlineAt: schedules[index]!.deadlineAt,
+                notBefore: schedules[index]!.notBefore,
                 effectivePriority: candidate.priority,
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
                 effectiveConcurrencyScope: candidate.concurrencyScope,
@@ -395,10 +467,14 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       // deadline is exactly `now`. They are eligible in THIS transaction only
       // ("admit only if free now"), so the creating pass admits them before
       // the deadline sweep; afterwards they expire below. Orphaned waiters of
-      // other requests that #admitOne cancels on the way leave projections.
+      // other requests that #admitCapacity cancels on the way leave projections.
       const admitted: RelayAdmissionProjection[] = [];
       for (const capacityId of orderedCapacityIds)
-        await this.#admitOne(tx, capacityId, now, existing ? undefined : request.id, admitted);
+        await this.#admitCapacity(tx, capacityId, now, admitted, {
+          requestId: request.id,
+          creatingRequestId: existing ? undefined : request.id,
+          lastChanceWaiterIds,
+        });
       const refreshed = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
         include: { Lease: true },
@@ -409,30 +485,36 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           notify: capacityIds,
           relay: admitted,
         };
-      if (!existing) {
-        const expiredNow = await tx.capacityWaiter.updateMany({
-          where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
-          data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
+      // Zero budgets of a new attempt, and last-chance deferred waiters of a
+      // poll, had their one admission check in this pass: expire them now.
+      await tx.capacityWaiter.updateMany({
+        where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
+        data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
+      });
+      // Every candidate of this request may have been terminalized in this
+      // pass: zero budgets of a new attempt, or members that became
+      // unroutable (grant-time re-check). Then the request moves on now
+      // instead of polling a request that can never be granted.
+      const liveWaiters = await tx.capacityWaiter.count({
+        where: { admissionRequestId: request.id, state: "WAITING" },
+      });
+      if (liveWaiters === 0) {
+        await tx.admissionRequest.update({
+          where: { id: request.id },
+          data: {
+            state: "EXPIRED",
+            terminalAt: now,
+            terminalReason: await noLiveCandidateReason(tx, request.id),
+          },
         });
-        if (expiredNow.count > 0) {
-          const liveWaiters = await tx.capacityWaiter.count({
-            where: { admissionRequestId: request.id, state: "WAITING" },
-          });
-          if (liveWaiters === 0) {
-            await tx.admissionRequest.update({
-              where: { id: request.id },
-              data: { state: "EXPIRED", terminalAt: now, terminalReason: "candidate_deadlines" },
-            });
-            return {
-              result: { state: "EXPIRED" } as const,
-              notify: capacityIds,
-              relay: [
-                ...admitted,
-                ...relayProjection(request.relayRequestId, attempt.attemptId, "EXPIRED"),
-              ],
-            };
-          }
-        }
+        return {
+          result: { state: "EXPIRED" } as const,
+          notify: capacityIds,
+          relay: [
+            ...admitted,
+            ...relayProjection(request.relayRequestId, attempt.attemptId, "EXPIRED"),
+          ],
+        };
       }
       return {
         result: { state: "WAITING", requestId: refreshed.id } as const,
@@ -598,19 +680,92 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     projections.push(...relayProjection(request.relayRequestId, request.attemptId, "CANCELLED"));
   }
 
-  async #admitOne(
+  /**
+   * Cancels the queued waiters of `capacityId` whose graph parent is gone and
+   * returns the live ones. Two batched plain reads (target, member); the
+   * cancellation follows #cancelOrphanedWaiter.
+   */
+  async #dropOrphanedWaiters<
+    W extends {
+      id: string;
+      admissionRequestId: string;
+      executionTargetId: string;
+      poolId: string | null;
+      poolMemberId: string | null;
+    },
+  >(
+    tx: Prisma.TransactionClient,
+    capacityId: string,
+    waiters: readonly W[],
+    now: Date,
+    projections: RelayAdmissionProjection[],
+  ): Promise<W[]> {
+    if (!waiters.length) return [...waiters];
+    const liveTargets = new Set(
+      (
+        await tx.executionTarget.findMany({
+          where: {
+            id: { in: [...new Set(waiters.map((waiter) => waiter.executionTargetId))] },
+            inferenceCapacityId: capacityId,
+          },
+          select: { id: true },
+        })
+      ).map((target) => target.id),
+    );
+    const memberIds = [
+      ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
+    ];
+    const members = new Map(
+      (memberIds.length
+        ? await tx.poolMember.findMany({
+            where: { id: { in: memberIds } },
+            select: { id: true, poolId: true, executionTargetId: true },
+          })
+        : []
+      ).map((member) => [member.id, member]),
+    );
+    const live: W[] = [];
+    for (const waiter of waiters) {
+      const member = waiter.poolMemberId ? members.get(waiter.poolMemberId) : undefined;
+      const alive =
+        liveTargets.has(waiter.executionTargetId) &&
+        (!waiter.poolMemberId ||
+          (member?.poolId === waiter.poolId &&
+            member.executionTargetId === waiter.executionTargetId));
+      if (alive) live.push(waiter);
+      else await this.#cancelOrphanedWaiter(tx, waiter, now, projections);
+    }
+    return live;
+  }
+
+  /**
+   * READ phase of an admission pass on one capacity: the deadline and
+   * routability sweeps, then ONE snapshot of everything the planner needs
+   * (capacity, ACTIVE leases, WAITING waiters, reservation members and direct
+   * targets, per-scope lease counts). Every read happens under the L4/L6 locks
+   * the caller already holds; this adds no lock.
+   */
+  async #readAdmissionSnapshot(
     tx: Prisma.TransactionClient,
     capacityId: string,
     now: Date,
     /** The attempt created in this transaction: its zero-budget waiters are still eligible. */
     creatingRequestId: string | undefined,
     projections: RelayAdmissionProjection[],
-  ): Promise<boolean> {
+  ): Promise<{
+    snapshot: AdmissionSnapshot;
+    rows: Map<string, AdmissionWaiterRow>;
+    userId: string;
+  } | null> {
     await tx.capacityWaiter.updateMany({
       where: {
         capacityId,
         state: "WAITING",
         deadlineAt: { lte: now },
+        // Deferred waiters are expired by their owner's poll, after the
+        // last-chance check it owes them (see acquire), never by another
+        // admitter's pass that may run before that check.
+        notBefore: null,
         ...(creatingRequestId ? { NOT: { admissionRequestId: creatingRequestId } } : {}),
       },
       data: {
@@ -619,6 +774,55 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         terminalReason: "candidate_deadline",
       },
     });
+    // Grant-time routability re-check (DB state only). The policy snapshot on
+    // a waiter is frozen at enqueue, but its member may have been drained,
+    // disabled, or (local members) zero-weighted or put into an UNHEALTHY
+    // cooldown while it
+    // queued. Such a waiter must neither be granted nor wait forever: it is
+    // terminalized here, even while the capacity is full, and its request
+    // expires on its own next poll when no live candidate remains (the other
+    // candidates keep waiting). The pool_member read is a plain subquery (no
+    // row lock), so it adds no lock-order edge; waiter rows are written under
+    // this capacity's L4 lock, like the deadline sweep above. CLI connection
+    // state is per process and stays a candidate-build / dispatch check.
+    // The waiter has no relation to the graph (DL-1 design (d)): the member
+    // filter is a plain read of pool_member (no row lock, no lock-order edge).
+    const queuedMemberIds = (
+      await tx.capacityWaiter.findMany({
+        where: { capacityId, state: "WAITING", poolMemberId: { not: null } },
+        select: { poolMemberId: true },
+        distinct: ["poolMemberId"],
+      })
+    ).flatMap((row) => (row.poolMemberId ? [row.poolMemberId] : []));
+    const unroutableMembers = queuedMemberIds.length
+      ? await tx.poolMember.findMany({
+          where: {
+            id: { in: queuedMemberIds },
+            // Weight and pool-member health route PRIMARY (local) members
+            // only: external members are ordered by publicOrder with weight 0
+            // and use provider health, checked at dispatch.
+            OR: [
+              { routingStatus: { not: "ACTIVE" } },
+              { tier: "PRIMARY", weight: { lte: 0 } },
+              { tier: "PRIMARY", healthStatus: "UNHEALTHY", nextRetryAt: { gt: now } },
+            ],
+          },
+          select: { id: true },
+        })
+      : [];
+    if (unroutableMembers.length)
+      await tx.capacityWaiter.updateMany({
+        where: {
+          capacityId,
+          state: "WAITING",
+          poolMemberId: { in: unroutableMembers.map((member) => member.id) },
+        },
+        data: {
+          state: "CANCELLED",
+          stateChangedAt: now,
+          terminalReason: MEMBER_UNROUTABLE_REASON,
+        },
+      });
     // A graph row, read without a lock: the capacity fence the caller holds
     // excludes every writer of its policy. A deleted capacity admits nothing;
     // its waiters are orphans the capacity sweeper terminalizes.
@@ -626,36 +830,31 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: { id: capacityId },
       select: { userId: true, hardConcurrencyLimit: true },
     });
-    if (!capacity) return false;
+    if (!capacity) return null;
     const activeLeases = await tx.capacityLease.findMany({
       where: { capacityId, state: "ACTIVE" },
       select: { executionTargetId: true, poolMemberId: true },
     });
-    const active = activeLeases.length;
-    if (capacity.hardConcurrencyLimit !== null && active >= capacity.hardConcurrencyLimit)
-      return false;
-    const waiters = await tx.capacityWaiter.findMany({
-      where: {
-        capacityId,
-        state: "WAITING",
-        OR: [
-          { deadlineAt: null },
-          { deadlineAt: { gt: now } },
-          ...(creatingRequestId
-            ? [{ admissionRequestId: creatingRequestId, deadlineAt: { gte: now } }]
-            : []),
-        ],
+    // Time filtering (candidate/request deadlines, the creating and last-chance
+    // exceptions) is the planner's job, so it is decided in one place.
+    const queuedWaiters = await tx.capacityWaiter.findMany({
+      where: { capacityId, state: "WAITING", AdmissionRequest: { state: "WAITING" } },
+      include: {
         AdmissionRequest: {
-          state: "WAITING",
-          OR: [
-            { deadlineAt: null },
-            { deadlineAt: { gt: now } },
-            ...(creatingRequestId ? [{ id: creatingRequestId }] : []),
-          ],
+          select: { requestId: true, attemptId: true, enqueueSequence: true, deadlineAt: true },
         },
       },
-      include: { AdmissionRequest: true },
     });
+    // No foreign key keeps the graph behind a waiter (DL-1 design (d)): a
+    // candidate whose target, member or pool was deleted, or whose target
+    // moved to another capacity, is cancelled here instead of planned.
+    const waiters = await this.#dropOrphanedWaiters(
+      tx,
+      capacityId,
+      queuedWaiters,
+      now,
+      projections,
+    );
     const configuredReservationMembers = await tx.poolMember.findMany({
       // Every PRIMARY (always local) execution target sharing this physical
       // capacity takes part in the same reservation accounting. External
@@ -697,199 +896,266 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         : `direct:${lease.executionTargetId}`;
       activeByOwner.set(ownerKey, (activeByOwner.get(ownerKey) ?? 0) + 1);
     }
-    const concurrencyActiveByScope = new Map<string, number>();
+    // ACTIVE lease counts of every concurrency scope some waiter is limited
+    // by: one grouped query per scope kind (not one count per scope).
+    const scopeKeys = new Map<string, { kind: "POOL" | "MEMBER" | "TARGET"; id: string }>();
     for (const waiter of waiters) {
       if (waiter.effectiveConcurrencyLimit === null) continue;
-      const scopeKey = `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`;
-      if (concurrencyActiveByScope.has(scopeKey)) continue;
-      const scopedActive = await tx.capacityLease.count({
-        where: {
-          state: "ACTIVE",
-          ...(waiter.effectiveConcurrencyScope === "POOL"
-            ? { poolId: waiter.effectiveConcurrencyScopeId }
+      scopeKeys.set(`${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`, {
+        kind:
+          waiter.effectiveConcurrencyScope === "POOL"
+            ? "POOL"
             : waiter.effectiveConcurrencyScope === "MEMBER"
-              ? { poolMemberId: waiter.effectiveConcurrencyScopeId }
-              : { executionTargetId: waiter.effectiveConcurrencyScopeId }),
-        },
+              ? "MEMBER"
+              : "TARGET",
+        id: waiter.effectiveConcurrencyScopeId,
       });
-      concurrencyActiveByScope.set(scopeKey, scopedActive);
     }
-    const eligibility = new Map<string, { borrowed: boolean }>();
-    const eligible = [];
-    for (const waiter of waiters) {
-      const memberLimit = waiter.effectiveConcurrencyLimit;
-      if (memberLimit !== null && memberLimit !== undefined) {
-        const memberActive =
-          concurrencyActiveByScope.get(
-            `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`,
-          ) ?? 0;
-        if (memberActive >= memberLimit) continue;
+    const scopeActive = new Map<string, number>();
+    for (const [kind, column] of [
+      ["POOL", "poolId"],
+      ["MEMBER", "poolMemberId"],
+      ["TARGET", "executionTargetId"],
+    ] as const) {
+      const ids = [
+        ...new Set([...scopeKeys.values()].filter((scope) => scope.kind === kind).map((s) => s.id)),
+      ];
+      if (!ids.length) continue;
+      const counted = await tx.capacityLease.groupBy({
+        by: [column],
+        where: { state: "ACTIVE", [column]: { in: ids } },
+        _count: { _all: true },
+      });
+      const counts = new Map<string, number>();
+      for (const row of counted) {
+        const id = row[column];
+        if (id) counts.set(id, row._count._all);
       }
-      const ownerKey = waiter.poolMemberId
-        ? `member:${waiter.poolMemberId}`
-        : `direct:${waiter.executionTargetId}`;
-      const reservedForOthers = Math.min(
-        capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
-        [...reservationsByOwner.entries()]
-          .filter(([reservationOwner]) => reservationOwner !== ownerKey)
-          .reduce(
-            (total, [reservationOwner, slots]) =>
-              total + Math.max(0, slots - (activeByOwner.get(reservationOwner) ?? 0)),
-            0,
-          ),
-      );
-      const ownReservedRemaining = Math.max(
-        0,
-        (reservationsByOwner.get(ownerKey) ?? 0) - (activeByOwner.get(ownerKey) ?? 0),
-      );
-      const borrowed =
-        capacity.hardConcurrencyLimit !== null &&
-        ownReservedRemaining === 0 &&
-        reservedForOthers > 0 &&
-        capacity.hardConcurrencyLimit - active <= reservedForOthers;
-      const queuedReservationOwnerNeedsSlot = waiters.some((entry) => {
-        const queuedOwner = entry.poolMemberId
-          ? `member:${entry.poolMemberId}`
-          : `direct:${entry.executionTargetId}`;
-        return (
-          entry.id !== waiter.id &&
-          entry.effectivePriority > waiter.effectivePriority &&
-          queuedOwner !== ownerKey &&
-          (reservationsByOwner.get(queuedOwner) ?? 0) > (activeByOwner.get(queuedOwner) ?? 0) &&
-          (entry.effectiveConcurrencyLimit === null ||
-            (concurrencyActiveByScope.get(
-              `${entry.effectiveConcurrencyScope}:${entry.effectiveConcurrencyScopeId}`,
-            ) ?? 0) < entry.effectiveConcurrencyLimit)
-        );
-      });
-      if (borrowed && queuedReservationOwnerNeedsSlot) continue;
-      if (borrowed && waiter.effectiveBorrowPolicy === "NEVER") continue;
-      eligible.push({
-        admissionRequestId: waiter.admissionRequestId,
-        waiterId: waiter.id,
-        candidateOrder: waiter.candidateOrder,
-        priority: waiter.effectivePriority,
-        enqueueSequence: waiter.AdmissionRequest.enqueueSequence,
-        eligible: true,
-      });
-      eligibility.set(waiter.id, { borrowed });
+      for (const [key, scope] of scopeKeys)
+        if (scope.kind === kind) scopeActive.set(key, counts.get(scope.id) ?? 0);
     }
-    if (!eligible.length) return false;
-    const runtime = await this.#capacityRuntime(tx, capacityId, capacity.userId);
-    const deficits = schedulerDeficits(runtime.schedulerDeficits);
-    const decision = scheduleWeightedDeficitRoundRobin({
-      candidates: eligible,
-      state: { cursor: runtime.schedulerCursor, deficits, version: runtime.schedulerVersion },
-    });
-    if (!decision.winner) return false;
-    const waiter = waiters.find((entry) => entry.id === decision.winner?.waiterId);
-    if (!waiter) return false;
-    // A request may have sibling waiters on distinct physical capacities.
-    // Serialize the winner at the durable request row, then re-read after the
-    // lock. This makes the unique attemptId lease constraint a final invariant
-    // rather than the normal arbitration mechanism (and avoids leaking P2002).
-    // A winner that another admitter can also reach was already locked, in
-    // sorted order, by lockCrossCapacityAdmissionRequests; any other winner's
-    // row is reachable only through capacity fences this transaction holds.
-    await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${waiter.admissionRequestId} FOR UPDATE`;
-    const winningRequest = await tx.admissionRequest.findUnique({
-      where: { id: waiter.admissionRequestId },
-      include: { Lease: true },
-    });
-    if (winningRequest?.state !== "WAITING" || winningRequest.Lease) return true;
-    // No foreign key keeps the graph behind a waiter (DL-1 design (d)): a
-    // candidate whose target, member or pool was deleted, or whose target
-    // moved to another capacity, is cancelled here instead of leased.
-    if (!(await this.#waiterGraphIsLive(tx, waiter, capacityId))) {
-      await this.#cancelOrphanedWaiter(tx, waiter, now, projections);
-      return true;
-    }
-    // G2n pass 5: the shutdown fence can arm DURING any await of this loop
-    // (release/reclamation run under the durable-cleanup permit, so their
-    // operations keep flowing after the fence arms). The durable admission
-    // sequence starts HERE — fencing-token/scheduler update, lease create,
-    // WAITING→ADMITTED — so this is the per-iteration stop point: once the
-    // fence is armed, no NEW admission may start. A sequence that already
-    // started (the check passed) is allowed to complete — its partial work
-    // is committed durable state, not a new admission.
-    if (isDbShutdownFenceArmed()) return false;
-    const updatedRuntime = await tx.capacityRuntime.update({
-      where: { capacityId },
-      data: {
-        schedulerCursor: decision.state.cursor,
-        schedulerDeficits: decision.state.deficits,
-        schedulerVersion: SCHEDULER_VERSION,
-        nextFencingToken: { increment: 1 },
-      },
-    });
-    const fencingToken = updatedRuntime.nextFencingToken - 1n;
-    await tx.capacityLease.create({
-      data: {
+
+    const rows = new Map<string, AdmissionWaiterRow>();
+    const plannerWaiters: PlannerWaiter[] = waiters.map((waiter) => {
+      rows.set(waiter.id, {
         userId: waiter.userId,
         requestId: waiter.AdmissionRequest.requestId,
         attemptId: waiter.AdmissionRequest.attemptId,
         admissionRequestId: waiter.admissionRequestId,
-        capacityId,
         executionTargetId: waiter.executionTargetId,
         poolId: waiter.poolId,
         poolMemberId: waiter.poolMemberId,
         priority: waiter.effectivePriority,
-        reservationClass: waiter.effectivePriority,
-        borrowed: eligibility.get(waiter.id)?.borrowed ?? false,
-        fencingToken,
-        ownerServerInstance: this.serverInstance,
-        heartbeatAt: now,
-        expiresAt: new Date(now.getTime() + 30_000),
+      });
+      return {
+        waiterId: waiter.id,
+        admissionRequestId: waiter.admissionRequestId,
+        candidateOrder: waiter.candidateOrder,
+        enqueueSequence: waiter.AdmissionRequest.enqueueSequence,
+        priority: waiter.effectivePriority,
+        notBefore: waiter.notBefore,
+        deadlineAt: waiter.deadlineAt,
+        requestDeadlineAt: waiter.AdmissionRequest.deadlineAt,
+        ownerKey: waiter.poolMemberId
+          ? `member:${waiter.poolMemberId}`
+          : `direct:${waiter.executionTargetId}`,
+        memberLimit: waiter.effectiveConcurrencyLimit,
+        scopeKey: `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`,
+        borrowPolicy: waiter.effectiveBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
+        leaseScopeKeys: [
+          ...(waiter.poolId ? [`POOL:${waiter.poolId}`] : []),
+          ...(waiter.poolMemberId ? [`MEMBER:${waiter.poolMemberId}`] : []),
+          `DIRECT_TARGET:${waiter.executionTargetId}`,
+        ],
+      };
+    });
+    // The scheduler state is H (capacity_runtime), created lazily under the
+    // capacity fence; a pass with no waiter plans nothing and needs none.
+    const runtime = waiters.length
+      ? await this.#capacityRuntime(tx, capacityId, capacity.userId)
+      : { schedulerCursor: 31, schedulerDeficits: null, schedulerVersion: SCHEDULER_VERSION };
+    return {
+      snapshot: {
+        capacityLimit: capacity.hardConcurrencyLimit,
+        active: activeLeases.length,
+        activeByOwner,
+        reservationsByOwner,
+        scopeActive,
+        waiters: plannerWaiters,
+        scheduler: {
+          cursor: runtime.schedulerCursor,
+          deficits: schedulerDeficits(runtime.schedulerDeficits),
+          version: runtime.schedulerVersion,
+        },
+      },
+      rows,
+      userId: capacity.userId,
+    };
+  }
+
+  /**
+   * WRITE phase: persists a plan in a few batched statements.
+   *
+   * Winners are serialized at their durable request rows (one sorted
+   * `FOR UPDATE` statement, then a re-read): the unique attemptId lease
+   * constraint is a final invariant, not the normal arbitration mechanism. A
+   * winner that another admitter can also reach was already locked, in sorted
+   * order, by lockCrossCapacityAdmissionRequests; any other winner's row is
+   * reachable only through capacity locks this transaction holds. A winner
+   * that is no longer WAITING (or already holds a lease) ends the persisted
+   * prefix and reports `stale`, so the caller re-plans from a fresh read.
+   *
+   * Shutdown fence (G2n pass 5): release/reclamation run under the durable-
+   * cleanup permit, so their operations keep flowing after the fence arms.
+   * The durable admission sequence starts HERE (scheduler/fencing update,
+   * lease inserts, WAITING to ADMITTED), so the fence is checked ONCE, right
+   * before the first write: armed writes nothing; a batch that started is
+   * committed durable state and completes.
+   *
+   * Nothing is carried across transaction attempts: every retry re-reads and
+   * re-plans, and fencing tokens come from the capacity_runtime counter.
+   */
+  async #persistGrants(
+    tx: Prisma.TransactionClient,
+    capacityId: string,
+    now: Date,
+    rows: ReadonlyMap<string, AdmissionWaiterRow>,
+    plan: GrantPlan,
+    userId: string,
+  ): Promise<{ persisted: PlannedGrant[]; stale: boolean }> {
+    if (!plan.grants.length) return { persisted: [], stale: false };
+    const requestIds = [...new Set(plan.grants.map((grant) => grant.admissionRequestId))].sort();
+    await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ANY(${requestIds}::text[]) ORDER BY id FOR UPDATE`;
+    const current = await tx.admissionRequest.findMany({
+      where: { id: { in: requestIds } },
+      select: { id: true, state: true, Lease: { select: { id: true } } },
+    });
+    const writable = new Set(
+      current.filter((request) => request.state === "WAITING" && !request.Lease).map((r) => r.id),
+    );
+    const firstStale = plan.grants.findIndex((grant) => !writable.has(grant.admissionRequestId));
+    const persisted = firstStale === -1 ? plan.grants : plan.grants.slice(0, firstStale);
+    const stale = firstStale !== -1;
+    if (isDbShutdownFenceArmed()) return { persisted: [], stale: false };
+    // Also true when the FIRST winner is stale (nothing persisted): re-plan.
+    if (!persisted.length) return { persisted: [], stale };
+    const last = persisted[persisted.length - 1]!;
+    await this.#capacityRuntime(tx, capacityId, userId);
+    const updatedRuntime = await tx.capacityRuntime.update({
+      where: { capacityId },
+      data: {
+        schedulerCursor: last.schedulerAfter.cursor,
+        schedulerDeficits: [...last.schedulerAfter.deficits],
+        schedulerVersion: SCHEDULER_VERSION,
+        nextFencingToken: { increment: persisted.length },
       },
     });
-    await tx.admissionRequest.update({
-      where: { id: waiter.admissionRequestId },
+    const firstToken = updatedRuntime.nextFencingToken - BigInt(persisted.length);
+    await tx.capacityLease.createMany({
+      data: persisted.map((grant, index) => {
+        const row = rows.get(grant.waiterId);
+        if (!row) throw new Error("Planned grant has no waiter row.");
+        return {
+          userId: row.userId,
+          requestId: row.requestId,
+          attemptId: row.attemptId,
+          admissionRequestId: row.admissionRequestId,
+          capacityId,
+          executionTargetId: row.executionTargetId,
+          poolId: row.poolId,
+          poolMemberId: row.poolMemberId,
+          priority: row.priority,
+          reservationClass: grant.reservationClass,
+          borrowed: grant.borrowed,
+          fencingToken: firstToken + BigInt(index),
+          ownerServerInstance: this.serverInstance,
+          heartbeatAt: now,
+          expiresAt: new Date(now.getTime() + 30_000),
+        };
+      }),
+    });
+    const winnerRequestIds = persisted.map((grant) => grant.admissionRequestId);
+    const winnerWaiterIds = persisted.map((grant) => grant.waiterId);
+    await tx.admissionRequest.updateMany({
+      where: { id: { in: winnerRequestIds } },
       data: { state: "ADMITTED" },
     });
     await tx.capacityWaiter.updateMany({
-      where: { admissionRequestId: waiter.admissionRequestId, state: "WAITING" },
+      where: {
+        admissionRequestId: { in: winnerRequestIds },
+        state: "WAITING",
+        id: { notIn: winnerWaiterIds },
+      },
       data: { state: "CANCELLED", stateChangedAt: now, terminalReason: "sibling_lost" },
     });
-    await tx.capacityWaiter.update({
-      where: { id: waiter.id },
+    await tx.capacityWaiter.updateMany({
+      where: { id: { in: winnerWaiterIds } },
       data: { state: "ADMITTED", stateChangedAt: now, terminalReason: null },
     });
-    return true;
+    return { persisted, stale };
   }
 
-  async #fillAvailable(
+  /**
+   * One admission pass on one capacity: read, plan, write. The ONE path to a
+   * slot for acquire (offer mode: `requestId` given, stops once it is
+   * granted) and for release/reclaim (fill mode). Returns whether `requestId`
+   * was granted here.
+   *
+   * Offers every free slot: with S-A spill-over, waiters become eligible by
+   * time passing (not a release event), so several eligible waiters can sit
+   * on a capacity with more than one free slot. The planner grants them in
+   * DRR order (older eligible waiters first, as a release-fill would) until
+   * the request holds a lease, nothing more is grantable, or the capacity is
+   * full; the loop is bounded by the queue size, never by a constant.
+   * Same locks as before (L4 plus the L6 pre-lock): no new lock-order edge.
+   */
+  async #admitCapacity(
     tx: Prisma.TransactionClient,
     capacityId: string,
     now: Date,
     projections: RelayAdmissionProjection[],
-  ) {
-    // G2n permit-scope (pass 4): admission scheduling during teardown is NEW
-    // work, never durable cleanup. release() runs inside the shutdown
-    // permit (its ACTIVE→RELEASED transitions must complete), and this fill
-    // previously inherited that permit — authorizing capacityLease.create
-    // and WAITING→ADMITTED for OTHER requests while the process is tearing
-    // down. When the global shutdown fence is armed, skip the fill: queued
-    // waiters remain WAITING and are admitted by the next boot (or their
-    // own deadlines) — the correct teardown semantic. Normal-operation
-    // aborts (fence NOT armed) keep filling: one request going away and
-    // admitting the next waiter is ordinary capacity behavior.
-    //
-    // G2n pass 5: the fence can arm DURING the loop's awaits, so the check
-    // is PER ITERATION (loop entry AND inside #admitOne immediately before
-    // the durable admission sequence), not once at entry — a fence that
-    // arms mid-fill stops the very next admission instead of authorizing
-    // the whole remaining queue. Both callers (release and reclamation)
-    // run through this same loop.
-    while (
-      !isDbShutdownFenceArmed() &&
-      (await this.#admitOne(tx, capacityId, now, undefined, projections))
-    ) {
-      // Each iteration consumes one durable waiter and rechecks physical/member
-      // limits, so this terminates without relying on a caller-provided bound.
+    options: {
+      requestId?: string;
+      creatingRequestId?: string;
+      lastChanceWaiterIds?: readonly string[];
+    } = {},
+  ): Promise<boolean> {
+    // G2n: fill mode (release/reclaim) is NEW admission work; with the fence
+    // armed it starts nothing (no sweeps, no snapshot, no row locks). Offer
+    // mode belongs to acquire, which the fence rejects on its own.
+    if (options.requestId === undefined && isDbShutdownFenceArmed()) return false;
+    // A re-planned pass happens only when a winner turned out to be no longer
+    // grantable at the write phase (unreachable under the held locks); every
+    // such round consumes at least one waiter, so the queue size bounds it.
+    for (let round = 0; ; round++) {
+      const read = await this.#readAdmissionSnapshot(
+        tx,
+        capacityId,
+        now,
+        options.creatingRequestId,
+        projections,
+      );
+      // A deleted capacity admits nothing; its waiters are orphans the
+      // capacity sweeper terminalizes.
+      if (!read) return false;
+      const { snapshot, rows, userId } = read;
+      const plan = planGrants(snapshot, now, options);
+      const { persisted, stale } = await this.#persistGrants(
+        tx,
+        capacityId,
+        now,
+        rows,
+        plan,
+        userId,
+      );
+      const granted =
+        options.requestId !== undefined &&
+        persisted.some((grant) => grant.admissionRequestId === options.requestId);
+      if (granted || !stale || round >= snapshot.waiters.length) return granted;
     }
   }
 
-  /** Capacity fences plus the cross-capacity request locks, for transactions that run #fillAvailable. */
+  /** Capacity fences plus the cross-capacity request locks, for transactions that run #admitCapacity. */
   async #fenceFill(
     tx: Prisma.TransactionClient,
     capacityId: string,
@@ -979,7 +1245,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             ...relayProjection(admission?.relayRequestId, lease.attemptId, "TERMINAL"),
           );
         }
-        if (result.count) await this.#fillAvailable(tx, lease.capacityId, now, projections);
+        if (result.count) await this.#admitCapacity(tx, lease.capacityId, now, projections);
         return { released: result.count === 1, projections };
       }),
     );
@@ -1124,7 +1390,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           projections.push(
             ...relayProjection(admission?.relayRequestId, lease.attemptId, "TERMINAL"),
           );
-          await this.#fillAvailable(tx, lease.capacityId, lockedNow, projections);
+          await this.#admitCapacity(tx, lease.capacityId, lockedNow, projections);
         }
         return { count: update.count, projections };
       });
@@ -1341,7 +1607,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         // after the fences, as in release.
         for (const capacityId of [...touched].sort()) {
           await lockCrossCapacityAdmissionRequests(tx, [capacityId]);
-          await this.#fillAvailable(tx, capacityId, now, projections);
+          await this.#admitCapacity(tx, capacityId, now, projections);
         }
         return { count, capacities: [...touched], projections };
       });
@@ -1365,22 +1631,111 @@ function relayProjection(
   return relayRequestId ? [{ relayRequestId, admissionAttemptId, state }] : [];
 }
 
+/** Upper bound of one spill-over delay; matches the S4 cache-holder wait cap. */
+export const MAX_CANDIDATE_NOT_BEFORE_MS = 30_000;
+/**
+ * A deferred attempt's candidates stay eligible at least this long after the
+ * spill instant, so a zero budget ("admit only if free at the spill instant")
+ * is checked by at least one runtime poll (100 ms) instead of expiring at the
+ * very instant it becomes eligible.
+ */
+export const DEFERRED_MIN_ELIGIBLE_WINDOW_MS = 250;
+
+function boundedNotBeforeMs(candidate: { notBeforeMs?: number }): number {
+  const value = candidate.notBeforeMs;
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.min(MAX_CANDIDATE_NOT_BEFORE_MS, Math.max(0, Math.floor(value)));
+}
+
+/**
+ * Durable schedule of every candidate of a NEW attempt on the database clock
+ * (`now` is the in-transaction clock_timestamp()). Process clocks never decide
+ * a wait budget or a spill-over instant.
+ *
+ * - `notBefore` = now + notBeforeMs (null when not deferred), never later than
+ *   the candidate's absolute upper bound.
+ * - The spill instant is the latest notBefore of the attempt. Every wait
+ *   budget counts from it, so an `:external` caller's shortened budget E ends
+ *   at max(notBefore) + E and a deadline never precedes its notBefore.
+ * - With an `anchor` (a retry round, see AdmissionAttempt.schedule) the same
+ *   schedule is computed from the anchor attempt's enqueue instant, the spill
+ *   instant is at least anchor + spillDelayMs, and instants already in the
+ *   past are clamped to `now` (no deferral; deadline now = "admit only if
+ *   free now"), so a retry never restarts or extends the original schedule.
+ */
+export function candidateSchedules<
+  C extends { deadlineAt?: Date; waitBudgetMs?: number | null; notBeforeMs?: number },
+>(
+  candidates: readonly C[],
+  attemptDeadlineAt: Date,
+  now: Date,
+  anchor?: { at: Date; spillDelayMs: number },
+): Array<{ notBefore: Date | null; deadlineAt: Date }> {
+  const base = anchor && anchor.at < now ? anchor.at : now;
+  const scheduledNotBefores = candidates.map((candidate) => {
+    const delayMs = boundedNotBeforeMs(candidate);
+    if (delayMs === 0) return null;
+    const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
+    const notBefore = new Date(base.getTime() + delayMs);
+    return notBefore < upperBound ? notBefore : upperBound;
+  });
+  const anchoredSpillMs = anchor
+    ? base.getTime() + boundedNotBeforeMs({ notBeforeMs: anchor.spillDelayMs })
+    : base.getTime();
+  const spillAt = new Date(
+    Math.max(anchoredSpillMs, ...scheduledNotBefores.map((notBefore) => notBefore?.getTime() ?? 0)),
+  );
+  return candidates.map((candidate, index) => {
+    const scheduled = scheduledNotBefores[index] ?? null;
+    const notBefore = scheduled && scheduled > now ? scheduled : null;
+    let deadlineAt = candidateDeadlineAt(candidate, attemptDeadlineAt, base, spillAt);
+    if (deadlineAt < now) {
+      const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
+      deadlineAt = upperBound < now ? upperBound : now;
+    }
+    return {
+      notBefore,
+      deadlineAt: notBefore && deadlineAt < notBefore ? notBefore : deadlineAt,
+    };
+  });
+}
+
 /**
  * Effective candidate deadline on the database clock (`now` is the in-
  * transaction clock_timestamp()). Process clocks never decide a wait budget.
+ * `spillAt` (default `now`) is the attempt's latest notBefore; the budget
+ * counts from it (see {@link candidateSchedules}).
  */
 export function candidateDeadlineAt(
   candidate: { deadlineAt?: Date; waitBudgetMs?: number | null },
   attemptDeadlineAt: Date,
   now: Date,
+  spillAt: Date = now,
 ): Date {
   const upperBound = candidate.deadlineAt ?? attemptDeadlineAt;
   if (candidate.waitBudgetMs === undefined || candidate.waitBudgetMs === null) return upperBound;
   const budgetMs = Number.isFinite(candidate.waitBudgetMs)
     ? Math.max(0, Math.floor(candidate.waitBudgetMs))
     : 0;
-  const relative = new Date(now.getTime() + budgetMs);
+  const deferred = spillAt.getTime() > now.getTime();
+  const relative = new Date(
+    spillAt.getTime() + (deferred ? Math.max(budgetMs, DEFERRED_MIN_ELIGIBLE_WINDOW_MS) : budgetMs),
+  );
   return relative < upperBound ? relative : upperBound;
+}
+
+/**
+ * Request-level terminal reason once no candidate is live: `member_unroutable`
+ * when a grant-time re-check removed a candidate, else `candidate_deadlines`.
+ */
+async function noLiveCandidateReason(
+  tx: Prisma.TransactionClient,
+  admissionRequestId: string,
+): Promise<string> {
+  const unroutable = await tx.capacityWaiter.count({
+    where: { admissionRequestId, terminalReason: MEMBER_UNROUTABLE_REASON },
+  });
+  return unroutable > 0 ? MEMBER_UNROUTABLE_REASON : "candidate_deadlines";
 }
 
 function schedulerDeficits(value: Prisma.JsonValue): number[] {

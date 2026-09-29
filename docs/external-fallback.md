@@ -52,7 +52,13 @@ The request goes external only after local routing could not serve it:
 
 - the local wait expired (an `:external` caller waits at most the pool's
   `externalAfterWaitMs`, default 2000 ms, and never longer than the local wait
-  budget; 0 means "go external at once when no local member is free now");
+  budget; 0 means "go external at once when no local member is free now").
+  When the request's prefix is warm on a busy member, the other local members
+  are held back for the pool's cache-holder wait first (see
+  [Waiting for the cache holder](#waiting-for-the-cache-holder)); the external
+  wait then counts from the end of that hold, so a request never goes external
+  while a cold local member is free. Pre-commit retry rounds keep the original
+  external deadline instead of waiting another `externalAfterWaitMs` each;
 - no healthy, compatible local member exists;
 - a retryable local failure happened before the first response byte, after the
   other local members were tried;
@@ -66,6 +72,40 @@ Responses operations on externally served responses) count against those caps.
 A request has at most one external phase; precommit failover across external
 members follows the existing retry rules.
 
+On a pool that also has local members, an owner-paid external phase waits for
+provider capacity at most `min(provider member budget, 10 s)`. If no provider
+slot frees by then, the attempt counts as "provider busy" and the request goes
+back to its local queue for the rest of the local budget (see the table below).
+The 10 s cap covers the whole external phase: a pre-commit retry on the next
+external member gets only what is left of it.
+Pools with only external members keep the provider member's own budget.
+
+### Waiting for the cache holder
+
+Cache-aware routing predicts which member still holds a request's prompt
+prefix. When that member is busy, the other members are not used at once: they
+become eligible only after the pool's cache-holder wait, so the warm member can
+take the request if it frees in time. Without an affinity hit nothing waits.
+
+- Automatic (the default): the re-prefill time the warm member saves, from the
+  matched prefix size and the member's measured cold prefill speed (recent
+  requests with at least 2000 prompt tokens and at most 5 % cache hits), capped
+  at 30 s; 2 s until the speed is measured.
+- A fixed value from 0 to 30000 ms (0 turns the wait off). Set it on the pool's
+  routing tab, `cacheHolderWaitMs` on `forwarderManagement.createModelPool` /
+  `updateModelPool` and `capacityManagement.updatePoolPolicy`, or the
+  `forwarder_model_pool_update` MCP tool (`null` = automatic).
+
+Relay metadata records `affinityWaitMs` (how long the request was held for the
+warm member) and `affinityOutcome` `HOLDER_WAITED` (the warm member was granted
+by the held admission) or `HOLDER_SPILLED` (another member was granted after the
+wait). A member that serves only after a pre-commit failover keeps the ordinary
+affinity outcome (`PREDICTED_MATCH` / `NO_MATCH`).
+
+The hold also delays everything that counts from the spill instant: the local
+wait budgets of the request and, for `:external`, the external fallback wait
+both start counting after the hold.
+
 ### When the external attempt does not happen
 
 If the attempt cannot send (no compatible external member, provider busy or
@@ -77,7 +117,7 @@ preserve the upstream status as described under [Own-key failure and accounting]
 
 | Situation | Result |
 | --- | --- |
-| Local wait expired, pool has local members | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
+| Local wait expired, pool has local members (including a capped provider wait that expired) | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
 | No compatible or healthy local member, context too large, or local failures after every member was tried | The same error the plain name gets. |
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |

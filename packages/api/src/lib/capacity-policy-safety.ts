@@ -51,6 +51,14 @@ export const modelPoolCapacityPolicyFields = {
   capacityContextMargin: z.number().int().min(0).max(10_000_000).optional(),
 };
 
+/**
+ * Saturation S-A cache-holder wait on a pool: null = automatic (re-prefill time
+ * of the matched prefix, 2 s until the holder's prefill speed is measured),
+ * 0 = off, otherwise fixed milliseconds. Capped at 30 s (owner decision S4).
+ * A routing preference, not a capacity limit: it takes no capacity locks.
+ */
+export const cacheHolderWaitMsSchema = z.number().int().min(0).max(30_000).nullable().optional();
+
 export function assertModelPoolCapacityPolicy(
   input: {
     concurrencyLimit: number | null | undefined;
