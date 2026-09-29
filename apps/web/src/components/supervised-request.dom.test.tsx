@@ -60,7 +60,6 @@ function agentTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
     approvalCode: null,
     rejectionReason: null,
     error: null,
-    multiViewer: true,
     viewerId: "viewer-1",
     writer: "you",
     viewerCount: 1,

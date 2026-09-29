@@ -77,7 +77,7 @@ const tokenAccess = await import("@ws-model-proxy/api/lib/model-api-token-access
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
-  poolMember: { findUnique: MockInstance; update: MockInstance };
+  poolMember: { findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: { findUnique: MockInstance };
   executionTarget: { findUnique: MockInstance };
   modelPool: { findFirst: MockInstance };
@@ -321,7 +321,7 @@ beforeEach(() => {
   });
   db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
   db.poolMember.findUnique.mockResolvedValue(memberRow());
-  db.poolMember.update.mockResolvedValue({ id: "member-id" });
+  db.poolMember.updateMany.mockResolvedValue({ count: 1 });
   mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
     directModels: [directTarget],
     modelPools: [poolTarget],
@@ -411,9 +411,9 @@ describe("runPoolMemberTest — typed core outcomes", () => {
     manager.body(sent.requestId, JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
     manager.complete(sent.requestId);
     await expect(corePromise).resolves.toMatchObject({ outcome: "ok", status: 200 });
-    expect(db.poolMember.update).toHaveBeenCalledWith(
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "member-id" },
+        where: expect.objectContaining({ id: "member-id" }),
         data: expect.objectContaining({ healthStatus: "HEALTHY" }),
       }),
     );
@@ -445,7 +445,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       outcome: "probe-failed",
       status: 200,
     });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   function reasoningInventory(reasoningConfig?: Record<string, unknown>, reasoning = true) {
@@ -557,7 +557,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       detail: REASONING_ONLY_PROBE_DETAIL,
     });
     expect(REASONING_ONLY_PROBE_DETAIL).not.toMatch(/pong/);
-    expect(db.poolMember.update).toHaveBeenCalled();
+    expect(db.poolMember.updateMany).toHaveBeenCalled();
   });
 
   it("does not attach a detail when visible pong content is present", async () => {
@@ -595,7 +595,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       outcome: "probe-failed",
       reason: expect.stringContaining("timeout"),
     });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 });
 
@@ -831,7 +831,7 @@ describe("diagnosticsCapacityRuntime — module-lifetime singleton", () => {
 describe("G2 — stable outcomes only (failure data never crosses the core)", () => {
   it("a health-write DB failure becomes the stable probe-error reason — the hostile message never crosses", async () => {
     const manager = new FakeRelayManager();
-    db.poolMember.update.mockRejectedValue(
+    db.poolMember.updateMany.mockRejectedValue(
       new Error("R63_DB_SENTINEL PrismaClientKnownRequestError P2025 SECRET_SQL"),
     );
     const corePromise = runPoolMemberTest({

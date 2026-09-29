@@ -365,7 +365,7 @@ export async function runPoolMemberTest({
           : "Member did not return a valid chat completion containing pong.",
       };
     }
-    await markPoolMemberRelaySuccess(member.id);
+    await markPoolMemberRelaySuccess(member.id, { trialStartedAt: null });
     return {
       outcome: "ok",
       status: started.status,

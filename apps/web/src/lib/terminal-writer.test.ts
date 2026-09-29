@@ -15,23 +15,21 @@ import {
 } from "./terminal-writer";
 
 describe("writer state", () => {
-  it("follows only on a multi-viewer terminal when this tab is not the writer", () => {
-    expect(isFollowing({ multiViewer: true, writer: "other" })).toBe(true);
-    expect(isFollowing({ multiViewer: true, writer: "none" })).toBe(true);
-    expect(isFollowing({ multiViewer: true, writer: "you" })).toBe(false);
-    // A 2.4 terminal has one viewer, which is always the writer.
-    expect(isFollowing({ multiViewer: false, writer: "other" })).toBe(false);
+  it("follows only when this tab is not the writer", () => {
+    expect(isFollowing({ writer: "other" })).toBe(true);
+    expect(isFollowing({ writer: "none" })).toBe(true);
+    expect(isFollowing({ writer: "you" })).toBe(false);
   });
 
   it("sends resizes only as the writer and takes over otherwise", () => {
-    expect(canSendResize({ multiViewer: true, writer: "you" })).toBe(true);
-    expect(canSendResize({ multiViewer: true, writer: "other" })).toBe(false);
-    expect(needsTakeover({ multiViewer: true, writer: "none" })).toBe(true);
-    expect(needsTakeover({ multiViewer: false, writer: "you" })).toBe(false);
+    expect(canSendResize({ writer: "you" })).toBe(true);
+    expect(canSendResize({ writer: "other" })).toBe(false);
+    expect(needsTakeover({ writer: "none" })).toBe(true);
+    expect(needsTakeover({ writer: "you" })).toBe(false);
   });
 
   it("follows the PTY size only once it is known", () => {
-    const base = { multiViewer: true, writer: "other" as const };
+    const base = { writer: "other" as const };
     expect(followSize({ ...base, ptyCols: null, ptyRows: null })).toBeNull();
     expect(followSize({ ...base, ptyCols: 120, ptyRows: 40 })).toEqual({ cols: 120, rows: 40 });
     expect(followSize({ ...base, writer: "you", ptyCols: 120, ptyRows: 40 })).toBeNull();

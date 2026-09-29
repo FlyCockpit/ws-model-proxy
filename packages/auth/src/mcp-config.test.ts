@@ -88,12 +88,6 @@ describe("env-bound constants", () => {
 });
 
 describe("policy constants (Resolved defaults)", () => {
-  it("keeps token lifetimes as named constants with the planned values", () => {
-    expect(mcpConfig.MCP_ACCESS_TOKEN_LIFETIME_SECONDS).toBe(10 * 60);
-    expect(mcpConfig.MCP_REFRESH_INACTIVITY_LIFETIME_SECONDS).toBe(72 * 60 * 60);
-    expect(mcpConfig.MCP_REFRESH_RETRY_WINDOW_SECONDS).toBe(30);
-  });
-
   it("pins CIMD and DCR registration to the 2026-07-28 profile", () => {
     expect(mcpConfig.MCP_METADATA_PROFILE).toBe("mcp-2026-07-28");
     expect(mcpConfig.MCP_CIMD_REGISTRATION_POLICY).toEqual({
@@ -113,10 +107,6 @@ describe("policy constants (Resolved defaults)", () => {
   it("pins the personal-token active cap and last-used touch interval", () => {
     expect(mcpConfig.MCP_PAT_MAX_ACTIVE_PER_USER).toBe(10);
     expect(mcpConfig.MCP_PAT_LAST_USED_TOUCH_INTERVAL_MS).toBe(900000);
-  });
-
-  it("pins the personal-token chosen-expiry TTL cap", () => {
-    expect(mcpConfig.MCP_PAT_MAX_TTL_DAYS).toBe(365);
   });
 
   it("lists the enabled scopes and registration ceilings", () => {

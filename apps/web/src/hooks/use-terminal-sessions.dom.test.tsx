@@ -12,8 +12,7 @@ import {
   cliIdentityFingerprint,
   DIRECTION_BROWSER_TO_CLI,
   DIRECTION_CLI_TO_BROWSER,
-  decodeTerminalPlaintext,
-  deriveTerminalSessionKeys,
+  decodeTerminalPlaintextV2,
   deriveTerminalSessionKeysV2,
   encodeTerminalData,
   encodeTerminalOutputKey,
@@ -21,10 +20,8 @@ import {
   generateEphemeralHandshake,
   importEcdhPublicRaw,
   importTerminalOutputKey,
-  openTerminalBytes,
   openTerminalBytesV2,
   sealTerminalBroadcast,
-  sealTerminalBytes,
   sealTerminalBytesV2,
   type TerminalSessionKeys,
 } from "@/hooks/use-terminal-crypto";
@@ -83,6 +80,7 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   currentCli = null;
   socket.handlers = null;
@@ -115,14 +113,43 @@ async function openAfterList(open: () => void, clis: ListedCli[]) {
   message({ type: "terminals", clis, terminals: [] });
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Captured before any test fakes timers, so `settle` always waits on the real clock.
+const realSetTimeout = globalThis.setTimeout;
+
+/**
+ * Lets queued async work finish (WebCrypto runs on the thread pool, then the
+ * promise chains that follow it) without waiting on a wall-clock delay. Use it
+ * before asserting that something did NOT happen.
+ */
+async function settle() {
+  await act(async () => {
+    for (let turn = 0; turn < 10; turn += 1) {
+      await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+    }
+  });
+}
+
+/** Fakes only the clocks the hook's throttle and debounce read; `waitFor` keeps polling. */
+function useFakeClock() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+}
+
+/**
+ * Moves the fake clock forward, then lets the sealing that timer started finish.
+ * While the clock is faked, poll with `vi.waitFor`: Testing Library's `waitFor`
+ * waits on a timer the fake clock never fires.
+ */
+async function advanceClock(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+  await settle();
 }
 
 type Cli = {
   keys: TerminalSessionKeys;
   unicastSeq: bigint;
-  viewerId: string | null;
+  viewerId: string;
 };
 
 type CliKey = Awaited<ReturnType<typeof generateEphemeralHandshake>>;
@@ -164,16 +191,15 @@ function requireCli(): FakeCli {
   return currentCli;
 }
 
-/** The relay's `clis` entry for the fake CLI: signed on 2.5, bare on 2.4. */
-async function listedCli(cli: FakeCli, multiViewer: boolean): Promise<ListedCli> {
+/** The relay's `clis` entry for the fake CLI, with its signed identity. */
+async function listedCli(cli: FakeCli): Promise<ListedCli> {
   const publicKey = bytesToBase64Url(cli.ecdh.publicKeyRaw);
   return {
     cliDeviceId: CLI_ID,
     slug: CLI_SLUG,
     publicKey,
-    terminalViewers: multiViewer,
-    identityPublicKey: multiViewer ? cli.identityPublicKey : null,
-    identitySignature: multiViewer ? await cli.sign(cli.ecdh.publicKeyRaw) : null,
+    identityPublicKey: cli.identityPublicKey,
+    identitySignature: await cli.sign(cli.ecdh.publicKeyRaw),
   };
 }
 
@@ -194,7 +220,7 @@ function listedTerminal(viewerAttached: boolean) {
 
 /** Plays the CLI side of an attach: derive keys, then `attaching` / `attached`. */
 async function attachAsCli(
-  viewerId: string | null,
+  viewerId: string,
   attachIndex = 0,
   answerWith?: CliKey,
   /** Runs in the same act as `attached`, before the browser derives keys. */
@@ -220,13 +246,10 @@ async function attachAsCli(
     cliPublicRaw: cli.publicKeyRaw,
     browserPublicRaw,
   };
-  const keys = viewerId
-    ? await deriveTerminalSessionKeysV2({ ...args, viewerId })
-    : await deriveTerminalSessionKeys(args);
+  const keys = await deriveTerminalSessionKeysV2({ ...args, viewerId });
   const state: Cli = { keys, unicastSeq: 0n, viewerId };
   const early = sealEarly ? await sealEarly(state) : [];
-  // The 2.5 server names the viewer for 2.4 terminals too; v1 crypto ignores it.
-  message({ type: "attaching", terminalId: TERMINAL_ID, viewerId: viewerId ?? VIEWER_ID });
+  message({ type: "attaching", terminalId: TERMINAL_ID, viewerId });
   act(() => {
     handlers().onMessage({
       type: "attached",
@@ -243,22 +266,14 @@ async function attachAsCli(
 async function sealUnicast(cli: Cli, plaintext: Uint8Array): Promise<SealedTerminalFrame> {
   cli.unicastSeq += 1n;
   const seq = cli.unicastSeq;
-  const body = cli.viewerId
-    ? await sealTerminalBytesV2({
-        key: cli.keys.cliToBrowser,
-        terminalId: TERMINAL_ID,
-        viewerId: cli.viewerId,
-        direction: DIRECTION_CLI_TO_BROWSER,
-        seq,
-        plaintext,
-      })
-    : await sealTerminalBytes({
-        key: cli.keys.cliToBrowser,
-        terminalId: TERMINAL_ID,
-        direction: DIRECTION_CLI_TO_BROWSER,
-        seq,
-        plaintext,
-      });
+  const body = await sealTerminalBytesV2({
+    key: cli.keys.cliToBrowser,
+    terminalId: TERMINAL_ID,
+    viewerId: cli.viewerId,
+    direction: DIRECTION_CLI_TO_BROWSER,
+    seq,
+    plaintext,
+  });
   return { terminalId: TERMINAL_ID, seq: Number(seq), body };
 }
 
@@ -298,7 +313,7 @@ async function listAndSubscribe() {
   const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
   message({
     type: "terminals",
-    clis: [await listedCli(currentCli, true)],
+    clis: [await listedCli(currentCli)],
     terminals: [listedTerminal(true)],
   });
   const localId = view.result.current.tabs[0]?.localId;
@@ -316,28 +331,22 @@ async function browserFrames(cli: Cli) {
   for (const [frame] of socket.sendFrame.mock.calls) {
     const decoded = decodeSealedFrame(frame);
     const seq = BigInt(decoded.seq);
-    const plaintext = cli.viewerId
-      ? await openTerminalBytesV2({
-          key: cli.keys.browserToCli,
-          terminalId: TERMINAL_ID,
-          viewerId: cli.viewerId,
-          direction: DIRECTION_BROWSER_TO_CLI,
-          seq,
-          ciphertext: decoded.body,
-        })
-      : await openTerminalBytes({
-          key: cli.keys.browserToCli,
-          terminalId: TERMINAL_ID,
-          direction: DIRECTION_BROWSER_TO_CLI,
-          seq,
-          ciphertext: decoded.body,
-        });
-    const message = decodeTerminalPlaintext(plaintext);
+    const plaintext = await openTerminalBytesV2({
+      key: cli.keys.browserToCli,
+      terminalId: TERMINAL_ID,
+      viewerId: cli.viewerId,
+      direction: DIRECTION_BROWSER_TO_CLI,
+      seq,
+      ciphertext: decoded.body,
+    });
+    const message = decodeTerminalPlaintextV2(plaintext);
     // Compare text, not Uint8Array: jsdom and Node each have their own.
     frames.push(
       message.kind === "data"
         ? { seq: decoded.seq, data: decoder.decode(message.data) }
-        : { seq: decoded.seq, resize: [message.cols, message.rows] },
+        : message.kind === "resize"
+          ? { seq: decoded.seq, resize: [message.cols, message.rows] }
+          : { seq: decoded.seq, kind: message.kind },
     );
   }
   return frames;
@@ -349,15 +358,15 @@ function outputText(events: TerminalOutputEvent[]): string {
     .join("");
 }
 
-async function setup(multiViewer: boolean, pinStore = createMemoryCliPinStore()) {
+async function setup(pinStore = createMemoryCliPinStore()) {
   currentCli = await fakeCli();
   const view = renderHook(() => useTerminalSessions({ pinStore }));
   message({
     type: "terminals",
-    clis: [await listedCli(currentCli, multiViewer)],
-    terminals: [listedTerminal(multiViewer)],
+    clis: [await listedCli(currentCli)],
+    terminals: [listedTerminal(true)],
   });
-  const cli = await attachAsCli(multiViewer ? VIEWER_ID : null);
+  const cli = await attachAsCli(VIEWER_ID);
   await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
   const tab = view.result.current.tabs[0];
   if (!tab) throw new Error("no tab");
@@ -369,7 +378,7 @@ async function setup(multiViewer: boolean, pinStore = createMemoryCliPinStore())
 }
 
 async function setupV2() {
-  const context = await setup(true);
+  const context = await setup();
   const outKey = crypto.getRandomValues(new Uint8Array(32));
   await unicast(context.cli, encodeTerminalOutputKey(1, outKey));
   await unicast(context.cli, encodeTerminalResize(120, 40));
@@ -377,7 +386,7 @@ async function setupV2() {
   return { ...context, outKey };
 }
 
-describe("useTerminalSessions (protocol 2.5)", () => {
+describe("useTerminalSessions (multi-viewer)", () => {
   it("decrypts broadcast frames after the unicast output key and PTY size", async () => {
     const { view, events, outKey } = await setupV2();
     await broadcast(outKey, 1, 1, "world");
@@ -398,41 +407,44 @@ describe("useTerminalSessions (protocol 2.5)", () => {
 
   it("sends nothing when a follower's box is fitted", async () => {
     const { view, localId } = await setupV2();
+    useFakeClock();
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
     act(() => view.result.current.sendResize(localId, 100, 30));
-    await sleep(200);
+    await advanceClock(200);
     expect(socket.sendFrame).not.toHaveBeenCalled();
     expect(view.result.current.tabs[0]).toMatchObject({ cols: 100, rows: 30 });
   });
 
   it("takes over on input: own-size resize first, then data, with increasing seq", async () => {
     const { view, cli, localId } = await setupV2();
+    useFakeClock();
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
     act(() => view.result.current.sendResize(localId, 100, 30));
     act(() => view.result.current.sendInput(localId, "ls"));
     expect(view.result.current.tabs[0]?.writer).toBe("you");
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
     const frames = await browserFrames(cli);
     expect(frames).toEqual([
       { seq: 1, resize: [100, 30] },
       { seq: 2, data: "ls" },
     ]);
     // A second keystroke does not resize again.
-    await sleep(60);
+    await advanceClock(60);
     act(() => view.result.current.sendInput(localId, "\r"));
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(3));
     const [, , third] = await browserFrames(cli);
     expect(third).toEqual({ seq: 3, data: "\r" });
   });
 
   it("debounces the writer's resizes into one frame", async () => {
     const { view, cli, localId } = await setupV2();
+    useFakeClock();
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
     act(() => view.result.current.sendResize(localId, 90, 30));
     act(() => view.result.current.sendResize(localId, 91, 31));
     act(() => view.result.current.sendResize(localId, 92, 32));
-    await sleep(200);
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    await advanceClock(200);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
     expect(await browserFrames(cli)).toEqual([{ seq: 1, resize: [92, 32] }]);
   });
 
@@ -442,7 +454,7 @@ describe("useTerminalSessions (protocol 2.5)", () => {
     const nextKey = crypto.getRandomValues(new Uint8Array(32));
     // Epoch 2 output arrives before its key: it waits in the queue.
     await broadcast(nextKey, 2, 1, "b");
-    await sleep(20);
+    await settle();
     expect(outputText(events)).toBe("hello a");
     await unicast(cli, encodeTerminalOutputKey(2, nextKey));
     await waitFor(() => expect(outputText(events)).toBe("hello ab"));
@@ -452,7 +464,7 @@ describe("useTerminalSessions (protocol 2.5)", () => {
     await waitFor(() => expect(outputText(events)).toBe("hello abc"));
     // A replayed broadcast seq is ignored.
     await broadcast(nextKey, 2, 2, "again");
-    await sleep(20);
+    await settle();
     expect(outputText(events)).toBe("hello abc");
   });
 
@@ -489,7 +501,7 @@ describe("useTerminalSessions (protocol 2.5)", () => {
 describe("useTerminalSessions End session until the relay confirms", () => {
   beforeEach(async () => {
     // Handshakes of the previous test may still finish on the shared socket mock.
-    await sleep(150);
+    await settle();
     socket.send.mockReset();
     socket.send.mockImplementation(() => "sent");
     socket.sendFrame.mockReset();
@@ -506,7 +518,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
       expect.objectContaining({ localId, ending: "pending" }),
     ]);
     act(() => view.result.current.sendInput(localId, "ls\r"));
-    await sleep(80);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     // Pressing it again does not send a second close while one is out.
     act(() => view.result.current.endSession(localId));
@@ -517,7 +529,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
 
   it("sends a close lost with its socket again when the next list still has the terminal", async () => {
     const { view, localId } = await setupV2();
-    const listed = await listedCli(requireCli(), true);
+    const listed = await listedCli(requireCli());
     // The socket takes the close into its queue, then closes before it left.
     socket.send.mockImplementation((entry) => (entry.type === "close" ? "queued" : "sent"));
     act(() => view.result.current.endSession(localId));
@@ -529,7 +541,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     expect(closes()).toHaveLength(2);
     expect(closes()[1]?.requestId).not.toBe(closes()[0]?.requestId);
     // No viewer slot is taken again for a terminal being ended.
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toHaveLength(attaches);
     expect(view.result.current.tabs[0]).toMatchObject({ localId, ending: "pending" });
     // An answer to the lost close changes nothing; the exit does.
@@ -539,7 +551,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
 
   it("removes the tab when the list after a reconnect no longer has the terminal", async () => {
     const { view, localId } = await setupV2();
-    const listed = await listedCli(requireCli(), true);
+    const listed = await listedCli(requireCli());
     act(() => view.result.current.endSession(localId));
     act(() => handlers().onDisconnect?.());
     act(() => handlers().onOpen?.());
@@ -550,7 +562,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
 
   it("sends it on the next socket when no socket took it", async () => {
     const { view, localId } = await setupV2();
-    const listed = await listedCli(requireCli(), true);
+    const listed = await listedCli(requireCli());
     socket.send.mockImplementation(() => "closed");
     act(() => view.result.current.endSession(localId));
     expect(view.result.current.tabs[0]).toMatchObject({ localId, ending: "pending" });
@@ -612,7 +624,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
   it("keeps closing an unopened shell closed with X across a reconnect, without showing it again", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
@@ -642,7 +654,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
   it("brings a shell no tab shows back as a tab when the relay refuses its close", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
@@ -671,7 +683,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
   it("keeps closing an opened shell refused for a substituted key until the relay confirms", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
@@ -708,7 +720,7 @@ describe("useTerminalSessions open refused before the relay read it", () => {
   it("matches acks by request id and opens a rate-limited tab again", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
@@ -761,7 +773,7 @@ describe("useTerminalSessions frames a full socket queue refused", () => {
   it("opens and attaches again with backoff instead of waiting on a frame never sent", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     let refuse = true;
     socket.send.mockImplementation((entry) => {
@@ -808,7 +820,7 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
   it("closes the shell when `opening` arrives for a tab already closed", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
     // Acks match opens in send order, and key generation can finish in either
     // order, so send the first open before starting the second.
@@ -839,7 +851,7 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
       cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
       cliNonce: bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))),
     });
-    await sleep(20);
+    await settle();
     expect(view.result.current.tabs).toEqual([
       expect.objectContaining({ localId: kept.localId, phase: "opening" }),
     ]);
@@ -871,13 +883,13 @@ describe("useTerminalSessions shell exit", () => {
     expect(view.result.current.tabs[0]?.phase).toBe("exited");
     // The queued epoch-2 frame opens once the key that follows it is read.
     await waitFor(() => expect(outputText(events)).toBe("hello abdce"));
-    await sleep(30);
+    await settle();
     expect(outputText(events)).toBe("hello abdce");
     expect(view.result.current.tabs[0]?.phase).toBe("exited");
     // The session is gone: input goes nowhere and later output is dropped.
     act(() => view.result.current.sendInput(localId, "x"));
     await unicast(cli, text("after"));
-    await sleep(30);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     expect(outputText(events)).toBe("hello abdce");
   });
@@ -893,7 +905,7 @@ describe("useTerminalSessions shell exit", () => {
       async (cli) => [await sealUnicast(cli, text("last ")), await sealUnicast(cli, text("words"))],
     );
     await waitFor(() => expect(outputText(events)).toBe("last words"));
-    await sleep(30);
+    await settle();
     expect(view.result.current.tabs[0]?.phase).toBe("exited");
   });
 });
@@ -904,12 +916,12 @@ describe("useTerminalSessions handshake after the tab ended", () => {
     const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>
       handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null }),
     );
-    await sleep(50);
+    await settle();
     expect(view.result.current.tabs[0]?.phase).toBe("exited");
     const localId = view.result.current.tabs[0]?.localId ?? "";
     act(() => view.result.current.sendInput(localId, "x"));
     await unicast(cli, text("ghost"));
-    await sleep(30);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     expect(view.result.current.tabs[0]?.phase).toBe("exited");
   });
@@ -924,13 +936,13 @@ describe("useTerminalSessions handshake after the tab ended", () => {
         approvalCode: null,
       }),
     );
-    await sleep(50);
+    await settle();
     expect(view.result.current.tabs[0]).toMatchObject({
       phase: "rejected",
       rejectionReason: "denied",
     });
     await unicast(cli, text("ghost"));
-    await sleep(30);
+    await settle();
     expect(events).toEqual([]);
   });
 
@@ -939,12 +951,12 @@ describe("useTerminalSessions handshake after the tab ended", () => {
     const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>
       view.result.current.detachTab(localId),
     );
-    await sleep(50);
+    await settle();
     expect(view.result.current.tabs).toEqual([]);
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
     act(() => view.result.current.sendInput(localId, "x"));
     await unicast(cli, text("ghost"));
-    await sleep(30);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     expect(events).toEqual([]);
   });
@@ -954,53 +966,14 @@ describe("useTerminalSessions handshake after the tab ended", () => {
     await attachAsCli(VIEWER_ID, 0, undefined, () =>
       handlers().onMessage({ type: "detached", terminalId: TERMINAL_ID, reason: null }),
     );
-    await sleep(50);
+    await settle();
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: "detached" });
   });
 });
 
-describe("useTerminalSessions (protocol 2.4)", () => {
-  it("keeps the v1 path: output decrypts and input goes out under v1 keys", async () => {
-    const { view, cli, localId, events } = await setup(false);
-    expect(view.result.current.tabs[0]).toMatchObject({ multiViewer: false, writer: "you" });
-    await unicast(cli, encodeTerminalData(new TextEncoder().encode("legacy")));
-    await waitFor(() => expect(outputText(events)).toBe("legacy"));
-    act(() => view.result.current.sendInput(localId, "x"));
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
-    act(() => view.result.current.sendResize(localId, 100, 30));
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
-    expect(await browserFrames(cli)).toEqual([
-      { seq: 1, data: "x" },
-      { seq: 2, resize: [100, 30] },
-    ]);
-  });
-
-  it("does not steal a 2.4 terminal another tab is viewing until selected", async () => {
-    currentCli = await fakeCli();
-    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    message({
-      type: "terminals",
-      clis: [await listedCli(currentCli, false)],
-      terminals: [listedTerminal(true)],
-    });
-    await sleep(50);
-    expect(sentOfType("attach")).toEqual([]);
-    const tab = view.result.current.tabs[0];
-    expect(tab?.error).toBe("detached");
-    act(() => view.result.current.selectTab(tab?.localId ?? ""));
-    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
-  });
-});
-
 describe("useTerminalSessions CLI identity pinning", () => {
-  it("allows a 2.4 CLI as unverified, without pinning anything", async () => {
-    const { view, pinStore } = await setup(false);
-    expect(view.result.current.cliTrust[CLI_ID]).toEqual({ status: "unverified" });
-    expect(pinStore.pins.size).toBe(0);
-  });
-
-  it("verifies and pins a 2.5 CLI identity on first use", async () => {
-    const { view, pinStore } = await setup(true);
+  it("verifies and pins a CLI identity on first use", async () => {
+    const { view, pinStore } = await setup();
     const cli = requireCli();
     expect(pinStore.pins.get(CLI_ID)).toBe(cli.identityPublicKey);
     const fingerprint = await cliIdentityFingerprint(base64UrlToBytes(cli.identityPublicKey));
@@ -1021,7 +994,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     await waitFor(() =>
@@ -1058,7 +1031,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     await waitFor(() =>
@@ -1073,7 +1046,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     currentCli = swapped;
     message({
       type: "terminals",
-      clis: [await listedCli(swapped, true)],
+      clis: [await listedCli(swapped)],
       terminals: [listedTerminal(true)],
     });
     const swappedFingerprint = await cliIdentityFingerprint(
@@ -1101,15 +1074,15 @@ describe("useTerminalSessions CLI identity pinning", () => {
       phase: "rejected",
       rejectionReason: "identity_changed",
     });
-    await sleep(20);
+    await settle();
     expect(sentOfType("attach")).toEqual([]);
   });
 
-  it("refuses a 2.5 CLI whose signature does not cover its terminal key", async () => {
+  it("refuses a CLI whose signature does not cover its terminal key", async () => {
     currentCli = await fakeCli();
     const pinStore = createMemoryCliPinStore();
     const view = renderHook(() => useTerminalSessions({ pinStore }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({
       type: "terminals",
       // Signed for another slug: the relay cannot re-bind a statement.
@@ -1132,10 +1105,10 @@ describe("useTerminalSessions CLI identity pinning", () => {
     expect(pinStore.pins.size).toBe(0);
   });
 
-  it("refuses a 2.5 CLI that lists no identity", async () => {
+  it("refuses a CLI that lists no identity", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     message({
       type: "terminals",
       clis: [{ ...listed, identityPublicKey: null, identitySignature: null }],
@@ -1152,7 +1125,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     await attachAsCli(VIEWER_ID, 0, await generateEphemeralHandshake());
@@ -1174,14 +1147,14 @@ describe("useTerminalSessions browser identity readiness", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     // The identity check finishes, but no handshake goes out without an identity.
     await waitFor(() =>
       expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "trusted" }),
     );
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toEqual([]);
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", rejectionReason: null });
 
@@ -1197,7 +1170,7 @@ describe("useTerminalSessions browser identity readiness", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     // The mocked identity has no public key, so this attach carries none.
@@ -1231,7 +1204,7 @@ describe("useTerminalSessions browser identity readiness", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
       type: "terminals",
-      clis: [await listedCli(currentCli, true)],
+      clis: [await listedCli(currentCli)],
       terminals: [listedTerminal(true)],
     });
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
@@ -1240,7 +1213,7 @@ describe("useTerminalSessions browser identity readiness", () => {
     view.rerender();
     identity.ready = true;
     view.rerender();
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toHaveLength(1);
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "rejected" });
   });
@@ -1249,12 +1222,12 @@ describe("useTerminalSessions browser identity readiness", () => {
 describe("useTerminalSessions reconnection", () => {
   it("discards a handshake that finishes after the socket dropped", async () => {
     currentCli = await fakeCli();
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
     // The socket drops while the browser is still deriving the session keys.
     await attachAsCli(VIEWER_ID, 0, undefined, () => handlers().onDisconnect?.());
-    await sleep(50);
+    await settle();
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
 
     // The next socket lists the terminal again, and the tab reattaches.
@@ -1266,7 +1239,7 @@ describe("useTerminalSessions reconnection", () => {
 
   it("drops an identity check that finishes on an earlier socket", async () => {
     currentCli = await fakeCli();
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     act(() => {
       handlers().onMessage({
@@ -1277,7 +1250,7 @@ describe("useTerminalSessions reconnection", () => {
       // Disconnect before the trust check lets the attach go out.
       handlers().onDisconnect?.();
     });
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toEqual([]);
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
@@ -1287,7 +1260,7 @@ describe("useTerminalSessions reconnection", () => {
 
 describe("useTerminalSessions terminals gone while disconnected", () => {
   it("marks a tab exited when the next list no longer has its terminal", async () => {
-    const { view, localId } = await setup(true);
+    const { view, localId } = await setup();
     expect(sentOfType("attach")).toHaveLength(1);
     act(() => handlers().onDisconnect?.());
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
@@ -1295,7 +1268,7 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     act(() => handlers().onOpen?.());
     message({
       type: "terminals",
-      clis: [await listedCli(requireCli(), true)],
+      clis: [await listedCli(requireCli())],
       terminals: [],
     });
     expect(view.result.current.tabs[0]).toMatchObject({
@@ -1303,21 +1276,21 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
       phase: "exited",
       error: TERMINAL_GONE,
     });
-    await sleep(20);
+    await settle();
     expect(sentOfType("attach")).toHaveLength(1);
     // Input to the ended tab goes nowhere.
     act(() => view.result.current.sendInput(localId, "ls\r"));
-    await sleep(20);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
   });
 
   it("reattaches a terminal the next list still has", async () => {
-    const { view } = await setup(true);
+    const { view } = await setup();
     act(() => handlers().onDisconnect?.());
     act(() => handlers().onOpen?.());
     message({
       type: "terminals",
-      clis: [await listedCli(requireCli(), true)],
+      clis: [await listedCli(requireCli())],
       terminals: [listedTerminal(true)],
     });
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: null });
@@ -1327,7 +1300,7 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
 
   it("does not end a terminal the relay named after the list was requested", async () => {
     currentCli = await fakeCli();
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [] });
@@ -1361,7 +1334,7 @@ describe("useTerminalSessions CLI list refresh", () => {
     expect(sentOfType("open")).toEqual([]);
     expect(view.result.current.tabs).toEqual([]);
 
-    message({ type: "terminals", clis: [await listedCli(currentCli, true)], terminals: [] });
+    message({ type: "terminals", clis: [await listedCli(currentCli)], terminals: [] });
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     expect(view.result.current.tabs).toEqual([
       expect.objectContaining({ cliDeviceId: CLI_ID, phase: "opening", rejectionReason: null }),
@@ -1370,7 +1343,7 @@ describe("useTerminalSessions CLI list refresh", () => {
 
   it("keeps a terminal closed with X out of later lists", async () => {
     const { view, localId } = await setupV2();
-    const listed = await listedCli(requireCli(), true);
+    const listed = await listedCli(requireCli());
     act(() => view.result.current.detachTab(localId));
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
     expect(view.result.current.tabs).toEqual([]);
@@ -1402,7 +1375,7 @@ describe("useTerminalSessions CLI list refresh", () => {
 describe("useTerminalSessions (agent requests)", () => {
   beforeEach(async () => {
     // Handshakes of the previous test may still finish on the shared socket mock.
-    await sleep(150);
+    await settle();
     socket.send.mockReset();
     socket.sendFrame.mockReset();
   });
@@ -1429,7 +1402,7 @@ describe("useTerminalSessions (agent requests)", () => {
 
   async function listAgent(status = "awaiting_user", shareOutput = true) {
     currentCli = await fakeCli();
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({ type: "terminals", clis: [listed], terminals: [agentTerminal(status, shareOutput)] });
     return { view, listed };
@@ -1468,7 +1441,7 @@ describe("useTerminalSessions (agent requests)", () => {
 
   it("lists an agent request without attaching, and attaches when it is selected", async () => {
     const { view } = await listAgent();
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toEqual([]);
     const tab = view.result.current.tabs[0];
     expect(tab).toMatchObject({ origin: "agent", phase: "waiting" });
@@ -1476,10 +1449,10 @@ describe("useTerminalSessions (agent requests)", () => {
     // A later list does not attach it either.
     message({
       type: "terminals",
-      clis: [await listedCli(requireCli(), true)],
+      clis: [await listedCli(requireCli())],
       terminals: [agentTerminal()],
     });
-    await sleep(50);
+    await settle();
     expect(sentOfType("attach")).toEqual([]);
     act(() => view.result.current.selectTab(tab?.localId ?? ""));
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
@@ -1488,7 +1461,7 @@ describe("useTerminalSessions (agent requests)", () => {
   it("drops keystrokes until the confirm screen has been shown", async () => {
     const { view, cli, localId, events } = await attachAgent();
     act(() => view.result.current.sendInput(localId, "\r"));
-    await sleep(100);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     const outKey = crypto.getRandomValues(new Uint8Array(32));
     await unicast(cli, encodeTerminalOutputKey(1, outKey));
@@ -1512,7 +1485,7 @@ describe("useTerminalSessions (agent requests)", () => {
       terminals: [agentTerminal("awaiting_output_review")],
     });
     act(() => view.result.current.sendInput(localId, "y\r"));
-    await sleep(100);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
   });
 
@@ -1539,7 +1512,7 @@ describe("useTerminalSessions (agent requests)", () => {
       return { ...context, localId: id };
     })();
     act(() => view.result.current.setReviewOutput(localId, true));
-    await sleep(50);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
   });
 
@@ -1568,7 +1541,7 @@ describe("useTerminalSessions (agent requests)", () => {
 
   it("does not end a user terminal that is still attaching when a push omits it", async () => {
     currentCli = await fakeCli();
-    const listed = await listedCli(currentCli, true);
+    const listed = await listedCli(currentCli);
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
     expect(view.result.current.tabs[0]?.phase).toBe("opening");
@@ -1588,7 +1561,7 @@ describe("useTerminalSessions (agent requests)", () => {
     expect(view.result.current.tabs[0]).toMatchObject({ localId, phase: "live", decline: "sent" });
     // This tab cannot press Enter after declining.
     act(() => view.result.current.sendInput(localId, "\r"));
-    await sleep(100);
+    await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     // A second Decline is not sent again.
     act(() => view.result.current.declineRequest(localId));

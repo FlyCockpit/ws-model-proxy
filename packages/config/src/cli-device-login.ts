@@ -54,3 +54,48 @@ export const CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE = "wsmp-upgrade-required";
  * "expired", or "polling too fast": 0.3.x matches those words in the error.
  */
 export const CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE = `This server requires wsmp ${WSMP_MIN_CLI_VERSION} or newer. Upgrade wsmp, then run \`wsmp login\` again.`;
+
+/**
+ * Why the approval page's two procedures (`cliCredentials.deviceLoginRequest`
+ * and `approveDeviceLogin`) refuse a request, sent as ORPCError
+ * `data.reason` so the page can say what happened and what to do next (the
+ * message text is never shown). The reasons say nothing an account could not
+ * already learn by holding the user code: another account's request is
+ * `not_found`, exactly as if the code did not exist.
+ *
+ * - `not_found`: no request with this code is visible to this account (wrong
+ *   code, wrong account, or already redeemed by the CLI).
+ * - `expired`: the request outlived its lifetime.
+ * - `already_handled`: it was denied, or another account approved it first.
+ * - `already_used`: it vanished while approving — approved and redeemed by
+ *   the CLI in between, or swept after expiry. Nothing further to approve.
+ * - `slug_mismatch`: the request is for a different CLI slug than the page
+ *   showed (the page is stale).
+ * - `no_slug`: the request names no CLI slug (a CLI older than
+ *   {@link WSMP_MIN_CLI_VERSION}).
+ */
+export const DEVICE_LOGIN_REFUSAL_REASONS = [
+  "not_found",
+  "expired",
+  "already_handled",
+  "already_used",
+  "slug_mismatch",
+  "no_slug",
+] as const;
+
+export type DeviceLoginRefusalReason = (typeof DEVICE_LOGIN_REFUSAL_REASONS)[number];
+
+const deviceLoginRefusalReasons: ReadonlySet<string> = new Set(DEVICE_LOGIN_REFUSAL_REASONS);
+
+export function isDeviceLoginRefusalReason(value: unknown): value is DeviceLoginRefusalReason {
+  return typeof value === "string" && deviceLoginRefusalReasons.has(value);
+}
+
+/** The `data.reason` of an error thrown by the approval procedures, or null. */
+export function deviceLoginRefusalReasonOf(error: unknown): DeviceLoginRefusalReason | null {
+  if (typeof error !== "object" || error === null) return null;
+  const data: unknown = Reflect.get(error, "data");
+  if (typeof data !== "object" || data === null) return null;
+  const reason: unknown = Reflect.get(data, "reason");
+  return isDeviceLoginRefusalReason(reason) ? reason : null;
+}

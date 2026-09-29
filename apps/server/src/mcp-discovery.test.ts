@@ -3,7 +3,7 @@ import { memoryAdapter } from "better-auth/adapters/memory";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Phase 3 discovery parity tests: the four well-known alias paths must be
@@ -44,9 +44,28 @@ const HOST = { host: "proxy.example.com" } as const;
 beforeEach(() => {
   grants.findUnique.mockReset().mockResolvedValue(null);
   grants.create.mockReset().mockResolvedValue(null);
+  // The shared fixtures keep their SPA-catch-all marker across tests; clear
+  // it so each assertion observes only this test's request.
+  for (const fixture of fixtures.values()) fixture.resetSpaProbe();
 });
 
-/** Real installed handler + memory adapter (parity-test pattern). */
+/**
+ * Real installed handler + memory adapter (parity-test pattern).
+ *
+ * ONE auth instance per MCP flag for the whole file: the memory-adapter
+ * instance and the Hono fixture are both construction-only (no test swaps
+ * the plugin set or remounts middleware), so the flag-on and flag-off
+ * fixtures are built in `beforeAll` and shared. The flag-off app differs
+ * only in the forwarder's `enabled` gate — the auth instance stays flag-on
+ * so the gate (not the plugin set) is what the flag-off rows observe.
+ *
+ * The DCR row does append one client row to the shared memory adapter. That
+ * accumulation is harmless here: no row in this file asserts on a client
+ * count, and each request derives its own PKCE verifier.
+ *
+ * State that DOES vary per test is reset in `beforeEach` (the `grants`
+ * mocks and the SPA-catch-all marker), never carried on the shared app.
+ */
 function buildAuth() {
   const memory: Record<string, Record<string, unknown>[]> = {
     oauthAccessToken: [],
@@ -120,8 +139,39 @@ function buildApp({ mcpEnabled }: { mcpEnabled: boolean }) {
     spaReached = true;
     return c.html("<html><body>SPA SHELL</body></html>");
   });
-  return { app, wasSpaReached: () => spaReached };
+  return { app, wasSpaReached: () => spaReached, resetSpaProbe: () => (spaReached = false) };
 }
+
+/**
+ * Flag-scoped fixture cache, filled once in `beforeAll`. The SPA-catch-all
+ * marker lives inside the cached app, so it is cleared per test by the
+ * `beforeEach` below rather than by building a fresh app.
+ */
+const fixtures = new Map<string, ReturnType<typeof buildApp>>();
+
+function fixtureKey(mcpEnabled: boolean): "on" | "off" {
+  return mcpEnabled ? "on" : "off";
+}
+
+/** The shared fixture app (one per MCP flag). */
+function fixtureApp(mcpEnabled: boolean): ReturnType<typeof buildApp>["app"] {
+  const fixture = fixtures.get(fixtureKey(mcpEnabled));
+  if (!fixture) throw new Error(`fixture not built for MCP flag ${fixtureKey(mcpEnabled)}`);
+  return fixture.app;
+}
+
+/** The shared fixture's SPA-catch-all marker. */
+function spaReached(mcpEnabled: boolean): boolean {
+  const fixture = fixtures.get(fixtureKey(mcpEnabled));
+  if (!fixture) throw new Error(`fixture not built for MCP flag ${fixtureKey(mcpEnabled)}`);
+  return fixture.wasSpaReached();
+}
+
+beforeAll(() => {
+  for (const mcpEnabled of [true, false]) {
+    fixtures.set(fixtureKey(mcpEnabled), buildApp({ mcpEnabled }));
+  }
+});
 
 const AUTH_SERVER_ALIASES = [
   "/.well-known/oauth-authorization-server/api/auth",
@@ -136,10 +186,10 @@ const PROTECTED_RESOURCE_ALIASES = [
 describe("MCP discovery aliases against the real installed handler", () => {
   describe.each(AUTH_SERVER_ALIASES)("authorization-server metadata %s", (alias) => {
     it("GET returns the REAL provider metadata (issuer, endpoints, scopes, DCR)", async () => {
-      const { app, wasSpaReached } = buildApp({ mcpEnabled: true });
+      const app = fixtureApp(true);
       const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status).toBe(200);
-      expect(wasSpaReached()).toBe(false);
+      expect(spaReached(true)).toBe(false);
       const doc = (await res.json()) as Record<string, unknown>;
       expect(doc.issuer).toBe(ISSUER);
       expect(doc.authorization_endpoint).toBe(`${ISSUER}/oauth2/authorize`);
@@ -155,7 +205,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     });
 
     it("HEAD matches the GET status and headers with an EMPTY body", async () => {
-      const { app } = buildApp({ mcpEnabled: true });
+      const app = fixtureApp(true);
       const getRes = await app.request(`${BASE}${alias}`, { headers: HOST });
       const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD", headers: HOST });
       expect(headRes.status).toBe(getRes.status);
@@ -167,7 +217,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     it.each(["PUT", "POST", "DELETE"] as const)(
       "%s → 405 with Allow: GET, HEAD (never reaches the handler for judging)",
       async (method) => {
-        const { app } = buildApp({ mcpEnabled: true });
+        const app = fixtureApp(true);
         const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status).toBe(405);
         expect(res.headers.get("allow")).toBe("GET, HEAD");
@@ -175,21 +225,21 @@ describe("MCP discovery aliases against the real installed handler", () => {
     );
 
     it("flag OFF → 404 for every method; never falls through to the SPA/SSR catch-all", async () => {
-      const { app, wasSpaReached } = buildApp({ mcpEnabled: false });
+      const app = fixtureApp(false);
       for (const method of ["GET", "HEAD", "PUT", "POST", "DELETE"] as const) {
         const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status, `${method} ${alias}`).toBe(404);
       }
-      expect(wasSpaReached()).toBe(false);
+      expect(spaReached(false)).toBe(false);
     });
   });
 
   describe.each(PROTECTED_RESOURCE_ALIASES)("protected-resource metadata %s", (alias) => {
     it("GET returns the REAL RFC 9728 resource document (canonical resource, issuer)", async () => {
-      const { app, wasSpaReached } = buildApp({ mcpEnabled: true });
+      const app = fixtureApp(true);
       const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status).toBe(200);
-      expect(wasSpaReached()).toBe(false);
+      expect(spaReached(true)).toBe(false);
       const doc = (await res.json()) as Record<string, unknown>;
       expect(doc.resource).toBe(CANONICAL);
       expect(doc.authorization_servers).toEqual([ISSUER]);
@@ -198,7 +248,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     });
 
     it("HEAD matches the GET status and content-type with an EMPTY body", async () => {
-      const { app } = buildApp({ mcpEnabled: true });
+      const app = fixtureApp(true);
       const getRes = await app.request(`${BASE}${alias}`, { headers: HOST });
       const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD", headers: HOST });
       expect(headRes.status).toBe(getRes.status);
@@ -209,7 +259,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     it.each(["PUT", "POST", "DELETE"] as const)(
       "%s → 405 with Allow: GET, HEAD",
       async (method) => {
-        const { app } = buildApp({ mcpEnabled: true });
+        const app = fixtureApp(true);
         const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status).toBe(405);
         expect(res.headers.get("allow")).toBe("GET, HEAD");
@@ -217,23 +267,23 @@ describe("MCP discovery aliases against the real installed handler", () => {
     );
 
     it("flag OFF → 404 for every method; never falls through to the SPA/SSR catch-all", async () => {
-      const { app, wasSpaReached } = buildApp({ mcpEnabled: false });
+      const app = fixtureApp(false);
       for (const method of ["GET", "HEAD", "PUT", "POST", "DELETE"] as const) {
         const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status, `${method} ${alias}`).toBe(404);
       }
-      expect(wasSpaReached()).toBe(false);
+      expect(spaReached(false)).toBe(false);
     });
   });
 
   it("no OpenID discovery document is served while openid is not configured", async () => {
-    const { app } = buildApp({ mcpEnabled: true });
+    const app = fixtureApp(true);
     const res = await app.request(`${BASE}/api/auth/.well-known/openid-configuration`);
     expect(res.status).toBe(404);
   });
 
   it("DCR registration accepts unauthenticated clients within the configured scope ceiling", async () => {
-    const { app } = buildApp({ mcpEnabled: true });
+    const app = fixtureApp(true);
     const res = await app.request(`${BASE}/api/auth/oauth2/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -255,7 +305,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
   });
 
   it("JWKS stays GET-only: HEAD /api/auth/jwks is NOT given a HEAD adapter (upstream 404)", async () => {
-    const { app } = buildApp({ mcpEnabled: true });
+    const app = fixtureApp(true);
     const getRes = await app.request(`${BASE}/api/auth/jwks`);
     expect(getRes.status).toBe(200);
     const headRes = await app.request(`${BASE}/api/auth/jwks`, { method: "HEAD" });

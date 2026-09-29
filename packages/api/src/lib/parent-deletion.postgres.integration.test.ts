@@ -849,6 +849,17 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     };
   }
 
+  /**
+   * Releases `held` after `ms` unless cancelled. Tests cancel it in `finally`
+   * and release right away, so a passed test never idles out the timer.
+   */
+  function scheduleRelease(held: { release: () => Promise<void> }, ms: number) {
+    const timer = setTimeout(() => {
+      void held.release().catch(() => undefined);
+    }, ms);
+    return { cancel: () => clearTimeout(timer) };
+  }
+
   it("the drain passes a terminal admission whose waiter another transaction holds (F2-07)", async () => {
     const { prisma, deletion } = required();
     const g = await graph("held-waiter");
@@ -858,18 +869,13 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       `SELECT id FROM capacity_waiter WHERE id = '${g.suffix}-tw-1' FOR UPDATE`,
     );
     try {
-      const started = Date.now();
-      const draining = settle(
+      // A drain that waited on the held waiter would end as pending on its
+      // lock_timeout, not ok with the request passed: `ok` plus `passed === 1`
+      // proves it did not wait, with no wall-clock bound to flake.
+      const outcome = await settle(
         deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] }),
       );
-      // Without waiting on the held waiter, nor timing out on it.
-      const outcome = await Promise.race([
-        draining,
-        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 1_500)),
-      ]);
-      expect(outcome).not.toBe("blocked");
-      expect(Date.now() - started).toBeLessThan(deletion.PARENT_DELETION_DRAIN_LOCK_TIMEOUT_MS);
-      if (outcome === "blocked" || !outcome.ok) throw new Error("drain did not finish");
+      if (!outcome.ok) throw new Error("drain did not finish");
       expect(outcome.value["admission_request.passed"]).toBe(1);
       expect(await count(`admission_request WHERE id = '${g.suffix}-tar-1'`)).toBe(1);
       expect(await count(`capacity_waiter WHERE id = '${g.suffix}-tw-1'`)).toBe(1);
@@ -1409,7 +1415,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       { timeout: 300_000 },
     );
     await isLocked;
-    const handle = await productionSweepHandle();
+    // The production sweep client with a shorter server-side statement bound:
+    // each of the 18 blocked backoff writes is cancelled by it, so 1 s instead
+    // of the production 3 s cuts the test by ~36 s. This test proves page
+    // continuation and round-robin, not the bound's value (F2-07 tests do).
+    const handle = required().clientFactory.createStatementBoundedPrismaClient(databaseUrl!, {
+      ...sweep.USER_DELETION_SWEEP_CLIENT_OPTIONS,
+      statementTimeoutMs: 1_000,
+    });
     const queue: import("@ws-model-proxy/db/parent-deletion").UserDeletionSweepQueue = {};
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const tick = () =>
@@ -2634,8 +2647,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   // inside the shutdown join.
   // ---------------------------------------------------------------------------
 
-  /** pg-pool's default `idleTimeoutMillis` (pg-pool index.js). */
-  const PG_POOL_DEFAULT_IDLE_MS = 10_000;
+  /** Shortened pg-pool `idleTimeoutMillis` (default 10 s) for the keep-warm test. */
+  const TEST_POOL_IDLE_MS = 300;
 
   /**
    * A loopback TCP proxy to the test database that holds every new
@@ -2698,11 +2711,19 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       .sort((a, b) => a - b);
   }
 
-  it("the sweep client keeps its connection across ticks longer apart than pg-pool's idle timeout, and recovers when the server closes it (F2-07d)", async () => {
+  it("the sweep client keeps its connection across ticks longer apart than the pool's idle timeout, and recovers when the server closes it (F2-07d)", async () => {
     const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
     await hideOtherMarkers([]);
     const before = new Set(await sweepBackends());
-    const client = sweep.createUserDeletionSweepClient(databaseUrl!).prisma;
+    // The production options with pg-pool's idle timeout shortened, so the
+    // test idles past it in ~1 s instead of 11.5 s. `min` (from the
+    // production options) is what keeps the connection; the timeout only sets
+    // how soon eviction would have closed it.
+    expect(sweep.USER_DELETION_SWEEP_CLIENT_OPTIONS.minIdleConnections).toBeGreaterThanOrEqual(1);
+    const client = required().clientFactory.createStatementBoundedPrismaClient(databaseUrl!, {
+      ...sweep.USER_DELETION_SWEEP_CLIENT_OPTIONS,
+      idleTimeoutMsForTest: TEST_POOL_IDLE_MS,
+    }).prisma;
     const tick = () =>
       sweep.sweepPendingUserDeletions({ prisma: client, notify: async () => undefined });
     const backendPid = async () => {
@@ -2714,14 +2735,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       await expect(tick()).resolves.toEqual({ deleted: 0, abandoned: 0, failed: 0 });
       const held = await backendPid();
       expect(await sweepBackends(before)).toEqual([held]);
-      // Longer than pg-pool's default idle timeout (the 5-minute interval
-      // exceeds it by far): the connection is still open, and the next tick
-      // runs on it without connecting.
-      await sleep(PG_POOL_DEFAULT_IDLE_MS + 1_500);
+      // Several times the (shortened) idle timeout, which the production
+      // 5-minute interval exceeds by far: the connection is still open, and
+      // the next tick runs on it without connecting.
+      await sleep(TEST_POOL_IDLE_MS * 4);
       expect(await sweepBackends(before)).toEqual([held]);
       await expect(tick()).resolves.toEqual({ deleted: 0, abandoned: 0, failed: 0 });
       expect(await backendPid()).toBe(held);
-      report(`sweep tick after ${PG_POOL_DEFAULT_IDLE_MS + 1_500} ms idle reused backend ${held}`);
+      report(`sweep tick after ${TEST_POOL_IDLE_MS * 4} ms idle reused backend ${held}`);
 
       // Inverse: the server (or a proxy) closes the held connection. The
       // pool drops it, and the next tick connects again and succeeds.
@@ -2907,7 +2928,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     // Released only after the join deadline has passed, counted from when the
     // blocked statement is observed (just before the join starts), so a
     // regression overruns the join instead of being rescued by the release.
-    let releasing: Promise<void> = Promise.resolve();
+    let releasing = { cancel: () => {} };
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const handle = await productionSweepHandle();
@@ -2918,9 +2939,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         '"deletionSweepAttempts" = "deletionSweepAttempts" + 1',
         held.pid,
       );
-      releasing = sleep(timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500).then(() =>
-        held.release(),
-      );
+      releasing = scheduleRelease(held, timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500);
       const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
       expect(applicationName).toBe(sweep.USER_DELETION_SWEEP_APPLICATION_NAME);
       const result = await shutDownSweep("backoff write", stop, handle);
@@ -2940,7 +2959,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       required().fence.disarmDbShutdownFence();
       errors.mockRestore();
       logs.mockRestore();
-      await releasing;
+      releasing.cancel();
       await held.release();
       await stop();
     }
@@ -2966,7 +2985,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     // Released only after the join deadline has passed, counted from when the
     // blocked statement is observed (just before the join starts), so a
     // regression overruns the join instead of being rescued by the release.
-    let releasing: Promise<void> = Promise.resolve();
+    let releasing = { cancel: () => {} };
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const handle = await productionSweepHandle();
     const client = handle.prisma;
@@ -2976,16 +2995,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         'SET "deletionRequestedAt" = NULL',
         held.pid,
       );
-      releasing = sleep(timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500).then(() =>
-        held.release(),
-      );
+      releasing = scheduleRelease(held, timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500);
       const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
       expect(applicationName).toBe(sweep.USER_DELETION_SWEEP_APPLICATION_NAME);
       expectSettledInsideJoin(await shutDownSweep("abandon write", stop, handle));
     } finally {
       required().fence.disarmDbShutdownFence();
       errors.mockRestore();
-      await releasing;
+      releasing.cancel();
       await held.release();
       await stop();
     }
@@ -3015,23 +3032,21 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     // Released only after the join deadline has passed, counted from when the
     // blocked statement is observed (just before the join starts), so a
     // regression overruns the join instead of being rescued by the release.
-    let releasing: Promise<void> = Promise.resolve();
+    let releasing = { cancel: () => {} };
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const handle = await productionSweepHandle();
     const client = handle.prisma;
     const stop = await startSweep(client);
     try {
       const applicationName = await waitForSweepWaiter("deletionSweepNextAttemptAt", held.pid);
-      releasing = sleep(timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500).then(() =>
-        held.release(),
-      );
+      releasing = scheduleRelease(held, timeouts.USER_DELETION_SWEEP_JOIN_TIMEOUT_MS + 1_500);
       const sweep = await import("../../../../apps/server/src/user-deletion-sweep.js");
       expect(applicationName).toBe(sweep.USER_DELETION_SWEEP_APPLICATION_NAME);
       expectSettledInsideJoin(await shutDownSweep("queue read", stop, handle));
     } finally {
       required().fence.disarmDbShutdownFence();
       errors.mockRestore();
-      await releasing;
+      releasing.cancel();
       await held.release();
       await stop();
     }
@@ -3628,7 +3643,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       `SELECT id FROM "user" WHERE id = '${stuck.id}' FOR NO KEY UPDATE`,
     );
     const releaseAtMs = 15_000;
-    const releasing = sleep(releaseAtMs).then(() => held.release());
+    const releasing = scheduleRelease(held, releaseAtMs);
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const client = await productionSweepClient();
     const started = Date.now();
@@ -3649,7 +3664,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       );
     } finally {
       errors.mockRestore();
-      await releasing;
+      releasing.cancel();
+      await held.release();
       await client.$disconnect();
     }
     // The cancelled backoff rolled back: still marked and due, attempts 0.
@@ -3676,7 +3692,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       `SELECT id FROM cli_device WHERE id = '${g.device.id}' FOR UPDATE`,
     );
     const releaseAtMs = 25_000;
-    const releasing = sleep(releaseAtMs).then(() => held.release());
+    const releasing = scheduleRelease(held, releaseAtMs);
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const client = await productionSweepClient();
     const started = Date.now();
@@ -3698,7 +3714,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       );
     } finally {
       errors.mockRestore();
-      await releasing;
+      releasing.cancel();
+      await held.release();
       await client.$disconnect();
     }
     const after = await deletionState(g.user.id);

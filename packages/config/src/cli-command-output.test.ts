@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   appendRollingTail,
   CLI_OUTPUT_ELLIPSIS,
@@ -547,5 +547,25 @@ describe("appendRollingTail", () => {
         cleanText(decode(dropped)) + cleanText(decode(tail)),
       );
     }
+  });
+});
+
+describe("byte transition table", () => {
+  it("is built on first use, not at import, and only once", async () => {
+    vi.resetModules();
+    const fresh = await import("./cli-command-output");
+    expect(fresh.byteTransitionTableBuildCount()).toBe(0);
+    // Creating a state, and everything else the module offers, builds nothing.
+    const state = new fresh.TerminalByteState();
+    expect(state.atBoundary).toBe(true);
+    fresh.cleanText("\u001b[31mred\u001b[0m");
+    expect(fresh.byteTransitionTableBuildCount()).toBe(0);
+
+    state.feed(0x61);
+    expect(fresh.byteTransitionTableBuildCount()).toBe(1);
+    // `consume` and further states share the one table.
+    state.consume(new Uint8Array([0x1b, 0x5b, 0x31]), 0, 3);
+    new fresh.TerminalByteState().feed(0x62);
+    expect(fresh.byteTransitionTableBuildCount()).toBe(1);
   });
 });
