@@ -1053,12 +1053,21 @@ describe("model API routes", () => {
     };
 
     beforeEach(() => {
+      // routes.ts anchors the local wait clock with performance.now() and
+      // subtracts the elapsed time from the spill window (2000 - elapsed). Real
+      // time made an exact `notBeforeMs` flaky (1999 after a >=1 ms pause on a
+      // loaded runner), so freeze only that clock; timers stay real.
+      vi.useFakeTimers({ toFake: ["performance"] });
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
         directModels: [],
         modelPools: [poolTarget],
       });
       // Unmeasured speed: the automatic wait falls back to the 2 s default.
       prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
     });
 
     it("defers the cold member by the default 2 s and records the spill", async () => {
