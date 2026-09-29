@@ -127,6 +127,8 @@ fn rename_without_overwrite_never_replaces_a_destination_created_after_the_check
     assert_eq!(fx.get("src.txt"), "mine");
 }
 
+// Linux only: elsewhere an overwrite has no atomic exchange here (documented residual).
+#[cfg(target_os = "linux")]
 #[test]
 fn rename_overwrite_never_replaces_a_destination_swapped_after_the_etag_check() {
     let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
