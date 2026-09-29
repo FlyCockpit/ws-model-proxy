@@ -393,12 +393,38 @@ describe("McpTokensPanel CLI command switches", () => {
     expect(within(list).queryByText("settings:mcp.tokens.cliDevicesNoneAllow")).toBeNull();
   });
 
-  it("warns when the account has no CLIs, and reports a failed load", async () => {
+  it("renders no limit line for devices that report no limit or omit the field", async () => {
+    state.devices = [
+      cliDevice("cli-1", "desk", { effectiveMode: "unsupervised", limitedBy: null }),
+      cliDevice("cli-2", "laptop", { effectiveMode: "unsupervised", limitedBy: undefined }),
+    ];
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    const list = await within(dialog).findByTestId("cli-command-devices");
+    // Null means nothing limits the device; an omitted field means the API
+    // did not report it. Neither renders a limit, and neither falls through
+    // to the missing key `cliDeviceLimit.null`.
+    expect(within(list).queryByText(/cliDeviceLimit/)).toBeNull();
+  });
+
+  it("warns when the account has no CLIs", async () => {
     state.devices = [];
     const user = userEvent.setup();
     const { dialog, cli } = await openCliCommands(user);
     await user.click(cli());
     expect(await within(dialog).findByText("settings:mcp.tokens.cliDevicesEmpty")).toBeTruthy();
+  });
+
+  it("reports a failed device load with a retry", async () => {
+    state.devicesError = new Error("device list unavailable");
+    const user = userEvent.setup();
+    const { dialog, cli } = await openCliCommands(user);
+    await user.click(cli());
+    expect(
+      await within(dialog).findByText("settings:mcp.tokens.cliDevicesLoadFailed"),
+    ).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: "actions.tryAgain" })).toBeTruthy();
   });
 
   it("never sends a device grant change from the token form", async () => {

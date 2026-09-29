@@ -49,7 +49,7 @@ const CLI_REJECTION_MESSAGES = {
   invalid_reason:
     "reason must be well-formed Unicode text (no unpaired surrogates) of at most 500 characters (Unicode code points) and contain no NUL",
   token_inactive:
-    "This MCP token was revoked, has expired, or no longer allows CLI commands (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP)",
+    "This MCP token was revoked, has expired, or no longer allows CLI commands, or the account no longer allows CLI effects (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP, or check the account)",
 } as const;
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */

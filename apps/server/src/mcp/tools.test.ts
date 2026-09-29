@@ -1319,7 +1319,7 @@ describe("CLI command tools", () => {
     ],
     [
       "token_inactive",
-      "This MCP token was revoked, has expired, or no longer allows CLI commands (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP)",
+      "This MCP token was revoked, has expired, or no longer allows CLI commands, or the account no longer allows CLI effects (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP, or check the account)",
     ],
   ] as const)("maps start error %s to a stable message", async (code, message) => {
     cliRuntime.startCliCommand.mockResolvedValue({ ok: false, error: code });

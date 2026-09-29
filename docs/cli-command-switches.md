@@ -32,12 +32,12 @@ person, on the dashboard or on the machine itself.
 - **MCP `forwarder_cli_devices_list`**: `features.commands` carries `mode`
   (grant), `deviceMode` (CLI config), `effectiveMode`, and
   `limitedBy`: `grant`, `cliConfig`, `both`, `offline` or `null` (nothing
-  limits it). `limitedBy` follows the order the relay refuses a command: an
-  `off` grant first, then a CLI that is not live, then whichever of the grant
-  and the CLI config is lower.
+  limits it). `limitedBy` names the switch to look at first: an `off` grant,
+  then a CLI that is not live, then whichever of the grant and the CLI config
+  is lower.
 - **MCP errors** name the switch that refused: "switch 1 of 3" (token),
   "switch 2 of 3" (dashboard grant), "switch 3 of 3" (wsmp config). An
-  offline CLI is not one of the three switches and says so.
+  offline CLI is not one of the three switches.
 
 ## Supervised commands and the terminal grant
 

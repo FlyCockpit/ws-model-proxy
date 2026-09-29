@@ -59,8 +59,8 @@ export function allowsHeadlessCommands(mode: McpCommandModeName | null | undefin
 }
 
 /**
- * Which switch holds `effectiveMode` below `unsupervised`, in the order the
- * relay refuses a command (`apps/server/src/relay/cli-commands.ts`):
+ * Which switch holds `effectiveMode` below `unsupervised`, as the switch an
+ * agent should look at first (`apps/server/src/relay/cli-commands.ts`):
  * - `grant`: the dashboard grant is the stricter of the two (or the grant is
  *   `off`, which the relay refuses before it looks at the CLI);
  * - `offline`: the grant allows commands but the CLI is not connected or
