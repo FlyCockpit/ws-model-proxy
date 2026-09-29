@@ -51,6 +51,7 @@ const db = prisma as unknown as {
   endpoint: {
     upsert: MockInstance;
     findUnique: MockInstance;
+    findMany: MockInstance;
     updateMany: MockInstance;
   };
   discoveredModel: {
@@ -214,6 +215,7 @@ function seedRegistrationMocks() {
   });
   db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
   db.endpoint.findUnique.mockResolvedValue(null);
+  db.endpoint.findMany.mockResolvedValue([]);
   db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
   db.endpoint.updateMany.mockResolvedValue({ count: 0 });
   db.discoveredModel.findUnique.mockResolvedValue(null);
