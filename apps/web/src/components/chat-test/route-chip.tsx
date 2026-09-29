@@ -6,6 +6,7 @@ import type { ChatRouteInfo } from "./chat-test-types";
 
 const KNOWN_REASONS = [
   "local_wait_expired",
+  "local_saturated_protected",
   "no_local_member",
   "local_context_ceiling",
   "local_failure",

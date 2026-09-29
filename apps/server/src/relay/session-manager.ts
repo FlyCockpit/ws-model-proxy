@@ -644,8 +644,8 @@ export class RelaySessionManager {
 
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
     const session = this.requireSession(socket);
-    // An older CLI gets a message it prints ("upgrade wsmp"), not an opaque
-    // schema rejection. Every released CLI treats protocol.error as fatal.
+    // A hello that is not the minimum protocol gets a message it can print
+    // (an "upgrade wsmp" text), not an opaque schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
       console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
@@ -1311,8 +1311,10 @@ export class RelaySessionManager {
 
   /**
    * Remember why a device's CLI was refused so its card can say "CLI upgrade
-   * required". Only a credential already bound to a device identifies it; an
-   * unbound token has no device yet (the relay log above has the versions).
+   * required", or "Server upgrade required" when the claimed protocol is newer
+   * than this server speaks. Only a credential already bound to a device
+   * identifies it; an unbound token has no device yet (the relay log above has
+   * the versions).
    */
   private async recordRejectedHello(
     session: SessionState,

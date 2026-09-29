@@ -56,7 +56,22 @@
         "cancel": "Keep current mode",
         "confirm": "Allow unsupervised"
       },
-      "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:"
+      "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:",
+      "effective": "Agents can run now",
+      "commandSwitches": "A command runs only when the MCP token, this grant and the CLI's own config all allow it. The effective mode is the stricter of the last two.",
+      "commandKind": {
+        "headless": "Headless commands",
+        "supervised": "Supervised commands"
+      },
+      "commandAllowed": "allowed now",
+      "commandRefusal": {
+        "grant_disabled": "refused: the dashboard grant above does not allow it. Raise the grant to allow it.",
+        "offline": "refused: this CLI is offline or too old for it. It works again once the CLI reconnects on a current wsmp.",
+        "feature_disabled": "refused: this CLI's own config does not allow it. On that machine run wsmp config set-mcp-commands and restart wsmp.",
+        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it.",
+        "grant_supervised_only": "refused: needs Unsupervised, and the dashboard grant above is Supervised. Raise the grant to allow it (this CLI's config must then allow it too).",
+        "cli_supervised_only": "refused: needs Unsupervised, and this CLI's own config is Supervised. On that machine run wsmp config set-mcp-commands unsupervised and restart wsmp."
+      }
     },
     "rename": {
       "action": "Rename",
@@ -74,6 +89,8 @@
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
     },
+    "serverUpgradeRequired": "Server upgrade required: CLI protocol {{protocol}} is newer than this server supports",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} was refused on {{value}} because it is newer than this server. Ask the server administrator to upgrade the server, or install an older wsmp on this machine.",
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
     "upgradeUnknownProtocol": "unknown",
@@ -251,6 +268,7 @@
       "reasonLabel": "Reason: {{reason}}",
       "reasons": {
         "local_wait_expired": "local members stayed busy past the wait limit",
+        "local_saturated_protected": "the local members' free capacity holds protected warm conversations",
         "no_local_member": "no compatible local member was available",
         "local_context_ceiling": "the request exceeded the local context limit",
         "local_failure": "the local attempt failed",
@@ -389,19 +407,15 @@
       "checking": "Checking identity…",
       "offline": "Offline",
       "unpinned": "This browser could not save the key. Compare the fingerprint before you type anything sensitive.",
-      "unverified": "Unverified. Update the CLI to verify its identity.",
       "invalid": "This CLI did not prove its identity. Its terminals are blocked.",
       "changed": "This CLI's identity key changed. Its terminals are blocked until you trust the new key.",
-      "downgraded": "This CLI no longer proves its identity. Its terminals are blocked until you allow it.",
       "pinned": "Pinned",
       "new": "New",
       "trustNew": "Trust new key",
-      "allowUnverified": "Allow unverified",
       "trustTitle": "Trust the new key for {{label}}?",
       "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
       "trustFailed": "The key could not be trusted. Reload and try again.",
       "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
-      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it.",
       "attention": "A CLI's identity key needs review. Its terminals are blocked until you check it.",
       "review": "Review"
     },
@@ -469,6 +483,28 @@
         "valueLabel": "Cache-holder wait in milliseconds",
         "hint": "When a continuation's prefix is warm on a busy member, other members are held back for this long so the warm member can take it. Automatic uses the member's measured prefill speed (2 s until it is measured). Maximum 30000 ms. Local wait budgets and the external fallback wait start counting after this hold."
       }
+    },
+    "protection": {
+      "title": "Protect active conversations",
+      "description": "A new conversation avoids a member whose free capacity still holds other conversations' recent, large prompt caches when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
+      "enabled": "Protect active conversations",
+      "windowSeconds": "Protection window (seconds)",
+      "minTokens": "Minimum conversation size (tokens)",
+      "share": "Share between users",
+      "shareModes": {
+        "EQUAL_SHARE": "Equal share per active user",
+        "FIRST_COME": "First come (no per-user cap)",
+        "FIXED_PERCENT": "Fixed percent per user"
+      },
+      "fixedPercent": "Percent each user may keep protected",
+      "ownerShare": "Your own share",
+      "override": {
+        "INHERIT": "Use the pool's share",
+        "PERCENT": "Fixed percent",
+        "UNPROTECTED": "Unprotected"
+      },
+      "percentLabel": "Percent of a member's capacity (1 to 100)",
+      "hint": "Warmth is estimated from the routing records of all this owner's pools on the member (sizes and times only, never prompt content). Only conversations used within the window and at least the minimum size count. Over their share, a user's oldest conversations lose protection first."
     },
     "capacity": {
       "title": "Shared local capacity",
@@ -918,6 +954,23 @@
       "offline": "offline (stored snapshot)",
       "noSeries": "No metrics reported yet.",
       "staleValue": "stale"
+    },
+    "grantRouting": {
+      "edit": "Routing",
+      "editFor": "Routing settings for {{email}}",
+      "title": "Routing for this person",
+      "description": "Settings that apply only to requests from {{email}}.",
+      "protection": "Protected share",
+      "protectionHint": "How much of a member's capacity this person's recent conversations may keep protected from new ones. Unprotected: their conversations are never shielded.",
+      "queuePriority": "Queue priority",
+      "prioritySet": "Set a priority",
+      "priorityValue": "Queue priority (0 to 31)",
+      "priorityHint": "Replaces the pool and member queue priority for this person's waiting requests. Higher numbers get a larger share of freed slots.",
+      "inherit": "Pool default",
+      "percentValue": "{{percent}} %",
+      "summary": "Protected share: {{protection}} · Queue priority: {{priority}}",
+      "saved": "Routing settings saved.",
+      "failed": "Could not save the routing settings."
     }
   },
   "relay": {

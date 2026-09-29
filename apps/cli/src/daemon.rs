@@ -842,7 +842,7 @@ fn run_relay_session(
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-    let mut terminals = TerminalRegistry::new(worker_tx.clone(), true);
+    let mut terminals = TerminalRegistry::new(worker_tx.clone());
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
 
     let hello = ClientControlMessage::Hello {

@@ -209,7 +209,11 @@ function catalogNames(includeCliCommands: boolean): string[] {
 
 interface WireResult {
   content?: { type: string; text: string }[];
-  structuredContent?: { result?: unknown; error?: { code?: string }; requestId?: string };
+  structuredContent?: {
+    result?: unknown;
+    error?: { code?: string; issues?: { code: string }[] };
+    requestId?: string;
+  };
   isError?: boolean;
 }
 
@@ -260,6 +264,108 @@ describe("tools/list — the manifest is the advertised catalog", () => {
     };
     const revoke = body.result?.tools?.find((tool) => tool.name === "model_api_token_revoke");
     expect(revoke?.inputSchema?.required).toContain("confirm");
+  });
+});
+
+describe("#117 — real input schemas and named failing fields", () => {
+  it("tools/list advertises the real required fields of a procedure-backed tool", async () => {
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(21), undefined);
+    const body = (await response.json()) as {
+      result?: {
+        tools?: { name: string; inputSchema?: { required?: string[]; properties?: object } }[];
+      };
+    };
+    const tool = (name: string) => body.result?.tools?.find((item) => item.name === name);
+    expect(tool("forwarder_pool_fallback_get")?.inputSchema?.required).toEqual(["poolId"]);
+    expect(tool("forwarder_pool_fallback_get")?.inputSchema?.properties).toHaveProperty("poolId");
+    expect(tool("model_api_tokens_preview")?.inputSchema?.required).toEqual(["scopeMode"]);
+  });
+
+  it("the real tools/list payload (descriptions included) stays within the client budget", async () => {
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(22), undefined);
+    const raw = await response.text();
+    const bytes = new TextEncoder().encode(raw).length;
+    // Measured 139-142 KB for 75-78 tools; the limit is ours, with headroom.
+    expect(bytes).toBeGreaterThan(50_000);
+    expect(bytes).toBeLessThanOrEqual(200 * 1024);
+  });
+
+  it("an unknown key on a strict procedure is reported as fixed text, never as a path or value", async () => {
+    const PLAIN = "plain-hostile-key-4242";
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_pool_fallback_update", {
+      poolId: "pool-1",
+      fallbackEnabled: true,
+      [PLAIN]: PLAIN,
+    });
+    expect(body.result?.isError).toBe(true);
+    const wire = JSON.stringify(body);
+    expect(wire).not.toContain(PLAIN);
+    const issues = body.result?.structuredContent?.error?.issues ?? [];
+    expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
+  });
+
+  it("a missing required field is named by path and code, and the procedure stays the authority", async () => {
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_pool_fallback_get", {});
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "BAD_REQUEST",
+        issues: [
+          {
+            path: ["poolId"],
+            code: "invalid_type",
+            message: "Invalid input: expected string, received undefined",
+          },
+        ],
+      },
+    });
+    expect(resultText(body.result ?? {})).toBe(
+      "Invalid input: poolId: Invalid input: expected string, received undefined",
+    );
+  });
+
+  it("never echoes input values, in any issue field, however the value is invalid", async () => {
+    const SECRET = "wsmp_model_ZZSECRETVALUEZZ0123456789";
+    const PLAIN = "plain-secret-value-9876";
+    const cases: [string, Record<string, unknown>][] = [
+      ["forwarder_pool_fallback_get", { poolId: SECRET.repeat(20) }],
+      ["forwarder_pool_fallback_get", { poolId: { nested: PLAIN } }],
+      ["forwarder_pool_fallback_get", { poolId: [PLAIN] }],
+      ["forwarder_pool_fallback_get", { poolId: 42, [PLAIN]: PLAIN }],
+      ["model_api_tokens_preview", { scopeMode: PLAIN }],
+      ["model_api_tokens_preview", { scopeMode: "ALLOWLIST", modelIds: [PLAIN, 7, SECRET] }],
+    ];
+    for (const [tool, args] of cases) {
+      const authInfo = buildAuthInfo(["mcp:read"]);
+      bindRequest(authInfo);
+      const { body } = await callTool(authInfo, tool, args);
+      expect(body.result?.isError).toBe(true);
+      const wire = JSON.stringify(body);
+      expect(wire).not.toContain(PLAIN);
+      expect(wire).not.toContain("ZZSECRETVALUEZZ");
+      expect(body.result?.structuredContent?.error?.code).toBe("BAD_REQUEST");
+    }
+  });
+
+  it("a BAD_REQUEST without validation issues keeps the plain stable error", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelApiToken.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", { message: "SECRET DETAIL", data: { issues: "not-a-list" } }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "model_api_token_revoke", {
+      id: "token-1",
+      confirm: "DELETE",
+    });
+    expect(resultText(body.result ?? {})).toBe("Invalid input");
+    expect(JSON.stringify(body)).not.toContain("SECRET");
   });
 });
 
@@ -1324,9 +1430,18 @@ describe("CLI command tools", () => {
 
   it.each([
     ["not_found", "Not found"],
-    ["grant_disabled", "CLI commands are disabled for this device"],
-    ["offline", "CLI is offline or does not support this protocol"],
-    ["feature_disabled", "CLI has MCP commands disabled in wsmp config"],
+    [
+      "grant_disabled",
+      "CLI commands are disabled for this device (switch 2 of 3: its MCP commands grant on the dashboard CLIs page is Off; a person must set it to Supervised or Unsupervised)",
+    ],
+    [
+      "offline",
+      "CLI is offline or does not support this protocol (the device must be connected and running a wsmp version that supports MCP commands)",
+    ],
+    [
+      "feature_disabled",
+      "CLI has MCP commands disabled in wsmp config (switch 3 of 3: on that machine run `wsmp config set-mcp-commands supervised` or `unsupervised`, then restart wsmp; the dashboard grant already allows commands)",
+    ],
     ["limit", "too many commands"],
     [
       "invalid_command",
@@ -1334,7 +1449,7 @@ describe("CLI command tools", () => {
     ],
     [
       "token_inactive",
-      "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
+      "This MCP token was revoked, has expired, or no longer allows CLI commands, or the account no longer allows CLI effects (switch 1 of 3: mcp:write and CLI commands are required; edit the token in Settings > MCP, or check the account)",
     ],
   ] as const)("maps start error %s to a stable message", async (code, message) => {
     cliRuntime.startCliCommand.mockResolvedValue({ ok: false, error: code });
@@ -1681,6 +1796,7 @@ describe("CLI command tools", () => {
 
     it.each([
       ["supervised_only", "use forwarder_cli_supervised_command_start"],
+      ["supervised_only", "whichever is stricter"],
       ["unsupported", "terminal support"],
       ["invalid_reason", "of at most 500 characters (Unicode code points)"],
     ] as const)("maps %s to a stable message", async (code, fragment) => {

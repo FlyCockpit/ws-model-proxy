@@ -1,25 +1,25 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-if (!process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = "postgresql://env-default-test@127.0.0.1:5432/env_default_test";
-}
+// Load the real server env schema with the flags UNSET, so the parsed `env`
+// object shows the defaults (not the source text that declares them).
+const FLAGS = [
+  "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
+  "WMP_MCP_ENABLED",
+  "WMP_MCP_PAT_ALLOW_NO_EXPIRY",
+  "SIGNUP_ENABLED",
+  "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
+] as const;
+process.env.DATABASE_URL ||= "postgresql://env-default-test@127.0.0.1:5432/env_default_test";
+process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
+process.env.BETTER_AUTH_URL = "http://localhost:3000";
+for (const flag of FLAGS) delete process.env[flag];
 
 const { strictBooleanFlag } = await import("./shared.js");
+const { env } = await import("./server.js");
+const { ENV_VARS } = await import("../../../scripts/lib/env-manifest.js");
 
-const serverSource = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
-const manifestSource = readFileSync(
-  new URL("../../../scripts/lib/env-manifest.ts", import.meta.url),
-  "utf8",
-);
-
-function manifestDefault(key: string): string {
-  const keyIndex = manifestSource.indexOf(`key: "${key}"`);
-  expect(keyIndex).toBeGreaterThan(-1);
-  const window = manifestSource.slice(keyIndex, keyIndex + 900);
-  const match = /default: "([^"]*)"/.exec(window);
-  expect(match).not.toBeNull();
-  return match?.[1] ?? "";
+function manifestDefault(key: string): string | undefined {
+  return ENV_VARS.find((entry) => entry.key === key)?.default;
 }
 
 describe("egress and MCP kill-switch defaults", () => {
@@ -31,20 +31,16 @@ describe("egress and MCP kill-switch defaults", () => {
   });
 
   it("defaults egress and MCP on without opening signup or private networks", () => {
-    expect(serverSource).toContain("WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(true)");
-    expect(serverSource).toContain("WMP_MCP_ENABLED: strictBooleanFlag(true)");
-    expect(serverSource).toContain("WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true)");
-    expect(serverSource).toContain("SIGNUP_ENABLED: strictBooleanFlag(),");
-    expect(serverSource).toContain("WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),");
-    expect(serverSource).not.toContain("Keep false until");
-    expect(serverSource).not.toContain("Release gate");
+    expect(env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toBe(true);
+    expect(env.WMP_MCP_ENABLED).toBe(true);
+    expect(env.WMP_MCP_PAT_ALLOW_NO_EXPIRY).toBe(true);
+    expect(env.SIGNUP_ENABLED).toBe(false);
+    expect(env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(false);
 
     expect(manifestDefault("WMP_PUBLIC_PROVIDER_EGRESS_ENABLED")).toBe("true");
     expect(manifestDefault("WMP_MCP_ENABLED")).toBe("true");
     expect(manifestDefault("WMP_MCP_PAT_ALLOW_NO_EXPIRY")).toBe("true");
     expect(manifestDefault("SIGNUP_ENABLED")).toBe("false");
     expect(manifestDefault("WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS")).toBe("false");
-    expect(manifestSource).not.toContain("Keep false until");
-    expect(manifestSource).not.toContain("Release gate for");
   });
 });

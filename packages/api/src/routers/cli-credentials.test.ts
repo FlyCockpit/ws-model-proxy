@@ -680,21 +680,24 @@ describe("cliCredentialsRouter", () => {
     it("hides codes another account holds, expired codes, and slug-less requests", async () => {
       const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
 
+      const reasonOf = (error: ORPCError) =>
+        (error.data as { reason?: unknown } | undefined)?.reason;
+
       db.deviceCode.findFirst.mockResolvedValueOnce(null);
       await expect(client.deviceLoginRequest({ userCode: "ABCDEFGH" })).rejects.toSatisfy(
-        (error: ORPCError) => error.code === "NOT_FOUND",
+        (error: ORPCError) => error.code === "NOT_FOUND" && reasonOf(error) === "not_found",
       );
 
       db.deviceCode.findFirst.mockResolvedValueOnce(
         deviceCodeRow({ expiresAt: new Date(Date.now() - 1000) }),
       );
       await expect(client.deviceLoginRequest({ userCode: "ABCDEFGH" })).rejects.toSatisfy(
-        (error: ORPCError) => error.code === "NOT_FOUND",
+        (error: ORPCError) => error.code === "BAD_REQUEST" && reasonOf(error) === "expired",
       );
 
       db.deviceCode.findFirst.mockResolvedValueOnce(deviceCodeRow({ scope: null }));
       await expect(client.deviceLoginRequest({ userCode: "ABCDEFGH" })).rejects.toSatisfy(
-        (error: ORPCError) => error.code === "BAD_REQUEST",
+        (error: ORPCError) => error.code === "BAD_REQUEST" && reasonOf(error) === "no_slug",
       );
       expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
     });
@@ -709,6 +712,8 @@ describe("cliCredentialsRouter", () => {
     });
   });
   describe("approveDeviceLogin", () => {
+    const refusedWith = (code: string, reason: string) => (error: ORPCError) =>
+      error.code === code && (error.data as { reason?: unknown } | undefined)?.reason === reason;
     function pendingRow(overrides: Record<string, unknown> = {}) {
       return deviceCodeRow({ userId: null, status: "pending", ...overrides });
     }
@@ -763,7 +768,19 @@ describe("cliCredentialsRouter", () => {
 
       await expect(
         client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
-      ).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+      ).rejects.toSatisfy(refusedWith("CONFLICT", "already_handled"));
+    });
+
+    it("reports the request as used, not CONFLICT-handled, when the CLI redeemed it between the two reads", async () => {
+      // Read as approvable; this account's own (or another's) approval won the
+      // write and the CLI redeemed (deleted) the row before the re-read.
+      db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow()).mockResolvedValueOnce(null);
+      db.deviceCode.updateMany.mockResolvedValue({ count: 0 });
+      const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+      await expect(
+        client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
+      ).rejects.toSatisfy(refusedWith("CONFLICT", "already_used"));
     });
 
     it("is idempotent when the SAME account's double-submit loses the conditional write", async () => {
@@ -810,9 +827,7 @@ describe("cliCredentialsRouter", () => {
 
       await expect(
         client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
-      ).rejects.toSatisfy(
-        (error: ORPCError) => error.code === "BAD_REQUEST" && error.message.includes("expired"),
-      );
+      ).rejects.toSatisfy(refusedWith("BAD_REQUEST", "expired"));
     });
 
     it("still CONFLICTs when a DIFFERENT account won the same race", async () => {
@@ -826,7 +841,7 @@ describe("cliCredentialsRouter", () => {
 
       await expect(
         client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
-      ).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+      ).rejects.toSatisfy(refusedWith("CONFLICT", "already_handled"));
     });
 
     it("hides a code another account holds", async () => {
@@ -837,7 +852,7 @@ describe("cliCredentialsRouter", () => {
 
       await expect(
         client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" }),
-      ).rejects.toSatisfy((error: ORPCError) => error.code === "NOT_FOUND");
+      ).rejects.toSatisfy(refusedWith("NOT_FOUND", "not_found"));
       expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
     });
 
@@ -846,21 +861,21 @@ describe("cliCredentialsRouter", () => {
       const approve = () => client.approveDeviceLogin({ userCode: "ABCDEFGH", slug: "desk-01" });
 
       db.deviceCode.findFirst.mockResolvedValueOnce(null);
-      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "NOT_FOUND");
+      await expect(approve()).rejects.toSatisfy(refusedWith("NOT_FOUND", "not_found"));
 
       db.deviceCode.findFirst.mockResolvedValueOnce(
         pendingRow({ expiresAt: new Date(Date.now() - 1000) }),
       );
-      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+      await expect(approve()).rejects.toSatisfy(refusedWith("BAD_REQUEST", "expired"));
 
       db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ status: "denied" }));
-      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+      await expect(approve()).rejects.toSatisfy(refusedWith("CONFLICT", "already_handled"));
 
       db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ scope: null }));
-      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+      await expect(approve()).rejects.toSatisfy(refusedWith("BAD_REQUEST", "no_slug"));
 
       db.deviceCode.findFirst.mockResolvedValueOnce(pendingRow({ scope: "cli-slug:other-01" }));
-      await expect(approve()).rejects.toSatisfy((error: ORPCError) => error.code === "CONFLICT");
+      await expect(approve()).rejects.toSatisfy(refusedWith("CONFLICT", "slug_mismatch"));
 
       expect(db.deviceCode.updateMany).not.toHaveBeenCalled();
     });

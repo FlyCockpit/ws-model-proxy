@@ -30,7 +30,7 @@ type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest
 const db = prisma as unknown as {
   poolMember: {
     findUnique: MockInstance;
-    update: MockInstance;
+    updateMany: MockInstance;
   };
 };
 
@@ -237,7 +237,7 @@ describe("pool member test routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.poolMember.findUnique.mockResolvedValue(memberRow());
-    db.poolMember.update.mockResolvedValue({ id: "member-id" });
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("rejects unauthenticated requests", async () => {
@@ -302,9 +302,9 @@ describe("pool member test routes", () => {
     const response = await responsePromise;
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ ok: true, status: 200 });
-    expect(db.poolMember.update).toHaveBeenCalledWith(
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "member-id" },
+        where: expect.objectContaining({ id: "member-id" }),
         data: expect.objectContaining({ healthStatus: "HEALTHY" }),
       }),
     );
@@ -346,7 +346,7 @@ describe("pool member test routes", () => {
       "<html>ok</html>",
       JSON.stringify({ choices: [{ message: { content: "hello" } }] }),
     ]) {
-      db.poolMember.update.mockClear();
+      db.poolMember.updateMany.mockClear();
       const { app, manager } = appWith();
       const responsePromise = app.request("/members/member-id/test", { method: "POST" });
       await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
@@ -357,7 +357,7 @@ describe("pool member test routes", () => {
       const response = await responsePromise;
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toMatchObject({ ok: false });
-      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
     }
   });
 
@@ -372,7 +372,7 @@ describe("pool member test routes", () => {
     const response = await responsePromise;
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ ok: false });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   it("does not reset health when the relay terminal fails after 200 headers", async () => {
@@ -386,7 +386,7 @@ describe("pool member test routes", () => {
     const response = await responsePromise;
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ ok: false });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   it("rejects a test when the global lease is already exhausted and does not take a CLI lease", async () => {

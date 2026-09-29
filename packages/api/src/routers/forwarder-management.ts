@@ -58,6 +58,7 @@ import {
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
+  mcpCommandRefusals,
 } from "../lib/mcp-command-mode";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -99,7 +100,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
-import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
+import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
   drainBeforeParentDelete,
   runCapacityDeleteTransaction,
@@ -234,6 +235,52 @@ const poolFallbackFields = {
   /** How long an `:external` request waits for local capacity (0 = only if free now). */
   externalAfterWaitMs: z.number().int().min(0).max(600_000).optional(),
 };
+
+/**
+ * Warm-session protection settings (saturation S-C): ordinary owner pool
+ * settings, also writable through the MCP pool tools. Redirect-only; no value
+ * can make a pool sit idle.
+ */
+const poolProtectionFields = {
+  protectionEnabled: z.boolean().optional(),
+  /** Only sessions used within this window are protected (seconds). */
+  protectionWindowSeconds: z.number().int().min(1).max(3600).optional(),
+  /** Only sessions of at least this many prompt tokens are protected. */
+  protectMinTokens: z.number().int().min(0).max(10_000_000).optional(),
+  protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]).optional(),
+  /** Per-user percent for FIXED_PERCENT (required then; cleared otherwise). */
+  protectionFixedPercent: z.number().int().min(1).max(100).nullable().optional(),
+  /** The owner's own share: null = share mode, 0 = unprotected, 1..100 = percent. */
+  ownerProtectionPercent: z.number().int().min(0).max(100).nullable().optional(),
+};
+
+type PoolProtectionShare = "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
+
+/**
+ * The share mode and fixed percent a save leaves on the pool: FIXED_PERCENT
+ * needs a percent, and every other mode stores none. Returns the fields to
+ * write (empty when the save touches neither).
+ */
+export function resolvePoolProtectionShare(
+  input: {
+    protectionShare?: PoolProtectionShare;
+    protectionFixedPercent?: number | null;
+  },
+  current: { protectionShare: PoolProtectionShare; protectionFixedPercent: number | null },
+): { protectionShare?: PoolProtectionShare; protectionFixedPercent?: number | null } {
+  if (input.protectionShare === undefined && input.protectionFixedPercent === undefined) return {};
+  const share = input.protectionShare ?? current.protectionShare;
+  const fixed =
+    input.protectionFixedPercent !== undefined
+      ? input.protectionFixedPercent
+      : current.protectionFixedPercent;
+  if (share !== "FIXED_PERCENT") return { protectionShare: share, protectionFixedPercent: null };
+  if (fixed === null)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "The fixed-percent protection share needs a percent from 1 to 100.",
+    });
+  return { protectionShare: share, protectionFixedPercent: fixed };
+}
 
 function isPrismaUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
@@ -657,6 +704,17 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
   const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
+  const refusals = mcpCommandRefusals({
+    grant: commandsGrant,
+    live:
+      live && commandsLive
+        ? {
+            mode: live.mcpCommandMode,
+            supervisedCommands: live.supervisedCommands,
+            terminalSupported: live.terminalSupported,
+          }
+        : null,
+  });
   const staleAt = row.lastHeartbeatAt
     ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
     : null;
@@ -684,13 +742,15 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     relayProtocolVersion: row.relayProtocolVersion ?? null,
     /**
      * Set when this device's last hello was refused for an old relay
-     * protocol; the next accepted hello clears it.
+     * protocol, or one newer than this server speaks (`reason`); the next
+     * accepted hello clears it.
      */
     upgradeRequired: row.relayRejectedAt
       ? {
           protocolVersion: row.rejectedRelayProtocolVersion ?? null,
           cliVersion: row.rejectedCliVersion ?? null,
           rejectedAt: row.relayRejectedAt,
+          reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
         }
       : null,
     nodeInfoAt: row.nodeInfoAt ?? null,
@@ -719,7 +779,13 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         live: commandsLive,
         /** What an MCP agent can do right now: the lowest of grant and live CLI mode. */
         effectiveMode: commandsEffective,
-        available: commandsEffective !== "off",
+        /**
+         * Why the relay would refuse each command kind right now (its refusal
+         * order), or null when it would admit it.
+         */
+        refusals,
+        /** Some command kind would be admitted (headless or supervised). */
+        available: refusals.headless === null || refusals.supervised === null,
       },
     },
     endpoints: row.Endpoints.map((endpoint) => ({
@@ -912,6 +978,14 @@ function serializePool(row: ModelPoolRow) {
       loadPenaltyWeight: row.affinityLoadPenaltyWeight,
     },
     cacheHolderWaitMs: row.cacheHolderWaitMs,
+    protection: {
+      enabled: row.protectionEnabled,
+      windowSeconds: row.protectionWindowSeconds,
+      minTokens: row.protectMinTokens,
+      share: row.protectionShare,
+      fixedPercent: row.protectionFixedPercent,
+      ownerPercent: row.ownerProtectionPercent,
+    },
     compatibility: {
       recommendedSurface,
       suggestedConnectionType: suggestedSurface,
@@ -1014,6 +1088,8 @@ function serializePool(row: ModelPoolRow) {
       granteeUserId: grant.granteeUserId,
       granteeEmail: grant.Grantee.email,
       granteeName: grant.Grantee.name,
+      protectionOverridePercent: grant.protectionOverridePercent,
+      queuePriority: grant.queuePriority,
     })),
   };
 }
@@ -1343,6 +1419,12 @@ const poolSelect = {
   affinityConfirmedCacheWeight: true,
   affinityLoadPenaltyWeight: true,
   cacheHolderWaitMs: true,
+  protectionEnabled: true,
+  protectionWindowSeconds: true,
+  protectMinTokens: true,
+  protectionShare: true,
+  protectionFixedPercent: true,
+  ownerProtectionPercent: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -1471,6 +1553,8 @@ const poolSelect = {
       id: true,
       createdAt: true,
       granteeUserId: true,
+      protectionOverridePercent: true,
+      queuePriority: true,
       Grantee: { select: { email: true, name: true } },
     },
   },
@@ -2584,11 +2668,16 @@ export const forwarderManagementRouter = {
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
         cacheHolderWaitMs: cacheHolderWaitMsSchema,
+        ...poolProtectionFields,
       }),
     )
     .handler(async ({ input, context }) => {
       if (input.fallbackEnabled === true)
         assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
+      const protectionShare = resolvePoolProtectionShare(input, {
+        protectionShare: "EQUAL_SHARE",
+        protectionFixedPercent: null,
+      });
       assertExternalAfterWaitWithinBudget({
         externalAfterWaitMs: input.externalAfterWaitMs,
         currentExternalAfterWaitMs: null,
@@ -2665,6 +2754,12 @@ export const forwarderManagementRouter = {
         affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
         affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
         cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
+        protectionEnabled: input.protectionEnabled ?? true,
+        protectionWindowSeconds: input.protectionWindowSeconds ?? 300,
+        protectMinTokens: input.protectMinTokens ?? 8192,
+        protectionShare: protectionShare.protectionShare ?? "EQUAL_SHARE",
+        protectionFixedPercent: protectionShare.protectionFixedPercent ?? null,
+        ownerProtectionPercent: input.ownerProtectionPercent ?? null,
       } as const;
       const capacityPolicy = {
         capacityPriority: data.capacityPriority,
@@ -2737,6 +2832,7 @@ export const forwarderManagementRouter = {
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
         cacheHolderWaitMs: cacheHolderWaitMsSchema,
+        ...poolProtectionFields,
         ...modelPoolCapacityPolicyFields,
       }),
     )
@@ -2809,6 +2905,8 @@ export const forwarderManagementRouter = {
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
+            protectionShare: true,
+            protectionFixedPercent: true,
           },
         });
         if (!current || current.userId !== userId) {
@@ -2930,6 +3028,19 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.cacheHolderWaitMs !== undefined
               ? { cacheHolderWaitMs: input.cacheHolderWaitMs }
+              : {}),
+            ...(input.protectionEnabled !== undefined
+              ? { protectionEnabled: input.protectionEnabled }
+              : {}),
+            ...(input.protectionWindowSeconds !== undefined
+              ? { protectionWindowSeconds: input.protectionWindowSeconds }
+              : {}),
+            ...(input.protectMinTokens !== undefined
+              ? { protectMinTokens: input.protectMinTokens }
+              : {}),
+            ...resolvePoolProtectionShare(input, current),
+            ...(input.ownerProtectionPercent !== undefined
+              ? { ownerProtectionPercent: input.ownerProtectionPercent }
               : {}),
             ...(input.capacityPriority !== undefined
               ? { capacityPriority: input.capacityPriority }
@@ -4160,6 +4271,55 @@ export const forwarderManagementRouter = {
         },
       });
       return { revokedCount: result.count };
+    }),
+
+  /**
+   * Owner-only per-grant routing settings (saturation S-C): the grantee's
+   * warm-session protection override (null = the pool's share mode,
+   * 0 = unprotected, 1..100 = percent) and queue priority (0..31, replaces
+   * the pool/member capacity priority for this grantee; null inherits).
+   * Omitted fields are left unchanged.
+   */
+  updatePoolGrant: protectedProcedure
+    .input(
+      z.object({
+        poolId: idSchema,
+        grantId: idSchema,
+        protectionOverridePercent: z.number().int().min(0).max(100).nullable().optional(),
+        queuePriority: z.number().int().min(0).max(31).nullable().optional(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      await ownedPool(input.poolId, userId);
+      // Same lock order as grant creation: the pool row (L1 / C1), then the grant.
+      return runSerializableTransaction(async (tx) => {
+        const locked = await tx.$queryRaw<Array<{ id: string }>>`
+          SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        if (locked.length !== 1)
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const updated = await tx.poolGrant.updateMany({
+          where: { id: input.grantId, poolId: input.poolId, ownerUserId: userId },
+          data: {
+            ...(input.protectionOverridePercent !== undefined
+              ? { protectionOverridePercent: input.protectionOverridePercent }
+              : {}),
+            ...(input.queuePriority !== undefined ? { queuePriority: input.queuePriority } : {}),
+          },
+        });
+        if (updated.count !== 1)
+          throw new ORPCError("NOT_FOUND", { message: "Pool grant not found." });
+        return tx.poolGrant.findUniqueOrThrow({
+          where: { id: input.grantId },
+          select: {
+            id: true,
+            poolId: true,
+            granteeUserId: true,
+            protectionOverridePercent: true,
+            queuePriority: true,
+          },
+        });
+      });
     }),
 
   visibleModels: protectedProcedure.handler(async ({ context }) =>

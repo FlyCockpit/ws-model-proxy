@@ -2,14 +2,11 @@ import { TERMINAL_BROWSER_JSON_WINDOW_MS } from "@ws-model-proxy/config/terminal
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
-  assertIncreasingTerminalSeq,
   base64UrlToBytes,
   bytesToBase64Url,
   DIRECTION_BROWSER_TO_CLI,
   DIRECTION_CLI_TO_BROWSER,
-  decodeTerminalPlaintext,
   decodeTerminalPlaintextV2,
-  deriveTerminalSessionKeys,
   deriveTerminalSessionKeysV2,
   encodeTerminalData,
   encodeTerminalResize,
@@ -18,9 +15,7 @@ import {
   importEcdhPublicRaw,
   importTerminalOutputKey,
   openTerminalBroadcast,
-  openTerminalBytes,
   openTerminalBytesV2,
-  sealTerminalBytes,
   sealTerminalBytesV2,
   type TerminalPlaintextV2,
   useTerminalIdentity,
@@ -130,8 +125,6 @@ export type TerminalTab = {
   approvalCode: string | null;
   rejectionReason: string | null;
   error: string | null;
-  /** Protocol 2.5 terminal: several viewers, v2 crypto, and a writer. */
-  multiViewer: boolean;
   viewerId: string | null;
   writer: TerminalWriterLabel;
   viewerCount: number;
@@ -180,14 +173,13 @@ export type TerminalOutputEvent =
 type PendingHandshake = {
   localId: string;
   terminalId: string;
-  version: 1 | 2;
   /** Server-minted viewer id, from `opening` / `attaching`. */
   viewerId: string | null;
   privateKey: CryptoKey;
   browserPublicRaw: Uint8Array;
   browserNonce: Uint8Array;
   /** 2.5: the ECDH key the pinned identity signed. The CLI must answer with it. */
-  expectedCliPublicKey: string | null;
+  expectedCliPublicKey: string;
   /** The handshake went out without a browser identity (it had not loaded). */
   withoutIdentity: boolean;
 };
@@ -199,7 +191,6 @@ type HandshakeInput = {
   cols: number;
   rows: number;
   mode: "open" | "attach";
-  version: 1 | 2;
 };
 
 type OutputKeyState = {
@@ -211,17 +202,15 @@ type OutputKeyState = {
 type LiveSession = {
   localId: string;
   terminalId: string;
-  version: 1 | 2;
-  /** Empty on v1. */
   viewerId: string;
   browserToCli: CryptoKey;
   cliToBrowser: CryptoKey;
   sendSeq: bigint;
   /** Unicast (pairwise) receive cursor. */
   recvSeq: bigint;
-  /** v2: the shared output key and its own receive cursor. */
+  /** The shared output key and its own receive cursor. */
   output: OutputKeyState | null;
-  /** v2: broadcast frames for an epoch whose key has not arrived yet. */
+  /** Broadcast frames for an epoch whose key has not arrived yet. */
   future: SealedTerminalFrame[];
 };
 
@@ -284,7 +273,6 @@ function newTab(input: {
   cliDeviceId: string;
   cols: number;
   rows: number;
-  multiViewer: boolean;
   opener: boolean;
   viewerCount: number;
   origin?: TerminalOrigin;
@@ -305,7 +293,7 @@ function newTab(input: {
     error: null,
     viewerId: null,
     // The opener is the first writer. An attaching tab follows until told.
-    writer: input.opener || !input.multiViewer ? "you" : "none",
+    writer: input.opener ? "you" : "none",
     ptyCols: null,
     ptyRows: null,
     decline: null,
@@ -383,8 +371,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const tabsRef = useRef(tabs);
   const activeRef = useRef(activeLocalId);
   const cliKeysRef = useRef(new Map<string, string | null>());
-  /** cliDeviceId -> the CLI speaks protocol 2.5 (multi-viewer, v2 crypto). */
-  const cliViewersRef = useRef(new Map<string, boolean>());
   /** Writer state per tab, updated synchronously ahead of the render. */
   const viewRef = useRef(new Map<string, TerminalWriterState>());
   const ownSizeRef = useRef(new Map<string, TerminalSize>());
@@ -482,7 +468,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const outputSeenRef = useRef(new Set<string>());
 
   const viewOf = useCallback((localId: string): TerminalWriterState => {
-    return viewRef.current.get(localId) ?? { multiViewer: false, writer: "you" };
+    return viewRef.current.get(localId) ?? { writer: "you" };
   }, []);
 
   const setView = useCallback(
@@ -713,23 +699,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     const run = previous
       .catch(() => undefined)
       .then(async () => {
-        const body =
-          session.version === 2
-            ? await sealTerminalBytesV2({
-                key: session.browserToCli,
-                terminalId,
-                viewerId: session.viewerId,
-                direction: DIRECTION_BROWSER_TO_CLI,
-                seq,
-                plaintext,
-              })
-            : await sealTerminalBytes({
-                key: session.browserToCli,
-                terminalId,
-                direction: DIRECTION_BROWSER_TO_CLI,
-                seq,
-                plaintext,
-              });
+        const body = await sealTerminalBytesV2({
+          key: session.browserToCli,
+          terminalId,
+          viewerId: session.viewerId,
+          direction: DIRECTION_BROWSER_TO_CLI,
+          seq,
+          plaintext,
+        });
         // A disconnect or re-attach replaces the session. Its keys are gone,
         // so the CLI would reject this frame.
         if (sessionsRef.current.get(terminalId) !== session) return;
@@ -864,16 +841,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (pending.terminalId) pendingRef.current.delete(pending.terminalId);
       attachingRef.current.delete(message.terminalId);
       const viewerId = pending.viewerId;
-      if (pending.version === 2 && !viewerId) {
+      if (!viewerId) {
         setTabs((current) =>
           patchTab(current, pending.localId, { phase: "rejected", error: "bad_handshake" }),
         );
         return;
       }
-      if (
-        pending.expectedCliPublicKey !== null &&
-        message.cliPublicKey !== pending.expectedCliPublicKey
-      ) {
+      if (message.cliPublicKey !== pending.expectedCliPublicKey) {
         refuseSubstitutedKey(pending, message.terminalId);
         return;
       }
@@ -888,10 +862,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         cliPublicRaw,
         browserPublicRaw: pending.browserPublicRaw,
       };
-      const keys =
-        pending.version === 2 && viewerId
-          ? await deriveTerminalSessionKeysV2({ ...shared, viewerId })
-          : await deriveTerminalSessionKeys(shared);
+      const keys = await deriveTerminalSessionKeysV2({ ...shared, viewerId });
       // The socket this handshake ran on is gone; its keys are obsolete. The
       // tab stays "opening", so the next connection attaches it again.
       if (generationRef.current !== generation) return;
@@ -906,8 +877,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const session: LiveSession = {
         localId: pending.localId,
         terminalId: message.terminalId,
-        version: pending.version,
-        viewerId: viewerId ?? "",
+        viewerId,
         browserToCli: keys.browserToCli,
         cliToBrowser: keys.cliToBrowser,
         sendSeq: 0n,
@@ -929,12 +899,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       reattachTimersRef.current.delete(pending.localId);
       const view = viewOf(pending.localId);
       const writer: TerminalWriterLabel =
-        pending.version === 1 || (message.type === "opened" && view.writer === "none")
-          ? "you"
-          : view.writer;
+        message.type === "opened" && view.writer === "none" ? "you" : view.writer;
       setView(
         pending.localId,
-        { writer, multiViewer: pending.version === 2 },
+        { writer },
         {
           terminalId: message.terminalId,
           phase: "live",
@@ -943,7 +911,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           error: null,
           opener: false,
           viewerId,
-          ...(pending.version === 1 ? { viewerCount: 1 } : {}),
         },
       );
       const resize = pendingResizeRef.current.get(pending.localId);
@@ -972,15 +939,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         refuseTab(input.localId, trustRejectionReason(trust));
         return;
       }
-      let version = input.version;
-      if (input.mode === "open") {
-        // An open can start before the first list arrives; use the listed version.
-        const multiViewer = cliViewersRef.current.get(input.cliDeviceId) ?? false;
-        version = multiViewer ? 2 : 1;
-        if (viewOf(input.localId).multiViewer !== multiViewer) {
-          setView(input.localId, { multiViewer }, { multiViewer });
-        }
-      }
       const handshake = await generateEphemeralHandshake();
       if (stale()) return;
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
@@ -997,7 +955,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       pendingRef.current.set(input.mode === "open" ? input.localId : input.terminalId, {
         localId: input.localId,
         terminalId: input.mode === "open" ? "" : input.terminalId,
-        version,
         viewerId: null,
         privateKey: handshake.privateKey,
         browserPublicRaw: handshake.publicKeyRaw,
@@ -1041,7 +998,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         failOpeningRef.current(input.localId, "rate_limited");
       }
     },
-    [ensureTrust, refuseTab, setView, viewOf],
+    [ensureTrust, refuseTab],
   );
 
   const attach = useCallback(
@@ -1059,10 +1016,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         terminalId: tab.terminalId,
         cols: own?.cols ?? tab.cols,
         rows: own?.rows ?? tab.rows,
-        version: viewOf(tab.localId).multiViewer ? 2 : 1,
       });
     },
-    [beginHandshake, clearTimer, viewOf],
+    [beginHandshake, clearTimer],
   );
 
   const canAttach = useCallback((tab: TerminalTab) => {
@@ -1095,7 +1051,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           terminalId: "",
           cols: tab.cols,
           rows: tab.rows,
-          version: tab.multiViewer ? 2 : 1,
         });
       }
     },
@@ -1234,7 +1189,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         setClis(message.clis);
         for (const cli of message.clis) {
           cliKeysRef.current.set(cli.cliDeviceId, cli.publicKey);
-          cliViewersRef.current.set(cli.cliDeviceId, cli.terminalViewers);
         }
         listReady.resolve();
         if (!message.pushed) for (const resolve of listWaitersRef.current.splice(0)) resolve();
@@ -1248,16 +1202,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           if (closing && closing.requestId === null && closing.retry === null) {
             sendClose(remote.terminalId);
           }
-          const multiViewer = cliViewersRef.current.get(remote.cliDeviceId) ?? false;
-          // 2.4: attaching steals the terminal from the tab that has it. Only
-          // do that when the user selects it.
-          const heldElsewhere = !multiViewer && remote.viewerAttached && !remote.attachedHere;
           const known = tabByTerminal(remote.terminalId);
           if (known) {
-            viewRef.current.set(known.localId, { ...viewOf(known.localId), multiViewer });
             patchTabNow(known.localId, {
-              multiViewer,
-              ...(multiViewer ? { viewerCount: remote.viewerCount } : {}),
+              viewerCount: remote.viewerCount,
               ...(remote.origin === "agent"
                 ? { origin: "agent" as const, supervised: remote.supervised }
                 : {}),
@@ -1267,7 +1215,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
                   }
                 : {}),
             });
-            if (canAttach(known) && !heldElsewhere) toAttach.push({ ...known, multiViewer });
+            if (canAttach(known)) toAttach.push(known);
             continue;
           }
           if (additions.some((tab) => tab.terminalId === remote.terminalId)) continue;
@@ -1280,19 +1228,17 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             cliDeviceId: remote.cliDeviceId,
             cols: remote.cols,
             rows: remote.rows,
-            multiViewer,
             opener: false,
             viewerCount: remote.viewerCount,
             origin: remote.origin,
             supervised: remote.supervised,
           });
-          if (heldElsewhere) tab.error = "detached";
           noteTerminalKnown(remote.terminalId);
-          viewRef.current.set(tab.localId, { multiViewer, writer: tab.writer });
+          viewRef.current.set(tab.localId, { writer: tab.writer });
           additions.push(tab);
           // Agent requests are listed, not attached: attaching takes a viewer
           // slot and is the oversight step the person chooses.
-          if (!heldElsewhere && tab.origin !== "agent") toAttach.push(tab);
+          if (tab.origin !== "agent") toAttach.push(tab);
         }
         if (additions.length > 0) {
           tabsRef.current = [
@@ -1363,16 +1309,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           }),
         );
         // Never sign a transcript for an ECDH key the pinned identity did not sign.
-        if (
-          pending.expectedCliPublicKey !== null &&
-          message.cliPublicKey !== pending.expectedCliPublicKey
-        ) {
+        if (message.cliPublicKey !== pending.expectedCliPublicKey) {
           takePendingByTerminalId(pendingRef.current, message.terminalId);
           refuseSubstitutedKey(pending, message.terminalId);
           return;
         }
-        // v2 signs the viewer id too. Without one the CLI would reject it.
-        if (pending.version === 2 && !pending.viewerId) return;
+        // The transcript signs the viewer id. Without one the CLI would reject it.
+        if (!pending.viewerId) return;
         const generation = generationRef.current;
         void signRef
           .current({
@@ -1381,7 +1324,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             browserNonce: pending.browserNonce,
             cliPublicKey: base64UrlToBytes(message.cliPublicKey),
             cliNonce: base64UrlToBytes(message.cliNonce),
-            ...(pending.version === 2 && pending.viewerId ? { viewerId: pending.viewerId } : {}),
+            viewerId: pending.viewerId,
           })
           .then((proof) => {
             // A proof for a socket that has since closed answers nothing.
@@ -1417,8 +1360,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (message.type === "viewers") {
         const tab = tabByTerminal(message.terminalId);
         if (!tab) return;
-        const view = viewOf(tab.localId);
-        if (!view.multiViewer) return;
         if (message.writer !== "you") clearTimer(resizeTimersRef.current, tab.localId);
         setView(tab.localId, { writer: message.writer }, { viewerCount: message.count });
         return;
@@ -1511,10 +1452,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // `self` answers this tab's own detach; the tab is already gone.
         if (message.reason === "self") return;
         dropSession(tab.localId, message.terminalId);
-        const view = viewOf(tab.localId);
         setView(
           tab.localId,
-          { writer: view.multiViewer ? "none" : "you" },
+          { writer: "none" },
           { phase: "opening", error: message.reason === "slow" ? "slow" : "detached" },
         );
         if (message.reason !== "slow") return;
@@ -1678,7 +1618,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     sendChainRef.current.clear();
     recvChainRef.current.clear();
     for (const [localId, view] of viewRef.current) {
-      if (view.multiViewer) viewRef.current.set(localId, { ...view, writer: "none" });
+      viewRef.current.set(localId, { ...view, writer: "none" });
     }
     const settle = (tabs: TerminalTab[]) =>
       tabs.flatMap((tab) => {
@@ -1691,7 +1631,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
               ...tab,
               phase: "opening" as const,
               error: null,
-              writer: tab.multiViewer ? ("none" as const) : tab.writer,
+              writer: "none" as const,
               decline,
             },
           ];
@@ -1829,36 +1769,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [applyPlaintext, openBroadcast],
   );
 
-  const receiveV1 = useCallback(
-    async (session: LiveSession, frame: SealedTerminalFrame) => {
-      if (frame.epoch !== undefined) return;
-      const seq = BigInt(frame.seq);
-      try {
-        assertIncreasingTerminalSeq(session.recvSeq, seq);
-      } catch {
-        return;
-      }
-      let plaintext: Uint8Array;
-      try {
-        plaintext = await openTerminalBytes({
-          key: session.cliToBrowser,
-          terminalId: session.terminalId,
-          direction: DIRECTION_CLI_TO_BROWSER,
-          seq,
-          ciphertext: frame.body,
-        });
-      } catch {
-        return;
-      }
-      if (session.recvSeq >= seq) return;
-      session.recvSeq = seq;
-      const decoded = decodeTerminalPlaintext(plaintext);
-      if (decoded.kind === "data")
-        emitOutput(session.localId, { kind: "data", data: decoded.data });
-    },
-    [emitOutput],
-  );
-
   const onSealed = useCallback(
     (frame: SealedTerminalFrame) => {
       const session = sessionsRef.current.get(frame.terminalId);
@@ -1877,13 +1787,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         .then(async () => {
           // A detach or re-attach replaced this session; its frames are stale.
           if (sessionsRef.current.get(frame.terminalId) !== session) return;
-          if (session.version === 2) await receiveV2(session, frame);
-          else await receiveV1(session, frame);
+          await receiveV2(session, frame);
         })
         .catch(() => undefined);
       recvChainRef.current.set(frame.terminalId, run);
     },
-    [receiveV1, receiveV2, tabByTerminal],
+    [receiveV2, tabByTerminal],
   );
   const socket = useTerminalSocket(options.enabled ?? true, {
     onMessage,
@@ -1956,18 +1865,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const startOpen = useCallback(
     (cliDeviceId: string) => {
       if (!readyRef.current) return;
-      const multiViewer = cliViewersRef.current.get(cliDeviceId) ?? false;
       const tab = newTab({
         localId: newId("local"),
         terminalId: null,
         cliDeviceId,
         cols: 80,
         rows: 24,
-        multiViewer,
         opener: true,
         viewerCount: 1,
       });
-      viewRef.current.set(tab.localId, { multiViewer, writer: tab.writer });
+      viewRef.current.set(tab.localId, { writer: tab.writer });
       tabsRef.current = [...tabsRef.current, tab];
       setTabs((current) => [...current, tab]);
       setActiveLocalId(tab.localId);
@@ -1978,7 +1885,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         terminalId: "",
         cols: tab.cols,
         rows: tab.rows,
-        version: multiViewer ? 2 : 1,
       });
     },
     [beginHandshake],
@@ -2278,7 +2184,7 @@ function pendingFor(
 function decodeMaybeResize(plaintext: Uint8Array): TerminalSize | null {
   if (plaintext[0] !== 0x02) return null;
   try {
-    const decoded = decodeTerminalPlaintext(plaintext);
+    const decoded = decodeTerminalPlaintextV2(plaintext);
     return decoded.kind === "resize" ? { cols: decoded.cols, rows: decoded.rows } : null;
   } catch {
     return null;

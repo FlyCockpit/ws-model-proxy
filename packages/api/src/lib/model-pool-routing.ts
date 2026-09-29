@@ -2,6 +2,17 @@ import prisma from "@ws-model-proxy/db";
 
 export const POOL_MEMBER_UNHEALTHY_AFTER_RETRYABLE_FAILURES = 3;
 export const POOL_MEMBER_HEALTH_COOLDOWN_MS = 60_000;
+/**
+ * A half-open trial claim (`halfOpenTrialStartedAt`) is a lease, not a
+ * permanent latch: a claimant that dies or exits without settling (client
+ * abort, crash, lost finalizer) would otherwise keep the member out of
+ * rotation forever. Pool attempts are not heartbeated and may legitimately run
+ * for the whole relay budget (`MODEL_API_RELAY_TIMEOUT_MS`, 15 minutes), so the
+ * lease is that budget plus a one-minute margin: a live attempt can never be
+ * taken over, and a stranded claim recovers within this bound. Pinned against
+ * the relay budget by a test in apps/server.
+ */
+export const POOL_MEMBER_HALF_OPEN_LEASE_MS = 16 * 60_000;
 export const POOL_MEMBER_RECOVERY_BACKOFF_MS = [
   1_000, 3_000, 5_000, 10_000, 15_000, 20_000, 30_000,
 ] as const;
@@ -233,6 +244,15 @@ export function beginPoolMemberHalfOpenTrial(
   };
 }
 
+/**
+ * The one lease predicate: a trial is live iff it was claimed after
+ * `now - lease`. The claim `where` in markPoolMemberHalfOpenTrial is its exact
+ * complement (expired iff `startedAt <= cutoff`).
+ */
+export function poolMemberTrialLive(startedAt: Date | null, now: Date): boolean {
+  return startedAt !== null && startedAt.getTime() > now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS;
+}
+
 function effectiveHealthStatusForRouting(
   member: Pick<PoolMemberRouteRow, "healthStatus" | "nextRetryAt" | "halfOpenTrialStartedAt">,
   now: Date,
@@ -242,7 +262,7 @@ function effectiveHealthStatusForRouting(
     return "HEALTHY";
   }
   if (member.healthStatus === "HALF_OPEN") {
-    return member.halfOpenTrialStartedAt === null ? "HALF_OPEN" : null;
+    return poolMemberTrialLive(member.halfOpenTrialStartedAt, now) ? null : "HALF_OPEN";
   }
   // A one-member pool has no alternative. Permit its normal execution path to
   // decide availability/compatibility rather than making health state alone a
@@ -520,50 +540,95 @@ export async function selectPoolRouteSequence({
   return buildPoolRouteSequence({ members, activeCliDeviceIds, now, state });
 }
 
+/**
+ * The ownership fence for relay outcome writes (success/failure). One rule for
+ * every attempt, so a stale actor can never overwrite a successor's epoch:
+ * - `trialStartedAt` set (the attempt claimed a half-open trial): the write
+ *   applies only while the row is still HALF_OPEN with exactly that claim.
+ * - `trialStartedAt` null (the attempt claimed nothing): the write applies only
+ *   when the row holds no LIVE trial, so it never clears another request's
+ *   claim. Anything else drops the outcome; the newer state wins.
+ */
+function poolMemberOutcomeFence(trialStartedAt: Date | null, now: Date) {
+  if (trialStartedAt)
+    return { healthStatus: "HALF_OPEN" as const, halfOpenTrialStartedAt: trialStartedAt };
+  return {
+    OR: [
+      { healthStatus: { not: "HALF_OPEN" as const } },
+      { halfOpenTrialStartedAt: null },
+      { halfOpenTrialStartedAt: { lte: new Date(now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS) } },
+    ],
+  };
+}
+
 export async function recordPoolMemberRelayFailure({
   poolMemberId,
   failure,
+  trialStartedAt,
   now = new Date(),
 }: {
   poolMemberId: string;
   failure: RelayFailureClass;
+  /** The half-open trial claim this attempt holds, if any (see the fence). */
+  trialStartedAt: Date | null;
   now?: Date;
 }): Promise<{ retryable: boolean; update: PoolMemberHealthUpdate | null }> {
   const failureClass = poolMemberFailureClassForRelayFailure(failure);
   if (!failureClass) return { retryable: false, update: null };
 
-  const member = await prisma.poolMember.findUnique({
-    where: { id: poolMemberId },
-    select: {
-      healthStatus: true,
-      lastFailureClass: true,
-      consecutiveRetryableFailures: true,
-      lastFailureAt: true,
-      nextRetryAt: true,
-      halfOpenTrialStartedAt: true,
-    },
-  });
-  if (!member) return { retryable: true, update: null };
+  // Read-modify-write, versioned on the fields the transition reads: a
+  // concurrent writer makes the update match 0 rows and we re-read (bounded to
+  // 3 rounds; a writer that loses all of them implies >= 3 committed failures,
+  // so the member is already UNHEALTHY).
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const member = await prisma.poolMember.findUnique({
+      where: { id: poolMemberId },
+      select: {
+        healthStatus: true,
+        lastFailureClass: true,
+        consecutiveRetryableFailures: true,
+        lastFailureAt: true,
+        nextRetryAt: true,
+        halfOpenTrialStartedAt: true,
+      },
+    });
+    if (!member) return { retryable: true, update: null };
+    const owned = trialStartedAt
+      ? member.healthStatus === "HALF_OPEN" &&
+        member.halfOpenTrialStartedAt?.getTime() === trialStartedAt.getTime()
+      : !(
+          member.healthStatus === "HALF_OPEN" &&
+          poolMemberTrialLive(member.halfOpenTrialStartedAt, now)
+        );
+    if (!owned) return { retryable: true, update: null };
 
-  const update = transitionPoolMemberHealthAfterRetryableFailure({
-    member,
-    failureClass,
-    now,
-  });
-  await prisma.poolMember.update({
-    where: { id: poolMemberId },
-    data: update,
-    select: { id: true },
-  });
-
-  return { retryable: true, update };
+    const update = transitionPoolMemberHealthAfterRetryableFailure({
+      member,
+      failureClass,
+      now,
+    });
+    const result = await prisma.poolMember.updateMany({
+      where: {
+        id: poolMemberId,
+        healthStatus: member.healthStatus,
+        halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
+        consecutiveRetryableFailures: member.consecutiveRetryableFailures,
+        ...(trialStartedAt ? {} : poolMemberOutcomeFence(null, now)),
+      },
+      data: update,
+    });
+    if (result.count === 1) return { retryable: true, update };
+  }
+  return { retryable: true, update: null };
 }
 
-export async function markPoolMemberRelaySuccess(poolMemberId: string): Promise<void> {
-  await prisma.poolMember.update({
-    where: { id: poolMemberId },
+export async function markPoolMemberRelaySuccess(
+  poolMemberId: string,
+  { trialStartedAt, now = new Date() }: { trialStartedAt: Date | null; now?: Date },
+): Promise<void> {
+  await prisma.poolMember.updateMany({
+    where: { id: poolMemberId, ...poolMemberOutcomeFence(trialStartedAt, now) },
     data: resetPoolMemberHealth(),
-    select: { id: true },
   });
 }
 
@@ -649,6 +714,12 @@ export async function markPoolMemberHalfOpenTrial({
       OR: [
         { healthStatus: "UNHEALTHY", nextRetryAt: { lte: now } },
         { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+        // An expired lease is reclaimable; the new timestamp fences the old
+        // holder's late release/settlement out (0 rows).
+        {
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: { lte: new Date(now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS) },
+        },
         ...(allowSingleDegradedFallback
           ? [{ healthStatus: "DEGRADED" as const, nextRetryAt: { lte: now } }]
           : []),

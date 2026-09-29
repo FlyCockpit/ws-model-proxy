@@ -231,6 +231,12 @@ import {
   transcriptionRequestProfileFromParts,
 } from "./transcription-request.js";
 import { type RelayRequestSourceValue, transitionRelayRequestTerminal } from "./usage-rollup.js";
+import {
+  assessWarmProtection,
+  protectionRouting,
+  type WarmProtectionPolicy,
+  warmProtectionSource,
+} from "./warm-protection.js";
 
 type ModelApiRouteDependencies = {
   manager?: Pick<
@@ -710,6 +716,8 @@ const inferenceCapacityRelaySelect = {
   templateVersion: true,
   engine: true,
   cacheNamespace: true,
+  engineKind: true,
+  kvBudgetTokens: true,
 } satisfies Prisma.InferenceCapacitySelect;
 
 const relayEndpointSelect = {
@@ -782,6 +790,11 @@ const poolMemberRelaySelect = {
       capacityWaitBudgetMs: true,
       externalAfterWaitMs: true,
       cacheHolderWaitMs: true,
+      protectionEnabled: true,
+      protectionWindowSeconds: true,
+      protectMinTokens: true,
+      protectionShare: true,
+      protectionFixedPercent: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -971,6 +984,19 @@ function poolAdmissionCandidate(
     candidateOrder,
     deadlineAt: new Date(requestDeadlineMs),
     waitBudgetMs: localAdmissionWaitBudget(effectiveMemberWaitBudget(member), externalAfterWaitMs),
+  };
+}
+
+function warmProtectionPolicyForMember(
+  member: PoolMemberRelayRow | undefined,
+): WarmProtectionPolicy {
+  const pool = member?.ModelPool;
+  return {
+    enabled: pool?.protectionEnabled ?? false,
+    windowSeconds: pool?.protectionWindowSeconds ?? 300,
+    minTokens: pool?.protectMinTokens ?? 8192,
+    share: pool?.protectionShare ?? "EQUAL_SHARE",
+    fixedPercent: pool?.protectionFixedPercent ?? null,
   };
 }
 
@@ -4480,6 +4506,8 @@ async function relayPool({
             sourceKind: ownKey ? "DIRECT" : "POOL",
             poolId: ownKey ? undefined : target.id,
             basePriority: 16,
+            // S-C: a grantee's queue priority applies to every pool waiter.
+            accessGrantId: ownKey ? undefined : target.accessGrantId,
             connectionOwner: "model-api-provider",
             deadlineAt: new Date(relayDeadlineMs),
             candidates: remaining.map((providerTarget, candidateOrder) => ({
@@ -5589,6 +5617,9 @@ async function relayPool({
           sourceKind: "POOL",
           poolId: target.id,
           basePriority: 16,
+          // S-C: the grant's queue priority (if set) replaces the pool/member
+          // priority for this grantee's waiters; the store reads it.
+          accessGrantId: target.accessGrantId,
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
@@ -5628,6 +5659,7 @@ async function relayPool({
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
       };
+  const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
@@ -5653,6 +5685,9 @@ async function relayPool({
           surface: requestedSurface,
           payload: affinityPayload,
           targets: affinityTargets,
+          // S-C: even one member must know whether this is a continuation
+          // (only protection needs it: a pool without it pays no extra reads).
+          scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
@@ -5695,6 +5730,75 @@ async function relayPool({
       relayRequestId,
     });
   }
+  // Saturation S-C: warm-session protection (redirect-only). A new session
+  // avoids members whose idle capacity holds other conversations' protected warm
+  // sessions: they route last, and with an external plan they are left out
+  // of the first local admission (or, when nothing else can serve, the
+  // request goes external first). It needs the affinity decision to tell a
+  // continuation (never redirected) from a new session, so without one
+  // nothing changes. Like affinity, it is an optimization only.
+  let protectionInitialCandidates: typeof routeCandidates | null = null;
+  let protectionExternalFirst = false;
+  if (capacityRuntime && affinityDecision && protectionPolicy.enabled) {
+    const decision = affinityDecision;
+    const affineMember = (poolMemberId: string) => {
+      const executionTargetId = memberById.get(poolMemberId)?.ExecutionTarget?.id;
+      return executionTargetId
+        ? (decision.prefixDepths[executionTargetId] ?? 0) > 0 ||
+            decision.conversationMatches[executionTargetId] === true
+        : false;
+    };
+    try {
+      const verdicts = await assessWarmProtection({
+        ownerId: target.ownerUserId,
+        policy: protectionPolicy,
+        members: routeCandidates.flatMap(({ poolMemberId }) => {
+          const member = memberById.get(poolMemberId);
+          const capacity = member?.ExecutionTarget?.InferenceCapacity;
+          if (!member || !capacity) return [];
+          return [
+            {
+              poolMemberId,
+              capacityId: capacity.id,
+              slots: capacity.hardConcurrencyLimit,
+              // Token mode uses the engine KV budget (protocol 2.7) when the
+              // engine reports one; llama.cpp stays slot-based with a
+              // smaller window (assessWarmProtection).
+              kvBudgetTokens: capacity.kvBudgetTokens,
+              engineKind: capacity.engineKind,
+              affine: affineMember(poolMemberId),
+              requestTokens:
+                (nativeCounts.get(poolMemberId) ?? operation.contextCount)?.tokens ?? 0,
+            },
+          ];
+        }),
+        source: warmProtectionSource,
+      });
+      const routing = protectionRouting({
+        candidates: routeCandidates.map(({ poolMemberId }) => ({
+          poolMemberId,
+          affine: affineMember(poolMemberId),
+        })),
+        verdicts,
+        externalPlan: externalAfterWaitMs !== null,
+      });
+      const candidateById = new Map(
+        routeCandidates.map((candidate) => [candidate.poolMemberId, candidate] as const),
+      );
+      const resolve = (ids: readonly string[]) =>
+        ids.flatMap((id) => {
+          const candidate = candidateById.get(id);
+          return candidate ? [candidate] : [];
+        });
+      routeCandidates = resolve(routing.order);
+      protectionInitialCandidates =
+        routing.initial.length === routing.order.length ? null : resolve(routing.initial);
+      protectionExternalFirst = routing.externalFirst;
+    } catch {
+      protectionInitialCandidates = null;
+      protectionExternalFirst = false;
+    }
+  }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
   const applyMemberContextCount = async (poolMemberId: string) => {
@@ -5719,9 +5823,31 @@ async function relayPool({
       cacheHolderPlan = null;
     }
   }
+  if (capacityRuntime && protectionExternalFirst) {
+    // S-C decision step 4: only PROTECTED (or PROTECTED + FULL) members and a
+    // live external plan: go external now. When the attempt does not
+    // dispatch, protection never blocks: admit over every member (PROTECTED
+    // last, oldest/cheapest first) with the full local budget, since the one
+    // external phase of this request is used up.
+    const overflow = await tryPublicOverflow("LOCAL_SATURATED_PROTECTED", async () => undefined);
+    if (overflow.kind === "response") return overflow.response;
+    // A cancel or a lost access (#76) ends the request; never resume locally.
+    const terminal = terminalExternalFailure(overflow);
+    if (terminal) {
+      await operation.dispose?.();
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: terminal });
+      return operationFailureResponse(operation, terminal);
+    }
+    localWaitMode = "full";
+  }
   if (capacityRuntime) {
     localWaitAnchorMs = performance.now();
-    const admissionCandidates = admissionCandidatesForRoutes(routeCandidates);
+    // S-C: with an external plan, PROTECTED members sit out the first
+    // admission; every later round (resume after the external phase,
+    // pre-commit retries) may use them.
+    const admissionCandidates = admissionCandidatesForRoutes(
+      protectionInitialCandidates ?? routeCandidates,
+    );
     if (admissionCandidates.some((candidate) => candidate === null)) {
       await operation.dispose?.();
       await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
@@ -6081,6 +6207,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6194,6 +6321,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6218,6 +6346,7 @@ async function relayPool({
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure: "upstream_5xx",
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
@@ -6247,6 +6376,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
@@ -6295,6 +6425,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6350,6 +6481,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6575,14 +6707,20 @@ async function relayPool({
             : "identity_unavailable";
           const terminalWrites = await Promise.allSettled([
             terminal.ok
-              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
+                  trialStartedAt: claimedTrialAt,
+                })
               : adaptationOutcome === "protocol_error" &&
                   upstreamTerminal.failure !== "capacity_lease_lost"
                 ? recordPoolMemberRelayFailure({
                     poolMemberId: candidate.poolMemberId,
+                    trialStartedAt: claimedTrialAt,
                     failure: "protocol_error",
                   })
-                : Promise.resolve(),
+                : // A served attempt that settled neither way (client abort
+                  // mid-stream, non-member failure) gives its trial back; a
+                  // no-op once success/failure already cleared it.
+                  releaseUnusedTrial(),
             updatePoolRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
               status: terminalStatus(terminal),
@@ -6671,6 +6809,13 @@ async function relayPool({
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
       finalFailure = failure;
+      // Only a retryable operation with a member-attributable failure writes
+      // member health below (which clears the trial). Every other exit (client
+      // abort, lease loss, non-member failure, or a non-retryable operation such
+      // as a stateful follow-up that breaks before the failure write) gives the
+      // claimed trial back instead of waiting out the lease.
+      if (!(operationRetryable && memberRetryable && isPoolRelayFailureClass(failure)))
+        await releaseUnusedTrial();
       if (!operationRetryable) break;
       if (leaseLost) {
         await releaseCapacityAttempt();
@@ -6679,6 +6824,7 @@ async function relayPool({
       if (memberRetryable && isPoolRelayFailureClass(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure,
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
@@ -6854,6 +7000,7 @@ async function relaySelectedModelNoFailover({
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
           poolId: requestedModelPoolId,
           basePriority: 16,
+          accessGrantId: requestedModelPoolId ? poolAccess?.accessGrantId : undefined,
           connectionOwner: "model-api",
           deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
@@ -7826,6 +7973,7 @@ function operationTreatsExternalAsBase(
 
 function externalFallbackReasonHeader(reason: PublicOverflowReason): string {
   if (reason === "LOCAL_WAIT_EXPIRED") return "local_wait_expired";
+  if (reason === "LOCAL_SATURATED_PROTECTED") return "local_saturated_protected";
   if (reason === "NO_COMPATIBLE_HEALTHY_PRIMARY") return "no_local_member";
   if (reason === "LOCAL_CONTEXT_CEILING") return "local_context_ceiling";
   return "local_failure";
@@ -8401,6 +8549,7 @@ async function relayBoundProviderResponse(input: {
         sourceKind: ownKey ? "DIRECT" : "POOL",
         poolId: ownKey ? undefined : input.stickyRoute.visibleTarget.id,
         basePriority: 16,
+        accessGrantId: ownKey ? undefined : input.stickyRoute.visibleTarget.accessGrantId,
         connectionOwner: "model-api-provider-stickiness",
         deadlineAt: new Date(boundStartedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
         candidates: [

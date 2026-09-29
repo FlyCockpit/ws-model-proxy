@@ -662,38 +662,11 @@ export function PoolDetailTab({
   }
   if (tab === "access") {
     return (
-      <section className="space-y-3" aria-labelledby="pool-grants-title">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h3 id="pool-grants-title" className="text-base font-semibold">
-            {t("dashboard:pools.grantsTitle")}
-          </h3>
-          <Button size="touch" onClick={detail.openGrant}>
-            <Plus className="size-4" />
-            {t("dashboard:pools.grant")}
-          </Button>
-        </div>
-        {pool.grants.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("dashboard:pools.noGrants")}</p>
-        ) : (
-          <ul className="space-y-2">
-            {pool.grants.map((grant) => (
-              <li
-                key={grant.granteeEmail}
-                className="flex min-w-0 flex-wrap items-center justify-between gap-3 border p-3"
-              >
-                <span className="min-w-0 break-all text-sm">{grant.granteeEmail}</span>
-                <Button
-                  size="touch"
-                  variant="destructive"
-                  onClick={() => detail.revokeGrant(grant.granteeEmail)}
-                >
-                  {t("dashboard:pools.revokeGrant")}
-                </Button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      <PoolGrantsSection
+        pool={pool}
+        openGrant={detail.openGrant}
+        revokeGrant={detail.revokeGrant}
+      />
     );
   }
   if (detail.deploymentFlags.isPending)
@@ -872,6 +845,284 @@ function PoolFallbackHistory({ poolId }: { poolId: string }) {
         </ol>
       )}
     </div>
+  );
+}
+
+type PoolGrantRow = PoolDetailModel["grants"][number];
+
+/** "Pool default" / "Unprotected" / "N %" for a protection override. */
+function protectionOverrideLabel(
+  percent: number | null,
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  if (percent === null) return t("dashboard:pools.grantRouting.inherit");
+  if (percent === 0) return t("dashboard:pools.protection.override.UNPROTECTED");
+  return t("dashboard:pools.grantRouting.percentValue", { percent });
+}
+
+function PoolGrantsSection({
+  pool,
+  openGrant,
+  revokeGrant,
+}: {
+  pool: PoolDetailModel;
+  openGrant: () => void;
+  revokeGrant: (email: string) => void;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const [editingGrantId, setEditingGrantId] = useState<string | null>(null);
+  const editingGrant = pool.grants.find((grant) => grant.id === editingGrantId);
+  return (
+    <section className="space-y-3" aria-labelledby="pool-grants-title">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 id="pool-grants-title" className="text-base font-semibold">
+          {t("dashboard:pools.grantsTitle")}
+        </h3>
+        <Button size="touch" onClick={openGrant}>
+          <Plus className="size-4" />
+          {t("dashboard:pools.grant")}
+        </Button>
+      </div>
+      {pool.grants.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{t("dashboard:pools.noGrants")}</p>
+      ) : (
+        <ul className="space-y-2">
+          {pool.grants.map((grant) => (
+            <li
+              key={grant.granteeEmail}
+              className="flex min-w-0 flex-wrap items-center justify-between gap-3 border p-3"
+            >
+              <div className="min-w-0 space-y-1">
+                <span className="block break-all text-sm">{grant.granteeEmail}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {t("dashboard:pools.grantRouting.summary", {
+                    protection: protectionOverrideLabel(grant.protectionOverridePercent, t),
+                    priority:
+                      grant.queuePriority === null
+                        ? t("dashboard:pools.grantRouting.inherit")
+                        : grant.queuePriority,
+                  })}
+                </span>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                <Button
+                  size="touch"
+                  variant="outline"
+                  onClick={() => setEditingGrantId(grant.id)}
+                  aria-label={t("dashboard:pools.grantRouting.editFor", {
+                    email: grant.granteeEmail,
+                  })}
+                >
+                  {t("dashboard:pools.grantRouting.edit")}
+                </Button>
+                <Button
+                  size="touch"
+                  variant="destructive"
+                  onClick={() => revokeGrant(grant.granteeEmail)}
+                >
+                  {t("dashboard:pools.revokeGrant")}
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <Dialog
+        open={Boolean(editingGrant)}
+        onOpenChange={(open) => !open && setEditingGrantId(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("dashboard:pools.grantRouting.title")}</DialogTitle>
+            <DialogDescription>
+              {t("dashboard:pools.grantRouting.description", {
+                email: editingGrant?.granteeEmail ?? "",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          {editingGrant ? (
+            <PoolGrantRoutingForm
+              key={editingGrant.id}
+              poolId={pool.id}
+              grant={editingGrant}
+              onSaved={() => setEditingGrantId(null)}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
+}
+
+/**
+ * Owner-only per-grant routing (saturation S-C): the grantee's warm-session
+ * protection override and queue priority.
+ */
+function PoolGrantRoutingForm({
+  poolId,
+  grant,
+  onSaved,
+}: {
+  poolId: string;
+  grant: PoolGrantRow;
+  onSaved: () => void;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const update = useMutation({
+    ...orpc.forwarderManagement.updatePoolGrant.mutationOptions({
+      onSuccess: () => {
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        toast.success(t("dashboard:pools.grantRouting.saved"));
+        onSaved();
+      },
+      onError: (error) => {
+        toast.error(friendly(error, t("dashboard:pools.grantRouting.failed")));
+      },
+    }),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const form = useForm({
+    defaultValues: {
+      protectionMode: (grant.protectionOverridePercent === null
+        ? "INHERIT"
+        : grant.protectionOverridePercent === 0
+          ? "UNPROTECTED"
+          : "PERCENT") as "INHERIT" | "PERCENT" | "UNPROTECTED",
+      protectionPercent: grant.protectionOverridePercent || 50,
+      priorityMode: (grant.queuePriority === null ? "INHERIT" : "SET") as "INHERIT" | "SET",
+      queuePriority: grant.queuePriority ?? 16,
+    },
+    validators: {
+      // A hidden field (its mode not selected) is never validated.
+      onSubmit: z
+        .object({
+          protectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
+          protectionPercent: z.number(),
+          priorityMode: z.enum(["INHERIT", "SET"]),
+          queuePriority: z.number(),
+        })
+        .refine(
+          (value) =>
+            value.protectionMode !== "PERCENT" ||
+            (Number.isInteger(value.protectionPercent) &&
+              value.protectionPercent >= 1 &&
+              value.protectionPercent <= 100),
+        )
+        .refine(
+          (value) =>
+            value.priorityMode !== "SET" ||
+            (Number.isInteger(value.queuePriority) &&
+              value.queuePriority >= 0 &&
+              value.queuePriority <= 31),
+        ),
+    },
+    onSubmit: async ({ value }) => {
+      await update
+        .mutateAsync({
+          poolId,
+          grantId: grant.id,
+          protectionOverridePercent:
+            value.protectionMode === "INHERIT"
+              ? null
+              : value.protectionMode === "UNPROTECTED"
+                ? 0
+                : value.protectionPercent,
+          queuePriority: value.priorityMode === "INHERIT" ? null : value.queuePriority,
+        })
+        .catch(() => undefined);
+    },
+  });
+  return (
+    <form
+      className="min-w-0 space-y-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void form.handleSubmit();
+      }}
+    >
+      <form.Field name="protectionMode">
+        {(modeField) => (
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`grant-protection-${grant.id}`}>
+              {t("dashboard:pools.grantRouting.protection")}
+            </Label>
+            <select
+              id={`grant-protection-${grant.id}`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={modeField.state.value}
+              onChange={(event) =>
+                modeField.handleChange(event.target.value as "INHERIT" | "PERCENT" | "UNPROTECTED")
+              }
+            >
+              <option value="INHERIT">{t("dashboard:pools.protection.override.INHERIT")}</option>
+              <option value="PERCENT">{t("dashboard:pools.protection.override.PERCENT")}</option>
+              <option value="UNPROTECTED">
+                {t("dashboard:pools.protection.override.UNPROTECTED")}
+              </option>
+            </select>
+            {modeField.state.value === "PERCENT" ? (
+              <form.Field name="protectionPercent">
+                {(field) => (
+                  <Input
+                    className="min-h-11"
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                    aria-label={t("dashboard:pools.protection.percentLabel")}
+                  />
+                )}
+              </form.Field>
+            ) : null}
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.grantRouting.protectionHint")}
+            </p>
+          </div>
+        )}
+      </form.Field>
+      <form.Field name="priorityMode">
+        {(modeField) => (
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`grant-priority-${grant.id}`}>
+              {t("dashboard:pools.grantRouting.queuePriority")}
+            </Label>
+            <select
+              id={`grant-priority-${grant.id}`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={modeField.state.value}
+              onChange={(event) => modeField.handleChange(event.target.value as "INHERIT" | "SET")}
+            >
+              <option value="INHERIT">{t("dashboard:pools.grantRouting.inherit")}</option>
+              <option value="SET">{t("dashboard:pools.grantRouting.prioritySet")}</option>
+            </select>
+            {modeField.state.value === "SET" ? (
+              <form.Field name="queuePriority">
+                {(field) => (
+                  <Input
+                    className="min-h-11"
+                    type="number"
+                    min={0}
+                    max={31}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                    aria-label={t("dashboard:pools.grantRouting.priorityValue")}
+                  />
+                )}
+              </form.Field>
+            ) : null}
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.grantRouting.priorityHint")}
+            </p>
+          </div>
+        )}
+      </form.Field>
+      <Button type="submit" size="touch" disabled={update.isPending}>
+        {t("common:actions.save")}
+      </Button>
+    </form>
   );
 }
 

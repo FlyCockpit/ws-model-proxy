@@ -52,6 +52,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { CliCommandDevices } from "@/components/mcp/cli-command-devices";
 import { isBadRequest, isConflict, isForbidden } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -150,9 +151,11 @@ function createErrorMessageKey(error: unknown): string {
 export function McpTokensPanel({
   createEnabled,
   allowNoExpiry,
+  lang,
 }: {
   createEnabled: boolean;
   allowNoExpiry: boolean;
+  lang: string;
 }) {
   const { t } = useTranslation(["settings", "common"]);
   const queryClient = useQueryClient();
@@ -351,6 +354,7 @@ export function McpTokensPanel({
                         idPrefix="mcp-token"
                         allowWrite={allowWrite}
                         allowCliCommands={allowCliCommands}
+                        lang={lang}
                         onAllowWriteChange={(next) => {
                           setAllowWrite(next);
                           if (!next) setAllowCliCommands(false);
@@ -612,6 +616,7 @@ export function McpTokensPanel({
               idPrefix="mcp-token-edit"
               allowWrite={editAllowWrite}
               allowCliCommands={editAllowCliCommands}
+              lang={lang}
               // While MCP is disabled only the capabilities the token already
               // had may stay on; the server refuses any widening.
               canEnableWrite={createEnabled || editTarget?.allowWrite === true}
@@ -695,6 +700,7 @@ function TokenCapabilityFields({
   idPrefix,
   allowWrite,
   allowCliCommands,
+  lang,
   canEnableWrite = true,
   canEnableCliCommands = true,
   onAllowWriteChange,
@@ -703,6 +709,7 @@ function TokenCapabilityFields({
   idPrefix: string;
   allowWrite: boolean;
   allowCliCommands: boolean;
+  lang: string;
   canEnableWrite?: boolean;
   canEnableCliCommands?: boolean;
   onAllowWriteChange: (next: boolean) => void;
@@ -743,6 +750,7 @@ function TokenCapabilityFields({
           </div>
         </div>
       ) : null}
+      {allowWrite && allowCliCommands ? <CliCommandDevices lang={lang} /> : null}
     </>
   );
 }

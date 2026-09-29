@@ -123,19 +123,15 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "identity.checking",
       "identity.offline",
       "identity.unpinned",
-      "identity.unverified",
       "identity.invalid",
       "identity.changed",
-      "identity.downgraded",
       "identity.pinned",
       "identity.new",
       "identity.trustNew",
-      "identity.allowUnverified",
       "identity.trustTitle",
       "identity.trustDescription",
       "identity.trustFailed",
       "identity.keyChangedAgain",
-      "identity.activeUnverified",
       "identity.attention",
       "identity.review",
     ].sort();
@@ -154,6 +150,17 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "commandModeHelp.supervised",
       "commandModeHelp.unsupervised",
       "commandModeRecommended",
+      "effective",
+      "commandSwitches",
+      "commandRefusal.grant_disabled",
+      "commandRefusal.grant_supervised_only",
+      "commandRefusal.cli_supervised_only",
+      "commandRefusal.offline",
+      "commandRefusal.feature_disabled",
+      "commandRefusal.unsupported",
+      "commandKind.headless",
+      "commandKind.supervised",
+      "commandAllowed",
       "unsupervisedConfirm.title",
       "unsupervisedConfirm.description",
       "unsupervisedConfirm.cancel",
@@ -193,6 +200,25 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       directHelp:
         "Los modelos directos siempre usan su propia API. Este control aplica a los pools.",
     });
+  });
+
+  it("labels every chat-test fallback reason in both bundles", () => {
+    // The chip renders `dashboard:chatTest.route.reasons.${reason}` for every
+    // reason the model API may report; a missing key leaks the raw code into
+    // the chip (`reasons.other` is the deliberate passthrough for unknowns).
+    expect(keyTree(esDashboard.chatTest.route.reasons)).toEqual(
+      keyTree(enDashboard.chatTest.route.reasons),
+    );
+    const reasons = [
+      "local_wait_expired",
+      "local_saturated_protected",
+      "no_local_member",
+      "local_context_ceiling",
+      "local_failure",
+      "other",
+    ].sort();
+    expect(keyTree(enDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
+    expect(keyTree(esDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
   });
 
   it("labels every surface the ModelApiSurface union allows", () => {

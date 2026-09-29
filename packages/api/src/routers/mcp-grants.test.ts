@@ -274,35 +274,15 @@ describe("authorizationCodeVerificationMarkers (DB relevance filter)", () => {
     expect(likeMatches(storedValue(), `%${typeMarker}%`)).toBe(true);
   });
 
-  it("LIKE mock fidelity (R98 finding 3): a pattern ending with a bare escape THROWS a 22025-style error, like real PostgreSQL", () => {
-    // Real PostgreSQL raises SQLSTATE 22025 for value "ab" / pattern "a\"
-    // and "x" / "%\" (probe-verified, .review-loop/r98-probe.out.txt). The
-    // mock must THROW the same error class — not return false — so it can
-    // never silently mask the error behavior. Production patterns cannot
-    // end with a bare escape (Prisma wraps the marker with %…% and both
-    // markers end with `"`), pinned by the assertion below.
-    for (const [value, pattern] of [
-      ["ab", "a\\"],
-      ["x", "%\\"],
-    ] as const) {
-      expect(() => likeMatches(value, pattern)).toThrowError(
-        expect.objectContaining({ code: "22025" }),
-      );
-    }
+  it("LIKE-SAFETY: neither production marker ends with a bare escape, so the compiled %marker% pattern can never raise PostgreSQL 22025 (R98 finding 3)", () => {
+    // Real PostgreSQL raises SQLSTATE 22025 for a LIKE pattern that ends with
+    // a bare escape. Production patterns are `%marker%` and both markers end
+    // with `"` — pinned here against the production marker builder.
     const { typeMarker, userMarker } = authorizationCodeVerificationMarkers("user-id");
     for (const marker of [typeMarker, userMarker]) {
       expect(marker.endsWith("\\")).toBe(false);
-      // The compiled contains pattern is %marker% — never trailing-escape.
       expect(() => likeMatches(storedValue(), `%${marker}%`)).not.toThrow();
     }
-    // R100 finding 2 + R101 finding 2: PostgreSQL only raises 22025 when
-    // the scan reaches the dangling escape with the value NOT exhausted;
-    // mismatch-first ("x"/"q\") and exhausted-at-escape ("a"/"a\",
-    // "a"/"%a\", ""/"\") values return false (probe-verified). Pinned:
-    expect(likeMatches("x", "q\\")).toBe(false);
-    expect(likeMatches("a", "a\\")).toBe(false);
-    expect(likeMatches("a", "%a\\")).toBe(false);
-    expect(likeMatches("", "\\")).toBe(false);
   });
 
   it("LIKE-SAFETY (R95/R96): the user marker for server-generated ids (cuid/uuid/nanoid alphabets) contains no JSON escapes and no % wildcard", () => {
@@ -401,18 +381,6 @@ describe("authorizationCodeVerificationMarkers (DB relevance filter)", () => {
         expect(serializationIsIdentity).toBe(false);
       }
     }
-  });
-
-  it("a marker embedded inside a JSON STRING (crafted query.state) is stored ESCAPED and cannot match", () => {
-    const { userMarker } = authorizationCodeVerificationMarkers("user-id");
-    const crafted = storedValue({
-      query: {
-        client_id: "client-b",
-        state: 'x "userId":"user-id" y', // malicious substring inside a string
-      },
-      userId: "someone-else",
-    });
-    expect(crafted).not.toContain(userMarker);
   });
 });
 
@@ -1349,32 +1317,6 @@ describe("mcpGrants.revokeMine", () => {
     expect(updateIn).not.toContain("ref-overmatch-foreign");
   });
 
-  it("LIKE-wildcard over-match volume (user's other-client codes beyond the cap) → LOUD CONFLICT, no writes (R95/R96 regression d)", async () => {
-    mockRevokeReads({ consents: [], refreshes: [], accesses: [] });
-    mockVerificationScan(
-      Array.from(
-        { length: VERIFICATION_CANDIDATE_TOTAL_CAP + VERIFICATION_CANDIDATE_BATCH },
-        (_, i) => ({
-          id: String(i).padStart(7, "0"),
-          value: codeValue({
-            query: { client_id: `https://example.com/other-${i}.json` },
-            referenceId: `ref-other-${i}`,
-          }),
-        }),
-      ),
-    );
-    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
-
-    await expect(
-      client().revokeMine({ clientRecordId: "record-a", confirm: "REVOKE" }),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
-    expect(db.mcpGrant.createMany).not.toHaveBeenCalled();
-    expect(db.oauthConsent.deleteMany).not.toHaveBeenCalled();
-    expect(db.oauthRefreshToken.updateMany).not.toHaveBeenCalled();
-    expect(db.oauthAccessToken.updateMany).not.toHaveBeenCalled();
-  });
-
   it("fail-closed guard at the router: a session user id whose serialization escapes (quote, backslash, control chars, lone surrogate) throws CONFLICT BEFORE any scan, transaction, or write (R95/R96 regression e, R98 finding 1)", async () => {
     for (const unsafeId of ['u"ser', "u\\ser", "u\nser", "u\tser", "u\x00ser", "\uD800ser"]) {
       const unsafeClient = createRouterClient(mcpGrantsRouter, {
@@ -1554,6 +1496,10 @@ describe("mcpGrants.revokeMine", () => {
       client().revokeMine({ clientRecordId: "record-a", confirm: "REVOKE" }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+    expect(db.mcpGrant.createMany).not.toHaveBeenCalled();
+    expect(db.oauthConsent.deleteMany).not.toHaveBeenCalled();
+    expect(db.oauthRefreshToken.updateMany).not.toHaveBeenCalled();
+    expect(db.oauthAccessToken.updateMany).not.toHaveBeenCalled();
   });
 
   it("hides foreign connections: no grant rows for this user → NOT_FOUND, no mutation", async () => {

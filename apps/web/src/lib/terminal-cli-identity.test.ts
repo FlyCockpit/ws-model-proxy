@@ -29,7 +29,6 @@ async function signedCli(): Promise<ListedCli> {
     cliDeviceId: "cli-1",
     slug: "desk-01",
     publicKey: ecdh.publicKeyB64,
-    terminalViewers: true,
     identityPublicKey: bytesToBase64Url(
       new Uint8Array(await crypto.subtle.exportKey("raw", identity.publicKey)),
     ),
@@ -42,9 +41,6 @@ const brokenStore: CliPinStore = {
     throw new Error("no indexedDB");
   },
   put: async () => {
-    throw new Error("no indexedDB");
-  },
-  remove: async () => {
     throw new Error("no indexedDB");
   },
 };
@@ -106,32 +102,25 @@ describe("CLI identity trust", () => {
     expect(store.pins.get("cli-1")).toBe(other.identityPublicKey);
   });
 
-  it("treats a pinned CLI that falls back to 2.4 as changed until allowed", async () => {
+  it("blocks a live pinned CLI that stops listing an identity, and keeps its pin", async () => {
     const cli = await signedCli();
     const store = createMemoryCliPinStore();
     await evaluateCliTrust(cli, store);
-    const legacy = {
-      ...cli,
-      terminalViewers: false,
-      identityPublicKey: null,
-      identitySignature: null,
-    };
-    const trust = await evaluateCliTrust(legacy, store);
-    expect(trust).toMatchObject({ status: "changed", fingerprint: null });
-    if (trust.status !== "changed") throw new Error("expected a changed identity");
-    expect(await trustNewCliKey(legacy, trust, store)).toEqual({ status: "unverified" });
-    expect(store.pins.size).toBe(0);
+    const bare = { ...cli, identityPublicKey: null, identitySignature: null };
+    const trust = await evaluateCliTrust(bare, store);
+    expect(trust).toEqual({ status: "invalid" });
+    expect(trustAllowsHandshake(trust)).toEqual({ ok: false });
+    expect(store.pins.get("cli-1")).toBe(cli.identityPublicKey);
   });
 
   it("treats a disconnected pinned CLI as offline and keeps its pin", async () => {
     const cli = await signedCli();
     const store = createMemoryCliPinStore();
     await evaluateCliTrust(cli, store);
-    // An offline CLI has no live protocol version and no terminal key.
+    // An offline CLI has no terminal key.
     const offline: ListedCli = {
       ...cli,
       publicKey: null,
-      terminalViewers: false,
       identityPublicKey: null,
       identitySignature: null,
     };
@@ -141,26 +130,9 @@ describe("CLI identity trust", () => {
     expect(store.pins.get("cli-1")).toBe(cli.identityPublicKey);
   });
 
-  it("never drops a pin for a CLI that went offline after the warning", async () => {
+  it("treats an offline CLI without a pin as offline", async () => {
     const cli = await signedCli();
-    const store = createMemoryCliPinStore();
-    await evaluateCliTrust(cli, store);
-    const legacy = {
-      ...cli,
-      terminalViewers: false,
-      identityPublicKey: null,
-      identitySignature: null,
-    };
-    const shown = await evaluateCliTrust(legacy, store);
-    if (shown.status !== "changed") throw new Error("expected a changed identity");
-    const offline = { ...legacy, publicKey: null };
-    expect(await trustNewCliKey(offline, shown, store)).toEqual({ status: "offline" });
-    expect(store.pins.get("cli-1")).toBe(cli.identityPublicKey);
-  });
-
-  it("treats an offline CLI without a pin as offline, not unverified", async () => {
-    const cli = await signedCli();
-    const offline = { ...cli, publicKey: null, terminalViewers: false };
+    const offline = { ...cli, publicKey: null };
     expect(await evaluateCliTrust(offline, createMemoryCliPinStore())).toEqual({
       status: "offline",
     });
