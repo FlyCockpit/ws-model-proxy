@@ -92,6 +92,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_model_capability_profile_set",
   "forwarder_model_attachment_limit_update",
   "forwarder_pool_grant_create",
+  "forwarder_pool_grant_update",
   "forwarder_pool_grant_revoke",
   "provider_account_create",
   "provider_account_update",
@@ -202,6 +203,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_model_attachment_limit_update:
     "forwarderManagement.updateDiscoveredModelAttachmentLimit",
   forwarder_pool_grant_create: "forwarderManagement.grantPoolAccessByEmail",
+  forwarder_pool_grant_update: "forwarderManagement.updatePoolGrant",
   forwarder_pool_grant_revoke: "forwarderManagement.revokePoolAccessByEmail",
   provider_account_create: "providerManagement.createAccount",
   provider_account_update: "providerManagement.updateAccount",
@@ -262,13 +264,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 28 read + 51 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 28 read + 52 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
     expect(PLAN_READ_TOOLS).toHaveLength(28);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(51);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(79);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(52);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(80);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -466,9 +468,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 79 catalog entries − 5 extracted cores = 74 procedure dispatches.
-    expect(dispatched).toBe(74);
-    expect(invoked).toHaveLength(74);
+    // 80 catalog entries − 5 extracted cores = 75 procedure dispatches.
+    expect(dispatched).toBe(75);
+    expect(invoked).toHaveLength(75);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -554,6 +556,12 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         name: "Pool",
         externalAfterWaitMs: 500,
         cacheHolderWaitMs: 1_500,
+        protectionEnabled: true,
+        protectionWindowSeconds: 300,
+        protectMinTokens: 8192,
+        protectionShare: "FIXED_PERCENT",
+        protectionFixedPercent: 25,
+        ownerProtectionPercent: 50,
       });
       expect(allowed).not.toHaveProperty("issues");
       // K1-1: the external wait they still accept carries its cost statement.

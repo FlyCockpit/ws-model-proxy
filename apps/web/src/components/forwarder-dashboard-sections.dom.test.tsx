@@ -243,6 +243,14 @@ const editablePool = {
   capacityContextMargin: 1_024,
   capacityBorrowPolicy: "WHEN_IDLE" as const,
   cacheHolderWaitMs: null as number | null,
+  protection: {
+    enabled: true,
+    windowSeconds: 300,
+    minTokens: 8192,
+    share: "EQUAL_SHARE" as "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT",
+    fixedPercent: null as number | null,
+    ownerPercent: null as number | null,
+  },
   affinity: {
     enabled: false,
     ttlSeconds: 3600,
@@ -627,6 +635,87 @@ describe("PoolForm affinity defaults", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
     await waitFor(() => expect(state.mutationCalls).toHaveLength(2));
     expect(state.mutationPayloads[1]?.input).toMatchObject({ cacheHolderWaitMs: 0 });
+  });
+
+  it("saves warm-session protection settings (share mode, fixed percent, owner share)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+      ownerProtectionPercent: null,
+    });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.share"), {
+      target: { value: "FIXED_PERCENT" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
+      target: { value: "25" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.ownerShare"), {
+      target: { value: "UNPROTECTED" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.windowSeconds"), {
+      target: { value: "120" },
+    });
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protection.enabled"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(2));
+    expect(state.mutationPayloads[1]?.input).toMatchObject({
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+  });
+
+  it("does not validate hidden percent fields (a stale invalid value never blocks save)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const share = screen.getByLabelText("dashboard:pools.protection.share");
+    fireEvent.change(share, { target: { value: "FIXED_PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
+      target: { value: "0" },
+    });
+    // Back to a mode without the field: the invalid hidden value is not sent or checked.
+    fireEvent.change(share, { target: { value: "EQUAL_SHARE" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+    });
+  });
+
+  it("does not validate a hidden owner percent (PERCENT back to INHERIT still saves)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const owner = screen.getByLabelText("dashboard:pools.protection.ownerShare");
+    fireEvent.change(owner, { target: { value: "PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(owner, { target: { value: "INHERIT" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ ownerProtectionPercent: null });
+  });
+
+  it("loads a stored owner protection percent", () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protection: { ...editablePool.protection, ownerPercent: 40 } },
+    });
+    expect(
+      (screen.getByLabelText("dashboard:pools.protection.ownerShare") as HTMLSelectElement).value,
+    ).toBe("PERCENT");
+    expect(
+      (screen.getByLabelText("dashboard:pools.protection.percentLabel") as HTMLInputElement).value,
+    ).toBe("40");
   });
 
   it("loads a stored fixed cache-holder wait", () => {

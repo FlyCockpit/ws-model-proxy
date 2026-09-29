@@ -52,6 +52,24 @@ describe("RouteChip", () => {
     expect(screen.getByTestId("chat-route").querySelector("[title]")).toBeNull();
   });
 
+  it("translates the protected-saturation reason instead of showing its raw code", () => {
+    render(
+      <RouteChip
+        route={{
+          ...base,
+          route: "pool-fallback",
+          servedModel: "openai/gpt-4o-mini",
+          fallbackReason: "local_saturated_protected",
+        }}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "dashboard:chatTest.route.reasonLabel(dashboard:chatTest.route.reasons.local_saturated_protected)",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows own key with the served model and an unknown reason as raw text", () => {
     render(
       <RouteChip

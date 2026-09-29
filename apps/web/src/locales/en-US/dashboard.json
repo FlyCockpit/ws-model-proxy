@@ -275,6 +275,7 @@
       "reasonLabel": "Reason: {{reason}}",
       "reasons": {
         "local_wait_expired": "local members stayed busy past the wait limit",
+        "local_saturated_protected": "the local members' free capacity holds protected warm conversations",
         "no_local_member": "no compatible local member was available",
         "local_context_ceiling": "the request exceeded the local context limit",
         "local_failure": "the local attempt failed",
@@ -489,6 +490,28 @@
         "valueLabel": "Cache-holder wait in milliseconds",
         "hint": "When a continuation's prefix is warm on a busy member, other members are held back for this long so the warm member can take it. Automatic uses the member's measured prefill speed (2 s until it is measured). Maximum 30000 ms. Local wait budgets and the external fallback wait start counting after this hold."
       }
+    },
+    "protection": {
+      "title": "Protect active conversations",
+      "description": "A new conversation avoids a member whose free capacity still holds other conversations' recent, large prompt caches when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
+      "enabled": "Protect active conversations",
+      "windowSeconds": "Protection window (seconds)",
+      "minTokens": "Minimum conversation size (tokens)",
+      "share": "Share between users",
+      "shareModes": {
+        "EQUAL_SHARE": "Equal share per active user",
+        "FIRST_COME": "First come (no per-user cap)",
+        "FIXED_PERCENT": "Fixed percent per user"
+      },
+      "fixedPercent": "Percent each user may keep protected",
+      "ownerShare": "Your own share",
+      "override": {
+        "INHERIT": "Use the pool's share",
+        "PERCENT": "Fixed percent",
+        "UNPROTECTED": "Unprotected"
+      },
+      "percentLabel": "Percent of a member's capacity (1 to 100)",
+      "hint": "Warmth is estimated from the routing records of all this owner's pools on the member (sizes and times only, never prompt content). Only conversations used within the window and at least the minimum size count. Over their share, a user's oldest conversations lose protection first."
     },
     "capacity": {
       "title": "Shared local capacity",
@@ -898,7 +921,24 @@
     "transformerTimeoutMs": "Transformer timeout (ms)",
     "transformerMaxAssets": "Max attachments per request",
     "updated": "Pool updated",
-    "weight": "Weight"
+    "weight": "Weight",
+    "grantRouting": {
+      "edit": "Routing",
+      "editFor": "Routing settings for {{email}}",
+      "title": "Routing for this person",
+      "description": "Settings that apply only to requests from {{email}}.",
+      "protection": "Protected share",
+      "protectionHint": "How much of a member's capacity this person's recent conversations may keep protected from new ones. Unprotected: their conversations are never shielded.",
+      "queuePriority": "Queue priority",
+      "prioritySet": "Set a priority",
+      "priorityValue": "Queue priority (0 to 31)",
+      "priorityHint": "Replaces the pool and member queue priority for this person's waiting requests. Higher numbers get a larger share of freed slots.",
+      "inherit": "Pool default",
+      "percentValue": "{{percent}} %",
+      "summary": "Protected share: {{protection}} · Queue priority: {{priority}}",
+      "saved": "Routing settings saved.",
+      "failed": "Could not save the routing settings."
+    }
   },
   "relay": {
     "createdAt": "Created",
