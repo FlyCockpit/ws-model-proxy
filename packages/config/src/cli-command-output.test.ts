@@ -291,27 +291,28 @@ describe("appendRollingTail", () => {
         Array.from({ length: 251 }, (_, n) => (n * 37) & 0xff),
       ),
     };
-    const nsPerByte = (value: { prefix: Uint8Array; body: Uint8Array }) => {
-      const runs: number[] = [];
-      for (let run = 0; run < 5; run += 1) {
-        const state = new TerminalByteState();
-        state.consume(value.prefix, 0, value.prefix.length);
-        const started = performance.now();
-        state.consume(value.body, 0, value.body.length);
-        runs.push(((performance.now() - started) * 1e6) / value.body.length);
-      }
-      return runs.sort((a, b) => a - b)[2] ?? 0;
+    const timeOnce = (value: { prefix: Uint8Array; body: Uint8Array }) => {
+      const state = new TerminalByteState();
+      state.consume(value.prefix, 0, value.prefix.length);
+      const started = performance.now();
+      state.consume(value.body, 0, value.body.length);
+      return ((performance.now() - started) * 1e6) / value.body.length;
     };
-    // Warm up, then measure every shape in the same conditions.
-    for (const value of Object.values(shapes)) nsPerByte(value);
-    const costs = Object.fromEntries(
-      Object.entries(shapes).map(([name, value]) => [name, nsPerByte(value)]),
-    );
+    // Interleaved rounds, each shape's minimum: a burst of contention during
+    // one shape's window cannot single it out.
+    const costs: Record<string, number> = {};
+    for (let round = 0; round < 7; round += 1) {
+      for (const [name, value] of Object.entries(shapes)) {
+        const cost = timeOnce(value);
+        costs[name] = Math.min(costs[name] ?? Number.POSITIVE_INFINITY, cost);
+      }
+    }
     const cheapest = Math.min(...Object.values(costs));
     for (const [name, cost] of Object.entries(costs)) {
       // One table load per byte: every shape within a small factor of the
-      // cheapest, and far above the event-loop-blocking rates measured before.
-      expect(cost, `${name} ${JSON.stringify(costs)}`).toBeLessThan(Math.max(4 * cheapest, 2));
+      // cheapest (the regressions this guards were 10-40x), and far above the
+      // event-loop-blocking rates measured before.
+      expect(cost, `${name} ${JSON.stringify(costs)}`).toBeLessThan(Math.max(6 * cheapest, 2));
       expect(cost, name).toBeLessThan(50);
     }
   });
@@ -320,6 +321,22 @@ describe("appendRollingTail", () => {
     // Every parser state (reached by a prefix) × every two-byte sequence,
     // followed by probes that tell the states apart: the boundary flag after
     // each byte must match the legacy per-byte decoder + parser.
+    // Parser states, plus every UTF-8 decoder substate (partial characters).
+    const decoderPrefixes = [
+      [0xc2],
+      [0xc3],
+      [0xe0],
+      [0xe1],
+      [0xe1, 0x80],
+      [0xed],
+      [0xf0],
+      [0xf1],
+      [0xf1, 0x80],
+      [0xf1, 0x80, 0x80],
+      [0xf3, 0xa0, 0x81],
+      [0xf4],
+      [0x1b, 0x5d, 0xf1, 0x80],
+    ];
     const prefixes = [
       "",
       "\u001b",
@@ -335,8 +352,12 @@ describe("appendRollingTail", () => {
       "\u001bP ",
       "\u001bP1<",
       "\u001bPq",
-    ].map(bytes);
-    const probe = bytes("x\u0007m\\\u001b\\y");
+    ]
+      .map(bytes)
+      .concat(decoderPrefixes.map((prefix) => Uint8Array.from(prefix)));
+    // The probe starts with continuation bytes, which tell apart how many a
+    // partial character still needs.
+    const probe = Uint8Array.from([0x80, 0x80, 0x80, ...bytes("x\u0007m\\\u001b\\y")]);
     for (const prefix of prefixes) {
       for (let first = 0; first < 0x100; first += 1) {
         for (let second = 0; second < 0x100; second += 1) {
