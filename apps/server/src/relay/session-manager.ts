@@ -62,6 +62,9 @@ import {
 } from "./registration.js";
 
 const WS_READY_STATE_OPEN = 1;
+/** Close code and reason for a socket closed because the server is shutting down. */
+export const SHUTDOWN_CLOSE_CODE = 1001;
+export const SHUTDOWN_CLOSE_REASON = "shutdown";
 
 export type RelaySocket = {
   readonly readyState: number;
@@ -547,6 +550,8 @@ export class RelaySessionManager {
    *   supervised command starts (`startSupervisedCommand` returns false);
    * - a CLI socket closes once its last model request finishes
    *   ({@link considerDrainClose}).
+   * - a CLI socket whose authentication finished after the drain began is
+   *   closed on open and never registered ({@link acceptAuthenticatedSocket});
    * It does not close sockets already upgraded: browser terminal sockets are
    * closed by the hub's `closeAll` (the shutdown's `closeBrowserSockets`
    * step) and CLI sockets by the close calls above.
@@ -558,6 +563,13 @@ export class RelaySessionManager {
     probe: (member) => this.probeOwnedPoolMember(member),
   });
 
+  /**
+   * Registers an upgraded, authenticated CLI socket. The single admission
+   * point for the drain: the upgrade middleware checks {@link relayDrain}
+   * before its awaited authentication, so a socket whose authentication
+   * finishes after the drain began arrives here. It is closed with the
+   * shutdown close code and never registered. Returns whether it was accepted.
+   */
   acceptAuthenticatedSocket({
     socket,
     identity,
@@ -566,7 +578,13 @@ export class RelaySessionManager {
     socket: RelaySocket;
     identity: CliWebsocketIdentity;
     now?: Date;
-  }) {
+  }): boolean {
+    if (this.relayDrain) {
+      if (socket.readyState === WS_READY_STATE_OPEN) {
+        socket.close(SHUTDOWN_CLOSE_CODE, SHUTDOWN_CLOSE_REASON);
+      }
+      return false;
+    }
     const unauthenticatedTimer = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
       if (!session?.registered) {
@@ -606,6 +624,7 @@ export class RelaySessionManager {
       endpointLoad: new Map(),
       malformedTelemetryLoggedAtMs: null,
     });
+    return true;
   }
 
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
@@ -1105,7 +1124,7 @@ export class RelaySessionManager {
     if (!this.sessionsBySocket.has(session.socket)) return null;
     this.teardownInteractiveWork(session);
     if (session.socket.readyState === WS_READY_STATE_OPEN) {
-      session.socket.close(1001, "shutdown");
+      session.socket.close(SHUTDOWN_CLOSE_CODE, SHUTDOWN_CLOSE_REASON);
     }
     return this.detachSession(session.socket, {
       now,
