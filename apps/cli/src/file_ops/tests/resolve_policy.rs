@@ -294,12 +294,16 @@ fn protected_files_are_hidden_from_search_and_stat() {
 #[test]
 fn special_files_and_trees_are_refused() {
     let fx = Fx::new();
-    for path in [
-        "/dev/null",
-        "/proc/self/environ",
-        "/proc/self/cmdline",
-        "/sys/kernel/hostname",
-    ] {
+    // /proc and /sys exist only on Linux; /dev is everywhere.
+    let mut special = vec!["/dev/null"];
+    if cfg!(target_os = "linux") {
+        special.extend([
+            "/proc/self/environ",
+            "/proc/self/cmdline",
+            "/sys/kernel/hostname",
+        ]);
+    }
+    for path in special {
         assert_eq!(
             code(fx.ops.read(&args(json!({ "path": path })), &fx.cancel)),
             ErrorCode::SpecialFile,

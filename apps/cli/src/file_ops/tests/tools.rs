@@ -180,7 +180,7 @@ fn list_refuses_files_and_special_trees() {
     assert_eq!(
         code(
             fx.ops
-                .dir_list(&args(json!({ "path": "/proc" })), &fx.cancel)
+                .dir_list(&args(json!({ "path": SPECIAL_TREE })), &fx.cancel)
         ),
         ErrorCode::SpecialFile
     );
@@ -188,8 +188,14 @@ fn list_refuses_files_and_special_trees() {
         .ops
         .dir_list(&args(json!({ "path": "/", "depth": 1 })), &fx.cancel)
         .unwrap();
-    assert!(root.entries.contains("/proc/"));
+    assert!(root.entries.contains(&format!("{SPECIAL_TREE}/")));
 }
+
+/// A special tree that exists on every Unix the module builds on.
+#[cfg(target_os = "linux")]
+const SPECIAL_TREE: &str = "/proc";
+#[cfg(not(target_os = "linux"))]
+const SPECIAL_TREE: &str = "/dev";
 
 // ---- search ---------------------------------------------------------------
 
