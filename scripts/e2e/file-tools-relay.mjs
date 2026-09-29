@@ -461,7 +461,8 @@ try {
     confirm: "RUN",
   });
   assert(overwrite.isError, "a masked value must never be written back");
-  assert.equal(overwrite.error.code, "secret_file");
+  // The mask token in the content is refused first; either way the file is untouched.
+  assert(["secret_file", "redacted_span"].includes(overwrite.error.code));
   for (const [name, args] of [
     [
       "forwarder_cli_file_edit",
