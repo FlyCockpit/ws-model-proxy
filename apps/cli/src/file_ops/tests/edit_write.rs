@@ -500,6 +500,17 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
         fx.get("cfg.yaml"),
         "API_KEY: sk-live-plainsecret\nother: 1\n"
     );
+    // one masked value is unmasked while the others stay masked: still refused
+    fx.put(
+        "three.conf",
+        "A_KEY=one-secret\nB_KEY=two-secret\nC_KEY=three-secret\n",
+    );
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("three.conf"), "dryRun": true,
+            "edits": [{ "oldText": "B_KEY", "newText": "B KEY" }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::RedactedSpan);
     // an edit elsewhere in the file is fine
     edit(
         &fx,

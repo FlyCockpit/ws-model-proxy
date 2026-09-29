@@ -183,6 +183,9 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     for (index, op) in args.edits.iter().enumerate() {
         new_texts.push(translate_eol(&op.new_text, crlf));
         let new_text = &new_texts[index];
+        if new_text.len() > MAX_NEW_TEXT_BYTES {
+            return Err(FileError::invalid("newText is longer than 1 MiB"));
+        }
         match (&op.old_text, op.start_line, op.end_line) {
             (Some(old), _, _) => {
                 plan_exact(
@@ -242,6 +245,12 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     // An edit that touches no masked value can still change that context, so no
     // masked byte of the original may show up unmasked in the result or in its
     // diff, `dryRun` included.
+    if after_view.long_construct {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "the edit would create a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
+        ));
+    }
     if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,

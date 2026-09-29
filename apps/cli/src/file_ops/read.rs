@@ -251,17 +251,19 @@ fn line_offset(bytes: &[u8], n: usize) -> usize {
     bytes.len()
 }
 
-/// Start of the first whole line within [`redact::LOOKBACK_BYTES`] before
-/// `offset` (the window start).
+/// Start of the line that contains the byte [`redact::LOOKBACK_BYTES`] before
+/// `offset` (the window start): the straddling line is kept whole, so a value
+/// opened on it (or a previous line longer than the lookback) still masks the
+/// window.
 fn lookback_start(bytes: &[u8], offset: usize) -> usize {
     let from = offset.saturating_sub(redact::LOOKBACK_BYTES);
     if from == 0 {
         return 0;
     }
-    match bytes[from..offset].iter().position(|b| *b == b'\n') {
-        Some(idx) => from + idx + 1,
-        None => offset,
-    }
+    bytes[..from]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |idx| idx + 1)
 }
 
 /// Start of the line before the one starting at `offset` (`0` when none).
@@ -487,7 +489,12 @@ fn read_large(
             }
             context_bytes += n as u64;
             context.push_back(buf);
-            while context_bytes > lookback && context.len() > 1 {
+            // drop the oldest line only while the rest still covers the lookback
+            while context.len() > 1
+                && context
+                    .front()
+                    .is_some_and(|old| context_bytes - old.len() as u64 >= lookback)
+            {
                 if let Some(old) = context.pop_front() {
                     context_bytes -= old.len() as u64;
                 }
@@ -532,6 +539,28 @@ fn read_large(
     })))
 }
 
+/// Move `start` back to the start of the line that contains it, so the tail
+/// chunk begins with a whole line (its state matters to the masker). Bounded by
+/// [`LARGE_LINE_MAX_BYTES`]; returns whether the first line stays partial.
+fn aligned_chunk_start(file: &std::fs::File, start: u64) -> FileResult<(u64, bool)> {
+    let mut at = start;
+    let mut moved = 0_u64;
+    while at > 0 {
+        let block = at.min(64 * 1024);
+        let mut buf = vec![0_u8; block as usize];
+        file.read_exact_at(&mut buf, at - block)?;
+        if let Some(idx) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok((at - block + idx as u64 + 1, false));
+        }
+        at -= block;
+        moved += block;
+        if moved > LARGE_LINE_MAX_BYTES {
+            return Ok((start, true));
+        }
+    }
+    Ok((0, false))
+}
+
 /// The last `count` lines of a huge file, without line numbers.
 #[allow(clippy::too_many_arguments)]
 fn tail_window(
@@ -547,10 +576,11 @@ fn tail_window(
     cancel.check()?;
     let chunk_len =
         ((max_bytes as u64) * 2 + 64 * 1024 + redact::LOOKBACK_BYTES as u64).min(stat.size);
-    let mut chunk = vec![0_u8; chunk_len as usize];
-    file.read_exact_at(&mut chunk, stat.size - chunk_len)?;
+    let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
+    let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
+    file.read_exact_at(&mut chunk, chunk_start)?;
     let mut raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
-    if chunk_len < stat.size && !raw_lines.is_empty() {
+    if partial_first && !raw_lines.is_empty() {
         raw_lines.remove(0); // a partial first line is unusable
     }
     let want = count.min(max_lines).min(raw_lines.len());

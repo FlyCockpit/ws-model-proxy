@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::*;
 use crate::file_ops::policy::Deny;
+use crate::file_ops::redact;
 
 // ---- protected paths are compared in the resolver's (physical) namespace ----
 
@@ -509,4 +510,151 @@ fn an_extreme_line_range_is_invalid_input_not_a_panic() {
         )
         .unwrap();
     assert_eq!(fx.get("a.txt"), "one\nx\ntwo\n");
+}
+
+// ---- the lookback keeps the line that straddles it ---------------------------
+
+#[test]
+fn a_previous_line_longer_than_the_lookback_still_gives_the_window_its_state() {
+    let fx = Fx::new();
+    let long = "x".repeat(redact::LOOKBACK_BYTES + 100_000);
+    fx.put(
+        "quote.txt",
+        format!("{long}\nAPI_KEY=\"opening\nleaked-quote-secret\"\n\nafter\n"),
+    );
+    let r = fx.read_with(json!({ "path": fx.p("quote.txt"), "startLine": 3 }));
+    assert!(!r.text.contains("leaked-quote-secret"), "{}", r.text);
+    fx.put(
+        "flag.txt",
+        format!("{long}\nrun --token\nleaked-flag-secret\n"),
+    );
+    let r = fx.read_with(json!({ "path": fx.p("flag.txt"), "startLine": 3 }));
+    assert!(!r.text.contains("leaked-flag-secret"), "{}", r.text);
+    // the value is opened on the very line that straddles the lookback boundary
+    let filler = "y\n".repeat(redact::LOOKBACK_BYTES / 2 - 8);
+    fx.put(
+        "straddle.txt",
+        format!("API_KEY=\"opening {long}\nsecret-in-middle\n{filler}visible-a\nvisible-b\n"),
+    );
+    let r = fx.read_with(json!({ "path": fx.p("straddle.txt"), "startLine": 2, "maxLines": 1 }));
+    assert!(!r.text.contains("secret-in-middle"), "{}", r.text);
+}
+
+fn write_huge_with_run(fx: &Fx, name: &str, blocks_before: usize, blocks_after: usize) -> u64 {
+    let path = fx.root.join(name);
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..blocks_before {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    let opener_line = blocks_before as u64 * 20_000 + 1;
+    file.write_all(b"X_TOKEN=\"opening\n").unwrap();
+    // a run far longer than the 128 KiB a bare tail chunk would hold, inside the lookback
+    for i in 0..12_000 {
+        writeln!(file, "tail-secret-{i}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").unwrap();
+    }
+    file.write_all(b"\nafter\n").unwrap();
+    for _ in 0..blocks_after {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+    opener_line
+}
+
+#[test]
+fn large_file_windows_see_a_value_opened_just_before_a_positive_or_tail_window() {
+    let fx = Fx::new();
+    // positive window inside the value, in a file over 64 MiB (opener ~59 MiB in)
+    let opener_line = write_huge_with_run(&fx, "pos.log", 63, 8);
+    let r = fx.read_with(
+        json!({ "path": fx.p("pos.log"), "startLine": opener_line + 11_000, "maxLines": 3 }),
+    );
+    assert!(!r.text.contains("tail-secret"), "{}", r.text);
+    // tail windows: one right after the run, one inside it (opener ~500 KiB before)
+    write_huge_with_run(&fx, "tail.log", 70, 0);
+    let r = fx.read_with(json!({ "path": fx.p("tail.log"), "startLine": -3 }));
+    assert!(
+        r.text.contains("after") && !r.text.contains("tail-secret"),
+        "{}",
+        r.text
+    );
+    let r = fx.read_with(json!({ "path": fx.p("tail.log"), "startLine": -5_000 }));
+    assert!(!r.text.contains("tail-secret"), "{}", r.text);
+}
+
+// ---- an agent cannot build a masked run that a windowed read would miss -------
+
+#[test]
+fn edits_cannot_manufacture_a_masked_run_longer_than_the_read_lookback() {
+    let fx = Fx::new();
+    fx.put("cfg.sh", "echo start\nPASSWORD=hunter2-secret\necho end\n");
+    let filler = "filler filler filler filler\n".repeat(700_000 / 28);
+    // step 1: PASSWORD=" opens a run of ~700 KB: allowed
+    fx.ops
+        .edit(
+            &args(json!({ "path": fx.p("cfg.sh"), "edits": [{
+                "oldText": "PASSWORD=", "newText": format!("PASSWORD=\"\n{filler}") }] })),
+            &fx.cancel,
+        )
+        .expect("a run inside the lookback is fine");
+    // step 2: insert another 700 KB above the value line: the run would be longer than
+    // the lookback, so a read starting at the value could not see the opener
+    let etag = fx.etag("cfg.sh");
+    let r = fx.ops.edit(
+        &args(
+            json!({ "path": fx.p("cfg.sh"), "expectedEtag": etag, "edits": [{
+            "startLine": 4, "endLine": 3, "newText": filler }] }),
+        ),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::RedactedSpan);
+    let last = fx.read_with(json!({ "path": fx.p("cfg.sh"), "startLine": -2 }));
+    assert!(!last.text.contains("hunter2-secret"), "{}", last.text);
+}
+
+// ---- Unicode spellings that a casefold volume resolves to the secret file -----
+
+#[test]
+fn folded_spellings_are_secret_class_for_reads_and_mutations() {
+    let fx = Fx::new();
+    let key = pem("PRIVATE KEY", "FAKEKEYBODY\n");
+    fx.put("server.\u{212A}ey", &key);
+    fx.put(".cache/huggingface/to\u{212A}en", "hf_fakeTokenValue123\n");
+    for path in ["server.\u{212A}ey", ".cache/huggingface/to\u{212A}en"] {
+        let r = fx.read_with(json!({ "path": fx.p(path) }));
+        assert!(r.secret_file, "{path}");
+        assert!(
+            !r.text.contains("FAKEKEYBODY") && !r.text.contains("hf_fake"),
+            "{}",
+            r.text
+        );
+        let d = fx
+            .ops
+            .execute("delete", json!({ "path": fx.p(path) }), &fx.cancel);
+        assert_eq!(d.expect_err("secret").code, ErrorCode::SecretFile, "{path}");
+    }
+    for (from, to) in [(".\u{DF}h", "x1"), (".\u{17F}sh", "x2")] {
+        let r = fx.ops.execute(
+            "rename",
+            json!({ "from": fx.p(from), "to": fx.p(to) }),
+            &fx.cancel,
+        );
+        assert_eq!(code(r), ErrorCode::SecretFile, "{from}");
+    }
+}
+
+// ---- CRLF translation counts against the newText cap ---------------------------
+
+#[test]
+fn crlf_translation_cannot_push_new_text_past_its_cap() {
+    let fx = Fx::new();
+    fx.put("crlf.txt", "a\r\nb\r\n");
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("crlf.txt"), "edits": [{
+            "oldText": "a", "newText": "\n".repeat(700_000) }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::InvalidInput);
 }

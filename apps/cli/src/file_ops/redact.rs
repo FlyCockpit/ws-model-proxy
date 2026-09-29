@@ -84,13 +84,31 @@ impl FileClass {
     }
 }
 
-/// Classify by the physical path of the file. Names are compared ASCII
-/// lower-cased on every OS: a case-insensitive volume (macOS default, casefold
+/// Fold a path for classification: Unicode lower-casing (the Kelvin sign
+/// U+212A becomes `k`), then the ligature-style folds that case-insensitive
+/// filesystems apply (`ſ` -> `s`, `ß`/`ẞ` -> `ss`). Everything is compared folded,
+/// so a spelling that a casefold or normalization-insensitive volume resolves to
+/// the secret file is classified as the secret file.
+fn fold(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .fold(String::with_capacity(name.len()), |mut out, ch| {
+            match ch {
+                'ſ' => out.push('s'),
+                'ß' | 'ẞ' => out.push_str("ss"),
+                other => out.push(other),
+            }
+            out
+        })
+}
+
+/// Classify by the physical path of the file. Names are compared folded
+/// ([`fold`]) on every OS: a case-insensitive volume (macOS default, casefold
 /// ext4, vfat) opens `ID_ED25519` or `.ENV` as the secret file, so the spelling
 /// the caller typed must not decide the class. Over-masking a genuinely distinct
 /// `.ENV` on a case-sensitive volume is the safe direction.
 pub fn classify(path: &Path) -> FileClass {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
+    let lower = fold(&path.to_string_lossy());
     let lower = Path::new(&lower);
     let name = lower
         .file_name()
@@ -125,7 +143,7 @@ pub fn is_secret_scope(path: &Path) -> bool {
     if classify(path).is_secret() {
         return true;
     }
-    let lower = path.to_string_lossy().to_ascii_lowercase();
+    let lower = fold(&path.to_string_lossy());
     let names: Vec<&str> = Path::new(&lower)
         .components()
         .filter_map(|c| match c {
@@ -158,6 +176,10 @@ pub struct MaskedView {
     pub spans: Vec<Span>,
     /// `cum[i]`: real-text length minus masked-view length over `spans[..=i]`.
     cum: Vec<isize>,
+    /// A masked multi-line run reaches further past its opening line than
+    /// [`LOOKBACK_BYTES`]: a windowed read would not see the opener. An edit that
+    /// creates such a run is refused (an agent could otherwise build one).
+    pub long_construct: bool,
 }
 
 impl MaskedView {
@@ -199,7 +221,7 @@ impl MaskedView {
         (pos as isize + delta) as usize
     }
 
-    fn from_parts(text: String, spans: Vec<Span>) -> Self {
+    fn from_parts(text: String, spans: Vec<Span>, long_construct: bool) -> Self {
         let mut delta: isize = 0;
         let cum = spans
             .iter()
@@ -208,7 +230,12 @@ impl MaskedView {
                 delta
             })
             .collect();
-        Self { text, spans, cum }
+        Self {
+            text,
+            spans,
+            cum,
+            long_construct,
+        }
     }
 }
 
@@ -243,13 +270,13 @@ static ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
 });
 static FLAG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?:^|[\s"'\[,=(])--(?:{SECRET_FLAGS})(=|[ \t]+|["']?,[ \t]*)"#
+        r#"(?:^|[^A-Za-z0-9_-])--(?:{SECRET_FLAGS})(=|[ \t]+|["']?,[ \t]*)"#
     ))
     .expect("flag regex")
 });
 static FLAG_AT_END: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?:^|[\s"'\[,=(])--(?:{SECRET_FLAGS})["']?,?[ \t]*\\?[ \t]*$"#
+        r#"(?:^|[^A-Za-z0-9_-])--(?:{SECRET_FLAGS})["']?,?[ \t]*\\?[ \t]*$"#
     ))
     .expect("flag-at-end regex")
 });
@@ -523,6 +550,7 @@ pub struct LineMasker {
     in_private_block: bool,
     pending_flag_value: bool,
     construct: Construct,
+    opened: bool,
 }
 
 impl LineMasker {
@@ -532,7 +560,14 @@ impl LineMasker {
             in_private_block: false,
             pending_flag_value: false,
             construct: Construct::None,
+            opened: false,
         }
+    }
+
+    /// Whether the last scanned line opened a multi-line value (its tail was
+    /// masked and the following lines continue it).
+    pub fn opened_on_last_line(&self) -> bool {
+        self.opened
     }
 
     pub fn class(&self) -> FileClass {
@@ -562,6 +597,7 @@ impl LineMasker {
     /// Masked ranges of `line` (byte ranges in `line` plus their replacement
     /// text), sorted and non-overlapping. Advances the state.
     pub fn scan(&mut self, line: &str) -> Vec<(Range<usize>, String)> {
+        self.opened = false;
         match self.construct {
             Construct::None => {}
             Construct::UntilBlank => {
@@ -656,6 +692,7 @@ impl LineMasker {
             }
         }
         self.construct = construct;
+        self.opened = construct != Construct::None;
         self.pending_flag_value = line.contains("--") && FLAG_AT_END.is_match(line);
         masks
     }
@@ -688,17 +725,26 @@ impl LineMasker {
 /// which needs the whole masked view; reads mask only the lines they return.
 pub fn mask(class: FileClass, text: &str) -> MaskedView {
     if class == FileClass::Plain && !TRIGGER.is_match(text) {
-        return MaskedView::from_parts(text.to_string(), Vec::new());
+        return MaskedView::from_parts(text.to_string(), Vec::new(), false);
     }
     let mut masker = LineMasker::new(class);
     let mut out = String::with_capacity(text.len());
     let mut spans = Vec::new();
     let mut offset = 0;
+    let mut opener = 0;
+    let mut long_construct = false;
     for raw in text.split_inclusive('\n') {
         let body_len = raw.trim_end_matches(['\n', '\r']).len();
         let (line, ending) = raw.split_at(body_len);
         let mut cursor = 0;
-        for (range, tok) in masker.scan(line) {
+        let continued = masker.in_continuation();
+        let masks = masker.scan(line);
+        if masker.opened_on_last_line() {
+            opener = offset;
+        } else if continued && !masks.is_empty() && offset - opener > LOOKBACK_BYTES {
+            long_construct = true;
+        }
+        for (range, tok) in masks {
             out.push_str(&line[cursor..range.start]);
             let view_start = out.len();
             out.push_str(&tok);
@@ -712,7 +758,7 @@ pub fn mask(class: FileClass, text: &str) -> MaskedView {
         out.push_str(ending);
         offset += raw.len();
     }
-    MaskedView::from_parts(out, spans)
+    MaskedView::from_parts(out, spans, long_construct)
 }
 
 #[cfg(test)]
@@ -1380,6 +1426,21 @@ mod tests {
                 &["\u{a0}", "\u{2002}"],
             ),
             (Plain, "K_TOKEN=abc1   \n", &["   "]),
+            // stage-3 round 3 (Opus C3b-4/5): quote escapes, glued text, other flag prefixes
+            (
+                Plain,
+                "X_TOKEN: 'first-secret\nsec''ret-tail-part'\n\nvisible\n",
+                &["first-secret", "ret-tail-part"],
+            ),
+            (
+                Plain,
+                "export X_TOKEN=\"first-secret\nsecond\"glued-tail-part\n\nvisible\n",
+                &["first-secret", "glued-tail-part"],
+            ),
+            (Plain, "cmd {--token brace-secret}\n", &["brace-secret"]),
+            (Plain, "a;--token semi-secret\n", &["semi-secret"]),
+            (Plain, "a|--api-key pipe-secret\n", &["pipe-secret"]),
+            (Plain, "a&&--password=and-secret\n", &["and-secret"]),
         ];
         let mut leaks = Vec::new();
         for (class, input, secrets) in rows {
@@ -1441,6 +1502,11 @@ mod tests {
             ("/p/.Env.Local", FileClass::Dotenv),
             ("/h/.Cache/HuggingFace/Token", FileClass::HfToken),
             ("/p/Server.PEM", FileClass::PemKey),
+            // Unicode folds a case-insensitive / normalization-insensitive volume applies
+            ("/p/server.\u{212A}ey", FileClass::PemKey),
+            ("/h/.cache/huggingface/to\u{212A}en", FileClass::HfToken),
+            ("/h/.ssh/\u{212A}id_x", FileClass::Plain),
+            ("/h/.ssh/id_\u{212A}", FileClass::SshPrivateKey),
         ] {
             assert_eq!(classify(Path::new(path)), class, "{path}");
         }
@@ -1453,6 +1519,9 @@ mod tests {
             "/h/.cache/HuggingFace/hub/x",
             "/h/.cache",
             "/p/.env",
+            "/h/.\u{DF}h",
+            "/h/.\u{17F}sh/config",
+            "/h/.\u{1E9E}h",
         ] {
             assert!(is_secret_scope(Path::new(path)), "{path}");
         }

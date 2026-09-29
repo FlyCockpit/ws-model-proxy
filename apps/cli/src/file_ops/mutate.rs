@@ -199,8 +199,9 @@ pub(crate) fn rename(
 /// directory moves have no atomic primitive here and rely on the checks above.
 /// Crash states: between the exchange and the unlink the old destination is
 /// under the source name; after `linkat` and before the unlink both names exist.
-/// Neither loses data. The undo moves the object now at the destination back only
-/// when it is the object that was moved.
+/// Neither loses data. The undo moves back whatever object the move actually put
+/// at the destination (a same-user cross-process successor in that window is the
+/// accepted residual).
 fn commit_rename(
     from: &Resolved,
     to: &Resolved,
