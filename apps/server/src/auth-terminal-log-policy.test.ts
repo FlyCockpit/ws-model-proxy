@@ -149,7 +149,17 @@ function buildMemoryApp(opts: { mountRequestLog?: boolean; injectRequestFailure?
     baseURL: BASE,
     secret: "parity-test-secret-at-least-thirty-two-characters",
     database: memoryAdapter(memory),
-    emailAndPassword: { enabled: true },
+    // Test-only hasher (the two-factor-lockout.test.ts pattern): this suite
+    // proves the LOG-SANITIZER policy, never password hashing, and real scrypt
+    // dominated its runtime. No assertion here reads the stored hash format or
+    // the scrypt parameters (the sign-up only needs a session cookie).
+    emailAndPassword: {
+      enabled: true,
+      password: {
+        hash: async (password) => `fast:${password}`,
+        verify: async ({ hash, password }) => hash === `fast:${password}`,
+      },
+    },
     advanced: { disableOriginCheck: false },
     logger: {
       log(level, message, ...args) {

@@ -76,7 +76,6 @@ function tab(localId: string, cliDeviceId: string): TerminalTab {
     approvalCode: null,
     rejectionReason: null,
     error: null,
-    multiViewer: true,
     viewerId: null,
     writer: "none",
     viewerCount: 1,
