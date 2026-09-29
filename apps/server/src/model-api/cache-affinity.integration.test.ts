@@ -1,5 +1,8 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -13,7 +16,7 @@ if (!databaseUrl)
   console.warn("[cache-affinity] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 integration("cache affinity PostgreSQL concurrency and retention", () => {
-  const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+  const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
 
   beforeAll(async () => {
@@ -1405,10 +1408,10 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     expect(await service.sweepExpiredAffinity({ now: new Date(), limit: 1 })).toBe(0);
   });
 
-  it("looks up identity after acquiring the pool row lock", async () => {
+  it("looks up identity after acquiring the cache-affinity fence", async () => {
     if (!db || !databaseUrl) return;
     const row = await fixture();
-    const blocker = createPrismaClient(databaseUrl);
+    const blocker = createFixturePrismaClient(databaseUrl);
     const now = new Date("2026-09-29T12:00:00Z");
     const base = {
       ownerId: row.tenant.id,
@@ -1431,11 +1434,13 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       releaseLock = resolve;
     });
     const lock = blocker.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${row.pool.id} FOR NO KEY UPDATE`;
+      // The fence the writer (and the dashboard clear) takes; under DL-1 (d)
+      // affinity writes lock no graph row.
+      await acquireFences(tx, [fences.cacheAffinity(row.owner.id, row.pool.id)]);
       signalLockAcquired();
       await release;
       // This evidence becomes visible only after the waiting writer gets the
-      // pool lock. A lookup before locking would mint a second session.
+      // fence. A lookup before locking would mint a second session.
       await tx.cacheAffinityRecord.create({
         data: {
           userId: row.owner.id,

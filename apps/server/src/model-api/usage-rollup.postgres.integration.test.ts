@@ -1,5 +1,7 @@
 import { latencyBucketIndex } from "@ws-model-proxy/config/usage-metrics";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
@@ -25,7 +27,7 @@ const integration = databaseUrl ? describe : describe.skip;
 if (!databaseUrl)
   console.warn("[usage-rollup-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
-type Db = ReturnType<typeof createPrismaClient>;
+type Db = ReturnType<typeof createFixturePrismaClient>;
 
 integration("usage rollups with real PostgreSQL", () => {
   let db: Db;
@@ -35,7 +37,7 @@ integration("usage rollups with real PostgreSQL", () => {
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    db = createPrismaClient(databaseUrl);
+    db = createFixturePrismaClient(databaseUrl);
     rollup = await import("./usage-rollup.js");
     retention = await import("./usage-retention.js");
   });
@@ -90,9 +92,6 @@ integration("usage rollups with real PostgreSQL", () => {
       cacheWriteTokens: null,
       usageKnown: true,
       resourceOwnerUserId: null,
-      RequestedModelPool: null,
-      SelectedExecutionTarget: null,
-      RequestedExecutionTarget: null,
       ...overrides,
     };
   }
@@ -199,7 +198,7 @@ integration("usage rollups with real PostgreSQL", () => {
             durationMs: 100,
             requestedModelPoolId: "pool-x",
             selectedPoolMemberId: "member-x",
-            RequestedModelPool: { userId: owner.id },
+            resourceOwnerUserId: owner.id,
             ...extra,
           }),
         )!;
@@ -215,9 +214,17 @@ integration("usage rollups with real PostgreSQL", () => {
       await db.$transaction((tx) =>
         rollup.writeRollupIncrements(tx, "usage_rollup_hour", [key(requester.id)]),
       );
-      // A prior deletion already produced the '' sentinel row for this key.
-      await db.user.delete({ where: { id: earlier.id } });
-      await db.user.delete({ where: { id: requester.id } });
+      // The production user delete (DL-1 (d)): its drain merges the deleted
+      // requester's rows onto the '' sentinel of each owner and erases the
+      // user's own; no trigger on "user" does it any more. A prior deletion
+      // already produced the '' sentinel row for this key.
+      const deletion = await import("@ws-model-proxy/db/parent-deletion");
+      const deleteUser = async (userId: string) => {
+        const mark = await deletion.requestUserDeletion(db, userId);
+        expect(await deletion.completeUserDeletion(db, userId, mark!.generation)).toBe(true);
+      };
+      await deleteUser(earlier.id);
+      await deleteUser(requester.id);
 
       const minute = await db.usageRollupMinute.findMany({ where: { ownerUserId: owner.id } });
       expect(minute).toHaveLength(1);
@@ -238,7 +245,7 @@ integration("usage rollups with real PostgreSQL", () => {
         }),
       ).toBe(0);
 
-      await db.user.delete({ where: { id: owner.id } });
+      await deleteUser(owner.id);
       expect(await db.usageRollupMinute.count({ where: { ownerUserId: owner.id } })).toBe(0);
       expect(await db.usageRollupHour.count({ where: { ownerUserId: owner.id } })).toBe(0);
     } finally {

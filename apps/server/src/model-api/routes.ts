@@ -145,6 +145,7 @@ import {
   transformerSupportedModalities,
   wrapTransformEnvelope,
 } from "./media-transform.js";
+import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
@@ -3157,7 +3158,7 @@ async function resolveStickyRoute({
   };
 }): Promise<StickyRoute | Response> {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
-  const record = await prisma.responseStickinessRecord.findUnique({
+  const stored = await prisma.responseStickinessRecord.findUnique({
     where: {
       userId_routingKeyDigest: {
         userId: requester.userId,
@@ -3181,14 +3182,39 @@ async function resolveStickyRoute({
       upstreamResponseIdDigest: true,
       fallbackRoute: true,
       poolGrantId: true,
-      PoolGrant: {
-        select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
-      },
-      TargetExecutionTarget: { select: { discoveredModelId: true } },
-      SelectedExecutionTarget: { select: { discoveredModelId: true } },
+      targetExecutionTargetId: true,
       expiresAt: true,
     },
   });
+  // Stickiness is hot-path history (@ws-model-proxy/db/capacity-lock-order):
+  // it names its grant and targets by plain id, with no foreign key. A
+  // deleted grant or target simply is not found, which fails closed below
+  // exactly as its former ON DELETE CASCADE did.
+  const [PoolGrant, TargetExecutionTarget, SelectedExecutionTarget] = stored
+    ? await Promise.all([
+        stored.poolGrantId
+          ? prisma.poolGrant.findUnique({
+              where: { id: stored.poolGrantId },
+              select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
+            })
+          : null,
+        stored.targetExecutionTargetId
+          ? prisma.executionTarget.findUnique({
+              where: { id: stored.targetExecutionTargetId },
+              select: { discoveredModelId: true },
+            })
+          : null,
+        stored.selectedExecutionTargetId
+          ? prisma.executionTarget.findUnique({
+              where: { id: stored.selectedExecutionTargetId },
+              select: { discoveredModelId: true },
+            })
+          : null,
+      ])
+    : [null, null, null];
+  const record = stored
+    ? { ...stored, PoolGrant, TargetExecutionTarget, SelectedExecutionTarget }
+    : null;
 
   if ((record?.routingVersion ?? 1) >= 3) {
     const validRequester =
@@ -5626,6 +5652,9 @@ async function relayPool({
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
           ...(schedule ? { schedule } : {}),
+          // The shortened local phase of an `:external` caller with an external
+          // plan must not fail open on metric-FULL members: it goes external.
+          metricFailOpen: !(externalAfterWaitMs !== null && localWaitMode === "shortened"),
         },
         signal: request.signal,
       });
@@ -5716,6 +5745,18 @@ async function relayPool({
         affinityDecision = null;
       }
     }
+  }
+  // Metric routing rules (S-B part 2), after compatibility and affinity:
+  // metric-FULL members are dropped (all kept when every one is FULL; then
+  // admission fails open, except an `:external` caller's shortened local
+  // phase), and `avoid` members rank last. Grant time re-checks FULL.
+  const metricOrder = await applyMetricRoutingVerdicts(routeCandidates);
+  routeCandidates = metricOrder.candidates;
+  if (metricOrder.allFull) {
+    console.warn("[model-api] every pool candidate is metric-FULL", {
+      poolId: target.id,
+      relayRequestId,
+    });
   }
   // Saturation S-C: warm-session protection (redirect-only). A new session
   // avoids members whose idle capacity holds protected warm sessions (including

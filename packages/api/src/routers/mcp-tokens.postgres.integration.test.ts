@@ -3,6 +3,7 @@ import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
@@ -32,14 +33,20 @@ integration("MCP personal tokens with real PostgreSQL", () => {
     process.env.WMP_MCP_ENABLED = "true";
     process.env.BETTER_AUTH_SECRET = "test-better-auth-secret-at-least-thirty-two";
     process.env.BETTER_AUTH_URL = "https://proxy.example.test";
-    const [db, router, access, security, mcpConfig] = await Promise.all([
+    const [, router, access, security, mcpConfig] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./mcp-tokens"),
       import("../lib/mcp-token-access"),
       import("@ws-model-proxy/db/forwarder-security"),
       import("@ws-model-proxy/auth/mcp-config"),
     ]);
-    modules = { prisma: db.default, router, access, security, mcpConfig };
+    modules = {
+      prisma: createFixturePrismaClient(databaseUrl!),
+      router,
+      access,
+      security,
+      mcpConfig,
+    };
   });
 
   afterAll(() => {

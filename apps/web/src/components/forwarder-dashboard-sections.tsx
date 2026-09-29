@@ -41,6 +41,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
+import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
 import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
@@ -830,6 +831,8 @@ export function CliEndpointsModelsSection() {
                 deviceName={device.displayName}
                 device={device}
               />
+
+              <CliDeviceMetricSources cliDeviceId={device.id} />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (

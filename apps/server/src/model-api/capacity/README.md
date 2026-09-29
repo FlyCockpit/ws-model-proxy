@@ -5,6 +5,20 @@ membership capacity; `PoolMember` and `ExecutionTarget` rows define reservation 
 policy; waiting `CapacityWaiter` rows determine whether reserved work is queued. No process-local
 counter grants capacity.
 
+## Writer classes and fences (DL-1)
+
+Capacity admission, release, reclaim, relay telemetry, rollups and provider attempt accounting are
+writer class **H** (hot path): they take only capacity/attempt/scope fences (transaction advisory
+locks, `acquireFences`) and write only hot-path tables, which have no foreign key to or from the
+dashboard graph. Management writers are class **M**: owner fences first, then policy/capacity
+fences, then graph rows; a database trigger refuses a graph write whose fences are not held.
+Sweepers are class **S** (SKIP LOCKED / `wait: false`). Deleting a parent never cascades into
+hot-path rows: they stay as orphaned history, admission cancels waiters whose graph is gone
+(`parent_deleted`), and the history sweeps and the deleted-user purge remove them later. The
+protocol, the fence levels and the proof are in `packages/db/src/capacity-lock-order.ts`.
+Scheduler state and the fencing-token counter live in `capacity_runtime` (hot path), not in
+`inference_capacity`.
+
 The CI-gated integration suite uses independent clients for advisory-lock, admission, fencing,
 restart, notification, and race proofs. Serialization (`40001`) and deadlock (`40P01`) retry logic is
 tested through the production transaction runner with injected rollback attempts. A live
@@ -23,7 +37,8 @@ and release/reclaim (fill mode: grant until nothing more fits).
 1. **Read** (`#readAdmissionSnapshot`): the deadline sweep (deferred waiters are left to their
    owner's poll), the grant-time routability re-check, then ONE snapshot of the capacity (limit, DRR
    cursor/deficits/version), ACTIVE leases, WAITING waiters, reservation members, direct
-   reservations and per-scope lease counts, all under the L4/L6 locks the caller already holds.
+   reservations and per-scope lease counts, all under the capacity and
+   concurrency-scope fences the caller already holds.
 2. **Plan** (`planGrants`, pure, no database): applies the decision repeatedly in memory. Each step
    is the single-grant decision (eligibility: `notBefore <= now`, candidate/request deadlines with
    the creating-request and last-chance exceptions, member/scope and physical limits, reservation
@@ -45,6 +60,16 @@ independent of how many waiters are granted (256 grants: about 0.5 s release, 1.
 loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged. The planner is O(k·W) per
 transaction (k grants over W waiters) and is suited to at most a few thousand simultaneously
 grantable waiters per capacity.
+
+### Known limitation: scope fence derived before the capacity fence
+
+`fenceCapacityAdmission` reads the durable concurrency-scope set of the target capacities
+BEFORE it takes the capacity fences. A waiter committed while an admission pass waits for a
+capacity fence introduces a scope fence that can no longer be taken (WMPF2 forbids a fence below
+one already held), so two fill-mode passes on different capacities that share such a scope can
+transiently over-admit one lease. This window is pre-existing (master's
+`lockCapacityAdmissionResources` derived the scope set the same way) and is bounded by one lease
+lifetime.
 
 ## Spill-over `notBefore` and grant-time routability (saturation S-A)
 
@@ -155,12 +180,13 @@ lease identity and fencing token. No new persistent state or external effect pre
 A process crash stops renewal, so the existing database-clock expiry/reclaim path recovers its
 slots; no process-local ownership is trusted across restart.
 
-Heartbeat is a single-row conditional UPDATE of `capacity_lease` at L7. It takes no advisory,
+Heartbeat is a single-row conditional UPDATE of `capacity_lease`. It takes no fence and no
 capacity, request, parent, or foreign-key locks and adds **no lock-order edges**. Its state, fencing
 token and unexpired predicates prevent renewal of a released/reclaimed lease. Both reclaim sites
 (maintenance and idempotent acquire of an expired lease) condition the UPDATE on expiry, so a
-renewal racing their earlier read wins without being overwritten. Admission/release/reclaim retain
-L0-L7 ordering from `packages/db/src/capacity-lock-order.ts`; only durable release/terminalization
+renewal racing their earlier read wins without being overwritten. Admission/release/reclaim follow the
+writer-class H protocol in `packages/db/src/capacity-lock-order.ts` (fences first, then hot-path
+rows only); only durable release/terminalization
 use the existing shutdown cleanup permit. Heartbeats get no shutdown or request-abort exemption.
 
 Every Prisma pool initializes each connection with session `TimeZone=UTC` in

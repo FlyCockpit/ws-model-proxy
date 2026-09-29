@@ -6,7 +6,10 @@ import {
   parseProviderCredentialKeyring,
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
@@ -96,7 +99,7 @@ async function waitFor<T>(
 }
 
 async function quiesceCapacityFixture(
-  db: ReturnType<typeof createPrismaClient>,
+  db: ReturnType<typeof createFixturePrismaClient>,
   userId: string,
 ): Promise<void> {
   const terminalAt = new Date();
@@ -118,7 +121,7 @@ async function quiesceCapacityFixture(
 }
 
 async function expectCapacityFixtureQuiescent(
-  db: ReturnType<typeof createPrismaClient>,
+  db: ReturnType<typeof createFixturePrismaClient>,
   userId: string,
 ): Promise<void> {
   expect(await db.capacityLease.count({ where: { userId, state: "ACTIVE" } })).toBe(0);
@@ -131,7 +134,7 @@ async function expectCapacityFixtureQuiescent(
 }
 
 integration("capacity admission across operating-system processes", () => {
-  const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+  const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   const children = new Set<ChildProcess>();
   const fixtureUserIds = new Set<string>();
   afterEach(async () => {
@@ -267,9 +270,15 @@ integration("capacity admission across operating-system processes", () => {
     // stable within that class.
     const deficits = Array(32).fill(0) as number[];
     deficits[31] = 1;
-    await db.inferenceCapacity.update({
-      where: { id: capacity.id },
-      data: { schedulerCursor: 31, schedulerDeficits: deficits },
+    await db.capacityRuntime.upsert({
+      where: { capacityId: capacity.id },
+      create: {
+        capacityId: capacity.id,
+        userId: capacity.userId,
+        schedulerCursor: 31,
+        schedulerDeficits: deficits,
+      },
+      update: { schedulerCursor: 31, schedulerDeficits: deficits },
     });
     const weightedCandidates = [
       {
@@ -388,7 +397,9 @@ integration("capacity admission across operating-system processes", () => {
     });
     const barrier = db.$transaction(
       async (tx) => {
-        await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${target.id} FOR UPDATE`;
+        // The admission path's capacity fence (hot-path writers lock no
+        // graph row under DL-1 (d)), so every worker queues behind it.
+        await acquireFences(tx, [fences.capacity(capacity.id)]);
         reportLocked?.();
         await release;
       },
@@ -899,9 +910,15 @@ integration("capacity admission across operating-system processes", () => {
         });
         expect(response.status).toBe(202);
       }
-      await db.inferenceCapacity.update({
-        where: { id: capacity.id },
-        data: { schedulerCursor: 0, schedulerDeficits: Array(32).fill(0) },
+      await db.capacityRuntime.upsert({
+        where: { capacityId: capacity.id },
+        create: {
+          capacityId: capacity.id,
+          userId: capacity.userId,
+          schedulerCursor: 0,
+          schedulerDeficits: Array(32).fill(0),
+        },
+        update: { schedulerCursor: 0, schedulerDeficits: Array(32).fill(0) },
       });
       const blockerRelease = await fetch(
         `http://127.0.0.1:${ports[0]}/release/${blocker.attemptId}`,
@@ -934,8 +951,8 @@ integration("capacity admission across operating-system processes", () => {
           borrowed: active.borrowed,
         };
         if (round === 10) {
-          const schedulerBeforeRestart = await db.inferenceCapacity.findUniqueOrThrow({
-            where: { id: capacity.id },
+          const schedulerBeforeRestart = await db.capacityRuntime.findUniqueOrThrow({
+            where: { capacityId: capacity.id },
           });
           restartFencingToken = schedulerBeforeRestart.nextFencingToken;
           await stop(servers[0]!.child);
@@ -946,8 +963,8 @@ integration("capacity admission across operating-system processes", () => {
           if (!("port" in ready)) throw new Error("Contended worker restart failed.");
           ports[0] = ready.port;
           servers[0] = restarted;
-          const schedulerAfterRestart = await db.inferenceCapacity.findUniqueOrThrow({
-            where: { id: capacity.id },
+          const schedulerAfterRestart = await db.capacityRuntime.findUniqueOrThrow({
+            where: { capacityId: capacity.id },
           });
           expect(schedulerAfterRestart.schedulerCursor).toBe(
             schedulerBeforeRestart.schedulerCursor,
@@ -964,8 +981,8 @@ integration("capacity admission across operating-system processes", () => {
         });
         expect(await response.json()).toEqual({ released: true });
         if (round === 10) {
-          const persisted = await db.inferenceCapacity.findUniqueOrThrow({
-            where: { id: capacity.id },
+          const persisted = await db.capacityRuntime.findUniqueOrThrow({
+            where: { capacityId: capacity.id },
           });
           expect(persisted.nextFencingToken).toBeGreaterThan(restartFencingToken!);
         }
@@ -1557,9 +1574,15 @@ integration("capacity admission across operating-system processes", () => {
         });
         return queued === lowLabels.length + initialHighBacklog ? true : undefined;
       }, 20_000);
-      await db.inferenceCapacity.update({
-        where: { id: capacity.id },
-        data: { schedulerCursor: 0, schedulerDeficits: Array(PRIORITY_CLASS_COUNT).fill(0) },
+      await db.capacityRuntime.upsert({
+        where: { capacityId: capacity.id },
+        create: {
+          capacityId: capacity.id,
+          userId: capacity.userId,
+          schedulerCursor: 0,
+          schedulerDeficits: Array(PRIORITY_CLASS_COUNT).fill(0),
+        },
+        update: { schedulerCursor: 0, schedulerDeficits: Array(PRIORITY_CLASS_COUNT).fill(0) },
       });
       finishUpstream(blockerUpstream, "wdrr-blocker");
       await (await pending.get("wdrr-blocker"))?.arrayBuffer();
@@ -1614,8 +1637,8 @@ integration("capacity admission across operating-system processes", () => {
           expect(label).toBe("wdrr-high-9");
           const ownerIndex = owners.get(label);
           if (ownerIndex === undefined) throw new Error("Production WDRR owner missing.");
-          const schedulerBeforeRestart = await db.inferenceCapacity.findUniqueOrThrow({
-            where: { id: capacity.id },
+          const schedulerBeforeRestart = await db.capacityRuntime.findUniqueOrThrow({
+            where: { capacityId: capacity.id },
           });
           await stop(workers[ownerIndex]!.child);
           children.delete(workers[ownerIndex]!.child);
@@ -1629,7 +1652,7 @@ integration("capacity admission across operating-system processes", () => {
           workers[ownerIndex] = restarted;
           ports[ownerIndex] = ready.port;
           await expect(
-            db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } }),
+            db.capacityRuntime.findUniqueOrThrow({ where: { capacityId: capacity.id } }),
           ).resolves.toMatchObject({
             schedulerCursor: schedulerBeforeRestart.schedulerCursor,
             schedulerDeficits: schedulerBeforeRestart.schedulerDeficits,
@@ -1670,7 +1693,7 @@ integration("capacity admission across operating-system processes", () => {
           children.add(repair.child);
           await repair.result;
           await expect(
-            db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } }),
+            db.capacityRuntime.findUniqueOrThrow({ where: { capacityId: capacity.id } }),
           ).resolves.toMatchObject({
             schedulerCursor: expected.state.cursor,
             schedulerDeficits: expected.state.deficits,

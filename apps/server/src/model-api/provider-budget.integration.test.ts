@@ -1,4 +1,6 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -12,7 +14,7 @@ if (!databaseUrl)
   console.warn("[provider-budget] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 integration("provider budget admission and reconciliation", () => {
-  const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+  const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./provider-budget.js");
   let accounting: typeof import("./provider-budget-accounting.js");
 

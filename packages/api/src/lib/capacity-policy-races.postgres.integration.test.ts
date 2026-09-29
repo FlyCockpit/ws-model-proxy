@@ -1,5 +1,7 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import {
@@ -40,7 +42,7 @@ integration("capacity policy production-router races", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
-    const [db, dbFactory, capacity, forwarder, provider] = await Promise.all([
+    const [, dbFactory, capacity, forwarder, provider] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/client-factory"),
       import("../routers/capacity-management"),
@@ -49,7 +51,7 @@ integration("capacity policy production-router races", () => {
     ]);
     blocker = dbFactory.createPrismaClient(databaseUrl);
     observer = dbFactory.createPrismaClient(databaseUrl);
-    modules = { prisma: db.default, capacity, forwarder, provider };
+    modules = { prisma: createFixturePrismaClient(databaseUrl!), capacity, forwarder, provider };
     const suffix = crypto.randomUUID();
     const user = await modules.prisma.user.create({
       data: {
@@ -293,7 +295,8 @@ integration("capacity policy production-router races", () => {
       reportLocked = resolve;
     });
     const blockerTransaction = blocker.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`execution-target:${identity}`}, 0))`;
+      // The production identity fence; its advisory key is lockKey below.
+      await acquireFences(tx, [fences.targetIdentity(identity)]);
       reportLocked?.();
       await release;
     });

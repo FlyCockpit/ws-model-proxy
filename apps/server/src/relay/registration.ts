@@ -36,10 +36,7 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
-import {
-  lockCapacityRowsForPolicyWrite,
-  lockExecutionTargetPolicies,
-} from "@ws-model-proxy/db/capacity-lock-order";
+import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
 
@@ -164,6 +161,8 @@ export async function persistRelayRegistration({
   userId: string;
   allowHumanTerminal: boolean;
   mcpCommandMode: McpCommandModeName;
+  /** Fence for the connection this registration accepted; see the schema. */
+  connectionGeneration: number;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -197,6 +196,11 @@ export async function persistRelayRegistration({
     try {
       const persisted = await prisma.$transaction(
         async (tx) => {
+          // Writer class M (@ws-model-proxy/db/capacity-lock-order): the
+          // owner fence first. Every writer of this user's graph holds it, so
+          // the plain reads below that plan the policy and capacity fences
+          // stay true until this transaction ends.
+          await fenceOwners(tx, [identity.userId]);
           const user = await tx.user.findUnique({
             where: { id: identity.userId },
             select: {
@@ -214,6 +218,58 @@ export async function persistRelayRegistration({
             throw new RelayRegistrationError("Credential owner is not active.", "access_denied");
           }
 
+          // Policy and capacity fences, before the first row lock or write:
+          // every existing execution target this inventory touches
+          // (capacity-policy) and every existing capacity row the capacity
+          // work below may write (capacity: the attached one, or the auto
+          // capacity it would adopt). Targets, models and capacities created
+          // by this transaction are invisible to every other transaction
+          // until commit, so their policy writes need no fence.
+          const inventoryModelFilters = endpoints.flatMap((endpoint) =>
+            endpoint.models.length > 0
+              ? [
+                  {
+                    Endpoint: { slug: endpoint.slug },
+                    upstreamModelId: { in: endpoint.models.map((model) => model.upstreamModelId) },
+                  },
+                ]
+              : [],
+          );
+          const knownDevice = await tx.cliDevice.findUnique({
+            where: { userId_slug: { userId: identity.userId, slug: cliSlug } },
+            select: { id: true },
+          });
+          const existingInventoryTargets =
+            knownDevice && inventoryModelFilters.length > 0
+              ? await tx.executionTarget.findMany({
+                  where: {
+                    userId: identity.userId,
+                    DiscoveredModel: {
+                      is: {
+                        Endpoint: { cliDeviceId: knownDevice.id },
+                        OR: inventoryModelFilters,
+                      },
+                    },
+                  },
+                  select: { id: true, inferenceCapacityId: true, discoveredModelId: true },
+                })
+              : [];
+          const candidateCapacityIds = new Set<string>();
+          for (const target of existingInventoryTargets) {
+            if (target.inferenceCapacityId) candidateCapacityIds.add(target.inferenceCapacityId);
+            else if (target.discoveredModelId)
+              for (const id of await existingDiscoveredCapacityCandidates(tx, {
+                userId: identity.userId,
+                discoveredModelId: target.discoveredModelId,
+                executionTargetId: target.id,
+              }))
+                candidateCapacityIds.add(id);
+          }
+          await acquireFences(tx, [
+            ...existingInventoryTargets.map((target) => fences.capacityPolicy(target.id)),
+            ...[...candidateCapacityIds].map((capacityId) => fences.capacity(capacityId)),
+          ]);
+
           const cliDevice = await tx.cliDevice.upsert({
             where: { userId_slug: { userId: identity.userId, slug: cliSlug } },
             // `name` is user-owned (dashboard); registration never writes it.
@@ -226,6 +282,11 @@ export async function persistRelayRegistration({
                     lastConnectedAt: now,
                     lastHeartbeatAt: now,
                     connectionCount: { increment: 1 },
+                    // Owns the device for this connection: a disconnect write
+                    // from the connection this one replaces carries the older
+                    // generation and is refused below it (see
+                    // `disconnectCliDeviceAtGeneration`).
+                    connectionGeneration: { increment: 1 },
                   }
                 : {}),
               ...reportedData,
@@ -239,6 +300,7 @@ export async function persistRelayRegistration({
               lastConnectedAt: now,
               lastHeartbeatAt: now,
               connectionCount: 1,
+              connectionGeneration: 1,
               ...reportedData,
             },
             select: {
@@ -251,6 +313,7 @@ export async function persistRelayRegistration({
               inventoryConfirmed: true,
               allowHumanTerminal: true,
               mcpCommandMode: true,
+              connectionGeneration: true,
             },
           });
 
@@ -290,42 +353,9 @@ export async function persistRelayRegistration({
             engineFacts: StoredEngineFacts | null;
           }> = [];
 
-          // Capacity lock order (@ws-model-proxy/db/capacity-lock-order):
-          // the device row above is L0. Every existing execution target this
-          // inventory touches is locked here (L2, sorted) before any endpoint,
-          // model, target or capacity write, and every capacity row is locked
-          // (L5, sorted) before the first capacity write below. Targets created
-          // in this transaction are invisible to every other transaction until
-          // commit, so their L2 locks cannot be contended.
-          const inventoryModelFilters = endpoints.flatMap((endpoint) =>
-            endpoint.models.length > 0
-              ? [
-                  {
-                    Endpoint: { slug: endpoint.slug },
-                    upstreamModelId: { in: endpoint.models.map((model) => model.upstreamModelId) },
-                  },
-                ]
-              : [],
-          );
-          const existingInventoryTargets =
-            inventoryModelFilters.length > 0
-              ? await tx.executionTarget.findMany({
-                  where: {
-                    userId: identity.userId,
-                    DiscoveredModel: {
-                      is: {
-                        Endpoint: { cliDeviceId: cliDevice.id },
-                        OR: inventoryModelFilters,
-                      },
-                    },
-                  },
-                  select: { id: true },
-                })
-              : [];
-          const policyLockedTargetIds = new Set(
+          const policyFencedTargetIds = new Set(
             existingInventoryTargets.map((target) => target.id),
           );
-          await lockExecutionTargetPolicies(tx, [...policyLockedTargetIds]);
 
           for (const endpoint of endpoints) {
             const coarseCapabilities = endpoint.defaultCapabilities
@@ -493,12 +523,9 @@ export async function persistRelayRegistration({
                   select: { id: true, inferenceCapacityId: true },
                 });
               }
-              if (!policyLockedTargetIds.has(target.id)) {
-                // Not in the snapshot the L2 set was read from, so this
-                // transaction created it: an uncontended lock on a new row.
-                await lockExecutionTargetPolicies(tx, [target.id]);
-                policyLockedTargetIds.add(target.id);
-              }
+              // A target outside the fenced set was created by this
+              // transaction (the owner fence excludes every other creator).
+              policyFencedTargetIds.add(target.id);
               upsertedTargetIds.add(target.id);
               const modelEngineFacts = mergeEngineFacts(endpoint.engineFacts, model.engineFacts);
               capacityWork.push({
@@ -542,21 +569,8 @@ export async function persistRelayRegistration({
             });
           }
 
-          // L5: every existing capacity row the loop below may write (the
-          // attached capacity, or the auto capacity it would adopt), sorted,
-          // before the first write. A capacity created below is a new row.
-          const candidateCapacityIds = new Set<string>();
-          for (const work of capacityWork) {
-            if (work.inferenceCapacityId) candidateCapacityIds.add(work.inferenceCapacityId);
-            else
-              for (const id of await existingDiscoveredCapacityCandidates(tx, {
-                userId: identity.userId,
-                discoveredModelId: work.discoveredModelId,
-                executionTargetId: work.targetId,
-              }))
-                candidateCapacityIds.add(id);
-          }
-          await lockCapacityRowsForPolicyWrite(tx, identity.userId, [...candidateCapacityIds]);
+          // Every existing capacity row the loop below may write holds its
+          // fence (taken above); a capacity created below is a new row.
           const engineFactsByCapacityId = new Map<string, StoredEngineFacts[]>();
           for (const work of capacityWork) {
             // Keep a capacity that is already attached. Otherwise create one
@@ -603,7 +617,7 @@ export async function persistRelayRegistration({
           }
 
           if (declaredContextByCapacityId.size > 0) {
-            // Every inventory target already holds its L2 policy lock (above).
+            // Every inventory target already holds its policy fence (above).
             // The seed fence deliberately equals that set: registration never
             // locks targets belonging to a different device or endpoint.
             const lockedExecutionTargetIds = new Set(upsertedTargetIds);
@@ -675,8 +689,9 @@ export async function persistRelayRegistration({
 
           if (engineFactsByCapacityId.size > 0) {
             // Same fence as the context seed: every target on the capacity
-            // must be one this inventory holds the L2 lock for, and every
-            // capacity row already holds its L5 policy lock (above).
+            // must be one this inventory holds the `06:capacity-policy:<target>`
+            // fence for, and every capacity row already holds its
+            // `08:capacity:<capacity>` fence (above).
             const capacities = await tx.inferenceCapacity.findMany({
               where: { userId: identity.userId, id: { in: [...engineFactsByCapacityId.keys()] } },
               select: {
@@ -798,6 +813,7 @@ export async function persistRelayRegistration({
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
             mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
+            connectionGeneration: cliDevice.connectionGeneration,
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,
@@ -805,7 +821,10 @@ export async function persistRelayRegistration({
             },
           };
         },
-        { isolationLevel: "Serializable" },
+        // READ COMMITTED: the owner fence serializes every writer of this
+        // user's graph, and each read after it sees the previous holder's
+        // commit (a SERIALIZABLE snapshot would predate the fence wait).
+        { isolationLevel: "ReadCommitted" },
       );
       return {
         ...persisted,

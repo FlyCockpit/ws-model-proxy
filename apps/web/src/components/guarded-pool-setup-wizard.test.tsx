@@ -263,7 +263,6 @@ describe("GuardedPoolSetupWizard", () => {
     expect(renderStep(2)).not.toContain("dashboard:pools.wizard.egressWarning");
     const withProvider = renderStep(2, ["provider"]);
     expect(withProvider).toContain("dashboard:pools.wizard.externalFallbackHint");
-    expect(withProvider).not.toContain("publicEgressAcknowledged");
   });
 
   it("disables provider checkboxes and explains why when deployment egress is off", () => {

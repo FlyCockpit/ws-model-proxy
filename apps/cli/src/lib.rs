@@ -6,6 +6,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod bounded_run;
 pub mod child_env;
 pub mod cli;
 pub mod commands;
@@ -18,6 +19,7 @@ pub mod exit;
 pub mod hostname;
 pub mod logging;
 pub mod media;
+pub mod metric_sources;
 pub mod output;
 pub mod paths;
 pub mod probe;

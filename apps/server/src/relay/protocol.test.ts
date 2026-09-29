@@ -1038,3 +1038,84 @@ describe("relay protocol 2.7 telemetry frames", () => {
     }
   });
 });
+
+describe("remoteMetricSourcesSchema (outbound metrics.sources.set)", () => {
+  const source = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json",
+  };
+  it("caps the list and rejects extra fields", async () => {
+    const { remoteMetricSourcesSchema, NODE_METRIC_SOURCES_MAX } = await import("./protocol.js");
+    const list = (length: number) =>
+      Array.from({ length }, (_, index) => ({ ...source, name: `s${index}` }));
+    expect(remoteMetricSourcesSchema.safeParse(list(NODE_METRIC_SOURCES_MAX)).success).toBe(true);
+    expect(remoteMetricSourcesSchema.safeParse(list(NODE_METRIC_SOURCES_MAX + 1)).success).toBe(
+      false,
+    );
+    expect(remoteMetricSourcesSchema.safeParse([{ ...source, stderr: "x" }]).success).toBe(false);
+  });
+});
+
+describe("metrics.sources.set encoding (G2a-3) and reserved label keys (CFc-5)", () => {
+  const source = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json" as const,
+  };
+  const frame = (sources: unknown[]) =>
+    ({ type: "metrics.sources.set", id: "sources-1", sources }) as Parameters<
+      typeof encodeRelayServerControlMessage
+    >[0];
+
+  it("never frames a source list that fails the wire schema", () => {
+    expect(JSON.parse(encodeRelayServerControlMessage(frame([source])))).toMatchObject({
+      sources: [source],
+    });
+    expect(JSON.parse(encodeRelayServerControlMessage(frame([])))).toMatchObject({ sources: [] });
+    const tooMany = Array.from({ length: 51 }, (_, index) => ({ ...source, name: `s${index}` }));
+    for (const sources of [
+      tooMany,
+      [{ ...source, stderr: "x" }],
+      [{ ...source, intervalSecs: 4 }],
+      [{ ...source, name: "bad name" }],
+      [{ ...source, command: "" }],
+      // The CLI's own definition of a runnable command (bytes, NUL, blank).
+      [{ ...source, command: "€".repeat(1509) }],
+      [{ ...source, command: "echo\u0000 1" }],
+      [{ ...source, command: "   " }],
+      [{ ...source, command: "\u0085" }],
+    ]) {
+      expect(() => encodeRelayServerControlMessage(frame(sources))).toThrow(/wire schema/);
+    }
+  });
+
+  it("rejects the reserved label key __proto__ and keeps its look-alikes", () => {
+    const metrics = relay27Vector("node-metrics.json");
+    const series = (labels: unknown) => [
+      { source: "s", name: "n", labels, value: 1, ts: "2026-09-28T12:00:00.000Z" },
+    ];
+    // JSON.parse makes a real own property named __proto__.
+    const reserved = JSON.parse('{"__proto__":"v"}');
+    expect(Object.keys(reserved)).toEqual(["__proto__"]);
+    expect(() =>
+      parseRelayClientControlFrame(JSON.stringify({ ...metrics, custom: series(reserved) })),
+    ).toThrow();
+    for (const key of ["proto", "_proto__", "__proto", "constructor", "__proto__x"]) {
+      const parsed = parseRelayClientControlFrame(
+        JSON.stringify({ ...metrics, custom: series({ [key]: "v" }) }),
+      );
+      expect(parsed).toMatchObject({ custom: [{ labels: { [key]: "v" } }] });
+    }
+    // As a label VALUE it is only a string.
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({ ...metrics, custom: series({ k: "__proto__" }) }),
+      ),
+    ).not.toThrow();
+  });
+});

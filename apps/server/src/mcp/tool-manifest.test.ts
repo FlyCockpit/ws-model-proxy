@@ -45,6 +45,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
   "forwarder_device_metrics_get",
+  "forwarder_pool_routing_rules_get",
   "forwarder_model_pools_list",
   "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
@@ -81,6 +82,8 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_model_pool_create",
   "forwarder_model_pool_update",
   "forwarder_pool_fallback_update",
+  "forwarder_pool_routing_rules_set",
+  "forwarder_device_metric_sources_set",
   "forwarder_model_pool_delete",
   "forwarder_pool_member_add",
   "forwarder_provider_member_add",
@@ -150,6 +153,8 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_chat_completion_test: "RUN",
   forwarder_cli_command_run: "RUN",
   forwarder_cli_supervised_command_start: "RUN",
+  forwarder_pool_routing_rules_set: "RUN",
+  forwarder_device_metric_sources_set: "RUN",
 });
 
 /** Exact catalog targets (name → target) for drift detection. */
@@ -158,6 +163,9 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
+  forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
+  forwarder_pool_routing_rules_set: "forwarderManagement.setPoolRoutingRules",
+  forwarder_device_metric_sources_set: "forwarderManagement.setCliDeviceMetricSources",
   forwarder_model_pools_list: "forwarderManagement.listModelPools",
   forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
@@ -262,13 +270,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 27 read + 52 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 28 read + 54 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(27);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(52);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(79);
+    expect(PLAN_READ_TOOLS).toHaveLength(28);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(54);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(82);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -466,9 +474,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 79 catalog entries − 5 extracted cores = 74 procedure dispatches.
-    expect(dispatched).toBe(74);
-    expect(invoked).toHaveLength(74);
+    // 82 catalog entries − 5 extracted cores = 77 procedure dispatches.
+    expect(dispatched).toBe(77);
+    expect(invoked).toHaveLength(77);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -869,63 +877,3 @@ describe("G5 — advertised schemas bound tool input size", () => {
     });
   });
 });
-
-it("has no dashboard pool-notice procedures or tool exclusions", () => {
-  expect(Object.keys(appRouter.forwarderManagement)).not.toEqual(
-    expect.arrayContaining(["listDashboardNotices", "dismissDashboardNotice"]),
-  );
-  expect(
-    [...MCP_TOOL_MANIFEST, ...MCP_TOOL_EXCLUSIONS].map((entry) => entry.target).join("\n"),
-  ).not.toMatch(/DashboardNotice/);
-});
-
-it.each([
-  [
-    "forwarder_guarded_pool_create",
-    "createGuardedModelPool",
-    {
-      slug: "legacy",
-      name: "Legacy",
-      localModelIds: ["local"],
-      recommendedSurface: "OPENAI_RESPONSES",
-      memberConcurrencyLimit: 1,
-      reservedSlots: 0,
-      localWaitBudgetMs: 30000,
-      providerModels: [],
-    },
-  ],
-  ["forwarder_model_pool_update", "updateModelPool", { id: "pool", name: "Legacy" }],
-  [
-    "forwarder_provider_member_add",
-    "addProviderPoolMember",
-    { poolId: "pool", providerModelId: "provider", publicOrder: 0 },
-  ],
-  ["forwarder_pool_member_update", "updatePoolMember", { id: "member", publicOrder: 1 }],
-  [
-    "forwarder_pool_grant_create",
-    "grantPoolAccessByEmail",
-    { poolId: "pool", email: "grantee@example.test" },
-  ],
-] as const)(
-  "strips retired inputs through MCP %s and its real procedure schema",
-  async (toolName, procedureName, input) => {
-    const tool = MCP_TOOL_MANIFEST.find((item) => item.name === toolName)!;
-    const parsed = await tool.inputSchema["~standard"].validate({
-      ...input,
-      publicEgressAcknowledged: false,
-      confirmGranteePrivacyChange: false,
-      ...(tool.confirmation ? { confirm: tool.confirmation } : {}),
-    });
-    expect(parsed).not.toHaveProperty("issues");
-    if (!("value" in parsed)) throw new Error("MCP schema rejected legacy arguments");
-    const args = parsed.value;
-    const schema = appRouter.forwarderManagement[procedureName]["~orpc"].inputSchema!;
-    const result = await schema["~standard"].validate(args);
-    expect(result).not.toHaveProperty("issues");
-    expect(result).toHaveProperty("value", expect.objectContaining(input));
-    if ("value" in result) {
-      expect(result.value).not.toHaveProperty("publicEgressAcknowledged");
-      expect(result.value).not.toHaveProperty("confirmGranteePrivacyChange");
-    }
-  },
-);

@@ -1,8 +1,12 @@
 import type { PrismaClient } from "../prisma/generated/client";
 
 /**
- * Batched requester rollup detach matching `detach_usage_rollup_requester` in
- * schema-hardening.sql (minute before hour, sentinel `''`, owner FK preserved).
+ * Batched requester rollup merge: moves a deleted requester's rows onto the
+ * sentinel requester `''` (minute before hour), keeping each owner's totals.
+ * Runs in the user drain and the deleted-user purge
+ * (./parent-deletion.ts, ./hot-path-sweeps.ts); rollups carry no foreign key
+ * (DL-1 writer class H), so nothing merges them at the user delete itself.
+ * Upserts go in rollup key order so concurrent merges cannot deadlock.
  */
 export async function drainRequesterUsageRollupsBatch(
   db: Pick<PrismaClient, "$queryRaw">,

@@ -497,8 +497,10 @@ export const EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS = 2_000;
  *   - pool member (pool fallback only; own-key has none): still in this pool
  *     for the same execution target, PUBLIC_OVERFLOW tier, routing ACTIVE.
  *     Read WITHOUT a lock, like the `user` rows: nothing after this read
- *     waits, and the claim writes no row a member writer reads, so a removal
- *     or disable committing after the read serializes after the claim.
+ *     waits, and the claim writes no row a member writer reads. A removal or
+ *     disable committing after the read cannot affect the claim's decision
+ *     (the send was already decided under the earlier state); its commit may
+ *     land before or after the claim commits.
  *
  * Returns null when the target is current. A member, model or endpoint that
  * no longer matches is `BOUND_TARGET_INVALID` for a stored-response binding
