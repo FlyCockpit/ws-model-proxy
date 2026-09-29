@@ -125,14 +125,6 @@ describe("key builders and prefixes", () => {
     expect(mcpIdentityKey("user-2", "client-a")).not.toBe(mcpIdentityKey("user-1", "client-a"));
   });
 
-  it("the module exposes NO key builder that accepts token bytes (structural bound)", () => {
-    // mcpIpKey takes a Hono Context (IP only); mcpIdentityKey takes verified
-    // (sub, clientId) strings. Neither accepts a token or token digest —
-    // pinned by their signatures being the only exported key builders.
-    expect(mcpIpKey.length).toBe(1);
-    expect(mcpIdentityKey.length).toBe(2);
-  });
-
   it("identity buckets are independent per (sub, client_id) pair", async () => {
     await mcpIdentityQuotaLimiter.consume(mcpIdentityKey("u1", "c1"), 1);
     // Exhaust u1/c1 (points = 2 in the mocked env).

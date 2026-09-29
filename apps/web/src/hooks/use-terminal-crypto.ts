@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export const TERMINAL_HKDF_LABEL = "wsmp-term-v1";
-export const TERMINAL_APPROVAL_LABEL = "wsmp-term-approve-v1";
 export const DIRECTION_BROWSER_TO_CLI = 0x01;
 export const DIRECTION_CLI_TO_BROWSER = 0x02;
 export const PLAINTEXT_DATA = 0x01;
@@ -203,97 +201,6 @@ async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
   ]);
 }
 
-export async function deriveTerminalSessionKeys(input: {
-  browserPrivateKey: CryptoKey;
-  cliPublicKey: CryptoKey;
-  browserNonce: Uint8Array;
-  cliNonce: Uint8Array;
-  terminalId: string;
-  cliPublicRaw: Uint8Array;
-  browserPublicRaw: Uint8Array;
-}): Promise<TerminalSessionKeys> {
-  if (input.browserNonce.byteLength !== 16 || input.cliNonce.byteLength !== 16) {
-    throw new Error("terminal nonces must be 16 bytes");
-  }
-  const ikm = new Uint8Array(
-    await crypto.subtle.deriveBits(
-      { name: "ECDH", public: input.cliPublicKey },
-      input.browserPrivateKey,
-      256,
-    ),
-  );
-  if (ikm.byteLength !== 32) throw new Error("ECDH IKM must be 32 bytes");
-  const hkdfKey = await crypto.subtle.importKey("raw", toArrayBuffer(ikm), "HKDF", false, [
-    "deriveBits",
-  ]);
-  const okm = new Uint8Array(
-    await crypto.subtle.deriveBits(
-      {
-        name: "HKDF",
-        hash: "SHA-256",
-        salt: toArrayBuffer(concatBytes([input.browserNonce, input.cliNonce])),
-        info: toArrayBuffer(
-          concatBytes([
-            textEncoder.encode(TERMINAL_HKDF_LABEL),
-            textEncoder.encode(input.terminalId),
-            input.cliPublicRaw,
-            input.browserPublicRaw,
-          ]),
-        ),
-      },
-      hkdfKey,
-      512,
-    ),
-  );
-  const browserToCliRaw = okm.slice(0, 32);
-  const cliToBrowserRaw = okm.slice(32, 64);
-  return {
-    ikm,
-    browserToCliRaw,
-    cliToBrowserRaw,
-    browserToCli: await importAesKey(browserToCliRaw),
-    cliToBrowser: await importAesKey(cliToBrowserRaw),
-  };
-}
-
-export async function sealTerminalBytes(input: {
-  key: CryptoKey;
-  terminalId: string;
-  direction: TerminalDirection;
-  seq: bigint;
-  plaintext: Uint8Array;
-}): Promise<Uint8Array> {
-  const sealed = await crypto.subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv: toArrayBuffer(terminalGcmNonce(input.seq)),
-      additionalData: toArrayBuffer(terminalAad(input.terminalId, input.direction, input.seq)),
-    },
-    input.key,
-    toArrayBuffer(input.plaintext),
-  );
-  return new Uint8Array(sealed);
-}
-
-export async function openTerminalBytes(input: {
-  key: CryptoKey;
-  terminalId: string;
-  direction: TerminalDirection;
-  seq: bigint;
-  ciphertext: Uint8Array;
-}): Promise<Uint8Array> {
-  const opened = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: toArrayBuffer(terminalGcmNonce(input.seq)),
-      additionalData: toArrayBuffer(terminalAad(input.terminalId, input.direction, input.seq)),
-    },
-    input.key,
-    toArrayBuffer(input.ciphertext),
-  );
-  return new Uint8Array(opened);
-}
-
 export function encodeTerminalData(data: Uint8Array): Uint8Array {
   const out = new Uint8Array(1 + data.byteLength);
   out[0] = PLAINTEXT_DATA;
@@ -333,55 +240,12 @@ export function decodeTerminalPlaintext(bytes: Uint8Array): TerminalPlaintext {
   throw new Error("unknown terminal plaintext");
 }
 
-export function assertIncreasingTerminalSeq(previous: bigint, next: bigint): void {
-  if (next <= previous) throw new Error("terminal seq did not increase");
-}
-
 function lengthPrefix(bytes: Uint8Array): Uint8Array {
   if (bytes.byteLength > 0xffff) throw new Error("transcript field too long");
   const out = new Uint8Array(2 + bytes.byteLength);
   new DataView(out.buffer).setUint16(0, bytes.byteLength, false);
   out.set(bytes, 2);
   return out;
-}
-
-export function buildApprovalTranscript(input: ApprovalTranscriptInput): Uint8Array {
-  return concatBytes([
-    lengthPrefix(textEncoder.encode(TERMINAL_APPROVAL_LABEL)),
-    lengthPrefix(textEncoder.encode(input.terminalId)),
-    lengthPrefix(input.browserPublicKey),
-    lengthPrefix(input.browserNonce),
-    lengthPrefix(input.cliPublicKey),
-    lengthPrefix(input.cliNonce),
-  ]);
-}
-
-export async function signApprovalTranscript(
-  privateKey: CryptoKey,
-  input: ApprovalTranscriptInput,
-): Promise<Uint8Array> {
-  const signature = new Uint8Array(
-    await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" },
-      privateKey,
-      toArrayBuffer(buildApprovalTranscript(input)),
-    ),
-  );
-  if (signature.byteLength !== 64) throw new Error("expected an IEEE P1363 signature");
-  return signature;
-}
-
-export async function verifyApprovalTranscript(
-  publicKey: CryptoKey,
-  input: ApprovalTranscriptInput,
-  signature: Uint8Array,
-): Promise<boolean> {
-  return crypto.subtle.verify(
-    { name: "ECDSA", hash: "SHA-256" },
-    publicKey,
-    toArrayBuffer(signature),
-    toArrayBuffer(buildApprovalTranscript(input)),
-  );
 }
 
 // Protocol 2.5 (crypto v2). Every variable-length field is lp16, so no two
@@ -830,10 +694,8 @@ async function loadOrCreateIdentity(): Promise<{
 export function useTerminalIdentity(): {
   ready: boolean;
   publicKey: () => string | null;
-  /** A `viewerId` signs the v2 (protocol 2.5) transcript. */
-  sign: (
-    input: ApprovalTranscriptInput & { viewerId?: string },
-  ) => Promise<TerminalIdentityProof | null>;
+  /** Signs the approval transcript, which binds the server-minted viewer id. */
+  sign: (input: ApprovalTranscriptV2Input) => Promise<TerminalIdentityProof | null>;
 } {
   const privateKeyRef = useRef<CryptoKey | null>(null);
   const publicKeyRawRef = useRef<Uint8Array | null>(null);
@@ -861,15 +723,11 @@ export function useTerminalIdentity(): {
     return raw ? bytesToBase64Url(raw) : null;
   }, []);
 
-  const sign = useCallback(async (input: ApprovalTranscriptInput & { viewerId?: string }) => {
+  const sign = useCallback(async (input: ApprovalTranscriptV2Input) => {
     const privateKey = privateKeyRef.current;
     const publicKeyRaw = publicKeyRawRef.current;
     if (!privateKey || !publicKeyRaw) return null;
-    const { viewerId, ...v1 } = input;
-    const signature =
-      viewerId === undefined
-        ? await signApprovalTranscript(privateKey, v1)
-        : await signApprovalTranscriptV2(privateKey, { ...v1, viewerId });
+    const signature = await signApprovalTranscriptV2(privateKey, input);
     return {
       publicKey: bytesToBase64Url(publicKeyRaw),
       signature: bytesToBase64Url(signature),

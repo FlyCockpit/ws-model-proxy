@@ -91,7 +91,7 @@ describe("parseTerminalServerMessage", () => {
     expect(parseTerminalServerMessage({ type: "decline", outcome: "started" })).toBeNull();
   });
 
-  it("reads viewer fields on listed terminals and the CLI viewer capability", () => {
+  it("reads viewer fields on listed terminals and the CLI identity", () => {
     const parsed = parseTerminalServerMessage({
       type: "terminals",
       clis: [
@@ -99,7 +99,6 @@ describe("parseTerminalServerMessage", () => {
           cliDeviceId: "c1",
           slug: "desk-01",
           publicKey: "pk",
-          terminalViewers: true,
           identityPublicKey: "ik",
           identitySignature: "sig",
         },
@@ -125,7 +124,6 @@ describe("parseTerminalServerMessage", () => {
           cliDeviceId: "c1",
           slug: "desk-01",
           publicKey: "pk",
-          terminalViewers: true,
           identityPublicKey: "ik",
           identitySignature: "sig",
         },
@@ -133,7 +131,6 @@ describe("parseTerminalServerMessage", () => {
           cliDeviceId: "c2",
           slug: null,
           publicKey: null,
-          terminalViewers: false,
           identityPublicKey: null,
           identitySignature: null,
         },

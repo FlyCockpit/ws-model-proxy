@@ -19,14 +19,13 @@ import { TerminalCliIdentities } from "./terminal-cli-identities";
 
 afterEach(() => cleanup());
 
-function cli(cliDeviceId: string, terminalViewers: boolean): ListedCli {
+function cli(cliDeviceId: string): ListedCli {
   return {
     cliDeviceId,
     slug: cliDeviceId,
     publicKey: "pk",
-    terminalViewers,
-    identityPublicKey: terminalViewers ? "ik" : null,
-    identitySignature: terminalViewers ? "sig" : null,
+    identityPublicKey: "ik",
+    identitySignature: "sig",
   };
 }
 
@@ -73,24 +72,21 @@ async function openAndConfirm(
 }
 
 describe("TerminalCliIdentities", () => {
-  it("shows the fingerprint of a trusted CLI and the unverified notice for a 2.4 CLI", () => {
-    renderList([cli("new", true), cli("old", false)], {
+  it("shows the fingerprint of a trusted CLI", () => {
+    renderList([cli("new")], {
       new: {
         status: "trusted",
         fingerprint: "EHI6 GLCX HTTU Q3DC VR2L P6WK K5PF OMMO",
         terminalPublicKey: "pk",
         firstUse: false,
       },
-      old: { status: "unverified" },
     });
     expect(screen.getByText("EHI6 GLCX HTTU Q3DC VR2L P6WK K5PF OMMO")).toBeTruthy();
-    expect(screen.getByText("label-old")).toBeTruthy();
-    expect(screen.getByText("dashboard:terminals.identity.unverified")).toBeTruthy();
   });
 
   it("shows both fingerprints and trusts the new key only after confirmation", async () => {
     const user = userEvent.setup();
-    const { onTrustNewKey } = renderList([cli("desk", true)], {
+    const { onTrustNewKey } = renderList([cli("desk")], {
       desk: {
         status: "changed",
         pinnedFingerprint: "AAAA AAAA",
@@ -116,7 +112,7 @@ describe("TerminalCliIdentities", () => {
 
   it("shows the pinned and new fingerprints inside the dialog", async () => {
     const user = userEvent.setup();
-    renderList([cli("desk", true)], { desk: shownChange });
+    renderList([cli("desk")], { desk: shownChange });
     const { dialog } = await openAndConfirm(user);
     expect(within(dialog).getByText("AAAA AAAA")).toBeTruthy();
     expect(within(dialog).getByText("BBBB BBBB")).toBeTruthy();
@@ -126,11 +122,7 @@ describe("TerminalCliIdentities", () => {
 
   it("confirms the snapshot it showed, not a key that arrived while it was open", async () => {
     const user = userEvent.setup();
-    const { onTrustNewKey, rerender } = renderList(
-      [cli("desk", true)],
-      { desk: shownChange },
-      false,
-    );
+    const { onTrustNewKey, rerender } = renderList([cli("desk")], { desk: shownChange }, false);
     const swapped: ChangedCliTrust = {
       ...shownChange,
       fingerprint: "CCCC CCCC",
@@ -148,7 +140,7 @@ describe("TerminalCliIdentities", () => {
   });
 
   it("blocks an invalid 2.5 CLI with a notice and no trust action", () => {
-    renderList([cli("bad", true)], { bad: { status: "invalid" } });
+    renderList([cli("bad")], { bad: { status: "invalid" } });
     expect(screen.getByText("dashboard:terminals.identity.invalid")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
   });
