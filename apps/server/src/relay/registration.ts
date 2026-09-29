@@ -161,6 +161,8 @@ export async function persistRelayRegistration({
   userId: string;
   allowHumanTerminal: boolean;
   mcpCommandMode: McpCommandModeName;
+  /** Fence for the connection this registration accepted; see the schema. */
+  connectionGeneration: number;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -280,6 +282,11 @@ export async function persistRelayRegistration({
                     lastConnectedAt: now,
                     lastHeartbeatAt: now,
                     connectionCount: { increment: 1 },
+                    // Owns the device for this connection: a disconnect write
+                    // from the connection this one replaces carries the older
+                    // generation and is refused below it (see
+                    // `disconnectCliDeviceAtGeneration`).
+                    connectionGeneration: { increment: 1 },
                   }
                 : {}),
               ...reportedData,
@@ -293,6 +300,7 @@ export async function persistRelayRegistration({
               lastConnectedAt: now,
               lastHeartbeatAt: now,
               connectionCount: 1,
+              connectionGeneration: 1,
               ...reportedData,
             },
             select: {
@@ -305,6 +313,7 @@ export async function persistRelayRegistration({
               inventoryConfirmed: true,
               allowHumanTerminal: true,
               mcpCommandMode: true,
+              connectionGeneration: true,
             },
           });
 
@@ -804,6 +813,7 @@ export async function persistRelayRegistration({
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
             mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
+            connectionGeneration: cliDevice.connectionGeneration,
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,

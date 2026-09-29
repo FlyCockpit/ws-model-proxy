@@ -173,6 +173,56 @@ pub struct Config {
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
+    /// Accept remotely defined metric sources (`metrics.sources.set`). Only
+    /// settable locally; read once when the relay starts. Each remote source
+    /// still needs `wsmp metrics approve` of its exact command.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_remote_metric_sources: bool,
+    /// Custom metric sources and remote-source approvals.
+    #[serde(default, skip_serializing_if = "MetricsConfig::is_empty")]
+    pub metrics: MetricsConfig,
+}
+
+/// `metrics` in the config file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MetricsConfig {
+    /// Local sources, keyed by source name (`[A-Za-z0-9_.:-]{1,64}`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, MetricSourceConfig>,
+    /// Remote source name -> SHA-256 (hex) of the exact approved command.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub approved_remote_sources: std::collections::BTreeMap<String, String>,
+}
+
+impl MetricsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty() && self.approved_remote_sources.is_empty()
+    }
+}
+
+pub const METRIC_SOURCE_DEFAULT_INTERVAL_SECS: u32 = 10;
+pub const METRIC_SOURCE_DEFAULT_TIMEOUT_SECS: u32 = 5;
+
+fn default_metric_interval() -> u32 {
+    METRIC_SOURCE_DEFAULT_INTERVAL_SECS
+}
+
+fn default_metric_timeout() -> u32 {
+    METRIC_SOURCE_DEFAULT_TIMEOUT_SECS
+}
+
+/// One local metric source: a command run every `intervalSecs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricSourceConfig {
+    pub command: String,
+    #[serde(default = "default_metric_interval")]
+    pub interval_secs: u32,
+    #[serde(default = "default_metric_timeout")]
+    pub timeout_secs: u32,
+    #[serde(default)]
+    pub format: crate::protocol::MetricSourceFormat,
 }
 
 /// The on-disk shape, including the legacy `allowMcpCommands` switch that
@@ -191,6 +241,8 @@ struct ConfigWire {
     mcp_command_mode: Option<McpCommandMode>,
     allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
+    allow_remote_metric_sources: bool,
+    metrics: MetricsConfig,
 }
 
 impl Default for ConfigWire {
@@ -207,6 +259,8 @@ impl Default for ConfigWire {
             mcp_command_mode: None,
             allow_mcp_commands: None,
             require_terminal_approval: false,
+            allow_remote_metric_sources: false,
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -229,6 +283,8 @@ impl From<ConfigWire> for Config {
             allow_human_terminal: wire.allow_human_terminal,
             mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
+            allow_remote_metric_sources: wire.allow_remote_metric_sources,
+            metrics: wire.metrics,
         }
     }
 }
@@ -245,6 +301,8 @@ impl Default for Config {
             allow_human_terminal: false,
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
+            allow_remote_metric_sources: false,
+            metrics: MetricsConfig::default(),
         }
     }
 }

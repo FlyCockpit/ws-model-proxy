@@ -163,7 +163,8 @@ describe("createMcpTransport — pinned configuration", () => {
               name !== "forwarder_cli_command_run" &&
               name !== "forwarder_cli_supervised_command_start" &&
               name !== "forwarder_cli_command_result" &&
-              name !== "forwarder_cli_activity_list",
+              name !== "forwarder_cli_activity_list" &&
+              name !== "forwarder_device_metric_sources_set",
           )
           .sort(),
       );

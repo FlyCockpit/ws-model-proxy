@@ -3,8 +3,12 @@ import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-ide
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { adminProcedure } from "../index";
-
-const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
+import {
+  cliHeartbeatIsStale,
+  cliHeartbeatStaleAt,
+  effectiveEndpointStatus,
+  endpointEffectiveStatusWhere,
+} from "../lib/cli-presence";
 
 const cliStatusSchema = z.enum(["DISCONNECTED", "CONNECTED", "STALE", "REVOKED"]);
 const endpointStatusSchema = z.enum(["UNKNOWN", "ONLINE", "DEGRADED", "OFFLINE"]);
@@ -152,15 +156,8 @@ function createdAtWhere(input: { createdAfter?: Date; createdBefore?: Date }) {
     : {};
 }
 
-function staleAt(lastHeartbeatAt: Date | null) {
-  return lastHeartbeatAt
-    ? new Date(lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
-    : null;
-}
-
 function isStale(lastHeartbeatAt: Date | null, now: Date) {
-  const nextStaleAt = staleAt(lastHeartbeatAt);
-  return Boolean(nextStaleAt && nextStaleAt <= now);
+  return cliHeartbeatIsStale(lastHeartbeatAt, now);
 }
 
 function owner(row: OwnerRow) {
@@ -195,7 +192,7 @@ function effectiveCapabilities(
 }
 
 function serializeCli(row: CliDeviceRow, now: Date) {
-  const nextStaleAt = staleAt(row.lastHeartbeatAt);
+  const nextStaleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
     id: row.id,
     createdAt: row.createdAt,
@@ -210,7 +207,7 @@ function serializeCli(row: CliDeviceRow, now: Date) {
     lastDisconnectedAt: row.lastDisconnectedAt,
     lastHeartbeatAt: row.lastHeartbeatAt,
     staleAt: nextStaleAt,
-    isStale: Boolean(nextStaleAt && nextStaleAt <= now),
+    isStale: isStale(row.lastHeartbeatAt, now),
     connectionCount: row.connectionCount,
     endpointCount: row._count.Endpoints,
     cliTokenCount: row._count.CliTokens,
@@ -235,7 +232,8 @@ function serializeEndpoint(row: EndpointRow, now: Date) {
     slug: row.slug,
     label: row.label,
     kind: String(row.kind),
-    status: String(row.status),
+    status: effectiveEndpointStatus(row.status, row.CliDevice, now),
+    reportedStatus: String(row.status),
     defaultCapabilities: row.defaultCapabilities,
     capabilityMetadata: row.capabilityMetadata,
     probeSuggestions: row.probeSuggestions,
@@ -245,7 +243,7 @@ function serializeEndpoint(row: EndpointRow, now: Date) {
     failureReasonCode: row.failureReasonCode,
     discoveredModelCount: row._count.DiscoveredModels,
     healthState:
-      row.status === "ONLINE" && !isStale(row.CliDevice.lastHeartbeatAt, now)
+      effectiveEndpointStatus(row.status, row.CliDevice, now) === "ONLINE"
         ? "HEALTHY"
         : "ATTENTION",
   };
@@ -262,7 +260,7 @@ function serializeModel(row: DiscoveredModelRow, now: Date) {
       id: row.Endpoint.id,
       slug: row.Endpoint.slug,
       label: row.Endpoint.label,
-      status: String(row.Endpoint.status),
+      status: effectiveEndpointStatus(row.Endpoint.status, row.Endpoint.CliDevice, now),
     },
     cliDevice: {
       id: row.Endpoint.CliDevice.id,
@@ -288,7 +286,7 @@ function serializeModel(row: DiscoveredModelRow, now: Date) {
     lastSeenAt: row.lastSeenAt,
     poolMemberCount: row._count.PoolMembers,
     healthState:
-      row.Endpoint.status === "ONLINE" && !isStale(row.Endpoint.CliDevice.lastHeartbeatAt, now)
+      effectiveEndpointStatus(row.Endpoint.status, row.Endpoint.CliDevice, now) === "ONLINE"
         ? "AVAILABLE"
         : "UNAVAILABLE",
   };
@@ -349,7 +347,11 @@ function serializePool(row: ModelPoolRow, now: Date) {
               endpointId: model.Endpoint.id,
               endpointSlug: model.Endpoint.slug,
               endpointLabel: model.Endpoint.label,
-              endpointStatus: String(model.Endpoint.status),
+              endpointStatus: effectiveEndpointStatus(
+                model.Endpoint.status,
+                model.Endpoint.CliDevice,
+                now,
+              ),
               cliDeviceId: model.Endpoint.CliDevice.id,
               cliDeviceSlug: model.Endpoint.CliDevice.slug,
               cliDeviceDisplayName: cliDeviceDisplayName(model.Endpoint.CliDevice),
@@ -712,9 +714,10 @@ export const adminObservabilityRouter = {
     .handler(async ({ input }) => {
       const page = input?.page ?? 1;
       const pageSize = input?.pageSize ?? 25;
-      const where = {
+      const now = new Date();
+      const where: Prisma.EndpointWhereInput = {
         ...ownerWhere(input?.ownerQuery),
-        ...(input?.status ? { status: input.status } : {}),
+        ...(input?.status ? endpointEffectiveStatusWhere(input.status, now) : {}),
       };
       const [total, rows] = await Promise.all([
         prisma.endpoint.count({ where }),
@@ -725,7 +728,6 @@ export const adminObservabilityRouter = {
           select: endpointSelect,
         }),
       ]);
-      const now = new Date();
       return paginatedResult({
         items: rows.map((row) => serializeEndpoint(row, now)),
         total,
@@ -766,7 +768,9 @@ export const adminObservabilityRouter = {
           : {};
       const where = {
         ...ownerWhere(input?.ownerQuery),
-        ...(input?.endpointStatus ? { Endpoint: { is: { status: input.endpointStatus } } } : {}),
+        ...(input?.endpointStatus
+          ? { Endpoint: { is: endpointEffectiveStatusWhere(input.endpointStatus, new Date()) } }
+          : {}),
         ...capabilityWhere,
       };
       const [total, rows] = await Promise.all([
