@@ -4322,8 +4322,10 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       await ownedPool(input.poolId, userId);
-      // Same lock order as grant creation: the pool row (L1 / C1), then the grant.
+      // Same lock order as grant creation: the owner fence first (writer
+      // class M), then the pool row, then the grant.
       return runSerializableTransaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const locked = await tx.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (locked.length !== 1)

@@ -97,7 +97,7 @@ async function deleteTerminalAdmissionBatch(
     const eligible = ids.filter((id) => !busy.has(id));
     if (eligible.length > 0)
       await tx.$executeRaw`
-        DELETE FROM admission_request WHERE id = ANY(${eligible}::text[])`;
+        DELETE FROM admission_request WHERE id = ANY(${eligible}::text[])`; // policy: bounded-delete -- ids locked and checked above
     return eligible.length === 0 ? 0 : candidates.length;
   });
 }
