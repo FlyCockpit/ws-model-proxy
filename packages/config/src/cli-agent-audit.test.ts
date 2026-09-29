@@ -154,6 +154,30 @@ describe("commandProgram", () => {
     },
   );
 
+  // C2b-1: a leading redirection or slash-bearing flag is not a program; its
+  // last path segment must never be stored.
+  const leadingWordRows: ReadonlyArray<readonly [string, string, string]> = [
+    ["stderr redirection", "2>/tmp/hunter2 ls", "hunter2"],
+    ["input redirection", "</run/secrets/ghp_notreal0000 psql", "ghp_notreal0000"],
+    ["output redirection", ">/run/secrets/db_password cat", "db_password"],
+    ["and-redirect", "&>/var/log/SeCrEt.txt make", "SeCrEt.txt"],
+    ["append redirection", "1>>/x/y/token-abc cmd", "token-abc"],
+    ["short flag with attached path", "-p/tmp/hunter2 x", "hunter2"],
+    ["long flag with equals path", "--config=/etc/secretfile run", "secretfile"],
+    ["invalid assignment name with path", "1FOO=/x/hunter2 cmd", "hunter2"],
+    ["expansion prefix", "$HOME/bin/tool", "tool"],
+    ["tilde prefix", "~/bin/tool", "tool"],
+    ["braced expansion prefix", "$" + "{X}/tool", "tool"],
+  ];
+  it.each(leadingWordRows)(
+    "never stores a fragment of a leading non-program word: %s",
+    (_n, input, fragment) => {
+      const program = commandProgram(input);
+      expect(program).toBe(UNKNOWN);
+      expect(program).not.toContain(fragment);
+    },
+  );
+
   it("returns the unknown program for non-string and non-well-formed input", () => {
     expect(commandProgram(undefined)).toBe(UNKNOWN);
     expect(commandProgram(null)).toBe(UNKNOWN);

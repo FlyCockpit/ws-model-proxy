@@ -166,6 +166,9 @@ export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 /** The only names a stored program may have: no spaces, quotes, NUL or non-ASCII. */
 const PROGRAM_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/;
 
+/** The whole program word: a plain path (program charset plus `/`). */
+const PROGRAM_WORD_PATTERN = /^[A-Za-z0-9._+/-]+$/;
+
 /**
  * A leading `NAME=value` assignment that is safe to skip: a valid shell env
  * NAME and a value made only of plain characters. Anything else in the value
@@ -230,8 +233,15 @@ export function commandProgram(command: unknown): string {
       if (SAFE_ASSIGNMENT_PATTERN.test(token)) continue;
       return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
     }
-    const base = basename(unquote(token));
-    if (base.startsWith("-")) return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+    // The WHOLE word is checked before its basename is taken: a leading
+    // redirection (`2>/x/y`), a slash-bearing flag (`--opt=/x/y`, `-p/x/y`) or
+    // any word with a character outside the path charset would otherwise leak
+    // its last path segment as the "program".
+    const word = unquote(token);
+    if (!PROGRAM_WORD_PATTERN.test(word) || word.startsWith("-")) {
+      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+    }
+    const base = basename(word);
     return PROGRAM_PATTERN.test(base) ? base : CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
   return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;

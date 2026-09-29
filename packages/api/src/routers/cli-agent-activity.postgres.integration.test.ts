@@ -190,35 +190,48 @@ integration("cli agent action events with real PostgreSQL", () => {
     expect(await prisma.cliAgentActionEvent.count({ where: { userId: kept.id } })).toBe(1);
   });
 
-  it("purges a row written after the user delete, and a row the drain skipped while locked", async () => {
+  it("purges a row written after the user delete, and keeps the entry while a skipped row is locked", async () => {
     const doomed = await user("late");
     // A row another transaction holds when the drain runs is skipped (SKIP LOCKED).
     const locked = await prisma.cliAgentActionEvent.create({
       data: { userId: doomed.id, cliDeviceId: "dev", ...base },
     });
-    const holder = new Promise<void>((resolve, reject) => {
-      prisma
-        .$transaction(
-          async (tx) => {
-            await tx.$queryRaw`SELECT id FROM cli_agent_action_event WHERE id = ${locked.id} FOR UPDATE`;
-            await deletion.deleteUserDurably(prisma, doomed.id, { batch: 3 });
-            resolve();
-            await new Promise((done) => setTimeout(done, 300));
-          },
-          { timeout: 20_000 },
-        )
-        .catch(reject);
+    let release: () => void = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    await holder;
-    // The user is gone, but the skipped row survives the drain.
+    let locking: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      locking = resolve;
+    });
+    const holder = prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM cli_agent_action_event WHERE id = ${locked.id} FOR UPDATE`;
+        locking();
+        await released;
+      },
+      { timeout: 30_000 },
+    );
+    await held;
+    await expect(deletion.deleteUserDurably(prisma, doomed.id, { batch: 3 })).resolves.toBe(
+      "deleted",
+    );
+    // The user is gone, but the skipped (locked) row survived the drain.
     expect(await prisma.user.count({ where: { id: doomed.id } })).toBe(0);
+    expect(await prisma.cliAgentActionEvent.count({ where: { userId: doomed.id } })).toBe(1);
     // A late event (queued write, other replica) lands after the delete.
     await prisma.cliAgentActionEvent.create({
       data: { userId: doomed.id, cliDeviceId: "dev", ...base },
     });
-    await new Promise((done) => setTimeout(done, 500));
-    const purged = await sweeps.purgeDeletedUserHistory(prisma, doomed.id, { batch: 3 });
-    expect(purged.remaining).toBe(false);
+    // While the row is still locked the purge takes the late row but reports
+    // the user's history as remaining, so the queue entry is not retired.
+    const busy = await sweeps.purgeDeletedUserHistory(prisma, doomed.id, { batch: 3 });
+    expect(busy.remaining).toBe(true);
+    expect(await prisma.cliAgentActionEvent.count({ where: { userId: doomed.id } })).toBe(1);
+    release();
+    await holder;
+    const done = await sweeps.purgeDeletedUserHistory(prisma, doomed.id, { batch: 3 });
+    expect(done.remaining).toBe(false);
     expect(await prisma.cliAgentActionEvent.count({ where: { userId: doomed.id } })).toBe(0);
   }, 60_000);
 
