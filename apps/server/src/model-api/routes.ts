@@ -6658,9 +6658,13 @@ async function relayPool({
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
       finalFailure = failure;
-      // Failures that write no member health (client abort, lease loss,
-      // non-member failures) would leave the claimed trial standing.
-      if (!(memberRetryable && isPoolRelayFailureClass(failure))) await releaseUnusedTrial();
+      // Only a retryable operation with a member-attributable failure writes
+      // member health below (which clears the trial). Every other exit (client
+      // abort, lease loss, non-member failure, or a non-retryable operation such
+      // as a stateful follow-up that breaks before the failure write) gives the
+      // claimed trial back instead of waiting out the lease.
+      if (!(operationRetryable && memberRetryable && isPoolRelayFailureClass(failure)))
+        await releaseUnusedTrial();
       if (!operationRetryable) break;
       if (leaseLost) {
         await releaseCapacityAttempt();
