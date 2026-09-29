@@ -137,6 +137,27 @@ function createHttpClient(
   return createORPCClient(link) as RouterClient<typeof providerManagementRouter>;
 }
 
+const isFenceCall = (call: unknown[]) =>
+  (call[0] as readonly string[]).join("?").includes("wsmp_acquire_fences");
+
+/**
+ * Writer class M: the first `$queryRaw` takes the caller's owner fence, every
+ * further fence (`laterFences`, in call order) precedes the first row lock,
+ * and `rowLocks` row-lock statements follow.
+ */
+function expectOwnerFenceThenRowLocks(rowLocks: number, laterFences: string[][] = []) {
+  const calls = db.$queryRaw.mock.calls as unknown[][];
+  expect(calls[0] && isFenceCall(calls[0])).toBe(true);
+  const fenceArrays = calls.filter(isFenceCall).map((call) => call[1]);
+  expect(fenceArrays).toEqual([["00:owner:owner"], ...laterFences]);
+  const firstRowLock = calls.findIndex((call) => !isFenceCall(call));
+  const lastFence = calls.findLastIndex(isFenceCall);
+  if (firstRowLock !== -1) expect(lastFence).toBeLessThan(firstRowLock);
+  expect(calls.filter((call) => !isFenceCall(call))).toHaveLength(rowLocks);
+  // No advisory lock outside wsmp_acquire_fences.
+  expect(db.$executeRaw).not.toHaveBeenCalled();
+}
+
 describe("providerManagementRouter security boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -375,7 +396,7 @@ describe("providerManagementRouter security boundary", () => {
         enabled: false,
       }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
-    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expectOwnerFenceThenRowLocks(1);
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
       isolationLevel: "Serializable",
@@ -392,8 +413,9 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.updateModel({ id: "model", enabled: true })).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
-    expect(db.$executeRaw).toHaveBeenCalledOnce();
-    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    // Owner fence, then the provider-model identity fence (no policy edit,
+    // so no capacity fences), then the account and model rows.
+    expectOwnerFenceThenRowLocks(2, [["02:execution-target:provider-model:model"]]);
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
   });
@@ -462,6 +484,24 @@ describe("providerManagementRouter security boundary", () => {
 
     await client.updateModel({ id: "model", concurrencyLimit: 8, contextWindow: 65_536 });
 
+    // A limit edit: owner fence, then identity, target capacity-policy and
+    // capacity fences in one ascending call, all before the account row (no
+    // inference_capacity row lock).
+    const calls = db.$queryRaw.mock.calls as unknown[][];
+    expect(calls.filter(isFenceCall).map((call) => call[1])).toEqual([
+      ["00:owner:owner"],
+      [
+        "02:execution-target:provider-model:model",
+        "06:capacity-policy:target",
+        "08:capacity:capacity",
+      ],
+    ]);
+    expect(calls.findLastIndex(isFenceCall)).toBeLessThan(
+      calls.findIndex((call) => !isFenceCall(call)),
+    );
+    expect(
+      calls.some((call) => (call[0] as readonly string[]).join("?").includes("inference_capacity")),
+    ).toBe(false);
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: { id: "capacity", userId: "owner" },
       data: {
@@ -1041,7 +1081,7 @@ describe("providerManagementRouter security boundary", () => {
       providerAccountId: "account",
       credential: "super-secret-value",
     });
-    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+    expectOwnerFenceThenRowLocks(1);
     expect(JSON.stringify(result)).not.toContain("super-secret-value");
     const write = db.providerCredential.create.mock.calls[0]?.[0];
     expect(JSON.stringify(write)).not.toContain("super-secret-value");
@@ -1080,7 +1120,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(
       client.updateAccount({ id: "account", authType: "API_KEY" }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expectOwnerFenceThenRowLocks(1);
     expect(db.providerCredential.count).toHaveBeenCalledWith({
       where: { userId: "owner", providerAccountId: "account" },
     });
@@ -1203,7 +1243,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(
       client.updateAccount({ id: "account", providerType: "anthropic-compatible" }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
-    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expectOwnerFenceThenRowLocks(1);
     expect(db.providerModel.findMany).toHaveBeenCalledWith({
       where: { userId: "owner", providerAccountId: "account", deletedAt: null },
       select: { id: true, nativeCapabilities: true },
@@ -1415,7 +1455,7 @@ describe("providerManagementRouter security boundary", () => {
     db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.deleteModel({ id: "model" })).resolves.toEqual({ success: true });
-    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expectOwnerFenceThenRowLocks(2);
     expect(db.providerModel.updateMany).toHaveBeenCalledWith({
       where: {
         id: "model",
@@ -1449,7 +1489,7 @@ describe("providerManagementRouter security boundary", () => {
     db.providerCredential.updateMany.mockResolvedValue({ count: 0 });
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.revokeCredential({ id: "credential" })).resolves.toEqual({ success: true });
-    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expectOwnerFenceThenRowLocks(2);
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
       isolationLevel: "Serializable",
     });
@@ -1489,7 +1529,7 @@ describe("providerManagementRouter security boundary", () => {
           ProviderAccount: { deletedAt: null, currentCredentialId: "credential" },
         },
       });
-      expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+      expectOwnerFenceThenRowLocks(2);
       expect(db.providerCredential.updateMany).not.toHaveBeenCalled();
       expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
     },
@@ -1712,7 +1752,7 @@ describe("providerManagementRouter security boundary", () => {
       reason: null,
     });
 
-    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expectOwnerFenceThenRowLocks(2);
     expect(db.providerCredential.updateMany).toHaveBeenCalledWith({
       where: { id: "credential", userId: "owner", status: "ACTIVE" },
       data: { lastUsedAt: expect.any(Date) },
@@ -1930,6 +1970,10 @@ describe("providerManagementRouter security boundary", () => {
 // pricing FK inversions, including create's database-dependent RI trigger order.
 describe("provider pricing writer lock order", () => {
   const trace: string[] = [];
+  let missingParent: "account" | "model" | null = null;
+  let pricingFenceError: Error | null = null;
+  const ownerFence = "fences 00:owner:owner";
+  const pricingFences = "fences 00:owner:owner 05:provider-pricing:owner:model";
   const pricing = {
     id: "price",
     providerAccountId: "account",
@@ -1967,17 +2011,29 @@ describe("provider pricing writer lock order", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    missingParent = null;
+    pricingFenceError = null;
     db.$queryRaw.mockImplementation(async (sql: TemplateStringsArray, ...values: unknown[]) => {
+      if (sql.join("?").includes("wsmp_acquire_fences")) {
+        const names = values[0] as string[];
+        if (pricingFenceError && names.some((name) => name.startsWith("05:")))
+          throw pricingFenceError;
+        trace.push(`fences ${names.join(" ")}`);
+        return [{ acquired: true }];
+      }
       expect(values).toContain("owner");
       const table = sql.join("?").match(/FROM (provider_\w+)/u)?.[1];
       expect(sql.join("?")).toContain(
         table === "provider_account" ? "FOR UPDATE" : "FOR NO KEY UPDATE",
       );
       trace.push(String(table));
+      if (missingParent === "account" && table === "provider_account") return [];
+      if (missingParent === "model" && table === "provider_model") return [];
       return [{ id: table === "provider_account" ? "account" : "model" }];
     });
-    db.$executeRaw.mockImplementation(async (_sql: TemplateStringsArray, key: string) => {
-      trace.push(key);
+    // Every advisory lock goes through wsmp_acquire_fences ($queryRaw).
+    db.$executeRaw.mockImplementation(async () => {
+      trace.push("executeRaw");
       return 1;
     });
     db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
@@ -2002,15 +2058,20 @@ describe("provider pricing writer lock order", () => {
   });
 
   it.each(writers)(
-    "%s locks account, pricing advisory and model before pricing and audit writes",
+    "%s takes the owner and pricing fences, then account and model, before pricing and audit writes",
     async (_name, write) => {
       await write();
-      expect(trace.slice(0, 3)).toEqual([
+      // Writer class M: the owner fence first, then the pricing fence (the
+      // owner fence is already held and skipped), then the account row and
+      // the model row.
+      expect(trace.slice(0, 4)).toEqual([
+        ownerFence,
+        pricingFences,
         "provider_account",
-        "provider-pricing:owner:model",
         "provider_model",
       ]);
-      expect(trace[3]).toMatch(/^pricing\./u);
+      expect(trace[4]).toMatch(/^pricing\./u);
+      expect(trace).not.toContain("executeRaw");
       expect(trace.at(-1)).toBe("audit.insert");
       expect(trace.filter((entry) => entry === "audit.insert")).toHaveLength(1);
       expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
@@ -2027,16 +2088,16 @@ describe("provider pricing writer lock order", () => {
       db.providerModel.findFirst.mockResolvedValue(null);
       db.providerPricingVersion.findFirst.mockResolvedValue(null);
       await expect(write()).rejects.toMatchObject({ code: "NOT_FOUND" });
-      expect(trace).toEqual([]);
+      // Only the owner fence: no pricing fence, no row lock.
+      expect(trace).toEqual([ownerFence]);
     },
   );
 
-  for (const missingParent of ["account", "model"] as const) {
+  for (const missing of ["account", "model"] as const) {
     it.each(writers)(
-      `%s refuses a missing/deleted ${missingParent} under its lock`,
+      `%s refuses a missing/deleted ${missing} under its lock`,
       async (_name, write) => {
-        if (missingParent === "model") db.$queryRaw.mockResolvedValueOnce([{ id: "account" }]);
-        db.$queryRaw.mockResolvedValueOnce([]);
+        missingParent = missing;
         await expect(write()).rejects.toMatchObject({ code: "NOT_FOUND" });
         expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
         expect(trace.some((entry) => entry.startsWith("pricing."))).toBe(false);
@@ -2045,12 +2106,12 @@ describe("provider pricing writer lock order", () => {
   }
 
   it.each(writers)(
-    "%s stops on a lock timeout without a pricing or audit write",
+    "%s stops on a pricing-fence timeout before any row lock, pricing or audit write",
     async (_name, write) => {
       const timeout = new Error("lock timeout");
-      db.$executeRaw.mockRejectedValueOnce(timeout);
+      pricingFenceError = timeout;
       await expect(write()).rejects.toThrow(timeout);
-      expect(trace).toEqual(["provider_account"]);
+      expect(trace).toEqual([ownerFence]);
       expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
     },
   );
@@ -2061,9 +2122,10 @@ describe("provider pricing writer lock order", () => {
       effectiveAt: new Date(Date.now() + 60_000),
     });
     await client.activatePricingVersion({ id: "price" });
-    expect(trace.slice(0, 3)).toEqual([
+    expect(trace.slice(0, 4)).toEqual([
+      ownerFence,
+      pricingFences,
       "provider_account",
-      "provider-pricing:owner:model",
       "provider_model",
     ]);
     expect(db.providerModel.update).not.toHaveBeenCalled();

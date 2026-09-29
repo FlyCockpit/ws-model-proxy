@@ -36,6 +36,7 @@ const busyRule = [{ metric: "endpoint.waiting", op: ">=", threshold: 2, effect: 
 
 type Row = {
   poolMemberId: string;
+  publisherId: string;
   verdict: string;
   ruleStates: string[];
   evaluatedAt: Date;
@@ -64,11 +65,20 @@ function harness(members: ReturnType<typeof member>[]) {
     poolMemberRoutingVerdict: {
       updateMany: vi.fn(
         async (args: {
-          where: { poolMemberId: string; evaluatedAt: { lte: Date } };
+          where: {
+            poolMemberId: string;
+            OR: [{ evaluatedAt: { lt: Date } }, { evaluatedAt: Date; publisherId: string }];
+          };
           data: Omit<Row, "poolMemberId">;
         }) => {
           const row = rows.get(args.where.poolMemberId);
-          if (!row || row.evaluatedAt > args.where.evaluatedAt.lte) return { count: 0 };
+          if (!row) return { count: 0 };
+          const [strictlyOlder, samePublisher] = args.where.OR;
+          const replaceable =
+            row.evaluatedAt < strictlyOlder.evaluatedAt.lt ||
+            (row.evaluatedAt.getTime() === samePublisher.evaluatedAt.getTime() &&
+              row.publisherId === samePublisher.publisherId);
+          if (!replaceable) return { count: 0 };
           rows.set(row.poolMemberId, { ...row, ...args.data });
           return { count: 1 };
         },
@@ -81,11 +91,23 @@ function harness(members: ReturnType<typeof member>[]) {
         return {};
       }),
       deleteMany: vi.fn(
-        async (args: { where: { poolMemberId: { in: string[] }; evaluatedAt: Date } }) => {
+        async (args: {
+          where: {
+            poolId?: string;
+            poolMemberId?: { in: string[] };
+            evaluatedAt?: Date;
+            publisherId?: string;
+          };
+        }) => {
           let count = 0;
-          for (const id of args.where.poolMemberId.in) {
-            const row = rows.get(id);
-            if (row && row.evaluatedAt.getTime() === args.where.evaluatedAt.getTime()) {
+          for (const [id, row] of [...rows]) {
+            const matches =
+              (args.where.poolId === undefined || row.poolId === args.where.poolId) &&
+              (args.where.poolMemberId === undefined || args.where.poolMemberId.in.includes(id)) &&
+              (args.where.evaluatedAt === undefined ||
+                row.evaluatedAt.getTime() === args.where.evaluatedAt.getTime()) &&
+              (args.where.publisherId === undefined || row.publisherId === args.where.publisherId);
+            if (matches) {
               rows.delete(id);
               count += 1;
             }
@@ -251,6 +273,33 @@ describe("MetricRoutingEvaluator", () => {
     });
     await h.evaluator.evaluate(newer, metrics(40, h.now()));
     expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
+  });
+
+  it("an equal-millisecond write by another publisher never overwrites the first writer", async () => {
+    // A (cancelled session) and B (its successor) evaluate in the same
+    // millisecond. Whoever wrote first owns the row: a delayed write by the
+    // other publisher is refused, and each publisher may refresh its own.
+    const h = harness([member("m1", hotRule)]);
+    const b = createRoutingEvaluationState("user-1", "device-1");
+    const a = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(b, metrics(40, T0));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", publisherId: b.publisherId });
+    await h.evaluator.evaluate(a, metrics(90, T0));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", publisherId: b.publisherId });
+    // The owner still refreshes at the same instant (same publisher).
+    a.written.clear();
+    b.written.clear();
+    await h.evaluator.evaluate(b, metrics(90, T0));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "FULL", publisherId: b.publisherId });
+  });
+
+  it("clears a pool's verdicts on request (the rule editor's hook)", async () => {
+    const h = harness([member("m1", hotRule), member("m2", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    expect(h.rows.size).toBe(2);
+    await h.evaluator.clearPool("pool-of-m1");
+    expect([...h.rows.keys()]).toEqual(["m2"]);
   });
 
   it("publishes nothing once its session was cancelled mid-evaluation", async () => {

@@ -21,7 +21,7 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
   user: { findUnique: MockInstance };
-  cliDevice: { upsert: MockInstance; update: MockInstance };
+  cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
@@ -178,6 +178,7 @@ describe("capability override origin", () => {
     db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
     db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    db.cliDevice.findUnique.mockResolvedValue(null);
     db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: "capacity-id",
@@ -390,12 +391,20 @@ describe("capability override origin", () => {
     });
   });
 
-  it("locks existing inventory targets (L2) before inventory writes and capacity rows (L5) before capacity writes", async () => {
-    // DL-1 capacity lock order: the device row (L0), then every existing
-    // target of this inventory, sorted, before any endpoint/model/target
-    // write; then the capacity rows it may write, sorted, before the first
-    // capacity write. No capacity write precedes a target lock.
-    db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
+  it("fences the owner first, then the inventory's policy and capacity fences before the first write", async () => {
+    // DL-1 design (d), writer class M: the owner fence, then plain reads that
+    // plan the fences, then the capacity-policy fence of every existing
+    // target of this inventory and the capacity fence of every capacity row
+    // it may write (one sorted call), all before the first row lock or write.
+    // No row lock on execution_target or inference_capacity is taken.
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-device-id" });
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "execution-target-id",
+        inferenceCapacityId: "capacity-id",
+        discoveredModelId: "model-id",
+      },
+    ]);
     db.executionTarget.findUnique.mockResolvedValue({
       id: "execution-target-id",
       inferenceCapacityId: "capacity-id",
@@ -410,19 +419,33 @@ describe("capability override origin", () => {
     });
     const sql = (index: number) =>
       ((db.$queryRaw.mock.calls[index]?.[0] as TemplateStringsArray | undefined) ?? []).join("?");
-    const order = (fragment: string) => {
-      const index = db.$queryRaw.mock.calls.findIndex((_, call) => sql(call).includes(fragment));
-      return db.$queryRaw.mock.invocationCallOrder[index] ?? Number.NaN;
-    };
-    const targetLock = order("FROM execution_target WHERE id = ? FOR NO KEY UPDATE");
-    const capacityLock = order("FROM inference_capacity WHERE id IN (");
+    const fenceCalls = db.$queryRaw.mock.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ index }) => sql(index).includes("wsmp_acquire_fences"));
+    expect(fenceCalls.map(({ call }) => call[1])).toEqual([
+      ["00:owner:user-id"],
+      ["06:capacity-policy:execution-target-id", "08:capacity:capacity-id"],
+    ]);
+    const orderOf = (position: number) =>
+      db.$queryRaw.mock.invocationCallOrder[fenceCalls[position]?.index ?? -1] ?? Number.NaN;
+    const ownerFence = orderOf(0);
+    const policyFence = orderOf(1);
     const firstOf = (mock: MockInstance) => mock.mock.invocationCallOrder[0] ?? Number.NaN;
-    expect(firstOf(db.cliDevice.upsert)).toBeLessThan(targetLock);
-    expect(targetLock).toBeLessThan(firstOf(db.endpoint.upsert));
-    expect(targetLock).toBeLessThan(firstOf(db.discoveredModel.upsert));
-    expect(capacityLock).toBeGreaterThan(firstOf(db.discoveredModel.upsert));
-    expect(capacityLock).toBeLessThan(firstOf(db.inferenceCapacity.updateMany));
-    // The L2 set is the inventory's existing targets on this device only.
+    expect(ownerFence).toBeLessThan(firstOf(db.user.findUnique));
+    expect(ownerFence).toBeLessThan(firstOf(db.cliDevice.findUnique));
+    expect(firstOf(db.executionTarget.findMany)).toBeLessThan(policyFence);
+    expect(policyFence).toBeLessThan(firstOf(db.cliDevice.upsert));
+    expect(policyFence).toBeLessThan(firstOf(db.endpoint.upsert));
+    expect(policyFence).toBeLessThan(firstOf(db.discoveredModel.upsert));
+    expect(policyFence).toBeLessThan(firstOf(db.inferenceCapacity.updateMany));
+    for (let index = 0; index < db.$queryRaw.mock.calls.length; index += 1) {
+      expect(sql(index)).not.toMatch(/FOR (NO KEY )?UPDATE/);
+    }
+    // The fenced set is the inventory's existing targets on this device only.
+    expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
+      where: { userId_slug: { userId: "user-id", slug: "desktop" } },
+      select: { id: true },
+    });
     expect(db.executionTarget.findMany).toHaveBeenCalledWith({
       where: {
         userId: "user-id",
@@ -433,8 +456,32 @@ describe("capability override origin", () => {
           },
         },
       },
-      select: { id: true },
+      select: { id: true, inferenceCapacityId: true, discoveredModelId: true },
     });
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "ReadCommitted",
+    });
+  });
+
+  it("fences only the owner for a device it has never seen", async () => {
+    db.cliDevice.findUnique.mockResolvedValue(null);
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints({ modelOverride: false }),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const fenceArgs = db.$queryRaw.mock.calls
+      .filter((call) => (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"))
+      .map((call) => call[1]);
+    expect(fenceArgs).toEqual([["00:owner:user-id"]]);
+    expect(db.executionTarget.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: { id: true, inferenceCapacityId: true, discoveredModelId: true },
+      }),
+    );
   });
 
   it("retries a raw policy-lock deadlock and then persists the registration", async () => {

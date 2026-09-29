@@ -1,4 +1,7 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -12,7 +15,7 @@ if (!databaseUrl)
   console.warn("[cache-affinity] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 integration("cache affinity PostgreSQL concurrency and retention", () => {
-  const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+  const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
 
   beforeAll(async () => {
@@ -297,10 +300,10 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     expect(await service.sweepExpiredAffinity({ now: new Date(), limit: 1 })).toBe(0);
   });
 
-  it("holds concurrent remember behind the pool row lock", async () => {
+  it("holds concurrent remember behind the pool's cache-affinity fence", async () => {
     if (!db || !databaseUrl) return;
     const row = await fixture();
-    const blocker = createPrismaClient(databaseUrl);
+    const blocker = createFixturePrismaClient(databaseUrl);
     let releaseLock!: () => void;
     let signalLockAcquired!: () => void;
     const lockAcquired = new Promise<void>((resolve) => {
@@ -310,7 +313,9 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       releaseLock = resolve;
     });
     const lock = blocker.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${row.pool.id} FOR UPDATE`;
+      // The fence the writer (and the dashboard clear) takes; under DL-1 (d)
+      // affinity writes lock no graph row.
+      await acquireFences(tx, [fences.cacheAffinity(row.owner.id, row.pool.id)]);
       signalLockAcquired();
       await release;
     });

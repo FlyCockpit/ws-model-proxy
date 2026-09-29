@@ -192,7 +192,7 @@ fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
-        kill_group(pid);
+        kill_run(pid);
         #[cfg(not(unix))]
         {
             drop(registry);
@@ -231,7 +231,7 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
         // reaped and recycled.
         #[cfg(unix)]
         for pid in groups {
-            kill_group(pid);
+            kill_run(pid);
         }
         // Elsewhere `taskkill` blocks: signal after unlocking.
         #[cfg(not(unix))]
@@ -549,6 +549,23 @@ fn kill_group(pid: u32) {
     );
 }
 
+/// Everything a registered run started: its group AND the direct child by pid
+/// (it may have left the group; while registered it is unreaped, so its pid
+/// cannot be recycled, the same argument as for the group id).
+#[cfg(unix)]
+fn kill_run(pid: u32) {
+    kill_group(pid);
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    if raw > 1 {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(raw),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
 #[cfg(not(unix))]
 fn kill_group(pid: u32) {
     // No process groups: end the whole tree, bounded so a stuck `taskkill`
@@ -711,6 +728,25 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!begin_spawn_in(shared), "nothing starts after the exit");
+    }
+
+    /// A registered run whose direct child left its process group (here: it
+    /// never had its own group, so `killpg(pid)` finds nothing) is still
+    /// killed at exit: the registry kills the child by pid as well.
+    #[cfg(unix)]
+    #[test]
+    fn exit_kills_a_registered_child_that_is_not_a_group_leader() {
+        let shared = fresh_registry();
+        assert!(begin_spawn_in(shared));
+        // No `process_group(0)`: the child shares this test's group.
+        let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        assert!(register_in(shared, child.id()));
+        kill_all_in(shared);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the registered child survived");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

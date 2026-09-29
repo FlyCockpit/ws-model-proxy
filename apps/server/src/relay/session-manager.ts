@@ -1506,6 +1506,11 @@ export class RelaySessionManager {
     }
   }
 
+  /** A pool's metric routing rules were replaced: clear its stored verdicts. */
+  async onPoolRoutingRulesChanged(poolId: string): Promise<void> {
+    await this.routingEvaluator.clearPool(poolId);
+  }
+
   /** The dashboard or MCP changed a device's remote metric sources. */
   async onRemoteMetricSourcesChanged(cliDeviceId: string) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);

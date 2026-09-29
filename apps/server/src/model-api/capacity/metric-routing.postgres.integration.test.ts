@@ -1,4 +1,5 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 import type { AdmissionAttempt, AdmissionResult, CapacityLeaseHandle } from "./types.js";
 
@@ -14,7 +15,7 @@ if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   );
 const integration = databaseUrl ? describe : describe.skip;
 
-type Db = ReturnType<typeof createPrismaClient>;
+type Db = ReturnType<typeof createFixturePrismaClient>;
 
 async function fixture(db: Db) {
   // The store module imports the default client, which validates the env.
@@ -143,7 +144,7 @@ async function requestState(db: Db, attemptId: string) {
 integration("PostgreSQL metric routing at grant time", () => {
   it("does not grant a queued waiter on a metric-FULL member, and grants it elsewhere", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -177,7 +178,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("fails open when every candidate is metric-FULL, and logs it", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -207,7 +208,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("counts a last-chance sibling as a live candidate: no fail-open past a non-FULL member", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -246,7 +247,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("a release-driven fill pass does not fail open past a sibling still owed its last chance", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -284,7 +285,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("an out-of-window sibling on another capacity does not block the fail-open", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -317,7 +318,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("keeps an :external shortened-phase request waiting instead of failing open", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -342,7 +343,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("ignores an expired verdict and never gates on avoid", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -360,7 +361,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("skips a metric-FULL first candidate in the creating pass", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const f = await fixture(db);
     try {
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -375,7 +376,7 @@ integration("PostgreSQL metric routing at grant time", () => {
 
   it("reads verdicts without locks: a held verdict row lock does not block admission", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const holder = createPrismaClient(databaseUrl);
     const f = await fixture(db);
     let release!: () => void;

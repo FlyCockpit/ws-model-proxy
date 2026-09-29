@@ -1,3 +1,4 @@
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -11,6 +12,9 @@ const T0 = new Date("2026-03-01T00:00:00.000Z");
 integration("pool member half-open trial lease (PostgreSQL)", () => {
   let prisma: typeof import("@ws-model-proxy/db").default;
   let routing: typeof import("./model-pool-routing");
+  // Fixture rows (graph tables) are created through the fixture client, which
+  // takes no writer fences; the code under test uses the shared client.
+  let fixtures: ReturnType<typeof createFixturePrismaClient>;
   const memberIds: string[] = [];
 
   beforeAll(async () => {
@@ -19,15 +23,16 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
     process.env.NODE_ENV = "test";
     prisma = (await import("@ws-model-proxy/db")).default;
     routing = await import("./model-pool-routing");
+    fixtures = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
-    const user = await prisma.user.create({
+    const user = await fixtures.user.create({
       data: {
         name: "Trial lease",
         email: `trial-lease-${suffix}@example.test`,
         slug: `trial-lease-${suffix}`,
       },
     });
-    const capacity = await prisma.inferenceCapacity.create({
+    const capacity = await fixtures.inferenceCapacity.create({
       data: {
         userId: user.id,
         label: `trial-lease-${suffix}`,
@@ -36,7 +41,7 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
         hardConcurrencyLimit: 4,
       },
     });
-    const account = await prisma.providerAccount.create({
+    const account = await fixtures.providerAccount.create({
       data: {
         userId: user.id,
         providerType: "proof",
@@ -46,10 +51,10 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
         authType: "BEARER",
       },
     });
-    const model = await prisma.providerModel.create({
+    const model = await fixtures.providerModel.create({
       data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
     });
-    const target = await prisma.executionTarget.create({
+    const target = await fixtures.executionTarget.create({
       data: {
         userId: user.id,
         kind: "PROVIDER_MODEL",
@@ -60,14 +65,14 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
     // One pool and member per case: cases never share a row. Provider targets
     // are external fallback members, which is enough for the claim under test.
     for (let index = 0; index < 20; index += 1) {
-      const pool = await prisma.modelPool.create({
+      const pool = await fixtures.modelPool.create({
         data: {
           userId: user.id,
           slug: `trial-lease-${index}-${suffix}`,
           name: `Trial lease ${index}`,
         },
       });
-      const member = await prisma.poolMember.create({
+      const member = await fixtures.poolMember.create({
         data: {
           poolId: pool.id,
           executionTargetId: target.id,
@@ -81,6 +86,7 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
 
   afterAll(async () => {
     // Fixture rows carry unique identities; nothing here is shared or global.
+    await fixtures?.$disconnect();
     await prisma?.$disconnect();
   });
 

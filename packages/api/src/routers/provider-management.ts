@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -8,8 +9,6 @@ import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
-  lockExecutionTargetIdentities,
-  lockExecutionTargetPolicies,
 } from "../lib/capacity-policy-safety";
 import { isMcpSession } from "../lib/mcp-session";
 import {
@@ -81,13 +80,14 @@ const providerWriteTransaction = {
 } as const;
 
 /**
- * Provider order in capacity-lock-order.ts: account -> pricing advisory ->
- * model -> pricing rows -> child inserts. Lock both FK parents explicitly so
- * pricing/audit inserts cannot acquire them in RI trigger order. These writers
- * never create targets or edit capacity policy, so they need no L0 fence.
+ * Provider order in capacity-lock-order.ts: owner fence -> pricing fence ->
+ * account -> model -> pricing rows -> child inserts. Lock both FK parents
+ * explicitly so pricing/audit inserts re-enter held rows. These writers never
+ * create targets or edit capacity policy, so they need no identity fence.
  * The model's non-key pricing fields need only NO KEY UPDATE, which also
- * stays compatible with target-insert FK KEY SHARE during pool setup.
- * Call inside the same serializable transaction as the identity pre-read and
+ * stays compatible with target-insert FK KEY SHARE during pool setup. Call
+ * before the transaction's first row lock or write (the fences come first),
+ * inside the same serializable transaction as the identity pre-read and
  * writes; a concurrent graph change aborts the snapshot instead of bypassing
  * ownership/liveness checks. The locks last through the final audit insert.
  */
@@ -96,12 +96,12 @@ async function lockPricingParents(
   userId: string,
   identity: { providerAccountId: string; providerModelId: string },
 ): Promise<void> {
+  await acquireFences(tx, [fences.owner(userId), fences.pricing(userId, identity.providerModelId)]);
   const accounts = await tx.$queryRaw<Array<{ id: string }>>`
     SELECT id FROM provider_account
     WHERE id = ${identity.providerAccountId} AND "userId" = ${userId}
       AND "deletedAt" IS NULL FOR UPDATE`;
   if (accounts.length === 0) throw missing();
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${identity.providerModelId}`}, 0))`;
   const models = await tx.$queryRaw<Array<{ id: string }>>`
     SELECT id FROM provider_model
     WHERE id = ${identity.providerModelId} AND "userId" = ${userId}
@@ -495,6 +495,7 @@ export const providerManagementRouter = {
     const userId = context.session.user.id;
     const baseUrl = accountBaseUrl(input.baseUrl);
     return prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [userId]);
       const row = await tx.providerAccount.create({
         data: {
           ...input,
@@ -523,6 +524,7 @@ export const providerManagementRouter = {
         data.baseUrl = accountBaseUrl(data.baseUrl);
       }
       return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${accountId} AND "userId" = ${userId} FOR UPDATE`;
         const current = await tx.providerAccount.findFirst({
           where: { id: accountId, userId, deletedAt: null },
@@ -601,6 +603,7 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
           where: { id: input.id, userId, deletedAt: null },
@@ -664,6 +667,8 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        // Writer class M: the owner fence before the account row.
+        await fenceOwners(tx, [userId]);
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
           where: { id: input.id, userId, deletedAt: null },
@@ -702,6 +707,7 @@ export const providerManagementRouter = {
     const userId = context.session.user.id;
     const now = new Date();
     await prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [userId]);
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
       const account = await tx.providerAccount.findFirst({
         where: { id: input.id, userId, deletedAt: null },
@@ -750,6 +756,7 @@ export const providerManagementRouter = {
     enabled();
     const userId = context.session.user.id;
     return prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [userId]);
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
       const account = await tx.providerAccount.findFirst({
         where: { id: input.providerAccountId, userId, deletedAt: null },
@@ -793,10 +800,25 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const { id: modelId, ...data } = input;
       const { row, advisoryRequested } = await runSerializableTransaction(async (tx) => {
-        // This pre-row identity fence is always first, matching provider
-        // attachment/setup paths even when the execution target does not yet
-        // exist.
-        await lockExecutionTargetIdentities(tx, [`provider-model:${modelId}`]);
+        await fenceOwners(tx, [userId]);
+        // The identity fence, matching provider attachment/setup paths even
+        // when the execution target does not yet exist, then (for a limit
+        // edit) the target's capacity-policy fence and its capacity's fence,
+        // all before the account and model rows.
+        const policyEdit = data.concurrencyLimit !== undefined || data.contextWindow !== undefined;
+        const plannedTarget = policyEdit
+          ? await tx.executionTarget.findUnique({
+              where: { providerModelId: modelId },
+              select: { id: true, inferenceCapacityId: true },
+            })
+          : null;
+        await acquireFences(tx, [
+          fences.targetIdentity(`provider-model:${modelId}`),
+          ...(plannedTarget ? [fences.capacityPolicy(plannedTarget.id)] : []),
+          ...(plannedTarget?.inferenceCapacityId
+            ? [fences.capacity(plannedTarget.inferenceCapacityId)]
+            : []),
+        ]);
         await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${modelId} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
         await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
         const current = await tx.providerModel.findFirst({
@@ -809,16 +831,11 @@ export const providerManagementRouter = {
         });
         if (!account) throw missing();
         assertInventoryMatchesProviderType(account.providerType, data.nativeCapabilities);
-        if (data.concurrencyLimit !== undefined || data.contextWindow !== undefined) {
-          const targetIdentity = await tx.executionTarget.findUnique({
-            where: { providerModelId: modelId },
-            select: { id: true, inferenceCapacityId: true },
-          });
-          if (targetIdentity) await lockExecutionTargetPolicies(tx, [targetIdentity.id]);
-          if (targetIdentity?.inferenceCapacityId)
-            await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${targetIdentity.inferenceCapacityId} AND "userId" = ${userId} FOR UPDATE`;
+        if (policyEdit) {
+          const targetIdentity = plannedTarget;
           // All mutable policy inputs are deliberately read only after both the
-          // target policy fence and the physical-capacity row lock are held.
+          // target policy fence and the physical-capacity fence are held (the
+          // owner fence keeps the target's capacity attachment stable).
           const reloadedTarget = await tx.executionTarget.findUnique({
             where: { providerModelId: modelId },
             select: {
@@ -930,6 +947,7 @@ export const providerManagementRouter = {
     readRevokeOrDeleteAllowed();
     const userId = context.session.user.id;
     await prisma.$transaction(async (tx) => {
+      await fenceOwners(tx, [userId]);
       await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${input.id} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
       const current = await tx.providerModel.findFirst({
@@ -988,6 +1006,7 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const model = await tx.providerModel.findFirst({
           where: {
             id: input.providerModelId,
@@ -1038,6 +1057,7 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const { id: pricingId, ratesPerMillion, chargeRules: rules, ...data } = input;
       return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const current = await tx.providerPricingVersion.findFirst({
           where: {
             id: pricingId,
@@ -1074,6 +1094,7 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const now = new Date();
         const candidate = await tx.providerPricingVersion.findFirst({
           where: {
@@ -1137,6 +1158,7 @@ export const providerManagementRouter = {
       readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const current = await tx.providerPricingVersion.findFirst({
           where: {
             id: input.id,
@@ -1175,6 +1197,7 @@ export const providerManagementRouter = {
       readRevokeOrDeleteAllowed();
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const current = await tx.providerPricingVersion.findFirst({
           where: {
             id: input.id,
@@ -1225,6 +1248,7 @@ export const providerManagementRouter = {
       const credentialId = randomUUID();
       return prisma.$transaction(
         async (tx) => {
+          await fenceOwners(tx, [userId]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} AND "deletedAt" IS NULL FOR UPDATE`;
           const account = await tx.providerAccount.findFirst({
             where: { id: input.providerAccountId, userId, deletedAt: null },
@@ -1284,6 +1308,7 @@ export const providerManagementRouter = {
       const credentialId = randomUUID();
       return prisma.$transaction(
         async (tx) => {
+          await fenceOwners(tx, [userId]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} AND "deletedAt" IS NULL FOR UPDATE`;
           const account = await tx.providerAccount.findFirst({
             where: { id: input.providerAccountId, userId, deletedAt: null },
@@ -1360,6 +1385,7 @@ export const providerManagementRouter = {
       if (!candidate) throw missing();
       await prisma.$transaction(
         async (tx) => {
+          await fenceOwners(tx, [userId]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${candidate.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${candidate.id} AND "userId" = ${userId} FOR UPDATE`;
           const row = await tx.providerCredential.findFirst({
@@ -1773,6 +1799,7 @@ export const providerManagementRouter = {
       if (!candidate) throw missing();
       return prisma.$transaction(
         async (tx) => {
+          await fenceOwners(tx, [userId]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${candidate.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${candidate.id} AND "userId" = ${userId} FOR UPDATE`;
           const row = await tx.providerCredential.findFirst({
@@ -1906,6 +1933,7 @@ export const providerManagementRouter = {
       // explicit and covers non-DB side effects of the transaction).
       throwIfCallerAborted();
       await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         // Match every credential lifecycle mutation's account-then-credential
         // lock order. The credential may have been revoked (or removed) while
         // the network request was in flight; that must not erase the attempt.
@@ -1957,7 +1985,8 @@ export const providerManagementRouter = {
       )
         throw new ORPCError("BAD_REQUEST");
       return prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${input.providerAccountId}`}, 0))`;
+        await fenceOwners(tx, [userId]);
+        await acquireFences(tx, [fences.budgetAccount(userId, input.providerAccountId)]);
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
           where: { id: input.providerAccountId, userId, deletedAt: null },
@@ -2027,7 +2056,8 @@ export const providerManagementRouter = {
       if (!current) throw missing();
       return prisma.$transaction(
         async (tx) => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${current.providerAccountId}`}, 0))`;
+          await fenceOwners(tx, [userId]);
+          await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
@@ -2098,7 +2128,8 @@ export const providerManagementRouter = {
       if (!current) throw missing();
       await prisma.$transaction(
         async (tx) => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${current.providerAccountId}`}, 0))`;
+          await fenceOwners(tx, [userId]);
+          await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({

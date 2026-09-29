@@ -390,13 +390,13 @@ export const auth = betterAuth({
       delete: {
         // Admin remove-user (and the self-service delete-user route, which is
         // not enabled) reach internalAdapter.deleteUser after deleting the
-        // user's sessions and accounts. Its plain adapter DELETE would cascade
-        // into capacity rows while admissions hold capacity locks (DL-1), and
-        // through the whole request history under one statement. The hook
-        // performs the durable, bounded delete itself
+        // user's sessions and accounts. Its plain adapter DELETE would bypass
+        // the owner fences every graph write takes (DL-1 writer class M; the
+        // graph-write fence trigger refuses it) and the history drain. The
+        // hook performs the durable, bounded delete itself
         // (@ws-model-proxy/db/parent-deletion: preflight, deletion marker and
-        // ban, history drain in short batches, then the capacity-graph delete
-        // in lock order) and returns false so Better Auth skips its own
+        // ban, history drain in short batches, then the graph delete under
+        // owner fences) and returns false so Better Auth skips its own
         // DELETE. Retained history was already refused before sessions and
         // accounts were touched (./user-deletion-preflight.ts). If completion
         // fails transiently the marker stays and the deletion sweeper finishes

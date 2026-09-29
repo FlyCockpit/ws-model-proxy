@@ -14,6 +14,7 @@
  * The inputs are numbers, names and labels only; no prompt text reaches here.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   type EndpointLoadSample,
   endpointLoadSeries,
@@ -37,6 +38,8 @@ export type RoutingEvaluationInputs = {
 
 /** Held by one relay session. */
 export type RoutingEvaluationState = {
+  /** Identifies this state as the publisher of the verdict rows it writes. */
+  publisherId: string;
   userId: string;
   cliDeviceId: string;
   lastRunAtMs: number | null;
@@ -52,6 +55,7 @@ export function createRoutingEvaluationState(
   cliDeviceId: string,
 ): RoutingEvaluationState {
   return {
+    publisherId: randomUUID(),
     userId,
     cliDeviceId,
     lastRunAtMs: null,
@@ -76,6 +80,7 @@ function rulesKey(rules: unknown): string {
 }
 
 type VerdictData = {
+  publisherId: string;
   userId: string;
   poolId: string;
   cliDeviceId: string;
@@ -199,6 +204,7 @@ export class MetricRoutingEvaluator {
         continue;
       }
       const data = {
+        publisherId: state.publisherId,
         userId: state.userId,
         poolId: member.poolId,
         cliDeviceId: state.cliDeviceId,
@@ -225,15 +231,24 @@ export class MetricRoutingEvaluator {
   }
   /**
    * The ONE write of a verdict: never older than what is stored. The row is
-   * updated only while its `evaluatedAt` is not newer than this
-   * evaluation's; a missing row is created, and losing that creation race
-   * (unique violation) is decided again by `evaluatedAt`: only a NEWER row
-   * makes this evaluation lose. True when this evaluation's verdict is now
-   * the stored one.
+   * replaced only when its `evaluatedAt` is strictly older than this
+   * evaluation's, or is this same publisher's own row (an equal timestamp
+   * from ANOTHER publisher belongs to whoever wrote first, so a cancelled
+   * session's delayed write cannot overwrite its successor even within one
+   * millisecond). A missing row is created, and losing that creation race
+   * (unique violation) is decided again the same way. True when this
+   * evaluation's verdict is now the stored one.
    */
   private async publish(memberId: string, data: VerdictData): Promise<boolean> {
+    const replaceable = {
+      poolMemberId: memberId,
+      OR: [
+        { evaluatedAt: { lt: data.evaluatedAt } },
+        { evaluatedAt: data.evaluatedAt, publisherId: data.publisherId },
+      ],
+    };
     const updated = await this.db.poolMemberRoutingVerdict.updateMany({
-      where: { poolMemberId: memberId, evaluatedAt: { lte: data.evaluatedAt } },
+      where: replaceable,
       data,
     });
     if (updated.count > 0) return true;
@@ -245,7 +260,7 @@ export class MetricRoutingEvaluator {
       // Another evaluation created the row first. It may be an OLDER one, so
       // decide by `evaluatedAt` again instead of assuming a newer wrote.
       const retried = await this.db.poolMemberRoutingVerdict.updateMany({
-        where: { poolMemberId: memberId, evaluatedAt: { lte: data.evaluatedAt } },
+        where: replaceable,
         data,
       });
       return retried.count > 0;
@@ -278,8 +293,22 @@ export class MetricRoutingEvaluator {
     const stale = published.filter((entry) => current.get(entry.poolId) !== entry.rulesKey);
     if (stale.length === 0) return;
     await this.db.poolMemberRoutingVerdict.deleteMany({
-      where: { poolMemberId: { in: stale.map((entry) => entry.memberId) }, evaluatedAt },
+      where: {
+        poolMemberId: { in: stale.map((entry) => entry.memberId) },
+        evaluatedAt,
+        publisherId: state.publisherId,
+      },
     });
     for (const entry of stale) state.written.delete(entry.memberId);
+  }
+
+  /**
+   * A pool's rules were replaced (the rule editor committed): its stored
+   * verdicts belong to the old rules. Cleared here, in the hot-path (H)
+   * module, because a management writer must not write H tables; an
+   * evaluation still in flight is retracted by `retractIfRulesChanged`.
+   */
+  async clearPool(poolId: string): Promise<void> {
+    await this.db.poolMemberRoutingVerdict.deleteMany({ where: { poolId } });
   }
 }

@@ -5,7 +5,8 @@ import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
-  lockExecutionTargetPolicies,
+  fenceExecutionTargetIdentities,
+  fenceExecutionTargetPolicies,
 } from "./capacity-policy-safety";
 
 function thrownBy(action: () => void): ORPCError {
@@ -323,20 +324,41 @@ describe("capacity policy safety", () => {
     ).toBeUndefined();
   });
 
-  it("locks unique execution targets in stable lexical order", async () => {
-    const query = vi.fn().mockResolvedValue([]);
+  it("fences unique execution-target policies in one sorted call, without row locks", async () => {
+    const query = vi.fn().mockResolvedValue([{ acquired: true }]);
     const execute = vi.fn().mockResolvedValue(1);
-    await lockExecutionTargetPolicies({ $queryRaw: query, $executeRaw: execute } as never, [
+    await fenceExecutionTargetPolicies({ $queryRaw: query, $executeRaw: execute } as never, [
       "z",
       "a",
       "z",
     ]);
-    expect(query).toHaveBeenCalledTimes(2);
-    expect(execute).toHaveBeenCalledTimes(2);
-    expect(String(execute.mock.calls[0]?.[0]?.[0])).toContain("pg_advisory_xact_lock");
-    expect(query.mock.calls[0]?.slice(1)).toEqual(["a"]);
-    expect(execute.mock.calls[0]?.slice(1)).toEqual(["capacity-policy:a"]);
-    expect(query.mock.calls[1]?.slice(1)).toEqual(["z"]);
-    expect(execute.mock.calls[1]?.slice(1)).toEqual(["capacity-policy:z"]);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(String(query.mock.calls[0]?.[0]?.join("?"))).toContain("wsmp_acquire_fences");
+    expect(query.mock.calls[0]?.slice(1)).toEqual([
+      ["06:capacity-policy:a", "06:capacity-policy:z"],
+      true,
+    ]);
+  });
+
+  it("fences execution-target identities at level 02 in one sorted call", async () => {
+    const query = vi.fn().mockResolvedValue([{ acquired: true }]);
+    const execute = vi.fn().mockResolvedValue(1);
+    await fenceExecutionTargetIdentities({ $queryRaw: query, $executeRaw: execute } as never, [
+      "provider-model:b",
+      "provider-model:a",
+    ]);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(query.mock.calls[0]?.slice(1)).toEqual([
+      ["02:execution-target:provider-model:a", "02:execution-target:provider-model:b"],
+      true,
+    ]);
+  });
+
+  it("takes no fence for an empty target set", async () => {
+    const query = vi.fn();
+    await fenceExecutionTargetPolicies({ $queryRaw: query } as never, []);
+    expect(query).not.toHaveBeenCalled();
   });
 });

@@ -52,6 +52,7 @@ const db = prisma as unknown as {
   discoveredModel: { findMany: MockInstance };
   executionTarget: { findMany: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
+  poolMember: { findMany: MockInstance };
   mcpPersonalToken: { findFirst: MockInstance };
 };
 
@@ -266,6 +267,7 @@ describe("supervised commands", () => {
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([]);
   });
 
   afterEach(async () => {

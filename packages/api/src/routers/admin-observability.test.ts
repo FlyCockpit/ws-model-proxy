@@ -17,6 +17,13 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 
+const relations = prisma as unknown as {
+  user: { findMany: MockInstance };
+  modelApiToken: { findMany: MockInstance };
+  discoveredModel: { findMany: MockInstance };
+  modelPool: { findMany: MockInstance };
+};
+
 const db = prisma as unknown as {
   appSetting: {
     findUnique: MockInstance;
@@ -430,28 +437,32 @@ describe("adminObservabilityRouter", () => {
         providerResponseId: "resp_secret_provider_id",
         routingKeyDigest: "sticky-secret-digest",
         imageBytes: "data:image/png;base64,secret",
-        User: owner(),
-        ModelApiToken: {
-          id: "token-id",
-          name: "Production key",
-          lookupPrefix: "wsmp_model_abcd",
-          secretDigest: "token-secret-digest",
-        },
-        RequestedDiscoveredModel: {
-          id: "model-id",
-          upstreamModelId: "llama",
-          User: { slug: "owner" },
-          Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
-        },
-        RequestedModelPool: null,
-        SelectedDiscoveredModel: {
-          id: "model-id",
-          upstreamModelId: "llama",
-          User: { slug: "owner" },
-          Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
-        },
+        // Hot-path rows carry plain ids (DL-1); relations load by id.
+        userId: owner().id,
+        requestedDiscoveredModelId: "model-id",
+        selectedDiscoveredModelId: "model-id",
+        requestedModelPoolId: null,
       },
     ]);
+
+    relations.user.findMany.mockResolvedValue([owner()]);
+    relations.modelApiToken.findMany.mockResolvedValue([
+      {
+        id: "token-id",
+        name: "Production key",
+        lookupPrefix: "wsmp_model_abcd",
+        secretDigest: "token-secret-digest",
+      },
+    ]);
+    relations.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "model-id",
+        upstreamModelId: "llama",
+        User: { slug: "owner" },
+        Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
+      },
+    ]);
+    relations.modelPool.findMany.mockResolvedValue([]);
 
     const createdAfter = new Date("2026-01-01T00:00:00.000Z");
     const result = await client().listRelayMetadataSummaries({

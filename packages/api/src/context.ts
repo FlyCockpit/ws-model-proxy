@@ -80,6 +80,13 @@ export type ContextServices = {
    */
   onRemoteMetricSourcesChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
   /**
+   * A pool's metric routing rules were replaced (committed). The relay clears
+   * the pool's stored verdicts: they are hot-path (H) rows, which a management
+   * (M) writer must not write, so the clearing runs in the H module after
+   * the rules commit.
+   */
+  onPoolRoutingRulesChanged?: (poolId: string) => Promise<void>;
+  /**
    * Close live relay sessions authenticated by credentials that were just
    * revoked (re-login, CLI token revoke). Called after the revoking write
    * commits. Per-process: it reaches the sessions this server holds.

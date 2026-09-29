@@ -2,6 +2,7 @@ import { appendFileSync } from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { Context } from "../context";
 
@@ -84,7 +85,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, deletion, order, forwarder, capacity, users, auth, listeners, fence, deadline] =
+    const [, deletion, order, forwarder, capacity, users, auth, listeners, fence, deadline] =
       await Promise.all([
         import("@ws-model-proxy/db"),
         import("@ws-model-proxy/db/parent-deletion"),
@@ -100,7 +101,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const clientFactory = await import("@ws-model-proxy/db/client-factory");
     const timeouts = await import("../../../../apps/server/src/shutdown-timeouts.js");
     modules = {
-      prisma: db.default,
+      prisma: createFixturePrismaClient(databaseUrl!),
       observer: clientFactory.createPrismaClient(databaseUrl),
       deletion,
       order,
@@ -226,41 +227,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     );
   }
 
-  /** A released capacity lease on the graph: RESTRICT-protected history. */
-  async function leaseHistory(g: Graph) {
-    const db = required().prisma;
-    const request = await db.admissionRequest.create({
-      data: {
-        userId: g.user.id,
-        requestId: `${g.suffix}-lease`,
-        attemptId: `${g.suffix}-lease`,
-        sourceKind: "DIRECT",
-        directExecutionTargetId: g.target.id,
-        basePriority: 16,
-        enqueueSequence: 1n,
-        connectionOwner: "fixture",
-        heartbeatAt: new Date(),
-        state: "TERMINAL",
-        terminalAt: new Date(),
-      },
-    });
-    await db.capacityLease.create({
-      data: {
-        userId: g.user.id,
-        requestId: request.requestId,
-        attemptId: request.attemptId,
-        admissionRequestId: request.id,
-        capacityId: g.capacityId,
-        executionTargetId: g.target.id,
-        priority: 16,
-        reservationClass: 16,
-        fencingToken: 1n,
-        ownerServerInstance: "fixture",
-        heartbeatAt: new Date(),
-        expiresAt: new Date(Date.now() + 30_000),
-        state: "RELEASED",
-        releasedAt: new Date(),
-      },
+  /**
+   * Provider accounting on the user: retained history a user delete refuses
+   * (OWNER_RETAINED_HISTORY_TABLES). Capacity lease history no longer blocks a
+   * delete under DL-1 (d): hot-path tables carry no foreign key to the graph.
+   */
+  async function retainedHistory(g: Graph) {
+    await required().prisma.providerAuditEvent.create({
+      data: { userId: g.user.id, action: "ACCOUNT_CREATED", subjectId: g.suffix },
     });
   }
 
@@ -324,7 +298,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       expect(drained["admission_request.passed"]).toBe(0);
       const locked = Date.now();
       await expect(
-        order.deleteUserInCapacityLockOrder(prisma, g.user.id, mark!.generation),
+        order.deleteUserUnderOwnerFences(prisma, g.user.id, mark!.generation),
       ).resolves.toBe(true);
       const heldMs = Date.now() - locked;
       report(`user ordered delete (capacity locks held at most): ${heldMs} ms`);
@@ -396,7 +370,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       // account, so the user is not stranded.
       const retained = await graph("ba-retained");
       await relayHistory(retained, "own", SMALL);
-      await leaseHistory(retained);
+      await retainedHistory(retained);
       await prisma.session.create({
         data: {
           userId: retained.user.id,
@@ -432,7 +406,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const { prisma, users } = required();
     const g = await graph("retained");
     await relayHistory(g, "own", SMALL);
-    await leaseHistory(g);
+    await retainedHistory(g);
     const admin = await graph("admin2");
     const client = createRouterClient(users.usersRouter, { context: sessionFor(admin.user) });
     await expect(client.remove({ userId: g.user.id })).rejects.toMatchObject({
@@ -864,6 +838,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const { prisma, deletion } = required();
     const g = await graph("held-waiter");
     await terminalAdmissions(g, 3);
+    // Only a whole-user delete drains history under DL-1 (d).
+    const mark = await deletion.requestUserDeletion(prisma, g.user.id);
     // The retention sweeper or an admitter holding one waiter row.
     const held = await holdRowLock(
       `SELECT id FROM capacity_waiter WHERE id = '${g.suffix}-tw-1' FOR UPDATE`,
@@ -873,7 +849,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       // lock_timeout, not ok with the request passed: `ok` plus `passed === 1`
       // proves it did not wait, with no wall-clock bound to flake.
       const outcome = await settle(
-        deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] }),
+        deletion.prepareParentDeletion(
+          prisma,
+          { userId: g.user.id, wholeUser: true },
+          { owner: { userId: g.user.id, generation: mark!.generation } },
+        ),
       );
       if (!outcome.ok) throw new Error("drain did not finish");
       expect(outcome.value["admission_request.passed"]).toBe(1);
@@ -884,7 +864,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       await held.release();
     }
     // Once the row is free the next run takes it.
-    await deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] });
+    await deletion.prepareParentDeletion(
+      prisma,
+      { userId: g.user.id, wholeUser: true },
+      { owner: { userId: g.user.id, generation: mark!.generation } },
+    );
     expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
   });
 
@@ -898,20 +882,23 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const cap = 100;
     const over = cap + 1;
     await terminalAdmissions(g, over);
+    const mark = await deletion.requestUserDeletion(prisma, g.user.id);
     // Every waiter held by one other transaction: each request is passed.
     const held = await holdRowLock(
       `SELECT id FROM capacity_waiter WHERE "poolId" = '${g.pool.id}' FOR UPDATE`,
     );
     try {
-      // The drain itself, not prepareParentDeletion (C21-T1): its residual
-      // recount (requests plus waiters, above the final-phase bound) raises
-      // the same error, so it would pass without the passed-admission cap.
+      // The drain itself, with a small passed-admission cap (C21-T1). Only a
+      // whole-user delete drains under DL-1 (d).
       const parents = await deletion.resolveDeletedParents(prisma, {
         userId: g.user.id,
-        poolIds: [g.pool.id],
+        wholeUser: true,
       });
       const outcome = await settle(
-        deletion.drainParentDeletionHistory(prisma, parents, { maxPassedAdmissions: cap }),
+        deletion.drainParentDeletionHistory(prisma, parents, {
+          maxPassedAdmissions: cap,
+          owner: { userId: g.user.id, generation: mark!.generation },
+        }),
       );
       expect(outcome.ok).toBe(false);
       if (outcome.ok) throw new Error("the drain carried an unbounded passed list");
@@ -924,7 +911,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       await held.release();
     }
     // Inverse: once the waiters are free the next run drains every request.
-    await deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] });
+    await deletion.prepareParentDeletion(
+      prisma,
+      { userId: g.user.id, wholeUser: true },
+      { owner: { userId: g.user.id, generation: mark!.generation } },
+    );
     expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
   }, 120_000);
 
@@ -1114,10 +1105,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       .prisma.$transaction(
         async (tx) => {
           await tx.$executeRawUnsafe("SET LOCAL deadlock_timeout = '150ms'");
-          // What admission holds (target, L2) before it inserts rows that
-          // take FOR KEY SHARE on the user (L7).
+          // What admission holds (the execution_target row) before it inserts
+          // rows that take FOR KEY SHARE on the user (the L7 user lock).
           await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${g.target.id} FOR UPDATE`;
-          deleting = order.deleteUserInCapacityLockOrder(prisma, g.user.id, mark!.generation);
+          deleting = order.deleteUserUnderOwnerFences(prisma, g.user.id, mark!.generation);
           // Wait until the delete is blocked on the target lock.
           for (let attempt = 0; attempt < 200; attempt += 1) {
             const [{ waiting }] = await prisma.$queryRaw<[{ waiting: bigint }]>`
@@ -1171,7 +1162,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       { timeout: 30_000 },
     );
     await isHeld;
-    const deleting = order.deleteUserInCapacityLockOrder(prisma, g.user.id, mark!.generation);
+    const deleting = order.deleteUserUnderOwnerFences(prisma, g.user.id, mark!.generation);
     await new Promise((resolve) => setTimeout(resolve, 200));
     release();
     await abandoning;
@@ -1180,7 +1171,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   });
 
   it(
-    "deleteModelPool detaches a large relay history and drains terminal admissions",
+    "deleteModelPool leaves a large relay and admission history in place, fast (DL-1 (d))",
     async () => {
       const { forwarder } = required();
       const g = await graph("pool");
@@ -1193,14 +1184,16 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         timed("deleteModelPool total", () => client.deleteModelPool({ id: g.pool.id })),
       ).resolves.toEqual({ deleted: true });
       expect(await count(`relay_request WHERE "userId" = '${g.user.id}'`)).toBe(ROWS);
-      expect(await count(`relay_request WHERE "requestedModelPoolId" = '${g.pool.id}'`)).toBe(0);
-      expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
+      // Nothing cascades into the hot path: the rows keep the pool's
+      // (now dangling) id; retention prunes terminal admissions later.
+      expect(await count(`relay_request WHERE "requestedModelPoolId" = '${g.pool.id}'`)).toBe(ROWS);
+      expect(await count(`admission_request WHERE "poolId" = '${g.pool.id}'`)).toBe(ADMISSIONS);
     },
     TIMEOUT * 2,
   );
 
   it(
-    "removeEndpointMetadata detaches direct-model relay history (the route's shape)",
+    "removeEndpointMetadata leaves direct-model relay history in place (DL-1 (d))",
     async () => {
       const { forwarder } = required();
       const g = await graph("endpoint");
@@ -1216,13 +1209,14 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       expect(await count(`relay_request WHERE "userId" = '${g.user.id}'`)).toBe(ROWS);
       expect(
         await count(`relay_request WHERE "selectedExecutionTargetId" = '${g.target.id}'`),
-      ).toBe(0);
+      ).toBe(ROWS);
+      expect(await required().prisma.executionTarget.count({ where: { id: g.target.id } })).toBe(0);
     },
     TIMEOUT * 2,
   );
 
   it(
-    "device, model and member deletes and capacity removal drain their history too",
+    "device, model and member deletes and capacity removal leave their history in place (DL-1 (d))",
     async () => {
       const { prisma, forwarder, capacity } = required();
       const rows = Math.min(ROWS, 20_000);
@@ -1263,8 +1257,10 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       ).resolves.toEqual({ deleted: true });
       expect(
         await count(`relay_request WHERE "selectedPoolMemberId" = '${member.member.id}'`),
-      ).toBe(0);
-      expect(await count(`capacity_waiter WHERE "poolMemberId" = '${member.member.id}'`)).toBe(0);
+      ).toBe(rows);
+      expect(await count(`capacity_waiter WHERE "poolMemberId" = '${member.member.id}'`)).toBe(
+        ADMISSIONS,
+      );
 
       const spare = await prisma.inferenceCapacity.create({
         data: {
@@ -1740,16 +1736,13 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           label: "race",
         },
       });
-      const model = await prisma.discoveredModel.create({
+      await prisma.discoveredModel.create({
         data: {
           userId: victim.user.id,
           endpointId: endpoint.id,
           upstreamModelId: "race-model",
           encodedModelId: `race-${victim.suffix}`,
         },
-      });
-      const target = await prisma.executionTarget.findUniqueOrThrow({
-        where: { discoveredModelId: model.id },
       });
       const login = await auth.auth.api.signInEmail({
         body: { email: admin.user.email, password },
@@ -1767,37 +1760,13 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         const result = await originalDeleteMany(args);
         if (args.model === "account" && !inserted) {
           inserted = true;
-          const request = await prisma.admissionRequest.create({
+          // Retained provider history (lease history no longer blocks a
+          // delete under DL-1 (d)).
+          await prisma.providerAuditEvent.create({
             data: {
               userId: victim.user.id,
-              requestId: `race-request-${suffix}`,
-              attemptId: `race-attempt-${suffix}`,
-              sourceKind: "DIRECT",
-              directExecutionTargetId: target.id,
-              basePriority: 16,
-              enqueueSequence: 1n,
-              connectionOwner: "race-probe",
-              heartbeatAt: new Date(),
-              state: "TERMINAL",
-              terminalAt: new Date(),
-            },
-          });
-          await prisma.capacityLease.create({
-            data: {
-              userId: victim.user.id,
-              requestId: request.requestId,
-              attemptId: request.attemptId,
-              admissionRequestId: request.id,
-              capacityId: target.inferenceCapacityId!,
-              executionTargetId: target.id,
-              priority: 16,
-              reservationClass: 16,
-              fencingToken: 1n,
-              ownerServerInstance: "race-probe",
-              heartbeatAt: new Date(),
-              expiresAt: new Date(Date.now() + 60_000),
-              state: "RELEASED",
-              releasedAt: new Date(),
+              action: "ACCOUNT_CREATED",
+              subjectId: `race-${suffix}`,
             },
           });
         }
@@ -1968,55 +1937,27 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   });
 
   it(
-    "counts live PENDING relay rows toward the final-phase bound for a user delete (r2 P2)",
+    "live PENDING relay rows do not hold a user delete back; they stay for the purge queue (DL-1 (d))",
     async () => {
       const { prisma, deletion } = required();
       const g = await graph("residual-user");
-      const over = deletion.PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS + 1;
+      const live = 50;
       await prisma.$executeRawUnsafe(
         `INSERT INTO relay_request (id, "userId", status)
        SELECT '${g.suffix}-live-' || n, '${g.user.id}', 'PENDING'
-         FROM generate_series(1, ${over}) n`,
+         FROM generate_series(1, ${live}) n`,
       );
       const mark = await deletion.requestUserDeletion(prisma, g.user.id);
       await expect(
         deletion.completeUserDeletion(prisma, g.user.id, mark!.generation),
-      ).rejects.toBeInstanceOf(deletion.ParentDeletionDrainPendingError);
-      // Nothing was deleted under the capacity locks; the marker stays for the sweeper.
-      expect(await count(`relay_request WHERE "userId" = '${g.user.id}'`)).toBe(over);
-      expect(
-        (await prisma.user.findUniqueOrThrow({ where: { id: g.user.id } })).deletionGeneration,
-      ).toBe(mark!.generation);
-      // Once the live rows are gone (terminal and drained, or reaped) it completes.
-      await prisma.$executeRawUnsafe(
-        `UPDATE relay_request SET status = 'FAILED' WHERE "userId" = '${g.user.id}'`,
-      );
-      await expect(
-        deletion.completeUserDeletion(prisma, g.user.id, mark!.generation),
       ).resolves.toBe(true);
+      // The drain skips in-flight rows; the final delete touches no hot-path
+      // row, so they remain (orphaned) and the user is queued for the purge.
+      expect(await count(`relay_request WHERE "userId" = '${g.user.id}'`)).toBe(live);
+      expect(await count(`deleted_user_purge WHERE "userId" = '${g.user.id}'`)).toBe(1);
     },
     TIMEOUT,
   );
-
-  it("counts live rows for a non-user parent delete too (pool)", async () => {
-    const { prisma, deletion } = required();
-    const g = await graph("residual-pool");
-    const parents = await deletion.resolveDeletedParents(prisma, {
-      userId: g.user.id,
-      poolIds: [g.pool.id],
-    });
-    await expect(deletion.countFinalPhaseResidualRows(prisma, parents)).resolves.toBe(0);
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${g.suffix}-pool-live-' || n, '${g.user.id}', 'PENDING', '${g.pool.id}'
-         FROM generate_series(1, 30) n`,
-    );
-    await expect(deletion.countFinalPhaseResidualRows(prisma, parents)).resolves.toBe(30);
-    await expect(deletion.countFinalPhaseResidualRows(prisma, parents, 10)).resolves.toBe(10);
-    await expect(
-      deletion.prepareParentDeletion(prisma, { userId: g.user.id, poolIds: [g.pool.id] }),
-    ).resolves.toBeDefined();
-  });
 
   it("returns pending when relay history keeps arriving during the drain", async () => {
     const { prisma, deletion } = required();
@@ -2272,7 +2213,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
   // pending error exactly like 55P03, so a slow cascade answers `delete_pending`
   // rather than failing as a 500, and a user is never abandoned for it.
   it("a statement timeout (57014) becomes pending like a lock timeout (F2-07)", async () => {
-    const { prisma, deletion, order, forwarder } = required();
+    const { prisma, deletion, order } = required();
 
     // (1) A statement that runs past the batch's statement bound with no
     // single lock wait reaching the lock bound: the real server cancels it
@@ -2360,26 +2301,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await prisma.relayRequest.count({ where: { id: relay.id } })).toBe(1);
     expect(await prisma.relayExecutionEvent.count({ where: { relayRequestId: relay.id } })).toBe(5);
 
-    // (3) The pending error's route mapping, not a 57014: a non-user parent
-    // delete whose drain reports pending (here through the residual bound,
-    // which raises the same ParentDeletionDrainPendingError that (1) and (2)
-    // show a 57014 becomes) answers CONFLICT with data.reason
-    // "delete_pending", leaving the pool intact.
-    const pool = await graph("pending-pool");
-    const over = deletion.PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS + 1;
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${pool.suffix}-live-' || n, '${pool.user.id}', 'PENDING', '${pool.pool.id}'
-         FROM generate_series(1, ${over}) n`,
-    );
-    const client = createRouterClient(forwarder.forwarderManagementRouter, {
-      context: sessionFor(pool.user),
-    });
-    await expect(client.deleteModelPool({ id: pool.pool.id })).rejects.toMatchObject({
-      code: "CONFLICT",
-      data: { reason: "delete_pending" },
-    });
-    expect(await prisma.modelPool.count({ where: { id: pool.pool.id } })).toBe(1);
+    // A non-user parent delete has no drain under DL-1 (d) (its final delete
+    // touches no hot-path row), so it has no pending outcome to map.
   }, 30_000);
 
   // ---------------------------------------------------------------------------
@@ -3103,27 +3026,12 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const { prisma, timeouts, order } = required();
     const user = await markedUser("relation-expansion");
     await hideOtherMarkers([user.id]);
-    // A live admission of the user's pool: the final delete reads it with its
-    // waiter and lease relations.
-    const pool = await prisma.modelPool.create({
-      data: { userId: user.id, slug: `pool-${crypto.randomUUID()}`, name: "empty pool" },
-    });
-    await prisma.admissionRequest.create({
-      data: {
-        userId: user.id,
-        requestId: `r-${crypto.randomUUID()}`,
-        attemptId: `a-${crypto.randomUUID()}`,
-        sourceKind: "POOL",
-        poolId: pool.id,
-        basePriority: 16,
-        enqueueSequence: 1n,
-        connectionOwner: "f2-07e",
-        heartbeatAt: new Date(),
-        state: "WAITING",
-      },
-    });
+    // The final transaction's first statements are the consecutive reads of
+    // its delete plan (resolveDeletedParents): the user's devices, then its
+    // discovered models. Under DL-1 (d) the final delete no longer reads any
+    // hot-path relation, so the plan reads stand in for the relation queries.
     const holders: Array<Awaited<ReturnType<typeof holdRowLock>>> = [];
-    const tables = ["capacity_waiter", "capacity_lease"] as const;
+    const tables = ["cli_device", "discovered_model"] as const;
     const handle = await productionSweepHandle();
     const production = handle.prisma;
     const { client, reached } = beforeFinalTransaction(production, async () => {
@@ -3139,7 +3047,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     let seen: Awaited<ReturnType<typeof watch.stop>> = [];
     try {
       await reached;
-      // The first relation query waits on its table's holder.
+      // The first plan read waits on its table's holder.
       const firstPid = await waitForBlocker("SELECT", new Set(holders.map((h) => h.pid)), 15_000);
       const first = holders.find((holder) => holder.pid === firstPid)!;
       const second = holders.find((holder) => holder.pid !== firstPid)!;
@@ -3163,7 +3071,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       // ...and nothing followed it: one statement bound plus the margin, not
       // two statements.
       expectSettledInsideJoin(result);
-      // The other relation's query was never dispatched: no sweep backend
+      // The next plan read was never dispatched: no sweep backend
       // ever waited on the second table's holder.
       expect(seen.filter((row) => row.blockedBy.includes(second.pid))).toEqual([]);
       expect(seen.some((row) => row.blockedBy.includes(first.pid))).toBe(true);
@@ -3771,7 +3679,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const g = await graph("co-owner");
     const outcome = await settle(
       order.runCapacityOrderedTransaction(prisma, (tx) =>
-        order.lockCapacityGraphForDelete(tx, { userId: g.user.id, wholeUser: true }),
+        order.fenceParentDelete(tx, { userId: g.user.id, wholeUser: true }),
       ),
     );
     expect(outcome.ok).toBe(false);
@@ -3972,10 +3880,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
   }, 60_000);
 
-  // #79 item 4: a waiter drain batch that exceeds the drain statement bound
-  // (a 5 000-row DELETE right after a bulk insert on a loaded host) is
-  // retried at half the size down to the floor instead of reporting pending.
-  // A statement trigger makes a batch slow above a row threshold.
+  // #79 item 4: a drain batch that exceeds the drain statement bound (a
+  // 5 000-row DELETE right after a bulk insert on a loaded host) is retried at
+  // half the size down to the floor instead of reporting pending. A statement
+  // trigger on admission_request makes a batch slow above a row threshold. (DL-1 (d): only a whole-user delete drains, so
+  // this runs the user drain's admission step.)
   it.each([
     ["completes at a smaller batch", 1_000],
     ["reports pending when even the floor batch times out", 100],
@@ -4021,19 +3930,25 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           RETURN NULL;
         END $$`);
       await observer.$executeRawUnsafe(`
-        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON capacity_waiter
+        CREATE TRIGGER wsmp_test_count_waiter_batch BEFORE DELETE ON admission_request
           FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_count_waiter_batch()`);
       await observer.$executeRawUnsafe(`
-        CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON capacity_waiter
+        CREATE TRIGGER wsmp_test_slow_waiter_batch AFTER DELETE ON admission_request
           REFERENCING OLD TABLE AS gone
           FOR EACH STATEMENT EXECUTE FUNCTION wsmp_test_slow_waiter_batch()`);
       try {
+        const mark = await deletion.requestUserDeletion(prisma, g.user.id);
+        if (!mark) throw new Error("deletion mark was not taken");
         const parents = await deletion.resolveDeletedParents(prisma, {
           userId: g.user.id,
-          poolIds: [g.pool.id],
+          wholeUser: true,
         });
         const started = Date.now();
-        const outcome = await settle(deletion.drainParentDeletionHistory(prisma, parents));
+        const outcome = await settle(
+          deletion.drainParentDeletionHistory(prisma, parents, {
+            owner: { userId: g.user.id, generation: mark.generation },
+          }),
+        );
         const elapsed = Date.now() - started;
         const [slow] = await observer.$queryRawUnsafe<
           Array<{ tried: bigint; attempts: bigint; lastSize: bigint }>
@@ -4056,7 +3971,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
           // observations are only reported: a loaded host can cancel a DELETE
           // before its AFTER trigger runs.)
           expect(outcome.value["batch.halved"]).toBe(3);
-          expect(outcome.value["capacity_waiter.delete"]).toBe(waiters);
+          expect(outcome.value["admission_request.delete"]).toBe(waiters);
           expect(await count(`capacity_waiter WHERE "poolId" = '${g.pool.id}'`)).toBe(0);
         } else {
           expect(outcome.ok).toBe(false);
@@ -4077,11 +3992,11 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
         );
       } finally {
         await observer.$executeRawUnsafe(
-          "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON capacity_waiter",
+          "DROP TRIGGER IF EXISTS wsmp_test_slow_waiter_batch ON admission_request",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_slow_waiter_batch()");
         await observer.$executeRawUnsafe(
-          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON capacity_waiter",
+          "DROP TRIGGER IF EXISTS wsmp_test_count_waiter_batch ON admission_request",
         );
         await observer.$executeRawUnsafe("DROP FUNCTION IF EXISTS wsmp_test_count_waiter_batch()");
         await observer.$executeRawUnsafe("DROP SEQUENCE IF EXISTS wsmp_test_waiter_attempts");

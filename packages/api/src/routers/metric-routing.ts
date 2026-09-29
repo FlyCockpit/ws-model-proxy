@@ -189,9 +189,9 @@ export const metricRoutingProcedures = {
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // Single statements: a non-key JSON column (FOR NO KEY UPDATE, which
-      // admission's FK KEY SHARE admits) and the H-class verdict table (no
-      // foreign keys). No capacity lock is held or taken.
+      // One graph statement (a non-key JSON column). The stored verdicts are
+      // H-class rows: they are cleared afterwards by the relay (H module),
+      // never by this M writer.
       const updated = await prisma.modelPool.updateMany({
         where: { id: input.poolId, userId },
         data: { routingRules: input.rules },
@@ -199,7 +199,7 @@ export const metricRoutingProcedures = {
       if (updated.count === 0) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
-      await prisma.poolMemberRoutingVerdict.deleteMany({ where: { poolId: input.poolId } });
+      await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
       return { poolId: input.poolId, rules: input.rules };
     }),
 

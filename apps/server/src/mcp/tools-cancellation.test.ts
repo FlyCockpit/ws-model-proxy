@@ -366,9 +366,10 @@ describe("G2n — durable cleanup permit (capacity release during shutdown)", ()
         findMany: vi.fn(async () => []),
       },
       inferenceCapacity: {
+        findUnique: vi.fn(async () => ({ userId: "user-1", hardConcurrencyLimit: null })),
+      },
+      capacityRuntime: {
         findUniqueOrThrow: vi.fn(async () => ({
-          id: "cap-1",
-          hardConcurrencyLimit: null,
           schedulerCursor: 0,
           schedulerDeficits: null,
           schedulerVersion: null,
@@ -376,12 +377,16 @@ describe("G2n — durable cleanup permit (capacity release during shutdown)", ()
         })),
       },
       poolMember: { findMany: vi.fn(async () => []) },
-      executionTarget: { findMany: vi.fn(async () => []) },
+      executionTarget: {
+        // The waiter's target is still on this capacity; the reservation read has no id filter.
+        findMany: vi.fn(async (args: { where: { id?: unknown } }) =>
+          args.where.id ? [{ id: "target-1" }] : [],
+        ),
+      },
       admissionRequest: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findUnique: vi.fn(async () => null),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     raw.$transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) =>
       callback(tx),
@@ -684,6 +689,7 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     const tx = {
       $executeRaw: txExecute,
       $queryRaw: txQuery,
+      providerBudgetReservation: { findMany: vi.fn(async () => []) },
       providerAttempt: { findUnique: vi.fn(async () => null) },
     };
     raw.$transaction.mockImplementation(async (callback: (txClient: unknown) => Promise<unknown>) =>
@@ -691,9 +697,9 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     );
     const controller = new AbortController();
     controller.abort();
-    // The settlement transaction OPENS and executes its advisory-lock
-    // statements even though the request's abort fence is active
-    // (permit-scoped to the durable transition).
+    // The settlement transaction OPENS and takes its fences (the attempt
+    // fence through wsmp_acquire_fences) even though the request's abort
+    // fence is active (permit-scoped to the durable transition).
     await expect(
       runWithDbAbortFence(controller.signal, () =>
         reconcileProviderBudget({
@@ -712,8 +718,16 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
       ),
     ).rejects.toThrow("No admitted provider attempt exists");
     expect(raw.$transaction).toHaveBeenCalled();
-    expect(txExecute).toHaveBeenCalled();
-    expect(txQuery).toHaveBeenCalled();
+    const fenceCalls = (txQuery.mock.calls as unknown as unknown[][]).filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+    );
+    expect(fenceCalls[0]?.[1]).toEqual(["01:provider-budget-attempt:attempt-1"]);
+    // The attempt row lock ran after the fences.
+    expect(
+      (txQuery.mock.calls as unknown as unknown[][]).some((call) =>
+        (call[0] as TemplateStringsArray).join("?").includes("FROM provider_attempt"),
+      ),
+    ).toBe(true);
   });
 
   it("health-trial release EXECUTES post-abort (permitted): the release transaction runs", async () => {
@@ -754,13 +768,14 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     const { PostgresCapacityAdmissionStore } = await import("../model-api/capacity/postgres-store");
     const { StoreCapacityAdmissionRuntime } = await import("../model-api/capacity/runtime");
     const controller = new AbortController();
-    // The poll transaction aborts the request at its first raw statement;
-    // the transaction's NEXT operation is fence-rejected.
+    // The poll transaction aborts the request at its first raw statement
+    // (the attempt fence); the transaction's NEXT operation is fence-rejected.
     const tx = {
-      $executeRaw: vi.fn(async () => {
+      $queryRaw: vi.fn(async () => {
         controller.abort();
-        return 0;
+        return [{ acquired: true }];
       }),
+      $executeRaw: vi.fn(async () => 0),
       admissionRequest: {
         findUnique: vi.fn(async () => ({
           id: "row",
@@ -842,23 +857,31 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
         createMany: vi.fn(async () => ({ count: 1 })),
       },
       inferenceCapacity: {
+        findUnique: vi.fn(async () => ({ userId: "user-1", hardConcurrencyLimit: null })),
+      },
+      capacityRuntime: {
         findUniqueOrThrow: vi.fn(async () => ({
-          hardConcurrencyLimit: null,
           schedulerCursor: 0,
           schedulerDeficits: null,
           schedulerVersion: null,
+          nextFencingToken: 1n,
         })),
         update: vi.fn(async () => ({ nextFencingToken: 2n })),
       },
       poolMember: { findMany: vi.fn(async () => []) },
-      executionTarget: { findMany: vi.fn(async () => []) },
+      executionTarget: {
+        // The waiter's target is still on this capacity; the reservation read has no id filter.
+        findMany: vi.fn(async (args: { where: { id?: unknown } }) =>
+          args.where.id ? [{ id: "target-1" }] : [],
+        ),
+        findUnique: vi.fn(async () => ({ inferenceCapacityId: "cap-1" })),
+      },
       admissionRequest: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findMany: vi.fn(async () => [{ id: "next-request", state: "WAITING", Lease: null }]),
         findUnique: vi.fn(async () => null),
         update: vi.fn(async () => ({})),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     raw.$transaction.mockImplementation(async (callback: (txClient: unknown) => Promise<unknown>) =>
       callback(tx),
@@ -889,7 +912,7 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     // The armed fence stops the fill BEFORE it starts: no sweep writes on other
     // requests' waiters (expiry / member_unroutable) and no snapshot read.
     expect(tx.capacityWaiter.updateMany).not.toHaveBeenCalled();
-    // (The L3 scope-lock lookup is a distinct-select findMany; the snapshot read has `include`.)
+    // (The concurrency-scope fence lookup is a distinct-select findMany; the snapshot read has `include`.)
     expect(
       (tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>).filter(
         (call) => call[0].include,
@@ -904,7 +927,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
    * loop entry; the enclosing release permit kept authorizing
    * capacityLease.create and WAITING→ADMITTED across the loop's awaits
    * after the fence armed mid-fill. The probes arm the fence inside
-   * inferenceCapacity.findUniqueOrThrow — AFTER fill entry, BEFORE the
+   * inferenceCapacity.findUnique (the capacity read) — AFTER fill entry, BEFORE the
    * durable admission transitions.
    */
   function fillTx(options: {
@@ -953,20 +976,28 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
         }),
       },
       inferenceCapacity: {
-        findUniqueOrThrow: vi.fn(async () => {
+        findUnique: vi.fn(async () => {
           if (options.arm === "read") armDbShutdownFence();
-          return {
-            hardConcurrencyLimit: null,
-            schedulerCursor: 0,
-            schedulerDeficits: null,
-            schedulerVersion: null,
-            nextFencingToken: 1n,
-          };
+          return { userId: "user-1", hardConcurrencyLimit: null };
         }),
+      },
+      capacityRuntime: {
+        findUniqueOrThrow: vi.fn(async () => ({
+          schedulerCursor: 0,
+          schedulerDeficits: null,
+          schedulerVersion: null,
+          nextFencingToken: 1n,
+        })),
         update: vi.fn(async () => ({ nextFencingToken: 2n })),
       },
       poolMember: { findMany: vi.fn(async () => []) },
-      executionTarget: { findMany: vi.fn(async () => []) },
+      executionTarget: {
+        // The waiter's target is still on this capacity; the reservation read has no id filter.
+        findMany: vi.fn(async (args: { where: { id?: unknown } }) =>
+          args.where.id ? [{ id: "target-1" }] : [],
+        ),
+        findUnique: vi.fn(async () => ({ inferenceCapacityId: "cap-1" })),
+      },
       admissionRequest: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findMany: vi.fn(async () =>
@@ -980,7 +1011,6 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
         findUnique: vi.fn(async () => null),
         update: vi.fn(async () => ({})),
       },
-      relayRequest: { updateMany: vi.fn(async () => ({ count: 0 })) },
     };
     return tx;
   }
@@ -1008,7 +1038,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     );
     const store = new PostgresCapacityAdmissionStore();
     // Fence NOT armed at release entry — it arms inside the fill's first
-    // inferenceCapacity.findUniqueOrThrow, after fill entry.
+    // inferenceCapacity.findUnique, after fill entry.
     await expect(releaseLease(store)).resolves.toBe(true);
     // The durable release transitions executed under the permit...
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(1);
@@ -1040,10 +1070,10 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     expect(tx.capacityLease.createMany).toHaveBeenCalledWith({
       data: expect.arrayContaining([expect.objectContaining({ attemptId: "attempt-next" })]),
     });
-    expect(tx.inferenceCapacity.update).toHaveBeenCalledTimes(1);
+    expect(tx.capacityRuntime.update).toHaveBeenCalledTimes(1);
     // Scheduler state of the LAST grant (class 3 spent 3 of its quantum 4), and one
     // fencing-counter increment for the whole batch.
-    expect(tx.inferenceCapacity.update).toHaveBeenCalledWith(
+    expect(tx.capacityRuntime.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           schedulerCursor: 3,
@@ -1053,7 +1083,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
       }),
     );
     const capacityUpdate = (
-      tx.inferenceCapacity.update.mock.calls as unknown as Array<
+      tx.capacityRuntime.update.mock.calls as unknown as Array<
         [{ data: { schedulerDeficits: number[] } }]
       >
     )[0]?.[0];
