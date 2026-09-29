@@ -5937,6 +5937,24 @@ describe("metric routing procedures (S-B part 2)", () => {
           DiscoveredModel: null,
           ExecutionTarget: target("VLLM"),
         },
+        {
+          id: "m5",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: { engineKind: "VLLM", engineSlots: 4 },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "stale",
+              Endpoint: {
+                slug: "stale-gpu",
+                cliDeviceId: "cli-id",
+                CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+              },
+            },
+          },
+        },
       ],
     });
     deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
@@ -5959,6 +5977,8 @@ describe("metric routing procedures (S-B part 2)", () => {
     ]);
     deep.cliDevice.findMany.mockResolvedValue([]);
     const fresh = new Date(now - 2_000);
+    // Outside the 15 s staleness window: ageSeconds > 15 and `live.stale` true.
+    const stale = new Date(now - 20_000);
     const result = await client({
       getLiveNodeTelemetry: (ids: readonly string[]) =>
         new Map(
@@ -5980,6 +6000,17 @@ describe("metric routing procedures (S-B part 2)", () => {
                   source: "vllm-metrics",
                   ts: fresh.toISOString(),
                   receivedAt: fresh,
+                },
+                {
+                  endpointSlug: "stale-gpu",
+                  modelSlug: null,
+                  running: 1,
+                  waiting: 2,
+                  kvUsage: 0.1,
+                  waitingStreak: 3,
+                  source: "vllm-metrics",
+                  ts: stale.toISOString(),
+                  receivedAt: stale,
                 },
               ],
             },
@@ -6014,6 +6045,13 @@ describe("metric routing procedures (S-B part 2)", () => {
     });
     // An expired snapshot row is not reported as the shared state.
     expect(byId.get("m4")?.snapshotState).toBeNull();
+    // A reading older than the staleness window reports its own age and does
+    // not hold FULL (fail open to lease counts).
+    expect(byId.get("m5")).toMatchObject({
+      state: "stale",
+      full: false,
+      live: { stale: true, ageSeconds: 20 },
+    });
     // Ollama has no engine signal.
     expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
   });

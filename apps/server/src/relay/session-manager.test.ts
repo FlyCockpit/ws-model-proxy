@@ -3388,6 +3388,88 @@ describe("relay 2.7 telemetry", () => {
     }
   });
 
+  it("evaluates pool routing on an endpoint.load frame and writes the engine-load verdict (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
+      };
+      deep.modelPool.findMany.mockResolvedValue([]);
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          ModelPool: { routingRules: [] },
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: { engineKind: "VLLM", engineSlots: null },
+            DiscoveredModel: { slug: null, Endpoint: { slug: "vllm" } },
+          },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      // The first accepted waiting frame is streak 1: below the sustained
+      // threshold, the evaluation writes nothing.
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).not.toHaveBeenCalled();
+      // A second accepted frame within the staleness window makes streak 2.
+      vi.setSystemTime(at(3_000));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(3_000));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          engineState: "full_waiting",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
+        }),
+      });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not schedule an evaluation for an endpoint.load frame the limiter drops (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      // The recovery scheduler also reads poolMember on its own timer; the
+      // routing evaluation is the only reader filtering on `tier`.
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // Inside the 1 s limiter the frame is dropped: no evaluation now and no
+      // trailing one either, so advancing past the window changes nothing.
+      await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(routingRuns()).toBe(1);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requires registration before telemetry", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
