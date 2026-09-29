@@ -554,10 +554,8 @@ fn secret_class_paths_are_read_only_for_every_mutating_tool() {
             }
             let r = fx.ops.execute(op, value, &fx.cancel);
             let err = r.expect_err(&format!("{op} {path}"));
-            assert!(
-                matches!(err.code, ErrorCode::SecretFile | ErrorCode::NotFound),
-                "{op} {path}: {err:?}"
-            );
+            // a refusal, never a lookup: the path is judged before it is opened
+            assert_eq!(err.code, ErrorCode::SecretFile, "{op} {path}: {err:?}");
         }
         // moving a secret path away, or anything onto a secret path
         for (from, to) in [(path, "moved.txt"), ("notes.txt", path)] {
@@ -567,8 +565,9 @@ fn secret_class_paths_are_read_only_for_every_mutating_tool() {
                 &fx.cancel,
             );
             let err = r.expect_err(&format!("rename {from} -> {to}"));
-            assert!(
-                matches!(err.code, ErrorCode::SecretFile | ErrorCode::NotFound),
+            assert_eq!(
+                err.code,
+                ErrorCode::SecretFile,
                 "rename {from} -> {to}: {err:?}"
             );
         }

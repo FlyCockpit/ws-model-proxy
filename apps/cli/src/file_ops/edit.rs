@@ -248,7 +248,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     if after_view.long_construct {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,
-            "the edit would create a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
+            "the file contains, or the edit would create, a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
         ));
     }
     if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {

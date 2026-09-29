@@ -782,3 +782,92 @@ fn the_same_bytes_in_another_file_do_not_share_an_etag() {
         .unwrap();
     assert_eq!(hashed.entries[0].etag.as_deref(), Some(etag.as_str()));
 }
+
+// ---- closure tests for the lookback on large files and the edit guard ---------
+
+/// A file over 64 MiB whose secret run is opened at the END of a long line that
+/// straddles the lookback boundary of the window. Returns (window start line).
+fn write_straddle_file(
+    fx: &Fx,
+    name: &str,
+    filler_blocks: usize,
+    continuation_lines: usize,
+    tail_filler_blocks: usize,
+) -> u64 {
+    let path = fx.root.join(name);
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..filler_blocks {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    let mut line = 20_000 * filler_blocks as u64;
+    // a 300 KB line that ends in the opener of a value
+    file.write_all("y".repeat(300_000).as_bytes()).unwrap();
+    file.write_all(b" API_KEY=\"opening\n").unwrap();
+    line += 1;
+    // continuation lines of the value
+    for i in 0..continuation_lines {
+        writeln!(file, "continued-secret-{i:06}-xxxxxxxxxxxxxxxxxx").unwrap();
+    }
+    line += continuation_lines as u64;
+    file.write_all(b"final-continued-secret\n\nvisible-end\n")
+        .unwrap();
+    for _ in 0..tail_filler_blocks {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    line + 1
+}
+
+#[test]
+fn a_value_opened_on_the_line_that_straddles_the_lookback_masks_a_large_file_window() {
+    let fx = Fx::new();
+    // positive window: the boundary byte (1 MiB before the window) is inside the long line
+    let window = write_straddle_file(&fx, "pos.log", 60, 19_500, 9);
+    assert!(std::fs::metadata(fx.root.join("pos.log")).unwrap().len() > 64 * 1024 * 1024);
+    let r = fx.read_with(json!({ "path": fx.p("pos.log"), "startLine": window, "maxLines": 1 }));
+    assert!(!r.text.contains("final-continued-secret"), "{}", r.text);
+    // tail window: the chunk boundary falls inside the long line
+    write_straddle_file(&fx, "tail.log", 69, 24_000, 0);
+    let r = fx.read_with(json!({ "path": fx.p("tail.log"), "startLine": -3 }));
+    assert!(!r.text.contains("final-continued-secret"), "{}", r.text);
+    assert!(r.text.contains("visible-end"), "{}", r.text);
+}
+
+#[test]
+fn a_short_value_past_the_first_mebibyte_does_not_block_edits() {
+    let fx = Fx::new();
+    let mut body = "filler line of text\n".repeat(60_000);
+    body.push_str("X_TOKEN=\"a\nb\"\n\nend\n");
+    fx.put("big.txt", &body);
+    fx.ops
+        .edit(
+            &args(json!({ "path": fx.p("big.txt"), "edits": [{ "oldText": "end", "newText": "fin" }] })),
+            &fx.cancel,
+        )
+        .expect("the run is short: the edit applies");
+    assert!(fx.get("big.txt").ends_with("\nfin\n"));
+}
+
+#[test]
+fn a_secret_flag_with_a_line_continuation_only_hides_its_value() {
+    let fx = Fx::new();
+    fx.put(
+        "start.sh",
+        "#!/bin/sh\nexec llama-server \\\n  --api-key \"$LLAMA_API_KEY\" \\\n  --ctx-size 32768 \\\n  --port 8080\n",
+    );
+    let r = fx.read("start.sh");
+    assert!(
+        r.text.contains("--ctx-size 32768") && r.text.contains("--port 8080"),
+        "{}",
+        r.text
+    );
+    fx.ops
+        .edit(
+            &args(json!({ "path": fx.p("start.sh"),
+                "edits": [{ "oldText": "--ctx-size 32768", "newText": "--ctx-size 65536" }] })),
+            &fx.cancel,
+        )
+        .unwrap();
+}

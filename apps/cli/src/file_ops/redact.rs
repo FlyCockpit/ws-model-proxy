@@ -377,6 +377,15 @@ fn is_variable_reference(value: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// `value` without a trailing shell line continuation that follows a blank
+/// (`"$KEY" \`): the backslash continues the COMMAND, not the value.
+fn without_continuation(value: &str) -> &str {
+    match value.strip_suffix('\\') {
+        Some(rest) if rest.ends_with([' ', '\t']) => rest.trim_end(),
+        _ => value,
+    }
+}
+
 /// Whether the value text is a bare variable reference or empty quotes. Quotes
 /// count only as a MATCHED pair (`"$X"`): a lone leading or trailing quote is
 /// part of a longer value.
@@ -573,7 +582,7 @@ fn first_assignment(line: &str) -> Option<Candidate> {
                 },
             ));
         }
-        if value_is_public(trimmed) {
+        if value_is_public(without_continuation(trimmed)) {
             continue;
         }
         let construct = construct_for_tail(tail, colon, indent_of(line), quote_left_open(line));
@@ -605,7 +614,7 @@ fn first_flag(line: &str) -> Option<Candidate> {
         if trimmed == "\\" {
             return Some((line.len(), Construct::UntilBlank));
         }
-        if value_is_public(trimmed) {
+        if value_is_public(without_continuation(trimmed)) {
             continue;
         }
         return Some((
@@ -630,7 +639,7 @@ fn first_env_word(line: &str) -> Option<Candidate> {
     let start = caps.get(0)?.end();
     let tail = &line[start..];
     let trimmed = tail.trim_end();
-    if trimmed.is_empty() || value_is_public(trimmed) {
+    if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
         return None;
     }
     Some((
@@ -647,7 +656,7 @@ fn first_inline_pair(line: &str) -> Option<Candidate> {
     let m = INLINE_PAIR.find(line)?;
     let tail = &line[m.end()..];
     let trimmed = tail.trim_end();
-    if trimmed.is_empty() || value_is_public(trimmed) {
+    if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
         return None;
     }
     Some((
@@ -723,7 +732,7 @@ fn continuation_value(line: &str) -> Option<(Range<usize>, Construct)> {
     if value == "\\" {
         return Some((line.len()..line.len(), Construct::UntilBlank));
     }
-    if value_is_public(value) {
+    if value_is_public(without_continuation(value)) {
         return None;
     }
     Some((
@@ -741,51 +750,78 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Line-oriented masker. Feed lines (without terminators) in file order. The
-/// state carried between lines is: a `PRIVATE KEY` block flag, a "previous line
-/// ended with a secret flag" flag, and an open multi-line [`Construct`] that
-/// keeps every following line masked until a structural end (a blank line or a dedent). A caller that
-/// serves a window from the middle of a file feeds the lines in
-/// [`LOOKBACK_BYTES`] before it (state only) for a class where
-/// [`FileClass::needs_prefix`] holds. Command-output masking (a later phase)
-/// reuses this as a streaming scanner.
+/// One open YAML-like block: it masks lines indented deeper than `indent` until
+/// a non-blank line at or below it.
+#[derive(Debug, Clone, Copy)]
+struct OpenBlock {
+    indent: usize,
+    opener: usize,
+}
+
+/// Line-oriented masker. Feed lines (without terminators) in file order.
+///
+/// The state is RESTARTABLE: opener detection runs on every line, also lines that
+/// an earlier value already masks, and constructs are kept side by side (union
+/// semantics: a line is masked when ANY open construct masks it). So a masker
+/// started at any line masks at least what a masker started at the top masks,
+/// except for values that were opened before its start line. The lines within
+/// [`LOOKBACK_BYTES`] before a window are fed first; a masked run reaching past
+/// the lookback from its (latest) opener is flagged ([`Self::long_run`]) and edits
+/// refuse to create one.
+///
+/// State: a `PRIVATE KEY` block flag, "the previous line ended with a secret
+/// flag", a few lines of Kubernetes name/value pairing, an until-blank run and
+/// the open YAML blocks. Command-output masking (a later phase) reuses this as a
+/// streaming scanner.
 #[derive(Debug, Clone)]
 pub struct LineMasker {
     class: FileClass,
+    lookback: usize,
     in_private_block: bool,
     pending_flag_value: bool,
-    construct: Construct,
-    opened: bool,
+    /// Offset of the latest opener of the run that masks lines until a blank line.
+    until_blank: Option<usize>,
+    blocks: Vec<OpenBlock>,
     /// Lines left in which a `value:` line belongs to a `name: SECRET_NAME` line.
     pair_lines: u8,
+    /// Offset of the next line when the caller does not supply one.
+    next_at: usize,
+    long_run: bool,
 }
 
 impl LineMasker {
     pub fn new(class: FileClass) -> Self {
-        Self {
-            class,
-            in_private_block: false,
-            pending_flag_value: false,
-            construct: Construct::None,
-            opened: false,
-            pair_lines: 0,
-        }
+        Self::with_lookback(class, LOOKBACK_BYTES)
     }
 
-    /// Whether the last scanned line opened a multi-line value (its tail was
-    /// masked and the following lines continue it).
-    pub fn opened_on_last_line(&self) -> bool {
-        self.opened
+    pub(crate) fn with_lookback(class: FileClass, lookback: usize) -> Self {
+        Self {
+            class,
+            lookback,
+            in_private_block: false,
+            pending_flag_value: false,
+            until_blank: None,
+            blocks: Vec::new(),
+            pair_lines: 0,
+            next_at: 0,
+            long_run: false,
+        }
     }
 
     pub fn class(&self) -> FileClass {
         self.class
     }
 
-    /// Whether the masker is inside a multi-line value that started on an
-    /// earlier line: the following lines are masked until it closes.
+    /// Whether a masked multi-line run reached further than the lookback past
+    /// its opener on any line so far: a windowed read could not see the opener.
+    pub fn long_run(&self) -> bool {
+        self.long_run
+    }
+
+    /// Whether a multi-line value that started on an earlier line is still open:
+    /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
-        self.construct != Construct::None
+        self.until_blank.is_some() || !self.blocks.is_empty()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a
@@ -805,31 +841,53 @@ impl LineMasker {
     /// Masked ranges of `line` (byte ranges in `line` plus their replacement
     /// text), sorted and non-overlapping. Advances the state.
     pub fn scan(&mut self, line: &str) -> Vec<(Range<usize>, String)> {
-        self.opened = false;
-        match self.construct {
+        let at = self.next_at;
+        self.scan_at(line, at)
+    }
+
+    /// [`Self::scan`] for a line that starts at byte `at` of the text (the caller
+    /// knows the exact offsets: this only feeds [`Self::long_run`]).
+    pub(crate) fn scan_at(&mut self, line: &str, at: usize) -> Vec<(Range<usize>, String)> {
+        self.next_at = at + line.len() + 1;
+        let blank = line.trim().is_empty();
+        // 1. which open constructs mask this line (the latest opener decides how far
+        //    back a reader would have to look)
+        let mut masked_by: Option<usize> = None;
+        if blank {
+            // a blank line ends the until-blank run; blocks pass through it
+            self.until_blank = None;
+        } else {
+            let indent = indent_of(line);
+            self.blocks.retain(|block| block.indent < indent);
+            masked_by = self
+                .blocks
+                .iter()
+                .map(|block| block.opener)
+                .chain(self.until_blank)
+                .max();
+        }
+        // 2. the line's own rules and openers, always (union semantics)
+        let (masks, opened) = self.scan_body(line);
+        if let Some(opener) = masked_by
+            && at.saturating_sub(opener) > self.lookback
+        {
+            self.long_run = true;
+        }
+        // 3. register what this line opened
+        match opened {
             Construct::None => {}
-            Construct::UntilBlank => {
-                self.pending_flag_value = false;
-                if line.trim().is_empty() {
-                    // the blank line is the structural end of the value
-                    self.construct = Construct::None;
-                    return Vec::new();
-                }
-                return vec![(0..line.len(), token_bare())];
-            }
+            Construct::UntilBlank => self.until_blank = Some(at),
             Construct::Block { line_indent } => {
-                if line.trim().is_empty() {
-                    return Vec::new();
-                }
-                if indent_of(line) > line_indent {
-                    self.pending_flag_value = false;
-                    return vec![(0..line.len(), token_bare())];
-                }
-                // dedent: the block is over and this line is a normal line
-                self.construct = Construct::None;
+                self.blocks.retain(|block| block.indent != line_indent);
+                self.blocks.push(OpenBlock {
+                    indent: line_indent,
+                    opener: at,
+                });
             }
         }
-        let masks = self.scan_body(line);
+        if masked_by.is_some() {
+            return vec![(0..line.len(), token_bare())];
+        }
         if masks.is_empty() {
             masks
         } else {
@@ -838,7 +896,7 @@ impl LineMasker {
     }
 
     /// The class and generic rules over `line` (ranges relative to `line`).
-    fn scan_body(&mut self, line: &str) -> Vec<LineMask> {
+    fn scan_body(&mut self, line: &str) -> (Vec<LineMask>, Construct) {
         let mut masks: Vec<LineMask> = Vec::new();
         let mut construct = Construct::None;
         let mut generic = true;
@@ -925,10 +983,8 @@ impl LineMasker {
                 construct = opened;
             }
         }
-        self.construct = construct;
-        self.opened = construct != Construct::None;
-        self.pending_flag_value = line.contains("--") && FLAG_AT_END.is_match(line);
-        masks
+        self.pending_flag_value = line.contains('-') && FLAG_AT_END.is_match(line);
+        (masks, construct)
     }
 
     /// `line` with its secrets replaced; borrowed when nothing was masked.
@@ -966,23 +1022,15 @@ pub(crate) fn mask_with_lookback(class: FileClass, text: &str, lookback: usize) 
     if class == FileClass::Plain && !has_trigger(text) {
         return MaskedView::from_parts(text.to_string(), Vec::new(), false);
     }
-    let mut masker = LineMasker::new(class);
+    let mut masker = LineMasker::with_lookback(class, lookback);
     let mut out = String::with_capacity(text.len());
     let mut spans = Vec::new();
     let mut offset = 0;
-    let mut opener = 0;
-    let mut long_construct = false;
     for raw in text.split_inclusive('\n') {
         let body_len = raw.trim_end_matches(['\n', '\r']).len();
         let (line, ending) = raw.split_at(body_len);
         let mut cursor = 0;
-        let continued = masker.in_continuation();
-        let masks = masker.scan(line);
-        if masker.opened_on_last_line() {
-            opener = offset;
-        } else if continued && !masks.is_empty() && offset - opener > lookback {
-            long_construct = true;
-        }
+        let masks = masker.scan_at(line, offset);
         for (range, tok) in masks {
             out.push_str(&line[cursor..range.start]);
             let view_start = out.len();
@@ -997,7 +1045,7 @@ pub(crate) fn mask_with_lookback(class: FileClass, text: &str, lookback: usize) 
         out.push_str(ending);
         offset += raw.len();
     }
-    MaskedView::from_parts(out, spans, long_construct)
+    MaskedView::from_parts(out, spans, masker.long_run())
 }
 
 #[cfg(test)]
@@ -1687,7 +1735,13 @@ mod tests {
             (
                 Plain,
                 "environment:\n  API_KEY:\n        SECRETXA1\n  HF_TOKEN: !!str\n        SECRETXB2\n  DB_PASSWORD: &pw\n        SECRETXC3\n  OPENAI_API_KEY: SECRETXD4-first\n        SECRETXE5-second\nnext: 1\n",
-                &["SECRETXA1", "SECRETXB2", "SECRETXC3", "SECRETXD4", "SECRETXE5"],
+                &[
+                    "SECRETXA1",
+                    "SECRETXB2",
+                    "SECRETXC3",
+                    "SECRETXD4",
+                    "SECRETXE5",
+                ],
             ),
             (Plain, "aider --openai-api-key SECRETX1\n", &["SECRETX1"]),
             (Plain, "aider --anthropic-api-key=SECRETX2\n", &["SECRETX2"]),
@@ -1971,13 +2025,111 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let lookback = 24;
+        let lookback = 30;
         let mut checked = 0;
-        for _ in 0..3000 {
-            let len = 3 + (next() % 22) as usize;
-            let lines: Vec<&str> = (0..len)
-                .map(|_| pool[(next() % pool.len() as u64) as usize])
-                .collect();
+        // hand-written shapes first (a reader that starts INSIDE a run whose body holds
+        // an opener), then random documents from the pool
+        let fixed: [&[&str]; 4] = [
+            &[
+                "E_KEY: |",
+                "  eeeeeeee",
+                "  eeeeeeee",
+                "  eeeeeeee",
+                "  Y_TOKEN=\"open",
+                "  more",
+                "end-of-e",
+                "gapgapgapgap",
+                "gapgapgapgap",
+                "DEPLOY_KEY: |",
+                "  line-one",
+                "",
+                "  hunter2-block-secret",
+                "done: yes",
+            ],
+            &[
+                "echo start",
+                "E_TOKEN=\"open",
+                "    Y_KEY: |",
+                "      deeper-one",
+                "      deeper-two",
+                "",
+                "      gap",
+                "      gap",
+                "      API_TOKEN=\"first",
+                "second-line-secret\"",
+                "",
+                "echo end",
+            ],
+            &[
+                "-flag-secret",
+                "close\"",
+                "x: 1",
+                "triple-body",
+                "M_SECRET=v \\",
+                "cont",
+                "",
+                "after",
+            ],
+            &[
+                "  - name: N_TOKEN",
+                "    value: pair-secret",
+                "  - name: M_KEY",
+                "    ",
+                "    value: two-secret",
+                "next: 1",
+            ],
+        ];
+        let mut docs: Vec<Vec<&str>> = fixed.iter().map(|d| d.to_vec()).collect();
+        // sweep the alignment: a reader that starts inside a block whose body holds an
+        // opener, at every distance from the window
+        let pads: Vec<String> = (0..40).map(|n| "p".repeat(n)).collect();
+        let y_lines: Vec<String> = (0..40)
+            .map(|n| format!("  Y_TOKEN=\"open{}", "x".repeat(n)))
+            .collect();
+        for (pad, y_line) in pads.iter().zip(&y_lines) {
+            docs.push(vec![
+                "E_KEY: |",
+                "  ee",
+                y_line,
+                "  more",
+                "DEPLOY_KEY: |",
+                "",
+                "  hunter2-block-secret",
+                "done: yes",
+            ]);
+            docs.push(vec![
+                "E_KEY: |",
+                "  ee",
+                y_line,
+                "  more",
+                "end-of-e",
+                pad,
+                "DEPLOY_KEY: |",
+                "",
+                "  hunter2-block-secret",
+                "done: yes",
+            ]);
+            docs.push(vec![
+                "E_TOKEN=\"open",
+                "    Y_KEY: |",
+                "      deeper",
+                "",
+                pad,
+                "      API_TOKEN=\"first",
+                "second-line-secret\"",
+                "",
+                "echo end",
+            ]);
+        }
+        for _ in 0..8000 {
+            let len = 3 + (next() % 38) as usize;
+            docs.push(
+                (0..len)
+                    .map(|_| pool[(next() % pool.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for lines in docs {
             let text = lines.join("\n") + "\n";
             for class in [FileClass::Plain, FileClass::Dotenv] {
                 let full = mask_with_lookback(class, &text, lookback);

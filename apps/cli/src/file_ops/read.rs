@@ -249,10 +249,11 @@ fn line_offset(bytes: &[u8], n: usize) -> usize {
     bytes.len()
 }
 
-/// Start of the line that contains the byte [`redact::LOOKBACK_BYTES`] before
-/// `offset` (the window start): the straddling line is kept whole, so a value
-/// opened on it (or a previous line longer than the lookback) still masks the
-/// window.
+/// Start of the line BEFORE the one that contains the byte
+/// [`redact::LOOKBACK_BYTES`] before `offset` (the window start). The straddling
+/// line is kept whole, and one more line before it: the previous line's flag or
+/// pairing state decides whether the next line opens a multi-line value, so the
+/// state a run needs is reproducible from any line at or after this one.
 fn lookback_start(bytes: &[u8], offset: usize) -> usize {
     lookback_start_with(bytes, offset, redact::LOOKBACK_BYTES)
 }
@@ -262,7 +263,14 @@ pub(crate) fn lookback_start_with(bytes: &[u8], offset: usize, lookback: usize) 
     if from == 0 {
         return 0;
     }
-    bytes[..from]
+    let containing = bytes[..from]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |idx| idx + 1);
+    if containing == 0 {
+        return 0;
+    }
+    bytes[..containing - 1]
         .iter()
         .rposition(|b| *b == b'\n')
         .map_or(0, |idx| idx + 1)
@@ -491,11 +499,15 @@ fn read_large(
             }
             context_bytes += n as u64;
             context.push_back(buf);
-            // drop the oldest line only while the rest still covers the lookback
-            while context.len() > 1
+            // drop the oldest line only while the lines after the NEXT one still cover
+            // the lookback (the oldest kept line stays before the straddling line)
+            while context.len() > 2
                 && context
                     .front()
-                    .is_some_and(|old| context_bytes - old.len() as u64 >= lookback)
+                    .zip(context.get(1))
+                    .is_some_and(|(old, next)| {
+                        context_bytes - old.len() as u64 - next.len() as u64 >= lookback
+                    })
             {
                 if let Some(old) = context.pop_front() {
                     context_bytes -= old.len() as u64;
