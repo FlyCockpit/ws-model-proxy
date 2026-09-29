@@ -630,8 +630,7 @@ export class RelaySessionManager {
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
     const session = this.requireSession(socket);
     // A hello that is not the minimum protocol gets a message it can print
-    // ("upgrade wsmp", or "upgrade the server"), not an opaque schema
-    // rejection. Every released CLI treats protocol.error as fatal.
+    // (an "upgrade wsmp" text), not an opaque schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
       console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
