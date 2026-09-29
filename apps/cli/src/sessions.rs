@@ -3798,6 +3798,63 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_exec_logs_the_timed_out_outcome() {
+        // The frame's `timed_out` flag is asserted above; this pins the CLI
+        // log's outcome code, which a dropped branch would quietly turn into
+        // `ended`/`signaled` while the frame stayed correct.
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let (tx, rx) = channel();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
+            execs.start(
+                &enabled_startup(false),
+                &Config::default(),
+                "slow",
+                slow_command(),
+                None,
+            );
+            std::thread::sleep(Duration::from_millis(350));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while execs.poll(Instant::now()).is_empty() {
+                while let Ok(message) = rx.try_recv() {
+                    match message {
+                        FromWorker::ExecBytes {
+                            command_id,
+                            stderr,
+                            bytes,
+                        } => {
+                            let _ = execs.on_bytes(&command_id, stderr, &bytes);
+                        }
+                        FromWorker::ExecEof { command_id, stderr } => {
+                            let _ = execs.on_eof(&command_id, stderr);
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(Instant::now() < deadline, "the exec never timed out");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        drop(rx);
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        let outcomes = command_ops(&log)
+            .into_iter()
+            .filter(|(_, id, _)| id == "slow")
+            .map(|(_, _, outcome)| outcome)
+            .collect::<Vec<_>>();
+        assert!(
+            outcomes.contains(&"timed_out".to_string()),
+            "no timed_out outcome line for a timed-out exec: {outcomes:?}\nlog:\n{log}"
+        );
+    }
+
+    #[test]
     fn dropping_the_exec_registry_reaps_the_child() {
         let (tx, rx) = channel();
         let pid = {
@@ -5420,18 +5477,70 @@ mod tests {
         drop(rx);
     }
 
-    /// Dead or a zombie. Elsewhere than Linux a killed orphan is reaped by
-    /// init, so plain existence is enough.
+    /// Dead or a zombie: the process can no longer act. A zombie is already
+    /// dead and only waits for its parent to reap it, and `kill(pid, 0)` still
+    /// succeeds for one, so a bare existence check would spin until its
+    /// deadline on a loaded macOS runner. Without `/proc` the state comes from
+    /// `ps`; if that is unavailable the process is assumed alive (fail closed).
     #[cfg(unix)]
-    fn process_gone(pid: u32) -> bool {
+    fn process_dead(pid: u32) -> bool {
+        if !process_exists(pid) {
+            return true;
+        }
         #[cfg(target_os = "linux")]
         {
             !process_running(pid)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            !process_exists(pid)
+            std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .is_some_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_start()
+                        .starts_with('Z')
+                })
         }
+    }
+
+    /// Dead or a zombie. Killed orphans are reaped by init after a moment.
+    #[cfg(unix)]
+    fn process_gone(pid: u32) -> bool {
+        process_dead(pid)
+    }
+
+    /// The zombie case that made the macOS confirm-child wait spin: a child
+    /// that exited but was not reaped still satisfies `kill(pid, 0)`, so a bare
+    /// existence check cannot tell it apart from a live one. Only a state
+    /// check can, and this pins that `process_dead` does so without reaping.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_exited_child_reads_as_dead_but_still_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("touch '{}'; exit 0", marker.display())])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_dead(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the exited child was never seen as dead"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Never reaped here, so it is still a zombie: a bare existence check
+        // would call it alive, which is what wedged the confirm-child wait.
+        assert!(process_exists(pid), "the child was reaped, not a zombie");
+        assert!(marker.exists());
+        let _ = child.wait();
     }
 
     #[cfg(unix)]
@@ -5704,9 +5813,13 @@ exit 3
         )
     }
 
-    /// Waits until the confirm child recorded next to `witness` is gone. A dead
-    /// child cannot create the witness later, so the caller can then assert its
-    /// absence without guessing how long a live child would need.
+    /// Waits until the confirm child recorded next to `witness` can no longer
+    /// run. A reaped or zombie child cannot create the witness later, so the
+    /// caller can then assert its absence without guessing how long a live
+    /// child would need. Zombie-aware on purpose: the child is the test's own
+    /// direct child, and on macOS `kill(pid, 0)` keeps succeeding for a zombie
+    /// that the test has not reaped yet (reaping here would lose the exit
+    /// status this helper does not need, so it just stops waiting).
     #[cfg(unix)]
     fn wait_for_confirm_child_exit(witness: &Path) {
         let pid = std::fs::read_to_string(witness.with_extension("pid"))
@@ -5715,7 +5828,7 @@ exit 3
             .parse::<u32>()
             .expect("pid");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while process_exists(pid) {
+        while !process_dead(pid) {
             assert!(Instant::now() < deadline, "the confirm child kept running");
             std::thread::sleep(Duration::from_millis(10));
         }

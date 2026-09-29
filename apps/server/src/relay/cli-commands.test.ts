@@ -929,6 +929,35 @@ describe("cli commands", () => {
       expect(path.split(" ").slice(1).join(" ")).toBe("run");
     });
 
+    it("maps a signalled exec to signal:<name> and a timeout to timed_out", async () => {
+      const socket = await connect();
+      const signalled = await startCliCommand({ ...base, command: "killed" });
+      if (!signalled.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: signalled.commandId,
+          timedOut: false,
+          signal: "SIGKILL",
+        }),
+      );
+      const timedOut = await startCliCommand({ ...base, command: "slow" });
+      if (!timedOut.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: timedOut.commandId,
+          timedOut: true,
+        }),
+      );
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:SIGKILL"],
+        ["completed", "timed_out"],
+      ]);
+    });
+
     it("stores the hash of the command text and its program, never a preview", async () => {
       const socket = await connect();
       const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz tool run";

@@ -59,6 +59,8 @@ describe("commandProgram", () => {
   // argument text, a secret, a quote or an unparsable fragment.
   const rows: ReadonlyArray<readonly [string, string, string]> = [
     ["a leading secret assignment is skipped", "FOO=secret curl https://x", "curl"],
+    ["an underscore-leading assignment is skipped", "_TOKEN=abc tool arg", "tool"],
+    ["a one-character program is accepted", "x arg", "x"],
     ["an absolute path is reduced to its basename", "/usr/bin/git push", "git"],
     ["a wrapper is stored by its own name", "sudo rm -rf x", "sudo"],
     ["env is not unwrapped", "env A=1 ls", "env"],
@@ -80,6 +82,8 @@ describe("commandProgram", () => {
     ["leading whitespace and tabs", "\t  /bin/ls", "ls"],
     ["a newline before the program", "\n\npython -c x", "python"],
     ["single quotes around the program", "'/bin/ls' x", "ls"],
+    ["an unterminated double quote fails closed", '"echo', UNKNOWN],
+    ["an unterminated single quote fails closed", "'ls", UNKNOWN],
     ["a quoted program containing a space", "'my tool' x", UNKNOWN],
     ["a relative script", "./run.sh", "run.sh"],
     ["a path with a trailing slash", "/usr/bin/", UNKNOWN],

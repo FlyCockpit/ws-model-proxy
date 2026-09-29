@@ -114,7 +114,7 @@ export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 const PROGRAM_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/;
 
 /** A leading `NAME=value` assignment whose NAME is a valid shell env name. */
-const ASSIGNMENT_PATTERN = /^[A-Za-z][A-Za-z0-9_]*=/;
+const ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
  * Splits a command into whitespace-separated tokens, keeping single- and

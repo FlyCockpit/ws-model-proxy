@@ -133,6 +133,31 @@ describe("CliAgentActivity", () => {
     expect(list.textContent).toContain("1,234");
   });
 
+  it("renders a supervised_command row with its program and hash chip", async () => {
+    state.respond = () => ({
+      events: [
+        row({
+          id: "e4",
+          kind: "supervised_command",
+          outcome: "completed",
+          path: `hmac-sha256:${HASH} make install`,
+          reason: "exit:0",
+        }),
+      ],
+      nextCursor: null,
+    });
+    renderIt();
+    await userEvent.click(screen.getByRole("button", { name: /clis.activity.show/ }));
+    const list = await screen.findByRole("list");
+    expect(list.textContent).toContain("clis.activity.kinds.supervised_command");
+    // The stored path is decoded, not shown raw: program via the chip, the hex
+    // hash truncated, and never the full digest.
+    expect(list.textContent).toContain(`clis.activity.program {"value":"make install"}`);
+    expect(list.textContent).toContain(`"value":"${"a".repeat(12)}"`);
+    expect(list.textContent).not.toContain(HASH);
+    expect(list.textContent).not.toContain(`hmac-sha256:${HASH}`);
+  });
+
   it("shows the program without a hash chip when the digest is unavailable", async () => {
     state.respond = () => ({
       events: [row({ id: "e3", path: "hmac-sha256:unavailable ls" })],
@@ -189,6 +214,10 @@ describe("splitAuditPath", () => {
     expect(splitAuditPath("command", `hmac-sha256:${HASH} pwd`)).toEqual({
       hash: "a".repeat(12),
       text: "pwd",
+    });
+    expect(splitAuditPath("supervised_command", `hmac-sha256:${HASH} make`)).toEqual({
+      hash: "a".repeat(12),
+      text: "make",
     });
     expect(splitAuditPath("file_read", `hmac-sha256:${HASH} pwd`)).toEqual({
       hash: null,

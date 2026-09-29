@@ -1392,6 +1392,21 @@ describe("supervised commands", () => {
       });
     });
 
+    it("records a signalled supervised.done as signal:<name>", async () => {
+      const socket = await connect();
+      const request = await spawnedAndAccepted(socket);
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        signal: "SIGKILL",
+        review: false,
+      });
+      await say(socket, { type: "term.exit", terminalId: request.terminalId, signal: "SIGKILL" });
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:SIGKILL"],
+      ]);
+    });
+
     it("never stores raw command text: a secret-bearing argument row holds only the program", async () => {
       const socket = await connect();
       const request = await spawnedAndAccepted(socket, {
