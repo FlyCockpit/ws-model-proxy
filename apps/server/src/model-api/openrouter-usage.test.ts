@@ -249,6 +249,37 @@ describe("OpenRouter usage dialect", () => {
           return records;
         },
       ],
+      // C7-4 fail-closed: a non-object usage shape on either Messages usage
+      // record cannot be read, so monotonicity cannot be verified and the
+      // stream must not settle (an inverted shape check would settle the
+      // valid final against an unreadable snapshot).
+      ...[
+        ["a string", "not-an-object"],
+        ["a number", 42],
+        ["an array", []],
+      ].map(([label, shape]): [string, () => unknown[]] => [
+        `a ${label} message_start snapshot usage`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const start = records.find((record) => record.type === "message_start")!;
+          (start.message as Record<string, unknown>).usage = shape;
+          return records;
+        },
+      ]),
+      ...[
+        ["a string", "not-an-object"],
+        ["a number", 42],
+        ["an array", []],
+        ["null", null],
+      ].map(([label, shape]): [string, () => unknown[]] => [
+        `a ${label} message_delta usage`,
+        () => {
+          const records = recordsOf("messages-stream-write");
+          const delta = records.find((record) => record.type === "message_delta")!;
+          delta.usage = shape;
+          return records;
+        },
+      ]),
       [
         "two message_start snapshots",
         () => {

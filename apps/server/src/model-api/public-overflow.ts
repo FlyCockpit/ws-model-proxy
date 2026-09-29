@@ -1848,7 +1848,9 @@ export class OpenRouterUsageRecords {
     if (classified.kind === "ambiguous") this.#ambiguous = true;
     else if (classified.kind === "superseded") {
       this.#superseded += 1;
-      if (this.#snapshots.length < 2) this.#snapshots.push(classified.usage);
+      // Only the first snapshot is ever compared (and settlement requires at
+      // most one superseded record), so one slot is enough.
+      if (this.#snapshots.length < 1) this.#snapshots.push(classified.usage);
     } else if (this.#finals.size < 2)
       this.#finals.set(JSON.stringify(classified.usage), classified.usage);
   }

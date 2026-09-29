@@ -2906,6 +2906,71 @@ describe("OpenRouter owner-paid settlement", () => {
     expect(settled.observationComplete).toBe(false);
   });
 
+  // AC 13: the event-less Responses terminal fallback is provider-agnostic.
+  // `classifyTerminalRecord` is keyed on the surface, so a non-OpenRouter
+  // Responses stream that omits `event:` lines completes the same way.
+  it.each(["openai", "openai-compatible"] as const)(
+    "completes an event-less Responses terminal for the %s provider type",
+    async (providerType) => {
+      const settled = await settleOwnerStream(
+        providerType,
+        [readFileSync(new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url))],
+        "owner",
+        "openai-responses",
+      );
+      expect(settled).toMatchObject({
+        userId: "owner",
+        poolId: "pool",
+        observationComplete: true,
+      });
+    },
+  );
+
+  // AC 14 / M5: Messages stays strict. A data-only `message_stop` with no
+  // `event:` line must never be taken as a terminal, even though the record's
+  // `type` names it; otherwise a truncated/forged Messages stream would settle.
+  it("does not complete a Messages stream whose terminal has no event line", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/messages-stream-write.raw", import.meta.url),
+      "utf8",
+    );
+    const withoutEvents = raw
+      .split("\n")
+      .filter((line) => !line.startsWith("event:"))
+      .join("\n");
+    expect(withoutEvents).not.toBe(raw);
+    expect(withoutEvents).toContain('data: {"type":"message_stop"}');
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutEvents)],
+      "owner",
+      "anthropic-messages",
+    );
+    expect(settled.observationComplete).toBe(false);
+  });
+
+  // G1-1: a type-only Responses `error` record is a terminal FAILED. The
+  // stream carries a later `response.completed`, so a regression that stops
+  // classifying the error would settle the success instead.
+  it("fails a Responses stream whose type-only error record precedes a success", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    const withError = raw.replace(
+      /data: \{"type":"response\.completed"/,
+      'data: {"type":"error","error":{"message":"upstream failed"}}\n\ndata: {"type":"response.completed"',
+    );
+    expect(withError).not.toBe(raw);
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withError)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled).toMatchObject({ reason: "FAILED", observationComplete: false });
+  });
+
   it.each([
     { providerType: "openrouter", complete: true },
     { providerType: "openai", complete: false },
