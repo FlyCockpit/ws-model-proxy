@@ -1,4 +1,5 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
+import { CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE } from "@ws-model-proxy/config/cli-agent-audit";
 import { escapeForDisplay } from "@ws-model-proxy/config/display-escape";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
@@ -39,11 +40,19 @@ const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   timeStyle: "medium",
 });
 
-/** A command's `path` is `sha256:<hex> <program>`; a file's is the path. */
+/**
+ * A command's `path` is `hmac-sha256:<hex|unavailable> <program>`; a file's is
+ * the path. The program is shown for both; the hash chip only when a real hex
+ * digest was stored, so the `unavailable` sentinel (the server could not derive
+ * the audit key) is not rendered as a short hash.
+ */
 export function splitAuditPath(kind: string, path: string): { hash: string | null; text: string } {
-  if (COMMAND_KINDS.has(kind)) {
-    const match = /^sha256:([0-9a-f]{64}) ?([\s\S]*)$/.exec(path);
-    if (match) return { hash: (match[1] ?? "").slice(0, 12), text: match[2] ?? "" };
+  if (!COMMAND_KINDS.has(kind)) return { hash: null, text: path };
+  const match = /^hmac-sha256:([0-9a-f]{64}) ?([\s\S]*)$/.exec(path);
+  if (match) return { hash: (match[1] ?? "").slice(0, 12), text: match[2] ?? "" };
+  const unavailablePrefix = `hmac-sha256:${CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE}`;
+  if (path.startsWith(unavailablePrefix)) {
+    return { hash: null, text: path.slice(unavailablePrefix.length).replace(/^ /, "") };
   }
   return { hash: null, text: path };
 }

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   allowsHeadlessCommands,
   allowsSupervisedCommands,
@@ -26,6 +26,7 @@ import {
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
+import { commandAuditDigest } from "./command-audit-digest.js";
 import { relayProtocolAtLeast } from "./protocol.js";
 import {
   relaySessionManager,
@@ -70,13 +71,15 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
 /** Input bound: a refused oversized command is still audited cheaply. */
 const AUDIT_COMMAND_MAX_CHARS = 16_384;
 
-/** `path` of a command event (SHA-256 of the command text plus its program). */
+/**
+ * `path` of a command event (keyed HMAC-SHA256 of the command text plus its
+ * program; see ./command-audit-digest.ts). Never throws: `commandAuditDigest`
+ * degrades to `unavailable` and this guards an unexpected parse error.
+ */
 function auditPathOf(command: unknown): string {
   try {
     if (typeof command !== "string") return "";
-    return commandAuditPath(command.slice(0, AUDIT_COMMAND_MAX_CHARS), (text) =>
-      createHash("sha256").update(text).digest("hex"),
-    );
+    return commandAuditPath(command.slice(0, AUDIT_COMMAND_MAX_CHARS), commandAuditDigest);
   } catch {
     return "";
   }

@@ -21,6 +21,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
   },
 }));
 
@@ -1367,7 +1368,7 @@ describe("supervised commands", () => {
         cliDeviceId: "desktop",
         mcpTokenId: "token-a",
       });
-      expect(String(events()[0]?.path)).toMatch(/^sha256:[0-9a-f]{64} make$/);
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} make$/);
       const serialized = JSON.stringify(events());
       expect(serialized).not.toContain("hunter2");
       expect(serialized).not.toContain("TOKEN_KEY");
@@ -1401,7 +1402,7 @@ describe("supervised commands", () => {
       const serialized = JSON.stringify(events());
       for (const leak of ["sk-secret-9", "https://x", "Authorization", "Bearer"])
         expect(serialized, `row leaks ${leak}`).not.toContain(leak);
-      expect(String(events()[0]?.path)).toMatch(/^sha256:[0-9a-f]{64} curl$/);
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
     });
 
     it("records an unanswered confirm as expired, and each refusal", async () => {

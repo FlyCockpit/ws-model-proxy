@@ -115,14 +115,20 @@ describe("commandProgram", () => {
 describe("commandAuditPath", () => {
   const hex = (text: string) => `H<${[...text].length}>`;
 
-  it("hashes the well-formed command text, not a mask, plus the program", () => {
+  it("uses the keyed-hash prefix and hashes the well-formed text plus the program", () => {
     expect(commandAuditPath("curl --api-key sk-secret-9 https://x", hex)).toMatch(
-      /^sha256:H<36> curl$/,
+      /^hmac-sha256:H<36> curl$/,
     );
   });
 
   it("hashes the command text as given and fails the program closed on NUL", () => {
-    expect(commandAuditPath("ls\0x", hex)).toBe("sha256:H<4> ?");
+    expect(commandAuditPath("ls\0x", hex)).toBe("hmac-sha256:H<4> ?");
+  });
+
+  it("stores the injected digest verbatim, never a plain sha256 label", () => {
+    const path = commandAuditPath("pwd", () => "unavailable");
+    expect(path).toBe("hmac-sha256:unavailable pwd");
+    expect(path.startsWith("sha256:")).toBe(false);
   });
 
   it("stores no argument text for any adversarial command", () => {

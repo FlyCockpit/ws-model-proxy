@@ -182,12 +182,38 @@ export function commandProgram(command: unknown): string {
 }
 
 /**
- * `path` of a command event: `sha256:<hex of the command text> <program>`. The
- * hash is over the well-formed command text itself (no mask), so it can verify
- * a guess but never reveals text; the only other field is {@link commandProgram},
- * a validated program name. `sha256Hex` is injected to keep this module free of
- * Node built-ins.
+ * `path` prefix of a command event: `<prefix><hash> <program>`. A keyed
+ * HMAC-SHA256, so DB access alone cannot confirm a guessed command (e.g. a
+ * short password on the command line).
  */
-export function commandAuditPath(command: string, sha256Hex: (text: string) => string): string {
-  return `sha256:${sha256Hex(command.toWellFormed())} ${commandProgram(command)}`;
+export const CLI_AGENT_ACTION_AUDIT_PATH_PREFIX = "hmac-sha256:";
+
+/**
+ * Stored in place of the hash when the server cannot derive the audit key
+ * (the auth secret is missing or derivation failed). It leaks nothing and
+ * cannot be checked against guesses.
+ */
+export const CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE = "unavailable";
+
+/** Hex length of the stored HMAC-SHA256 digest. */
+export const CLI_AGENT_ACTION_AUDIT_HASH_HEX_LENGTH = 64;
+
+/**
+ * Fixed HKDF info label for the audit key. It must never change for a given
+ * deployment: it separates this key from every other use of the auth secret,
+ * so a key derived for another purpose cannot reproduce these digests.
+ */
+export const CLI_AGENT_ACTION_AUDIT_HKDF_INFO = "wsmp-cli-agent-audit-v1";
+
+/**
+ * `path` of a command event: `hmac-sha256:<hex of the command text> <program>`.
+ * The digest is over the well-formed command text itself (no mask), so with the
+ * server-held key it can verify a guess but never reveals text; without the key
+ * it reveals nothing. The only other field is {@link commandProgram}, a
+ * validated program name. `digest` is injected to keep this module free of Node
+ * built-ins; it must return {@link CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE} when
+ * it has no key, and its output is stored verbatim after the prefix.
+ */
+export function commandAuditPath(command: string, digest: (text: string) => string): string {
+  return `${CLI_AGENT_ACTION_AUDIT_PATH_PREFIX}${digest(command.toWellFormed())} ${commandProgram(command)}`;
 }

@@ -66,7 +66,7 @@ function row(overrides: Partial<Row> = {}): Row {
     cliDeviceId: "cli-1",
     kind: "command",
     outcome: "completed",
-    path: `sha256:${HASH} make`,
+    path: `hmac-sha256:${HASH} make`,
     reason: "exit:0",
     bytes: null,
     startedAt: "2026-01-01T00:00:00.000Z",
@@ -133,6 +133,21 @@ describe("CliAgentActivity", () => {
     expect(list.textContent).toContain("1,234");
   });
 
+  it("shows the program without a hash chip when the digest is unavailable", async () => {
+    state.respond = () => ({
+      events: [row({ id: "e3", path: "hmac-sha256:unavailable ls" })],
+      nextCursor: null,
+    });
+    renderIt();
+    await userEvent.click(screen.getByRole("button", { name: /clis.activity.show/ }));
+    const list = await screen.findByRole("list");
+    // The program is shown plainly (no "Program:" chip, like a file path), and
+    // neither the sentinel nor the label leaks into the row.
+    expect(list.textContent).toContain("ls");
+    expect(list.textContent).not.toContain("commandHash");
+    expect(list.textContent).not.toContain("unavailable");
+  });
+
   it("shows the empty state", async () => {
     state.respond = () => ({ events: [], nextCursor: null });
     renderIt();
@@ -159,7 +174,7 @@ describe("CliAgentActivity", () => {
     state.respond = (input) =>
       input.cursor === undefined
         ? { events: [row({ id: "e1" })], nextCursor: "cursor-1" }
-        : { events: [row({ id: "e2", path: `sha256:${HASH} second` })], nextCursor: null };
+        : { events: [row({ id: "e2", path: `hmac-sha256:${HASH} second` })], nextCursor: null };
     renderIt();
     await userEvent.click(screen.getByRole("button", { name: /clis.activity.show/ }));
     await userEvent.click(await screen.findByRole("button", { name: "clis.activity.loadMore" }));
@@ -170,18 +185,30 @@ describe("CliAgentActivity", () => {
 });
 
 describe("splitAuditPath", () => {
-  it("splits only command kinds and only a well-formed hash prefix", () => {
-    expect(splitAuditPath("command", `sha256:${HASH} pwd`)).toEqual({
+  it("splits only command kinds and only a well-formed keyed-hash prefix", () => {
+    expect(splitAuditPath("command", `hmac-sha256:${HASH} pwd`)).toEqual({
       hash: "a".repeat(12),
       text: "pwd",
     });
-    expect(splitAuditPath("file_read", `sha256:${HASH} pwd`)).toEqual({
+    expect(splitAuditPath("file_read", `hmac-sha256:${HASH} pwd`)).toEqual({
+      hash: null,
+      text: `hmac-sha256:${HASH} pwd`,
+    });
+    expect(splitAuditPath("command", "hmac-sha256:short pwd")).toEqual({
+      hash: null,
+      text: "hmac-sha256:short pwd",
+    });
+    // The unkeyed label is not a command hash prefix any more.
+    expect(splitAuditPath("command", `sha256:${HASH} pwd`)).toEqual({
       hash: null,
       text: `sha256:${HASH} pwd`,
     });
-    expect(splitAuditPath("command", "sha256:short pwd")).toEqual({
+  });
+
+  it("shows the program but no hash chip for the unavailable sentinel", () => {
+    expect(splitAuditPath("command", "hmac-sha256:unavailable pwd")).toEqual({
       hash: null,
-      text: "sha256:short pwd",
+      text: "pwd",
     });
   });
 });

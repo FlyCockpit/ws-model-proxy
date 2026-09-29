@@ -54,7 +54,7 @@ const CLI_REJECTION_MESSAGES = {
 
 /** Shown on `forwarder_cli_activity_list`: what the audit log holds. */
 export const CLI_AGENT_ACTIVITY_NOTICE =
-  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a SHA-256 of the command text plus the program name, never the command text itself), sizes and timestamps. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
+  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */
 export const CLI_SUPERVISED_COMMAND_NOTICE =

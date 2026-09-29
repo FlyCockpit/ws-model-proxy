@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { commandAuditDigest } from "./command-audit-digest.js";
 import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -17,6 +17,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
   },
 }));
 
@@ -861,7 +862,7 @@ describe("cli commands", () => {
         userId: "user-id",
         cliDeviceId: "desktop",
         mcpTokenId: "token-audit",
-        path: expect.stringMatching(/^sha256:[0-9a-f]{64} pwd$/),
+        path: expect.stringMatching(/^hmac-sha256:[0-9a-f]{64} pwd$/),
       });
     });
 
@@ -877,7 +878,7 @@ describe("cli commands", () => {
         userId: "user-id",
         cliDeviceId: "desktop",
         mcpTokenId: "token-audit",
-        path: expect.stringMatching(/^sha256:[0-9a-f]{64} pwd$/),
+        path: expect.stringMatching(/^hmac-sha256:[0-9a-f]{64} pwd$/),
       });
     });
 
@@ -922,7 +923,7 @@ describe("cli commands", () => {
         mcpTokenId: "token-audit",
       });
       const path = String(events()[0]?.path);
-      expect(path).toMatch(/^sha256:[0-9a-f]{64} run$/);
+      expect(path).toMatch(/^hmac-sha256:[0-9a-f]{64} run$/);
       expect(JSON.stringify(events())).not.toContain("sk-secret-9");
       // No stored field of the row may contain any argument text.
       expect(path.split(" ").slice(1).join(" ")).toBe("run");
@@ -946,9 +947,7 @@ describe("cli commands", () => {
       // The first word is a secret-bearing assignment: it is skipped, never stored.
       expect(path).not.toContain("abcdefghij");
       expect(path.split(" ").slice(1).join(" ")).toBe("tool");
-      expect(path.slice(0, path.indexOf(" "))).toBe(
-        `sha256:${createHash("sha256").update(command).digest("hex")}`,
-      );
+      expect(path.slice(0, path.indexOf(" "))).toBe(`hmac-sha256:${commandAuditDigest(command)}`);
     });
 
     it("never stores raw argument text for a secret-bearing command", async () => {
@@ -968,7 +967,7 @@ describe("cli commands", () => {
       const serialized = JSON.stringify(events());
       for (const leak of ["secret", "sk-secret-9", "https://x", "--api-key", "FOO="])
         expect(serialized, `row leaks ${leak}`).not.toContain(leak);
-      expect(String(events()[0]?.path)).toMatch(/^sha256:[0-9a-f]{64} curl$/);
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
     });
 
     it("records a command the session loss cancelled and one the CLI rejected", async () => {

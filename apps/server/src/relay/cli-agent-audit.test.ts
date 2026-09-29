@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CliAgentActionEventInput } from "@ws-model-proxy/config/cli-agent-audit";
 import { armDbShutdownFence, disarmDbShutdownFence } from "@ws-model-proxy/db/shutdown-fence";
 import type { MockInstance } from "vitest";
@@ -103,22 +104,18 @@ describe("recordCliAgentAction", () => {
   });
 
   it("never writes raw command text: the row carries only the hash and the program", async () => {
-    const { createHash } = await import("node:crypto");
     const { commandAuditPath } = await import("@ws-model-proxy/config/cli-agent-audit");
     const command = "FOO=secret curl --api-key sk-secret-9 https://x";
-    recordCliAgentAction(
-      event({
-        kind: "command",
-        path: commandAuditPath(command, (text) => createHash("sha256").update(text).digest("hex")),
-      }),
-    );
+    // The keyed digest is injected: this module never sees the key.
+    const digest = (text: string) => createHash("sha256").update(`key:${text}`).digest("hex");
+    recordCliAgentAction(event({ kind: "command", path: commandAuditPath(command, digest) }));
     await flushCliAgentAudit();
     const serialized = JSON.stringify(written(), (_k, v) =>
       typeof v === "bigint" ? String(v) : v,
     );
     for (const leak of ["secret", "sk-secret-9", "https://x", "--api-key", "FOO=", command])
       expect(serialized, `write leaks ${leak}`).not.toContain(leak);
-    expect(written()[0]?.path).toMatch(/^sha256:[0-9a-f]{64} curl$/);
+    expect(written()[0]?.path).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
   });
 
   it("makes every string safe for Postgres and bounds it", async () => {

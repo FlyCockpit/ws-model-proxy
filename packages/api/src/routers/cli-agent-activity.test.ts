@@ -34,7 +34,7 @@ function row(index: number) {
     cliDeviceId: "device-1",
     mcpTokenId: "token-1",
     kind: "command",
-    path: "sha256:x pwd",
+    path: "hmac-sha256:x pwd",
     etagBefore: null,
     etagAfter: null,
     bytes: index === 0 ? 5n : null,

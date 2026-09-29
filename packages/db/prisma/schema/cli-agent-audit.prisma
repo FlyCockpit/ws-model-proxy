@@ -39,9 +39,13 @@ model CliAgentActionEvent {
   /// The personal MCP token that acted; null when it is unknown.
   mcpTokenId  String?
   kind        CliAgentActionKind
-  /// Files: the requested path. Commands: `sha256:<hex of the command text>
-  /// <program>` (packages/config/src/cli-agent-audit.ts) — never any command
-  /// text; the program is the basename of the first non-assignment word.
+  /// Files: the requested path. Commands: `hmac-sha256:<hex of the command
+  /// text> <program>`, or `hmac-sha256:unavailable <program>` when the server
+  /// cannot derive the audit key (packages/config/src/cli-agent-audit.ts,
+  /// apps/server/src/relay/command-audit-digest.ts) — never any command text;
+  /// the program is the basename of the first non-assignment word. The digest
+  /// is HMAC-SHA256 under a key derived from the server auth secret, so the
+  /// table alone cannot be used to check a guessed command.
   path        String
   etagBefore  String?
   etagAfter   String?

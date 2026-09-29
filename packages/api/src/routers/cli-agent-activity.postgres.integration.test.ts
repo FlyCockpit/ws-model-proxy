@@ -71,7 +71,7 @@ integration("cli agent action events with real PostgreSQL", () => {
 
   const base = {
     kind: "command" as const,
-    path: "sha256:abc pwd",
+    path: "hmac-sha256:abc pwd",
     outcome: "completed" as const,
     startedAt: new Date(),
   };

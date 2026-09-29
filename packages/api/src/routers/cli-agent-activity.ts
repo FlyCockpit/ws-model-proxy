@@ -31,8 +31,8 @@ function decodeCursor(cursor: string): { createdAt: Date; id: string } {
 /**
  * Read-only, owner-scoped view of the agent audit log (what MCP agents did on
  * the caller's CLI devices). Metadata only: the log never holds file content,
- * diffs, command output or command text (a command's `path` is a SHA-256 of
- * the command text plus its program name). Also exposed as the MCP tool
+ * diffs, command output or command text (a command's `path` is a keyed
+ * HMAC-SHA256 of the command text plus its program name). Also exposed as the MCP tool
  * `forwarder_cli_activity_list`.
  */
 export const cliAgentActivityRouter = {
