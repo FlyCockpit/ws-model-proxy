@@ -23,13 +23,19 @@ function maintenanceOptions(): string {
 describe("index.ts relay maintenance wiring", () => {
   it("imports the agent audit stop from its module", () => {
     expect(source).toMatch(
-      /import \{ stopCliAgentAuditWriter \} from "\.\/relay\/cli-agent-audit\.js";/,
+      /import \{ flushCliAgentAudit, stopCliAgentAuditWriter \} from "\.\/relay\/cli-agent-audit\.js";/,
     );
   });
 
   it("passes the real audit writer stop to relay maintenance", () => {
     // Property value must be the imported writer, not an inline no-op.
     expect(maintenanceOptions()).toMatch(/stopCliAgentAudit:\s*stopCliAgentAuditWriter\b/);
+  });
+
+  it("passes the real audit flush to the shutdown, after the relay close", () => {
+    expect(source).toMatch(
+      /installServerShutdown\(\{[\s\S]*?flushAgentAudit:\s*flushCliAgentAudit\b/,
+    );
   });
 
   it("keeps the relay maintenance stop in the shutdown periodic-job list", () => {

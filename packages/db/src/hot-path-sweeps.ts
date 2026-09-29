@@ -35,6 +35,7 @@ import {
   fences,
   serverTimeoutSqlState,
 } from "./capacity-lock-order";
+import { USER_PLAIN_ID_HISTORY_TABLES } from "./parent-deletion-residual";
 import { isDbShutdownFenceArmed } from "./shutdown-fence";
 import { drainRequesterUsageRollupsBatch } from "./usage-rollup-requester-drain";
 
@@ -249,6 +250,21 @@ export async function purgeDeletedUserHistory(
       throw error;
     }
   }, batch);
+  // History keyed by a plain user id outside the hot path (the agent audit
+  // log). A row the drain skipped (locked) or an event written after the
+  // drain (a queued audit write, another replica) is taken here, and counts
+  // as remaining until it is gone, so the entry is not retired early.
+  let plainRemaining = false;
+  for (const [table, { userColumn }] of Object.entries(USER_PLAIN_ID_HISTORY_TABLES)) {
+    processed += await sweepLoop(
+      () => deleteOwnedBatch(db, table, "ctid", userColumn, userId, batch),
+      batch,
+    );
+    const [left] = await db.$queryRaw<[{ remaining: boolean }]>`
+      SELECT EXISTS (SELECT 1 FROM ${Prisma.raw(`"${table}"`)}
+                      WHERE ${Prisma.raw(`"${userColumn}"`)} = ${userId}) AS remaining`;
+    plainRemaining ||= left?.remaining ?? true;
+  }
   const [left] = await db.$queryRaw<[{ remaining: boolean }]>`
     SELECT EXISTS (SELECT 1 FROM relay_request WHERE "userId" = ${userId})
         OR EXISTS (SELECT 1 FROM admission_request WHERE "userId" = ${userId})
@@ -260,7 +276,7 @@ export async function purgeDeletedUserHistory(
         OR EXISTS (SELECT 1 FROM usage_rollup_hour
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
         AS remaining`;
-  return { processed, remaining: left?.remaining ?? true };
+  return { processed, remaining: plainRemaining || (left?.remaining ?? true) };
 }
 
 /** Bound on the purge's wait for a rollup merge destination held by a hot writer. */

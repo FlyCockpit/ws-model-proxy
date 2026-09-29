@@ -15,6 +15,7 @@ import type {
 import {
   type CliAgentActionKind,
   type CliAgentActionOutcome,
+  cliAgentSignalReason,
   cliAgentWireReason,
   commandAuditPath,
 } from "@ws-model-proxy/config/cli-agent-audit";
@@ -92,7 +93,7 @@ function exitReason(fields: {
   timedOut?: boolean;
 }): string {
   if (fields.timedOut === true) return "timed_out";
-  if (fields.signal !== null) return `signal:${fields.signal}`;
+  if (fields.signal !== null) return cliAgentSignalReason(fields.signal);
   return fields.exitCode !== null ? `exit:${fields.exitCode}` : "exit";
 }
 

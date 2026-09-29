@@ -105,6 +105,59 @@ export type CliAgentActionEventInput = {
 };
 
 /**
+ * Signal names a stored `signal:<name>` reason may carry (POSIX and common
+ * Linux/macOS names, with or without the `SIG` prefix), and numeric signals
+ * 1-64. The wire accepts any 1-32 character token from the CLI; only this
+ * finite vocabulary is stored, so a misbehaving CLI cannot put text in a row.
+ */
+const SIGNAL_NAMES = new Set([
+  "HUP",
+  "INT",
+  "QUIT",
+  "ILL",
+  "TRAP",
+  "ABRT",
+  "IOT",
+  "BUS",
+  "FPE",
+  "KILL",
+  "USR1",
+  "SEGV",
+  "USR2",
+  "PIPE",
+  "ALRM",
+  "TERM",
+  "STKFLT",
+  "CHLD",
+  "CONT",
+  "STOP",
+  "TSTP",
+  "TTIN",
+  "TTOU",
+  "URG",
+  "XCPU",
+  "XFSZ",
+  "VTALRM",
+  "PROF",
+  "WINCH",
+  "IO",
+  "POLL",
+  "PWR",
+  "SYS",
+  "EMT",
+  "INFO",
+]);
+
+/** `signal:<name|number>` as sent for a known signal, else `signal:unknown`. */
+export function cliAgentSignalReason(signal: string): string {
+  const upper = signal.toUpperCase();
+  const name = upper.startsWith("SIG") ? upper.slice(3) : upper;
+  if (SIGNAL_NAMES.has(name)) return `signal:${signal}`;
+  if (/^[1-9][0-9]?$/.test(signal) && Number(signal) <= 64) return `signal:${signal}`;
+  return "signal:unknown";
+}
+
+/**
  * Stored as the program of a command event when it cannot be extracted (empty,
  * unparsable, or a name outside the allowed charset/length).
  */

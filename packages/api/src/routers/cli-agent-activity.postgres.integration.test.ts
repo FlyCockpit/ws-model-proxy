@@ -15,35 +15,47 @@ const integration = databaseUrl ? describe : describe.skip;
 
 integration("cli agent action events with real PostgreSQL", () => {
   let prisma: typeof import("@ws-model-proxy/db").default;
+  // Graph rows (user, device) are written through the fixture client, which the
+  // graph-write fence triggers accept; the code under test uses `prisma`.
+  let fixture: ReturnType<
+    typeof import("@ws-model-proxy/db/test-fixture-client").createFixturePrismaClient
+  >;
   let router: typeof import("./cli-agent-activity").cliAgentActivityRouter;
   let deletion: typeof import("@ws-model-proxy/db/parent-deletion");
+  let sweeps: typeof import("@ws-model-proxy/db/hot-path-sweeps");
   const users: string[] = [];
 
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, routerModule, deletionModule] = await Promise.all([
+    const [db, routerModule, deletionModule, sweepsModule] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./cli-agent-activity"),
       import("@ws-model-proxy/db/parent-deletion"),
+      import("@ws-model-proxy/db/hot-path-sweeps"),
     ]);
     prisma = db.default;
+    fixture = (await import("@ws-model-proxy/db/test-fixture-client")).createFixturePrismaClient(
+      databaseUrl,
+    );
     router = routerModule.cliAgentActivityRouter;
     deletion = deletionModule;
+    sweeps = sweepsModule;
   });
 
   afterAll(async () => {
     if (!prisma) return;
     for (const id of users) {
       await prisma.cliAgentActionEvent.deleteMany({ where: { userId: id } });
-      await prisma.user.deleteMany({ where: { id } });
+      await fixture.user.deleteMany({ where: { id } });
     }
+    await fixture.$disconnect();
   });
 
   async function user(label: string) {
     const suffix = crypto.randomUUID();
-    const row = await prisma.user.create({
+    const row = await fixture.user.create({
       data: {
         name: `Audit ${label}`,
         email: `audit-${label}-${suffix}@example.test`,
@@ -178,15 +190,47 @@ integration("cli agent action events with real PostgreSQL", () => {
     expect(await prisma.cliAgentActionEvent.count({ where: { userId: kept.id } })).toBe(1);
   });
 
+  it("purges a row written after the user delete, and a row the drain skipped while locked", async () => {
+    const doomed = await user("late");
+    // A row another transaction holds when the drain runs is skipped (SKIP LOCKED).
+    const locked = await prisma.cliAgentActionEvent.create({
+      data: { userId: doomed.id, cliDeviceId: "dev", ...base },
+    });
+    const holder = new Promise<void>((resolve, reject) => {
+      prisma
+        .$transaction(
+          async (tx) => {
+            await tx.$queryRaw`SELECT id FROM cli_agent_action_event WHERE id = ${locked.id} FOR UPDATE`;
+            await deletion.deleteUserDurably(prisma, doomed.id, { batch: 3 });
+            resolve();
+            await new Promise((done) => setTimeout(done, 300));
+          },
+          { timeout: 20_000 },
+        )
+        .catch(reject);
+    });
+    await holder;
+    // The user is gone, but the skipped row survives the drain.
+    expect(await prisma.user.count({ where: { id: doomed.id } })).toBe(0);
+    // A late event (queued write, other replica) lands after the delete.
+    await prisma.cliAgentActionEvent.create({
+      data: { userId: doomed.id, cliDeviceId: "dev", ...base },
+    });
+    await new Promise((done) => setTimeout(done, 500));
+    const purged = await sweeps.purgeDeletedUserHistory(prisma, doomed.id, { batch: 3 });
+    expect(purged.remaining).toBe(false);
+    expect(await prisma.cliAgentActionEvent.count({ where: { userId: doomed.id } })).toBe(0);
+  }, 60_000);
+
   it("keeps the rows when a device is deleted (owner history until retention)", async () => {
     const owner = await user("device");
-    const device = await prisma.cliDevice.create({
+    const device = await fixture.cliDevice.create({
       data: { userId: owner.id, slug: `dev-${crypto.randomUUID().slice(0, 8)}` },
     });
     await prisma.cliAgentActionEvent.create({
       data: { userId: owner.id, cliDeviceId: device.id, ...base },
     });
-    await prisma.cliDevice.delete({ where: { id: device.id } });
+    await fixture.cliDevice.delete({ where: { id: device.id } });
     expect(await prisma.cliAgentActionEvent.count({ where: { cliDeviceId: device.id } })).toBe(1);
   });
 });

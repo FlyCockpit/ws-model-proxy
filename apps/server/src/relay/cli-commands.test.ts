@@ -959,6 +959,25 @@ describe("cli commands", () => {
       ]);
     });
 
+    it("stores an unknown exec signal as signal:unknown, never the CLI's text", async () => {
+      const socket = await connect();
+      const result = await startCliCommand({ ...base, command: "killed" });
+      if (!result.ok) throw new Error("expected start");
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "exec.done",
+          commandId: result.commandId,
+          timedOut: false,
+          signal: "AUDIT_MARKER",
+        }),
+      );
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:unknown"],
+      ]);
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
     it("stores the hash of the command text and its program, never a preview", async () => {
       const socket = await connect();
       const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz tool run";

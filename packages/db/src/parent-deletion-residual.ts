@@ -97,9 +97,11 @@ export const HISTORY_DRAIN_EDGES = {
  * count ignores them (they are not part of the locked cascade). The catalog
  * test requires every table with a `userId`-like column and no foreign key to
  * be listed here or in `PLAIN_USER_ID_EXEMPT` there, so a new plain-id table
- * cannot ship unclassified. Rows written after the drain (a refusal recorded
- * for a user whose deletion is already marked) are removed by the retention
- * sweep of the same table.
+ * cannot ship unclassified. A row the drain skipped (locked) or one written
+ * after the drain (a queued audit write, another replica) is taken by the
+ * deleted-user purge (`purgeDeletedUserHistory`, driven by the
+ * `deleted_user_purge` queue entry the delete writes), which also counts these
+ * tables as remaining; the 90-day retention sweep is the last bound.
  */
 export const USER_PLAIN_ID_HISTORY_TABLES = {
   cli_agent_action_event: { userColumn: "userId" },

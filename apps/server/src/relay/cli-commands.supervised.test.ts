@@ -1409,6 +1409,26 @@ describe("supervised commands", () => {
       ]);
     });
 
+    it("stores an unknown supervised.done signal as signal:unknown", async () => {
+      const socket = await connect();
+      const request = await spawnedAndAccepted(socket);
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        signal: "AUDIT_MARKER",
+        review: false,
+      });
+      await say(socket, {
+        type: "term.exit",
+        terminalId: request.terminalId,
+        signal: "AUDIT_MARKER",
+      });
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:unknown"],
+      ]);
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
     it("never stores raw command text: a secret-bearing argument row holds only the program", async () => {
       const socket = await connect();
       const request = await spawnedAndAccepted(socket, {

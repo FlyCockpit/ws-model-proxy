@@ -9,7 +9,13 @@ const PAGE_MAX = 100;
 const cursorSchema = z.string().min(1).max(200);
 
 const listInput = z.object({
-  cliDeviceId: z.string().min(1).max(128).optional(),
+  // NUL cannot be stored in a text column and would raise a database error.
+  cliDeviceId: z
+    .string()
+    .min(1)
+    .max(128)
+    .refine((value) => !value.includes("\0"), "Invalid device id.")
+    .optional(),
   limit: z.number().int().min(1).max(PAGE_MAX).default(PAGE_DEFAULT),
   cursor: cursorSchema.optional(),
 });

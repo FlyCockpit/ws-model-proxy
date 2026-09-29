@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   CLI_AGENT_REJECTION_FALLBACK,
   CLI_AGENT_WIRE_REASONS,
+  cliAgentSignalReason,
   cliAgentWireReason,
   commandAuditPath,
   commandProgram,
@@ -51,6 +52,26 @@ describe("cliAgentWireReason", () => {
 
   it("keeps the fallback inside the machine-code charset", () => {
     expect(CLI_AGENT_REJECTION_FALLBACK).toMatch(/^[A-Za-z0-9_:.-]+$/);
+  });
+});
+
+describe("cliAgentSignalReason", () => {
+  it.each([
+    ["SIGKILL", "signal:SIGKILL"],
+    ["SIGTERM", "signal:SIGTERM"],
+    ["kill", "signal:kill"],
+    ["9", "signal:9"],
+    ["64", "signal:64"],
+    ["AUDIT_MARKER", "signal:unknown"],
+    ["sk-abc123secret", "signal:unknown"],
+    ["0", "signal:unknown"],
+    ["65", "signal:unknown"],
+    ["09", "signal:unknown"],
+    ["SIG", "signal:unknown"],
+    ["", "signal:unknown"],
+    ["SIGKILL.x", "signal:unknown"],
+  ])("maps %s to %s", (input, expected) => {
+    expect(cliAgentSignalReason(input)).toBe(expected);
   });
 });
 

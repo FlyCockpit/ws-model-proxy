@@ -95,6 +95,7 @@ describe("cliAgentActivity.list", () => {
       await expect(client.list({ cursor })).rejects.toMatchObject({ code: expect.any(String) });
     await expect(client.list({ limit: 101 })).rejects.toBeInstanceOf(ORPCError);
     await expect(client.list({ limit: 0 })).rejects.toBeInstanceOf(ORPCError);
+    await expect(client.list({ cliDeviceId: "dev\0ice" })).rejects.toBeInstanceOf(ORPCError);
     expect(findMany).not.toHaveBeenCalled();
   });
 });
