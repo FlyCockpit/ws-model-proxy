@@ -2309,6 +2309,9 @@ describe("forwarderManagementRouter", () => {
       where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
       data: { protectionOverridePercent: 0, queuePriority: 24 },
     });
+    // Writer class M: the owner fence is the first lock operation, before the pool row lock.
+    expect(fenceCalls()).toEqual([["00:owner:user-id"]]);
+    expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
     // Omitted fields stay; null means "inherit".
     await client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: null });
     expect(db.poolGrant.updateMany).toHaveBeenLastCalledWith({

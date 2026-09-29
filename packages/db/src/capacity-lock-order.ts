@@ -286,7 +286,8 @@
  * Every transaction that holds a C-row in a conflicting mode and then waits
  * on a later C-level takes them in the same order: pool writers and deletes
  * (L1 first, then their grant/allowlist cascades), grant upserts (pool L1
- * first), grant revokes (single statement), user deletes (L1 on every owned
+ * first), grant setting updates (`updatePoolGrant`: owner fence, then pool L1,
+ * then the grant), grant revokes (single statement), user deletes (L1 on every owned
  * and granted pool before the L7 cascade into grants, tokens, entries and
  * provider rows), `updateExternalAccess` (the caller's own token FOR NO KEY
  * UPDATE, scoped by `userId`, before its entries), token revoke (single
