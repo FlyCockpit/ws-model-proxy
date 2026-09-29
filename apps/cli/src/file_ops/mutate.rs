@@ -84,14 +84,19 @@ fn resolve_for(
 }
 
 /// The etag a caller would have seen for the object `stat` describes.
-fn object_etag(ops: &FileOps, resolved: &Resolved, stat: &Stat) -> FileResult<Option<String>> {
+fn object_etag(
+    ops: &FileOps,
+    resolved: &Resolved,
+    stat: &Stat,
+    cancel: &Cancel,
+) -> FileResult<Option<String>> {
     Ok(match stat.kind() {
         Kind::File => {
             let (mut file, opened) = resolved.open_regular(&ops.policy, Access::Remove)?;
             if !opened.same_object(stat) {
                 return Err(FileError::conflict("replaced"));
             }
-            Some(current_etag(ops, &mut file, &opened)?)
+            Some(current_etag(ops, &mut file, &opened, cancel)?)
         }
         Kind::Symlink => Some(ops.key.weak_stat(stat)),
         Kind::Dir | Kind::Other => None,
@@ -104,6 +109,7 @@ pub(crate) fn rename(
     cancel: &Cancel,
 ) -> FileResult<RenameResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_exclusive(cancel)?;
     let overwrite = args.overwrite.unwrap_or(false);
     if overwrite && args.expected_etag.is_none() {
         return Err(FileError::invalid(
@@ -142,7 +148,7 @@ pub(crate) fn rename(
         ));
     }
     ops.policy.check_identity(Access::Remove, &src)?;
-    let src_etag = object_etag(ops, &from, &src)?;
+    let src_etag = object_etag(ops, &from, &src, cancel)?;
     if !overwrite && let Some(expected) = &args.expected_etag {
         match &src_etag {
             Some(current) if current == expected => {}
@@ -172,7 +178,7 @@ pub(crate) fn rename(
             ));
         }
         ops.policy.check_identity(Access::Write, dst)?;
-        let current = object_etag(ops, &to, dst)?.unwrap_or_default();
+        let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
         }
@@ -374,6 +380,7 @@ fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
 
 pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_shared(cancel)?;
     let mode = args
         .mode
         .as_deref()
@@ -445,6 +452,7 @@ pub(crate) fn delete(
     cancel: &Cancel,
 ) -> FileResult<DeleteResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_exclusive(cancel)?;
     let resolved = resolve_for(ops, &args.path, Access::Remove, false)?;
     if resolved.is_self() {
         return Err(FileError::invalid(
@@ -467,7 +475,7 @@ pub(crate) fn delete(
         }
     };
     if let Some(expected) = &args.expected_etag {
-        match object_etag(ops, &resolved, &st)? {
+        match object_etag(ops, &resolved, &st, cancel)? {
             Some(current) if current == *expected => {}
             Some(current) => return Err(FileError::conflict(&current)),
             None => return Err(FileError::invalid("directories have no etag")),

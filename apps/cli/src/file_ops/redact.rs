@@ -486,22 +486,18 @@ type Candidate = (usize, Construct);
 /// The assignment separators, longest first.
 const SEPARATORS: [&str; 6] = ["::=", "?=", "+=", ":=", "=", ":"];
 
-/// Every secret-name suffix in `line` as (suffix start, suffix end, bare name allowed),
-/// in order of position.
-fn secret_suffix_ends(line: &str) -> Vec<(usize, usize, bool)> {
-    let mut found = Vec::new();
-    for (suffix, bare_ok) in [
-        ("_TOKEN", false),
-        ("_KEY", false),
-        ("_SECRET", false),
-        ("PASSWORD", true),
-    ] {
-        for (at, _) in line.match_indices(suffix) {
-            found.push((at, at + suffix.len(), bare_ok));
-        }
-    }
-    found.sort_unstable();
-    found
+/// The end offset of every secret-name suffix (`_TOKEN`, `_KEY`, `_SECRET`,
+/// `PASSWORD`) in `line`, in order.
+fn secret_suffix_ends(line: &str) -> Vec<usize> {
+    let mut ends: Vec<usize> = ["_TOKEN", "_KEY", "_SECRET", "PASSWORD"]
+        .into_iter()
+        .flat_map(|suffix| {
+            line.match_indices(suffix)
+                .map(move |(at, _)| at + suffix.len())
+        })
+        .collect();
+    ends.sort_unstable();
+    ends
 }
 
 /// The first secret-named assignment of `line`. Its value is the whole rest of
@@ -514,19 +510,18 @@ fn secret_suffix_ends(line: &str) -> Vec<(usize, usize, bool)> {
 fn first_assignment(line: &str) -> Option<Candidate> {
     let bytes = line.as_bytes();
     let is_name = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_';
-    for (suffix_start, end, bare_ok) in secret_suffix_ends(line) {
+    for end in secret_suffix_ends(line) {
         // the name: the run of name bytes that ends at `end`
         let mut start = end;
         while start > 0 && is_name(bytes[start - 1]) {
             start -= 1;
         }
-        // `_KEY` etc. need at least one name character before them; a bare
-        // `PASSWORD` is a name by itself
-        let prefix_len = suffix_start - start;
+        // `_TOKEN`, `_KEY`, `_SECRET` and `PASSWORD` are names by themselves;
+        // `TOKEN=` and `KEY=` (no underscore) stay visible
         let first_ok = bytes
             .get(start)
             .is_some_and(|b| b.is_ascii_uppercase() || *b == b'_');
-        if !first_ok || (!bare_ok && prefix_len == 0) {
+        if !first_ok {
             continue;
         }
         // a name that continues past the suffix (`X_KEYS`) is not this suffix
@@ -1714,6 +1709,11 @@ mod tests {
             ),
             (Plain, "K_TOKEN=abc1   \n", &["   "]),
             (Plain, "_DEPLOY_TOKEN=lead-secret\n", &["lead-secret"]),
+            (
+                Plain,
+                "_TOKEN=short-secret\n_KEY: short-key-secret\n_SECRET=x-secret\n",
+                &["short-secret", "short-key-secret", "x-secret"],
+            ),
             (Plain, "  export __A_KEY: under-secret\n", &["under-secret"]),
             // stage-3 round 3 (Opus C3b-4/5): quote escapes, glued text, other flag prefixes
             (

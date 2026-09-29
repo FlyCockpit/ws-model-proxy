@@ -12,9 +12,10 @@ use std::time::Instant;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::error::{FileError, FileResult};
+use super::error::{ErrorCode, FileError, FileResult};
 use super::glob::Glob;
 use super::policy::Access;
+use super::read::read_to_end_cancellable;
 use super::redact;
 use super::resolve::{Kind, ResolveOpts, resolve};
 use super::text::{self, floor_boundary, name_for_display, strip_eol};
@@ -74,6 +75,7 @@ pub(crate) fn search(
     args: &SearchArgs,
     cancel: &Cancel,
 ) -> FileResult<SearchResult> {
+    cancel.check()?;
     if args.pattern.is_empty() || args.pattern.len() > MAX_PATTERN_BYTES {
         return Err(FileError::invalid("pattern must be 1 to 1024 bytes"));
     }
@@ -130,6 +132,7 @@ pub(crate) fn search(
     };
 
     let scan_file = |state: &mut State, entry: &Entry<'_>, shown: &str| -> FileResult<()> {
+        cancel.check()?;
         let opened = super::resolve::Resolved {
             dir: entry.parent.try_clone()?,
             dir_path: entry
@@ -147,13 +150,10 @@ pub(crate) fn search(
             return Ok(());
         }
         let mut bytes = Vec::with_capacity(stat.size as usize);
-        if file
-            .by_ref()
-            .take(MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return Ok(());
+        match read_to_end_cancellable(file.by_ref().take(MAX_FILE_BYTES + 1), &mut bytes, cancel) {
+            Ok(()) => {}
+            Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
+            Err(_) => return Ok(()),
         }
         state.scanned += 1;
         if text::sniff_binary(&bytes).is_some() {

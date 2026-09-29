@@ -48,7 +48,7 @@ pub(crate) fn perm_mode(bits: u32) -> Mode {
 }
 
 /// Refuse files an atomic replace would damage.
-pub fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
+pub(crate) fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
     let euid = ops.policy.euid();
     if stat.uid != euid && euid != 0 {
         return Err(FileError::new(
@@ -99,7 +99,7 @@ fn temp_name(name: &OsStr) -> OsString {
 /// Replace `name` in `dir` with `content`. `orig` is the open original and
 /// `orig_etag` the etag of the bytes the new content was derived from.
 #[allow(clippy::too_many_arguments)]
-pub fn replace(
+pub(crate) fn replace(
     ops: &FileOps,
     dir: &OwnedFd,
     name: &OsStr,
@@ -143,7 +143,7 @@ pub fn replace(
     // the identity the replacement will have once renamed (etags are bound to it)
     let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
 
-    recheck(ops, dir, name, orig, orig_stat, orig_etag)?;
+    recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
     ops.step(Step::EtagRechecked)?;
     cancel.check()?;
 
@@ -165,6 +165,7 @@ fn recheck(
     orig: &mut File,
     orig_stat: &Stat,
     orig_etag: &str,
+    cancel: &Cancel,
 ) -> FileResult<()> {
     let named =
         fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|errno| match errno {
@@ -175,22 +176,32 @@ fn recheck(
         return Err(FileError::conflict("replaced"));
     }
     let now = Stat::from_metadata(&orig.metadata()?);
-    let current = read_from_start(ops, orig, &now)?;
+    let current = read_from_start(ops, orig, &now, cancel)?;
     if current != orig_etag {
         return Err(FileError::conflict(&current));
     }
     Ok(())
 }
 
-fn read_from_start(ops: &FileOps, file: &mut File, stat: &Stat) -> FileResult<String> {
+fn read_from_start(
+    ops: &FileOps,
+    file: &mut File,
+    stat: &Stat,
+    cancel: &Cancel,
+) -> FileResult<String> {
     use std::io::Seek;
     file.rewind()?;
-    current_etag(ops, file, stat)
+    current_etag(ops, file, stat, cancel)
 }
 
 /// Create `name` exclusively with `mode` (after umask) and `content`. The new
 /// file is removed again if any later step fails.
-pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> FileResult<Stat> {
+pub(crate) fn create_new(
+    dir: &OwnedFd,
+    name: &OsStr,
+    content: &[u8],
+    mode: u32,
+) -> FileResult<Stat> {
     let fd = openat(
         dir.as_fd(),
         name,

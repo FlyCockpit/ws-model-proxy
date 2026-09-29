@@ -116,6 +116,78 @@ struct PathLocks {
     released: Condvar,
 }
 
+/// Namespace guard: file mutations (edit, write, mkdir) share it; rename and
+/// delete hold it exclusively, so a directory cannot be moved or removed while a
+/// change below it is in flight (its path lock and its held parent fd would
+/// otherwise name different directories). Reads do not take it.
+#[derive(Debug, Default)]
+struct Namespace {
+    state: Mutex<NsState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct NsState {
+    shared: usize,
+    exclusive: bool,
+}
+
+pub struct NamespaceGuard<'a> {
+    ns: &'a Namespace,
+    exclusive: bool,
+}
+
+impl Drop for NamespaceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.ns.state.lock() {
+            if self.exclusive {
+                state.exclusive = false;
+            } else {
+                state.shared -= 1;
+            }
+        }
+        self.ns.changed.notify_all();
+    }
+}
+
+impl Namespace {
+    fn acquire(
+        &self,
+        exclusive: bool,
+        cancel: &Cancel,
+        wait: Duration,
+    ) -> FileResult<NamespaceGuard<'_>> {
+        let deadline = std::time::Instant::now() + wait;
+        let poisoned = || FileError::new(ErrorCode::IoError, "lock poisoned");
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        while state.exclusive || (exclusive && state.shared > 0) {
+            cancel.check()?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(FileError::new(
+                    ErrorCode::Timeout,
+                    "another change is still in progress; retry",
+                ));
+            }
+            let slice = (deadline - now).min(Duration::from_millis(50));
+            state = self
+                .changed
+                .wait_timeout(state, slice)
+                .map_err(|_| poisoned())?
+                .0;
+        }
+        if exclusive {
+            state.exclusive = true;
+        } else {
+            state.shared += 1;
+        }
+        Ok(NamespaceGuard {
+            ns: self,
+            exclusive,
+        })
+    }
+}
+
 pub struct PathGuard<'a> {
     locks: &'a PathLocks,
     path: PathBuf,
@@ -165,6 +237,7 @@ pub struct FileOps {
     pub(crate) limits: Limits,
     pub(crate) hook: Option<StepHook>,
     locks: PathLocks,
+    namespace: Namespace,
 }
 
 impl FileOps {
@@ -175,6 +248,7 @@ impl FileOps {
             limits: Limits::default(),
             hook: None,
             locks: PathLocks::default(),
+            namespace: Namespace::default(),
         }
     }
 
@@ -199,6 +273,16 @@ impl FileOps {
             Some(hook) => hook(step),
             None => Ok(()),
         }
+    }
+
+    /// Shared namespace guard for a file mutation (see [`Namespace`]).
+    pub(crate) fn namespace_shared(&self, cancel: &Cancel) -> FileResult<NamespaceGuard<'_>> {
+        self.namespace.acquire(false, cancel, self.limits.lock_wait)
+    }
+
+    /// Exclusive namespace guard for a rename or delete.
+    pub(crate) fn namespace_exclusive(&self, cancel: &Cancel) -> FileResult<NamespaceGuard<'_>> {
+        self.namespace.acquire(true, cancel, self.limits.lock_wait)
     }
 
     pub(crate) fn lock_path(&self, path: PathBuf, cancel: &Cancel) -> FileResult<PathGuard<'_>> {

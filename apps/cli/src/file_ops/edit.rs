@@ -144,6 +144,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         ));
     }
 
+    let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -159,7 +160,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     let _lock = ops.lock_path(full.clone(), cancel)?;
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
-    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
+    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
     let previous_etag = ops.key.strong(&stat, &original);
     if let Some(expected) = &args.expected_etag
         && *expected != previous_etag

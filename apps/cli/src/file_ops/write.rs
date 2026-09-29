@@ -111,6 +111,7 @@ fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
 
 pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_shared(cancel)?;
     let content = decode_content(args)?;
     let if_exists = args.if_exists.unwrap_or_default();
     let mode = args.mode.as_deref().map(parse_mode).transpose()?;
@@ -205,7 +206,7 @@ fn write_resolved(
         ));
     }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
-    let previous_etag = current_etag(ops, &mut file, &stat)?;
+    let previous_etag = current_etag(ops, &mut file, &stat, cancel)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
     }
@@ -217,7 +218,7 @@ fn write_resolved(
     if stat.size <= super::etag::STRONG_ETAG_MAX_BYTES {
         use std::io::Seek;
         file.rewind()?;
-        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
+        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES, cancel)?;
         if text::sniff_binary(&bytes).is_none()
             && let Ok(text) = String::from_utf8(bytes)
         {

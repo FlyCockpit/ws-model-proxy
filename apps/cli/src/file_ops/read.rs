@@ -107,8 +107,28 @@ pub(crate) fn clamp_window(args: &ReadArgs) -> FileResult<(usize, usize)> {
     Ok((lines.min(MAX_LINES) as usize, bytes.min(MAX_BYTES) as usize))
 }
 
+/// `Read::read_to_end` in 1 MiB steps, observing cancellation between them.
+pub(crate) fn read_to_end_cancellable<R: Read>(
+    mut reader: R,
+    out: &mut Vec<u8>,
+    cancel: &Cancel,
+) -> FileResult<()> {
+    loop {
+        cancel.check()?;
+        let n = reader.by_ref().take(1 << 20).read_to_end(out)?;
+        if n == 0 {
+            return Ok(());
+        }
+    }
+}
+
 /// Read the whole file (at most `max` bytes) from an open fd.
-pub(crate) fn load_all(file: &mut std::fs::File, stat: &Stat, max: u64) -> FileResult<Vec<u8>> {
+pub(crate) fn load_all(
+    file: &mut std::fs::File,
+    stat: &Stat,
+    max: u64,
+    cancel: &Cancel,
+) -> FileResult<Vec<u8>> {
     if stat.size > max {
         return Err(FileError::new(
             ErrorCode::TooLarge,
@@ -116,7 +136,7 @@ pub(crate) fn load_all(file: &mut std::fs::File, stat: &Stat, max: u64) -> FileR
         ));
     }
     let mut bytes = Vec::with_capacity(stat.size as usize);
-    file.take(max + 1).read_to_end(&mut bytes)?;
+    read_to_end_cancellable(file.take(max + 1), &mut bytes, cancel)?;
     if bytes.len() as u64 > max {
         return Err(FileError::new(
             ErrorCode::TooLarge,
@@ -131,11 +151,12 @@ pub(crate) fn current_etag(
     ops: &FileOps,
     file: &mut std::fs::File,
     stat: &Stat,
+    cancel: &Cancel,
 ) -> FileResult<String> {
     if stat.size > STRONG_ETAG_MAX_BYTES {
         return Ok(ops.key.weak_stat(stat));
     }
-    let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES)?;
+    let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES, cancel)?;
     Ok(ops.key.strong(stat, &bytes))
 }
 
@@ -176,7 +197,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
         );
     }
 
-    let bytes = load_all(&mut file, &stat, STRONG_ETAG_MAX_BYTES)?;
+    let bytes = load_all(&mut file, &stat, STRONG_ETAG_MAX_BYTES, cancel)?;
     cancel.check()?;
     let etag = ops.key.strong(&stat, &bytes);
     if args.if_none_match.as_deref() == Some(etag.as_str()) {

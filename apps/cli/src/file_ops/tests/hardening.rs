@@ -871,3 +871,142 @@ fn a_secret_flag_with_a_line_continuation_only_hides_its_value() {
         )
         .unwrap();
 }
+
+// ---- a directory cannot move under an in-flight change -------------------------
+
+#[test]
+fn renaming_a_parent_waits_for_an_in_flight_edit_below_it() {
+    use std::sync::mpsc;
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let reached_tx = std::sync::Mutex::new(reached_tx);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let fx = Arc::new(Fx::new().with_hook(move |step| {
+        if step == Step::EtagRechecked && first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20));
+        }
+        Ok(())
+    }));
+    fx.put("d/f.txt", "one\n");
+    let editor = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.edit(
+                &args(json!({ "path": fx.p("d/f.txt"), "edits": [{ "oldText": "one", "newText": "A" }] })),
+                &fx.cancel,
+            )
+        })
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("edit A reached its final recheck");
+    let renamer = {
+        let fx = Arc::clone(&fx);
+        std::thread::spawn(move || {
+            fx.ops.rename(
+                &args(json!({ "from": fx.p("d"), "to": fx.p("e") })),
+                &fx.cancel,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !renamer.is_finished(),
+        "the rename must wait for the edit in flight"
+    );
+    assert!(fx.root.join("d/f.txt").exists(), "nothing moved yet");
+    resume_tx.send(()).unwrap();
+    editor.join().unwrap().expect("edit A commits");
+    renamer.join().unwrap().expect("the rename runs after it");
+    assert_eq!(fx.get("e/f.txt"), "A\n");
+}
+
+// ---- cancellation reaches search and hashing -----------------------------------
+
+#[test]
+fn cancelled_single_file_search_and_stat_hash_stop() {
+    let fx = Arc::new(Fx::new());
+    fx.put("one.txt", "needle\n");
+    fx.cancel.cancel();
+    let r = fx.ops.search(
+        &args(json!({ "root": fx.p("one.txt"), "pattern": "needle" })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::Cancelled);
+    let big = Arc::new(Fx::new());
+    let path = big.root.join("big.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&vec![b'a'; 1 << 20]).unwrap();
+    file.set_len(60 << 20).unwrap();
+    drop(file);
+    let canceller = {
+        let big = Arc::clone(&big);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            big.cancel.cancel();
+        })
+    };
+    let started = Instant::now();
+    let r = big.ops.stat(
+        &args(json!({ "paths": [big.p("big.bin")], "hash": true })),
+        &big.cancel,
+    );
+    canceller.join().unwrap();
+    match r {
+        Err(err) => assert_eq!(err.code, ErrorCode::Cancelled),
+        Ok(_) => assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "hashed 60 MiB despite the cancel"
+        ),
+    }
+}
+
+// ---- edits cannot arrange a layout that a restarted window masker misreads -----
+
+#[test]
+fn edits_cannot_arrange_a_layout_that_makes_a_window_show_a_masked_value() {
+    let fx = Fx::new();
+    fx.put(
+        "cfg.yaml",
+        "name: demo\nDEPLOY_KEY: |\n  line-one-of-key\n\n  hunter2-block-secret\ndone: yes\n",
+    );
+    let block = "  eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n".repeat(950_000 / 35);
+    // an accepted edit that puts a quoted opener inside a preceding block ...
+    let _ = fx.ops.edit(
+        &args(json!({ "path": fx.p("cfg.yaml"), "edits": [{
+            "oldText": "name: demo\n",
+            "newText": format!("name: demo\nE_KEY: |\n{block}  Y_TOKEN=\"open\n  more\nend-of-e\n") }] })),
+        &fx.cancel,
+    );
+    let etag = fx.etag("cfg.yaml");
+    let gap = "gap gap gap gap gap gap gap\n".repeat(500_000 / 28);
+    let _ = fx.ops.edit(
+        &args(
+            json!({ "path": fx.p("cfg.yaml"), "expectedEtag": etag, "edits": [{
+            "oldText": "end-of-e\n", "newText": format!("end-of-e\n{gap}") }] }),
+        ),
+        &fx.cancel,
+    );
+    // ... whether or not the edits were accepted, no window may show the value
+    let full = fx.read_with(json!({ "path": fx.p("cfg.yaml"), "startLine": -2 }));
+    assert!(!full.text.contains("hunter2-block-secret"), "{}", full.text);
+    let total = fx.read_with(json!({ "path": fx.p("cfg.yaml"), "startLine": 1, "maxLines": 1 }));
+    let lines = total.total_lines.expect("in-memory read has a line count");
+    for start in [
+        lines.saturating_sub(3),
+        lines.saturating_sub(2),
+        lines.saturating_sub(1),
+    ] {
+        let r = fx.read_with(json!({ "path": fx.p("cfg.yaml"), "startLine": start.max(1) }));
+        assert!(
+            !r.text.contains("hunter2-block-secret"),
+            "startLine {start}: {}",
+            r.text
+        );
+    }
+}
