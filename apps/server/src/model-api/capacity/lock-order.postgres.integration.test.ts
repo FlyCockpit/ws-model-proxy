@@ -256,6 +256,124 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     }
   }, 60_000);
 
+  it("stores engine facts and refreshes only an AUTO limit from engine slots, with a live lease", async () => {
+    // S-B (relay 2.7): registration writes engine facts under the L5 policy
+    // lock it already holds, refreshes an AUTO hard limit from reported slots
+    // on every update, and never touches a USER limit.
+    if (!databaseUrl) return;
+    registrationRetryErrors.length = 0;
+    process.env.DATABASE_URL = databaseUrl;
+    const suffix = crypto.randomUUID();
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const user = await fixtures.user.create({
+      data: {
+        name: "Engine facts",
+        email: `engine-facts-${suffix}@example.test`,
+        slug: `engine-facts-${suffix}`,
+      },
+    });
+    try {
+      const token = await fixtures.cliToken.create({
+        data: {
+          userId: user.id,
+          name: "engine",
+          lookupPrefix: `engine-${suffix}`,
+          secretDigest: `engine-digest-${suffix}`,
+        },
+      });
+      const identity = {
+        kind: "cliToken" as const,
+        id: token.id,
+        userId: user.id,
+        lookupPrefix: token.lookupPrefix,
+        cliDeviceId: null,
+      };
+      const register = async (slots: number) => {
+        const { persistRelayRegistration } = await import("../../relay/registration.js");
+        await persistRelayRegistration({
+          identity,
+          cli: { slug: "engine-cli" },
+          endpoints: [
+            {
+              slug: "engine-endpoint",
+              label: "Engine endpoint",
+              kind: "openai-compatible" as const,
+              status: "online" as const,
+              defaultCapabilities: {
+                version: 1 as const,
+                protocol: "openai-compatible" as const,
+                chatCompletions: { supported: true },
+              },
+              models: [
+                { upstreamModelId: "engine/model", capabilityOverrideMode: "inherit" as const },
+              ],
+              engineFacts: {
+                engine: { value: "llama.cpp" as const, source: "probe" as const },
+                slots: { value: slots, source: "probe" as const },
+                maxModelLen: { value: 32_768, source: "probe" as const },
+              },
+            },
+          ],
+          inventoryConfirmed: true,
+          endpointTargeting: true,
+        });
+      };
+      await register(3);
+      const target = await fixtures.executionTarget.findFirstOrThrow({
+        where: { userId: user.id, kind: "DISCOVERED_MODEL" },
+      });
+      const capacityId = target.inferenceCapacityId;
+      if (!capacityId) throw new Error("Registration must attach a capacity.");
+      expect(
+        await fixtures.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
+      ).toMatchObject({
+        hardConcurrencyLimit: 3,
+        hardConcurrencyLimitSource: "AUTO",
+        engineKind: "LLAMA_CPP",
+        engineSlots: 3,
+        maxModelLen: 32_768,
+        engineFactsSource: "PROBE",
+      });
+
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(fixtures, `engine-${suffix}`);
+      const holder = await store.acquire({
+        requestId: `engine-holder-${suffix}`,
+        attemptId: `engine-holder-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: "engine-holder",
+        deadlineAt: new Date(Date.now() + 60_000),
+        candidates: [{ capacityId, executionTargetId: target.id, candidateOrder: 0 }],
+      });
+      expect(holder.state).toBe("ADMITTED");
+
+      // The engine restarted with more slots while a lease is live.
+      await register(5);
+      expect(
+        await fixtures.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
+      ).toMatchObject({ hardConcurrencyLimit: 5, hardConcurrencyLimitSource: "AUTO" });
+
+      await fixtures.inferenceCapacity.update({
+        where: { id: capacityId },
+        data: { hardConcurrencyLimit: 2, hardConcurrencyLimitSource: "USER" },
+      });
+      await register(6);
+      expect(
+        await fixtures.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
+      ).toMatchObject({
+        hardConcurrencyLimit: 2,
+        hardConcurrencyLimitSource: "USER",
+        engineSlots: 6,
+      });
+      expect(registrationRetryErrors).toEqual([]);
+    } finally {
+      await cleanupLiveCapacityState(fixtures, user.id);
+      await fixtures.$disconnect();
+    }
+  }, 60_000);
+
   it("expires terminal relay requests while an admitter updates one of them (no 40P01)", async () => {
     // L6/L7. An admitter locks its admission_request row, then updates the
     // relay_request row it references. Retention deletes that terminal relay

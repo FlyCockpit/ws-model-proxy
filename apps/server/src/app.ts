@@ -243,6 +243,8 @@ function cliContextServices() {
     cancelMcpTokenCommands: (tokenId: string) => cancelCommandsForToken(tokenId),
     getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
       relaySessionManager.getLiveCliFeatures(cliDeviceIds),
+    getLiveNodeTelemetry: (cliDeviceIds: readonly string[]) =>
+      relaySessionManager.getLiveNodeTelemetry(cliDeviceIds),
     supervisedCommands: {
       listPending: listPendingSupervised,
       submitOutput: submitSupervisedOutput,

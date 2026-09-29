@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.6";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.7";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -21,19 +21,54 @@ pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 /// credit (`relay.request.body.ack`) to the server for each chunk its upstream
 /// request consumes. Mirrors `RELAY_REQUEST_BODY_WINDOW_CHUNKS` on the server.
 pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
-/// What a pre-2.6 server answers when its strict hello schema rejects a 2.6 hello.
+/// What an older server (2.6 or earlier) answers when its strict hello schema
+/// rejects a newer hello.
 pub const OLDER_SERVER_HELLO_REJECTION: &str = "Malformed relay protocol message.";
+/// Engine facts, node telemetry and live load frame limits. They mirror the
+/// server's strict 2.7 schemas (`apps/server/src/relay/protocol.ts`).
+pub const NODE_METRICS_CUSTOM_MAX: usize = 50;
+pub const NODE_METRICS_SOURCES_MAX: usize = 50;
+pub const NODE_GPU_MAX: usize = 32;
+pub const NODE_INTERFACE_MAX: usize = 32;
+pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
+pub const NODE_DISK_MAX: usize = 16;
 
 /// The fatal error for a `protocol.error` that arrives before `hello.ok`.
-/// A pre-2.6 server rejects the 2.6 hello as malformed; say so plainly.
+/// An older server rejects the newer hello as malformed; say so plainly.
 pub fn hello_rejection_message(message: &str) -> String {
-    if message == OLDER_SERVER_HELLO_REJECTION {
+    // A pre-2.6 server answers "Malformed relay protocol message.". A 2.6
+    // server pre-checks the hello, answers its own upgrade-required text
+    // naming its (older) protocol, and never reaches its strict schema.
+    // Only the named version _older than_ ours means the server is behind;
+    // a future server naming a newer protocol leaves the message intact.
+    let server_too_old = message == OLDER_SERVER_HELLO_REJECTION
+        || named_relay_protocol_version(message)
+            .is_some_and(|version| version < local_relay_protocol_version());
+    if server_too_old {
         format!(
             "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
         )
     } else {
         format!("relay protocol error: {message}")
     }
+}
+
+/// The protocol version a rejection names in `(relay protocol X.Y)`, e.g. the
+/// `RELAY_UPGRADE_REQUIRED_MESSAGE` of a server older than this CLI.
+fn named_relay_protocol_version(message: &str) -> Option<(u32, u32)> {
+    const MARKER: &str = "(relay protocol ";
+    let rest = &message[message.find(MARKER)? + MARKER.len()..];
+    parse_relay_protocol_version(rest.get(..rest.find(')')?)?)
+}
+
+/// Numeric `major.minor` for a relay protocol version such as `2.7`.
+fn parse_relay_protocol_version(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+fn local_relay_protocol_version() -> (u32, u32) {
+    parse_relay_protocol_version(RELAY_PROTOCOL_VERSION).expect("RELAY_PROTOCOL_VERSION is X.Y")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +224,15 @@ pub enum ClientControlMessage {
         signal: Option<String>,
         timed_out: bool,
     },
+    /// 2.7: static node facts, once per connection after `hello.ok`.
+    #[serde(rename = "node.info")]
+    NodeInfo(NodeInfo),
+    /// 2.7: periodic node metrics (built-ins every 20 s; never closer than 5 s).
+    #[serde(rename = "node.metrics")]
+    NodeMetrics(NodeMetrics),
+    /// 2.7: live engine load for one endpoint (or one model on it).
+    #[serde(rename = "endpoint.load")]
+    EndpointLoad(EndpointLoad),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +307,9 @@ pub struct CliReportedFeatures {
     pub mcp_command_mode: McpCommandMode,
     pub terminal_approval: bool,
     pub terminal_supported: bool,
+    /// 2.7: whether this CLI accepts remotely defined metric sources
+    /// (`metrics.sources.set`). Always false until the local opt-in exists.
+    pub remote_metric_sources: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +333,8 @@ pub struct CliCapabilities {
     pub terminal_viewers: bool,
     /// 2.6: this CLI implements supervised terminals (`term.spawn`).
     pub supervised_commands: bool,
+    /// 2.7: this CLI sends `node.info`, `node.metrics` and `endpoint.load`.
+    pub node_telemetry: bool,
     /// The browser pins this key and checks the signature before any
     /// terminal handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,10 +362,12 @@ impl CliCapabilities {
                 mcp_command_mode: snapshot.mcp_command_mode,
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
+                remote_metric_sources: false,
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
             terminal_viewers: true,
             supervised_commands: true,
+            node_telemetry: true,
             terminal_identity: snapshot.terminal_identity.clone(),
         }
     }
@@ -337,6 +388,9 @@ pub struct EndpointInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_suggestions: Option<OpenAiCompatibleCapabilities>,
     pub models: Vec<DiscoveredModelInventory>,
+    /// 2.7: static engine facts for the whole endpoint. Digest-excluded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_facts: Option<EngineFacts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -362,6 +416,354 @@ pub struct DiscoveredModelInventory {
     /// when an auto capacity limit is still null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// 2.7: per-model engine facts; each field overrides the endpoint's.
+    /// Digest-excluded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_facts: Option<EngineFacts>,
+}
+
+/// Where one engine fact came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FactSource {
+    Probe,
+    Config,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineFact<T> {
+    pub value: T,
+    pub source: FactSource,
+}
+
+impl<T> EngineFact<T> {
+    pub fn probe(value: T) -> Self {
+        Self {
+            value,
+            source: FactSource::Probe,
+        }
+    }
+
+    pub fn config(value: T) -> Self {
+        Self {
+            value,
+            source: FactSource::Config,
+        }
+    }
+}
+
+/// 2.7 static engine facts. Every field is optional and carries its source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineFacts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineFact<crate::engine::EngineKind>>,
+    /// Concurrent sequences the engine runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slots: Option<EngineFact<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_per_slot: Option<EngineFact<u64>>,
+    /// Total KV capacity in tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_tokens: Option<EngineFact<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<EngineFact<u64>>,
+    /// llama.cpp `--cache-ram`. Not detected yet; defined for the presets.
+    #[serde(rename = "hostPromptCacheMiB", skip_serializing_if = "Option::is_none")]
+    pub host_prompt_cache_mib: Option<EngineFact<u64>>,
+    /// Model ids one engine process serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_model_aliases: Option<EngineFact<Vec<String>>>,
+}
+
+impl EngineFacts {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 2.7 `node.info`: static facts about this machine. Every field is optional.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<NodeOs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<NodeCpu>,
+    #[serde(rename = "memoryTotalMiB", skip_serializing_if = "Option::is_none")]
+    pub memory_total_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<NodeGpuInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_memory: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<NodeKind>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<NodeInterfaceInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mechanism: Option<ExecutionMechanism>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeOs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCpu {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Logical CPUs available to this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeGpuInfo {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+    /// `None` on unified-memory GPUs (nvidia-smi reports `[N/A]`).
+    #[serde(rename = "vramTotalMiB", skip_serializing_if = "Option::is_none")]
+    pub vram_total_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeKind {
+    Unified,
+    Discrete,
+    Cpu,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeInterfaceInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_speed_mbps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+}
+
+/// How the CLI process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMechanism {
+    Foreground,
+    Systemd,
+    Launchd,
+    Container,
+}
+
+/// 2.7 `node.metrics`. `[N/A]` readings are omitted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeMetrics {
+    /// RFC 3339 sample time.
+    pub ts: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<NodeCpuMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<NodeMemoryMetrics>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<NodeDiskMetrics>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<NodeGpuMetrics>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<NodeInterfaceMetrics>,
+    /// Custom metric series (S-B part 2). At most `NODE_METRICS_CUSTOM_MAX`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom: Vec<CustomMetric>,
+    /// Status of each configured or remotely defined metric source.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<MetricSourceStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCpuMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load5: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load15: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NodeMemoryMetrics {
+    #[serde(rename = "totalMiB", skip_serializing_if = "Option::is_none")]
+    pub total_mib: Option<u64>,
+    /// `/proc/meminfo` `MemAvailable`; on unified memory this is the GPU budget too.
+    #[serde(rename = "availableMiB", skip_serializing_if = "Option::is_none")]
+    pub available_mib: Option<u64>,
+    #[serde(rename = "swapTotalMiB", skip_serializing_if = "Option::is_none")]
+    pub swap_total_mib: Option<u64>,
+    #[serde(rename = "swapFreeMiB", skip_serializing_if = "Option::is_none")]
+    pub swap_free_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NodeDiskMetrics {
+    pub mount: String,
+    #[serde(rename = "totalMiB", skip_serializing_if = "Option::is_none")]
+    pub total_mib: Option<u64>,
+    #[serde(rename = "freeMiB", skip_serializing_if = "Option::is_none")]
+    pub free_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeGpuMetrics {
+    pub index: u32,
+    #[serde(rename = "vramUsedMiB", skip_serializing_if = "Option::is_none")]
+    pub vram_used_mib: Option<u64>,
+    #[serde(rename = "vramTotalMiB", skip_serializing_if = "Option::is_none")]
+    pub vram_total_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization_percent: Option<f64>,
+    #[serde(rename = "temperatureC", skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    #[serde(rename = "powerW", skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f64>,
+    #[serde(rename = "smClockMHz", skip_serializing_if = "Option::is_none")]
+    pub sm_clock_mhz: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeInterfaceMetrics {
+    pub name: String,
+    /// Lifetime totals since boot, saturated at `Number.MAX_SAFE_INTEGER`
+    /// (see `telemetry::BYTE_COUNTER_MAX`) so the server's strict schema keeps
+    /// accepting the frame. Treat a value at the cap as "at least this much".
+    pub rx_bytes: u64,
+    /// See [`Self::rx_bytes`].
+    pub tx_bytes: u64,
+}
+
+/// One custom series. Names and label keys/values match `[A-Za-z0-9_.:-]{1,64}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMetric {
+    pub source: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub value: f64,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricSourceOrigin {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricSourceState {
+    Active,
+    PendingApproval,
+    Refused,
+    Unsupported,
+    Disabled,
+    Failing,
+}
+
+/// Why a source's last run produced nothing. Never command output or stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricSourceError {
+    Spawn,
+    Timeout,
+    ExitStatus,
+    OutputTooLarge,
+    Parse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricSourceStatus {
+    pub name: String,
+    pub origin: MetricSourceOrigin,
+    pub state: MetricSourceState,
+    /// SHA-256 (hex) of the exact command string, for hash-pinned approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_sha256: Option<String>,
+    /// The source's run interval in seconds (`5..=86_400`). The server marks
+    /// a source's series stale after 3× this (S-B part 2). Local sources are
+    /// defined only in the CLI config, so this is the server's only way to
+    /// learn their cadence. Absent when the source has no schedule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<MetricSourceError>,
+}
+
+/// 2.7 `endpoint.load`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointLoad {
+    pub endpoint_slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_slug: Option<String>,
+    pub running: u64,
+    pub waiting: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slots_busy: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_hits_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_queries_delta: Option<u64>,
+    pub source: crate::engine::LoadSource,
+    pub ts: String,
+}
+
+/// 2.7 `metrics.sources.set` (server to CLI): remotely defined custom metric
+/// sources. This CLI does not run them yet and reports each as `unsupported`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteMetricSource {
+    pub name: String,
+    pub command: String,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    pub format: MetricSourceFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricSourceFormat {
+    Number,
+    Json,
+    Prometheus,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -494,6 +896,11 @@ enum KnownServerControlMessage {
         #[serde(default)]
         reason: Option<String>,
     },
+    #[serde(rename = "metrics.sources.set")]
+    MetricsSourcesSet {
+        id: String,
+        sources: Vec<RemoteMetricSource>,
+    },
 }
 
 /// A supervised command request, as `term.spawn` carries it.
@@ -593,6 +1000,11 @@ pub enum ServerControlMessage {
         /// with another one) the terminal simply ends.
         if_waiting: bool,
     },
+    /// 2.7: remotely defined metric sources (replaces the previous list).
+    MetricsSourcesSet {
+        id: String,
+        sources: Vec<RemoteMetricSource>,
+    },
     Unknown {
         type_name: String,
     },
@@ -681,6 +1093,86 @@ impl RelayBinaryFrameMetadata {
     }
 }
 
+/// Token counts the server's strict schema accepts (`1..=1e12`). A value
+/// outside it is dropped here so one odd engine report cannot fail hello.
+const ENGINE_TOKEN_COUNT_MAX: u64 = 1_000_000_000_000;
+
+fn token_fact(value: Option<u64>) -> Option<EngineFact<u64>> {
+    value
+        .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
+        .map(EngineFact::probe)
+}
+
+/// Endpoint-level engine facts: the declared or detected engine, probed
+/// numbers, and `slots`: the configured concurrency when set, else the
+/// engine's reported slots.
+pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
+    let detected = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref());
+    let engine = crate::engine::effective_kind(endpoint).map(|(kind, declared)| {
+        if declared {
+            EngineFact::config(kind)
+        } else {
+            EngineFact::probe(kind)
+        }
+    });
+    let probed_slots = detected
+        .and_then(|engine| engine.slots)
+        .filter(|slots| (1..=10_000).contains(slots));
+    // Detection is overridable by config (#70 §B): a concurrency set with
+    // `wsmp endpoints concurrency` wins over the engine's reported slots (for
+    // example to keep some llama.cpp slots free for direct local use); the
+    // probed count only fills an unset value.
+    let configured_slots = endpoint
+        .concurrency_limit
+        .filter(|limit| (1..=10_000).contains(limit));
+    let facts = EngineFacts {
+        engine,
+        slots: configured_slots
+            .map(EngineFact::config)
+            .or_else(|| probed_slots.map(EngineFact::probe)),
+        ctx_per_slot: token_fact(detected.and_then(|engine| engine.ctx_per_slot)),
+        kv_tokens: token_fact(detected.and_then(|engine| engine.kv_tokens)),
+        max_model_len: token_fact(detected.and_then(|engine| engine.max_model_len)),
+        host_prompt_cache_mib: None,
+        served_model_aliases: detected
+            .map(|engine| {
+                engine
+                    .served_model_aliases
+                    .iter()
+                    .filter(|alias| {
+                        // Trimmed as the server's zod `.trim()` trims.
+                        let trimmed =
+                            alias.trim_matches(crate::telemetry_bounds::is_js_trim_whitespace);
+                        !trimmed.is_empty() && trimmed.len() <= 512
+                    })
+                    .take(64)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|aliases| !aliases.is_empty())
+            .map(EngineFact::probe),
+    };
+    (!facts.is_empty()).then_some(facts)
+}
+
+/// Per-model facts that differ from the endpoint's (vLLM `max_model_len`).
+fn model_engine_facts(endpoint: &EndpointConfig, upstream_model_id: &str) -> Option<EngineFacts> {
+    let max_model_len = token_fact(
+        endpoint
+            .last_probe
+            .as_ref()
+            .and_then(|probe| probe.engine.as_ref())
+            .and_then(|engine| engine.model_max_len.get(upstream_model_id).copied()),
+    )?;
+    Some(EngineFacts {
+        max_model_len: Some(max_model_len),
+        ..EngineFacts::default()
+    })
+}
+
 pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> EndpointInventory {
     let mut default_capabilities = endpoint.default_capabilities.clone();
     if endpoint.engine.accepts_top_k() {
@@ -717,9 +1209,11 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
                     capability_override_mode: model.capability_override_mode.clone(),
                     probe_suggestions: model.probe_suggestions.clone(),
                     concurrency_limit: endpoint.concurrency_limit,
+                    engine_facts: model_engine_facts(endpoint, &model.upstream_model_id),
                 }
             })
             .collect(),
+        engine_facts: endpoint_engine_facts(endpoint),
     }
 }
 
@@ -799,10 +1293,52 @@ fn stable_object_json(values: &Map<String, Value>) -> String {
 
 pub fn encode_control(message: &ClientControlMessage) -> Result<String> {
     let text = serde_json::to_string(message).context("serializing relay control frame")?;
-    if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
-        anyhow::bail!("JSON control frame exceeds 64 KiB");
+    if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
+        return Ok(text);
     }
-    Ok(text)
+    if let Some(text) = inventory_without_engine_facts(message)? {
+        return Ok(text);
+    }
+    anyhow::bail!("JSON control frame exceeds 64 KiB");
+}
+
+/// A `hello` or `inventory.update` over the frame cap sheds its engine facts
+/// (digest-excluded and advisory) before it is refused, least useful first:
+/// per-model facts, then served-model aliases, then every endpoint fact. The
+/// inventory itself is never trimmed. `None` when shedding is not enough.
+fn inventory_without_engine_facts(message: &ClientControlMessage) -> Result<Option<String>> {
+    let steps: [fn(&mut EndpointInventory); 3] = [
+        |endpoint| {
+            for model in &mut endpoint.models {
+                model.engine_facts = None;
+            }
+        },
+        |endpoint| {
+            if let Some(facts) = endpoint.engine_facts.as_mut() {
+                facts.served_model_aliases = None;
+            }
+        },
+        |endpoint| endpoint.engine_facts = None,
+    ];
+    let mut shed = message.clone();
+    for (index, step) in steps.iter().enumerate() {
+        match &mut shed {
+            ClientControlMessage::Hello { endpoints, .. }
+            | ClientControlMessage::InventoryUpdate { endpoints, .. } => {
+                endpoints.iter_mut().for_each(step);
+            }
+            _ => return Ok(None),
+        }
+        let text = serde_json::to_string(&shed).context("serializing relay control frame")?;
+        if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
+            tracing::warn!(
+                shed_steps = index + 1,
+                "the endpoint inventory exceeds 64 KiB with engine facts; sent without some of them"
+            );
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
 }
 
 pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
@@ -820,7 +1356,34 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
     }
     let known: KnownServerControlMessage =
         serde_json::from_value(value).context("parsing relay server control frame")?;
+    if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
+        validate_remote_metric_sources(sources)?;
+    }
     Ok(known.into())
+}
+
+/// The server's strict 2.7 `metrics.sources.set` contract
+/// (`remoteMetricSourcesSchema`), enforced here too: a list that breaks it
+/// is refused whole (and then ignored, never fatal; see `control_frame_fault`).
+/// Unknown fields are refused by `deny_unknown_fields`, the format by its enum.
+pub fn validate_remote_metric_sources(sources: &[RemoteMetricSource]) -> Result<()> {
+    if sources.len() > NODE_METRICS_SOURCES_MAX {
+        anyhow::bail!("metrics.sources.set lists more than {NODE_METRICS_SOURCES_MAX} sources");
+    }
+    for source in sources {
+        // zod counts UTF-16 code units.
+        let command_units = source.command.encode_utf16().count();
+        if !crate::telemetry::is_metric_name(&source.name)
+            || !(1..=4096).contains(&command_units)
+            || !(crate::telemetry::METRIC_SOURCE_INTERVAL_MIN_SECS
+                ..=crate::telemetry::METRIC_SOURCE_INTERVAL_MAX_SECS)
+                .contains(&source.interval_secs)
+            || !(1..=300).contains(&source.timeout_secs)
+        {
+            anyhow::bail!("metrics.sources.set carries a source outside the 2.7 contract");
+        }
+    }
+    Ok(())
 }
 
 fn known_server_frame(type_name: &str) -> bool {
@@ -842,6 +1405,7 @@ fn known_server_frame(type_name: &str) -> bool {
             | "exec.cancel"
             | "term.spawn"
             | "supervised.cancel"
+            | "metrics.sources.set"
     )
 }
 
@@ -985,6 +1549,9 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                     if_waiting: matches!(reason.as_deref(), Some("expire" | "decline")),
                 }
             }
+            KnownServerControlMessage::MetricsSourcesSet { id, sources } => {
+                Self::MetricsSourcesSet { id, sources }
+            }
         }
     }
 }
@@ -1019,7 +1586,9 @@ mod inventory_digest_tests {
                 capability_override_mode: CapabilityOverrideMode::Inherit,
                 probe_suggestions: None,
                 concurrency_limit: None,
+                engine_facts: None,
             }],
+            engine_facts: None,
         }];
         assert_eq!(
             inventory_digest(&endpoints),
@@ -1254,6 +1823,11 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name == "relay.request" || type_name == "relay.request.body" {
         return FrameFault::Fatal;
     }
+    // 2.7 telemetry control is advisory: a malformed definition list is
+    // dropped and the relay keeps running.
+    if type_name == "metrics.sources.set" {
+        return FrameFault::Ignore;
+    }
     if type_name == "term.spawn"
         && let Some(command_id) = string_field(value, "commandId")
     {
@@ -1446,12 +2020,15 @@ mod tests {
                 default_capabilities: OpenAiCompatibleCapabilities::openai_defaults(),
                 probe_suggestions: None,
                 models: Vec::new(),
+                engine_facts: None,
             }],
         };
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.6""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.7""#));
+        assert!(encoded.contains(r#""nodeTelemetry":true"#));
+        assert!(encoded.contains(r#""remoteMetricSources":false"#));
         assert!(encoded.contains(r#""supervisedCommands":true"#));
         assert!(encoded.contains(r#""hostname":"desk-01.local""#));
         assert!(!encoded.contains(r#""label":"Desktop""#));
@@ -1690,9 +2267,9 @@ mod tests {
         assert_eq!(control_frame_fault(&fatal), FrameFault::Fatal);
     }
     #[test]
-    fn a_pre_2_6_server_rejection_says_to_upgrade_the_server() {
+    fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
-        assert!(message.contains("rejected relay protocol 2.6"), "{message}");
+        assert!(message.contains("rejected relay protocol 2.7"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -1700,6 +2277,31 @@ mod tests {
         assert_eq!(
             hello_rejection_message("access_denied"),
             "relay protocol error: access_denied"
+        );
+    }
+
+    #[test]
+    fn a_26_server_upgrade_required_reply_says_to_upgrade_the_server() {
+        // The exact text the released 2.6 server sends a 2.7 hello.
+        let message = hello_rejection_message(
+            "This server requires wsmp 0.4.0 or newer (relay protocol 2.6). Upgrade wsmp and restart it.",
+        );
+        assert!(
+            message.contains("upgrade the WS Model Proxy server"),
+            "{message}"
+        );
+        assert!(message.contains("relay protocol 2.6"), "{message}");
+    }
+
+    #[test]
+    fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
+        // A 2.8 server's genuine "upgrade wsmp" must pass through: the CLI is
+        // the one behind, so do not tell the person to upgrade the server.
+        let reply =
+            "This server requires a newer wsmp (relay protocol 2.8). Upgrade wsmp and restart it.";
+        assert_eq!(
+            hello_rejection_message(reply),
+            format!("relay protocol error: {reply}")
         );
     }
 
@@ -2008,6 +2610,442 @@ mod tests {
                 terminal_id: "t".to_string(),
                 viewer_id: "v".to_string(),
             }
+        );
+    }
+}
+
+/// Cross-language vectors shared with `apps/server/src/relay/protocol.test.ts`:
+/// the server's strict 2.7 schemas must accept exactly what this CLI encodes.
+#[cfg(test)]
+mod relay_27_vectors {
+    use super::*;
+    use crate::config::{ModelConfig, ProbeSnapshot, ProbeStatus};
+    use crate::engine::{DetectedEngine, EngineKind, LoadSource};
+
+    fn vector(text: &str) -> Value {
+        serde_json::from_str(text).expect("vector is JSON")
+    }
+
+    fn encoded(message: &ClientControlMessage) -> Value {
+        serde_json::from_str(&encode_control(message).expect("encode")).expect("json")
+    }
+
+    fn probed(engine: DetectedEngine, models: &[&str]) -> Option<ProbeSnapshot> {
+        Some(ProbeSnapshot {
+            status: ProbeStatus::Online,
+            models: models.iter().map(|id| (*id).to_string()).collect(),
+            suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+            engine: Some(engine),
+        })
+    }
+
+    fn inventory(endpoint: &EndpointConfig) -> EndpointInventory {
+        // Vectors pin the facts, not capability profiles.
+        let mut inventory = endpoint_inventory(endpoint, EndpointStatus::Online);
+        inventory.default_capabilities = OpenAiCompatibleCapabilities::default();
+        inventory.probe_suggestions = None;
+        inventory
+    }
+
+    #[test]
+    fn hello_with_engine_facts_matches_the_shared_vector() {
+        let vllm = EndpointConfig {
+            slug: "vllm".to_string(),
+            label: "vLLM".to_string(),
+            concurrency_limit: Some(8),
+            models: vec![ModelConfig {
+                slug: Some("llama".to_string()),
+                upstream_model_id: "meta/llama".to_string(),
+                ..ModelConfig::default()
+            }],
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::Vllm),
+                    kv_tokens: Some(32_768),
+                    model_max_len: [("meta/llama".to_string(), 131_072)].into_iter().collect(),
+                    served_model_aliases: vec!["meta/llama".to_string(), "llama-alias".to_string()],
+                    ..DetectedEngine::default()
+                },
+                &["meta/llama", "llama-alias"],
+            ),
+            ..EndpointConfig::default()
+        };
+        let llama = EndpointConfig {
+            slug: "llama".to_string(),
+            label: "llama.cpp".to_string(),
+            engine: crate::config::EndpointEngine::LlamaCpp,
+            models: vec![ModelConfig {
+                slug: Some("qwen".to_string()),
+                upstream_model_id: "qwen".to_string(),
+                ..ModelConfig::default()
+            }],
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::LlamaCpp),
+                    slots: Some(4),
+                    ctx_per_slot: Some(32_768),
+                    max_model_len: Some(32_768),
+                    ..DetectedEngine::default()
+                },
+                &["qwen"],
+            ),
+            ..EndpointConfig::default()
+        };
+        let mut capabilities = CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
+            allow_human_terminal: false,
+            mcp_command_mode: McpCommandMode::Off,
+            require_terminal_approval: false,
+            terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
+            terminal_identity: None,
+        });
+        capabilities.features.terminal_supported = true;
+        let hello = ClientControlMessage::Hello {
+            id: "hello-1".to_string(),
+            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
+            cli: CliInventory {
+                slug: "desk".to_string(),
+                hostname: Some("desk-01.local".to_string()),
+                version: Some("0.4.0".to_string()),
+                capabilities,
+            },
+            endpoints: vec![inventory(&vllm), inventory(&llama)],
+        };
+        assert_eq!(
+            encoded(&hello),
+            vector(include_str!("../tests/fixtures/relay-2.7/hello.json"))
+        );
+    }
+
+    #[test]
+    fn engine_facts_never_change_the_inventory_digest() {
+        let mut endpoint = EndpointConfig {
+            slug: "vllm".to_string(),
+            label: "vLLM".to_string(),
+            models: vec![ModelConfig {
+                upstream_model_id: "m".to_string(),
+                ..ModelConfig::default()
+            }],
+            ..EndpointConfig::default()
+        };
+        let without = inventory_digest(&[endpoint_inventory(&endpoint, EndpointStatus::Online)]);
+        endpoint.concurrency_limit = Some(3);
+        endpoint.last_probe = probed(
+            DetectedEngine {
+                kind: Some(EngineKind::Vllm),
+                kv_tokens: Some(1_000),
+                model_max_len: [("m".to_string(), 4_096)].into_iter().collect(),
+                ..DetectedEngine::default()
+            },
+            &["m"],
+        );
+        let with = endpoint_inventory(&endpoint, EndpointStatus::Online);
+        assert!(with.engine_facts.is_some());
+        assert!(with.models[0].engine_facts.is_some());
+        assert_eq!(inventory_digest(&[with]), without);
+    }
+
+    #[test]
+    fn no_facts_are_sent_for_an_undetected_generic_endpoint() {
+        let endpoint = EndpointConfig {
+            slug: "remote".to_string(),
+            engine: crate::config::EndpointEngine::Auto,
+            ..EndpointConfig::default()
+        };
+        assert_eq!(endpoint_engine_facts(&endpoint), None);
+        let declared = EndpointConfig {
+            engine: crate::config::EndpointEngine::Ollama,
+            concurrency_limit: Some(2),
+            ..endpoint
+        };
+        let facts = endpoint_engine_facts(&declared).expect("facts");
+        assert_eq!(facts.engine, Some(EngineFact::config(EngineKind::Ollama)));
+        assert_eq!(facts.slots, Some(EngineFact::config(2)));
+    }
+
+    #[test]
+    fn a_configured_concurrency_wins_over_probed_engine_slots() {
+        // `wsmp endpoints concurrency local 4` on a llama.cpp started with
+        // `-np 8`: the hello reports 4 (config), so the server's AUTO limit
+        // stays at 4; the probed 8 only fills an unset value.
+        let mut endpoint = EndpointConfig {
+            slug: "local".to_string(),
+            concurrency_limit: Some(4),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::LlamaCpp),
+                    slots: Some(8),
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::config(4)));
+        endpoint.concurrency_limit = None;
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::probe(8)));
+    }
+
+    #[test]
+    fn served_model_aliases_are_trimmed_like_the_server_trims() {
+        let endpoint = EndpointConfig {
+            slug: "vllm".to_string(),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::Vllm),
+                    served_model_aliases: vec!["\u{FEFF} ".to_string(), "llama".to_string()],
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(
+            facts.served_model_aliases,
+            Some(EngineFact::probe(vec!["llama".to_string()]))
+        );
+    }
+
+    #[test]
+    fn node_info_matches_the_shared_vector() {
+        let info = NodeInfo {
+            os: Some(NodeOs {
+                name: Some("Ubuntu".to_string()),
+                version: Some("24.04".to_string()),
+                kernel: Some("6.8.0-45-generic".to_string()),
+                arch: Some("aarch64".to_string()),
+            }),
+            cpu: Some(NodeCpu {
+                model: Some("Cortex-X925".to_string()),
+                cores: Some(20),
+            }),
+            memory_total_mib: Some(124_000),
+            gpus: vec![NodeGpuInfo {
+                index: 0,
+                name: Some("NVIDIA GB10".to_string()),
+                uuid: Some("GPU-bbbb".to_string()),
+                driver_version: Some("580.82.07".to_string()),
+                vram_total_mib: None,
+            }],
+            unified_memory: Some(true),
+            node_kind: Some(NodeKind::Unified),
+            interfaces: vec![NodeInterfaceInfo {
+                name: "enP7s7".to_string(),
+                addresses: vec!["192.168.1.20".to_string(), "fe80::1".to_string()],
+                link_speed_mbps: Some(10_000),
+                mtu: Some(1500),
+            }],
+            execution_mechanism: Some(ExecutionMechanism::Systemd),
+            cli_version: Some("0.4.0".to_string()),
+        };
+        assert_eq!(
+            encoded(&ClientControlMessage::NodeInfo(info)),
+            vector(include_str!("../tests/fixtures/relay-2.7/node-info.json"))
+        );
+    }
+
+    #[test]
+    fn node_metrics_matches_the_shared_vector() {
+        let metrics = NodeMetrics {
+            ts: "2026-09-28T12:00:00.000Z".to_string(),
+            cpu: Some(NodeCpuMetrics {
+                usage_percent: Some(12.5),
+                load1: Some(0.5),
+                load5: Some(1.25),
+                load15: Some(2.0),
+            }),
+            memory: Some(NodeMemoryMetrics {
+                total_mib: Some(124_000),
+                available_mib: Some(64_000),
+                swap_total_mib: Some(0),
+                swap_free_mib: Some(0),
+            }),
+            disks: vec![NodeDiskMetrics {
+                mount: "/".to_string(),
+                total_mib: Some(1_900_000),
+                free_mib: Some(800_000),
+            }],
+            gpus: vec![NodeGpuMetrics {
+                index: 0,
+                utilization_percent: Some(3.0),
+                temperature_c: Some(40.0),
+                sm_clock_mhz: Some(2418.0),
+                ..NodeGpuMetrics::default()
+            }],
+            interfaces: vec![NodeInterfaceMetrics {
+                name: "enP7s7".to_string(),
+                rx_bytes: 123_456_789,
+                tx_bytes: 98_765,
+            }],
+            custom: vec![CustomMetric {
+                source: "fans".to_string(),
+                name: "gpu_fan_rpm".to_string(),
+                labels: [("gpu".to_string(), "0".to_string())].into_iter().collect(),
+                value: 1800.0,
+                ts: "2026-09-28T11:59:58.000Z".to_string(),
+            }],
+            sources: vec![
+                MetricSourceStatus {
+                    name: "fans".to_string(),
+                    origin: MetricSourceOrigin::Remote,
+                    state: MetricSourceState::Unsupported,
+                    command_sha256: Some(
+                        "4a1d8f0a2c0e3f6a0b5c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a"
+                            .to_string(),
+                    ),
+                    interval_secs: Some(10),
+                    error: None,
+                },
+                MetricSourceStatus {
+                    name: "psu".to_string(),
+                    origin: MetricSourceOrigin::Local,
+                    state: MetricSourceState::Failing,
+                    command_sha256: Some(
+                        "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"
+                            .to_string(),
+                    ),
+                    interval_secs: Some(60),
+                    error: Some(MetricSourceError::Timeout),
+                },
+            ],
+        };
+        assert_eq!(
+            encoded(&ClientControlMessage::NodeMetrics(metrics)),
+            vector(include_str!(
+                "../tests/fixtures/relay-2.7/node-metrics.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn endpoint_load_matches_the_shared_vector() {
+        let load = EndpointLoad {
+            endpoint_slug: "vllm".to_string(),
+            model_slug: None,
+            running: 3,
+            waiting: 2,
+            kv_usage: Some(0.42),
+            slots_busy: None,
+            deferred: None,
+            prefix_cache_hits_delta: Some(50),
+            prefix_cache_queries_delta: Some(200),
+            source: LoadSource::VllmMetrics,
+            ts: "2026-09-28T12:00:01.000Z".to_string(),
+        };
+        assert_eq!(
+            encoded(&ClientControlMessage::EndpointLoad(load)),
+            vector(include_str!(
+                "../tests/fixtures/relay-2.7/endpoint-load.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_inventory_over_the_frame_cap_sheds_engine_facts_before_it_is_refused() {
+        let model = |index: usize| DiscoveredModelInventory {
+            slug: None,
+            upstream_model_id: format!("org/model-{index:04}-{}", "x".repeat(40)),
+            capabilities: None,
+            capability_override_mode: CapabilityOverrideMode::Inherit,
+            probe_suggestions: None,
+            concurrency_limit: None,
+            engine_facts: Some(EngineFacts {
+                max_model_len: Some(EngineFact::probe(131_072)),
+                ..EngineFacts::default()
+            }),
+        };
+        let endpoint = |models: usize| EndpointInventory {
+            slug: "router".to_string(),
+            label: "Router".to_string(),
+            kind: "openai-compatible".to_string(),
+            status: EndpointStatus::Online,
+            default_capabilities: OpenAiCompatibleCapabilities::default(),
+            probe_suggestions: None,
+            models: (0..models).map(model).collect(),
+            engine_facts: Some(EngineFacts {
+                engine: Some(EngineFact::probe(EngineKind::Vllm)),
+                ..EngineFacts::default()
+            }),
+        };
+        let update = |models: usize| ClientControlMessage::InventoryUpdate {
+            id: "u".to_string(),
+            endpoints: vec![endpoint(models)],
+        };
+        // 500 models fit without their facts and do not fit with them.
+        let full = serde_json::to_string(&update(500)).expect("json");
+        assert!(full.len() > RELAY_JSON_CONTROL_MAX_BYTES, "{}", full.len());
+        let text = encode_control(&update(500)).expect("facts are shed, not the inventory");
+        assert!(text.len() <= RELAY_JSON_CONTROL_MAX_BYTES);
+        assert!(!text.contains("maxModelLen"));
+        assert!(
+            text.contains(r#""engine":{"value":"vllm""#),
+            "endpoint facts kept"
+        );
+        assert_eq!(text.matches("upstreamModelId").count(), 500);
+        // A frame within the cap is untouched.
+        let small = encode_control(&update(2)).expect("small");
+        assert_eq!(small.matches("maxModelLen").count(), 2);
+        // An inventory too large even without facts is still refused.
+        assert!(encode_control(&update(2_000)).is_err());
+    }
+
+    #[test]
+    fn metrics_sources_set_parses_from_the_shared_vector() {
+        let message = parse_server_control(include_str!(
+            "../tests/fixtures/relay-2.7/metrics-sources-set.json"
+        ))
+        .expect("parse");
+        let ServerControlMessage::MetricsSourcesSet { id, sources } = message else {
+            panic!("expected metrics.sources.set");
+        };
+        assert_eq!(id, "sources-1");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "fans");
+        assert_eq!(sources[0].interval_secs, 10);
+        assert_eq!(sources[0].format, MetricSourceFormat::Number);
+        // Everything the server's strict schema refuses is refused here too.
+        let valid = r#"{"name":"ok","command":"echo 1","intervalSecs":5,"timeoutSecs":1,"format":"number"}"#;
+        let frame = |source: String| {
+            format!(r#"{{"type":"metrics.sources.set","id":"x","sources":[{source}]}}"#)
+        };
+        assert!(parse_server_control(&frame(valid.to_string())).is_ok());
+        let command = |command: &str| {
+            valid.replace(
+                r#""echo 1""#,
+                &serde_json::to_string(command).expect("json"),
+            )
+        };
+        let invalid = [
+            valid.replace(r#""ok""#, r#""bad name""#),
+            valid.replace(r#""ok""#, r#""""#),
+            command(""),
+            command(&"x".repeat(4097)),
+            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":4"#),
+            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":86401"#),
+            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":0"#),
+            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":301"#),
+            valid.replace(r#""number""#, r#""yaml""#),
+            valid.replace('}', r#","stderr":"x"}"#),
+        ];
+        for source in invalid {
+            assert!(
+                parse_server_control(&frame(source.clone())).is_err(),
+                "{source}"
+            );
+            assert_eq!(control_frame_fault(&frame(source)), FrameFault::Ignore);
+        }
+        // 4096 UTF-16 units is the bound, not 4096 bytes.
+        assert!(parse_server_control(&frame(command(&"é".repeat(4096)))).is_ok());
+        let fifty_one = vec![valid; NODE_METRICS_SOURCES_MAX + 1].join(",");
+        assert!(parse_server_control(&frame(fifty_one)).is_err());
+        let fifty = vec![valid; NODE_METRICS_SOURCES_MAX].join(",");
+        assert!(parse_server_control(&frame(fifty)).is_ok());
+        // A malformed list is dropped, never fatal.
+        assert_eq!(
+            control_frame_fault(r#"{"type":"metrics.sources.set","id":"x","sources":"nope"}"#),
+            FrameFault::Ignore
         );
     }
 }

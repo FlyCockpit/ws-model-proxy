@@ -7,6 +7,7 @@ import type { Prisma } from "@ws-model-proxy/db";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
+import { enginePreset } from "../lib/engine-facts";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {},
@@ -139,12 +140,14 @@ describe("capacityManagementRouter", () => {
         id: "cap-a",
         userId: "owner",
         label: "A",
+        enginePreset: enginePreset(null),
         _count: { ExecutionTargets: 2, CapacityLeases: 3, CapacityWaiters: 0 },
       },
       {
         id: "cap-b",
         userId: "owner",
         label: "B",
+        enginePreset: enginePreset(null),
         _count: { ExecutionTargets: 0, CapacityLeases: 0, CapacityWaiters: 1 },
       },
     ]);

@@ -179,6 +179,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "H status: pool member health, one row per statement",
   "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
   "packages/api/src/lib/discovered-inference-capacity.ts": "M: capacity discovery and backfill",
+  "packages/api/src/lib/engine-facts.ts":
+    "M: relay engine facts and AUTO limit refresh (registration holds the capacity fences)",
   "packages/api/src/lib/cli-credential-access.ts": "M: device login and deletion",
   "packages/api/src/routers/forwarder-management.ts": "M: dashboard pool/device/model writes",
   "packages/api/src/routers/capacity-management.ts": "M: capacity policy",

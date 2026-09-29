@@ -53,8 +53,14 @@ type CapacityWriteArgs = {
     hardConcurrencyLimit?: number | null;
     hardConcurrencyLimitSource?: "AUTO" | "USER";
     runtimeIdentityKey?: { in?: readonly string[] };
+    NOT?: { hardConcurrencyLimit?: number | null };
   };
-  data?: { hardConcurrencyLimit?: number | null; hardConcurrencyLimitSource?: "AUTO" | "USER" };
+  data?: {
+    hardConcurrencyLimit?: number | null;
+    hardConcurrencyLimitSource?: "AUTO" | "USER";
+    engineKind?: string | null;
+    engineSlots?: number | null;
+  };
 };
 
 function applyCapacityWrite(
@@ -84,6 +90,12 @@ function applyCapacityWrite(
   }
   const keys = where.runtimeIdentityKey?.in;
   if (keys && !keys.includes(row.runtimeIdentityKey)) return { count: 0 };
+  if (
+    where.NOT?.hardConcurrencyLimit !== undefined &&
+    where.NOT.hardConcurrencyLimit === row.hardConcurrencyLimit
+  ) {
+    return { count: 0 };
+  }
   if (args.data && "hardConcurrencyLimit" in args.data) {
     row.hardConcurrencyLimit = args.data.hardConcurrencyLimit ?? null;
   }
@@ -189,7 +201,7 @@ describe("capability override origin", () => {
       connection: true,
       reported: {
         cliVersion: "1.0.0",
-        relayProtocolVersion: "2.6",
+        relayProtocolVersion: "2.7",
         reportedHumanTerminal: null,
         reportedMcpCommandMode: null,
         reportedTerminalApproval: null,
@@ -1105,5 +1117,252 @@ describe("capability override origin", () => {
     expect(row.hardConcurrencyLimit).toBeNull();
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+  });
+  function engineRegistration(engineFacts: Record<string, unknown>, concurrencyLimit?: number) {
+    const registration = preAttachedRegistration(concurrencyLimit);
+    return {
+      ...registration,
+      endpoints: registration.endpoints.map((endpoint) => ({ ...endpoint, engineFacts })),
+    };
+  }
+
+  function engineCapacity(
+    id: string,
+    targets: Array<{
+      id: string;
+      directConcurrencyLimit?: number | null;
+      directReservedSlots?: number;
+      members?: Array<{ reserved: number | null; limit?: number | null }>;
+    }>,
+  ) {
+    return {
+      id,
+      ExecutionTargets: targets.map((target) => ({
+        id: target.id,
+        directConcurrencyLimit: target.directConcurrencyLimit ?? null,
+        directReservedSlots: target.directReservedSlots ?? 0,
+        PoolMembers: (target.members ?? []).map((member) => ({
+          capacityConcurrencyMode: member.limit === undefined ? "INHERIT" : "LIMITED",
+          capacityConcurrencyLimit: member.limit ?? null,
+          capacityReservedSlots: member.reserved,
+          ModelPool: { capacityConcurrencyLimit: null, capacityReservedSlots: 0 },
+        })),
+      })),
+    };
+  }
+
+  const LLAMA_FACTS = {
+    engine: { value: "llama.cpp", source: "probe" },
+    slots: { value: 8, source: "probe" },
+    ctxPerSlot: { value: 32768, source: "probe" },
+    maxModelLen: { value: 32768, source: "probe" },
+  };
+
+  it("stores engine facts and refreshes an AUTO limit from reported slots on every update", async () => {
+    const row = {
+      id: "auto-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "discovered-model:model-id",
+      hardConcurrencyLimit: 4 as number | null,
+      hardConcurrencyLimitSource: "AUTO" as "AUTO" | "USER",
+    };
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.findMany.mockImplementation(async (args: { select?: object }) =>
+      args.select && "physicalMaxContext" in args.select
+        ? []
+        : [engineCapacity(row.id, [{ id: "execution-target-id" }])],
+    );
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(engineRegistration(LLAMA_FACTS));
+    expect(row.hardConcurrencyLimit).toBe(8);
+    expect(row.hardConcurrencyLimitSource).toBe("AUTO");
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "auto-capacity", userId: "user-id" },
+      data: {
+        engineKind: "LLAMA_CPP",
+        engineSlots: 8,
+        kvBudgetTokens: null,
+        maxModelLen: 32768,
+        engineFactsSource: "PROBE",
+        engineFactsAt: now,
+      },
+    });
+
+    // The engine restarted with fewer slots: the AUTO limit follows it.
+    await persistRelayRegistration(
+      engineRegistration({ ...LLAMA_FACTS, slots: { value: 2, source: "probe" } }),
+    );
+    expect(row.hardConcurrencyLimit).toBe(2);
+  });
+
+  it("never refreshes a USER limit or USER unlimited from engine slots, but stores the facts", async () => {
+    for (const userLimit of [null, 3]) {
+      const row = {
+        id: "user-capacity",
+        userId: "user-id",
+        runtimeIdentityKey: "discovered-model:model-id",
+        hardConcurrencyLimit: userLimit as number | null,
+        hardConcurrencyLimitSource: "USER" as "AUTO" | "USER",
+      };
+      db.executionTarget.findUnique.mockResolvedValue({
+        id: "execution-target-id",
+        inferenceCapacityId: row.id,
+      });
+      db.inferenceCapacity.findMany.mockResolvedValue([
+        engineCapacity(row.id, [{ id: "execution-target-id" }]),
+      ]);
+      db.inferenceCapacity.updateMany.mockClear();
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+
+      await persistRelayRegistration(engineRegistration(LLAMA_FACTS));
+
+      expect(row.hardConcurrencyLimit).toBe(userLimit);
+      expect(row.hardConcurrencyLimitSource).toBe("USER");
+      expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "user-capacity", userId: "user-id" },
+          data: expect.objectContaining({ engineKind: "LLAMA_CPP", engineSlots: 8 }),
+        }),
+      );
+    }
+  });
+
+  it("skips a slot refresh that a direct or pool policy on the capacity would not fit", async () => {
+    for (const target of [
+      { id: "execution-target-id", directConcurrencyLimit: 6 },
+      { id: "execution-target-id", members: [{ reserved: 5 }] },
+      { id: "execution-target-id", members: [{ reserved: 0, limit: 7 }] },
+    ]) {
+      const row = {
+        id: "auto-capacity",
+        userId: "user-id",
+        runtimeIdentityKey: "discovered-model:model-id",
+        hardConcurrencyLimit: 8 as number | null,
+        hardConcurrencyLimitSource: "AUTO" as "AUTO" | "USER",
+      };
+      db.executionTarget.findUnique.mockResolvedValue({
+        id: "execution-target-id",
+        inferenceCapacityId: row.id,
+      });
+      db.inferenceCapacity.findMany.mockResolvedValue([engineCapacity(row.id, [target])]);
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+
+      await persistRelayRegistration(
+        engineRegistration({ ...LLAMA_FACTS, slots: { value: 4, source: "probe" } }),
+      );
+
+      expect(row.hardConcurrencyLimit).toBe(8);
+    }
+  });
+
+  it("writes no facts to a capacity shared with a target outside this registration", async () => {
+    const row = {
+      id: "shared-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "discovered-model:model-id",
+      hardConcurrencyLimit: 4 as number | null,
+      hardConcurrencyLimitSource: "AUTO" as "AUTO" | "USER",
+    };
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      engineCapacity(row.id, [{ id: "execution-target-id" }, { id: "other-device-target" }]),
+    ]);
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(engineRegistration(LLAMA_FACTS));
+
+    expect(row.hardConcurrencyLimit).toBe(4);
+    for (const call of db.inferenceCapacity.updateMany.mock.calls) {
+      expect((call[0] as CapacityWriteArgs).data).not.toHaveProperty("engineKind");
+    }
+  });
+
+  it("seeds a new Ollama capacity with the engine default and a vLLM one with its config slots", async () => {
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.executionTarget.create.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: null,
+    });
+    await persistRelayRegistration(
+      engineRegistration({ engine: { value: "ollama", source: "probe" } }),
+    );
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ hardConcurrencyLimit: 1 }),
+      }),
+    );
+    db.inferenceCapacity.upsert.mockClear();
+    await persistRelayRegistration(
+      engineRegistration({ engine: { value: "lm-studio", source: "config" } }),
+    );
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ hardConcurrencyLimit: 4 }),
+      }),
+    );
+    db.inferenceCapacity.upsert.mockClear();
+    await persistRelayRegistration(
+      engineRegistration({
+        engine: { value: "vllm", source: "probe" },
+        slots: { value: 6, source: "config" },
+        kvTokens: { value: 32768, source: "probe" },
+      }),
+    );
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ hardConcurrencyLimit: 6 }),
+      }),
+    );
+  });
+
+  it("stores no engine facts when the inventory reports none", async () => {
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      engineCapacity("capacity-id", [{ id: "execution-target-id" }]),
+    ]);
+    await persistRelayRegistration(preAttachedRegistration(2));
+    for (const call of db.inferenceCapacity.updateMany.mock.calls) {
+      expect((call[0] as CapacityWriteArgs).data).not.toHaveProperty("engineKind");
+    }
+  });
+
+  it("clears a recorded protocol rejection on an accepted hello", async () => {
+    await persistRelayRegistration({
+      ...preAttachedRegistration(),
+      connection: true,
+      reported: {
+        cliVersion: "0.5.0",
+        relayProtocolVersion: "2.7",
+        reportedHumanTerminal: false,
+        reportedMcpCommandMode: "OFF",
+        reportedTerminalApproval: false,
+        reportedTerminalSupported: true,
+        reportedHostname: null,
+        featuresReportedAt: now,
+      },
+    });
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          rejectedRelayProtocolVersion: null,
+          rejectedCliVersion: null,
+          relayRejectedAt: null,
+        }),
+      }),
+    );
   });
 });

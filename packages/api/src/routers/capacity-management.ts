@@ -17,6 +17,7 @@ import {
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import { deletionConflict } from "../lib/deletion-conflict";
+import { enginePreset } from "../lib/engine-facts";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -200,8 +201,11 @@ export const capacityManagementRouter = {
       : [[], []];
     const activeLeases = new Map(leases.map((row) => [row.capacityId, row._count._all]));
     const waitingWaiters = new Map(waiters.map((row) => [row.capacityId, row._count._all]));
+    // The engine preset is derived from the stored engine kind (relay 2.7
+    // engine facts); S-C and S-D read it, this list only shows it.
     return capacities.map((capacity) => ({
       ...capacity,
+      enginePreset: enginePreset(capacity.engineKind),
       _count: {
         ExecutionTargets: capacity._count.ExecutionTargets,
         CapacityLeases: activeLeases.get(capacity.id) ?? 0,

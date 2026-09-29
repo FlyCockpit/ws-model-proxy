@@ -28,6 +28,20 @@ export function holdCapacityLeaseForResponse({
   const lifetime =
     owner ?? new CapacityLeaseOwner(store, lease, signal, heartbeatIntervalMs, leaseExtensionMs);
   const lifetimeSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+  if (lifetimeSignal.aborted) {
+    // The lease (or the client) is already gone before a single byte was
+    // exposed. Refuse the hand-off so the route's precommit path classifies
+    // it (a lost lease fails over or answers 5xx; a client abort is 499)
+    // instead of committing headers for a body that can only error.
+    const reason: unknown = lifetimeSignal.reason;
+    void lifetime.release(reason);
+    void response.body
+      .cancel(reason)
+      .catch((error: unknown) => reportCleanupFailure("cancel", error));
+    throw reason instanceof Error
+      ? reason
+      : new Error("Capacity lease ended before the response.", { cause: reason });
+  }
   let finished = false;
   let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
   let terminalError: unknown;
@@ -60,7 +74,6 @@ export function holdCapacityLeaseForResponse({
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       downstream = controller;
-      if (lifetimeSignal.aborted) abort();
     },
     async pull(controller) {
       try {

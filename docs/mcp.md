@@ -11,6 +11,17 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
+Node telemetry (relay protocol 2.7) is read-only over MCP.
+`forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
+`node.info`, its freshest `node.metrics` (live from the relay session, else the
+stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
+`endpoint.load` readings the relay holds in memory. Detected engine facts
+(`engineKind`, `engineSlots`, `kvBudgetTokens`, `maxModelLen`,
+`engineFactsSource`, `engineFactsAt`) and the derived `enginePreset` appear on
+every capacity in `capacity_records_list`. Neither ever contains prompt text:
+the CLI reads only slot ids, context sizes and busy flags from llama.cpp
+`/slots`.
+
 ## Setup
 
 Required environment:

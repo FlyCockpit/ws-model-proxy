@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(capabilities.terminal_public_key, public_key);
         assert!(capabilities.terminal);
         assert!(capabilities.exec);
-        assert_eq!(capabilities.protocol_version, "2.6");
+        assert_eq!(capabilities.protocol_version, "2.7");
         assert!(capabilities.terminal_viewers);
         assert!(capabilities.supervised_commands);
     }

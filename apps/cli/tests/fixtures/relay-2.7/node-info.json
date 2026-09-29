@@ -1,0 +1,19 @@
+{
+  "type": "node.info",
+  "os": { "name": "Ubuntu", "version": "24.04", "kernel": "6.8.0-45-generic", "arch": "aarch64" },
+  "cpu": { "model": "Cortex-X925", "cores": 20 },
+  "memoryTotalMiB": 124000,
+  "gpus": [{ "index": 0, "name": "NVIDIA GB10", "uuid": "GPU-bbbb", "driverVersion": "580.82.07" }],
+  "unifiedMemory": true,
+  "nodeKind": "unified",
+  "interfaces": [
+    {
+      "name": "enP7s7",
+      "addresses": ["192.168.1.20", "fe80::1"],
+      "linkSpeedMbps": 10000,
+      "mtu": 1500
+    }
+  ],
+  "executionMechanism": "systemd",
+  "cliVersion": "0.4.0"
+}

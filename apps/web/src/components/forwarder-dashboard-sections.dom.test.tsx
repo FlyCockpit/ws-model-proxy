@@ -720,6 +720,30 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     );
   });
 
+  it("flags a device whose CLI must be upgraded for the relay protocol", () => {
+    state.cliDevices = [
+      {
+        ...cliDeviceWithModel,
+        upgradeRequired: {
+          protocolVersion: "2.6",
+          cliVersion: "0.4.0",
+          rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+        },
+      },
+      { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", upgradeRequired: null },
+    ];
+    mountModelsSection();
+
+    const badges = screen.getAllByText(/^dashboard:clis\.upgradeRequired\|/);
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.textContent).toBe(
+      `dashboard:clis.upgradeRequired|${JSON.stringify({ protocol: "2.6" })}`,
+    );
+    expect(screen.getByText(/^dashboard:clis\.upgradeRequiredDetail\|/).textContent).toContain(
+      '"version":"0.4.0"',
+    );
+  });
+
   it("keeps the plain success toast on clean responses", async () => {
     state.cliDevices = [cliDeviceWithModel];
     state.capabilityImpact = [];

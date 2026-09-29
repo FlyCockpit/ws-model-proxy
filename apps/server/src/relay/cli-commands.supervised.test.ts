@@ -99,13 +99,13 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.6",
+        protocolVersion: "2.7",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -123,10 +123,12 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
           mcpCommandMode: features.mode,
           terminalApproval: false,
           terminalSupported: features.terminalSupported,
+          remoteMetricSources: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
+        nodeTelemetry: true,
       },
     },
     endpoints: [],

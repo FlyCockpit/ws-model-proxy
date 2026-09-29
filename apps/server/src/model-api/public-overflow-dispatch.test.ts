@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
@@ -112,7 +113,10 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
 import openRouterUsageFixture from "./fixtures/openrouter-usage.json";
-import { claimProviderHealthTrial } from "./provider-attempt-runtime.js";
+import {
+  claimProviderHealthTrial,
+  recordProviderAttemptEvent,
+} from "./provider-attempt-runtime.js";
 import { admitProviderBudget } from "./provider-budget.js";
 import { providerBillableTokens } from "./provider-budget-accounting.js";
 import {
@@ -2153,117 +2157,140 @@ describe("public overflow terminal response dispatch", () => {
     rememberAffinity.mockResolvedValue(undefined);
   });
 
-  it("settles cancellation before provider I/O as not sent with no health verdict", async () => {
-    recordProviderOutcome.mockClear();
-    db.modelPool.findFirst.mockResolvedValue({
-      fallbackEnabled: true,
-      fallbackForGrantees: false,
-      PoolMembers: [
-        {
-          id: "member-cancel",
-          publicOrder: 0,
-          ExecutionTarget: {
-            id: "target-cancel",
-            ProviderModel: {
-              id: "model-cancel",
-              userId: "owner",
-              upstreamModelId: "upstream-model",
-              contextWindow: 10_000,
-              maxOutputTokens: 1_000,
-              nativeCapabilities: {
-                protocols: ["openai"],
-                surfaces: ["openai-chat"],
-                streaming: true,
-                features: [],
-              },
-              healthStatus: "HEALTHY",
-              healthNextRetryAt: null,
-              enabled: true,
-              deletedAt: null,
-              ProviderAccount: {
-                id: "account-cancel",
+  it.each([
+    [
+      "a client cancellation",
+      () => new Error("client disconnected"),
+      "CANCELLED",
+      "CANCELLED",
+      "CANCELLED",
+    ],
+    // F2-CAP-3: a lost capacity lease is a server-side failure, never a cancel.
+    [
+      "a capacity lease loss",
+      () => new CapacityLeaseLostError("ownership_lost"),
+      "FAILED",
+      "CAPACITY_LEASE_LOST",
+      "FAILED",
+    ],
+  ] as const)(
+    "settles %s before provider I/O as not sent with no health verdict",
+    async (_label, abortReason, budgetReason, eventReason, terminalState) => {
+      recordProviderOutcome.mockClear();
+      db.modelPool.findFirst.mockResolvedValue({
+        fallbackEnabled: true,
+        fallbackForGrantees: false,
+        PoolMembers: [
+          {
+            id: "member-cancel",
+            publicOrder: 0,
+            ExecutionTarget: {
+              id: "target-cancel",
+              ProviderModel: {
+                id: "model-cancel",
                 userId: "owner",
-                providerType: "openai",
-                providerVersion: null,
-                baseUrl: "https://provider.example",
-                authType: "BEARER",
+                upstreamModelId: "upstream-model",
+                contextWindow: 10_000,
+                maxOutputTokens: 1_000,
+                nativeCapabilities: {
+                  protocols: ["openai"],
+                  surfaces: ["openai-chat"],
+                  streaming: true,
+                  features: [],
+                },
                 healthStatus: "HEALTHY",
                 healthNextRetryAt: null,
                 enabled: true,
                 deletedAt: null,
-                CurrentCredential: {
-                  id: "credential-cancel",
-                  credentialType: "BEARER",
-                  aadVersion: 1,
-                  algorithm: "AES-256-GCM",
-                  keyVersion: "v1",
-                  ciphertext: new Uint8Array(),
-                  nonce: new Uint8Array(),
-                  authTag: new Uint8Array(),
-                  status: "ACTIVE",
+                ProviderAccount: {
+                  id: "account-cancel",
+                  userId: "owner",
+                  providerType: "openai",
+                  providerVersion: null,
+                  baseUrl: "https://provider.example",
+                  authType: "BEARER",
+                  healthStatus: "HEALTHY",
+                  healthNextRetryAt: null,
+                  enabled: true,
+                  deletedAt: null,
+                  CurrentCredential: {
+                    id: "credential-cancel",
+                    credentialType: "BEARER",
+                    aadVersion: 1,
+                    algorithm: "AES-256-GCM",
+                    keyVersion: "v1",
+                    ciphertext: new Uint8Array(),
+                    nonce: new Uint8Array(),
+                    authTag: new Uint8Array(),
+                    status: "ACTIVE",
+                  },
                 },
               },
             },
           },
+        ],
+      });
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-cancel",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-cancel" }),
         },
-      ],
-    });
-    const tx = {
-      ...consentDelegates(),
-      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
-        mockRequesterValidityQuery(strings, values, consentDelegates()),
-      ),
-      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-      providerCredential: {
-        findFirst: vi.fn().mockResolvedValue({
-          id: "credential-cancel",
-          credentialType: "BEARER",
-          aadVersion: 1,
-          algorithm: "AES-256-GCM",
-          keyVersion: "v1",
-          ciphertext: new Uint8Array(),
-          nonce: new Uint8Array(),
-          authTag: new Uint8Array(),
-        }),
-        update: vi.fn().mockResolvedValue({ id: "credential-cancel" }),
-      },
-    };
-    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
-      callback(tx),
-    );
-    const controller = new AbortController();
-    controller.abort(new Error("client disconnected"));
-    providerHttpsRequest.mockReset();
-    reconcileProviderBudget.mockClear();
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const controller = new AbortController();
+      controller.abort(abortReason());
+      providerHttpsRequest.mockReset();
+      reconcileProviderBudget.mockClear();
+      vi.mocked(recordProviderAttemptEvent).mockClear();
 
-    const result = await dispatchPublicOverflow({
-      userId: "owner",
-      poolId: "pool",
-      requestId: "request-cancel",
-      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      ...ownerConsentFields(),
-      requestedProtocol: "openai",
-      requestedSurface: "openai-chat",
-      stream: false,
-      requiredFeatures: [],
-      path: "/v1/chat/completions",
-      headers: new Headers({ "content-type": "application/json" }),
-      body: new TextEncoder().encode('{"model":"pool"}'),
-      signal: controller.signal,
-      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
-      requestedOutputTokens: 1n,
-      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
-      adaptationEnabled: false,
-      retrySafe: false,
-    });
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-cancel",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: controller.signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
 
-    expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
-    expect(recordProviderOutcome).not.toHaveBeenCalled();
-    expect(providerHttpsRequest).not.toHaveBeenCalled();
-    expect(reconcileProviderBudget).toHaveBeenCalledWith(
-      expect.objectContaining({ reason: "CANCELLED", dispatchOutcome: "NOT_SENT" }),
-    );
-  });
+      expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: budgetReason, dispatchOutcome: "NOT_SENT" }),
+      );
+      expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: "TERMINAL", reason: eventReason, terminalState }),
+      );
+    },
+  );
 
   it("aborts a pending provider request when heartbeat ownership is lost", async () => {
     vi.useFakeTimers();
@@ -2437,6 +2464,176 @@ describe("public overflow terminal response dispatch", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // F2-CAP-3 (C1a-4/C1b-2/C1b-1): the capacity wrapper cancels the provider
+  // body when its lease is lost (mid-stream or at the hand-off refusal). That
+  // cancel must settle the attempt (heartbeat stopped, budget reconciled,
+  // terminal resolved) as a server-side FAILED, never as a client CANCELLED;
+  // a genuine client cancel keeps CANCELLED.
+  it.each([
+    [
+      "lease loss",
+      () => new CapacityLeaseLostError("ownership_lost"),
+      "FAILED",
+      "CAPACITY_LEASE_LOST",
+      "FAILED",
+    ],
+    [
+      "client cancel",
+      () => new Error("client disconnected"),
+      "CANCELLED",
+      "CANCELLED",
+      "CANCELLED",
+    ],
+  ] as const)(
+    "settles a cancelled provider body on %s with the right outcome",
+    async (_label, abortReason, budgetReason, eventReason, terminalState) => {
+      recordProviderOutcome.mockClear();
+      reconcileProviderBudget.mockClear();
+      vi.mocked(recordProviderAttemptEvent).mockClear();
+      db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const upstream = new Readable({ read() {} });
+      Object.assign(upstream, {
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+      providerHttpsRequest.mockImplementationOnce(async () => upstream);
+      const controller = new AbortController();
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-cancel-settle",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: true,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+        signal: controller.signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      if (!result.dispatched) throw new Error("expected a committed provider response");
+      // Nothing ever reads the body: only the cancel can settle the attempt.
+      const reason = abortReason();
+      controller.abort(reason);
+      await result.response.body?.cancel(reason);
+      await result.terminal;
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: budgetReason }),
+      );
+      expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: "TERMINAL", reason: eventReason, terminalState }),
+      );
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+    },
+  );
+
+  it("records one outcome when a lease loss lands during the settle of a client-cancelled attempt", async () => {
+    recordProviderOutcome.mockClear();
+    reconcileProviderBudget.mockClear();
+    vi.mocked(recordProviderAttemptEvent).mockClear();
+    db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = new Readable({ read() {} });
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    providerHttpsRequest.mockImplementationOnce(async () => upstream);
+    const controller = new AbortController();
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-cancel-race",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(),
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: true,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+      signal: controller.signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    if (!result.dispatched) throw new Error("expected a committed provider response");
+    // Nothing ever reads the body: only the cancel can settle the attempt.
+    // The client cancels the body; the lease is then lost DURING the budget
+    // write. One attempt must not be split into different outcomes.
+    reconcileProviderBudget.mockImplementationOnce(async () => {
+      controller.abort(new CapacityLeaseLostError("ownership_lost"));
+    });
+    await result.response.body?.cancel(new Error("client disconnected"));
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "CANCELLED" }),
+    );
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "FAILED",
+        terminalState: "CANCELLED",
+      }),
+    );
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
   });
 });
 

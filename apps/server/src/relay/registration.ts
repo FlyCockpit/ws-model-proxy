@@ -16,6 +16,15 @@ import {
   linkExecutionTargetCapacity,
 } from "@ws-model-proxy/api/lib/discovered-inference-capacity";
 import {
+  applyEngineFactsToCapacity,
+  engineDefaultConcurrency,
+  type HardLimitRefreshDependent,
+  mergeEngineFacts,
+  type StoredEngineFacts,
+  sameStoredEngineFacts,
+  storedEngineFacts,
+} from "@ws-model-proxy/api/lib/engine-facts";
+import {
   type McpCommandModeDb,
   type McpCommandModeName,
   mcpCommandModeFromDb,
@@ -174,6 +183,10 @@ export async function persistRelayRegistration({
           reportedTerminalSupported: reported.reportedTerminalSupported,
           reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
+          // An accepted hello ends any "CLI upgrade required" state.
+          rejectedRelayProtocolVersion: null,
+          rejectedCliVersion: null,
+          relayRejectedAt: null,
         }
       : {};
 
@@ -328,6 +341,7 @@ export async function persistRelayRegistration({
             upstreamModelId: string;
             reportedConcurrency: number | undefined;
             declaredContext: number | null;
+            engineFacts: StoredEngineFacts | null;
           }> = [];
 
           const policyFencedTargetIds = new Set(
@@ -504,12 +518,20 @@ export async function persistRelayRegistration({
               // transaction (the owner fence excludes every other creator).
               policyFencedTargetIds.add(target.id);
               upsertedTargetIds.add(target.id);
+              const modelEngineFacts = mergeEngineFacts(endpoint.engineFacts, model.engineFacts);
               capacityWork.push({
                 targetId: target.id,
                 inferenceCapacityId: target.inferenceCapacityId,
                 discoveredModelId: discoveredModel.id,
                 upstreamModelId: model.upstreamModelId,
-                reportedConcurrency: model.concurrencyLimit,
+                // The AUTO seed of a new capacity: the CLI's configured
+                // concurrency, else engine slots, else the engine default.
+                reportedConcurrency:
+                  model.concurrencyLimit ??
+                  modelEngineFacts?.slots?.value ??
+                  engineDefaultConcurrency(modelEngineFacts?.engine?.value) ??
+                  undefined,
+                engineFacts: storedEngineFacts(modelEngineFacts),
                 declaredContext: declaredContextWindow(
                   resolveEffectiveCapabilityMetadata({
                     capabilityOverrideMode: keepDashboardOverride
@@ -540,6 +562,7 @@ export async function persistRelayRegistration({
 
           // Every existing capacity row the loop below may write holds its
           // fence (taken above); a capacity created below is a new row.
+          const engineFactsByCapacityId = new Map<string, StoredEngineFacts[]>();
           for (const work of capacityWork) {
             // Keep a capacity that is already attached. Otherwise create one
             // and set the foreign key before this transaction commits.
@@ -567,6 +590,11 @@ export async function persistRelayRegistration({
                 executionTargetId: work.targetId,
                 reportedConcurrency: work.reportedConcurrency,
               });
+            }
+            if (work.engineFacts && inferenceCapacityId) {
+              const facts = engineFactsByCapacityId.get(inferenceCapacityId) ?? [];
+              facts.push(work.engineFacts);
+              engineFactsByCapacityId.set(inferenceCapacityId, facts);
             }
             if (work.declaredContext != null && inferenceCapacityId) {
               declaredContextByCapacityId.set(
@@ -647,6 +675,71 @@ export async function persistRelayRegistration({
                   data: { physicalMaxContext: declared },
                 });
               }
+            }
+          }
+
+          if (engineFactsByCapacityId.size > 0) {
+            // Same fence as the context seed: every target on the capacity
+            // must be one this inventory holds the L2 lock for, and every
+            // capacity row already holds its L5 policy lock (above).
+            const capacities = await tx.inferenceCapacity.findMany({
+              where: { userId: identity.userId, id: { in: [...engineFactsByCapacityId.keys()] } },
+              select: {
+                id: true,
+                ExecutionTargets: {
+                  select: {
+                    id: true,
+                    directConcurrencyLimit: true,
+                    directReservedSlots: true,
+                    PoolMembers: {
+                      select: {
+                        capacityConcurrencyMode: true,
+                        capacityConcurrencyLimit: true,
+                        capacityReservedSlots: true,
+                        ModelPool: {
+                          select: { capacityConcurrencyLimit: true, capacityReservedSlots: true },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            });
+            for (const capacity of capacities) {
+              if (capacity.ExecutionTargets.some((target) => !upsertedTargetIds.has(target.id))) {
+                continue;
+              }
+              const reported = engineFactsByCapacityId.get(capacity.id) ?? [];
+              const [facts, ...others] = reported;
+              // One engine process reports one set of facts; disagreeing
+              // reports for a shared capacity are left for the person.
+              if (!facts || others.some((other) => !sameStoredEngineFacts(facts, other))) continue;
+              const dependents: HardLimitRefreshDependent[] = capacity.ExecutionTargets.flatMap(
+                (target) => [
+                  {
+                    kind: "direct" as const,
+                    concurrencyLimit: target.directConcurrencyLimit,
+                    reservedSlots: target.directReservedSlots,
+                  },
+                  ...target.PoolMembers.map(
+                    (member): HardLimitRefreshDependent => ({
+                      kind: "member",
+                      mode: member.capacityConcurrencyMode,
+                      limit: member.capacityConcurrencyLimit,
+                      reserved: member.capacityReservedSlots,
+                      poolLimit: member.ModelPool.capacityConcurrencyLimit,
+                      poolReserved: member.ModelPool.capacityReservedSlots,
+                    }),
+                  ),
+                ],
+              );
+              await applyEngineFactsToCapacity(tx, {
+                userId: identity.userId,
+                capacityId: capacity.id,
+                facts,
+                dependents,
+                now,
+              });
             }
           }
 
