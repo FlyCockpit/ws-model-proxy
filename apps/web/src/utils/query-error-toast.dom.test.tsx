@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryCache, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,7 +9,7 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 }));
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { createAppQueryCache } from "./query-error-toast";
+import { createAppQueryCache, retryQueryWith } from "./query-error-toast";
 
 function Failure({ meta }: { meta?: { skipGlobalErrorToast?: boolean } }) {
   useQuery({
@@ -66,5 +66,33 @@ describe("app query error toast", () => {
     options.action.onClick();
     expect(invalidate).toHaveBeenCalledTimes(1);
     expect(invalidate.mock.calls[0]?.[0]).toMatchObject({ queryKey: ["probe", undefined] });
+  });
+
+  it("retryQueryWith refetches the failed query (Retry is not a no-op)", async () => {
+    let fetches = 0;
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+      queryCache: new QueryCache(),
+    });
+    function Probe() {
+      useQuery({
+        queryKey: ["retry-probe"],
+        queryFn: async () => {
+          fetches += 1;
+          throw { message: "boom" };
+        },
+      });
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <Probe />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetches).toBe(1));
+    const query = client.getQueryCache().find<unknown, unknown>({ queryKey: ["retry-probe"] });
+    if (!query) throw new Error("query missing");
+    retryQueryWith(client)(query);
+    await waitFor(() => expect(fetches).toBe(2));
   });
 });

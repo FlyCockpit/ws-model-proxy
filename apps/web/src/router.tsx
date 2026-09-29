@@ -11,7 +11,7 @@ import { routeTree } from "./routeTree.gen";
 import { type DeletionEntity } from "./utils/friendly-error";
 import { createAppMutationCache } from "./utils/mutation-error-toast";
 import { orpc } from "./utils/orpc";
-import { createAppQueryCache } from "./utils/query-error-toast";
+import { createAppQueryCache, retryQueryWith } from "./utils/query-error-toast";
 import { shouldRetryQuery } from "./utils/query-retry";
 
 // Read the per-request CSP nonce forwarded by the API server on the
@@ -23,6 +23,9 @@ const getCspNonce = createIsomorphicFn()
   .client(() => undefined);
 
 export function getRouter() {
+  // Retry needs the client, which owns this cache; resolved on click.
+  const retryQuery: Parameters<typeof createAppQueryCache>[1] = (query) =>
+    retryQueryWith(queryClient)(query);
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: shouldRetryQuery, staleTime: 1000 * 60 * 5 },
@@ -32,7 +35,7 @@ export function getRouter() {
     // `meta: { skipGlobalErrorToast: true }` (utils/query-error-toast).
     queryCache: createAppQueryCache(
       (key) => i18n.t(key),
-      (query) => query.invalidate,
+      (query) => retryQuery(query),
     ),
     // Surface mutation failures by default so no action ever fails silently.
     // Mutations that handle their own errors (e.g. inline form errors) can

@@ -168,14 +168,19 @@ function DevicePage() {
         </div>
         {refusal ? (
           <DeviceLoginRefusal reason={refusal} onReload={reload} />
-        ) : requestQuery.data ? (
-          <DeviceLoginRequestDetails request={requestQuery.data} />
-        ) : requestQuery.error ? (
-          <p role="alert" className="text-sm text-destructive">
-            {friendly(requestQuery.error, t("device.request.loadError"))}
-          </p>
         ) : (
-          <DeviceLoginRequestSkeleton />
+          <>
+            {requestQuery.data ? (
+              <DeviceLoginRequestDetails request={requestQuery.data} />
+            ) : requestQuery.error ? null : (
+              <DeviceLoginRequestSkeleton />
+            )}
+            {requestQuery.error ? (
+              <p role="alert" className="text-sm text-destructive">
+                {friendly(requestQuery.error, t("device.request.loadError"))}
+              </p>
+            ) : null}
+          </>
         )}
         {refusal ? null : (
           <div className="flex gap-2">
@@ -187,7 +192,7 @@ function DevicePage() {
                   approveMutation.mutate({ userCode, slug: requestQuery.data.slug });
                 }
               }}
-              disabled={!requestQuery.data || approveMutation.isPending}
+              disabled={!requestQuery.data || requestQuery.isFetching || approveMutation.isPending}
             >
               {approveMutation.isPending ? t("device.approving") : t("device.approve")}
             </Button>

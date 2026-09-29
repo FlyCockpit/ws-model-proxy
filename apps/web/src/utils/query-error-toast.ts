@@ -1,4 +1,4 @@
-import { type Query, QueryCache } from "@tanstack/react-query";
+import { type Query, QueryCache, type QueryClient } from "@tanstack/react-query";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 
 import { friendly } from "./friendly-error";
@@ -28,4 +28,14 @@ export function createAppQueryCache(
       });
     },
   });
+}
+
+/**
+ * The global toast's Retry action: refetch exactly the failed query (only if
+ * it is still observed; a disabled or unmounted query stays idle).
+ */
+export function retryQueryWith(client: QueryClient): (query: AppQuery) => void {
+  return (query) => {
+    void client.invalidateQueries({ queryKey: query.queryKey, exact: true });
+  };
 }

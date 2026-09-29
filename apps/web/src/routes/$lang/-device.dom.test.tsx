@@ -79,7 +79,7 @@ vi.mock("@/utils/orpc", () => ({
 }));
 
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { createAppQueryCache } from "@/utils/query-error-toast";
+import { createAppQueryCache, retryQueryWith } from "@/utils/query-error-toast";
 import { Route } from "./device";
 
 function refusal(reason: string) {
@@ -91,7 +91,7 @@ async function mount() {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     queryCache: createAppQueryCache(
       (key) => `t(${key})`,
-      (query) => query.invalidate,
+      (query) => retryQueryWith(client)(query),
     ),
   });
   const Component = Route.options.component as ComponentType & { preload?: () => Promise<unknown> };
@@ -267,5 +267,22 @@ describe("DevicePage approval refusals", () => {
 
     await waitFor(() => expect(screen.getByText("device.refusal.no_slug.title")).toBeTruthy());
     expect(screen.queryByText("device.refusal.slug_mismatch.title")).toBeNull();
+  });
+
+  it("keeps the details but shows an alert and disables Approve when a reload fails with a non-refusal error", async () => {
+    state.approve = () => Promise.reject(refusal("slug_mismatch"));
+    await mount();
+    const user = userEvent.setup();
+    await waitFor(() => expect(screen.getByText("device.approve")).toBeTruthy());
+    await user.click(screen.getByText("device.approve"));
+    await waitFor(() =>
+      expect(screen.getByText("device.refusal.slug_mismatch.title")).toBeTruthy(),
+    );
+
+    state.read = () => Promise.reject(new Error("network down"));
+    await user.click(screen.getByText("device.refusal.reload"));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(toast.error).not.toHaveBeenCalled();
   });
 });
