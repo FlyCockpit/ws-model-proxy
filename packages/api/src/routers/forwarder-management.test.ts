@@ -5209,7 +5209,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
   });
 
-  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+  it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {
     const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
     const row = {
       id: "cli-id",

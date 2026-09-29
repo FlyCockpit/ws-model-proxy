@@ -20,13 +20,6 @@ export {
 };
 
 /**
- * The only relay protocol this server speaks. 2.7 adds engine facts in the
- * inventory, `node.info`, `node.metrics`, `endpoint.load` and
- * `metrics.sources.set`; it is also the minimum: an older CLI is refused at
- * hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`. 2.8 goes to the MCP node file
- * tools (#103) and 2.9 to model deployments (owner decision on #70).
- */
-/**
  * Sent as `protocol.error` to a CLI whose hello is older than 2.7. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
  * text is what the person sees. It names the protocol rather than a wsmp

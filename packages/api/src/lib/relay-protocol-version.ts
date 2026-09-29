@@ -1,6 +1,11 @@
 /**
  * The relay protocols this server speaks, oldest first. The single source for
  * both the server's hello gate and the device card's refusal wording.
+ *
+ * 2.7 adds engine facts in the inventory, `node.info`, `node.metrics`,
+ * `endpoint.load` and `metrics.sources.set`; it is also the minimum: an older
+ * CLI is refused at hello. 2.8 goes to the MCP node file tools (#103) and 2.9
+ * to model deployments (owner decision on #70).
  */
 export const RELAY_PROTOCOL_VERSIONS = ["2.7"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
