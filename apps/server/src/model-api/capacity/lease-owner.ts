@@ -3,12 +3,7 @@ import { CapacityLeaseLostError } from "./lease-loss.js";
 import { currentCapacityRequestScope } from "./request-scope.js";
 import type { CapacityAdmissionStore, CapacityLeaseHandle } from "./types.js";
 
-export {
-  type CapacityLeaseLossKind,
-  CapacityLeaseLostError,
-  capacityLeaseLostSignal,
-  isCapacityLeaseLost,
-} from "./lease-loss.js";
+export { CapacityLeaseLostError, isCapacityLeaseLost } from "./lease-loss.js";
 
 export const reportCapacityCleanupFailure = (operation: "cancel" | "release", error: unknown) => {
   console.warn("[capacity] response lease cleanup failed", {

@@ -80,13 +80,24 @@ describe("capacity request scope", () => {
     app.post("/streams", async () => {
       owner = new CapacityLeaseOwner(leaseStore, lease, undefined, 0);
       return holdCapacityLeaseForResponse({
-        response: new Response("streamed"),
+        // Read-ahead through the hold and the scope wrapper buffers up to two
+        // chunks; the third keeps EOF unread until the client drains the body.
+        response: new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of ["str", "eam", "ed"])
+                controller.enqueue(new TextEncoder().encode(part));
+              controller.close();
+            },
+          }),
+        ),
         store: leaseStore,
         lease,
         owner,
       });
     });
     const response = await app.request("/streams", { method: "POST" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
     expect(leaseStore.release).not.toHaveBeenCalled();
     await expect(response.text()).resolves.toBe("streamed");
     expect(leaseStore.release).toHaveBeenCalledOnce();
