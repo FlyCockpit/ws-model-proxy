@@ -22,10 +22,11 @@
 //!    continuation or a YAML/JSON list item).
 //!
 //! The scanner never decides where a value ENDS. A value that opens a multi-line
-//! form (an unclosed quote, `"""`/`'''`, a YAML `|`/`>` block scalar, a trailing
-//! `\`) keeps the following lines masked until the form provably closes; if it
-//! never closes, the rest of what is scanned is masked. Masked values are counted
-//! in characters; the length itself is not returned.
+//! form (a quote left open, a trailing `\`, a YAML `|`/`>` block scalar) keeps the
+//! following lines masked until a STRUCTURAL end: the first blank line, or for a
+//! block scalar the first line at or below the key line's indentation, or the end
+//! of the scanned region. It never ends at a closing quote. Masked values are
+//! counted in characters; the length itself is not returned.
 //!
 //! There is deliberately no vendor-prefix scanner and no cloud-credential list.
 //!
@@ -283,27 +284,6 @@ fn is_variable_reference(value: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Byte index of the first unescaped `quote` in `line`, if any.
-fn closing_quote_index(line: &str, quote: char) -> Option<usize> {
-    let mut escaped = false;
-    for (idx, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-/// Byte index just past the first `quote quote quote` in `line`.
-fn closing_triple_end(line: &str, quote: char) -> Option<usize> {
-    let triple: String = std::iter::repeat_n(quote, 3).collect();
-    line.find(&triple).map(|idx| idx + triple.len())
-}
-
 /// Whether the value text is a bare variable reference or empty quotes.
 fn value_is_public(value: &str) -> bool {
     // A lone backslash is a shell line continuation, not a value.
@@ -314,13 +294,15 @@ fn value_is_public(value: &str) -> bool {
         || is_variable_reference(value.trim_matches(|c| c == '"' || c == '\''))
 }
 
-/// The quote that is still open at the end of `text` (scanned from outside any
-/// quote). `"` opens anywhere; `'` only at the start of a word, so an
-/// apostrophe in prose (`it's`) does not swallow the following lines.
-fn open_quote_after(text: &str) -> Option<char> {
+/// Whether a quote is still open at the end of `text` (scanned from outside any
+/// quote, backslash escapes skipped). This only decides whether a masked value
+/// CONTINUES on the next line; it never decides where masking ends (that is a
+/// blank line or a dedent, see [`Construct`]). Any `"` or `'` counts, so
+/// `abc'def`, `'a'"b` and doubled `''` all fail closed: an odd shape is a
+/// continuation.
+fn quote_left_open(text: &str) -> bool {
     let mut open: Option<char> = None;
     let mut escaped = false;
-    let mut prev: Option<char> = None;
     for ch in text.chars() {
         if escaped {
             escaped = false;
@@ -330,59 +312,44 @@ fn open_quote_after(text: &str) -> Option<char> {
             match open {
                 Some(quote) if ch == quote => open = None,
                 Some(_) => {}
-                None => {
-                    let word_start = prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_'));
-                    if ch == '"' || (ch == '\'' && word_start) {
-                        open = Some(ch);
-                    }
-                }
+                None if ch == '"' || ch == '\'' => open = Some(ch),
+                None => {}
             }
         }
-        prev = Some(ch);
     }
-    open
+    open.is_some()
 }
 
-/// A multi-line value that the masked tail of a line opened. The following
-/// lines stay masked until it provably closes.
+/// A multi-line value that the masked tail of a line opened. Masking ends only
+/// at a structural boundary that needs no quote parsing: never at a closing
+/// quote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Construct {
     None,
-    /// An unclosed `"` or `'`: masked until the closing quote.
-    Quote(char),
-    /// An unclosed `"""` or `'''`.
-    Triple(char),
-    /// A YAML `|`/`>` block scalar of a key at column `key_col`: masked while
-    /// lines are blank or indented deeper.
+    /// A quote left open, a trailing `\`, shell concatenation: every following
+    /// line is masked until the first BLANK line (or the end of the region).
+    UntilBlank,
+    /// A YAML-like value (`key: ...`): masked while lines are blank or indented
+    /// deeper than the KEY LINE (its own leading-whitespace width, so a quoted
+    /// key or a `- ` item does not shift the threshold); the first non-blank line
+    /// at or below that indentation ends it.
     Block {
-        key_col: usize,
+        line_indent: usize,
     },
-    /// A trailing `\`: the next line is part of the value.
-    Backslash,
 }
 
-/// The construct that the value text `tail` (rest of the line, after the
-/// separator) opens.
-fn construct_for_tail(tail: &str, colon: bool, key_col: usize) -> Construct {
+/// The construct that the value text `tail` opens. `colon` marks a YAML-like
+/// `key: value` (only its block scalars end at a dedent); `line_indent` is the
+/// indentation of the line holding the key.
+fn construct_for_tail(tail: &str, colon: bool, line_indent: usize) -> Construct {
     let trimmed = tail.trim();
     if colon && BLOCK_SCALAR.is_match(trimmed) {
-        return Construct::Block { key_col };
+        return Construct::Block { line_indent };
     }
-    for quote in ['"', '\''] {
-        let triple: String = std::iter::repeat_n(quote, 3).collect();
-        if trimmed.starts_with(&triple) {
-            return if trimmed[3..].contains(&triple) {
-                Construct::None
-            } else {
-                Construct::Triple(quote)
-            };
-        }
-    }
-    if let Some(quote) = open_quote_after(tail) {
-        return Construct::Quote(quote);
-    }
-    if trimmed.ends_with('\\') {
-        return Construct::Backslash;
+    if trimmed.ends_with('\\') || quote_left_open(tail) {
+        // Stricter than a YAML dedent: a quoted or continued value may sit at any
+        // indentation in the many YAML-like files that are not valid YAML.
+        return Construct::UntilBlank;
     }
     Construct::None
 }
@@ -429,12 +396,12 @@ fn first_assignment(line: &str) -> Option<Candidate> {
         let trimmed = tail.trim_end();
         if trimmed == "\\" {
             // a lone backslash hides nothing, but the value is on the next line
-            return Some((line.len(), Construct::Backslash));
+            return Some((line.len(), Construct::UntilBlank));
         }
         if value_is_public(trimmed) {
             continue;
         }
-        let construct = construct_for_tail(tail, sep.as_str() == ":", name.start());
+        let construct = construct_for_tail(tail, sep.as_str() == ":", indent_of(line));
         return Some((whole.end(), construct));
     }
     None
@@ -447,23 +414,22 @@ fn first_flag(line: &str) -> Option<Candidate> {
     }
     let mut pos = 0_usize;
     while let Some(caps) = FLAG.captures_at(line, pos) {
-        let (Some(sep), Some(whole)) = (caps.get(1), caps.get(0)) else {
+        let Some(whole) = caps.get(0) else {
             break;
         };
         let start = whole.end();
         pos = start;
-        if sep.as_str() != "=" && line[start..].starts_with('-') {
-            continue;
-        }
+        // The next token is the value whatever its first character: a secret can
+        // start with `-`, and over-masking a following public option is fine.
         let tail = &line[start..];
         let trimmed = tail.trim_end();
         if trimmed == "\\" {
-            return Some((line.len(), Construct::Backslash));
+            return Some((line.len(), Construct::UntilBlank));
         }
         if value_is_public(trimmed) {
             continue;
         }
-        return Some((start, construct_for_tail(tail, false, 0)));
+        return Some((start, construct_for_tail(tail, false, indent_of(line))));
     }
     None
 }
@@ -477,9 +443,11 @@ fn first_secret(line: &str) -> Option<Candidate> {
     }
 }
 
-/// The mask for the tail of `line` starting at `start` (none when empty).
+/// The mask for the tail of `line` starting at `start` (none when empty), to the
+/// very end of the physical line: the caller has already removed the line
+/// terminator, and trailing whitespace can be part of a secret.
 fn tail_mask(line: &str, start: usize) -> Option<LineMask> {
-    let end = line.trim_end().len();
+    let end = line.len();
     (start < end).then(|| (start..end, token(line[start..end].chars().count())))
 }
 
@@ -520,20 +488,20 @@ fn continuation_value(line: &str) -> Option<(Range<usize>, Construct)> {
         start += 2;
         start += line[start..].len() - line[start..].trim_start().len();
     }
-    if start >= line.len() || line[start..].starts_with('-') {
+    if start >= line.len() {
         return None;
     }
-    let end = line.trim_end().len();
-    let value = &line[start..end];
+    let end = line.len();
+    let value = line[start..end].trim_end();
     if value == "\\" {
-        return Some((line.len()..line.len(), Construct::Backslash));
+        return Some((line.len()..line.len(), Construct::UntilBlank));
     }
     if value_is_public(value) {
         return None;
     }
     Some((
         start..end.max(start),
-        construct_for_tail(&line[start..], false, 0),
+        construct_for_tail(&line[start..], false, indent_of(line)),
     ))
 }
 
@@ -544,7 +512,7 @@ fn indent_of(line: &str) -> usize {
 /// Line-oriented masker. Feed lines (without terminators) in file order. The
 /// state carried between lines is: a `PRIVATE KEY` block flag, a "previous line
 /// ended with a secret flag" flag, and an open multi-line [`Construct`] that
-/// keeps every following line masked until it provably closes. A caller that
+/// keeps every following line masked until a structural end (a blank line or a dedent). A caller that
 /// serves a window from the middle of a file feeds the lines in
 /// [`LOOKBACK_BYTES`] before it (state only) for a class where
 /// [`FileClass::needs_prefix`] holds. Command-output masking (a later phase)
@@ -594,40 +562,27 @@ impl LineMasker {
     /// Masked ranges of `line` (byte ranges in `line` plus their replacement
     /// text), sorted and non-overlapping. Advances the state.
     pub fn scan(&mut self, line: &str) -> Vec<(Range<usize>, String)> {
-        let whole = |line: &str| vec![(0..line.len(), token_bare())];
         match self.construct {
             Construct::None => {}
-            Construct::Backslash => {
+            Construct::UntilBlank => {
                 self.pending_flag_value = false;
-                if !line.trim_end().ends_with('\\') {
+                if line.trim().is_empty() {
+                    // the blank line is the structural end of the value
                     self.construct = Construct::None;
+                    return Vec::new();
                 }
-                return whole(line);
+                return vec![(0..line.len(), token_bare())];
             }
-            Construct::Block { key_col } => {
+            Construct::Block { line_indent } => {
                 if line.trim().is_empty() {
                     return Vec::new();
                 }
-                if indent_of(line) > key_col {
+                if indent_of(line) > line_indent {
                     self.pending_flag_value = false;
-                    return whole(line);
+                    return vec![(0..line.len(), token_bare())];
                 }
                 // dedent: the block is over and this line is a normal line
                 self.construct = Construct::None;
-            }
-            Construct::Quote(quote) => {
-                self.pending_flag_value = false;
-                return match closing_quote_index(line, quote) {
-                    None => whole(line),
-                    Some(idx) => self.after_close(line, idx + quote.len_utf8()),
-                };
-            }
-            Construct::Triple(quote) => {
-                self.pending_flag_value = false;
-                return match closing_triple_end(line, quote) {
-                    None => whole(line),
-                    Some(end) => self.after_close(line, end),
-                };
             }
         }
         let masks = self.scan_body(line);
@@ -636,22 +591,6 @@ impl LineMasker {
         } else {
             merge(masks, line)
         }
-    }
-
-    /// A multi-line value closed at byte `end` of `line`.
-    fn after_close(&mut self, line: &str, end: usize) -> Vec<LineMask> {
-        self.construct = Construct::None;
-        let rest = &line[end..];
-        if self.class == FileClass::Dotenv {
-            // Nothing after a value is trusted; it may still open another value.
-            self.construct = construct_for_tail(rest, false, 0);
-            return vec![(0..line.len(), token_bare())];
-        }
-        let mut masks = vec![(0..end, token_bare())];
-        for (range, tok) in self.scan_body(rest) {
-            masks.push((range.start + end..range.end + end, tok));
-        }
-        merge(masks, line)
     }
 
     /// The class and generic rules over `line` (ranges relative to `line`).
@@ -694,10 +633,10 @@ impl LineMasker {
                     generic = true;
                 } else if let Some(m) = DOTENV_ASSIGN.find(line) {
                     masks.extend(tail_mask(line, m.end()));
-                    construct = construct_for_tail(&line[m.end()..], false, 0);
+                    construct = construct_for_tail(&line[m.end()..], false, indent_of(line));
                 } else {
                     masks.push((0..line.len(), token_bare()));
-                    construct = construct_for_tail(line, false, 0);
+                    construct = construct_for_tail(line, false, indent_of(line));
                 }
             }
             FileClass::Plain => {}
@@ -805,11 +744,7 @@ mod tests {
                 "export A = \"x y z\"\n",
                 "export A = \u{27E6}redacted:7\u{27E7}\n",
             ),
-            (
-                Dotenv,
-                "A='multi word value'  \n",
-                "A=\u{27E6}redacted:18\u{27E7}  \n",
-            ),
+            (Dotenv, "A='multi word value'  \n", "A=⟦redacted:20⟧\n"),
             (
                 Dotenv,
                 "A=\r\nB=x\r\n",
@@ -948,22 +883,22 @@ mod tests {
                 "HF_TOKEN:hunter2\n",
                 "HF_TOKEN:\u{27E6}redacted:7\u{27E7}\n",
             ),
-            // a quoted value that spans lines masks every line of it, in any class,
-            // and text after the closing quote is scanned normally again
+            // a quoted value that spans lines masks every following line until a blank
+            // line (never at the closing quote), in any class
             (
                 Plain,
                 "X_TOKEN=\"first\nsecond\nthird\" tail\nafter\n",
-                "X_TOKEN=\u{27E6}redacted:6\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7} tail\nafter\n",
+                "X_TOKEN=⟦redacted:6⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n",
             ),
             (
                 Plain,
                 "X_KEY: 'a\nb'\nY_KEY=z\n",
-                "X_KEY: \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\nY_KEY=\u{27E6}redacted:1\u{27E7}\n",
+                "X_KEY: ⟦redacted:2⟧\n⟦redacted⟧\n⟦redacted⟧\n",
             ),
             (
                 Plain,
                 "--token \"a\nb\"\nplain\n",
-                "--token \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\nplain\n",
+                "--token ⟦redacted:2⟧\n⟦redacted⟧\n⟦redacted⟧\n",
             ),
             (
                 Plain,
@@ -997,7 +932,7 @@ mod tests {
             (
                 Dotenv,
                 "A=\"first\nSECOND\"\nB=x\n",
-                "A=⟦redacted:6⟧\n⟦redacted⟧\nB=⟦redacted:1⟧\n",
+                "A=⟦redacted:6⟧\n⟦redacted⟧\n⟦redacted⟧\n",
             ),
             (
                 Dotenv,
@@ -1078,7 +1013,7 @@ mod tests {
             ),
             (Plain, "\"--api-key=abc\"\n", "\"--api-key=⟦redacted:4⟧\n"),
             (Plain, "--token-limit 5\n", "--token-limit 5\n"),
-            (Plain, "--api-key --other\n", "--api-key --other\n"),
+            (Plain, "--api-key --other\n", "--api-key ⟦redacted:7⟧\n"),
             (Plain, "--api-key=$KEY\n", "--api-key=$KEY\n"),
             (Plain, "--api-key-file /run/k\n", "--api-key-file /run/k\n"),
             (
@@ -1099,7 +1034,7 @@ mod tests {
             (
                 Plain,
                 "  - --secret\n  - --flag\n",
-                "  - --secret\n  - --flag\n",
+                "  - --secret\n  - ⟦redacted:6⟧\n",
             ),
             // hf token file
             (HfToken, "hf_abcdef\n", "\u{27E6}redacted:9\u{27E7}\n"),
@@ -1390,10 +1325,61 @@ mod tests {
             (Dotenv, "KEY: value with colon\n", &["value with colon"]),
             (
                 Dotenv,
-                "  export DB_URL = postgres://u:pw@h/db  # note\n",
-                &["postgres", "pw"],
+                "  export DB_URL = value-one two  # note\n",
+                &["value-one", "two", "note"],
             ),
             (PemKey, "# note\nK_TOKEN=\"a\nb\"\n", &["b\""]),
+            // stage-3 round 3 (C3a-1..6): masking ends only at a blank line or a dedent,
+            // never at a closing quote
+            (
+                Plain,
+                "API_KEY: 'first1\n  second1''tail-secret1\n  third1'\nvisible: 1\n",
+                &["second1", "tail-secret1", "third1"],
+            ),
+            (
+                Plain,
+                "K_TOKEN='a1'\"b1\nc1\"\n\nvisible\n",
+                &["a1", "b1", "c1"],
+            ),
+            (
+                Plain,
+                "K_TOKEN=\"x1\\\nc1\"\\\nd1\ne1\n\nvisible\n",
+                &["x1", "c1", "d1", "e1"],
+            ),
+            (
+                Plain,
+                "export K_TOKEN=abc1\\\n\"open1\nmore1\n\nvisible\n",
+                &["abc1", "open1", "more1"],
+            ),
+            (
+                Plain,
+                "K_TOKEN=\"\"\"x1\"\"\" ; A_KEY=\"open2\nmore2\n\nv\n",
+                &["x1", "open2", "more2"],
+            ),
+            (
+                Plain,
+                "K_TOKEN=abc1'def1\nghi1'\n\nvisible\n",
+                &["abc1", "def1", "ghi1"],
+            ),
+            (
+                Dotenv,
+                "K_TOKEN=abc1'def1\nNEXT_KEY=ghi1'\n\nB=1\n",
+                &["abc1", "def1", "NEXT_KEY", "ghi1"],
+            ),
+            (
+                Plain,
+                "\"K_TOKEN\": |\n one1\n two1\nvisible: 1\n",
+                &["one1", "two1"],
+            ),
+            (Plain, "run --token -secret1 --x\n", &["secret1"]),
+            (Plain, "run --api-key\n-secret2\n", &["secret2"]),
+            (Plain, "run --password=-secret3\n", &["secret3"]),
+            (
+                Plain,
+                "K_TOKEN=abc1\u{a0}\u{2002}\n",
+                &["\u{a0}", "\u{2002}"],
+            ),
+            (Plain, "K_TOKEN=abc1   \n", &["   "]),
         ];
         let mut leaks = Vec::new();
         for (class, input, secrets) in rows {
@@ -1415,6 +1401,32 @@ mod tests {
         assert_eq!(
             masked(FileClass::Plain, text),
             "a:\n  TLS_KEY: \u{27E6}redacted:1\u{27E7}\n\u{27E6}redacted\u{27E7}\n\n\u{27E6}redacted\u{27E7}\n  other: shown\nb: shown\n"
+        );
+    }
+
+    #[test]
+    fn structural_ends_show_public_text_again_and_only_there() {
+        use FileClass::Plain;
+        // a YAML block scalar ends at the first non-blank line at or below the KEY LINE's
+        // indentation (the line's own, so a quoted key or a `- ` item does not shift it;
+        // a deeper sibling of a list item is over-masked, never leaked)
+        assert_eq!(
+            masked(Plain, "\"K_TOKEN\": |\n one\n\n two\nvisible: 1\n"),
+            "\"K_TOKEN\": \u{27E6}redacted:1\u{27E7}\n\u{27E6}redacted\u{27E7}\n\n\u{27E6}redacted\u{27E7}\nvisible: 1\n"
+        );
+        assert_eq!(
+            masked(Plain, "- K_KEY: >-\n    body\n  sibling: 1\ntop: 1\n"),
+            "- K_KEY: \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\ntop: 1\n"
+        );
+        // every other multi-line form ends at the first blank line, not at a quote
+        assert_eq!(
+            masked(Plain, "K_TOKEN=\"a\nb\" tail\nc\n\nvisible\n"),
+            "K_TOKEN=\u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\n\nvisible\n"
+        );
+        // a region that never reaches a blank line is masked to its end
+        assert_eq!(
+            masked(Plain, "K_TOKEN=\"a\nb\nc\n"),
+            "K_TOKEN=\u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\n"
         );
     }
 
@@ -1500,20 +1512,22 @@ mod tests {
     }
 
     #[test]
-    fn a_line_masker_carries_an_open_quote_across_lines_for_every_class() {
-        let mut masker = LineMasker::new(FileClass::Plain);
-        assert_eq!(
-            masker.mask_line("K_TOKEN=\"one"),
-            "K_TOKEN=\u{27E6}redacted:4\u{27E7}"
-        );
-        assert!(masker.in_continuation());
-        assert_eq!(masker.mask_line("two"), "\u{27E6}redacted\u{27E7}");
-        assert_eq!(
-            masker.mask_line("three\" ok"),
-            "\u{27E6}redacted\u{27E7} ok"
-        );
-        assert!(!masker.in_continuation());
-        assert_eq!(masker.mask_line("visible"), "visible");
+    fn a_line_masker_masks_a_multi_line_value_until_a_blank_line_for_every_class() {
+        for class in [FileClass::Plain, FileClass::PemKey] {
+            let mut masker = LineMasker::new(class);
+            assert_eq!(
+                masker.mask_line("K_TOKEN=\"one"),
+                "K_TOKEN=\u{27E6}redacted:4\u{27E7}"
+            );
+            assert!(masker.in_continuation());
+            assert_eq!(masker.mask_line("two"), "\u{27E6}redacted\u{27E7}");
+            // a closing quote does not end masking; only the blank line does
+            assert_eq!(masker.mask_line("three\" ok"), "\u{27E6}redacted\u{27E7}");
+            assert_eq!(masker.mask_line("still masked"), "\u{27E6}redacted\u{27E7}");
+            assert_eq!(masker.mask_line(""), "");
+            assert!(!masker.in_continuation());
+            assert_eq!(masker.mask_line("visible"), "visible");
+        }
     }
 
     #[test]

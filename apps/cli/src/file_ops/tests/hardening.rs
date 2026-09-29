@@ -206,7 +206,7 @@ fn a_multi_line_quoted_value_in_a_plain_file_is_masked_in_every_window() {
     let fx = Fx::new();
     fx.put(
         "notes.txt",
-        "intro\nX_TOKEN=\"first-secret\nsecond-secret\nthird-secret\" # note\nafter\n",
+        "intro\nX_TOKEN=\"first-secret\nsecond-secret\nthird-secret\" # note\n\nafter\n",
     );
     for start in 1..=5 {
         let r = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": start }));
@@ -214,9 +214,11 @@ fn a_multi_line_quoted_value_in_a_plain_file_is_masked_in_every_window() {
             assert!(!r.text.contains(leaked), "startLine {start}: {}", r.text);
         }
     }
+    // a closing quote does not end masking (`# note` is part of the masked line);
+    // the blank line does
     let r = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": 4 }));
     assert!(
-        r.text.contains("# note") && r.text.contains("after"),
+        !r.text.contains("# note") && r.text.contains("after"),
         "{}",
         r.text
     );
@@ -354,10 +356,7 @@ fn context_lines_that_are_not_utf8_still_advance_the_masking_state() {
     );
     let r = fx.read_with(json!({ "path": fx.p("latin1.txt"), "startLine": 2 }));
     assert!(!r.text.contains("second-line-secret"), "{}", r.text);
-    fx.put(
-        "app.env",
-        b"NOTE=\"v\xe9 opens\nsecond-env-secret\"\nB=1\n",
-    );
+    fx.put("app.env", b"NOTE=\"v\xe9 opens\nsecond-env-secret\"\nB=1\n");
     let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 2 }));
     assert!(!r.text.contains("second-env-secret"), "{}", r.text);
     // an invalid line INSIDE the window of an env file is masked whole, not a binary error
@@ -385,14 +384,18 @@ fn a_window_inside_a_multi_line_value_is_masked_from_the_lookback() {
     for i in 0..30_000 {
         body.push_str(&format!("secret-line-{i}\n"));
     }
-    body.push_str("end\"\nvisible\n");
+    body.push_str("end\"\n\nvisible\n");
     fx.put("long.txt", &body);
     // the window starts ~400 KiB inside the value, well within the 1 MiB lookback
     let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 29_000, "maxLines": 5 }));
     assert!(!r.text.contains("secret-line"), "{}", r.text);
     let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 30_002 }));
     assert!(r.text.contains("visible"), "{}", r.text);
-    assert!(!r.text.contains("secret-line"), "{}", r.text);
+    assert!(
+        !r.text.contains("secret-line") && !r.text.contains("end\""),
+        "{}",
+        r.text
+    );
 }
 
 #[test]
@@ -408,7 +411,7 @@ fn the_tail_window_of_a_huge_file_sees_a_value_opened_in_the_lookback() {
     for i in 0..20 {
         writeln!(file, "tail-secret-{i}").unwrap();
     }
-    file.write_all(b"end\"\nafter\n").unwrap();
+    file.write_all(b"end\"\n\nafter\n").unwrap();
     file.flush().unwrap();
     drop(file);
     assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
@@ -430,4 +433,80 @@ fn rename_overwrite_refuses_a_different_object_kind() {
     assert_eq!(code(r), ErrorCode::Exists);
     assert_eq!(fx.get("f.txt"), "file");
     assert!(fx.root.join("d/x").exists());
+}
+
+// ---- cancellation reaches the large-file read loops ---------------------------
+
+#[test]
+fn a_cancelled_read_of_a_huge_file_stops_instead_of_scanning_it() {
+    let fx = Arc::new(Fx::new());
+    let path = fx.root.join("huge.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line 0123456789012345678901234567890123456789\n".repeat(20_000);
+    for _ in 0..70 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    // already cancelled: refused up front, in the head path and the tail path
+    fx.cancel.cancel();
+    for start in [1_i64, -3, 1_000_000] {
+        let r = fx.ops.read(
+            &args(json!({ "path": fx.p("huge.log"), "startLine": start })),
+            &fx.cancel,
+        );
+        assert_eq!(code(r), ErrorCode::Cancelled, "startLine {start}");
+    }
+    // cancelled while the prefix is being scanned: observed at the next check, long
+    // before the 1.4 M lines are read
+    let fx2 = Arc::new(Fx::new());
+    std::fs::copy(&path, fx2.root.join("huge.log")).unwrap();
+    let canceller = {
+        let fx2 = Arc::clone(&fx2);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            fx2.cancel.cancel();
+        })
+    };
+    let started = Instant::now();
+    let r = fx2.ops.read(
+        &args(json!({ "path": fx2.p("huge.log"), "startLine": 1_400_000 })),
+        &fx2.cancel,
+    );
+    canceller.join().unwrap();
+    let elapsed = started.elapsed();
+    match r {
+        Err(err) => assert_eq!(err.code, ErrorCode::Cancelled, "{elapsed:?}"),
+        // the scan finished before the flag was set on a very fast machine: not a failure
+        Ok(_) => assert!(elapsed < Duration::from_millis(50), "{elapsed:?}"),
+    }
+}
+
+#[test]
+fn an_extreme_line_range_is_invalid_input_not_a_panic() {
+    let fx = Fx::new();
+    fx.put("a.txt", "one\ntwo\n");
+    let etag = fx.etag("a.txt");
+    for (start, end) in [
+        (1_u64, u64::MAX),
+        (u64::MAX, u64::MAX),
+        (4, 2),
+        (u64::MAX, 1),
+    ] {
+        let r = fx.ops.edit(
+            &args(json!({ "path": fx.p("a.txt"), "expectedEtag": etag,
+                "edits": [{ "startLine": start, "endLine": end, "newText": "x\n" }] })),
+            &fx.cancel,
+        );
+        assert!(matches!(code(r), ErrorCode::InvalidInput), "{start}..{end}");
+    }
+    // the supported empty insertion range still works
+    fx.ops
+        .edit(
+            &args(json!({ "path": fx.p("a.txt"), "expectedEtag": etag,
+                "edits": [{ "startLine": 2, "endLine": 1, "newText": "x\n" }] })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(fx.get("a.txt"), "one\nx\ntwo\n");
 }

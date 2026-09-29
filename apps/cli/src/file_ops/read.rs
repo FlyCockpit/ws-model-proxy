@@ -172,6 +172,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
     if stat.size > STRONG_ETAG_MAX_BYTES {
         return read_large(
             ops, args, &mut file, &stat, class, echo, start, &opts_for, max_lines, max_bytes,
+            cancel,
         );
     }
 
@@ -380,6 +381,9 @@ pub(crate) fn assemble(
     })
 }
 
+/// How many lines of a huge file are read between cancellation checks.
+const CANCEL_CHECK_LINES: u64 = 512;
+
 /// Longest single line served from a file over 64 MiB. Masking needs the whole
 /// line in memory, so an unbounded line (a sparse or minified file) would be an
 /// allocation the file's owner controls.
@@ -416,7 +420,9 @@ fn read_large(
     opts_for: &dyn Fn(u64) -> WindowOpts,
     max_lines: usize,
     max_bytes: usize,
+    cancel: &Cancel,
 ) -> FileResult<ReadOutcome> {
+    cancel.check()?;
     let etag = ops.key.weak(&file.metadata()?);
     if args.if_none_match.as_deref() == Some(etag.as_str()) {
         return Ok(ReadOutcome::Unchanged {
@@ -441,6 +447,7 @@ fn read_large(
         tail_window(
             file,
             stat,
+            cancel,
             &mut masker,
             start.unsigned_abs() as usize,
             max_lines,
@@ -461,7 +468,11 @@ fn read_large(
         };
         let mut context: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
         let mut context_bytes = 0_u64;
-        for _ in 1..first {
+        for seen in 1..first {
+            // a 64 MiB prefix is millions of lines: observe cancellation as we go
+            if seen.is_multiple_of(CANCEL_CHECK_LINES) {
+                cancel.check()?;
+            }
             let mut buf = Vec::new();
             let n = read_line_bounded(&mut reader, &mut buf)?;
             if n == 0 {
@@ -485,7 +496,14 @@ fn read_large(
         for buf in &context {
             masker.advance_bytes(strip_eol(buf));
         }
+        let mut served = 0_u64;
         let mut lines = std::iter::from_fn(|| {
+            served += 1;
+            if served.is_multiple_of(CANCEL_CHECK_LINES)
+                && let Err(err) = cancel.check()
+            {
+                return Some(Err(err));
+            }
             let mut buf = Vec::new();
             match read_line_bounded(&mut reader, &mut buf) {
                 Ok(0) => None,
@@ -518,12 +536,14 @@ fn read_large(
 fn tail_window(
     file: &std::fs::File,
     stat: &Stat,
+    cancel: &Cancel,
     masker: &mut LineMasker,
     count: usize,
     max_lines: usize,
     max_bytes: usize,
     etag: &str,
 ) -> FileResult<(Window, Eol)> {
+    cancel.check()?;
     let chunk_len =
         ((max_bytes as u64) * 2 + 64 * 1024 + redact::LOOKBACK_BYTES as u64).min(stat.size);
     let mut chunk = vec![0_u8; chunk_len as usize];

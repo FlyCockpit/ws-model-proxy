@@ -487,13 +487,13 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
             assert_eq!(code(r), ErrorCode::RedactedSpan, "{file} {edits} dry={dry}");
         }
     }
-    // an insert that opens a new context inside a multi-line value is refused too
+    // a blank line inserted inside a multi-line value would end its masking: refused too
     let etag = fx.etag("multi.txt");
     let r = edit(
         &fx,
         "multi.txt",
         Some(&etag),
-        json!([{ "startLine": 2, "endLine": 1, "newText": "\"\n" }]),
+        json!([{ "startLine": 2, "endLine": 1, "newText": "\n" }]),
     );
     assert_eq!(code(r), ErrorCode::RedactedSpan);
     assert_eq!(

@@ -456,7 +456,7 @@ fn plan_lines(
     budget: &mut SizeBudget,
 ) -> FileResult<Planned> {
     let total = text::count_lines(original) as u64;
-    if start == 0 || end + 1 < start || start > total + 1 || end > total {
+    if start == 0 || end > total || end < start - 1 || start > total + 1 {
         return Err(FileError::invalid(format!(
             "edit {index}: line range {start}..{end} is outside the file ({total} lines)"
         )));
