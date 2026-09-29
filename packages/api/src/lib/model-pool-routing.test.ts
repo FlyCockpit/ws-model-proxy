@@ -666,65 +666,76 @@ describe("modelPoolRouting", () => {
     });
   });
 
-  it("retries a disconnect transaction that expired, and gives up after five attempts", async () => {
-    const expired = Object.assign(new Error("expired"), { code: "P2028" });
+  it("retries a disconnect transaction that expired or hit a lock timeout, within bounds", async () => {
+    vi.useFakeTimers();
     const tx = db as unknown as { $transaction: MockInstance };
-    tx.$transaction.mockReset();
-    tx.$transaction.mockRejectedValueOnce(expired).mockResolvedValueOnce(true);
-    await expect(
-      disconnectCliDeviceAtGeneration({
-        cliDeviceId: "cli-1",
-        generation: 1,
-        cliStatus: "DISCONNECTED",
-        failureClass: "WEBSOCKET_DISCONNECTED",
-      }),
-    ).resolves.toBe(true);
-    expect(tx.$transaction).toHaveBeenCalledTimes(2);
-    expect(tx.$transaction.mock.calls[0]?.[1]).toEqual({ timeout: 10_000, maxWait: 5_000 });
+    const input = {
+      cliDeviceId: "cli-1",
+      generation: 1,
+      cliStatus: "DISCONNECTED" as const,
+      failureClass: "WEBSOCKET_DISCONNECTED" as const,
+    };
+    // Runs the call to completion under fake timers (backoff sleeps included).
+    const settle = async (promise: Promise<boolean>, ms = 60_000) => {
+      const outcome = promise.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      await vi.advanceTimersByTimeAsync(ms);
+      return outcome;
+    };
+    try {
+      const expired = Object.assign(new Error("expired"), { code: "P2028" });
+      tx.$transaction.mockReset();
+      tx.$transaction.mockRejectedValueOnce(expired).mockResolvedValueOnce(true);
+      await expect(settle(disconnectCliDeviceAtGeneration(input))).resolves.toEqual({
+        value: true,
+      });
+      expect(tx.$transaction).toHaveBeenCalledTimes(2);
+      expect(tx.$transaction.mock.calls[0]?.[1]).toEqual({ timeout: 10_000, maxWait: 5_000 });
 
-    tx.$transaction.mockReset();
-    tx.$transaction.mockRejectedValue(expired);
-    await expect(
-      disconnectCliDeviceAtGeneration({
-        cliDeviceId: "cli-1",
-        generation: 1,
-        cliStatus: "DISCONNECTED",
-        failureClass: "WEBSOCKET_DISCONNECTED",
-      }),
-    ).rejects.toBe(expired);
-    expect(tx.$transaction).toHaveBeenCalledTimes(5);
+      // Other retryable errors are count-bound.
+      tx.$transaction.mockReset();
+      tx.$transaction.mockRejectedValue(expired);
+      await expect(settle(disconnectCliDeviceAtGeneration(input))).resolves.toEqual({
+        error: expired,
+      });
+      expect(tx.$transaction).toHaveBeenCalledTimes(5);
 
-    // A lock timeout (55P03) is transient too: it releases the device row so a
-    // reconnecting hello is never stuck behind a slow member-row holder.
-    tx.$transaction.mockReset();
-    const lockTimeout = Object.assign(new Error("lock timeout"), {
-      code: "P2010",
-      meta: { code: "55P03" },
-    });
-    tx.$transaction.mockRejectedValueOnce(lockTimeout).mockResolvedValueOnce(false);
-    await expect(
-      disconnectCliDeviceAtGeneration({
-        cliDeviceId: "cli-1",
-        generation: 1,
-        cliStatus: "DISCONNECTED",
-        failureClass: "WEBSOCKET_DISCONNECTED",
-      }),
-    ).resolves.toBe(false);
-    expect(tx.$transaction).toHaveBeenCalledTimes(2);
+      // A lock timeout (real driver-adapter error shape) is transient and is
+      // retried on a time budget well past the count cap: every attempt
+      // releases the device row, and dropping the disconnect would leave the
+      // device CONNECTED with no session.
+      const lockTimeout = Object.assign(new Error("canceling statement due to lock timeout"), {
+        code: "P2039",
+        meta: { driverAdapterError: { cause: { code: "55P03" } } },
+      });
+      tx.$transaction.mockReset();
+      for (let i = 0; i < 12; i += 1) tx.$transaction.mockRejectedValueOnce(lockTimeout);
+      tx.$transaction.mockResolvedValueOnce(true);
+      await expect(settle(disconnectCliDeviceAtGeneration(input))).resolves.toEqual({
+        value: true,
+      });
+      expect(tx.$transaction).toHaveBeenCalledTimes(13);
 
-    // A non-transient error is not retried.
-    tx.$transaction.mockReset();
-    const fatal = new Error("boom");
-    tx.$transaction.mockRejectedValue(fatal);
-    await expect(
-      disconnectCliDeviceAtGeneration({
-        cliDeviceId: "cli-1",
-        generation: 1,
-        cliStatus: "DISCONNECTED",
-        failureClass: "WEBSOCKET_DISCONNECTED",
-      }),
-    ).rejects.toBe(fatal);
-    expect(tx.$transaction).toHaveBeenCalledTimes(1);
+      // A lock that never clears is given up after the budget.
+      tx.$transaction.mockReset();
+      tx.$transaction.mockRejectedValue(lockTimeout);
+      await expect(settle(disconnectCliDeviceAtGeneration(input), 120_000)).resolves.toEqual({
+        error: lockTimeout,
+      });
+
+      // A non-transient error is not retried.
+      tx.$transaction.mockReset();
+      const fatal = new Error("boom");
+      tx.$transaction.mockRejectedValue(fatal);
+      await expect(settle(disconnectCliDeviceAtGeneration(input))).resolves.toEqual({
+        error: fatal,
+      });
+      expect(tx.$transaction).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fences the member scope with the device generation", async () => {

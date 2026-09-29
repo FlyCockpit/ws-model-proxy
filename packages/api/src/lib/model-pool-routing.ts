@@ -1,4 +1,5 @@
 import prisma from "@ws-model-proxy/db";
+import { serverTimeoutSqlState } from "@ws-model-proxy/db/capacity-lock-order";
 import { retryableSerializableTransactionCode } from "./serializable-transaction";
 
 export const POOL_MEMBER_UNHEALTHY_AFTER_RETRYABLE_FAILURES = 3;
@@ -889,16 +890,18 @@ const DISCONNECT_TRANSACTION_MAX_WAIT_MS = 5_000;
  */
 const DISCONNECT_LOCK_TIMEOUT_MS = 2_000;
 const DISCONNECT_RETRY_BACKOFF_MS = 100;
+/**
+ * Lock timeouts are retried on a time budget, not a count: every attempt
+ * releases the device row within DISCONNECT_LOCK_TIMEOUT_MS, so retrying never
+ * blocks a reconnect, and dropping a genuine disconnect (the session is
+ * already gone from memory) would leave the device CONNECTED with nothing to
+ * correct it. The budget bounds shutdown; other retryable errors stay
+ * count-bound.
+ */
+const DISCONNECT_LOCK_RETRY_BUDGET_MS = 30_000;
 
 function isLockTimeout(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const meta = Reflect.get(error, "meta");
-  const sqlState =
-    typeof meta === "object" && meta !== null ? Reflect.get(meta, "code") : undefined;
-  const message = Reflect.get(error, "message");
-  return (
-    sqlState === "55P03" || (typeof message === "string" && /55P03|lock timeout/i.test(message))
-  );
+  return serverTimeoutSqlState(error) === "55P03";
 }
 
 /** P2028 = Prisma interactive transaction expired / could not start in `maxWait`. */
@@ -940,7 +943,9 @@ export async function disconnectCliDeviceAtGeneration({
   // that lost a deadlock/serialization race) is safely re-run. Without the
   // retry the session is already gone from memory and nothing would record
   // the disconnect (device left CONNECTED with no session).
-  for (let attempt = 1; ; attempt += 1) {
+  const lockRetryDeadline = Date.now() + DISCONNECT_LOCK_RETRY_BUDGET_MS;
+  let failures = 0;
+  for (;;) {
     try {
       return await prisma.$transaction(
         async (tx) => {
@@ -962,9 +967,16 @@ export async function disconnectCliDeviceAtGeneration({
         { timeout: DISCONNECT_TRANSACTION_TIMEOUT_MS, maxWait: DISCONNECT_TRANSACTION_MAX_WAIT_MS },
       );
     } catch (error) {
-      if (attempt >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS || !isRetryableDisconnectError(error))
-        throw error;
-      await new Promise((resolve) => setTimeout(resolve, DISCONNECT_RETRY_BACKOFF_MS * attempt));
+      failures += 1;
+      // Lock timeouts retry until the time budget ends; every other retryable
+      // error is capped by count.
+      const exhausted = isLockTimeout(error)
+        ? Date.now() >= lockRetryDeadline
+        : failures >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS || !isRetryableDisconnectError(error);
+      if (exhausted) throw error;
+      await new Promise((resolve) =>
+        setTimeout(resolve, DISCONNECT_RETRY_BACKOFF_MS * Math.min(failures, 10)),
+      );
     }
   }
 }
