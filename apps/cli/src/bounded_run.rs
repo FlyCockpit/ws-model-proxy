@@ -55,8 +55,10 @@
 //! its run reaped it) and refuses later runs: the shutdown check happens
 //! before anything is spawned, and shutdown waits for runs that are already
 //! mid-spawn (each kills its own group at registration), so an exiting daemon does not orphan the group of
-//! a command that was running. `SIGKILL` of the daemon itself cannot be
-//! caught and can still leave a group behind for up to its timeout.
+//! a command that was running. A panic in a release build (which aborts)
+//! ends the runs in flight first ([`kill_all_active_for_panic`], installed by
+//! `main`). `SIGKILL` of the daemon itself cannot be caught and can leave a
+//! command running until it exits by itself.
 
 use std::collections::BTreeSet;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
