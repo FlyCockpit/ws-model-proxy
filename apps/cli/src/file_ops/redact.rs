@@ -1808,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn public_look_alikes_stay_visible_and_a_string_opened_before_the_name_is_not_a_continuation() {
+    fn public_names_stay_visible_and_a_string_opened_before_the_name_is_not_a_continuation() {
         use FileClass::Plain;
         for line in [
             "run --max-tokens 4096\n",
