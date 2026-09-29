@@ -106,6 +106,8 @@ export async function ensureEngineProcessCapacity(
     update: {},
     create: {
       userId: input.userId,
+      // The DB's auto-label trigger disambiguates every automatic creator
+      // under the owner fence, before the unique-label constraint is checked.
       label: `Engine process ${input.endpointSlug}`.slice(0, 120),
       runtimeIdentityKey,
       runtimeModel: input.endpointId,

@@ -17,7 +17,9 @@ Ollama, LM Studio, router mode, and owner assignments stay independent. Discover
 moves take both capacity fences; live leases retain their original capacity and
 moved-target waiters are cancelled by runtime cleanup. Parent deletes remove empty
 AUTO discovery rows in the same transaction. Startup repairs existing idle orphans
-with bounded batches; owner-created empty rows remain. No schema change is needed.
+with bounded batches; owner-created empty rows remain. Automatic labels are
+disambiguated by an additive database trigger when an existing label collides;
+apply schema hardening before starting the new server. No destructive schema change is needed.
 
 ## Before you deploy
 

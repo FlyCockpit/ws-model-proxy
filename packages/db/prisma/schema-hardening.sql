@@ -858,6 +858,61 @@ CREATE TRIGGER execution_target_identity_immutable
 BEFORE UPDATE OF "userId", kind, "discoveredModelId", "providerModelId" ON execution_target
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_identity_immutable();
 
+-- One label allocator for ALL automatic capacity creators, including nested
+-- execution-target triggers and the deploy backfill. M already holds the owner
+-- fence; D holds the tables exclusively. Read only: no fence or row lock here.
+CREATE OR REPLACE FUNCTION allocate_auto_capacity_label()
+RETURNS trigger LANGUAGE plpgsql AS $auto_capacity_label$
+DECLARE
+  preferred_label TEXT;
+  existing_label TEXT;
+  label_count BIGINT;
+BEGIN
+  IF NEW."hardConcurrencyLimitSource" <> 'AUTO' OR
+     split_part(NEW."runtimeIdentityKey", ':', 1) NOT IN
+       ('discovered-model', 'execution-target', 'engine-process') THEN
+    RETURN NEW;
+  END IF;
+  IF position(':' IN NEW."runtimeIdentityKey") = 0 OR
+     length(NEW."runtimeIdentityKey") <= length(split_part(NEW."runtimeIdentityKey", ':', 1)) + 1 OR
+     NEW.label IS NULL OR btrim(NEW.label) = '' THEN
+    RAISE EXCEPTION 'Invalid automatic capacity identity or label' USING ERRCODE = '23514';
+  END IF;
+  SELECT label INTO existing_label FROM inference_capacity
+   WHERE "userId" = NEW."userId" AND "runtimeIdentityKey" = NEW."runtimeIdentityKey";
+  IF FOUND THEN
+    NEW.label := existing_label;
+    RETURN NEW;
+  END IF;
+  preferred_label := left(NEW.label, 120);
+  IF NOT EXISTS (SELECT 1 FROM inference_capacity
+                  WHERE "userId" = NEW."userId" AND label = preferred_label) THEN
+    NEW.label := preferred_label;
+    RETURN NEW;
+  END IF;
+  SELECT count(*) INTO label_count FROM inference_capacity WHERE "userId" = NEW."userId";
+  -- At most label_count labels are occupied: these label_count + 1 distinct
+  -- candidates (including preferred_label) contain a vacancy. Bounded even
+  -- when an owner has deliberately occupied every predictable suffix.
+  SELECT candidate.label INTO NEW.label
+    FROM generate_series(2::bigint, label_count + 1) AS suffix(n)
+    CROSS JOIN LATERAL (
+      SELECT left(preferred_label, 120 - length(' (' || n || ')')) || ' (' || n || ')' AS label
+    ) candidate
+   WHERE NOT EXISTS (SELECT 1 FROM inference_capacity occupied
+                      WHERE occupied."userId" = NEW."userId" AND occupied.label = candidate.label)
+   ORDER BY n LIMIT 1;
+  IF NEW.label IS NULL THEN
+    RAISE EXCEPTION 'Automatic capacity label allocation failed' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$auto_capacity_label$;
+
+DROP TRIGGER IF EXISTS inference_capacity_auto_label ON inference_capacity;
+CREATE TRIGGER inference_capacity_auto_label BEFORE INSERT ON inference_capacity
+FOR EACH ROW EXECUTE FUNCTION allocate_auto_capacity_label();
+
 -- Old application instances know only about discovered_model. Create the new
 -- identity in the same transaction as every old-style insert so target-backed
 -- consumers never race a missing execution target during a rolling deploy.

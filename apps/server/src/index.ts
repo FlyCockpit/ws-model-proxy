@@ -3,8 +3,6 @@
 import "@ws-model-proxy/env/load-dotenv";
 
 import { serve } from "@hono/node-server";
-import { backfillDiscoveredInferenceCapacities } from "@ws-model-proxy/api/lib/discovered-inference-capacity";
-import { sweepOrphanAutoCapacities } from "@ws-model-proxy/api/lib/engine-process-capacity";
 import { auth } from "@ws-model-proxy/auth";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
@@ -31,6 +29,7 @@ import { startRelayMaintenance } from "./relay-maintenance.js";
 import { installServerShutdown } from "./server-shutdown.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
+import { runStartupCapacityRepairs } from "./startup-capacity-repairs.js";
 import { createUserDeletionSweepClient, startUserDeletionSweep } from "./user-deletion-sweep.js";
 
 // ---------------------------------------------------------------------------
@@ -105,8 +104,7 @@ await waitForDependencies();
 // requests or treat a trigger-created null as unlimited. Then repair idle
 // orphan discovery rows left by older model/device deletes.
 try {
-  await backfillDiscoveredInferenceCapacities();
-  await sweepOrphanAutoCapacities();
+  await runStartupCapacityRepairs();
 } catch (error) {
   console.error(
     "[server] FATAL: discovered inference capacity backfill/cleanup failed.",

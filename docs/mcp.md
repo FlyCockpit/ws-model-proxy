@@ -25,13 +25,16 @@ the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
 when the CLI proves that at least two inventory model ids are aliases served
 by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
-capacities. User assignments and USER limits are preserved. An alias that is
+capacities. Model-swapping front ends are excluded only through engine detection
+and router-role proof. User assignments and USER limits are preserved. An alias that is
 removed from the process splits back to its own capacity on the next inventory.
 Old capacity rows remain while their leases or waiters are live; runtime cleanup
 cancels moved-target waiters and releases leases using their original capacity.
 Empty AUTO discovery capacities are removed with model, endpoint, and device
 deletes, and an idempotent startup sweep repairs existing idle orphans.
 Owner-created empty capacities remain visible in `capacity_records_list`.
+Automatic capacity labels get a numeric suffix when an owner's existing label
+collides; repeated discovery preserves the capacity identity and its label.
 
 `forwarder_device_metrics_get` also lists `series`: every metric a pool routing
 rule can name on that device (built-in `node.*` series such as

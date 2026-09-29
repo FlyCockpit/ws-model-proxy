@@ -1,6 +1,7 @@
 import { createRouterClient } from "@orpc/server";
 import type { Context } from "@ws-model-proxy/api/context";
 import type { EngineKindName } from "@ws-model-proxy/api/lib/engine-facts";
+import type { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceParentDelete, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -44,6 +45,7 @@ integration("engine process capacity lifecycle", () => {
     router: typeof import("@ws-model-proxy/api/routers/index");
     db: typeof import("@ws-model-proxy/db").default;
     factory: typeof import("@ws-model-proxy/db/client-factory");
+    discovered: typeof import("@ws-model-proxy/api/lib/discovered-inference-capacity");
     store: typeof import("../model-api/capacity/postgres-store.js");
   };
   // Fixed input clock; the admission store deliberately owns its database clock.
@@ -57,7 +59,7 @@ integration("engine process capacity lifecycle", () => {
     process.env.NODE_ENV = "test";
     process.env.BETTER_AUTH_SECRET = "test-better-auth-secret-at-least-thirty-two";
     process.env.BETTER_AUTH_URL = "https://proxy.example.test";
-    const [registration, lifecycle, access, router, { default: db }, factory, store] =
+    const [registration, lifecycle, access, router, { default: db }, factory, store, discovered] =
       await Promise.all([
         import("./registration.js"),
         import("@ws-model-proxy/api/lib/engine-process-capacity"),
@@ -66,8 +68,9 @@ integration("engine process capacity lifecycle", () => {
         import("@ws-model-proxy/db"),
         import("@ws-model-proxy/db/client-factory"),
         import("../model-api/capacity/postgres-store.js"),
+        import("@ws-model-proxy/api/lib/discovered-inference-capacity"),
       ]);
-    modules = { registration, lifecycle, access, router, db, factory, store };
+    modules = { registration, lifecycle, access, router, db, factory, store, discovered };
     fixture = createFixturePrismaClient(databaseUrl);
   });
   afterAll(async () => {
@@ -110,10 +113,11 @@ integration("engine process capacity lifecycle", () => {
       aliases: string[] | undefined = ["a", "b"],
       ids = ["a", "b"],
       slots: number | null = 1,
+      slug = "engine",
     ) => {
       const endpoints: EndpointInventory[] = [
         {
-          slug: "engine",
+          slug,
           label: "Engine",
           kind: "openai-compatible",
           status: "online",
@@ -152,6 +156,313 @@ integration("engine process capacity lifecycle", () => {
       });
     return { user, register, targets, identity };
   }
+
+  it.each([
+    {
+      name: "no collision (default endpoint)",
+      occupied: [],
+      slug: "engine",
+      retry: false,
+      suffix: "",
+    },
+    {
+      name: "owner uses shared label",
+      occupied: ["Engine process engine"],
+      slug: "engine",
+      retry: false,
+      suffix: " (2)",
+    },
+    {
+      name: "first free suffix skips occupied higher suffix",
+      occupied: ["Engine process engine", "Engine process engine (3)"],
+      slug: "engine",
+      retry: false,
+      suffix: " (2)",
+    },
+    {
+      name: "owner uses second endpoint label",
+      occupied: ["Engine process second"],
+      slug: "second",
+      retry: false,
+      suffix: " (2)",
+    },
+    {
+      name: "many occupied suffixes",
+      occupied: [
+        "Engine process engine",
+        ...Array.from({ length: 31 }, (_, i) => `Engine process engine (${i + 2})`),
+      ],
+      slug: "engine",
+      retry: false,
+      suffix: " (33)",
+    },
+    {
+      name: "capacity-key conflict retries whole transaction",
+      occupied: ["Engine process engine"],
+      slug: "engine",
+      retry: true,
+      suffix: " (2)",
+    },
+  ])("allocates durable labels: $name", async ({ occupied, slug, retry, suffix }) => {
+    const { user, register } = await setup();
+    if (occupied.length === 0) {
+      const foreign = (await setup()).user;
+      await fixture.inferenceCapacity.create({
+        data: {
+          userId: foreign.id,
+          label: "Engine process engine",
+          runtimeIdentityKey: "owner:foreign",
+          runtimeModel: "owner",
+          hardConcurrencyLimitSource: "USER",
+        },
+      });
+    }
+    const owners = [];
+    for (const [i, label] of occupied.entries()) {
+      owners.push(
+        await fixture.inferenceCapacity.create({
+          data: {
+            userId: user.id,
+            label,
+            runtimeIdentityKey: `owner:${i}`,
+            runtimeModel: "owner",
+            hardConcurrencyLimitSource: "USER",
+          },
+        }),
+      );
+    }
+    if (slug === "second") await register();
+    const retryStart = retries.length;
+    try {
+      if (retry) {
+        // nextval survives rollback. Fail the first real process INSERT with
+        // 23505, then let the retry succeed: no mocked transaction delegate.
+        await fixture.$executeRawUnsafe("CREATE SEQUENCE test_engine_capacity_conflict_seq");
+        await fixture.$executeRawUnsafe(`CREATE FUNCTION test_engine_capacity_conflict()
+          RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW."runtimeIdentityKey" LIKE 'engine-process:%'
+               AND nextval('test_engine_capacity_conflict_seq') = 1 THEN
+              RAISE unique_violation USING MESSAGE = 'test capacity-key conflict',
+                CONSTRAINT = 'inference_capacity_userId_runtimeIdentityKey_key';
+            END IF;
+            RETURN NEW;
+          END $$`);
+        await fixture.$executeRawUnsafe(`CREATE TRIGGER test_engine_capacity_conflict
+          BEFORE INSERT ON inference_capacity FOR EACH ROW
+          EXECUTE FUNCTION test_engine_capacity_conflict()`);
+      }
+      if (occupied.length === 0 && slug === "engine") await register();
+      else await register("llama.cpp", ["a", "b"], ["a", "b"], 1, slug);
+      if (retry) {
+        const [sequence] = await fixture.$queryRaw<Array<{ attempts: number }>>`
+          SELECT last_value::int AS attempts FROM test_engine_capacity_conflict_seq`;
+        expect(sequence?.attempts).toBe(2);
+      }
+      const endpoint = await fixture.endpoint.findFirstOrThrow({
+        where: { userId: user.id, slug },
+      });
+      const key = `engine-process:${endpoint.id}`;
+      const capacity = await fixture.inferenceCapacity.findUniqueOrThrow({
+        where: { userId_runtimeIdentityKey: { userId: user.id, runtimeIdentityKey: key } },
+      });
+      expect(capacity.label).toBe(`Engine process ${slug}${suffix}`);
+      expect(capacity.hardConcurrencyLimit).toBe(1);
+      expect(
+        await fixture.executionTarget.count({ where: { inferenceCapacityId: capacity.id } }),
+      ).toBe(2);
+      await register("llama.cpp", ["a", "b"], ["a", "b"], 1, slug);
+      expect(
+        await fixture.inferenceCapacity.findUnique({ where: { id: capacity.id } }),
+      ).toMatchObject({
+        id: capacity.id,
+        label: capacity.label,
+        runtimeIdentityKey: key,
+        hardConcurrencyLimit: capacity.hardConcurrencyLimit,
+      });
+      // Repoint/split and sweep still preserve owner labels and remove idle AUTO rows.
+      await register("llama.cpp", ["a"], ["a", "b"], 1, slug);
+      expect(
+        await fixture.executionTarget.count({ where: { inferenceCapacityId: capacity.id } }),
+      ).toBe(0);
+      await modules.lifecycle.sweepOrphanAutoCapacities();
+      expect(await fixture.inferenceCapacity.findUnique({ where: { id: capacity.id } })).toBeNull();
+      for (const owner of owners)
+        expect(await fixture.inferenceCapacity.findUnique({ where: { id: owner.id } })).toEqual(
+          owner,
+        );
+      if (!retry) expect(retries.slice(retryStart)).toEqual([]);
+    } finally {
+      if (retry) {
+        await fixture.$executeRawUnsafe(
+          "DROP TRIGGER IF EXISTS test_engine_capacity_conflict ON inference_capacity",
+        );
+        await fixture.$executeRawUnsafe("DROP FUNCTION IF EXISTS test_engine_capacity_conflict()");
+        await fixture.$executeRawUnsafe(
+          "DROP SEQUENCE IF EXISTS test_engine_capacity_conflict_seq",
+        );
+      }
+      retries.splice(retryStart);
+    }
+  });
+
+  it.each(["discovered-model", "execution-target"] as const)(
+    "disambiguates sibling %s creation",
+    async (kind) => {
+      const { user, register } = await setup();
+      await register("generic");
+      const endpoint = await fixture.endpoint.findFirstOrThrow({ where: { userId: user.id } });
+      const modelId = `label-${crypto.randomUUID()}`;
+      const [target] = await fixture.$queryRaw<
+        Array<{ targetId: string }>
+      >`SELECT 'et_dm_' || md5(${modelId}) AS "targetId"`;
+      const targetId = target?.targetId;
+      if (!targetId) throw new Error("target id missing");
+      const preferred =
+        kind === "discovered-model" ? `Discovered model ${modelId}` : `extra (${targetId})`;
+      const owner = await fixture.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: preferred,
+          runtimeIdentityKey: "owner:collision",
+          runtimeModel: "owner",
+          hardConcurrencyLimitSource: "USER",
+        },
+      });
+      const id = await modules.db.$transaction(async (tx) => {
+        await acquireFences(tx, [fences.owner(user.id)]);
+        if (kind === "discovered-model")
+          return modules.discovered.ensureDiscoveredInferenceCapacity(tx, {
+            userId: user.id,
+            discoveredModelId: modelId,
+            upstreamModelId: "extra",
+          });
+        await tx.discoveredModel.create({
+          data: {
+            id: modelId,
+            userId: user.id,
+            endpointId: endpoint.id,
+            upstreamModelId: "extra",
+            encodedModelId: modelId,
+          },
+        });
+        return (await tx.executionTarget.findUniqueOrThrow({ where: { id: targetId } }))
+          .inferenceCapacityId;
+      });
+      if (!id) throw new Error("capacity missing");
+      expect((await fixture.inferenceCapacity.findUniqueOrThrow({ where: { id } })).label).toBe(
+        `${preferred} (2)`,
+      );
+      expect(await fixture.inferenceCapacity.findUnique({ where: { id: owner.id } })).toEqual(
+        owner,
+      );
+    },
+  );
+
+  it.each([
+    {
+      name: "long label",
+      key: "engine-process:long",
+      label: "x".repeat(120),
+      source: "AUTO" as const,
+      expected: "x".repeat(116) + " (2)",
+    },
+    {
+      name: "owner intent",
+      key: "engine-process:owner",
+      label: "occupied",
+      source: "USER" as const,
+      expected: null,
+    },
+    {
+      name: "unknown prefix",
+      key: "owner:unknown",
+      label: "occupied",
+      source: "AUTO" as const,
+      expected: null,
+    },
+    {
+      name: "malformed reserved key",
+      key: "engine-process:",
+      label: "occupied",
+      source: "AUTO" as const,
+      expected: null,
+    },
+    {
+      name: "empty automatic label",
+      key: "engine-process:empty",
+      label: "",
+      source: "AUTO" as const,
+      expected: null,
+    },
+  ])(
+    "bounds allocation and preserves rejection: $name",
+    async ({ key, label, source, expected }) => {
+      const { user } = await setup();
+      const owner = await fixture.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: label || "owner",
+          runtimeIdentityKey: "owner:label",
+          runtimeModel: "owner",
+          hardConcurrencyLimitSource: "USER",
+        },
+      });
+      const insert = () =>
+        modules.db.$transaction(async (tx) => {
+          await acquireFences(tx, [fences.owner(user.id)]);
+          return tx.inferenceCapacity.create({
+            data: {
+              userId: user.id,
+              label,
+              runtimeIdentityKey: key,
+              runtimeModel: "engine",
+              hardConcurrencyLimitSource: source,
+            },
+          });
+        });
+      if (expected === null) {
+        if (source === "USER" || key.startsWith("owner:"))
+          await expect(insert()).rejects.toMatchObject({ code: "P2002" });
+        else await expect(insert()).rejects.toThrow("Invalid automatic capacity identity or label");
+      } else expect((await insert()).label).toBe(expected);
+      expect(await fixture.inferenceCapacity.findUnique({ where: { id: owner.id } })).toEqual(
+        owner,
+      );
+    },
+  );
+
+  it("allocates again after cancellation without reserving a label", async () => {
+    const { user } = await setup();
+    const data = {
+      userId: user.id,
+      label: "cancelled",
+      runtimeIdentityKey: "engine-process:cancelled",
+      runtimeModel: "engine",
+    };
+    // Native INSERT omits provenance, pinning the database AUTO default too
+    // (Prisma create supplies its own generated default explicitly).
+    const id = crypto.randomUUID();
+    const insert = (tx: Prisma.TransactionClient) => tx.$queryRaw<
+      Array<{ label: string; hardConcurrencyLimitSource: string }>
+    >`INSERT INTO inference_capacity (id, "userId", label, "runtimeIdentityKey", "runtimeModel", "updatedAt")
+      VALUES (${id}, ${data.userId}, ${data.label}, ${data.runtimeIdentityKey}, ${data.runtimeModel}, NOW())
+      RETURNING label, "hardConcurrencyLimitSource"`;
+    await expect(
+      modules.db.$transaction(async (tx) => {
+        await acquireFences(tx, [fences.owner(user.id)]);
+        expect((await insert(tx))[0]?.label).toBe(data.label);
+        throw new Error("cancel registration");
+      }),
+    ).rejects.toThrow("cancel registration");
+    expect(await fixture.inferenceCapacity.count({ where: { userId: user.id } })).toBe(0);
+    const capacity = await modules.db.$transaction(async (tx) => {
+      await acquireFences(tx, [fences.owner(user.id)]);
+      return (await insert(tx))[0];
+    });
+    expect(capacity?.label).toBe(data.label);
+    expect(capacity?.hardConcurrencyLimitSource).toBe("AUTO");
+  });
 
   it("merges proven engines, preserves owner choices, splits removed aliases, and repeats idempotently", async () => {
     for (const engine of ["llama.cpp", "vllm", "sglang", "ollama", "lm-studio"] as const) {

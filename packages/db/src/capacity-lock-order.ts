@@ -321,7 +321,11 @@ import {
 
 type Tx = Prisma.TransactionClient;
 
-/** Reserved keys of capacities created by discovery, never owner-created keys. */
+/**
+ * Reserved discovery keys. schema-hardening.sql's inference_capacity_auto_label
+ * trigger disambiguates labels for AUTO inserts with these keys under M's
+ * owner fence (or D's exclusive table locks), without acquiring another lock.
+ */
 export const AUTO_CAPACITY_RUNTIME_KEY_PREFIXES = [
   "discovered-model:",
   "execution-target:",
