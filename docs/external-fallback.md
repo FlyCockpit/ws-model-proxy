@@ -314,9 +314,13 @@ response on the conservative liability path. Spend settles from OpenRouter's
 upstream provider also bills the key owner, so spend is `cost +
 cost_details.upstream_inference_cost` ("the actual cost charged by the upstream
 AI provider"); a BYOK usage without a valid upstream cost keeps the liability.
+`is_byok` must be present as a boolean (every capture carries one): a missing,
+null or non-boolean value is invalid usage and keeps the liability.
 A response settles only from its one authoritative usage record: Chat, the
 root `usage` (final chunk when streaming); Messages, the `message` body or the
-`message_delta` event (the partial `message_start` snapshot is superseded);
+`message_delta` event (the partial `message_start` snapshot is superseded, and
+a final below that snapshot in any token count is a regression that keeps the
+liability);
 Responses, the `response` body or the terminal `response.completed` event
 (`usage: null` is absence). Several different authoritative usages, usage in
 any other root carrier (`usage`, `response.usage`, `message.usage`; nested

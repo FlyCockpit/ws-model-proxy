@@ -2878,11 +2878,32 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines, so the native
-    // Responses terminal is not recognised and the observation stays
-    // incomplete (liability). OpenRouter accounts claim only Chat Completions,
-    // so Responses clients reach OpenRouter adapted to Chat.
-    expect(settled.observationComplete).toBe(surface !== "openai-responses");
+    // OpenRouter's Responses stream sends no `event:` lines: the record's
+    // `type` is its terminal event, so the observation completes.
+    expect(settled.observationComplete).toBe(true);
+  });
+
+  it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    // A `response.completed` event line on a record of another type is no terminal.
+    const text = raw.replace(
+      /data: (\{"type":"response\.created")/,
+      "event: response.completed\ndata: $1",
+    );
+    expect(text).not.toBe(raw);
+    // The real terminal record is removed, leaving only the mismatching one.
+    const withoutTerminal = text.replace(/data: \{"type":"response\.completed".*\n\n/, "");
+    expect(withoutTerminal).not.toBe(text);
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutTerminal)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled.observationComplete).toBe(false);
   });
 
   it.each([
