@@ -5,7 +5,7 @@ import {
 import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
-import { stringifyWellFormed } from "./wire-text.js";
+import { isWellFormedText, stringifyWellFormed } from "./wire-text.js";
 
 export { relayProtocolAtLeast };
 
@@ -277,7 +277,20 @@ export const NODE_METRICS_CUSTOM_MAX = 50;
 export const NODE_METRIC_SOURCES_MAX = 50;
 const MIB_MAX = 1_000_000_000;
 const mibSchema = z.number().int().min(0).max(MIB_MAX);
-const shortTextSchema = z.string().trim().min(1).max(256);
+/**
+ * Free text stored in the `CliDevice` JSON snapshot. PostgreSQL JSONB cannot
+ * hold NUL or an unpaired UTF-16 surrogate, so such text is refused here,
+ * before any rate-limit slot is spent (the write would fail after it).
+ */
+function storedTextSchema(max: number, trim = true) {
+  return (trim ? z.string().trim() : z.string())
+    .min(1)
+    .max(max)
+    .refine((value) => !value.includes("\u0000") && isWellFormedText(value), {
+      message: "Text must not contain NUL or unpaired surrogates.",
+    });
+}
+const shortTextSchema = storedTextSchema(256);
 const percentSchema = z.number().min(0).max(100);
 const nonNegativeCountSchema = z.number().int().min(0).max(1_000_000);
 const byteCounterSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
@@ -294,7 +307,7 @@ const nodeInfoSchema = z
         name: shortTextSchema.optional(),
         version: shortTextSchema.optional(),
         kernel: shortTextSchema.optional(),
-        arch: z.string().trim().min(1).max(32).optional(),
+        arch: storedTextSchema(32).optional(),
       })
       .strict()
       .optional(),
@@ -312,8 +325,8 @@ const nodeInfoSchema = z
           .object({
             index: z.number().int().min(0).max(255),
             name: shortTextSchema.optional(),
-            uuid: z.string().trim().min(1).max(128).optional(),
-            driverVersion: z.string().trim().min(1).max(64).optional(),
+            uuid: storedTextSchema(128).optional(),
+            driverVersion: storedTextSchema(64).optional(),
             vramTotalMiB: mibSchema.nullable().optional(),
           })
           .strict(),
@@ -327,7 +340,7 @@ const nodeInfoSchema = z
         z
           .object({
             name: interfaceNameSchema,
-            addresses: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
+            addresses: z.array(storedTextSchema(64)).max(16).optional(),
             linkSpeedMbps: z.number().int().min(0).max(10_000_000).optional(),
             mtu: z.number().int().min(0).max(1_000_000).optional(),
           })
@@ -336,7 +349,7 @@ const nodeInfoSchema = z
       .max(32)
       .optional(),
     executionMechanism: z.enum(["foreground", "systemd", "launchd", "container"]).optional(),
-    cliVersion: z.string().trim().min(1).max(80).optional(),
+    cliVersion: storedTextSchema(80).optional(),
   })
   .strict();
 export type NodeInfoMessage = z.infer<typeof nodeInfoSchema>;
@@ -350,6 +363,12 @@ const metricSourceStatusSchema = z
       .string()
       .regex(/^[0-9a-f]{64}$/)
       .optional(),
+    /**
+     * The source's run interval. Local sources exist only in the CLI config,
+     * so this is how the server learns their cadence: a source's series are
+     * stale after 3x this (S-B part 2). Absent for a source with no schedule.
+     */
+    intervalSecs: z.number().int().min(5).max(86_400).optional(),
     /** A reason code only: command output and stderr never leave the CLI. */
     error: z.enum(["spawn", "timeout", "exit_status", "output_too_large", "parse"]).optional(),
   })
@@ -396,7 +415,7 @@ const nodeMetricsSchema = z
       .array(
         z
           .object({
-            mount: z.string().min(1).max(256),
+            mount: storedTextSchema(256, false),
             totalMiB: mibSchema.optional(),
             freeMiB: mibSchema.optional(),
           })

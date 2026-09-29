@@ -713,6 +713,12 @@ pub struct MetricSourceStatus {
     /// SHA-256 (hex) of the exact command string, for hash-pinned approval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_sha256: Option<String>,
+    /// The source's run interval in seconds (`5..=86_400`). The server marks
+    /// a source's series stale after 3× this (S-B part 2). Local sources are
+    /// defined only in the CLI config, so this is the server's only way to
+    /// learn their cadence. Absent when the source has no schedule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<MetricSourceError>,
 }
@@ -1281,10 +1287,52 @@ fn stable_object_json(values: &Map<String, Value>) -> String {
 
 pub fn encode_control(message: &ClientControlMessage) -> Result<String> {
     let text = serde_json::to_string(message).context("serializing relay control frame")?;
-    if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
-        anyhow::bail!("JSON control frame exceeds 64 KiB");
+    if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
+        return Ok(text);
     }
-    Ok(text)
+    if let Some(text) = inventory_without_engine_facts(message)? {
+        return Ok(text);
+    }
+    anyhow::bail!("JSON control frame exceeds 64 KiB");
+}
+
+/// A `hello` or `inventory.update` over the frame cap sheds its engine facts
+/// (digest-excluded and advisory) before it is refused, least useful first:
+/// per-model facts, then served-model aliases, then every endpoint fact. The
+/// inventory itself is never trimmed. `None` when shedding is not enough.
+fn inventory_without_engine_facts(message: &ClientControlMessage) -> Result<Option<String>> {
+    let steps: [fn(&mut EndpointInventory); 3] = [
+        |endpoint| {
+            for model in &mut endpoint.models {
+                model.engine_facts = None;
+            }
+        },
+        |endpoint| {
+            if let Some(facts) = endpoint.engine_facts.as_mut() {
+                facts.served_model_aliases = None;
+            }
+        },
+        |endpoint| endpoint.engine_facts = None,
+    ];
+    let mut shed = message.clone();
+    for (index, step) in steps.iter().enumerate() {
+        match &mut shed {
+            ClientControlMessage::Hello { endpoints, .. }
+            | ClientControlMessage::InventoryUpdate { endpoints, .. } => {
+                endpoints.iter_mut().for_each(step);
+            }
+            _ => return Ok(None),
+        }
+        let text = serde_json::to_string(&shed).context("serializing relay control frame")?;
+        if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
+            tracing::warn!(
+                shed_steps = index + 1,
+                "the endpoint inventory exceeds 64 KiB with engine facts; sent without some of them"
+            );
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
 }
 
 pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
@@ -2759,15 +2807,30 @@ mod relay_27_vectors {
                 value: 1800.0,
                 ts: "2026-09-28T11:59:58.000Z".to_string(),
             }],
-            sources: vec![MetricSourceStatus {
-                name: "fans".to_string(),
-                origin: MetricSourceOrigin::Remote,
-                state: MetricSourceState::Unsupported,
-                command_sha256: Some(
-                    "4a1d8f0a2c0e3f6a0b5c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a".to_string(),
-                ),
-                error: None,
-            }],
+            sources: vec![
+                MetricSourceStatus {
+                    name: "fans".to_string(),
+                    origin: MetricSourceOrigin::Remote,
+                    state: MetricSourceState::Unsupported,
+                    command_sha256: Some(
+                        "4a1d8f0a2c0e3f6a0b5c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a"
+                            .to_string(),
+                    ),
+                    interval_secs: Some(10),
+                    error: None,
+                },
+                MetricSourceStatus {
+                    name: "psu".to_string(),
+                    origin: MetricSourceOrigin::Local,
+                    state: MetricSourceState::Failing,
+                    command_sha256: Some(
+                        "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"
+                            .to_string(),
+                    ),
+                    interval_secs: Some(60),
+                    error: Some(MetricSourceError::Timeout),
+                },
+            ],
         };
         assert_eq!(
             encoded(&ClientControlMessage::NodeMetrics(metrics)),
@@ -2798,6 +2861,55 @@ mod relay_27_vectors {
                 "../tests/fixtures/relay-2.7/endpoint-load.json"
             ))
         );
+    }
+
+    #[test]
+    fn an_inventory_over_the_frame_cap_sheds_engine_facts_before_it_is_refused() {
+        let model = |index: usize| DiscoveredModelInventory {
+            slug: None,
+            upstream_model_id: format!("org/model-{index:04}-{}", "x".repeat(40)),
+            capabilities: None,
+            capability_override_mode: CapabilityOverrideMode::Inherit,
+            probe_suggestions: None,
+            concurrency_limit: None,
+            engine_facts: Some(EngineFacts {
+                max_model_len: Some(EngineFact::probe(131_072)),
+                ..EngineFacts::default()
+            }),
+        };
+        let endpoint = |models: usize| EndpointInventory {
+            slug: "router".to_string(),
+            label: "Router".to_string(),
+            kind: "openai-compatible".to_string(),
+            status: EndpointStatus::Online,
+            default_capabilities: OpenAiCompatibleCapabilities::default(),
+            probe_suggestions: None,
+            models: (0..models).map(model).collect(),
+            engine_facts: Some(EngineFacts {
+                engine: Some(EngineFact::probe(EngineKind::Vllm)),
+                ..EngineFacts::default()
+            }),
+        };
+        let update = |models: usize| ClientControlMessage::InventoryUpdate {
+            id: "u".to_string(),
+            endpoints: vec![endpoint(models)],
+        };
+        // 500 models fit without their facts and do not fit with them.
+        let full = serde_json::to_string(&update(500)).expect("json");
+        assert!(full.len() > RELAY_JSON_CONTROL_MAX_BYTES, "{}", full.len());
+        let text = encode_control(&update(500)).expect("facts are shed, not the inventory");
+        assert!(text.len() <= RELAY_JSON_CONTROL_MAX_BYTES);
+        assert!(!text.contains("maxModelLen"));
+        assert!(
+            text.contains(r#""engine":{"value":"vllm""#),
+            "endpoint facts kept"
+        );
+        assert_eq!(text.matches("upstreamModelId").count(), 500);
+        // A frame within the cap is untouched.
+        let small = encode_control(&update(2)).expect("small");
+        assert_eq!(small.matches("maxModelLen").count(), 2);
+        // An inventory too large even without facts is still refused.
+        assert!(encode_control(&update(2_000)).is_err());
     }
 
     #[test]

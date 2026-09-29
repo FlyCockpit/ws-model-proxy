@@ -25,10 +25,10 @@ use crate::config::EndpointConfig;
 use crate::engine::{EngineKind, LoadReading};
 use crate::protocol::{
     ClientControlMessage, EndpointLoad, ExecutionMechanism, MetricSourceOrigin, MetricSourceState,
-    MetricSourceStatus, NODE_GPU_MAX, NODE_INTERFACE_ADDRESS_MAX, NODE_INTERFACE_MAX,
-    NODE_METRICS_SOURCES_MAX, NodeCpu, NodeCpuMetrics, NodeDiskMetrics, NodeGpuInfo,
-    NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind, NodeMemoryMetrics,
-    NodeMetrics, NodeOs, RemoteMetricSource, encode_control,
+    MetricSourceStatus, NODE_GPU_MAX, NODE_INTERFACE_MAX, NODE_METRICS_SOURCES_MAX, NodeCpu,
+    NodeCpuMetrics, NodeDiskMetrics, NodeGpuInfo, NodeGpuMetrics, NodeInfo, NodeInterfaceInfo,
+    NodeInterfaceMetrics, NodeKind, NodeMemoryMetrics, NodeMetrics, NodeOs, RemoteMetricSource,
+    encode_control,
 };
 use crate::relay_bus::FromWorker;
 
@@ -43,8 +43,13 @@ pub const LOAD_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const GPU_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const GPU_QUERY_OUTPUT_LIMIT: u64 = 64 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(200);
-const LOAD_SCRAPE_CONCURRENCY: usize = 8;
+/// Load scrapes in flight at once, across all endpoints. Each worker is
+/// bounded by the engine request timeouts (llama.cpp: two requests).
+const LOAD_SCRAPE_CONCURRENCY: usize = 16;
 const TEXT_FIELD_MAX: usize = 256;
+/// A metric source's interval bounds (`intervalSecs` on both wire directions).
+pub const METRIC_SOURCE_INTERVAL_MIN_SECS: u32 = 5;
+pub const METRIC_SOURCE_INTERVAL_MAX_SECS: u32 = 86_400;
 
 /// Handle owned by one relay session. Dropping it stops the thread; the relay
 /// loop never joins it (a scrape may still be finishing).
@@ -56,6 +61,8 @@ pub struct Telemetry {
 #[derive(Default)]
 struct Shared {
     endpoints: Vec<EndpointConfig>,
+    /// Bumped whenever `endpoints` changes, so the load scheduler resyncs.
+    endpoints_generation: u64,
     remote_sources: Vec<RemoteMetricSource>,
     /// Set when `metrics.sources.set` arrived; the next metrics frame goes
     /// out as soon as the minimum gap allows.
@@ -87,6 +94,7 @@ impl Telemetry {
             && shared.endpoints != endpoints
         {
             shared.endpoints = endpoints.to_vec();
+            shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
         }
     }
 
@@ -108,40 +116,72 @@ impl Drop for Telemetry {
     }
 }
 
-/// Hand one frame to the relay loop without waiting. `false` once the
-/// session is gone.
-fn offer(tx: &SyncSender<FromWorker>, message: &ClientControlMessage) -> bool {
-    let text = match encode_control(message) {
-        Ok(text) => text,
-        Err(error) => {
-            tracing::warn!(error = %error, "encoding a telemetry frame failed; dropped");
-            return true;
-        }
+/// What happened to one telemetry frame handed to the relay loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Queued,
+    /// The outbound queue was full (or the frame could not be encoded).
+    Dropped,
+    /// The session is gone; the sampler stops.
+    Gone,
+}
+
+/// Hand one frame to the relay loop without waiting. Every telemetry frame
+/// passes [`crate::telemetry_bounds::conform`] here, so nothing the sampler
+/// read can fall outside the server's strict schema.
+fn offer(tx: &SyncSender<FromWorker>, mut message: ClientControlMessage) -> Sent {
+    let Some(text) = encode_telemetry(&mut message) else {
+        return Sent::Dropped;
     };
     match tx.try_send(FromWorker::Telemetry(text)) {
-        Ok(()) => true,
+        Ok(()) => Sent::Queued,
         Err(TrySendError::Full(_)) => {
             tracing::debug!("relay outbound queue full; telemetry frame dropped");
-            true
+            Sent::Dropped
         }
-        Err(TrySendError::Disconnected(_)) => false,
+        Err(TrySendError::Disconnected(_)) => Sent::Gone,
+    }
+}
+
+/// Conform and encode one telemetry frame; `None` (logged) if it cannot be.
+pub fn encode_telemetry(message: &mut ClientControlMessage) -> Option<String> {
+    crate::telemetry_bounds::conform(message);
+    match encode_control(message) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::warn!(error = %error, "encoding a telemetry frame failed; dropped");
+            None
+        }
     }
 }
 
 fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>) {
     let mut gpu = GpuQuery::default();
     let info = collect_node_info(&mut gpu);
-    if !offer(&tx, &ClientControlMessage::NodeInfo(info)) {
+    if offer(&tx, ClientControlMessage::NodeInfo(info)) == Sent::Gone {
         return;
+    }
+    // Endpoint load has its own scheduler thread: a slow scrape never delays
+    // node metrics (nvidia-smi may take seconds), and the reverse.
+    let load_tx = tx.clone();
+    let load_stop = Arc::clone(&stop);
+    let load_shared = Arc::clone(&shared);
+    let spawned = thread::Builder::new()
+        .name("wsmp-load".to_string())
+        .spawn(move || {
+            let agent = crate::engine::http_agent(crate::engine::LOAD_TIMEOUT);
+            run_loads(&load_tx, &load_stop, &load_shared, move |endpoint, kind| {
+                crate::engine::sample_load(&agent, endpoint, kind)
+            });
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(error = %error, "starting the load sampler failed; endpoint load is off");
     }
     let mut cpu = CpuSampler::default();
     // Prime the CPU counters so the first metrics frame has a usage figure.
     cpu.sample();
-    let mut load_state = BTreeMap::<String, LoadState>::new();
     let mut last_metrics: Option<Instant> = None;
     let mut next_metrics = Instant::now() + Duration::from_secs(2);
-    let mut next_load = Instant::now();
-    let agent = crate::engine::http_agent(crate::engine::LOAD_TIMEOUT);
     while !stop.load(Ordering::SeqCst) {
         let now = Instant::now();
         let sources_changed = shared
@@ -158,23 +198,11 @@ fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shar
                 Err(_) => Vec::new(),
             };
             let metrics = collect_node_metrics(&mut cpu, &mut gpu, &remote);
-            if !offer(&tx, &ClientControlMessage::NodeMetrics(metrics)) {
+            if offer(&tx, ClientControlMessage::NodeMetrics(metrics)) == Sent::Gone {
                 return;
             }
             last_metrics = Some(Instant::now());
             next_metrics = Instant::now() + NODE_METRICS_INTERVAL;
-        }
-        if now >= next_load {
-            let endpoints = shared
-                .lock()
-                .map(|shared| shared.endpoints.clone())
-                .unwrap_or_default();
-            for load in sample_loads(&agent, &endpoints, &mut load_state, &stop) {
-                if !offer(&tx, &ClientControlMessage::EndpointLoad(load)) {
-                    return;
-                }
-            }
-            next_load = Instant::now() + LOAD_SAMPLE_INTERVAL;
         }
         thread::sleep(STOP_POLL);
     }
@@ -185,6 +213,16 @@ struct LoadState {
     last_sent: Option<(Instant, LoadReading)>,
     prefix_hits_total: Option<f64>,
     prefix_queries_total: Option<f64>,
+}
+
+impl LoadState {
+    /// Record a frame the relay loop accepted. A dropped frame is not
+    /// committed, so its prefix-cache deltas fold into the next one.
+    fn commit(&mut self, reading: LoadReading, at: Instant) {
+        self.prefix_hits_total = reading.prefix_cache_hits_total;
+        self.prefix_queries_total = reading.prefix_cache_queries_total;
+        self.last_sent = Some((at, reading));
+    }
 }
 
 /// Endpoints with a scrapeable engine, paired with their kind.
@@ -201,58 +239,162 @@ pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, Engine
         .collect()
 }
 
-fn sample_loads(
-    agent: &ureq::Agent,
-    endpoints: &[EndpointConfig],
-    state: &mut BTreeMap<String, LoadState>,
-    stop: &AtomicBool,
-) -> Vec<EndpointLoad> {
-    let targets = load_targets(endpoints);
-    state.retain(|slug, _| targets.iter().any(|(endpoint, _)| &endpoint.slug == slug));
-    let mut frames = Vec::new();
-    for batch in targets.chunks(LOAD_SCRAPE_CONCURRENCY) {
-        if stop.load(Ordering::SeqCst) {
-            break;
+/// One endpoint's place in the load scheduler.
+struct LoadSchedule {
+    target: (EndpointConfig, EngineKind),
+    state: LoadState,
+    next_due: Instant,
+    in_flight: bool,
+}
+
+/// A finished scrape, reported by its worker.
+struct LoadDone {
+    slug: String,
+    target: (EndpointConfig, EngineKind),
+    reading: Option<LoadReading>,
+    finished: Instant,
+    ts: String,
+}
+
+/// Per-endpoint load scheduling. Each endpoint is scraped every
+/// [`LOAD_SAMPLE_INTERVAL`] after its previous scrape finished, by at most
+/// [`LOAD_SCRAPE_CONCURRENCY`] short-lived workers in total (each bounded by
+/// the engine request timeouts). A finished scrape goes out at once, stamped
+/// with its own completion time, so a slow endpoint only occupies a worker
+/// and never holds back another endpoint's frame. Due endpoints are started
+/// oldest-due first, so none starves when more are due than workers exist.
+/// A result for an endpoint whose configuration changed (or that was
+/// removed) while it was in flight is discarded.
+fn run_loads<F>(tx: &SyncSender<FromWorker>, stop: &AtomicBool, shared: &Mutex<Shared>, sample: F)
+where
+    F: Fn(&EndpointConfig, EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
+{
+    let (done_tx, done_rx) = mpsc::channel::<LoadDone>();
+    let mut schedules = BTreeMap::<String, LoadSchedule>::new();
+    let mut seen_generation = None;
+    let mut in_flight = 0_usize;
+    while !stop.load(Ordering::SeqCst) {
+        let (generation, endpoints) = match shared.lock() {
+            Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
+                (shared.endpoints_generation, Some(shared.endpoints.clone()))
+            }
+            Ok(shared) => (shared.endpoints_generation, None),
+            Err(_) => return,
+        };
+        if let Some(endpoints) = endpoints {
+            seen_generation = Some(generation);
+            let targets = load_targets(&endpoints);
+            schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            for target in targets {
+                let slug = target.0.slug.clone();
+                let replace = schedules
+                    .get(&slug)
+                    .is_none_or(|schedule| schedule.target != target);
+                if replace {
+                    schedules.insert(
+                        slug,
+                        LoadSchedule {
+                            target,
+                            state: LoadState::default(),
+                            next_due: Instant::now(),
+                            in_flight: false,
+                        },
+                    );
+                }
+            }
         }
-        let readings = thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|(endpoint, kind)| {
-                    (
-                        endpoint.slug.clone(),
-                        scope.spawn(move || crate::engine::sample_load(agent, endpoint, *kind)),
-                    )
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|(slug, handle)| (slug, handle.join().ok().flatten()))
-                .collect::<Vec<_>>()
-        });
+
         let now = Instant::now();
-        for (slug, reading) in readings {
-            let Some(reading) = reading else { continue };
-            let entry = state.entry(slug.clone()).or_default();
-            if let Some(frame) = next_load_frame(entry, &slug, reading, now, &now_rfc3339()) {
-                frames.push(frame);
+        let mut due = schedules
+            .iter()
+            .filter(|(_, schedule)| !schedule.in_flight && schedule.next_due <= now)
+            .map(|(slug, schedule)| (schedule.next_due, slug.clone()))
+            .collect::<Vec<_>>();
+        due.sort();
+        for (_, slug) in due
+            .into_iter()
+            .take(LOAD_SCRAPE_CONCURRENCY.saturating_sub(in_flight))
+        {
+            let Some(schedule) = schedules.get_mut(&slug) else {
+                continue;
+            };
+            let target = schedule.target.clone();
+            let done_tx = done_tx.clone();
+            let sample = sample.clone();
+            let spawned = thread::Builder::new()
+                .name("wsmp-load-scrape".to_string())
+                .spawn(move || {
+                    let reading = sample(&target.0, target.1);
+                    let _ = done_tx.send(LoadDone {
+                        slug,
+                        target,
+                        reading,
+                        finished: Instant::now(),
+                        ts: now_rfc3339(),
+                    });
+                });
+            if spawned.is_ok() {
+                schedule.in_flight = true;
+                in_flight += 1;
+            } else {
+                schedule.next_due = now + LOAD_SAMPLE_INTERVAL;
+            }
+        }
+
+        let first = match done_rx.recv_timeout(STOP_POLL) {
+            Ok(done) => Some(done),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        for done in first
+            .into_iter()
+            .chain(std::iter::from_fn(|| done_rx.try_recv().ok()))
+        {
+            in_flight = in_flight.saturating_sub(1);
+            let Some(schedule) = schedules.get_mut(&done.slug) else {
+                continue;
+            };
+            if schedule.target != done.target {
+                continue;
+            }
+            schedule.in_flight = false;
+            schedule.next_due = done.finished + LOAD_SAMPLE_INTERVAL;
+            let Some(reading) = done.reading else {
+                continue;
+            };
+            let Some(frame) = next_load_frame(
+                &schedule.state,
+                &done.slug,
+                &reading,
+                done.finished,
+                &done.ts,
+            ) else {
+                continue;
+            };
+            match offer(tx, ClientControlMessage::EndpointLoad(frame)) {
+                Sent::Queued => schedule.state.commit(reading, done.finished),
+                Sent::Dropped => {}
+                Sent::Gone => return,
             }
         }
     }
-    frames
 }
 
 fn counter_delta(previous: Option<f64>, current: Option<f64>) -> Option<u64> {
     let (previous, current) = (previous?, current?);
-    // A reset (engine restart) is not a negative delta.
+    // A reset (engine restart) is not a delta. The cap is applied again in
+    // `telemetry_bounds::conform`; this keeps the float cast in range.
     (current >= previous).then(|| saturating_byte_counter((current - previous).round() as u64))
 }
 
 /// Decide whether a reading goes out: on change, or every
-/// `LOAD_REFRESH_INTERVAL` when unchanged. Prefix-cache counters become deltas.
+/// `LOAD_REFRESH_INTERVAL` when unchanged. Prefix-cache counters become
+/// deltas against the last frame the relay loop accepted. The caller commits
+/// the reading ([`LoadState::commit`]) only once the frame was queued.
 fn next_load_frame(
-    state: &mut LoadState,
+    state: &LoadState,
     endpoint_slug: &str,
-    reading: LoadReading,
+    reading: &LoadReading,
     now: Instant,
     ts: &str,
 ) -> Option<EndpointLoad> {
@@ -268,15 +410,13 @@ fn next_load_frame(
         Some((at, last)) => {
             now.duration_since(*at) >= LOAD_REFRESH_INTERVAL
                 || changed_counters
-                || !same_load(last, &reading)
+                || !same_load(last, reading)
         }
     };
     if !due {
         return None;
     }
-    state.prefix_hits_total = reading.prefix_cache_hits_total;
-    state.prefix_queries_total = reading.prefix_cache_queries_total;
-    let frame = EndpointLoad {
+    Some(EndpointLoad {
         endpoint_slug: endpoint_slug.to_string(),
         model_slug: None,
         running: reading.running,
@@ -288,9 +428,7 @@ fn next_load_frame(
         prefix_cache_queries_delta: queries_delta,
         source: reading.source,
         ts: ts.to_string(),
-    };
-    state.last_sent = Some((now, reading));
-    Some(frame)
+    })
 }
 
 fn same_load(left: &LoadReading, right: &LoadReading) -> bool {
@@ -316,15 +454,21 @@ pub fn remote_source_statuses(sources: &[RemoteMetricSource]) -> Vec<MetricSourc
             origin: MetricSourceOrigin::Remote,
             state: MetricSourceState::Unsupported,
             command_sha256: Some(sha256_hex(source.command.as_bytes())),
+            interval_secs: Some(source.interval_secs).filter(|secs| {
+                (METRIC_SOURCE_INTERVAL_MIN_SECS..=METRIC_SOURCE_INTERVAL_MAX_SECS).contains(secs)
+            }),
             error: None,
         })
         .collect()
 }
 
-/// Cap a remotely defined source list at the server's schema bound.
+/// Cap a remotely defined source list at the server's schema bound. Invalid
+/// names are dropped first (as [`remote_source_statuses`] does), so they
+/// cannot use up slots that valid sources after them need.
 fn bounded_remote_sources(sources: &[RemoteMetricSource]) -> Vec<RemoteMetricSource> {
     sources
         .iter()
+        .filter(|source| is_metric_name(&source.name))
         .take(NODE_METRICS_SOURCES_MAX)
         .cloned()
         .collect()
@@ -530,12 +674,16 @@ pub enum Bounded {
 }
 
 /// Run a program with a scrubbed environment, no stdin, stderr discarded,
-/// stdout capped at `limit`, killed after `timeout`.
+/// stdout capped at `limit` (more is a failure), killed after `timeout`.
 ///
-/// On Unix the child leads its own process group, and a timeout kills the
-/// whole group: `nvidia-smi` and similar tools may spawn helpers (NVIDIA's
-/// persistenced probes, vendor wrappers) that inherit the stdout pipe, and
-/// killing only the direct child would leave them holding it open.
+/// The run ends when stdout closes (every process holding the pipe exited or
+/// closed it) or at the deadline, whichever is first. Then, on every path,
+/// whatever is left of the child's process group is killed before the child
+/// is reaped: the unreaped child keeps its pid, and so the group id, from
+/// being reused, so the group kill can never hit an unrelated process. A
+/// helper the tool left behind (forked into the background, or holding the
+/// pipe after the tool exited) therefore never outlives the call. A program
+/// that closes stdout and keeps running is killed too and counts as failed.
 pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64) -> Bounded {
     let mut command = Command::new(program);
     command
@@ -554,43 +702,36 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
         return Bounded::Unavailable;
     };
     let Some(stdout) = child.stdout.take() else {
-        kill_child_group(&mut child);
+        kill_group_and_reap(&mut child);
         return Bounded::Failed;
     };
     let (done_tx, done_rx) = mpsc::channel();
     // The reader owns the pipe so a full pipe cannot stall the child; the
     // result arrives on a channel so a leaked pipe never blocks this thread.
+    // It reads one byte past the limit to tell "exactly the limit" from "more".
     let _reader = thread::spawn(move || {
         let mut buffer = Vec::new();
-        let _ = stdout.take(limit).read_to_end(&mut buffer);
+        let _ = stdout
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buffer);
         let _ = done_tx.send(buffer);
     });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            _ => {
-                kill_child_group(&mut child);
-                break None;
-            }
-        }
+    let output = done_rx.recv_timeout(timeout).ok();
+    let status = kill_group_and_reap(&mut child);
+    let Some(buffer) = output else {
+        return Bounded::Failed;
     };
-    if !status.is_some_and(|status| status.success()) {
+    if buffer.len() as u64 > limit || !status.is_some_and(|status| status.success()) {
         return Bounded::Failed;
     }
-    let remaining = deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(200);
-    let Ok(buffer) = done_rx.recv_timeout(remaining) else {
-        return Bounded::Failed;
-    };
     String::from_utf8(buffer).map_or(Bounded::Failed, Bounded::Output)
 }
 
-/// Kill the child and, on Unix, every process that stayed in its group.
+/// Kill every process left in the child's group, then reap the child and
+/// return its exit status. The group is signalled while the child is still
+/// unreaped (a zombie at worst), so its pid cannot have been recycled.
 #[cfg(unix)]
-fn kill_child_group(child: &mut std::process::Child) {
-    // `killpg` reaches helpers the child spawned into its group before the
-    // direct `kill` below reaps it.
+fn kill_group_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
     if let Ok(raw) = i32::try_from(child.id())
         && raw > 1
     {
@@ -599,15 +740,18 @@ fn kill_child_group(child: &mut std::process::Child) {
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // A child that already exited keeps the status it exited with; SIGKILL
+    // cannot change it.
+    child.wait().ok()
 }
 
-/// Kill the child (no process-group semantics off Unix).
+/// Kill the child (no process-group semantics off Unix), then reap it.
 #[cfg(not(unix))]
-fn kill_child_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn kill_group_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
+    child.wait().ok()
 }
 
 fn node_kind(gpus: &[GpuRow]) -> (NodeKind, bool) {
@@ -716,7 +860,7 @@ fn interface_addresses() -> BTreeMap<String, Vec<String>> {
             continue;
         };
         let list = addresses.entry(interface.interface_name).or_default();
-        if list.len() < NODE_INTERFACE_ADDRESS_MAX {
+        if list.len() < crate::protocol::NODE_INTERFACE_ADDRESS_MAX {
             list.push(text);
         }
     }
@@ -931,17 +1075,28 @@ mod tests {
         }
     }
 
+    /// Plan a frame and, when one is due, commit it as queued.
+    fn step(
+        state: &mut LoadState,
+        reading: LoadReading,
+        at: Instant,
+        ts: &str,
+    ) -> Option<EndpointLoad> {
+        let frame = next_load_frame(state, "vllm", &reading, at, ts)?;
+        state.commit(reading, at);
+        Some(frame)
+    }
+
     #[test]
     fn load_frames_go_out_on_change_or_refresh_with_counter_deltas() {
         let mut state = LoadState::default();
         let start = Instant::now();
-        let first = next_load_frame(&mut state, "vllm", reading(1, Some(100.0)), start, "t0")
-            .expect("first reading is sent");
+        let first =
+            step(&mut state, reading(1, Some(100.0)), start, "t0").expect("first reading is sent");
         assert_eq!(first.prefix_cache_hits_delta, None);
         assert!(
-            next_load_frame(
+            step(
                 &mut state,
-                "vllm",
                 reading(1, Some(100.0)),
                 start + Duration::from_secs(2),
                 "t1"
@@ -949,27 +1104,24 @@ mod tests {
             .is_none(),
             "unchanged within the refresh interval"
         );
-        let changed = next_load_frame(
+        let changed = step(
             &mut state,
-            "vllm",
             reading(2, Some(150.0)),
             start + Duration::from_secs(3),
             "t2",
         )
         .expect("a change is sent");
         assert_eq!(changed.prefix_cache_hits_delta, Some(50));
-        let refreshed = next_load_frame(
+        let refreshed = step(
             &mut state,
-            "vllm",
             reading(2, Some(150.0)),
             start + Duration::from_secs(9),
             "t3",
         )
         .expect("refresh after the interval");
         assert_eq!(refreshed.prefix_cache_hits_delta, Some(0));
-        let reset = next_load_frame(
+        let reset = step(
             &mut state,
-            "vllm",
             reading(0, Some(5.0)),
             start + Duration::from_secs(10),
             "t4",
@@ -978,6 +1130,187 @@ mod tests {
         assert_eq!(
             reset.prefix_cache_hits_delta, None,
             "a counter reset is not a delta"
+        );
+    }
+
+    #[test]
+    fn a_dropped_load_frame_keeps_its_prefix_cache_delta_for_the_next_one() {
+        let mut state = LoadState::default();
+        let start = Instant::now();
+        step(&mut state, reading(1, Some(100.0)), start, "t0").expect("first");
+        // 100 → 150 is planned but the queue is full: not committed.
+        let dropped = next_load_frame(
+            &state,
+            "vllm",
+            &reading(1, Some(150.0)),
+            start + Duration::from_secs(2),
+            "t1",
+        )
+        .expect("due");
+        assert_eq!(dropped.prefix_cache_hits_delta, Some(50));
+        // The next frame covers both intervals.
+        let next = step(
+            &mut state,
+            reading(1, Some(170.0)),
+            start + Duration::from_secs(4),
+            "t2",
+        )
+        .expect("due");
+        assert_eq!(next.prefix_cache_hits_delta, Some(70));
+    }
+
+    fn load_endpoint(slug: &str) -> EndpointConfig {
+        EndpointConfig {
+            slug: slug.to_string(),
+            engine: crate::config::EndpointEngine::Vllm,
+            ..EndpointConfig::default()
+        }
+    }
+
+    fn load_slug(text: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(text).expect("frame json");
+        value["endpointSlug"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn a_slow_endpoint_never_holds_back_another_endpoints_load_frame() {
+        // Every worker slot but one is taken by an endpoint that answers in
+        // 1.2 s. The fast endpoint's frame must go out as soon as its own
+        // scrape finishes, not after the slow batch.
+        let mut endpoints = (0..LOAD_SCRAPE_CONCURRENCY - 1)
+            .map(|index| load_endpoint(&format!("a-slow-{index:02}")))
+            .collect::<Vec<_>>();
+        endpoints.push(load_endpoint("z-fast"));
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoints,
+            ..Shared::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(256);
+        let started = Instant::now();
+        let thread_stop = Arc::clone(&stop);
+        let thread_shared = Arc::clone(&shared);
+        let scheduler = thread::spawn(move || {
+            run_loads(&tx, &thread_stop, &thread_shared, |endpoint, _| {
+                if endpoint.slug.starts_with("a-slow") {
+                    thread::sleep(Duration::from_millis(1_200));
+                }
+                Some(LoadReading {
+                    running: 1,
+                    source: LoadSource::VllmMetrics,
+                    ..LoadReading::default()
+                })
+            });
+        });
+        let mut fast_at = None;
+        let mut first_slow_at = None;
+        while started.elapsed() < Duration::from_secs(5)
+            && (fast_at.is_none() || first_slow_at.is_none())
+        {
+            let Ok(FromWorker::Telemetry(text)) = rx.recv_timeout(Duration::from_secs(5)) else {
+                break;
+            };
+            let slug = load_slug(&text);
+            if slug == "z-fast" {
+                fast_at.get_or_insert(started.elapsed());
+            } else {
+                first_slow_at.get_or_insert(started.elapsed());
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        scheduler.join().expect("scheduler");
+        let fast_at = fast_at.expect("the fast endpoint reported");
+        let first_slow_at = first_slow_at.expect("a slow endpoint reported");
+        assert!(
+            fast_at < Duration::from_millis(900),
+            "fast endpoint waited {fast_at:?}"
+        );
+        assert!(fast_at < first_slow_at, "{fast_at:?} vs {first_slow_at:?}");
+    }
+
+    #[test]
+    fn load_scrapes_never_exceed_the_worker_budget() {
+        let endpoints = (0..LOAD_SCRAPE_CONCURRENCY * 2)
+            .map(|index| load_endpoint(&format!("e-{index:02}")))
+            .collect::<Vec<_>>();
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoints,
+            ..Shared::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(256);
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (thread_stop, thread_shared) = (Arc::clone(&stop), Arc::clone(&shared));
+        let (worker_live, worker_peak) = (Arc::clone(&live), Arc::clone(&peak));
+        let scheduler = thread::spawn(move || {
+            run_loads(&tx, &thread_stop, &thread_shared, move |_, _| {
+                let now = worker_live.fetch_add(1, Ordering::SeqCst) + 1;
+                worker_peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(300));
+                worker_live.fetch_sub(1, Ordering::SeqCst);
+                None
+            });
+        });
+        thread::sleep(Duration::from_millis(1_000));
+        stop.store(true, Ordering::SeqCst);
+        scheduler.join().expect("scheduler");
+        drop(rx);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= LOAD_SCRAPE_CONCURRENCY, "peak {peak}");
+        assert!(
+            peak >= LOAD_SCRAPE_CONCURRENCY / 2,
+            "workers ran in parallel: {peak}"
+        );
+    }
+
+    #[test]
+    fn a_result_for_a_changed_endpoint_configuration_is_discarded() {
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoints: vec![load_endpoint("vllm")],
+            ..Shared::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(256);
+        let (thread_stop, thread_shared) = (Arc::clone(&stop), Arc::clone(&shared));
+        let scheduler = thread::spawn(move || {
+            run_loads(&tx, &thread_stop, &thread_shared, |endpoint, _| {
+                // The old configuration's scrape is slow and reports 7.
+                let running = if endpoint.base_url.is_empty() {
+                    thread::sleep(Duration::from_millis(600));
+                    7
+                } else {
+                    1
+                };
+                Some(LoadReading {
+                    running,
+                    source: LoadSource::VllmMetrics,
+                    ..LoadReading::default()
+                })
+            });
+        });
+        thread::sleep(Duration::from_millis(150));
+        {
+            let mut shared = shared.lock().expect("shared");
+            shared.endpoints[0].base_url = "http://changed".to_string();
+            shared.endpoints_generation += 1;
+        }
+        thread::sleep(Duration::from_millis(1_000));
+        stop.store(true, Ordering::SeqCst);
+        scheduler.join().expect("scheduler");
+        let frames = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                FromWorker::Telemetry(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!frames.is_empty(), "the new configuration reported");
+        assert!(
+            frames.iter().all(|text| !text.contains(r#""running":7"#)),
+            "{frames:?}"
         );
     }
 

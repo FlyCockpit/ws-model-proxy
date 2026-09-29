@@ -30,6 +30,7 @@ pub mod startup;
 pub mod state;
 pub mod supervised_run;
 pub mod telemetry;
+pub mod telemetry_bounds;
 pub mod terminal_crypto;
 pub mod terminal_identity;
 pub mod terminal_parse;

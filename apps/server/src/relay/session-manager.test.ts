@@ -2293,17 +2293,56 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
-  it("closes the socket for a telemetry frame with fields outside the strict schema", async () => {
+  it("drops a telemetry frame outside the strict schema without closing the session", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const { manager, socket } = await registered();
+    const rejected = [
+      // An unknown field: nothing from it is stored or logged.
+      metrics("2026-01-01T00:00:00.000Z", { stderr: "leaked" }),
+      // An out-of-range reading (kernel iowait regression can push this past 100).
+      metrics("2026-01-01T00:00:00.000Z", { cpu: { usagePercent: 101.3 } }),
+      JSON.stringify({ type: "node.info", os: { name: "a\u0000b" } }),
+      JSON.stringify({ type: "node.info", gpus: [{ index: 0, uuid: "u".repeat(129) }] }),
+      JSON.stringify({ ...JSON.parse(load("vllm", 1)), running: 1_000_001 }),
+    ];
+    for (const frame of rejected) await manager.handleTextFrame(socket, frame, now);
+    expect(socket.closes).toEqual([]);
+    expect(telemetryWrites()).toEqual([]);
+    expect(manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")).toEqual({
+      nodeMetrics: null,
+      nodeMetricsReceivedAt: null,
+      endpointLoad: [],
+    });
+    // Logged once (per minute per session), by type only.
+    expect(consoleError.mock.calls).toEqual([
+      ["[relay] malformed telemetry frame dropped", "node.metrics"],
+    ]);
+    // The rejected frames spent no rate-limit slot: valid ones still land.
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:01.000Z"), at(1_000));
     await manager.handleTextFrame(
       socket,
-      metrics("2026-01-01T00:00:00.000Z", { stderr: "leaked" }),
-      now,
+      JSON.stringify({ type: "node.info", os: { name: "Ubuntu" } }),
+      at(1_000),
     );
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
-    expect(telemetryWrites()).toEqual([]);
+    expect(telemetryWrites()).toHaveLength(2);
     consoleError.mockRestore();
+    manager.dispose();
+  });
+
+  it("persists the metrics snapshot at most once a minute per device, across reconnects", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+    // The write is conditional on the stored timestamp, so a snapshot stored
+    // by an earlier session (or another instance) inside the window wins.
+    expect(telemetryWrites()).toEqual([
+      {
+        where: {
+          OR: [{ nodeMetricsAt: null }, { nodeMetricsAt: { lte: at(-60_000) } }],
+          id: "cli-device-id",
+        },
+        data: expect.objectContaining({ nodeMetricsAt: now }),
+      },
+    ]);
     manager.dispose();
   });
 

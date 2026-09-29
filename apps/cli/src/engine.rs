@@ -161,12 +161,29 @@ pub(crate) fn fetch_route(
     let mut response = request
         .call()
         .with_context(|| format!("requesting `{route}` from endpoint `{}`", endpoint.slug))?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_string()
+    read_decoded_body(response.body_mut(), limit)
         .with_context(|| format!("reading `{route}` from endpoint `{}`", endpoint.slug))
+}
+
+/// Read a response body, holding the DECODED size to `limit`. ureq's own
+/// limit sits beneath content decoding and counts compressed bytes, so a
+/// small gzip body could otherwise expand far past it. The wire limit stays
+/// as well; the decoded reader then stops at `limit + 1` bytes.
+fn read_decoded_body(body: &mut ureq::Body, limit: u64) -> Result<String> {
+    use std::io::Read;
+    let mut decoded = Vec::new();
+    // ureq refuses a body that reaches its limit; one byte of slack keeps an
+    // exact-limit body legal, and the decoded check below is the real bound.
+    body.with_config()
+        .limit(limit.saturating_add(1))
+        .reader()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut decoded)
+        .context("reading the response body")?;
+    if decoded.len() as u64 > limit {
+        anyhow::bail!("the decoded response body exceeds {limit} bytes");
+    }
+    String::from_utf8(decoded).context("the response body is not UTF-8")
 }
 
 /// Detect the engine and its static facts. `models` are the ids and
@@ -866,5 +883,87 @@ mod tests {
         let debug = format!("{slots:?} {:?}", llama_slots_load(&slots));
         assert!(!debug.contains("TOP-SECRET"), "{debug}");
         assert!(!debug.contains("prompt"), "{debug}");
+    }
+
+    /// Serve one HTTP response on loopback; `None` when loopback bind is denied.
+    fn serve_once(
+        body: Vec<u8>,
+        encoding: Option<&'static str>,
+    ) -> Option<(String, std::thread::JoinHandle<()>)> {
+        use std::io::{Read, Write};
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("bind test engine: {error}"),
+        };
+        let address = listener.local_addr().expect("test engine address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept engine request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let encoding = encoding
+                .map(|value| format!("content-encoding: {value}\r\n"))
+                .unwrap_or_default();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{encoding}content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        Some((format!("http://{address}/v1"), server))
+    }
+
+    fn fetch_once(
+        body: Vec<u8>,
+        encoding: Option<&'static str>,
+        limit: u64,
+    ) -> Option<Result<String>> {
+        let (base_url, server) = serve_once(body, encoding)?;
+        let endpoint = EndpointConfig {
+            slug: "engine".to_string(),
+            base_url,
+            ..EndpointConfig::default()
+        };
+        let result = fetch_route(&http_agent(DETECT_TIMEOUT), &endpoint, "props", limit);
+        server.join().expect("test engine thread");
+        Some(result)
+    }
+
+    #[test]
+    fn engine_body_limits_count_decoded_bytes_not_compressed_bytes() {
+        let oversized = include_bytes!("../tests/fixtures/engines/oversized-props.json.gz");
+        assert!(
+            (oversized.len() as u64) < JSON_BODY_LIMIT,
+            "the wire body fits the limit"
+        );
+        let Some(result) = fetch_once(oversized.to_vec(), Some("gzip"), JSON_BODY_LIMIT) else {
+            return;
+        };
+        let error = result.expect_err("a gzip body that decodes past the limit is refused");
+        assert!(format!("{error:#}").contains("exceeds"), "{error:#}");
+
+        // Legitimate compressed responses still work.
+        let small = include_bytes!("../tests/fixtures/engines/small-props.json.gz");
+        let Some(result) = fetch_once(small.to_vec(), Some("gzip"), JSON_BODY_LIMIT) else {
+            return;
+        };
+        assert!(
+            result
+                .expect("small gzip body")
+                .contains("\"total_slots\":4")
+        );
+    }
+
+    #[test]
+    fn engine_body_limit_accepts_exactly_the_limit_and_refuses_one_more_byte() {
+        let Some(result) = fetch_once(vec![b'x'; 1024], None, 1024) else {
+            return;
+        };
+        assert_eq!(result.expect("exact-limit body").len(), 1024);
+        let Some(result) = fetch_once(vec![b'x'; 1025], None, 1024) else {
+            return;
+        };
+        assert!(result.is_err(), "limit + 1 is refused");
     }
 }

@@ -606,7 +606,7 @@ fn should_reuse_reconnect_inventory(
     desired_modified_at: SystemTime,
     revision: Option<&crate::protocol::InventoryRevision>,
 ) -> bool {
-    active == desired
+    same_desired_config(active, desired)
         && acknowledged_modified_at == Some(desired_modified_at)
         && acknowledged_inventory_matches_config(active, revision)
 }
@@ -624,16 +624,35 @@ fn reconnect_inventory_candidate(
         desired_modified_at,
         revision,
     ) {
-        return Ok((active.clone(), inventory_with_fresh_engine_facts(active)));
+        return Ok(config_with_fresh_engine_facts(active));
     }
     prepare_inventory_candidate(active)
 }
 
-/// The reconnect inventory for an unchanged, acknowledged snapshot, with
-/// engine facts re-detected (an engine may have restarted with other slots).
-/// Facts are digest-excluded, so this never changes the acknowledged
-/// identity, and nothing is written to the config file.
-fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> {
+/// Whether two configs are the same desired snapshot. Detected engine facts
+/// are left out: the reconnect fast path refreshes them in memory only (they
+/// are digest-excluded), so the running config may carry newer facts than
+/// the file without being a different desired inventory.
+fn same_desired_config(left: &Config, right: &Config) -> bool {
+    let without_engine_facts = |config: &Config| {
+        let mut config = config.clone();
+        for endpoint in &mut config.endpoints {
+            if let Some(probe) = endpoint.last_probe.as_mut() {
+                probe.engine = None;
+            }
+        }
+        config
+    };
+    left == right || without_engine_facts(left) == without_engine_facts(right)
+}
+
+/// The reconnect config and inventory for an unchanged, acknowledged
+/// snapshot, with engine facts re-detected (an engine may have restarted with
+/// other slots, or become detectable). The returned config carries the same
+/// facts as the inventory, so the session's load sampler scrapes the engine
+/// the hello advertises. Facts are digest-excluded, so this never changes the
+/// acknowledged identity, and nothing is written to the config file.
+fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInventory>) {
     let mut refreshed = active.clone();
     let targets = refreshed
         .endpoints
@@ -693,7 +712,8 @@ fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> 
             }
         }
     }
-    inventory_snapshot_from_config(&refreshed)
+    let inventory = inventory_snapshot_from_config(&refreshed);
+    (refreshed, inventory)
 }
 
 /// Whether a fast-path re-detection should replace the stored engine facts.
@@ -702,7 +722,10 @@ fn inventory_with_fresh_engine_facts(active: &Config) -> Vec<EndpointInventory> 
 /// result. A re-detection that found no kind found no facts of its own and
 /// must not wipe what the last full probe stored. Mirrors
 /// [`crate::probe::apply_probe_report`], which keeps previous facts on an
-/// offline probe; stale facts stay bounded by the stored `engineFactsAt`.
+/// offline probe. Kept facts are re-sent as they are, and the server stamps
+/// `engineFactsAt` on every hello that carries facts, so that timestamp means
+/// "last reported", not "last measured": kept facts stay until the next
+/// successful detection (this fast path, a reload or a full probe).
 fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
     engine.kind.is_some()
 }
@@ -3549,6 +3572,69 @@ mod tests {
             ..crate::engine::DetectedEngine::default()
         };
         assert!(re_detection_replaces_stored(&re_detected));
+    }
+
+    #[test]
+    fn the_reconnect_fast_path_hands_the_session_the_facts_its_hello_advertises() {
+        // An acknowledged auto endpoint whose engine was not detectable at the
+        // last probe; on reconnect `/props` answers. The hello advertises
+        // llama.cpp, and the config the session (and its load sampler) runs
+        // on must carry the same detection, or llama.cpp load is never scraped.
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind test engine: {error}"),
+        };
+        let address = listener.local_addr().expect("test engine address");
+        thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0_u8; 4096];
+                let read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let response = if head.starts_with("GET /props ") {
+                    let body = r#"{"total_slots":4,"default_generation_settings":{"n_ctx":8192}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let mut active = Config::default();
+        active.endpoints.push(crate::config::EndpointConfig {
+            slug: "auto".to_string(),
+            base_url: format!("http://{address}/v1"),
+            last_probe: Some(crate::config::ProbeSnapshot {
+                status: crate::config::ProbeStatus::Online,
+                models: vec!["m".to_string()],
+                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: None,
+            }),
+            ..crate::config::EndpointConfig::default()
+        });
+        assert!(crate::telemetry::load_targets(&active.endpoints).is_empty());
+
+        let (config, inventory) = config_with_fresh_engine_facts(&active);
+        let advertised = inventory[0]
+            .engine_facts
+            .as_ref()
+            .and_then(|facts| facts.engine.as_ref())
+            .map(|fact| fact.value);
+        assert_eq!(advertised, Some(crate::engine::EngineKind::LlamaCpp));
+        let targets = crate::telemetry::load_targets(&config.endpoints);
+        assert_eq!(targets.len(), 1, "the sampler scrapes the detected engine");
+        assert_eq!(targets[0].1, crate::engine::EngineKind::LlamaCpp);
+        // The refreshed facts do not make the snapshot a different desired
+        // inventory, so the next reconnect still takes the fast path.
+        assert!(same_desired_config(&config, &active));
+        let mut edited = config.clone();
+        edited.endpoints[0].label = "other".to_string();
+        assert!(!same_desired_config(&edited, &active));
     }
 
     #[test]

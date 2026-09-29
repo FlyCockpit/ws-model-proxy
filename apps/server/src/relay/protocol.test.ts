@@ -767,6 +767,11 @@ describe("relay protocol 2.7 telemetry frames", () => {
       "node-info.json",
       "node-metrics.json",
       "endpoint-load.json",
+      // The CLI's conform pass applied to out-of-range readings
+      // (`apps/cli/src/telemetry_bounds.rs`): still accepted here.
+      "node-info-extreme.json",
+      "node-metrics-extreme.json",
+      "endpoint-load-extreme.json",
     ]) {
       const vector = relay27Vector(name);
       expect(parseRelayClientControlFrame(JSON.stringify(vector))).toMatchObject({
@@ -784,6 +789,49 @@ describe("relay protocol 2.7 telemetry frames", () => {
     expect(hello.endpoints[0]?.models[0]?.engineFacts).toEqual({
       maxModelLen: { value: 131072, source: "probe" },
     });
+  });
+
+  it("carries each metric source's interval, local sources included", () => {
+    const frame = parseRelayClientControlFrame(JSON.stringify(relay27Vector("node-metrics.json")));
+    if (frame.type !== "node.metrics") throw new Error("expected node.metrics");
+    expect(frame.sources?.map((source) => [source.origin, source.intervalSecs])).toEqual([
+      ["remote", 10],
+      ["local", 60],
+    ]);
+    const withSource = (source: Record<string, unknown>) =>
+      JSON.stringify({
+        type: "node.metrics",
+        ts: "2026-09-28T12:00:00.000Z",
+        sources: [{ name: "fans", origin: "local", state: "active", ...source }],
+      });
+    expect(() => parseRelayClientControlFrame(withSource({}))).not.toThrow();
+    for (const intervalSecs of [5, 86_400]) {
+      expect(() => parseRelayClientControlFrame(withSource({ intervalSecs }))).not.toThrow();
+    }
+    for (const intervalSecs of [4, 86_401, 1.5, "10"]) {
+      expect(() => parseRelayClientControlFrame(withSource({ intervalSecs }))).toThrow();
+    }
+  });
+
+  it("refuses NUL and unpaired surrogates in stored telemetry text", () => {
+    const info = (os: Record<string, unknown>) => JSON.stringify({ type: "node.info", os });
+    const disk = (mount: string) =>
+      JSON.stringify({ type: "node.metrics", ts: "2026-09-28T12:00:00.000Z", disks: [{ mount }] });
+    for (const bad of ["a\u0000b", "a\ud800b", "\udc00"]) {
+      expect(() => parseRelayClientControlFrame(info({ name: bad }))).toThrow();
+      expect(() => parseRelayClientControlFrame(info({ arch: bad }))).toThrow();
+      expect(() => parseRelayClientControlFrame(disk(bad))).toThrow();
+      expect(() =>
+        parseRelayClientControlFrame(
+          JSON.stringify({ type: "node.info", gpus: [{ index: 0, driverVersion: bad }] }),
+        ),
+      ).toThrow();
+    }
+    // Paired surrogates, combining marks and ZWJ sequences are ordinary text.
+    for (const good of ["😀", "e\u0301", "👩\u200d💻", "Ubuntu"]) {
+      expect(() => parseRelayClientControlFrame(info({ name: good }))).not.toThrow();
+      expect(() => parseRelayClientControlFrame(disk(`/mnt/${good}`))).not.toThrow();
+    }
   });
 
   it("encodes metrics.sources.set in the shape the CLI parses", () => {

@@ -20,7 +20,7 @@ import {
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
@@ -303,8 +303,19 @@ export const NODE_INFO_MIN_INTERVAL_MS = 60_000;
  * them at least 5 s apart; the margin absorbs network jitter.
  */
 export const NODE_METRICS_MIN_INTERVAL_MS = 4_000;
-/** The CliDevice snapshot of the latest metrics is written at most this often. */
+/**
+ * The CliDevice snapshot of the latest metrics is written at most this often
+ * per device, across sessions and server instances (the write is conditional
+ * on the stored `nodeMetricsAt`), so reconnecting cannot reset the budget.
+ */
 export const NODE_METRICS_PERSIST_INTERVAL_MS = 60_000;
+/** A dropped malformed telemetry frame is logged at most this often per session. */
+const MALFORMED_TELEMETRY_LOG_INTERVAL_MS = 60_000;
+const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
+  "node.info",
+  "node.metrics",
+  "endpoint.load",
+]);
 /** Per endpoint/model key; the CLI sends every 2–5 s and on change. */
 export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
@@ -351,6 +362,7 @@ type SessionState = {
   nodeMetricsAcceptedAtMs: number | null;
   nodeMetricsPersistedAtMs: number | null;
   endpointLoad: Map<string, LiveEndpointLoadEntry>;
+  malformedTelemetryLoggedAtMs: number | null;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -592,6 +604,7 @@ export class RelaySessionManager {
       nodeMetricsAcceptedAtMs: null,
       nodeMetricsPersistedAtMs: null,
       endpointLoad: new Map(),
+      malformedTelemetryLoggedAtMs: null,
     });
   }
 
@@ -1335,7 +1348,19 @@ export class RelaySessionManager {
       return;
     }
     session.nodeMetricsPersistedAtMs = nowMs;
-    await this.writeTelemetry(cliDeviceId, { nodeMetrics: sample, nodeMetricsAt: now });
+    await this.writeTelemetry(
+      cliDeviceId,
+      { nodeMetrics: sample, nodeMetricsAt: now },
+      // Per device, not per session: a snapshot stored by an earlier session
+      // (or another server instance) inside the window keeps this one out,
+      // and an older delayed write never replaces a newer snapshot.
+      {
+        OR: [
+          { nodeMetricsAt: null },
+          { nodeMetricsAt: { lte: new Date(nowMs - NODE_METRICS_PERSIST_INTERVAL_MS) } },
+        ],
+      },
+    );
   }
 
   private async writeTelemetry(
@@ -1343,9 +1368,10 @@ export class RelaySessionManager {
     data:
       | { nodeInfo: Omit<NodeInfoMessage, "type">; nodeInfoAt: Date }
       | { nodeMetrics: Omit<NodeMetricsMessage, "type">; nodeMetricsAt: Date },
+    condition: Prisma.CliDeviceWhereInput = {},
   ) {
     try {
-      await prisma.cliDevice.updateMany({ where: { id: cliDeviceId }, data });
+      await prisma.cliDevice.updateMany({ where: { ...condition, id: cliDeviceId }, data });
     } catch (error) {
       console.error(
         "[relay] storing node telemetry failed",
@@ -2866,6 +2892,20 @@ export class RelaySessionManager {
       const command = commandId ? session.commandsById.get(commandId) : undefined;
       if (command?.status === "running") this.cancelTrackedCommand(session, command);
       console.error("[relay] malformed exec frame");
+      return true;
+    }
+    // Telemetry is advisory: a reading outside the strict schema (or an
+    // unknown field) drops that frame, never the session and the inference
+    // it carries. Nothing from the frame is stored or logged but its type.
+    if (session.registered && TELEMETRY_FRAME_TYPES.has(type)) {
+      const nowMs = Date.now();
+      if (
+        session.malformedTelemetryLoggedAtMs === null ||
+        nowMs - session.malformedTelemetryLoggedAtMs >= MALFORMED_TELEMETRY_LOG_INTERVAL_MS
+      ) {
+        session.malformedTelemetryLoggedAtMs = nowMs;
+        console.error("[relay] malformed telemetry frame dropped", type);
+      }
       return true;
     }
     return false;
