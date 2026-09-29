@@ -149,9 +149,11 @@ export const USER_DELETION_SWEEP_DISCONNECT_TIMEOUT_MS = 1_000;
 export const SHARED_DISCONNECT_TIMEOUT_MS = 2_000;
 
 /**
- * Bound on step 1's awaited work in `stopPeriodicJobs` (index.ts): capacity
- * maintenance stop closes the LISTEN client's socket via `Client.end()`, which
- * otherwise waits indefinitely for the peer to close the connection.
+ * Bound on step 1's awaited work in `stopPeriodicJobs` (server-shutdown.ts):
+ * capacity maintenance stop closes the LISTEN client's socket via
+ * `Client.end()`, which otherwise waits indefinitely for the peer to close the
+ * connection, and relay maintenance stop waits for its sweeps already running
+ * (./relay-maintenance.ts). Both are awaited together under this bound.
  */
 export const PERIODIC_JOBS_STOP_TIMEOUT_MS = 2_000;
 

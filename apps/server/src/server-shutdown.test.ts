@@ -240,6 +240,38 @@ describe("installServerShutdown", () => {
     expect(h.events.filter((event) => event === "diagnostics:close")).toHaveLength(1);
   });
 
+  it("waits for a periodic job stop's join before the drain starts", async () => {
+    const h = harness();
+    let releaseJoin: () => void = () => undefined;
+    const join = new Promise<void>((resolve) => {
+      releaseJoin = () => {
+        h.events.push("relayMaintenance:joined");
+        resolve();
+      };
+    });
+    installServerShutdown({
+      ...h.deps,
+      periodicJobStops: [
+        () => {
+          h.events.push("relayMaintenance:stop");
+          return join;
+        },
+      ],
+    });
+    h.signals.emit("SIGTERM");
+    // Every stop and capacity maintenance ran, but the step still waits.
+    await vi.waitFor(() => expect(h.events).toContain("capacity:stopMaintenance"));
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    expect(h.events).not.toContain("terminals:closeAll");
+    expect(h.events).not.toContain("http:close");
+    releaseJoin();
+    await settled(h.events);
+    const at = (event: string) => h.events.indexOf(event);
+    expect(at("relayMaintenance:stop")).toBeLessThan(at("sweep:stop"));
+    expect(at("relayMaintenance:joined")).toBeLessThan(at("terminals:closeAll"));
+    expect(h.exits).toEqual([0]);
+  });
+
   it("tolerates missing optional runtimes (no capacity lifecycle, no MCP handler)", async () => {
     const h = harness({ capacityLifecycle: null, mcpHandler: null });
     installServerShutdown(h.deps);

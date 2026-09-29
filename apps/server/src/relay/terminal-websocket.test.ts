@@ -468,6 +468,10 @@ describe("terminal browser hub", () => {
   afterEach(async () => {
     terminalBrowserHub.closeAll();
     await relaySessionManager.closeRelaySessions();
+    // Test hygiene only: closeRelaySessions sets the shutdown drain flag,
+    // which production never clears, and a draining server refuses every
+    // browser terminal registration.
+    Reflect.set(relaySessionManager, "relayDrain", false);
   });
 
   function attachBrowser() {
@@ -718,6 +722,14 @@ describe("terminal browser hub", () => {
     );
   }
 
+  function registrationCounts(): { bySocket: number; byId: number } {
+    const hub = terminalBrowserHub as unknown as {
+      bySocket: Map<unknown, unknown>;
+      byId: Map<unknown, unknown>;
+    };
+    return { bySocket: hub.bySocket.size, byId: hub.byId.size };
+  }
+
   it("refuses hub registration when the handshake straddles a deletion mark", async () => {
     const browser = new FakeSocket();
     db.session.findUnique.mockResolvedValueOnce(
@@ -910,6 +922,57 @@ describe("terminal browser hub", () => {
     expect(registered(pending)).toBe(false);
     expect(registered(admitted)).toBe(false);
     expect(registered(own)).toBe(true);
+  });
+
+  // Shutdown sets the drain flag and closes every browser socket in one turn
+  // (closeBrowserSockets). An upgrade whose middleware passed the drain check
+  // before that opens after closeAll() already ran: it must be closed, not
+  // registered for the rest of the process.
+  it("closes a browser terminal socket that opens after the shutdown closed every socket", async () => {
+    limiterState.fail = false;
+    let releaseSession: (value: unknown) => void = () => undefined;
+    sessions.getSession.mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseSession = resolve;
+      }),
+    );
+    const upgrade = middlewareApp().request("/api/dashboard/terminal/ws", {
+      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
+    });
+    // The middleware passed the drain check and waits on the session lookup.
+    await vi.waitFor(() => expect(sessions.getSession).toHaveBeenCalledTimes(1));
+    const admitted = attachBrowser();
+    // closeBrowserSockets runs now.
+    relaySessionManager.beginDrain();
+    terminalBrowserHub.closeAll();
+    expect(admitted.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    releaseSession(browserSession());
+    expect((await upgrade).status).toBe(200);
+
+    const socket = new FakeSocket();
+    const ws = new WSContext<WebSocketLike>({
+      get readyState() {
+        return socket.readyState as 0 | 1 | 2 | 3;
+      },
+      send: (data) => socket.send(data as string | ArrayBuffer),
+      close: (code, reason) => socket.close(code, reason),
+    });
+    const events = terminalSocketEvents({
+      user: { id: "user-id" },
+      session: { id: "session-id" },
+    } as unknown as Session);
+    const before = registrationCounts();
+    events.onOpen?.(new Event("open"), ws);
+    expect(socket.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    // onOpen registers a RelaySocket wrapper, not the raw socket, so assert on the hub's
+    // maps: the refused registration must not be left behind.
+    expect(registrationCounts()).toEqual(before);
+    // Closed without an admission read: the database may already be released.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(db.session.findUnique).not.toHaveBeenCalled();
+    events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(socket.sends).toHaveLength(0);
   });
 
   it("the upgrade's onOpen registers synchronously and admits through the admission read", async () => {

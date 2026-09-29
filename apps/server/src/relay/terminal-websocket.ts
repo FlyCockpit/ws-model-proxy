@@ -1186,10 +1186,18 @@ registerTerminalBridge({
  * Fails closed: a missing or foreign or expired session, a missing user row, a
  * deletion marker or an active ban close the socket (4401), and a read error
  * closes it (1011) before rethrowing for the caller's log. A socket that
- * closed or was revoked during the read is never registered.
+ * closed or was revoked during the read is never registered. A socket that
+ * opens once the shutdown drain began is closed (1001) without a read.
  */
 export async function admitBrowserConnection(input: BrowserConnInput): Promise<void> {
   const conn = terminalBrowserHub.register(input);
+  // Shutdown sets the drain flag and runs closeAll() in one synchronous turn.
+  // An upgrade that passed the middleware's drain check before that registers
+  // here after closeAll() already ran, so nothing else would close it.
+  if (relaySessionManager.isDraining()) {
+    terminalBrowserHub.refuse(conn, 1001, "shutdown");
+    return;
+  }
   let row: {
     userId: string;
     expiresAt: Date;
