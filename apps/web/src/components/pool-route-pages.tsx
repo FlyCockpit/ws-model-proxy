@@ -973,12 +973,28 @@ function PoolGrantRoutingForm({
       queuePriority: grant.queuePriority ?? 16,
     },
     validators: {
-      onSubmit: z.object({
-        protectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
-        protectionPercent: z.number().int().min(1).max(100),
-        priorityMode: z.enum(["INHERIT", "SET"]),
-        queuePriority: z.number().int().min(0).max(31),
-      }),
+      // A hidden field (its mode not selected) is never validated.
+      onSubmit: z
+        .object({
+          protectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
+          protectionPercent: z.number(),
+          priorityMode: z.enum(["INHERIT", "SET"]),
+          queuePriority: z.number(),
+        })
+        .refine(
+          (value) =>
+            value.protectionMode !== "PERCENT" ||
+            (Number.isInteger(value.protectionPercent) &&
+              value.protectionPercent >= 1 &&
+              value.protectionPercent <= 100),
+        )
+        .refine(
+          (value) =>
+            value.priorityMode !== "SET" ||
+            (Number.isInteger(value.queuePriority) &&
+              value.queuePriority >= 0 &&
+              value.queuePriority <= 31),
+        ),
     },
     onSubmit: async ({ value }) => {
       await update

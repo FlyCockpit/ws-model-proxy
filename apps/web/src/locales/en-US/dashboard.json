@@ -438,7 +438,7 @@
     },
     "protection": {
       "title": "Protect active conversations",
-      "description": "A new conversation avoids a member whose free capacity still holds other people's recent, large prompt caches when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
+      "description": "A new conversation avoids a member whose free capacity still holds other conversations' recent, large prompt caches when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
       "enabled": "Protect active conversations",
       "windowSeconds": "Protection window (seconds)",
       "minTokens": "Minimum conversation size (tokens)",
@@ -456,7 +456,7 @@
         "UNPROTECTED": "Unprotected"
       },
       "percentLabel": "Percent of a member's capacity (1 to 100)",
-      "hint": "Warmth is estimated from this pool's routing records (sizes and times only, never prompt content). Only conversations used within the window and at least the minimum size count. Over their share, a user's oldest conversations lose protection first."
+      "hint": "Warmth is estimated from the routing records of all this owner's pools on the member (sizes and times only, never prompt content). Only conversations used within the window and at least the minimum size count. Over their share, a user's oldest conversations lose protection first."
     },
     "capacity": {
       "title": "Shared local capacity",

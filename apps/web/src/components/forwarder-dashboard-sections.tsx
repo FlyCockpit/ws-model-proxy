@@ -1609,6 +1609,9 @@ export function ownerProtectionModeOf(
   return percent === null ? "INHERIT" : percent === 0 ? "UNPROTECTED" : "PERCENT";
 }
 
+const validPercent = (percent: number) =>
+  Number.isInteger(percent) && percent >= 1 && percent <= 100;
+
 function protectionSettingsFromForm(value: {
   protectionEnabled: boolean;
   protectionWindowSeconds: number;
@@ -1661,71 +1664,78 @@ export function PoolForm({
   // Inline server rejection on the recommended-API field (update path only;
   // the guarded wizard owns its own create-failure surface).
   const [surfaceUnsupported, setSurfaceUnsupported] = useState(false);
-  const poolSchema = z.object({
-    slug: z
-      .string()
-      .trim()
-      .superRefine((value, ctx) => {
-        const result = validateForwarderPoolSlug(value);
-        if (!result.ok) {
-          ctx.addIssue({
-            code: "custom",
-            message:
-              result.reason === "reserved"
-                ? t("dashboard:pools.reservedSlug")
-                : t("dashboard:pools.invalidSlug"),
-          });
-        }
-      }),
-    name: z.string().trim().min(1).max(120),
-    description: z.string().trim().max(1000),
-    transformerDiscoveredModelId: z.string(),
-    transformerImages: z.boolean(),
-    transformerAudio: z.boolean(),
-    transformerVideo: z.boolean(),
-    transformerCacheMode: z.enum(["OFF", "MEMORY"]),
-    transformerSystemPrompt: z.string().max(16_000),
-    transformerIncludePrimaryTools: z.boolean(),
-    transformerMaxTools: z.number().int().min(1).max(128),
-    transformerMaxToolChars: z.number().int().min(256).max(32_000),
-    transformerTimeoutMs: z.string(),
-    transformerMaxAssets: z.string(),
-    maxAttachmentMiB: z
-      .string()
-      .refine(
-        (value) => value.trim() === "" || (/^\d+$/.test(value.trim()) && Number(value) > 0),
-        t("dashboard:pools.attachmentLimitInvalid"),
-      ),
-    optimisticBasicTranscription: z.boolean(),
-    protocolAdaptationEnabled: z.boolean(),
-    allowLossyDeveloperRoleCollapse: z.boolean(),
-    recommendedSurfaceOverride: z.enum(["", ...poolSurfaceValues]),
-    capacityPriority: z.number().int().min(0).max(31),
-    capacityConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
-    capacityConcurrencyLimit: z.number().int().min(1).max(10_000),
-    capacityReservedSlots: z.number().int().min(0).max(10_000),
-    capacityWaitBudgetMode: z.enum(["LIMITED", "UNLIMITED"]),
-    capacityWaitBudgetMs: z.number().int().min(0).max(600_000),
-    capacityContextCeilingMode: z.enum(["LIMITED", "UNLIMITED"]),
-    capacityContextCeiling: z.number().int().min(1).max(100_000_000),
-    capacityContextMargin: z.number().int().min(0).max(100_000_000),
-    capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
-    affinityEnabled: z.boolean(),
-    affinityTtlSeconds: z.number().int().min(60).max(604_800),
-    affinityMaxRecords: z.number().int().min(100).max(100_000),
-    affinityPrefixWeight: z.number().int().min(0).max(10_000),
-    affinityConversationWeight: z.number().int().min(0).max(10_000),
-    affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
-    cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
-    cacheHolderWaitMs: z.number().int().min(0).max(30_000),
-    protectionEnabled: z.boolean(),
-    protectionWindowSeconds: z.number().int().min(1).max(3600),
-    protectMinTokens: z.number().int().min(0).max(10_000_000),
-    protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
-    protectionFixedPercent: z.number().int().min(1).max(100),
-    ownerProtectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
-    ownerProtectionPercent: z.number().int().min(1).max(100),
-  });
+  const poolSchema = z
+    .object({
+      slug: z
+        .string()
+        .trim()
+        .superRefine((value, ctx) => {
+          const result = validateForwarderPoolSlug(value);
+          if (!result.ok) {
+            ctx.addIssue({
+              code: "custom",
+              message:
+                result.reason === "reserved"
+                  ? t("dashboard:pools.reservedSlug")
+                  : t("dashboard:pools.invalidSlug"),
+            });
+          }
+        }),
+      name: z.string().trim().min(1).max(120),
+      description: z.string().trim().max(1000),
+      transformerDiscoveredModelId: z.string(),
+      transformerImages: z.boolean(),
+      transformerAudio: z.boolean(),
+      transformerVideo: z.boolean(),
+      transformerCacheMode: z.enum(["OFF", "MEMORY"]),
+      transformerSystemPrompt: z.string().max(16_000),
+      transformerIncludePrimaryTools: z.boolean(),
+      transformerMaxTools: z.number().int().min(1).max(128),
+      transformerMaxToolChars: z.number().int().min(256).max(32_000),
+      transformerTimeoutMs: z.string(),
+      transformerMaxAssets: z.string(),
+      maxAttachmentMiB: z
+        .string()
+        .refine(
+          (value) => value.trim() === "" || (/^\d+$/.test(value.trim()) && Number(value) > 0),
+          t("dashboard:pools.attachmentLimitInvalid"),
+        ),
+      optimisticBasicTranscription: z.boolean(),
+      protocolAdaptationEnabled: z.boolean(),
+      allowLossyDeveloperRoleCollapse: z.boolean(),
+      recommendedSurfaceOverride: z.enum(["", ...poolSurfaceValues]),
+      capacityPriority: z.number().int().min(0).max(31),
+      capacityConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
+      capacityConcurrencyLimit: z.number().int().min(1).max(10_000),
+      capacityReservedSlots: z.number().int().min(0).max(10_000),
+      capacityWaitBudgetMode: z.enum(["LIMITED", "UNLIMITED"]),
+      capacityWaitBudgetMs: z.number().int().min(0).max(600_000),
+      capacityContextCeilingMode: z.enum(["LIMITED", "UNLIMITED"]),
+      capacityContextCeiling: z.number().int().min(1).max(100_000_000),
+      capacityContextMargin: z.number().int().min(0).max(100_000_000),
+      capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
+      affinityEnabled: z.boolean(),
+      affinityTtlSeconds: z.number().int().min(60).max(604_800),
+      affinityMaxRecords: z.number().int().min(100).max(100_000),
+      affinityPrefixWeight: z.number().int().min(0).max(10_000),
+      affinityConversationWeight: z.number().int().min(0).max(10_000),
+      affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
+      cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
+      cacheHolderWaitMs: z.number().int().min(0).max(30_000),
+      protectionEnabled: z.boolean(),
+      protectionWindowSeconds: z.number().int().min(1).max(3600),
+      protectMinTokens: z.number().int().min(0).max(10_000_000),
+      protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
+      // Percent fields are validated only while their mode is selected (below).
+      protectionFixedPercent: z.number(),
+      ownerProtectionMode: z.enum(["INHERIT", "PERCENT", "UNPROTECTED"]),
+      ownerProtectionPercent: z.number(),
+    })
+    .refine(
+      (value) =>
+        (value.protectionShare !== "FIXED_PERCENT" || validPercent(value.protectionFixedPercent)) &&
+        (value.ownerProtectionMode !== "PERCENT" || validPercent(value.ownerProtectionPercent)),
+    );
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
       onSuccess: () => {

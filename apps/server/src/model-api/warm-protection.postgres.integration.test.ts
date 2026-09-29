@@ -238,9 +238,9 @@ integration("warm-session protection with real PostgreSQL", () => {
             overridePercent,
           }))
           .sort((left, right) => left.ageSeconds - right.ageSeconds);
+      // The UNPROTECTED grantee's session (override 0) is dropped in SQL.
       expect(summary(capacityA.id)).toEqual([
         { userId: owner.id, ageSeconds: 10, tokens: 20_000, overridePercent: 40 },
-        { userId: unprotected.id, ageSeconds: 20, tokens: 30_000, overridePercent: 0 },
         { userId: grantee.id, ageSeconds: 30, tokens: 9_000, overridePercent: null },
       ]);
       expect(summary(capacityB.id)).toEqual([
@@ -255,18 +255,17 @@ integration("warm-session protection with real PostgreSQL", () => {
       });
       expect(stranger.size).toBe(0);
 
-      // The bound is per capacity: a busy pool never crowds out another
-      // pool's sessions (a global limit of 2 would return B(5s) and A(10s)).
+      // The bound is per (capacity, user) and never spent on UNPROTECTED rows.
       const bounded = await warm.loadWarmSessions({
         ownerId: owner.id,
         capacityIds: [capacityA.id, capacityB.id],
         policy,
         now,
-        limitPerCapacity: 2,
+        limitPerUser: 1,
       });
       expect(bounded.get(capacityA.id)?.map(({ userId }) => userId)).toEqual([
         owner.id,
-        unprotected.id,
+        grantee.id,
       ]);
       expect(bounded.get(capacityB.id)?.map(({ userId }) => userId)).toEqual([owner.id]);
 
@@ -303,6 +302,141 @@ integration("warm-session protection with real PostgreSQL", () => {
       expect(verdicts.get("a")).toMatchObject({ state: "PROTECTED", protectedSessions: 2 });
     } finally {
       for (const id of [owner.id, unprotected.id, grantee.id])
+        await db.user.deleteMany({ where: { id } });
+    }
+  }, 60_000);
+  it("keeps every user's sessions under the read bound and one session per explicit conversation", async () => {
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const owner = await user("owner2");
+    const heavy = await user("heavy");
+    const light = await user("light");
+    const batch = await user("batch");
+    try {
+      const device = await db.cliDevice.create({
+        data: { userId: owner.id, slug: `device-${suffix}` },
+      });
+      const endpoint = await db.endpoint.create({
+        data: { userId: owner.id, cliDeviceId: device.id, slug: `endpoint-${suffix}`, label: "W" },
+      });
+      const pool = await db.modelPool.create({
+        data: { userId: owner.id, slug: `pool-${suffix}`, name: "Warm pool" },
+      });
+      for (const [grantee, protectionOverridePercent] of [
+        [heavy, null],
+        [light, null],
+        [batch, 0],
+      ] as const)
+        await db.poolGrant.create({
+          data: {
+            poolId: pool.id,
+            ownerUserId: owner.id,
+            granteeUserId: grantee.id,
+            protectionOverridePercent,
+          },
+        });
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: owner.id,
+          label: `c-${suffix}`,
+          runtimeIdentityKey: `c-${suffix}`,
+          runtimeModel: "warm-proof",
+          hardConcurrencyLimit: 4,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: owner.id,
+          endpointId: endpoint.id,
+          upstreamModelId: "m",
+          encodedModelId: `m-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const now = new Date();
+      const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+      let sequence = 0;
+      const row = (input: {
+        tenantUserId: string;
+        lastUsedAt: Date;
+        tokens: number;
+        bindingDigest?: string;
+        conversationDigest?: string;
+      }) => ({
+        userId: owner.id,
+        tenantUserId: input.tenantUserId,
+        poolId: pool.id,
+        executionTargetId: target.id,
+        targetIdentity: "identity",
+        bindingDigest: input.bindingDigest ?? "b".repeat(64),
+        prefixDigest: input.conversationDigest
+          ? null
+          : `prefix-${String(sequence++).padStart(40, "0")}`,
+        conversationDigest: input.conversationDigest ?? null,
+        prefixDepth: input.conversationDigest ? 0 : 1,
+        estimatedTokens: input.tokens,
+        lastUsedAt: input.lastUsedAt,
+        createdAt: ago(1_000),
+        expiresAt: new Date(now.getTime() + 3_600_000),
+      });
+      const same = ago(3);
+      await db.cacheAffinityRecord.createMany({
+        data: [
+          // A batch (UNPROTECTED) user with many newer sessions.
+          ...Array.from({ length: 6 }, (_, index) =>
+            row({ tenantUserId: batch.id, lastUsedAt: ago(1 + index / 10), tokens: 20_000 }),
+          ),
+          // A heavy user with many newer sessions than the light user's one.
+          ...Array.from({ length: 6 }, (_, index) =>
+            row({ tenantUserId: heavy.id, lastUsedAt: ago(2 + index), tokens: 20_000 }),
+          ),
+          row({ tenantUserId: light.id, lastUsedAt: ago(60), tokens: 12_000 }),
+          // Two explicit conversations finishing in the same instant, each with
+          // its conversation record and the shared prefix records of the request.
+          row({
+            tenantUserId: owner.id,
+            lastUsedAt: same,
+            tokens: 15_000,
+            conversationDigest: "c".repeat(40),
+          }),
+          row({
+            tenantUserId: owner.id,
+            lastUsedAt: same,
+            tokens: 16_000,
+            conversationDigest: "d".repeat(40),
+          }),
+          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 16_000 }),
+          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 15_000 }),
+        ],
+      });
+      const policy = { windowSeconds: 300, minTokens: 8192 };
+      const sessions = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: [capacity.id],
+        policy,
+        now,
+        limitPerUser: 2,
+      });
+      const list = sessions.get(capacity.id) ?? [];
+      const count = (userId: string) => list.filter((session) => session.userId === userId).length;
+      // UNPROTECTED rows are dropped before ranking; the light user's only
+      // session survives the heavy user's newer ones; the heavy user is cut.
+      expect(count(batch.id)).toBe(0);
+      expect(count(heavy.id)).toBe(2);
+      expect(count(light.id)).toBe(1);
+      // Distinct explicit conversations stay distinct at one timestamp, and
+      // the prefix records of the same instant are not a third session.
+      expect(
+        list
+          .filter((session) => session.userId === owner.id)
+          .map((s) => s.tokens)
+          .sort(),
+      ).toEqual([15_000, 16_000]);
+    } finally {
+      for (const id of [owner.id, heavy.id, light.id, batch.id])
         await db.user.deleteMany({ where: { id } });
     }
   }, 60_000);

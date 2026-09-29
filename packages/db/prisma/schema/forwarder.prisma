@@ -1059,7 +1059,7 @@ model ModelPool {
   /// spill-over delay); 1..30000 = fixed milliseconds.
   cacheHolderWaitMs               Int?
   /// Warm-session protection (saturation S-C): a new session is routed away
-  /// from a member whose idle capacity holds other users' recently used,
+  /// from a member whose idle capacity holds other conversations' recently used,
   /// large prompt caches when another member (or, for `:external`, an
   /// external route) can take it. Redirect-only: it never blocks or queues.
   protectionEnabled               Boolean                       @default(true)

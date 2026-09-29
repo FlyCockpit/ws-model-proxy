@@ -123,7 +123,7 @@ The request goes external only after local routing could not serve it:
   while a cold local member is free. Pre-commit retry rounds keep the original
   external deadline instead of waiting another `externalAfterWaitMs` each;
 - no local member is free for a new conversation because the members with an
-  idle slot hold other people's protected warm sessions (see
+  idle slot hold protected warm sessions (other conversations, including the caller's own) (see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
   free: a new `:external` conversation may go external at once while a local
@@ -179,7 +179,7 @@ both start counting after the hold.
 
 ### Warm-session protection
 
-A new conversation should not evict someone else's recently used, large prompt
+A new conversation should not evict another conversation's recently used, large prompt
 cache when another member, or an external provider, can take it. No engine
 reports how old its cached prefixes are, so WSMP estimates "warm" from its own
 routing records (sizes and times only, never prompt content). Traffic that
@@ -191,7 +191,7 @@ For each request, every local member that has no affinity hit for it is:
 
 - **full** when all its slots are busy;
 - **protected** when it is not full but every idle slot holds a protected
-  session of someone else (slot mode), or, when the engine reports its KV
+  session of another conversation (slot mode), or, when the engine reports its KV
   budget (vLLM, SGLang: protocol 2.7 engine facts), when the protected tokens
   plus the request exceed 90% of that budget (token mode);
 - **free** otherwise.
@@ -228,6 +228,17 @@ capacity is shared between the people whose sessions are warm
   anyone's share.
 - `FIXED_PERCENT`: each user may keep `protectionFixedPercent` % of the slots.
 - `FIRST_COME`: no per-user cap.
+
+A session is one explicit conversation (its refreshed conversation record) or,
+for traffic without a conversation id, the prefix records one request wrote.
+An edited or shortened history can leave its older branch counted as a second
+session until the window ends (the engine may still hold it). The records of
+every pool of the owner on the member count; each session's override comes from
+its own pool (grant, or the owner's percent), each distinct override is its own
+budget, and one user's total never exceeds their largest share. `UNPROTECTED`
+sessions are never shielded and never count. Reads are bounded per user per
+member (2000 newest sessions), so one busy user or pool cannot hide another's
+sessions.
 
 Over the share, a user's oldest sessions lose protection first. The owner has
 no grant, so `ownerProtectionPercent` sets the owner's own share (null = the

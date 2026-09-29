@@ -498,6 +498,35 @@ describe("dedicated pool pages", () => {
         }),
       );
     });
+
+    it("does not validate a hidden percent field (a stale invalid value never blocks save)", async () => {
+      state.tab = "access";
+      state.pools = [grantPool({ protectionOverridePercent: 30, queuePriority: 5 })];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
+        target: { value: "150" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.protection"), {
+        target: { value: "UNPROTECTED" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: 0,
+            queuePriority: 5,
+          },
+        }),
+      );
+    });
   });
 
   describe("fallback settings form", () => {

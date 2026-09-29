@@ -5655,6 +5655,7 @@ async function relayPool({
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
       };
+  const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
@@ -5680,8 +5681,9 @@ async function relayPool({
           surface: requestedSurface,
           payload: affinityPayload,
           targets: affinityTargets,
-          // S-C: even one member must know whether this is a continuation.
-          scoreSingleTarget: true,
+          // S-C: even one member must know whether this is a continuation
+          // (only protection needs it: a pool without it pays no extra reads).
+          scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
@@ -5713,7 +5715,7 @@ async function relayPool({
     }
   }
   // Saturation S-C: warm-session protection (redirect-only). A new session
-  // avoids members whose idle capacity holds other users' protected warm
+  // avoids members whose idle capacity holds other conversations' protected warm
   // sessions: they route last, and with an external plan they are left out
   // of the first local admission (or, when nothing else can serve, the
   // request goes external first). It needs the affinity decision to tell a
@@ -5721,7 +5723,6 @@ async function relayPool({
   // nothing changes. Like affinity, it is an optimization only.
   let protectionInitialCandidates: typeof routeCandidates | null = null;
   let protectionExternalFirst = false;
-  const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (capacityRuntime && affinityDecision && protectionPolicy.enabled) {
     const decision = affinityDecision;
     const affineMember = (poolMemberId: string) => {
@@ -5814,10 +5815,12 @@ async function relayPool({
     // external phase of this request is used up.
     const overflow = await tryPublicOverflow("LOCAL_SATURATED_PROTECTED", async () => undefined);
     if (overflow.kind === "response") return overflow.response;
-    if (overflow.kind === "unavailable" && overflow.reason === "CANCELLED") {
+    // A cancel or a lost access (#76) ends the request; never resume locally.
+    const terminal = terminalExternalFailure(overflow);
+    if (terminal) {
       await operation.dispose?.();
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "cancelled" });
-      return operationFailureResponse(operation, "cancelled");
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: terminal });
+      return operationFailureResponse(operation, terminal);
     }
     localWaitMode = "full";
   }

@@ -19,12 +19,14 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 /** Token mode keeps this fraction of the KV budget as headroom. */
 export const PROTECTION_KV_HEADROOM = 0.1;
 /**
- * Upper bound on warm sessions read per member KV pool per request (newest
- * first). The window (default 5 min) and the size floor (default 8k tokens)
- * keep the real count far below it; the bound only caps a pathological table.
- * It applies per capacity so one busy pool can never crowd another pool's
- * sessions out of the read (a silently truncated protection set would leave
- * that pool looking unprotected).
+ * Upper bound on warm sessions read per user per member KV pool per request
+ * (newest first). The window (default 5 min) and the size floor (default 8k
+ * tokens) keep the real count far below it; the bound only caps a pathological
+ * table. It is per (capacity, user) because a user's protected sessions are a
+ * newest-first prefix of their own list: keeping each user's newest N leaves
+ * every user's prefix (up to N) and the active-user count exact, and one busy
+ * user or pool can never crowd another's sessions out of the read (a silently
+ * truncated protection set would leave the pool looking unprotected).
  */
 export const WARM_SESSION_QUERY_LIMIT = 2_000;
 
@@ -130,7 +132,9 @@ function eligible(session: WarmSession, policy: WarmProtectionPolicy) {
  * and belong to a user who is not `UNPROTECTED`. An "active user" has at least
  * one eligible session; users with only small or idle sessions do not dilute
  * the others' shares. Each active user may keep, newest first:
- * - an owner/grant override percent (1..100) of the pool, else
+ * - an owner/grant override percent (1..100) of the pool, per override value
+ *   (each session carries its own pool's override; the user's total stays
+ *   within the largest of their shares), else
  * - EQUAL_SHARE: max(1 session, pool / active users);
  * - FIXED_PERCENT: the pool's fixed percent;
  * - FIRST_COME: everything.
@@ -153,39 +157,55 @@ export function protectedWarmSessions(
   const activeUsers = byUser.size;
   const tokenMode = load.kvBudgetTokens !== null && load.kvBudgetTokens > 0;
   const protectedSessions: WarmSession[] = [];
+  const fractionFor = (override: number | null) =>
+    override !== null
+      ? override / 100
+      : policy.share === "FIRST_COME"
+        ? Number.POSITIVE_INFINITY
+        : policy.share === "FIXED_PERCENT" && policy.fixedPercent !== null
+          ? policy.fixedPercent / 100
+          : 1 / activeUsers;
+  // "Always at least one session" ("max(1 slot, K / active users)").
+  const fits = (scope: { count: number; tokens: number }, fraction: number, tokens: number) => {
+    if (scope.count === 0 || !Number.isFinite(fraction)) return true;
+    if (tokenMode) return scope.tokens + tokens <= load.kvBudgetTokens! * fraction;
+    return load.slots !== null && load.slots > 0
+      ? scope.count < Math.max(1, Math.floor(load.slots * fraction))
+      : true;
+  };
   for (const own of byUser.values()) {
     own.sort((left, right) => left.ageMs - right.ageMs || right.tokens - left.tokens);
-    // One override per user: the most generous explicit one across the user's
-    // eligible sessions (a user may hold grants in several pools of the same
-    // KV pool), so it never depends on which pool served the newest request.
-    const overrides = own.flatMap(({ overridePercent }) =>
-      overridePercent === null ? [] : [overridePercent],
+    // A session's override comes from its own pool (grant or owner percent), so
+    // each override value is its own budget bucket: one pool's setting never
+    // widens or narrows another pool's sessions. Across buckets the user stays
+    // within the largest bucket's share, so buckets never multiply entitlement.
+    const buckets = new Map<number | null, { count: number; tokens: number; closed: boolean }>();
+    const user = { count: 0, tokens: 0, closed: false };
+    const userFraction = Math.max(
+      ...own.map(({ overridePercent }) => fractionFor(overridePercent)),
     );
-    const override = overrides.length > 0 ? Math.max(...overrides) : null;
-    const fraction =
-      override !== null
-        ? override / 100
-        : policy.share === "FIRST_COME"
-          ? Number.POSITIVE_INFINITY
-          : policy.share === "FIXED_PERCENT" && policy.fixedPercent !== null
-            ? policy.fixedPercent / 100
-            : 1 / activeUsers;
-    if (tokenMode) {
-      const budget = load.kvBudgetTokens! * fraction;
-      let used = 0;
-      for (const [index, session] of own.entries()) {
-        // Always at least one session ("max(1 slot, K / active users)").
-        if (index > 0 && used + session.tokens > budget) break;
-        used += session.tokens;
-        protectedSessions.push(session);
+    for (const session of own) {
+      const bucket = buckets.get(session.overridePercent) ?? {
+        count: 0,
+        tokens: 0,
+        closed: false,
+      };
+      buckets.set(session.overridePercent, bucket);
+      if (user.closed || bucket.closed) continue;
+      if (!fits(user, userFraction, session.tokens)) {
+        user.closed = true;
+        continue;
       }
-      continue;
+      if (!fits(bucket, fractionFor(session.overridePercent), session.tokens)) {
+        bucket.closed = true;
+        continue;
+      }
+      for (const scope of [user, bucket]) {
+        scope.count += 1;
+        scope.tokens += session.tokens;
+      }
+      protectedSessions.push(session);
     }
-    const maxSessions =
-      load.slots !== null && load.slots > 0 && Number.isFinite(fraction)
-        ? Math.max(1, Math.floor(load.slots * fraction))
-        : own.length;
-    protectedSessions.push(...own.slice(0, maxSessions));
   }
   return protectedSessions;
 }
@@ -360,47 +380,79 @@ export async function loadWarmSessions({
   capacityIds,
   policy,
   now = new Date(),
-  limitPerCapacity = WARM_SESSION_QUERY_LIMIT,
+  limitPerUser = WARM_SESSION_QUERY_LIMIT,
 }: {
   ownerId: string;
   capacityIds: readonly string[];
   policy: Pick<WarmProtectionPolicy, "windowSeconds" | "minTokens">;
   now?: Date;
-  limitPerCapacity?: number;
+  limitPerUser?: number;
 }): Promise<Map<string, WarmSession[]>> {
   const sessions = new Map<string, WarmSession[]>();
   if (capacityIds.length === 0) return sessions;
   const since = new Date(now.getTime() - policy.windowSeconds * 1000);
   const rows = await prisma.$queryRaw<WarmSessionRow[]>(Prisma.sql`
-    SELECT "capacityId", "userId", "lastUsedAt", "tokens", "overridePercent"
-      FROM (
-    SELECT t."inferenceCapacityId" AS "capacityId",
-           r."tenantUserId" AS "userId",
-           r."lastUsedAt" AS "lastUsedAt",
-           MAX(r."estimatedTokens")::int AS "tokens",
-           CASE WHEN r."tenantUserId" = r."userId"
-                THEN p."ownerProtectionPercent"
-                ELSE g."protectionOverridePercent" END AS "overridePercent",
-           ROW_NUMBER() OVER (
-             PARTITION BY t."inferenceCapacityId"
-             ORDER BY r."lastUsedAt" DESC, MAX(r."estimatedTokens") DESC
-           ) AS "rank"
-      FROM cache_affinity_record r
-      JOIN execution_target t ON t.id = r."executionTargetId"
-      JOIN model_pool p ON p.id = r."poolId"
-      LEFT JOIN pool_grant g ON g."poolId" = r."poolId" AND g."granteeUserId" = r."tenantUserId"
-     WHERE r."userId" = ${ownerId}
-       AND t."userId" = ${ownerId}
-       AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
-       AND r."lastUsedAt" >= ${since}
-       AND r."expiresAt" > ${now}
-       AND r."estimatedTokens" IS NOT NULL
-     GROUP BY t."inferenceCapacityId", r."tenantUserId", r."userId", r."poolId",
-              r."executionTargetId", r."bindingDigest", r."lastUsedAt",
-              p."ownerProtectionPercent", g."protectionOverridePercent"
-    HAVING MAX(r."estimatedTokens") >= ${policy.minTokens}
-      ) ranked
-     WHERE "rank" <= ${limitPerCapacity}
+    WITH candidate AS (
+      SELECT r.*, t."inferenceCapacityId" AS "capacityId"
+        FROM cache_affinity_record r
+        JOIN execution_target t ON t.id = r."executionTargetId"
+       WHERE r."userId" = ${ownerId}
+         AND t."userId" = ${ownerId}
+         AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
+         AND r."lastUsedAt" >= ${since}
+         AND r."expiresAt" > ${now}
+         AND r."estimatedTokens" IS NOT NULL
+    ),
+    session AS (
+      -- An explicit conversation is one session: its (single, refreshed)
+      -- conversation record, whatever else shares its timestamp.
+      SELECT c."capacityId", c."tenantUserId", c."poolId", c."userId",
+             c."lastUsedAt", c."estimatedTokens" AS tokens
+        FROM candidate c
+       WHERE c."conversationDigest" IS NOT NULL AND c."prefixDigest" IS NULL
+      UNION ALL
+      -- Prefix-only traffic: the prefix records one request wrote share
+      -- tenant, pool, target, binding and lastUsedAt. A group that a
+      -- conversation record of the same instant already covers is not repeated.
+      SELECT c."capacityId", c."tenantUserId", c."poolId", c."userId",
+             c."lastUsedAt", MAX(c."estimatedTokens") AS tokens
+        FROM candidate c
+       WHERE c."prefixDigest" IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate v
+            WHERE v."conversationDigest" IS NOT NULL AND v."prefixDigest" IS NULL
+              AND v."tenantUserId" = c."tenantUserId" AND v."poolId" = c."poolId"
+              AND v."executionTargetId" = c."executionTargetId"
+              AND v."bindingDigest" = c."bindingDigest"
+              AND v."lastUsedAt" = c."lastUsedAt")
+       GROUP BY c."capacityId", c."tenantUserId", c."userId", c."poolId",
+                c."executionTargetId", c."bindingDigest", c."lastUsedAt"
+    ),
+    scoped AS (
+      SELECT s."capacityId", s."tenantUserId" AS "userId", s."lastUsedAt",
+             s.tokens::int AS tokens,
+             CASE WHEN s."tenantUserId" = s."userId"
+                  THEN p."ownerProtectionPercent"
+                  ELSE g."protectionOverridePercent" END AS "overridePercent"
+        FROM session s
+        JOIN model_pool p ON p.id = s."poolId"
+        LEFT JOIN pool_grant g ON g."poolId" = s."poolId" AND g."granteeUserId" = s."tenantUserId"
+       WHERE s.tokens >= ${policy.minTokens}
+    ),
+    ranked AS (
+      SELECT scoped.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY "capacityId", "userId"
+               ORDER BY "lastUsedAt" DESC, tokens DESC
+             ) AS "rank"
+        FROM scoped
+       -- UNPROTECTED sessions are never shielded and never count: they must
+       -- not use up the read bound either.
+       WHERE "overridePercent" IS DISTINCT FROM 0
+    )
+    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent"
+      FROM ranked
+     WHERE "rank" <= ${limitPerUser}
      ORDER BY "lastUsedAt" DESC
   `);
   for (const row of rows) {

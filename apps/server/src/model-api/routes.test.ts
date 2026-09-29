@@ -1605,6 +1605,30 @@ describe("model API routes", () => {
       ]);
     });
 
+    it.each([
+      ["POOL_OWNER_INACTIVE", 404, "not_found"],
+      ["REQUESTER_ACCESS_BLOCKED", 401, "access_denied"],
+    ] as const)(
+      "the protected external attempt ends the request on lost access (%s), never admitting locally",
+      async (reason, status, code) => {
+        useExternalPlan();
+        db.poolMember.findMany.mockResolvedValue(members());
+        kvPools({ a: "PROTECTED", b: "PROTECTED" });
+        publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason });
+        // The provider tier admits; the send gate then finds the access lost.
+        const { acquire, runtime } = scripted(["overflow-member", "member-a"]);
+
+        const { response } = request(runtime, EXTERNAL_MODEL_ID);
+        const served = await response;
+
+        expect(served.status).toBe(status);
+        await expect(served.json()).resolves.toMatchObject({ error: { code } });
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+        // No local admission round after the terminal external outcome.
+        expect(rounds(acquire)).toEqual([]);
+      },
+    );
+
     it("with a plan, a PROTECTED member sits out only the first admission", async () => {
       useExternalPlan();
       db.poolMember.findMany.mockResolvedValue(members());

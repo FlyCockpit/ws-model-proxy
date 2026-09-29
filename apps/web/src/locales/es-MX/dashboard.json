@@ -438,7 +438,7 @@
     },
     "protection": {
       "title": "Proteger conversaciones activas",
-      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras personas cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
+      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras conversaciones cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
       "enabled": "Proteger conversaciones activas",
       "windowSeconds": "Ventana de protección (segundos)",
       "minTokens": "Tamaño mínimo de la conversación (tokens)",
@@ -456,7 +456,7 @@
         "UNPROTECTED": "Sin protección"
       },
       "percentLabel": "Porcentaje de la capacidad de un miembro (1 a 100)",
-      "hint": "El calor se estima con los registros de enrutamiento de este pool (solo tamaños y tiempos, nunca el contenido del prompt). Solo cuentan las conversaciones usadas dentro de la ventana y con al menos el tamaño mínimo. Por encima de su parte, las conversaciones más antiguas de un usuario pierden la protección primero."
+      "hint": "El calor se estima con los registros de enrutamiento de todos los pools de este propietario en el miembro (solo tamaños y tiempos, nunca el contenido del prompt). Solo cuentan las conversaciones usadas dentro de la ventana y con al menos el tamaño mínimo. Por encima de su parte, las conversaciones más antiguas de un usuario pierden la protección primero."
     },
     "capacity": {
       "title": "Capacidad local compartida",

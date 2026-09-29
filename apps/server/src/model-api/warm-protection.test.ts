@@ -124,6 +124,55 @@ describe("S-C warm-session equity", () => {
     );
   });
 
+  it.each([
+    // [label, overrides newest-first, share, slots, expected protected count]
+    ["100% pool A does not widen 25% pool B", [100, 25, 25, 25], "EQUAL_SHARE", 4, 2],
+    [
+      "explicit 25% does not suppress inherited FIRST_COME",
+      [25, null, null, null],
+      "FIRST_COME",
+      4,
+      4,
+    ],
+    [
+      "two explicit values: the user total stays within the larger share",
+      [25, 75, 75, 75, 25],
+      "EQUAL_SHARE",
+      4,
+      3,
+    ],
+    ["the largest bucket bounds the user total", [50, 50, 100, 100], "EQUAL_SHARE", 4, 4],
+    ["a bucket always keeps its first session", [10, 10, 10], "EQUAL_SHARE", 4, 1],
+    ["inherit shares the pool with an explicit bucket", [null, null, 25, 25], "EQUAL_SHARE", 4, 3],
+  ] as const)("cross-pool overrides: %s", (_label, overrides, share, slotCount, expected) => {
+    const sessions = overrides.map((override, index) =>
+      session("alice", 10 + index, 10_000, override),
+    );
+    expect(protectedWarmSessions(sessions, slots(slotCount), policy({ share }))).toHaveLength(
+      expected,
+    );
+    expect(
+      protectedWarmSessions([...sessions].reverse(), slots(slotCount), policy({ share })),
+    ).toHaveLength(expected);
+  });
+
+  it("token mode applies each override bucket and the user total to the KV budget", () => {
+    const load = { slots: null, active: 0, kvBudgetTokens: 100_000 };
+    const sessions = [
+      session("alice", 10, 30_000, 100),
+      session("alice", 20, 30_000, 25),
+      session("alice", 30, 30_000, 25),
+      session("alice", 40, 30_000, 100),
+    ];
+    // Bucket 25% of 100k holds one 30k session (the second would be 60k > 25k);
+    // bucket 100% holds both of its own; the user total 100k holds three.
+    expect(ages(protectedWarmSessions(sessions, load, policy()))).toEqual([
+      "alice@10",
+      "alice@20",
+      "alice@40",
+    ]);
+  });
+
   it("a percent override replaces the pool share for that user", () => {
     const protectedSessions = protectedWarmSessions(
       [
