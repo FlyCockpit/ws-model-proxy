@@ -287,8 +287,9 @@ export const cliCredentialsRouter = {
           throw expiredLoginRequest();
         }
         // The row is gone: this request was read as approvable, so it was
-        // approved and redeemed by the CLI between the read and the write (or
-        // expired and was swept). Say so, rather than "already handled".
+        // approved and redeemed by the CLI between the read and the write, or
+        // it was swept after expiring, or it was denied and then swept by the
+        // denied-poll sweep. Say so, rather than "already handled".
         if (current === null) throw alreadyUsed();
         throw alreadyHandled();
       }

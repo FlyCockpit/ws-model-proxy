@@ -29,6 +29,22 @@ describe("CLI device login scope", () => {
   });
 });
 
+describe("DEVICE_LOGIN_REFUSAL_REASONS", () => {
+  it("is exactly the six accepted refusal reasons", () => {
+    // Literal, deliberately NOT derived from the constant: this fails if a
+    // reason is removed, added, or reordered without updating the wire
+    // contract the approval page and CLI both classify on.
+    expect(DEVICE_LOGIN_REFUSAL_REASONS).toEqual([
+      "not_found",
+      "expired",
+      "already_handled",
+      "already_used",
+      "slug_mismatch",
+      "no_slug",
+    ]);
+  });
+});
+
 describe("deviceLoginRefusalReasonOf", () => {
   it.each(DEVICE_LOGIN_REFUSAL_REASONS)("reads %s from data.reason", (reason) => {
     expect(deviceLoginRefusalReasonOf({ code: "CONFLICT", data: { reason } })).toBe(reason);
