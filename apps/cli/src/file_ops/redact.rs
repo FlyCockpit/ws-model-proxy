@@ -100,6 +100,13 @@ fn fold(name: &str) -> String {
                 match ch {
                     'ſ' => out.push('s'),
                     'ß' | 'ẞ' => out.push_str("ss"),
+                    // the Latin ligatures FB00-FB06 fold to their letters
+                    '\u{FB00}' => out.push_str("ff"),
+                    '\u{FB01}' => out.push_str("fi"),
+                    '\u{FB02}' => out.push_str("fl"),
+                    '\u{FB03}' => out.push_str("ffi"),
+                    '\u{FB04}' => out.push_str("ffl"),
+                    '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
                     other => out.push(other),
                 }
                 out
@@ -307,14 +314,14 @@ const SECRET_NAME: &str =
 /// csh `setenv NAME value`.
 static ENV_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^[ \t]*(?:ENV|ARG|setenv|SetEnv)[ \t]+({SECRET_NAME})[ \t]+"
+        r"^[ \t]*(?i:env|arg|setenv)[ \t]+({SECRET_NAME})[ \t]+"
     ))
     .expect("env word regex")
 });
 /// Inline Kubernetes/ECS name/value pair: `{"name": "DB_PASSWORD", "value": "..."}`.
 static INLINE_PAIR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?[ \t]*,[ \t]*["']?value["']?[ \t]*:[ \t]*"#
+        r#"["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?[ \t]*,[^{{}}]*?["']?value["']?[ \t]*:[ \t]*"#
     ))
     .expect("inline pair regex")
 });
@@ -554,6 +561,9 @@ fn first_assignment(line: &str) -> Option<Candidate> {
         } else if matches!(bytes.get(at), Some(b'"' | b'\'')) {
             at += 1;
         }
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
         if bytes.get(at) == Some(&b']') {
             at += 1;
         }
@@ -601,6 +611,43 @@ fn first_assignment(line: &str) -> Option<Candidate> {
     None
 }
 
+/// A JSON key can spell an ASCII letter as `\u00XX` (`"API\u005fKEY"`). The
+/// line is decoded (ASCII escapes only) into a shadow string with a byte map, the
+/// assignment recognizer runs on it, and the candidate maps back to the original
+/// offsets, so the mask covers the source bytes.
+fn first_assignment_escaped(line: &str) -> Option<Candidate> {
+    if !line.contains("\\u00") {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut decoded = String::with_capacity(line.len());
+    let mut map: Vec<usize> = Vec::with_capacity(line.len() + 1);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && bytes.get(i + 1) == Some(&b'u')
+            && bytes.get(i + 2..i + 4) == Some(b"00")
+            && let Some(hex) = line.get(i + 4..i + 6)
+            && let Ok(value) = u8::from_str_radix(hex, 16)
+            && value.is_ascii()
+        {
+            decoded.push(value as char);
+            map.push(i);
+            i += 6;
+            continue;
+        }
+        let ch = line[i..].chars().next()?;
+        decoded.push(ch);
+        for _ in 0..ch.len_utf8() {
+            map.push(i);
+        }
+        i += ch.len_utf8();
+    }
+    map.push(bytes.len());
+    let (start, construct) = first_assignment(&decoded)?;
+    Some((*map.get(start)?, construct))
+}
+
 /// The first secret flag of `line` (`--token abc`, `--api-key=abc`).
 fn first_flag(line: &str) -> Option<Candidate> {
     if !line.contains('-')
@@ -637,18 +684,21 @@ fn first_flag(line: &str) -> Option<Candidate> {
 
 /// `ENV NAME value` / `setenv NAME value`.
 fn first_env_word(line: &str) -> Option<Candidate> {
-    let head = line.trim_start();
-    if !(head.starts_with("ENV")
-        || head.starts_with("ARG")
-        || head.starts_with("setenv")
-        || head.starts_with("SetEnv"))
-    {
+    let head = line.trim_start().as_bytes();
+    let directive = [&b"env"[..], b"arg", b"setenv"]
+        .iter()
+        .any(|word| head.len() >= word.len() && head[..word.len()].eq_ignore_ascii_case(word));
+    if !directive {
         return None;
     }
     let caps = ENV_WORD.captures(line)?;
     let start = caps.get(0)?.end();
     let tail = &line[start..];
     let trimmed = tail.trim_end();
+    if trimmed == "\\" {
+        // a lone backslash hides nothing, but the value is on the next line
+        return Some((line.len(), Construct::UntilBlank));
+    }
     if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
         return None;
     }
@@ -689,6 +739,7 @@ fn first_inline_pair(line: &str) -> Option<Candidate> {
 fn first_secret(line: &str) -> Option<Candidate> {
     [
         first_assignment(line),
+        first_assignment_escaped(line),
         first_flag(line),
         first_env_word(line),
         first_inline_pair(line),
@@ -765,16 +816,37 @@ fn continuation_value(line: &str) -> Option<(Range<usize>, Construct)> {
     ))
 }
 
-/// A `-----BEGIN <anything> PRIVATE KEY-----` marker (`OPENSSH`, `RSA`, `EC`,
-/// `ENCRYPTED` and plain): public keys and certificates do not match.
-fn pem_begin(line: &str) -> bool {
-    line.find("-----BEGIN")
-        .is_some_and(|at| line[at..].contains("PRIVATE KEY-----"))
-}
-
-fn pem_end(line: &str) -> bool {
-    line.find("-----END")
-        .is_some_and(|at| line[at..].contains("PRIVATE KEY-----"))
+/// The private-key BEGIN/END markers of `line` in order, with their labels
+/// (`true` for a BEGIN). A marker is `-----BEGIN <label>-----` /
+/// `-----END <label>-----`; it is a private key marker when the label ends in
+/// `PRIVATE KEY` (plain, RSA, EC, DSA, OPENSSH, ENCRYPTED). Public keys and
+/// certificates are not. Several markers may share a line.
+fn pem_events(line: &str) -> Vec<(bool, &str)> {
+    let mut events = Vec::new();
+    let mut at = 0;
+    while let Some(found) = line[at..].find("-----") {
+        let start = at + found;
+        let rest = &line[start + 5..];
+        let (is_begin, label_start) = if let Some(r) = rest.strip_prefix("BEGIN ") {
+            (Some(true), r)
+        } else if let Some(r) = rest.strip_prefix("END ") {
+            (Some(false), r)
+        } else {
+            (None, rest)
+        };
+        if let Some(begin) = is_begin
+            && let Some(label_end) = label_start.find("-----")
+        {
+            let label = &label_start[..label_end];
+            if label.ends_with("PRIVATE KEY") {
+                events.push((begin, label));
+            }
+            at = start + 5 + (rest.len() - label_start.len()) + label_end + 5;
+            continue;
+        }
+        at = start + 5;
+    }
+    events
 }
 
 fn indent_of(line: &str) -> usize {
@@ -808,8 +880,9 @@ struct OpenBlock {
 pub struct LineMasker {
     class: FileClass,
     lookback: usize,
-    /// Offset of the `-----BEGIN ... PRIVATE KEY-----` line of the open key block.
-    pem_block: Option<usize>,
+    /// Open `-----BEGIN <label>-----` private-key blocks: label and the offset of
+    /// the BEGIN line. An END closes the innermost block of the SAME label.
+    pem_stack: Vec<(String, usize)>,
     pending_flag_value: bool,
     /// Offset of the latest opener of the run that masks lines until a blank line.
     until_blank: Option<usize>,
@@ -837,7 +910,7 @@ impl LineMasker {
         Self {
             class,
             lookback,
-            pem_block: None,
+            pem_stack: Vec::new(),
             pending_flag_value: false,
             until_blank: None,
             blocks: Vec::new(),
@@ -863,7 +936,7 @@ impl LineMasker {
     /// Whether a multi-line value that started on an earlier line is still open:
     /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
-        self.until_blank.is_some() || !self.blocks.is_empty() || self.pem_block.is_some()
+        self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_stack.is_empty()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a
@@ -902,7 +975,10 @@ impl LineMasker {
         } else {
             let indent = indent_of(line);
             self.blocks.retain(|block| block.indent < indent);
-            self.env_blocks.retain(|block| block.indent < indent);
+            // an item `- ...` at the header's own indentation still belongs to the list
+            let item = line.trim_start().starts_with('-');
+            self.env_blocks
+                .retain(|block| block.indent < indent || (item && block.indent == indent));
             masked_by = self
                 .blocks
                 .iter()
@@ -911,10 +987,24 @@ impl LineMasker {
                 .max();
             env_open = self.env_blocks.iter().map(|block| block.opener).max();
         }
-        // a private-key block (any file): from its BEGIN line through its END line
-        let begin = pem_begin(line);
-        let end = pem_end(line);
-        let pem_opener = self.pem_block.or(begin.then_some(at));
+        // private-key blocks (any file): from a BEGIN line through the END line of the
+        // same label. The markers of a line apply in byte order (`END CERT-----BEGIN
+        // KEY` opens one); a mismatched END closes nothing (fail closed); several
+        // blocks may be open at once, and the latest opener charges the lookback.
+        let mut pem_touched = !self.pem_stack.is_empty();
+        let pem_open_at_start = self.pem_stack.iter().map(|(_, opener)| *opener).max();
+        let mut stack = std::mem::take(&mut self.pem_stack);
+        for (begin, label) in pem_events(line) {
+            pem_touched = true;
+            if begin {
+                if stack.len() < 16 {
+                    stack.push((label.to_string(), at));
+                }
+            } else if let Some(idx) = stack.iter().rposition(|(open, _)| open == label) {
+                stack.truncate(idx);
+            }
+        }
+        let pem_opener = pem_open_at_start.or(pem_touched.then_some(at));
         masked_by = masked_by.max(pem_opener);
         // 2. the line's own rules and openers, always (union semantics)
         self.dep = None;
@@ -925,14 +1015,18 @@ impl LineMasker {
             self.long_run = true;
         }
         // 3. register what this line opened or closed
+        // a construct opened by a line whose own masking rests on a prerequisite line
+        // (a name line, an env list header) is charged to that prerequisite: a reader
+        // that cannot see it cannot mask the construct either
+        let opener_at = self.dep.map_or(at, |dep| dep.min(at));
         match opened {
             Construct::None => {}
-            Construct::UntilBlank => self.until_blank = Some(at),
+            Construct::UntilBlank => self.until_blank = Some(opener_at),
             Construct::Block { line_indent } => {
                 self.blocks.retain(|block| block.indent != line_indent);
                 self.blocks.push(OpenBlock {
                     indent: line_indent,
-                    opener: at,
+                    opener: opener_at,
                 });
             }
         }
@@ -941,11 +1035,7 @@ impl LineMasker {
             self.env_blocks.retain(|block| block.indent != indent);
             self.env_blocks.push(OpenBlock { indent, opener: at });
         }
-        if end && (self.pem_block.is_some() || begin) {
-            self.pem_block = None;
-        } else if begin && self.pem_block.is_none() {
-            self.pem_block = Some(at);
-        }
+        self.pem_stack = stack;
         if masked_by.is_some() {
             return vec![(0..line.len(), token_bare())];
         }
@@ -1540,6 +1630,32 @@ mod tests {
             assert_eq!(view.matches("BODYLINE").count(), 0, "{view:?}");
             assert!(view.starts_with("head\n"));
         }
+        // an END binds to its own label; a mismatched END closes nothing (fail closed);
+        // nested and same-line transitions keep every open block masked
+        let ec_open = "-----BEGIN EC PRIVATE KEY-----";
+        let rsa_open = "-----BEGIN RSA PRIVATE KEY-----";
+        let ec_end = "-----END EC PRIVATE KEY-----";
+        let rsa_end = "-----END RSA PRIVATE KEY-----";
+        for (text, must_end_visible) in [
+            (format!("{ec_open}\nBODYA\n{rsa_end}\nBODYB\n"), false),
+            (
+                format!("{rsa_open}\n{ec_open}\nBODYA\n{ec_end}\nBODYB\n{rsa_end}\ntail\n"),
+                true,
+            ),
+            (
+                format!("{ec_end}{rsa_open}\nBODYA\nBODYB\n{rsa_end}\ntail\n"),
+                true,
+            ),
+            (
+                format!("{rsa_end}{ec_open}\nBODYA\n{ec_end}{rsa_open}\nBODYB\n{rsa_end}\ntail\n"),
+                true,
+            ),
+        ] {
+            let view = masked(FileClass::Plain, &format!("head\n{text}"));
+            assert!(!view.contains("BODY"), "{text:?} -> {view:?}");
+            assert!(view.starts_with("head\n"), "{view:?}");
+            assert!(!must_end_visible || view.ends_with("tail\n"), "{view:?}");
+        }
         // public keys and certificates stay visible
         for label in [
             "PUBLIC KEY",
@@ -1920,6 +2036,37 @@ mod tests {
                 &["SECRETXL1", "SECRETXL2", "SECRETXL3"],
             ),
             (Plain, "API_KEY='$FOO\nSECRETXL4'\n\nv\n", &["SECRETXL4"]),
+            // round 6: variants inside the kept env shapes
+            (
+                Plain,
+                "ENV API_KEY \\\nenvcont-secret\n\nv\n",
+                &["envcont-secret"],
+            ),
+            (
+                Plain,
+                "env API_KEY lowerenv-secret\nArg DB_PASSWORD mixedarg-secret\n",
+                &["lowerenv-secret", "mixedarg-secret"],
+            ),
+            (
+                Plain,
+                "os.environ[\"API_KEY\" ] = \"space-secret\"\nos.environ[ \"X_TOKEN\" ] = 'sp2-secret'\n",
+                &["space-secret", "sp2-secret"],
+            ),
+            (
+                Plain,
+                "{\"name\": \"DB_PASSWORD\", \"other\": 1, \"valueFrom\": null, \"value\": \"between-secret\"}\n",
+                &["between-secret"],
+            ),
+            (
+                Plain,
+                "env:\n- value: indentless-secret\n  name: API_KEY\n- value: second-indentless\n  name: X_TOKEN\nnext: 1\n",
+                &["indentless-secret", "second-indentless"],
+            ),
+            (
+                Plain,
+                "{\"API\\u005fKEY\": \"uni-secret\", \"\\u0044B_PASSWORD\":\"uni2-secret\"}\n",
+                &["uni-secret", "uni2-secret"],
+            ),
         ];
         let mut leaks = Vec::new();
         for (class, input, secrets) in rows {
@@ -2027,6 +2174,15 @@ mod tests {
             ("/mnt/usb/prod.env. ", FileClass::Dotenv),
             ("/h/.cache/huggingface/token.", FileClass::HfToken),
             ("/mnt/usb/server.pem.", FileClass::PemKey),
+            (
+                "/h/.cache/huggingface/\u{FB05}ored_tokens",
+                FileClass::HfToken,
+            ),
+            (
+                "/h/.cache/huggingface/\u{FB06}ored_tokens",
+                FileClass::HfToken,
+            ),
+            ("/h/.cache/huggingface/\u{FB01}le", FileClass::Plain),
             ("/h/.ssh/id_\u{212A}", FileClass::SshPrivateKey),
         ] {
             assert_eq!(classify(Path::new(path)), class, "{path}");
@@ -2171,7 +2327,65 @@ mod tests {
         let mut checked = 0;
         // hand-written shapes first (a reader that starts INSIDE a run whose body holds
         // an opener), then random documents from the pool
-        let fixed: [&[&str]; 4] = [
+        let fixed: [&[&str]; 8] = [
+            // a name line, comments, then the value header with a trailing comment
+            &[
+                "- name: X_TOKEN",
+                "  # a comment line",
+                "  # another comment line here",
+                "  value: |  # note",
+                "    BODY-secret-line",
+                "next: 1",
+            ],
+            &[
+                concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+                concat!("-----BEGIN ", "EC PRIVATE KEY-----"),
+                "BODY-secret-line",
+                concat!("-----END ", "EC PRIVATE KEY-----"),
+                "more-secret-body",
+                concat!("-----END ", "RSA PRIVATE KEY-----"),
+                "after",
+            ],
+            // the env header is just inside the lookback of the `value:` line, its
+            // block's continuation is just outside: the block is charged to the header
+            &[
+                "env:",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "  - value: |",
+                "      cont-secret-line",
+                "next: 1",
+            ],
+            &[
+                "- name: X_TOKEN",
+                "  x: 12345678901234567890123456789012345678901234567890",
+                "  y: 2",
+                "  value: |",
+                "    cont-secret-line",
+                "next: 1",
+            ],
             &[
                 "E_KEY: |",
                 "  eeeeeeee",

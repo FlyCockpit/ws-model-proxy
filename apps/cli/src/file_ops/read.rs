@@ -414,6 +414,9 @@ pub(crate) fn assemble(
     })
 }
 
+/// The most of a huge file's end that one tail read scans for its lines.
+const TAIL_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// How many lines of a huge file are read between cancellation checks.
 const CANCEL_CHECK_LINES: u64 = 512;
 
@@ -616,15 +619,33 @@ fn tail_window(
     etag: &str,
 ) -> FileResult<(Window, Eol)> {
     cancel.check()?;
-    let chunk_len = ((max_bytes as u64) * 2 + 64 * 1024).min(stat.size);
-    let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
-    if partial_first {
-        // A line longer than 16 MiB precedes the tail: its state cannot be known,
-        // and serving the lines after it unmasked could show a continued value.
-        return Err(too_large_tail());
-    }
-    let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
-    file.read_exact_at(&mut chunk, chunk_start)?;
+    // Read enough of the end to hold the requested lines (lines that mask short
+    // can be very long raw): grow the chunk up to the scan bound, then refuse
+    // instead of returning fewer lines than asked without saying so.
+    let wanted = count.min(max_lines);
+    let mut chunk_len = ((max_bytes as u64) * 2 + 64 * 1024).min(stat.size);
+    let (chunk_start, chunk) = loop {
+        cancel.check()?;
+        let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
+        if partial_first {
+            // A line longer than 16 MiB precedes the tail: its state cannot be known,
+            // and serving the lines after it unmasked could show a continued value.
+            return Err(too_large_tail());
+        }
+        let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
+        file.read_exact_at(&mut chunk, chunk_start)?;
+        let lines = chunk.split_inclusive(|b| *b == b'\n').count();
+        if lines >= wanted || chunk_start == 0 {
+            break (chunk_start, chunk);
+        }
+        if chunk_len >= TAIL_SCAN_MAX_BYTES.min(stat.size) {
+            return Err(FileError::new(
+                ErrorCode::TooLarge,
+                "the requested last lines are longer than the tail scan bound (32 MiB); ask for fewer lines or use a positive startLine",
+            ));
+        }
+        chunk_len = (chunk_len * 4).min(TAIL_SCAN_MAX_BYTES).min(stat.size);
+    };
     let raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
     let want = count.min(max_lines).min(raw_lines.len());
     if want == 0 {

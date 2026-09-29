@@ -1261,3 +1261,68 @@ fn a_tail_window_of_lines_that_mask_short_still_sees_its_context() {
         r.text.get(..120).unwrap_or(&r.text)
     );
 }
+
+// ---- a tail read returns the lines it was asked for --------------------------------
+
+#[test]
+fn a_tail_read_returns_every_requested_line_even_when_they_mask_short() {
+    let fx = Fx::new();
+    let path = fx.root.join("wide.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..68 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    for i in 0..12 {
+        file.write_all(format!("W{i}_TOKEN={}\n", "a".repeat(110_000)).as_bytes())
+            .unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+    let r = fx.read_with(json!({ "path": fx.p("wide.log"), "startLine": -12, "maxLines": 12 }));
+    assert_eq!(r.text.lines().count(), 12, "{}", r.text);
+    assert!(!r.text.contains("aaaa"), "{}", r.text);
+    // more raw than the scan bound: refused, never a silent subset
+    let r = fx.ops.read(
+        &args(json!({ "path": fx.p("wide.log"), "startLine": -1_000_000, "maxLines": 2000 })),
+        &fx.cancel,
+    );
+    if let Ok(ok) = r {
+        // the file's whole tail fits the bound: fine, but then it must be complete
+        match ok {
+            crate::file_ops::read::ReadOutcome::Content(c) => assert!(c.text.lines().count() > 12),
+            crate::file_ops::read::ReadOutcome::Unchanged { .. } => panic!("unexpected"),
+        }
+    }
+}
+
+// ---- the file tools' own staging files are not tool targets --------------------------
+
+#[test]
+fn another_tool_call_cannot_replace_a_staged_file() {
+    let fx = Fx::new();
+    fx.put("ordinary.txt", "one\n");
+    for tool in ["write", "delete", "rename", "mkdir"] {
+        let staged = fx.p(".ordinary.txt.wsmp-abcdefghij");
+        let value = match tool {
+            "write" => json!({ "path": staged, "content": "swap" }),
+            "delete" => json!({ "path": staged }),
+            "rename" => json!({ "from": staged, "to": fx.p("elsewhere.txt") }),
+            _ => json!({ "path": staged }),
+        };
+        let r = fx.ops.execute(tool, value, &fx.cancel);
+        assert_eq!(
+            r.expect_err("staged names are refused").code,
+            ErrorCode::PathDenied,
+            "{tool}"
+        );
+    }
+    // an ordinary dotfile that merely looks similar is fine
+    fx.ops
+        .write(
+            &args(json!({ "path": fx.p(".ordinary.txt.wsmp-short"), "content": "ok" })),
+            &fx.cancel,
+        )
+        .unwrap();
+}

@@ -112,6 +112,11 @@ impl Policy {
                 "this tree holds special files and is not accessible",
             ));
         }
+        if access != Access::Read && is_staging_name(full) {
+            return Err(FileError::denied(
+                "temporary files of the file tools are not accessible",
+            ));
+        }
         if access != Access::Read && super::redact::is_secret_scope(full) {
             return Err(FileError::new(
                 ErrorCode::SecretFile,
@@ -176,6 +181,21 @@ impl Policy {
     pub fn hidden_from_walk(&self, full: &Path) -> bool {
         self.check_path(Access::Read, full).is_err()
     }
+}
+
+/// A name that `atomic::replace` stages a replacement under
+/// (`.<name>.wsmp-<10 alphanumerics>`): another tool call must not be able to
+/// swap the staged object between its fsync and its rename.
+fn is_staging_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    rest.rsplit_once(".wsmp-").is_some_and(|(_, suffix)| {
+        suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
 }
 
 /// `path` with its deepest existing ancestor resolved to the physical path
