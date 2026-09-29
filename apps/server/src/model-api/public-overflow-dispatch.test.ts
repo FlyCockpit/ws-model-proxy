@@ -3335,11 +3335,80 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines, so the native
-    // Responses terminal is not recognised and the observation stays
-    // incomplete (liability). OpenRouter accounts claim only Chat Completions,
-    // so Responses clients reach OpenRouter adapted to Chat.
+    // OpenRouter's Responses stream sends no `event:` lines and its terminal is
+    // deliberately not recognised (read to EOF, full hold): the observation
+    // completes only where the terminal is named (Messages `message_stop`,
+    // Chat `[DONE]`).
     expect(settled.observationComplete).toBe(surface !== "openai-responses");
+  });
+
+  it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    // A `response.completed` event line on a record of another type is no terminal.
+    const text = raw.replace(
+      /data: (\{"type":"response\.created")/,
+      "event: response.completed\ndata: $1",
+    );
+    expect(text).not.toBe(raw);
+    // The real terminal record is removed, leaving only the mismatching one.
+    const withoutTerminal = text.replace(/data: \{"type":"response\.completed".*\n\n/, "");
+    expect(withoutTerminal).not.toBe(text);
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutTerminal)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled.observationComplete).toBe(false);
+  });
+
+  // AC 13: an event-less (data-only) Responses record is never a terminal, for
+  // any provider type: recognising one would cut the read off at the first
+  // such record and make billing depend on transport chunking.
+  it.each(["openrouter", "openai", "openai-compatible"] as const)(
+    "does not complete an event-less Responses terminal for the %s provider type",
+    async (providerType) => {
+      // Strip the trailing `data: [DONE]` sentinel so nothing else ends the stream.
+      const raw = readFileSync(
+        new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+        "utf8",
+      );
+      const withoutDone = raw.replace(/data: \[DONE\]\s*$/, "");
+      expect(withoutDone).not.toBe(raw);
+      const settled = await settleOwnerStream(
+        providerType,
+        [Buffer.from(withoutDone)],
+        "owner",
+        "openai-responses",
+      );
+      expect(settled.observationComplete).toBe(false);
+    },
+  );
+
+  // AC 14 / M5: Messages stays strict. A data-only `message_stop` with no
+  // `event:` line must never be taken as a terminal, even though the record's
+  // `type` names it; otherwise a truncated/forged Messages stream would settle.
+  it("does not complete a Messages stream whose terminal has no event line", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/messages-stream-write.raw", import.meta.url),
+      "utf8",
+    );
+    const withoutEvents = raw
+      .split("\n")
+      .filter((line) => !line.startsWith("event:"))
+      .join("\n");
+    expect(withoutEvents).not.toBe(raw);
+    expect(withoutEvents).toContain('data: {"type":"message_stop"}');
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutEvents)],
+      "owner",
+      "anthropic-messages",
+    );
+    expect(settled.observationComplete).toBe(false);
   });
 
   it.each([
