@@ -13,6 +13,71 @@ detection timing based on server configuration, making such a test nondeterminis
 shared CI. The injected proof deterministically verifies the same driver error codes, retry bound,
 and absence of state committed by failed attempts.
 
+## One admission planner: who gets a slot
+
+Every grant of a physical-capacity slot goes through `admission-planner.ts` (`planGrants`), the
+single enforcement point for "who gets a slot". `PostgresCapacityAdmissionStore.#admitCapacity` runs
+it for both callers: acquire (offer mode: stop once the polling or creating request is granted)
+and release/reclaim (fill mode: grant until nothing more fits).
+
+1. **Read** (`#readAdmissionSnapshot`): the deadline sweep (deferred waiters are left to their
+   owner's poll), the grant-time routability re-check, then ONE snapshot of the capacity (limit, DRR
+   cursor/deficits/version), ACTIVE leases, WAITING waiters, reservation members, direct
+   reservations and per-scope lease counts, all under the L4/L6 locks the caller already holds.
+2. **Plan** (`planGrants`, pure, no database): applies the decision repeatedly in memory. Each step
+   is the single-grant decision (eligibility: `notBefore <= now`, candidate/request deadlines with
+   the creating-request and last-chance exceptions, member/scope and physical limits, reservation
+   borrowing, then one weighted deficit round robin pick), then updates the in-memory state (active
+   counts, per-owner and per-scope counts, the winner's request leaves the queue, DRR state). The
+   loop is bounded by progress (waiters at entry + 1 steps, every grant removes a waiter), never by a
+   constant, so unlimited capacities are served completely. Borrow-check aggregates are computed
+   once per step.
+3. **Write** (`#persistGrants`): one sorted `FOR UPDATE` over the winners' request rows plus a
+   re-read (a winner no longer WAITING ends the persisted prefix and the pass re-plans), the
+   shutdown fence checked ONCE right before the first write (armed: nothing is written), then
+   batched writes: the capacity's scheduler state and fencing counter, `createMany` leases,
+   requests to ADMITTED, sibling waiters to CANCELLED, winner waiters to ADMITTED.
+
+The transaction can be retried (`runCapacitySerializable`): nothing is carried across attempts;
+each attempt re-reads, re-plans and takes fencing tokens from the capacity row's counter. Cost per
+transaction is one snapshot plus O(waiters) work per grant in memory and a handful of statements,
+independent of how many waiters are granted (256 grants: about 0.5 s release, 1.5 s poll on a
+loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged. The planner is O(k·W) per
+transaction (k grants over W waiters) and is suited to at most a few thousand simultaneously
+grantable waiters per capacity.
+
+## Spill-over `notBefore` and grant-time routability (saturation S-A)
+
+- A pool request whose prefix is warm on one member (the cache holder: best continuation
+  prefix depth, or a conversation match) defers every other candidate: the store sets
+  `CapacityWaiter.notBefore = clock_timestamp() + notBeforeMs` at enqueue (database clock,
+  capped at 30 s). A waiter before its `notBefore` is neither granted nor counted in the
+  reservation-borrowing arbitration, and the DRR scheduler never sees it.
+- Every wait budget of an attempt counts from its spill instant (the latest `notBefore`), so a
+  deadline never precedes `notBefore` and an `:external` caller leaves the local queue only at
+  `max(notBefore) + externalAfterWaitMs`. A deferred attempt keeps at least 250 ms of eligibility
+  so a zero budget is still checked once at the spill instant.
+- Time passing is not a release event and sends no notification: the runtime re-polls every
+  100 ms and each poll re-runs admission, so a deferred waiter becomes grantable on the first
+  poll at or after its `notBefore`.
+- A deferred waiter always gets one admission check after it becomes eligible. Each poll stamps
+  `AdmissionRequest.heartbeatAt`; when a poll is delayed past a deferred waiter's deadline (for
+  example by contended capacity locks) and the previous poll ran before its `notBefore`, that poll
+  runs admission for it once ("last chance") and expires it only afterwards. Other admitters'
+  deadline sweeps skip deferred waiters and leave them to their owner's poll; the request's
+  absolute deadline still applies.
+- A retry round (a new attempt after a pre-commit failure) may pass
+  `schedule: { anchorAttemptId, spillDelayMs }`: its `notBefore`, spill instant and budgets are
+  then computed from the first attempt's database-clock enqueue instant
+  (`AdmissionRequest.enqueuedAt`), not restarted, so lock waits before the retry's transaction
+  never extend the original external deadline. Instants already in the past are clamped to now.
+- At each admission pass (even while the capacity is full), waiters whose member is no longer
+  routable (`routingStatus` not ACTIVE; for PRIMARY members also `weight <= 0` or UNHEALTHY with a future
+  `nextRetryAt`; external members use provider health at dispatch)
+  are cancelled with `terminalReason = member_unroutable`; the request expires with that reason
+  once no candidate is left. The `pool_member` read is a plain subquery (no row lock), so it adds
+  no lock-order edge. CLI connection state is per process and remains a candidate-build and
+  dispatch check only.
 
 ## Lease ownership from admission to release (F2-CAP-1)
 

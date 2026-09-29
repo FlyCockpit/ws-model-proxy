@@ -226,6 +226,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     protocolAdaptationEnabled: false,
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
+    cacheHolderWaitMs: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -2156,6 +2157,28 @@ describe("forwarderManagementRouter", () => {
     // Disabling never inspects or removes the external members.
     expect(db.poolMember.findMany).not.toHaveBeenCalled();
     expect(db.poolMember.delete).not.toHaveBeenCalled();
+  });
+
+  it("stores the cache-holder wait override (auto, off, fixed) and caps it at 30 s", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    for (const value of [750, 0, null]) {
+      db.modelPool.update.mockResolvedValueOnce(poolRow({ cacheHolderWaitMs: value }));
+      await expect(
+        client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: value }),
+      ).resolves.toMatchObject({ cacheHolderWaitMs: value });
+      const update = db.modelPool.update.mock.calls.at(-1)?.[0] as {
+        data: Record<string, unknown>;
+      };
+      expect(update.data).toMatchObject({ cacheHolderWaitMs: value });
+    }
+    await expect(
+      client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: 30_001 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // Unrelated saves leave the stored override untouched.
+    db.modelPool.update.mockResolvedValueOnce(poolRow({ name: "Renamed" }));
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {

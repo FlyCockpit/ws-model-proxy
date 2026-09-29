@@ -439,6 +439,77 @@ describe("cache affinity", () => {
     expect(result.scores).toEqual({ "target-a": 100, "target-b": 0 });
   });
 
+  it("reports the matched prefix size from the deepest matching record", async () => {
+    const targetA = target("target-a", "runtime-a", "capacity-a");
+    const targetB = target("target-b", "runtime-b", "capacity-b");
+    const continuationPayload = {
+      ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "secret answer" }],
+    };
+    const digests = (runtimeIdentity: string) =>
+      affinityPrefixDigests({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        surface: "OPENAI_CHAT_COMPLETIONS",
+        payload: continuationPayload,
+        runtimeIdentity,
+      });
+    const a = digests(targetA.targetIdentity);
+    const b = digests(targetB.targetIdentity);
+    const record = (
+      executionTargetId: string,
+      targetIdentity: string,
+      bindingDigest: string,
+      prefixDigest: string | undefined,
+      prefixDepth: number,
+      estimatedTokens: number | null,
+    ) => ({
+      executionTargetId,
+      targetIdentity,
+      bindingDigest,
+      prefixDigest,
+      conversationDigest: null,
+      prefixDepth,
+      digestVersion: 4,
+      engineCacheConfirmed: false,
+      estimatedTokens,
+    });
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      record("target-a", "runtime-a", a.bindingDigest, a.digests[0], 1, 3_000),
+      record("target-b", "runtime-b", b.bindingDigest, b.digests[0], 1, 1_000),
+      record("target-b", "runtime-b", b.bindingDigest, b.digests[1], 2, 5_000),
+    ]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuationPayload,
+      targets: [targetA, targetB],
+    });
+    expect(result.prefixTokens).toEqual({ "target-a": 3_000, "target-b": 5_000 });
+
+    // Unknown sizes are omitted, never guessed.
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      record("target-a", "runtime-a", a.bindingDigest, a.digests[0], 1, null),
+    ]);
+    const unknown = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuationPayload,
+      targets: [targetA, targetB],
+    });
+    expect(unknown.prefixTokens).toEqual({});
+  });
+
   it("queries only unexpired owner-scoped records with target identities", async () => {
     const now = new Date("2026-08-25T12:00:00.000Z");
     await rankAffinityTargets({

@@ -51,6 +51,12 @@ import {
   rememberAffinity,
 } from "./cache-affinity.js";
 import {
+  type CacheHolderPlan,
+  cacheHolderOutcome,
+  planCacheHolderWait,
+  spillDelayMs,
+} from "./cache-holder-wait.js";
+import {
   type ContextCountTelemetry,
   contextFitsLimits,
   countSerializedRequestContext,
@@ -157,6 +163,7 @@ import {
   OPENROUTER_DATA_POLICY_ERROR_CODE,
   OPENROUTER_DATA_POLICY_ERROR_MESSAGE,
 } from "./openrouter-privacy.js";
+import { prefillSpeedSource } from "./prefill-estimator.js";
 import {
   ADAPTER_VERSION,
   AdapterError,
@@ -740,6 +747,7 @@ const poolMemberRelaySelect = {
       capacityContextMargin: true,
       capacityWaitBudgetMs: true,
       externalAfterWaitMs: true,
+      cacheHolderWaitMs: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -815,7 +823,14 @@ type RelayMetadataUpdate = {
   transformerCacheHit?: boolean | null;
   transformerErrorClass?: string | null;
   attemptCount?: number;
-  affinity?: { outcome: string; score: number; prefixDepth: number; reason: string };
+  affinity?: {
+    outcome: string;
+    score: number;
+    prefixDepth: number;
+    reason: string;
+    /** Local admission time spent waiting for the cache holder (S-A window). */
+    waitMs?: number | null;
+  };
   execution?: {
     selectedExecutionTargetId?: string;
     selectedPoolMemberId?: string;
@@ -870,6 +885,41 @@ export function localAdmissionWaitBudget(
   if (externalAfterWaitMs === null) return memberBudgetMs;
   const external = Math.max(0, externalAfterWaitMs);
   return memberBudgetMs === null ? external : Math.min(memberBudgetMs, external);
+}
+
+/**
+ * Owner-paid provider-capacity wait cap on a pool that also has local members
+ * (saturation S-A, deferred from #56). Without it a null provider budget let
+ * the request wait for PROVIDER capacity until the 15-minute relay deadline,
+ * outside the local queue and unbounded by externalAfterWaitMs. When the cap
+ * expires the external phase reports PROVIDER_SATURATED and the request
+ * resumes its remaining local wait.
+ */
+export const EXTERNAL_PROVIDER_WAIT_CAP_MS = 10_000;
+
+/**
+ * Provider-capacity wait budget for one owner-paid external member: the
+ * member budget, bounded by {@link EXTERNAL_PROVIDER_WAIT_CAP_MS} when the pool
+ * has local members to return to. Provider-only pools keep the member budget.
+ */
+export function providerCapacityWaitBudget(
+  memberBudgetMs: number | null,
+  poolHasLocalMembers: boolean,
+  /**
+   * Time already spent in this external phase: earlier rounds' capacity
+   * waits AND their failed pre-commit dispatches (the cap bounds the whole
+   * phase before the request returns to its local queue).
+   */
+  phaseElapsedMs = 0,
+): number | null {
+  if (!poolHasLocalMembers) return memberBudgetMs;
+  // One cap for the whole external phase: a pre-commit retry on the next
+  // provider member gets only what is left of it, never a fresh 10 s.
+  const capMs = Math.max(
+    0,
+    EXTERNAL_PROVIDER_WAIT_CAP_MS - Math.floor(Math.max(0, phaseElapsedMs)),
+  );
+  return memberBudgetMs === null ? capMs : Math.min(memberBudgetMs, capMs);
 }
 
 function poolAdmissionCandidate(
@@ -2086,6 +2136,9 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
           affinityScore: update.affinity.score,
           affinityPrefixDepth: update.affinity.prefixDepth,
           affinityReason: update.affinity.reason,
+          ...(update.affinity.waitMs !== undefined
+            ? { affinityWaitMs: update.affinity.waitMs }
+            : {}),
         }
       : {}),
     ...(update.execution
@@ -4026,6 +4079,8 @@ async function relayPool({
   // F2-CAP-3: the last external attempt ended because its capacity lease was
   // lost (a server-side event). Attributed on the relay row, never a cancel.
   let externalLeaseLost = false;
+  /** Set once the member listing is known: bounds the provider-capacity wait. */
+  let poolHasLocalMembers = false;
   const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
     failRelayMetadata({ ...input, routeIdentity });
   const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
@@ -4277,6 +4332,12 @@ async function relayPool({
       if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
         return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
+      // Durations only (process monotonic clock): the store turns each
+      // round's remaining budget into a database-clock deadline. A lock wait
+      // before a round's store transaction can stretch that round's deadline
+      // by the wait (bounded; the anchored schedule is used only for the
+      // `:external` local deadline the issue requires to be exact).
+      const providerPhaseStartMs = performance.now();
       let remaining = compatible;
       let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
         dispatched: false,
@@ -4308,7 +4369,15 @@ async function relayPool({
               deadlineAt: new Date(relayDeadlineMs),
               // Own-key is opportunistic; leave the relay budget for the
               // independently consented owner-paid tier and local resume.
-              waitBudgetMs: ownKey ? 0 : (providerTarget.capacityWaitBudgetMs ?? null),
+              // Owner-paid waits are capped on a pool with local members so
+              // the request returns to its local queue (S-A section 6).
+              waitBudgetMs: ownKey
+                ? 0
+                : providerCapacityWaitBudget(
+                    providerTarget.capacityWaitBudgetMs ?? null,
+                    poolHasLocalMembers,
+                    performance.now() - providerPhaseStartMs,
+                  ),
             })),
           },
           signal: request.signal,
@@ -4935,6 +5004,7 @@ async function relayPool({
   const providerOnly =
     listedMembers.length === 0 ||
     (forcedPoolMemberId != null && members.length === 0 && external.consent);
+  poolHasLocalMembers = !providerOnly;
   if (!providerOnly) {
     routeIdentity = { ...routeIdentity, fallbackRoute: "local" };
     externalAttempt.localRouteDecided = true;
@@ -5262,22 +5332,68 @@ async function relayPool({
   // waits the full budget ("full"). Without an external plan it is "full".
   let localWaitMode: "shortened" | "remaining" | "full" =
     externalAfterWaitMs !== null ? "shortened" : "full";
+  // Saturation S-A: the spill-over plan (cache-holder wait) and the local wait
+  // clock. A "shortened" round after the first (a pre-commit retry) re-anchors
+  // to the FIRST local attempt's database-clock schedule (AdmissionAttempt.
+  // schedule), so it reuses the original spill instant and external deadline
+  // exactly; lock waits before its transaction cannot extend them. Other
+  // later rounds ("remaining"/"full" budgets are fresh by design) measure the
+  // remaining spill window from the process-monotonic anchor below; only that
+  // duration uses the process clock, the store turns it into a DB instant.
+  let cacheHolderPlan: CacheHolderPlan | null = null;
+  let localWaitAnchorMs: number | null = null;
+  let firstLocalAttemptId: string | null = null;
+  let cacheHolderWaitedMs: number | null = null;
+  // The member the planned (spill-over) admission granted. HOLDER_WAITED /
+  // HOLDER_SPILLED describe only that admission; a member serving after a
+  // pre-commit failover keeps the ordinary affinity outcome.
+  let cacheHolderAdmittedMemberId: string | null = null;
+  const localWaitElapsedMs = () =>
+    localWaitAnchorMs === null ? 0 : Math.floor(performance.now() - localWaitAnchorMs);
   const admissionCandidateForRoute = (
     candidate: (typeof routeCandidates)[number],
     candidateOrder: number,
+    holderInRound: boolean,
   ) => {
     const member = memberById.get(candidate.poolMemberId);
     if (!member) return null;
     const admission = poolAdmissionCandidate(member, candidateOrder, relayDeadlineMs);
-    if (!admission || externalAfterWaitMs === null || localWaitMode === "full") return admission;
+    if (!admission) return null;
+    // Shortened rounds are scheduled from the first attempt's DB-clock anchor
+    // (see admitLocalCandidates), so they pass the ORIGINAL window and budget.
+    const anchored = externalAfterWaitMs !== null && localWaitMode === "shortened";
+    const elapsedMs = anchored ? 0 : localWaitElapsedMs();
+    const notBeforeMs = spillDelayMs(
+      cacheHolderPlan,
+      candidate.poolMemberId,
+      holderInRound,
+      elapsedMs,
+    );
+    const scheduled = notBeforeMs === undefined ? admission : { ...admission, notBeforeMs };
+    if (externalAfterWaitMs === null || localWaitMode === "full") return scheduled;
     const memberBudgetMs = effectiveMemberWaitBudget(member);
     return {
-      ...admission,
-      waitBudgetMs:
-        localWaitMode === "shortened"
-          ? localAdmissionWaitBudget(memberBudgetMs, externalAfterWaitMs)
-          : resumedLocalWaitBudget(memberBudgetMs, externalAfterWaitMs),
+      ...scheduled,
+      // The store counts this budget from the (first round's) spill instant,
+      // so the external phase starts at max(notBefore) + min(B, E), never
+      // while a cold local member is free and eligible, and a retry round
+      // never waits another full E (no N x E total).
+      waitBudgetMs: anchored
+        ? (localAdmissionWaitBudget(memberBudgetMs, externalAfterWaitMs) ?? 0)
+        : resumedLocalWaitBudget(memberBudgetMs, externalAfterWaitMs),
     };
+  };
+  /** Admission candidates of one round, in route order (candidateOrder = index). */
+  const admissionCandidatesForRoutes = (
+    candidates: readonly (typeof routeCandidates)[number][],
+  ) => {
+    const plan = cacheHolderPlan;
+    const holderInRound =
+      plan !== null &&
+      candidates.some(({ poolMemberId }) => plan.holderMemberIds.has(poolMemberId));
+    return candidates.map((candidate, candidateOrder) =>
+      admissionCandidateForRoute(candidate, candidateOrder, holderInRound),
+    );
   };
   const admitLocalCandidates = async (
     runtime: CapacityAdmissionRuntime,
@@ -5288,13 +5404,26 @@ async function relayPool({
     // the remaining members are re-admitted (each retry is a new attempt);
     // LEASE_LOST surfaces only when no member is left or the deadline passed.
     while (true) {
+      const attemptId = crypto.randomUUID();
+      // Every shortened attempt after the first (pre-commit and lease-loss
+      // retries alike) re-anchors to the FIRST local attempt's DB schedule.
+      const schedule =
+        firstLocalAttemptId !== null &&
+        externalAfterWaitMs !== null &&
+        localWaitMode === "shortened"
+          ? {
+              anchorAttemptId: firstLocalAttemptId,
+              spillDelayMs: cacheHolderPlan?.windowMs ?? 0,
+            }
+          : undefined;
+      firstLocalAttemptId ??= attemptId;
       const admission = await acquireCapacityWithTelemetry({
         runtime,
         relayRequestId,
         attempt: {
           requestId: crypto.randomUUID(),
           relayRequestId,
-          attemptId: crypto.randomUUID(),
+          attemptId,
           ownerId: target.ownerUserId,
           sourceKind: "POOL",
           poolId: target.id,
@@ -5302,6 +5431,7 @@ async function relayPool({
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
+          ...(schedule ? { schedule } : {}),
         },
         signal: request.signal,
       });
@@ -5397,10 +5527,25 @@ async function relayPool({
     operation.contextCount = count;
     await updateContextCountMetadata(relayRequestId, count);
   };
+  if (capacityRuntime && affinityDecision) {
+    try {
+      cacheHolderPlan = await planCacheHolderWait({
+        decision: affinityDecision,
+        candidates: routeCandidates.map(({ poolMemberId }) => ({
+          poolMemberId,
+          executionTargetId: memberById.get(poolMemberId)?.ExecutionTarget?.id,
+        })),
+        poolOverrideMs: eligibleMembers[0]?.ModelPool?.cacheHolderWaitMs,
+        speedSource: prefillSpeedSource,
+      });
+    } catch {
+      // Like affinity itself, the wait is an optimization only.
+      cacheHolderPlan = null;
+    }
+  }
   if (capacityRuntime) {
-    const admissionCandidates = routeCandidates.map((candidate, candidateOrder) =>
-      admissionCandidateForRoute(candidate, candidateOrder),
-    );
+    localWaitAnchorMs = performance.now();
+    const admissionCandidates = admissionCandidatesForRoutes(routeCandidates);
     if (admissionCandidates.some((candidate) => candidate === null)) {
       await operation.dispose?.();
       await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
@@ -5445,10 +5590,9 @@ async function relayPool({
         try {
           capacityLease = await admitLocalCandidates(
             capacityRuntime,
-            routeCandidates.flatMap((candidate, candidateOrder) => {
-              const resumed = admissionCandidateForRoute(candidate, candidateOrder);
-              return resumed ? [resumed] : [];
-            }),
+            admissionCandidatesForRoutes(routeCandidates).flatMap((resumed) =>
+              resumed ? [resumed] : [],
+            ),
           );
         } catch {
           await operation.dispose?.();
@@ -5467,6 +5611,13 @@ async function relayPool({
       }
     }
     const selectedPoolMemberId = capacityLease.lease.poolMemberId;
+    // Telemetry: how long the local admission held this request for the cache
+    // holder (the window's share of the wait; beyond it any wait is ordinary
+    // saturation, not a holder wait).
+    if (cacheHolderPlan) {
+      cacheHolderWaitedMs = Math.round(Math.min(localWaitElapsedMs(), cacheHolderPlan.windowMs));
+      cacheHolderAdmittedMemberId = selectedPoolMemberId;
+    }
     try {
       await applyMemberContextCount(selectedPoolMemberId);
     } catch {
@@ -5532,8 +5683,7 @@ async function relayPool({
     let candidate = selectedRouteCandidates[candidateIndex]!;
     if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
       const remaining = selectedRouteCandidates.slice(candidateIndex);
-      const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
-        const resolved = admissionCandidateForRoute(remainingCandidate, candidateOrder);
+      const admissionCandidates = admissionCandidatesForRoutes(remaining).map((resolved) => {
         if (!resolved)
           throw new Error("Capacity-enabled pool member lost execution target identity.");
         return resolved;
@@ -5561,8 +5711,7 @@ async function relayPool({
           try {
             capacityLease = await admitLocalCandidates(
               capacityRuntime,
-              remaining.map((remainingCandidate, candidateOrder) => {
-                const resumed = admissionCandidateForRoute(remainingCandidate, candidateOrder);
+              admissionCandidatesForRoutes(remaining).map((resumed) => {
                 if (!resumed)
                   throw new Error("Capacity-enabled pool member lost execution target identity.");
                 return resumed;
@@ -6256,11 +6405,16 @@ async function relayPool({
               localTerminal: terminal,
               affinity: {
                 outcome:
-                  affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
+                  (candidate.poolMemberId === cacheHolderAdmittedMemberId
+                    ? cacheHolderOutcome(cacheHolderPlan, candidate.poolMemberId)
+                    : null) ??
+                  (affinityDecision &&
+                  (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
                     ? "PREDICTED_MATCH"
                     : affinityPolicy.enabled
                       ? "NO_MATCH"
-                      : "DISABLED",
+                      : "DISABLED"),
+                waitMs: cacheHolderPlan ? cacheHolderWaitedMs : null,
                 score: selectedAffinityScore,
                 prefixDepth: selectedAffinityPrefixDepth,
                 reason: selectedAffinityReason,

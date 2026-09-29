@@ -25,6 +25,7 @@ import {
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
   type CapacityPolicyFailureReasons,
+  cacheHolderWaitMsSchema,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
@@ -904,6 +905,7 @@ function serializePool(row: ModelPoolRow) {
       confirmedCacheWeight: row.affinityConfirmedCacheWeight,
       loadPenaltyWeight: row.affinityLoadPenaltyWeight,
     },
+    cacheHolderWaitMs: row.cacheHolderWaitMs,
     compatibility: {
       recommendedSurface,
       suggestedConnectionType: suggestedSurface,
@@ -1334,6 +1336,7 @@ const poolSelect = {
   affinityConversationWeight: true,
   affinityConfirmedCacheWeight: true,
   affinityLoadPenaltyWeight: true,
+  cacheHolderWaitMs: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -2552,6 +2555,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2632,6 +2636,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: input.affinityConversationWeight ?? 150,
         affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
         affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
+        cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
       } as const;
       const capacityPolicy = {
         capacityPriority: data.capacityPriority,
@@ -2703,6 +2708,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
         ...modelPoolCapacityPolicyFields,
       }),
     )
@@ -2893,6 +2899,9 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.affinityLoadPenaltyWeight !== undefined
               ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.cacheHolderWaitMs !== undefined
+              ? { cacheHolderWaitMs: input.cacheHolderWaitMs }
               : {}),
             ...(input.capacityPriority !== undefined
               ? { capacityPriority: input.capacityPriority }

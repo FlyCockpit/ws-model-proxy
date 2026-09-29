@@ -53,6 +53,17 @@ export function capacityCandidateEligible({
   return true;
 }
 
+/** FIFO by durable enqueue sequence, then request id, candidate order and waiter id. */
+export function compareSchedulerCandidates(a: SchedulerCandidate, b: SchedulerCandidate): number {
+  if (a.enqueueSequence !== b.enqueueSequence)
+    return a.enqueueSequence < b.enqueueSequence ? -1 : 1;
+  return (
+    a.admissionRequestId.localeCompare(b.admissionRequestId) ||
+    a.candidateOrder - b.candidateOrder ||
+    a.waiterId.localeCompare(b.waiterId)
+  );
+}
+
 export function defaultPriorityQuanta(): number[] {
   return Array.from({ length: PRIORITY_CLASS_COUNT }, (_, priority) => 1 + priority);
 }
@@ -75,16 +86,7 @@ export function scheduleWeightedDeficitRoundRobin({
     queue.push(candidate);
     queues.set(candidate.priority, queue);
   }
-  for (const queue of queues.values())
-    queue.sort((a, b) =>
-      a.enqueueSequence === b.enqueueSequence
-        ? a.admissionRequestId.localeCompare(b.admissionRequestId) ||
-          a.candidateOrder - b.candidateOrder ||
-          a.waiterId.localeCompare(b.waiterId)
-        : a.enqueueSequence < b.enqueueSequence
-          ? -1
-          : 1,
-    );
+  for (const queue of queues.values()) queue.sort(compareSchedulerCandidates);
 
   const deficits = [...state.deficits];
   for (let priority = 0; priority < PRIORITY_CLASS_COUNT; priority++)

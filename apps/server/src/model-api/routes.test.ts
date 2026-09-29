@@ -60,6 +60,14 @@ vi.mock("./cache-affinity.js", async (importOriginal) => {
   };
 });
 
+// The prefill speed source is the auto-mode input to the cache-holder wait;
+// stub it at the routing seam so the tests never read relay history.
+const prefillSpeed = vi.hoisted(() => ({ tokensPerSecond: vi.fn() }));
+vi.mock("./prefill-estimator.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./prefill-estimator.js")>();
+  return { ...actual, prefillSpeedSource: prefillSpeed };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -98,7 +106,9 @@ const {
   captureProviderResponseBinding,
   chatTestCompletionsHandler,
   createModelApiRoutes,
+  EXTERNAL_PROVIDER_WAIT_CAP_MS,
   localAdmissionWaitBudget,
+  providerCapacityWaitBudget,
   resumedLocalWaitBudget,
 } = await import("./routes.js");
 const retryPolicy = await import("./relay-retry-policy.js");
@@ -448,6 +458,7 @@ function poolMemberRow({
   affinityEnabled = false,
   countStrategy,
   externalAfterWaitMs = 2_000,
+  cacheHolderWaitMs = null,
 }: {
   id: string;
   discoveredModelId: string;
@@ -469,6 +480,7 @@ function poolMemberRow({
   affinityEnabled?: boolean;
   countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
   externalAfterWaitMs?: number;
+  cacheHolderWaitMs?: number | null;
 }) {
   return {
     id,
@@ -492,6 +504,7 @@ function poolMemberRow({
       capacityContextMargin: poolContextMargin,
       capacityWaitBudgetMs: 30_000,
       externalAfterWaitMs,
+      cacheHolderWaitMs,
       affinityEnabled,
       affinityTtlSeconds: 3600,
       affinityMaxRecords: 10_000,
@@ -590,7 +603,7 @@ function externalProviderTarget(poolMemberId = "primary-provider-member") {
     poolMemberId,
     executionTargetId: `${poolMemberId}-target`,
     inferenceCapacityId: `${poolMemberId}-capacity`,
-    capacityWaitBudgetMs: 30_000,
+    capacityWaitBudgetMs: 30_000 as number | null,
     publicOrder: 0,
     providerModelId: `${poolMemberId}-model`,
     upstreamModelId: "provider-upstream",
@@ -697,6 +710,23 @@ describe("X1 local wait budgets", () => {
     expect(resumedLocalWaitBudget(null, 2_000)).toBeNull();
     // E >= B leaves "admit only if free now".
     expect(resumedLocalWaitBudget(1_000, 2_000)).toBe(0);
+  });
+});
+
+describe("S-A provider-capacity wait cap", () => {
+  it("caps owner-paid provider waits only on pools with local members", () => {
+    expect(providerCapacityWaitBudget(null, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+    expect(providerCapacityWaitBudget(60_000, true)).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+    expect(providerCapacityWaitBudget(3_000, true)).toBe(3_000);
+    // One cap per external phase: later provider rounds get what is left.
+    expect(providerCapacityWaitBudget(null, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(3_000, true, 9_000)).toBe(1_000);
+    expect(providerCapacityWaitBudget(500, true, 9_000)).toBe(500);
+    expect(providerCapacityWaitBudget(null, true, 12_000)).toBe(0);
+    // Provider-only pools keep the member budget (no local queue to return to).
+    expect(providerCapacityWaitBudget(60_000, false, 12_000)).toBe(60_000);
+    expect(providerCapacityWaitBudget(null, false)).toBeNull();
+    expect(providerCapacityWaitBudget(60_000, false)).toBe(60_000);
   });
 });
 
@@ -865,6 +895,376 @@ describe("model API routes", () => {
     // A plain pool name never inspects external (PUBLIC_OVERFLOW) members.
     expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  describe("S-A: wait for the cache holder", () => {
+    const affineMembers = (options: { cacheHolderWaitMs?: number | null } = {}) => [
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+        ...options,
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+        affinityEnabled: true,
+        ...options,
+      }),
+    ];
+    /** Member A holds the continuation prefix (depth 2, about 6000 tokens). */
+    const holderDecision = (prefixDepthA = 2) => ({
+      orderedTargetIds: ["member-a-target", "member-b-target"],
+      scores: { "member-a-target": 200, "member-b-target": 0 },
+      prefixDepths: { "member-a-target": prefixDepthA, "member-b-target": 0 },
+      conversationMatches: { "member-a-target": false, "member-b-target": false },
+      reasons: {},
+      matchedPrefixDepth: prefixDepthA,
+      prefixTokens: prefixDepthA > 0 ? { "member-a-target": 6_000 } : {},
+    });
+    /** Admits the member named `grant` (the store decides; this fakes its answer). */
+    const grantingRuntime = (grant: string) => {
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate =
+          attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant) ??
+          attempt.candidates[0]!;
+        if (candidate.poolMemberId !== grant) return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      return { acquire, runtime };
+    };
+    const candidatesOf = (acquire: ReturnType<typeof grantingRuntime>["acquire"], call = 0) =>
+      acquire.mock.calls[call]?.[0].candidates.map((candidate) => ({
+        poolMemberId: candidate.poolMemberId,
+        notBeforeMs: candidate.notBeforeMs,
+        waitBudgetMs: candidate.waitBudgetMs,
+      }));
+    const serve = async (runtime: CapacityAdmissionRuntime, model = poolTarget.modelId) => {
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(model),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      return { response: await responsePromise, manager };
+    };
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      // Unmeasured speed: the automatic wait falls back to the 2 s default.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+    });
+
+    it("defers the cold member by the default 2 s and records the spill", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response, manager } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // Prefill speed of the holder is not measured yet: the 2 s default.
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        { poolMemberId: "member-b", notBeforeMs: 2_000, waitBudgetMs: 30_000 },
+      ]);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({
+                affinityOutcome: "HOLDER_SPILLED",
+                affinityWaitMs: expect.any(Number),
+              }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it("sizes the automatic wait from the holder prefix and measured prefill speed", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      // 6000-token holder prefix at 2000 tokens/s: 3 s re-prefill time.
+      prefillSpeed.tokensPerSecond.mockResolvedValue(2_000);
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      expect(prefillSpeed.tokensPerSecond).toHaveBeenCalledWith("member-a-target");
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        { poolMemberId: "member-b", notBeforeMs: 3_000, waitBudgetMs: 30_000 },
+      ]);
+    });
+
+    it("records a holder wait when the cache holder serves", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers({ cacheHolderWaitMs: 750 }));
+      affinity.rank.mockResolvedValue(holderDecision());
+      const { acquire, runtime } = grantingRuntime("member-a");
+
+      const { response } = await serve(runtime);
+
+      expect(response.status).toBe(200);
+      // A fixed pool override replaces the automatic estimate.
+      expect(candidatesOf(acquire)?.[1]).toMatchObject({ notBeforeMs: 750 });
+      expect(prefillSpeed.tokensPerSecond).not.toHaveBeenCalled();
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityOutcome: "HOLDER_WAITED" }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it.each([
+      ["no real affinity hit", affineMembers(), holderDecision(0)],
+      ["the pool turned the wait off", affineMembers({ cacheHolderWaitMs: 0 }), holderDecision()],
+    ] as const)("defers nothing when %s", async (_label, members, decision) => {
+      db.poolMember.findMany.mockResolvedValue([...members]);
+      affinity.rank.mockResolvedValue(decision);
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      await serve(runtime);
+
+      expect(candidatesOf(acquire)?.map(({ notBeforeMs }) => notBeforeMs)).toEqual([
+        undefined,
+        undefined,
+      ]);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityWaitMs: null }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+    });
+
+    it(":external counts every shortened budget from the spill instant", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const { acquire, runtime } = grantingRuntime("member-b");
+
+      const { response } = await serve(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      // E = 2 s for both: the store counts it from max(notBefore) = now + 2 s,
+      // so the external phase can start only at 4 s, never while the cold
+      // member is free and eligible.
+      expect(candidatesOf(acquire)).toEqual([
+        { poolMemberId: "member-a", notBeforeMs: undefined, waitBudgetMs: 2_000 },
+        { poolMemberId: "member-b", notBeforeMs: 2_000, waitBudgetMs: 2_000 },
+      ]);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it(":external retry rounds all anchor to the first attempt, keeping the hold window", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        ...affineMembers(),
+        poolMemberRow({
+          id: "member-c",
+          discoveredModelId: "model-c",
+          upstreamModelId: "upstream-c",
+          cliDeviceId: "cli-c",
+          affinityEnabled: true,
+        }),
+      ]);
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const acquire = vi.mocked(runtime.acquire);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      // The holder and then member B fail before commit; member C serves.
+      for (const index of [0, 1]) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(index + 1), { timeout: 5_000 });
+        manager.headers(requireSent(manager, index).requestId, 500, {
+          "content-type": "application/json",
+        });
+      }
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(3), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 2).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      const attempts = acquire.mock.calls.map(([attempt]) => attempt);
+      expect(attempts).toHaveLength(3);
+      const [first, ...retries] = attempts;
+      // Round 1 holds the cold members back by the 2 s default window.
+      expect(first?.schedule).toBeUndefined();
+      expect(first?.candidates.map(({ notBeforeMs }) => notBeforeMs)).toEqual([
+        undefined,
+        2_000,
+        2_000,
+      ]);
+      for (const retry of retries) {
+        // Every retry (not only the second) re-anchors to the FIRST attempt
+        // and keeps its spill instant (anchor + window) even without the holder.
+        expect(retry?.schedule).toEqual({
+          anchorAttemptId: first?.attemptId,
+          spillDelayMs: 2_000,
+        });
+        expect(retry?.candidates.every(({ waitBudgetMs }) => waitBudgetMs === 2_000)).toBe(true);
+      }
+    });
+
+    it("keeps the ordinary affinity outcome when a member serves after a pre-commit failover", async () => {
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision());
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      const runtime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      // The holder is admitted at once, then fails before commit; member B
+      // serves the retry. No spill-over happened: not HOLDER_SPILLED.
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2), { timeout: 5_000 });
+      expect(requireSent(manager, 1).endpointSlug).toBe("member-b-endpoint");
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      await vi.waitFor(
+        () =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ affinityOutcome: "NO_MATCH" }),
+            }),
+          ),
+        { timeout: 5_000 },
+      );
+      expect(db.relayRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ affinityOutcome: "HOLDER_SPILLED" }),
+        }),
+      );
+    });
+
+    it(":external retry rounds reuse the original external deadline", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue(affineMembers());
+      affinity.rank.mockResolvedValue(holderDecision(0));
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")]),
+      );
+      const runtime = admittingCapacityRuntime();
+      const acquire = vi.mocked(runtime.acquire);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      // The first member spends 300 ms before failing retryably (precommit 5xx).
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      manager.headers(requireSent(manager).requestId, 500, { "content-type": "application/json" });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      const first = acquire.mock.calls[0]?.[0];
+      const retry = acquire.mock.calls[1]?.[0];
+      expect(first?.candidates[0]?.waitBudgetMs).toBe(2_000);
+      expect(first?.schedule).toBeUndefined();
+      // Not a fresh 2 s: the retry re-anchors to the FIRST attempt's
+      // database-clock schedule, so the store counts the same 2 s from the
+      // original spill instant (the 300 ms already spent, plus any lock wait
+      // before the retry's transaction, count against the same deadline).
+      expect(retry?.attemptId).not.toBe(first?.attemptId);
+      expect(retry?.schedule).toEqual({ anchorAttemptId: first?.attemptId, spillDelayMs: 0 });
+      expect(retry?.candidates[0]?.waitBudgetMs).toBe(2_000);
+    });
   });
 
   it.each([
@@ -7267,6 +7667,108 @@ describe("model API routes", () => {
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ fallbackRoute: "local" }) }),
       );
+    });
+
+    it("charges provider pre-commit retries against one external-phase capacity-wait cap", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          { ...externalProviderTarget("overflow-a"), capacityWaitBudgetMs: null },
+          { ...externalProviderTarget("overflow-b"), capacityWaitBudgetMs: null },
+        ]),
+      );
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+        providerIoStarted: true,
+      });
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const scripted = acquire.getMockImplementation()!;
+      // The first provider slot arrives after 9 s (simulated monotonic time),
+      // then its dispatch fails before commit and the next member is tried.
+      let simulatedElapsedMs = 0;
+      const monotonic = performance.now.bind(performance);
+      const clock = vi
+        .spyOn(performance, "now")
+        .mockImplementation(() => monotonic() + simulatedElapsedMs);
+      acquire.mockImplementation(async (attempt) => {
+        if (attempt.candidates[0]?.poolMemberId?.startsWith("overflow-")) {
+          const first = !acquire.mock.calls
+            .slice(0, -1)
+            .some(([earlier]) => earlier.candidates[0]?.poolMemberId?.startsWith("overflow-"));
+          simulatedElapsedMs += first ? 9_000 : 1_000;
+          return first ? scripted(attempt) : { state: "EXPIRED" as const };
+        }
+        return scripted(attempt);
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      try {
+        const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(EXTERNAL_MODEL_ID),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+        const response = await responsePromise;
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-wsmp-route")).toBe("local");
+        const providerBudgets = acquire.mock.calls
+          .map(([attempt]) => attempt.candidates[0])
+          .filter((candidate) => candidate?.poolMemberId?.startsWith("overflow-"))
+          .map((candidate) => candidate?.waitBudgetMs);
+        // Not a fresh 10 s for the second member: 9 s of the cap are spent.
+        expect(providerBudgets).toHaveLength(2);
+        expect(providerBudgets[0]).toBe(EXTERNAL_PROVIDER_WAIT_CAP_MS);
+        expect(providerBudgets[1]).toBeGreaterThanOrEqual(900);
+        expect(providerBudgets[1]).toBeLessThanOrEqual(1_000);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("bounds the owner-paid provider-capacity wait on a mixed pool and returns to the local queue", async () => {
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      // The provider member has no budget of its own: without the cap it could
+      // wait for provider capacity until the 15-minute relay deadline.
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([
+          {
+            ...externalProviderTarget("overflow-member"),
+            capacityWaitBudgetMs: null,
+          },
+        ]),
+      );
+      const { acquire, runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "EXPIRED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      const providerBudgets = acquire.mock.calls
+        .map(([attempt]) => attempt.candidates[0])
+        .filter((candidate) => candidate?.poolMemberId === "overflow-member")
+        .map((candidate) => candidate?.waitBudgetMs);
+      expect(providerBudgets).toEqual([EXTERNAL_PROVIDER_WAIT_CAP_MS]);
+      // The capped provider wait expired: the request resumed its local wait.
+      expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
     });
 
     it("fails like the plain name (429) with the header when the resumed wait also expires", async () => {

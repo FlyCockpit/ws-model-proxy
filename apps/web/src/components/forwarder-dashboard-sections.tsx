@@ -1684,6 +1684,8 @@ export function PoolForm({
     affinityPrefixWeight: z.number().int().min(0).max(10_000),
     affinityConversationWeight: z.number().int().min(0).max(10_000),
     affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
+    cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
+    cacheHolderWaitMs: z.number().int().min(0).max(30_000),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1767,6 +1769,9 @@ export function PoolForm({
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
       affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
       affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
+      // S-A cache-holder wait: null = automatic; 0 = off; N = fixed ms.
+      cacheHolderWaitMode: (pool?.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
+      cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1858,6 +1863,8 @@ export function PoolForm({
             affinityPrefixWeight: value.affinityPrefixWeight,
             affinityConversationWeight: value.affinityConversationWeight,
             affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+            cacheHolderWaitMs:
+              value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
           }
         : {};
       if (mode === "create") {
@@ -1881,6 +1888,7 @@ export function PoolForm({
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+          cacheHolderWaitMs: value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
         });
         toast.success(t("dashboard:pools.created"));
         onSuccess();
@@ -2082,6 +2090,47 @@ export function PoolForm({
               </form.Field>
             ))}
           </div>
+          <form.Field name="cacheHolderWaitMode">
+            {(modeField) => (
+              <div className="mt-4 min-w-0 space-y-2">
+                <Label htmlFor="cacheHolderWaitMode">
+                  {t("dashboard:pools.affinity.fields.cacheHolderWaitMs")}
+                </Label>
+                <select
+                  id="cacheHolderWaitMode"
+                  className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                  value={modeField.state.value}
+                  onChange={(event) =>
+                    modeField.handleChange(event.target.value as "AUTO" | "FIXED")
+                  }
+                >
+                  <option value="AUTO">{t("dashboard:pools.affinity.cacheHolderWait.auto")}</option>
+                  <option value="FIXED">
+                    {t("dashboard:pools.affinity.cacheHolderWait.fixed")}
+                  </option>
+                </select>
+                {modeField.state.value === "FIXED" ? (
+                  <form.Field name="cacheHolderWaitMs">
+                    {(field) => (
+                      <Input
+                        id="cacheHolderWaitMs"
+                        className="min-h-11"
+                        type="number"
+                        min={0}
+                        max={30000}
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(Number(event.target.value))}
+                        aria-label={t("dashboard:pools.affinity.cacheHolderWait.valueLabel")}
+                      />
+                    )}
+                  </form.Field>
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pools.affinity.cacheHolderWait.hint")}
+                </p>
+              </div>
+            )}
+          </form.Field>
           <p className="mt-3 text-xs text-muted-foreground">
             {t("dashboard:pools.affinity.privacy")}
           </p>
@@ -4056,7 +4105,7 @@ export function RelayMetadataSection() {
                   <td className="p-3 align-top tabular-nums">{numberOrDash(row.attemptCount)}</td>
                   <td className="p-3 align-top" title={row.affinityReason ?? undefined}>
                     {row.affinityOutcome
-                      ? `${row.affinityOutcome} · ${row.affinityScore ?? 0} · ${row.affinityPrefixDepth ?? 0}`
+                      ? `${row.affinityOutcome} · ${row.affinityScore ?? 0} · ${row.affinityPrefixDepth ?? 0}${row.affinityWaitMs != null ? ` · ${t("dashboard:relay.affinityWait", { ms: row.affinityWaitMs })}` : ""}`
                       : "—"}
                   </td>
                   <td className="p-3 align-top font-mono">

@@ -13,6 +13,8 @@ import {
 import {
   allocateReservationSlots,
   candidateDeadlineAt,
+  candidateSchedules,
+  DEFERRED_MIN_ELIGIBLE_WINDOW_MS,
   isRetryableCapacityTransactionError,
   PostgresCapacityAdmissionStore,
   runCapacitySerializable,
@@ -41,6 +43,105 @@ describe("candidate wait budgets on the database clock", () => {
     expect(candidateDeadlineAt({ waitBudgetMs: 0 }, upper, now)).toEqual(now);
     expect(candidateDeadlineAt({ waitBudgetMs: null }, upper, now)).toEqual(upper);
     expect(candidateDeadlineAt({}, upper, now)).toEqual(upper);
+  });
+});
+
+describe("spill-over candidate schedules on the database clock", () => {
+  const now = new Date("2026-09-26T12:00:00.000Z");
+  const upper = new Date("2026-09-26T12:15:00.000Z");
+  const at = (ms: number) => new Date(now.getTime() + ms);
+
+  it("is identical to plain budgets when no candidate is deferred", () => {
+    expect(
+      candidateSchedules([{ waitBudgetMs: 0 }, { waitBudgetMs: 2_000 }, {}], upper, now),
+    ).toEqual([
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: at(2_000) },
+      { notBefore: null, deadlineAt: upper },
+    ]);
+  });
+
+  it("counts every budget from the latest notBefore and never ends before it", () => {
+    const [holder, cold] = candidateSchedules(
+      [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }],
+      upper,
+      now,
+    );
+    expect(cold).toEqual({ notBefore: at(1_500), deadlineAt: at(3_500) });
+    // The holder is eligible from now; its budget also ends spill + budget.
+    expect(holder).toEqual({ notBefore: null, deadlineAt: at(3_500) });
+  });
+
+  it("keeps a zero budget checkable for a short window at the spill instant", () => {
+    const schedules = candidateSchedules(
+      [{ waitBudgetMs: 0 }, { waitBudgetMs: 0, notBeforeMs: 1_000 }],
+      upper,
+      now,
+    );
+    expect(schedules.map(({ deadlineAt }) => deadlineAt)).toEqual([
+      at(1_000 + DEFERRED_MIN_ELIGIBLE_WINDOW_MS),
+      at(1_000 + DEFERRED_MIN_ELIGIBLE_WINDOW_MS),
+    ]);
+  });
+
+  it("re-anchors a retry round to the original schedule instead of restarting it", () => {
+    // The first attempt was enqueued 1.2 s ago (anchor); the retry's own
+    // transaction runs now (after any lock wait). Its spill instant and
+    // budgets stay those of the original schedule.
+    const anchor = { at: at(-1_200), spillDelayMs: 1_500 };
+    const [holder, cold] = candidateSchedules(
+      [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }],
+      upper,
+      now,
+      anchor,
+    );
+    expect(cold).toEqual({ notBefore: at(300), deadlineAt: at(2_300) });
+    expect(holder).toEqual({ notBefore: null, deadlineAt: at(2_300) });
+    // A round without the holder defers nobody but keeps the original spill
+    // instant (anchor + spillDelayMs) for its budgets.
+    expect(candidateSchedules([{ waitBudgetMs: 2_000 }], upper, now, anchor)).toEqual([
+      { notBefore: null, deadlineAt: at(2_300) },
+    ]);
+  });
+
+  it("clamps an anchored schedule already in the past to 'admit only if free now'", () => {
+    const anchor = { at: at(-5_000), spillDelayMs: 1_500 };
+    expect(
+      candidateSchedules(
+        [{ waitBudgetMs: 2_000 }, { waitBudgetMs: 2_000, notBeforeMs: 1_500 }, {}],
+        upper,
+        now,
+        anchor,
+      ),
+    ).toEqual([
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: now },
+      { notBefore: null, deadlineAt: upper },
+    ]);
+    // An anchor in the future (clock skew between clients) is treated as now.
+    expect(
+      candidateSchedules([{ waitBudgetMs: 2_000 }], upper, now, {
+        at: at(60_000),
+        spillDelayMs: 0,
+      }),
+    ).toEqual([{ notBefore: null, deadlineAt: at(2_000) }]);
+  });
+
+  it("caps notBefore at 30 s and at the candidate's absolute bound", () => {
+    expect(candidateSchedules([{ notBeforeMs: 90_000 }], upper, now)[0]?.notBefore).toEqual(
+      at(30_000),
+    );
+    const bound = at(500);
+    expect(candidateSchedules([{ notBeforeMs: 5_000, deadlineAt: bound }], upper, now)).toEqual([
+      { notBefore: bound, deadlineAt: bound },
+    ]);
+    // Garbage delays are treated as "not deferred".
+    expect(
+      candidateSchedules([{ notBeforeMs: Number.NaN }, { notBeforeMs: -5 }], upper, now),
+    ).toEqual([
+      { notBefore: null, deadlineAt: upper },
+      { notBefore: null, deadlineAt: upper },
+    ]);
   });
 });
 
@@ -81,7 +182,14 @@ describe("capacity lease release", () => {
       effectiveConcurrencyScope: "DIRECT_TARGET",
       effectiveConcurrencyScopeId: "target",
       effectiveBorrowPolicy: "WHEN_IDLE",
-      AdmissionRequest: { requestId: "request", attemptId: "attempt-1", enqueueSequence: 1n },
+      AdmissionRequest: {
+        requestId: "request",
+        attemptId: "attempt-1",
+        enqueueSequence: 1n,
+        deadlineAt: null,
+      },
+      notBefore: null,
+      deadlineAt: null,
       PoolMember: null,
     };
     const tx = {
@@ -99,9 +207,9 @@ describe("capacity lease release", () => {
       capacityLease: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findMany: vi.fn().mockResolvedValue([]),
-        create: vi.fn(async () => {
+        createMany: vi.fn(async () => {
           admitted = true;
-          return {};
+          return { count: 1 };
         }),
       },
       inferenceCapacity: {
@@ -119,11 +227,10 @@ describe("capacity lease release", () => {
       admissionRequest: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         update: vi.fn().mockResolvedValue({}),
-        findUnique: vi.fn(async (args: { where: { id?: string } }) =>
-          args.where.id === "request-1"
-            ? { state: admitted ? "ADMITTED" : "WAITING", Lease: null }
-            : null,
-        ),
+        findMany: vi.fn(async () => [
+          { id: "request-1", state: admitted ? "ADMITTED" : "WAITING", Lease: null },
+        ]),
+        findUnique: vi.fn(async () => null),
       },
     };
     let attempts = 0;
@@ -173,7 +280,7 @@ describe("capacity lease release", () => {
     });
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
-    expect(tx.capacityLease.create).not.toHaveBeenCalled();
+    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
     expect(tx.inferenceCapacity.update).not.toHaveBeenCalled();
   });
 
@@ -183,7 +290,7 @@ describe("capacity lease release", () => {
     const { tx, transaction, store, lease } = releaseFixture();
     await expect(store.release(lease)).resolves.toBe(true);
     expect(transaction).toHaveBeenCalledTimes(2);
-    expect(tx.capacityLease.create).toHaveBeenCalled();
+    expect(tx.capacityLease.createMany).toHaveBeenCalledTimes(1);
   });
 });
 
