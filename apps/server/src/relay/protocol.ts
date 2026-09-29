@@ -13,8 +13,8 @@ export { relayProtocolAtLeast };
  * The only relay protocol this server speaks. 2.7 adds engine facts in the
  * inventory, `node.info`, `node.metrics`, `endpoint.load` and
  * `metrics.sources.set`; it is also the minimum: an older CLI is refused at
- * hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`. 2.8 is reserved for model
- * deployments.
+ * hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`. 2.8 goes to the MCP node file
+ * tools (#103) and 2.9 to model deployments (owner decision on #70).
  */
 export const RELAY_PROTOCOL_VERSIONS = ["2.7"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];

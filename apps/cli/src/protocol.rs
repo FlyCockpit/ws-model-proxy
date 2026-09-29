@@ -749,7 +749,7 @@ pub struct EndpointLoad {
 /// 2.7 `metrics.sources.set` (server to CLI): remotely defined custom metric
 /// sources. This CLI does not run them yet and reports each as `unsupported`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteMetricSource {
     pub name: String,
     pub command: String,
@@ -1104,8 +1104,8 @@ fn token_fact(value: Option<u64>) -> Option<EngineFact<u64>> {
 }
 
 /// Endpoint-level engine facts: the declared or detected engine, probed
-/// numbers, and the configured concurrency as `slots` when the engine reports
-/// none (Ollama and LM Studio never do).
+/// numbers, and `slots`: the configured concurrency when set, else the
+/// engine's reported slots.
 pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let detected = endpoint
         .last_probe
@@ -1121,14 +1121,18 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let probed_slots = detected
         .and_then(|engine| engine.slots)
         .filter(|slots| (1..=10_000).contains(slots));
+    // Detection is overridable by config (#70 §B): a concurrency set with
+    // `wsmp endpoints concurrency` wins over the engine's reported slots (for
+    // example to keep some llama.cpp slots free for direct local use); the
+    // probed count only fills an unset value.
+    let configured_slots = endpoint
+        .concurrency_limit
+        .filter(|limit| (1..=10_000).contains(limit));
     let facts = EngineFacts {
         engine,
-        slots: probed_slots.map(EngineFact::probe).or_else(|| {
-            endpoint
-                .concurrency_limit
-                .filter(|limit| (1..=10_000).contains(limit))
-                .map(EngineFact::config)
-        }),
+        slots: configured_slots
+            .map(EngineFact::config)
+            .or_else(|| probed_slots.map(EngineFact::probe)),
         ctx_per_slot: token_fact(detected.and_then(|engine| engine.ctx_per_slot)),
         kv_tokens: token_fact(detected.and_then(|engine| engine.kv_tokens)),
         max_model_len: token_fact(detected.and_then(|engine| engine.max_model_len)),
@@ -1139,7 +1143,9 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
                     .served_model_aliases
                     .iter()
                     .filter(|alias| {
-                        let trimmed = alias.trim();
+                        // Trimmed as the server's zod `.trim()` trims.
+                        let trimmed =
+                            alias.trim_matches(crate::telemetry_bounds::is_js_trim_whitespace);
                         !trimmed.is_empty() && trimmed.len() <= 512
                     })
                     .take(64)
@@ -1350,7 +1356,34 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
     }
     let known: KnownServerControlMessage =
         serde_json::from_value(value).context("parsing relay server control frame")?;
+    if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
+        validate_remote_metric_sources(sources)?;
+    }
     Ok(known.into())
+}
+
+/// The server's strict 2.7 `metrics.sources.set` contract
+/// (`remoteMetricSourcesSchema`), enforced here too: a list that breaks it
+/// is refused whole (and then ignored, never fatal; see `control_frame_fault`).
+/// Unknown fields are refused by `deny_unknown_fields`, the format by its enum.
+pub fn validate_remote_metric_sources(sources: &[RemoteMetricSource]) -> Result<()> {
+    if sources.len() > NODE_METRICS_SOURCES_MAX {
+        anyhow::bail!("metrics.sources.set lists more than {NODE_METRICS_SOURCES_MAX} sources");
+    }
+    for source in sources {
+        // zod counts UTF-16 code units.
+        let command_units = source.command.encode_utf16().count();
+        if !crate::telemetry::is_metric_name(&source.name)
+            || !(1..=4096).contains(&command_units)
+            || !(crate::telemetry::METRIC_SOURCE_INTERVAL_MIN_SECS
+                ..=crate::telemetry::METRIC_SOURCE_INTERVAL_MAX_SECS)
+                .contains(&source.interval_secs)
+            || !(1..=300).contains(&source.timeout_secs)
+        {
+            anyhow::bail!("metrics.sources.set carries a source outside the 2.7 contract");
+        }
+    }
+    Ok(())
 }
 
 fn known_server_frame(type_name: &str) -> bool {
@@ -2730,6 +2763,52 @@ mod relay_27_vectors {
     }
 
     #[test]
+    fn a_configured_concurrency_wins_over_probed_engine_slots() {
+        // `wsmp endpoints concurrency local 4` on a llama.cpp started with
+        // `-np 8`: the hello reports 4 (config), so the server's AUTO limit
+        // stays at 4; the probed 8 only fills an unset value.
+        let mut endpoint = EndpointConfig {
+            slug: "local".to_string(),
+            concurrency_limit: Some(4),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::LlamaCpp),
+                    slots: Some(8),
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::config(4)));
+        endpoint.concurrency_limit = None;
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::probe(8)));
+    }
+
+    #[test]
+    fn served_model_aliases_are_trimmed_like_the_server_trims() {
+        let endpoint = EndpointConfig {
+            slug: "vllm".to_string(),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::Vllm),
+                    served_model_aliases: vec!["\u{FEFF} ".to_string(), "llama".to_string()],
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(
+            facts.served_model_aliases,
+            Some(EngineFact::probe(vec!["llama".to_string()]))
+        );
+    }
+
+    #[test]
     fn node_info_matches_the_shared_vector() {
         let info = NodeInfo {
             os: Some(NodeOs {
@@ -2926,6 +3005,43 @@ mod relay_27_vectors {
         assert_eq!(sources[0].name, "fans");
         assert_eq!(sources[0].interval_secs, 10);
         assert_eq!(sources[0].format, MetricSourceFormat::Number);
+        // Everything the server's strict schema refuses is refused here too.
+        let valid = r#"{"name":"ok","command":"echo 1","intervalSecs":5,"timeoutSecs":1,"format":"number"}"#;
+        let frame = |source: String| {
+            format!(r#"{{"type":"metrics.sources.set","id":"x","sources":[{source}]}}"#)
+        };
+        assert!(parse_server_control(&frame(valid.to_string())).is_ok());
+        let command = |command: &str| {
+            valid.replace(
+                r#""echo 1""#,
+                &serde_json::to_string(command).expect("json"),
+            )
+        };
+        let invalid = [
+            valid.replace(r#""ok""#, r#""bad name""#),
+            valid.replace(r#""ok""#, r#""""#),
+            command(""),
+            command(&"x".repeat(4097)),
+            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":4"#),
+            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":86401"#),
+            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":0"#),
+            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":301"#),
+            valid.replace(r#""number""#, r#""yaml""#),
+            valid.replace('}', r#","stderr":"x"}"#),
+        ];
+        for source in invalid {
+            assert!(
+                parse_server_control(&frame(source.clone())).is_err(),
+                "{source}"
+            );
+            assert_eq!(control_frame_fault(&frame(source)), FrameFault::Ignore);
+        }
+        // 4096 UTF-16 units is the bound, not 4096 bytes.
+        assert!(parse_server_control(&frame(command(&"é".repeat(4096)))).is_ok());
+        let fifty_one = vec![valid; NODE_METRICS_SOURCES_MAX + 1].join(",");
+        assert!(parse_server_control(&frame(fifty_one)).is_err());
+        let fifty = vec![valid; NODE_METRICS_SOURCES_MAX].join(",");
+        assert!(parse_server_control(&frame(fifty)).is_ok());
         // A malformed list is dropped, never fatal.
         assert_eq!(
             control_frame_fault(r#"{"type":"metrics.sources.set","id":"x","sources":"nope"}"#),

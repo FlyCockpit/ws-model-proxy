@@ -61,7 +61,7 @@ pre-2.6 servers and a 2.6 server's "This server requires wsmp ... (relay
 protocol 2.6)" reply, while a genuine future-server "upgrade wsmp" reply stays
 as the CLI's own upgrade error). Release notes for the first wsmp that speaks
 2.7 must say that the server and every CLI need upgrading together. Protocol
-2.8 is reserved for model deployments.
+2.8 goes to the MCP node file tools (#103) and 2.9 to model deployments.
 
 ## One-time setup
 
