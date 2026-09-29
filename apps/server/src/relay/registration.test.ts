@@ -336,9 +336,56 @@ describe("capability override origin", () => {
       now,
     });
 
-    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as { update: Record<string, unknown> };
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as {
+      update: Record<string, unknown>;
+      create: Record<string, unknown>;
+      select: Record<string, unknown>;
+    };
     expect(call.update).not.toHaveProperty("reportedHostname");
     expect(call.update).not.toHaveProperty("name");
+    // The connection-gated fence writes are hello-only. An inventory update
+    // that bumped the generation would let a connection that never held
+    // ownership fence out the live one.
+    expect(call.update).not.toHaveProperty("connectionGeneration");
+    expect(call.update).not.toHaveProperty("connectionCount");
+    expect(call.update).not.toHaveProperty("status");
+    expect(call.create.connectionGeneration).toBe(1);
+    expect(call.select.connectionGeneration).toBe(true);
+  });
+
+  it("advances the connection generation on an accepted hello", async () => {
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: [],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      connection: true,
+      reported: {
+        cliVersion: "1.0.0",
+        relayProtocolVersion: "2.7",
+        reportedHumanTerminal: null,
+        reportedMcpCommandMode: null,
+        reportedTerminalApproval: null,
+        reportedTerminalSupported: null,
+        reportedHostname: "desk-01.local",
+        featuresReportedAt: now,
+      },
+      now,
+    });
+
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as {
+      update: Record<string, unknown>;
+      create: Record<string, unknown>;
+      select: Record<string, unknown>;
+    };
+    // A reconnect must supersede the generation the connection it replaces
+    // carried, or that connection's stale disconnect write (whose fence
+    // predicate is `where: { id, connectionGeneration }`) still matches.
+    expect(call.update.connectionGeneration).toEqual({ increment: 1 });
+    expect(call.create.connectionGeneration).toBe(1);
+    // Read back so the session carries the fence the writes above produced.
+    expect(call.select.connectionGeneration).toBe(true);
   });
 
   it("treats only dashboard origin as protected", () => {

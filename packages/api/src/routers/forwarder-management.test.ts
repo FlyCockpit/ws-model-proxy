@@ -5301,6 +5301,56 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(hook).not.toHaveBeenCalled();
   });
 
+  it("shows endpoints of disconnected or stale CLIs as OFFLINE and keeps the reported status", async () => {
+    const endpoint = (id: string, status: string) => ({
+      id,
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: id,
+      label: id,
+      kind: "OPENAI_COMPATIBLE",
+      status,
+      defaultCapabilities: [],
+      capabilityMetadata: null,
+      probeSuggestions: null,
+      lastSeenAt: new Date("2026-01-01"),
+      lastHealthCheckAt: null,
+      statusChangedAt: null,
+      failureReasonCode: null,
+      published: true,
+      unpublishedAt: null,
+      DiscoveredModels: [],
+    });
+    const device = (id: string, status: string, heartbeatAgoMs: number | null) => ({
+      id,
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: id,
+      name: id,
+      reportedHostname: null,
+      status,
+      lastHeartbeatAt: heartbeatAgoMs === null ? null : new Date(Date.now() - heartbeatAgoMs),
+      User: { slug: "owner" },
+      Endpoints: [endpoint(`${id}-ep`, "ONLINE")],
+    });
+    db.cliDevice.findMany.mockResolvedValue([
+      device("live", "CONNECTED", 1_000),
+      device("gone", "DISCONNECTED", 1_000),
+      device("stale", "CONNECTED", 5 * 60_000),
+      device("never", "CONNECTED", null),
+    ]);
+
+    const result = await client().listCliDevices();
+
+    expect(result.map((cli) => [cli.slug, cli.endpoints[0]?.status])).toEqual([
+      ["live", "ONLINE"],
+      ["gone", "OFFLINE"],
+      ["stale", "OFFLINE"],
+      ["never", "OFFLINE"],
+    ]);
+    expect(result.every((cli) => cli.endpoints[0]?.reportedStatus === "ONLINE")).toBe(true);
+  });
+
   it("reports terminal and command features from the live snapshot and stored columns", async () => {
     db.cliDevice.findMany.mockResolvedValue([
       {
@@ -5678,4 +5728,253 @@ it("omits a shared pool entirely after its grant is revoked", async () => {
   const result = await httpClient().visibleModels();
   expect(result.modelPools).toEqual([]);
   expect(JSON.stringify(result)).not.toMatch(/openrouter|Owner private billing label/);
+});
+
+describe("metric routing procedures (S-B part 2)", () => {
+  const deep = prisma as unknown as {
+    modelPool: { findFirst: MockInstance; updateMany: MockInstance };
+    poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
+    cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
+  };
+  const source = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json" as const,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function client(services?: Record<string, unknown>) {
+    return createRouterClient(forwarderManagementRouter, {
+      context: { ...buildContext(), ...(services ? { services } : {}) },
+    });
+  }
+
+  it("replaces a pool's rules, scoped to the owner, and asks the relay to clear its verdicts (M never writes an H table)", async () => {
+    deep.modelPool.updateMany.mockResolvedValue({ count: 1 });
+    const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
+    const rules = [
+      {
+        metric: "node.gpu.temperature_c",
+        labels: { gpu: "0" },
+        op: ">",
+        threshold: 85,
+        effect: "full",
+      },
+    ] as const;
+    const result = await client({ onPoolRoutingRulesChanged }).setPoolRoutingRules({
+      poolId: "pool-1",
+      rules: [...rules],
+    });
+    expect(result.rules[0]).toMatchObject({ aggregate: "max", effect: "full" });
+    expect(deep.modelPool.updateMany).toHaveBeenCalledWith({
+      where: { id: "pool-1", userId: "user-id" },
+      data: { routingRules: [expect.objectContaining({ metric: "node.gpu.temperature_c" })] },
+    });
+    expect(onPoolRoutingRulesChanged).toHaveBeenCalledWith("pool-1");
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects another user's pool and invalid rules without writing", async () => {
+    deep.modelPool.updateMany.mockResolvedValue({ count: 0 });
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [{ metric: "x", op: ">", threshold: 1, effect: "avoid" }],
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [{ metric: "bad name", op: ">", threshold: 1, effect: "avoid" }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("reports each member's verdict, staleness and the metrics its device offers", async () => {
+    const now = Date.now();
+    const model = (upstreamModelId: string) => ({
+      slug: null,
+      upstreamModelId,
+      Endpoint: {
+        slug: "gpu",
+        cliDeviceId: "cli-id",
+        CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+      },
+    });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      slug: "coder",
+      routingRules: [{ metric: "fan_rpm", op: ">", threshold: 3000, effect: "avoid" }],
+      PoolMembers: [
+        { id: "m1", DiscoveredModel: null, ExecutionTarget: { DiscoveredModel: model("a") } },
+        { id: "m2", DiscoveredModel: null, ExecutionTarget: { DiscoveredModel: model("b") } },
+        { id: "m3", DiscoveredModel: null, ExecutionTarget: { DiscoveredModel: model("c") } },
+      ],
+    });
+    deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+      {
+        poolMemberId: "m1",
+        verdict: "AVOID",
+        ruleStates: ["triggered"],
+        evaluatedAt: new Date(now - 1_000),
+        expiresAt: new Date(now + 20_000),
+      },
+      {
+        poolMemberId: "m2",
+        verdict: "AVOID",
+        ruleStates: ["triggered"],
+        evaluatedAt: new Date(now - 60_000),
+        expiresAt: new Date(now - 30_000),
+      },
+    ]);
+    deep.cliDevice.findMany.mockResolvedValue([]);
+    const receivedAt = new Date(now - 2_000);
+    const result = await client({
+      getLiveNodeTelemetry: (ids: readonly string[]) =>
+        new Map(
+          ids.map((id) => [
+            id,
+            {
+              nodeMetrics: {
+                ts: receivedAt.toISOString(),
+                custom: [
+                  {
+                    source: "fans",
+                    name: "fan_rpm",
+                    value: 3200,
+                    ts: receivedAt.toISOString(),
+                  },
+                ],
+                sources: [{ name: "fans", origin: "local", state: "active", intervalSecs: 10 }],
+              },
+              nodeMetricsReceivedAt: receivedAt,
+              endpointLoad: [
+                {
+                  endpointSlug: "gpu",
+                  modelSlug: null,
+                  running: 2,
+                  waiting: 1,
+                  source: "vllm-metrics",
+                  ts: receivedAt.toISOString(),
+                  receivedAt,
+                },
+              ],
+            },
+          ]),
+        ),
+    }).getPoolRoutingRules({ poolId: "pool-1" });
+    expect(deep.modelPool.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "pool-1", userId: "user-id" } }),
+    );
+    expect(
+      result.members.map((member) => [member.poolMemberId, member.state, member.verdict]),
+    ).toEqual([
+      ["m1", "active", "avoid"],
+      ["m2", "stale", null],
+      ["m3", "unevaluated", null],
+    ]);
+    expect(result.devices[0]).toMatchObject({ label: "desk.local", live: true });
+    expect(result.devices[0]?.series).toEqual([
+      expect.objectContaining({ name: "fan_rpm", value: 3200, stale: false, origin: "custom" }),
+    ]);
+    expect(result.members[0]?.endpointSeries.map((entry) => entry.name)).toEqual([
+      "endpoint.running",
+      "endpoint.waiting",
+    ]);
+  });
+
+  it("stores remote metric sources only while the device is unsupervised and pushes them", async () => {
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    const pushed: string[] = [];
+    const result = await client({
+      onRemoteMetricSourcesChanged: async (id: string) => {
+        pushed.push(id);
+        return true;
+      },
+    }).setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source] });
+    expect(deep.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id", mcpCommandMode: "UNSUPERVISED" },
+      data: { remoteMetricSources: [source], remoteMetricSourcesAt: expect.any(Date) },
+    });
+    expect(pushed).toEqual(["cli-id"]);
+    expect(result).toMatchObject({ delivered: true });
+    expect(result.sources[0]?.commandSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    for (const mode of ["OFF", "SUPERVISED"]) {
+      vi.clearAllMocks();
+      deep.cliDevice.findUnique.mockResolvedValue({
+        id: "cli-id",
+        userId: "user-id",
+        mcpCommandMode: mode,
+      });
+      await expect(
+        client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source] }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(deep.cliDevice.updateMany).not.toHaveBeenCalled();
+    }
+  });
+
+  it("lists rule-addressable series and the server-held remote sources in device metrics", async () => {
+    const at = new Date(Date.now() - 1_000);
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      slug: "desk",
+      status: "CONNECTED",
+      nodeInfo: null,
+      nodeInfoAt: null,
+      nodeMetrics: {
+        ts: at.toISOString(),
+        cpu: { usagePercent: 40 },
+        gpus: [{ index: 1, temperatureC: 70 }],
+      },
+      nodeMetricsAt: at,
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [source],
+      remoteMetricSourcesAt: at,
+    });
+    const result = await client().getCliDeviceMetrics({ cliDeviceId: "cli-id" });
+    expect(result.series.map((entry) => [entry.name, entry.labels])).toEqual([
+      ["node.cpu.usage_percent", {}],
+      ["node.gpu.temperature_c", { gpu: "1" }],
+    ]);
+    expect(result.remoteMetricSources).toEqual([
+      { ...source, commandSha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    ]);
+    expect(result.remoteMetricSourcesAllowed).toBe(false);
+  });
+
+  it("refuses when the mode changed during the write, and hides other users' devices", async () => {
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 0 });
+    await expect(
+      client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source] }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "someone-else",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    await expect(
+      client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [] }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source, source] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
 });

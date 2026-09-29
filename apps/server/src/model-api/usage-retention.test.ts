@@ -25,7 +25,9 @@ const {
   compactMinuteRollups,
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
+  deleteExpiredRoutingVerdicts,
   hourIncrementsFromMinuteRows,
+  ROUTING_VERDICT_RETENTION_MS,
   reapAbandonedPendingRequests,
   runUsageRetention,
   startUsageRetention,
@@ -114,6 +116,7 @@ describe("usage retention", () => {
       deletedUserRowsPurged: 0,
       orphanCapacityRuntimeDeleted: 0,
       expiredStickinessDeleted: 0,
+      routingVerdictsDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -349,6 +352,24 @@ describe("usage retention", () => {
     expect(cutoff).toEqual(new Date(NOW.getTime() - 395 * DAY_MS));
   });
 
+  it("deletes routing verdicts that expired over an hour ago in SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    await expect(
+      deleteExpiredRoutingVerdicts({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      Date,
+      number,
+    ];
+    expect(strings.join("?")).toContain("DELETE FROM pool_member_routing_verdict");
+    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
+    expect(cutoff).toEqual(new Date(NOW.getTime() - ROUTING_VERDICT_RETENTION_MS));
+    expect(batch).toBe(2);
+  });
+
   it("moves minute rows older than 30 days into additive hourly upserts in one transaction", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([
@@ -435,6 +456,7 @@ describe("usage retention", () => {
       relayRequestsDeleted: 0,
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
+      routingVerdictsDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });
     expect(startUsageRetention({ retentionDays: 14, run })).toBe(stop);

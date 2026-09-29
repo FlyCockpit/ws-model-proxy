@@ -98,6 +98,7 @@ type McpToolDescriptor = (typeof MCP_TOOL_MANIFEST)[number];
 const db = prisma as unknown as {
   modelApiToken: { findMany: MockInstance; findUnique: MockInstance; update: MockInstance };
   relayRequest: { findMany: MockInstance };
+  cliDevice: { findMany: MockInstance };
   providerAccount: { findFirst: MockInstance };
   providerCredential: { findMany: MockInstance };
   mcpGrant: { findUnique: MockInstance };
@@ -198,6 +199,7 @@ const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  "forwarder_device_metric_sources_set",
 ]);
 
 function catalogNames(includeCliCommands: boolean): string[] {
@@ -957,6 +959,59 @@ describe("G3 — JSON→Date input adaptation", () => {
   });
 });
 
+describe("CLI presence through the MCP projection", () => {
+  it("forwarder_cli_devices_list shows a disconnected CLI's endpoints as OFFLINE", async () => {
+    const heartbeat = new Date(Date.now() - 1_000);
+    db.cliDevice.findMany = db.cliDevice.findMany ?? vi.fn();
+    db.cliDevice.findMany.mockResolvedValue(
+      (["CONNECTED", "DISCONNECTED"] as const).map((status) => ({
+        id: `cli-${status}`,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+        slug: status.toLowerCase(),
+        name: null,
+        reportedHostname: "host",
+        status,
+        lastHeartbeatAt: heartbeat,
+        User: { slug: "owner" },
+        Endpoints: [
+          {
+            id: `ep-${status}`,
+            createdAt: new Date("2026-01-01T00:00:00Z"),
+            updatedAt: new Date("2026-01-01T00:00:00Z"),
+            slug: "ep",
+            label: "ep",
+            kind: "OPENAI_COMPATIBLE",
+            status: "ONLINE",
+            defaultCapabilities: [],
+            capabilityMetadata: null,
+            probeSuggestions: null,
+            lastSeenAt: null,
+            lastHealthCheckAt: null,
+            statusChangedAt: null,
+            failureReasonCode: null,
+            published: true,
+            unpublishedAt: null,
+            DiscoveredModels: [],
+          },
+        ],
+      })),
+    );
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_cli_devices_list", {});
+    const rows = body.result?.structuredContent?.result as {
+      status: string;
+      endpoints: { status: string; reportedStatus: string }[];
+    }[];
+    expect(rows.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
+      ["CONNECTED", "ONLINE"],
+      ["DISCONNECTED", "OFFLINE"],
+    ]);
+    expect(rows[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+  });
+});
+
 describe("G4 — the sanitizing boundary covers the ENTIRE pipeline", () => {
   function dispatchFor(output: () => unknown, projector?: (output: unknown) => unknown) {
     return {
@@ -1313,6 +1368,13 @@ describe("CLI command tools", () => {
     expect(flagged).toContain("forwarder_cli_command_run");
     expect(flagged).toContain("forwarder_cli_supervised_command_start");
     expect(flagged).toContain("forwarder_cli_command_result");
+    expect(flagged).toContain("forwarder_device_metric_sources_set");
+    for (const hidden of [
+      await listedNames(OAUTH_CREDENTIAL, ["mcp:write"]),
+      await listedNames(PAT_WITHOUT_CLI, ["mcp:write"]),
+    ]) {
+      expect(hidden).not.toContain("forwarder_device_metric_sources_set");
+    }
   });
 
   it("tells the model that other secrets in command output are NOT redacted", async () => {
@@ -1351,6 +1413,22 @@ describe("CLI command tools", () => {
       expect(resultText(result).toLowerCase()).not.toContain("disabled");
       expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
     }
+  });
+
+  it("defining a device's metric sources needs the command credential, like the CLI command tools", async () => {
+    const setSources = requireDescriptor("forwarder_device_metric_sources_set");
+    const client = { forwarderManagement: { setCliDeviceMetricSources: vi.fn() } };
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      const result = await runManifestTool(setSources, {
+        dispatch: cliDispatch(credential),
+        scopes: ["mcp:write"],
+        client: client as never,
+        args: { cliDeviceId: "cli-1", sources: [], confirm: "RUN" },
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Tool forwarder_device_metric_sources_set not found");
+    }
+    expect(client.forwarderManagement.setCliDeviceMetricSources).not.toHaveBeenCalled();
   });
 
   it("an unregistered call on the transport is the SDK not-found error", async () => {

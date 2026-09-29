@@ -17,6 +17,9 @@ const CLI_COMMAND_TOOL_NAMES: ReadonlySet<string> = new Set([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  // Defines commands that run on the person's machine (custom metric
+  // sources), so it needs the same per-credential opt-in as the tools above.
+  "forwarder_device_metric_sources_set",
 ]);
 
 export function isCliCommandTool(name: string): boolean {

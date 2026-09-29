@@ -1065,6 +1065,7 @@ fn help_lists_ready_commands() {
         .stdout(predicate::str::contains("daemon"))
         .stdout(predicate::str::contains("service"))
         .stdout(predicate::str::contains("reload"))
+        .stdout(predicate::str::contains("metrics"))
         .stdout(predicate::str::contains("logout"));
 }
 
@@ -1521,22 +1522,28 @@ mod signal_shutdown {
     }
 
     fn start_relay(args: &[&str]) -> Setup {
+        start_relay_with(args, json!({}))
+    }
+
+    /// `extra` is merged over the base config (top-level keys).
+    fn start_relay_with(args: &[&str], extra: Value) -> Setup {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical tempdir");
         let config = dir.join("config.json");
         let state = dir.join("state");
         let relay = FakeRelay::start();
-        write_config(
-            &config,
-            json!({
-                "version": 1,
-                "serverUrl": relay.server_url,
-                "cliSlug": "cli-signal-test",
-                "cliTokenEnv": TOKEN_ENV,
-                "allowMcpCommands": true,
-                "endpoints": []
-            }),
-        );
+        let mut value = json!({
+            "version": 1,
+            "serverUrl": relay.server_url,
+            "cliSlug": "cli-signal-test",
+            "cliTokenEnv": TOKEN_ENV,
+            "allowMcpCommands": true,
+            "endpoints": []
+        });
+        if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        write_config(&config, value);
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
             .args(args)
             .env("WSMP_CONFIG", &config)
@@ -1629,6 +1636,148 @@ mod signal_shutdown {
         }
         signal(setup.child.id(), "TERM");
         assert_clean_shutdown(&mut setup, &shell, &grand, 15);
+    }
+
+    /// A relay whose custom metric source is running: hello.ok has been sent
+    /// (which starts telemetry), and the command's shell and background child
+    /// pids are known.
+    struct SourceRun {
+        setup: Setup,
+        socket: TcpStream,
+        shell: String,
+        grand: String,
+        _pids: tempfile::TempDir,
+    }
+
+    fn start_relay_with_running_source() -> SourceRun {
+        // The source's environment is scrubbed, so the command names its files.
+        let pids = tempfile::tempdir().expect("tempdir");
+        let dir = pids.path().canonicalize().expect("canonical tempdir");
+        let setup = start_relay_with(
+            &["connect"],
+            json!({ "metrics": { "sources": { "slow": {
+                "command": format!(
+                    "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+                    dir.join("shell.pid").display(),
+                    dir.join("grand.pid").display()
+                ),
+                "intervalSecs": 5,
+                "timeoutSecs": 300,
+                "format": "number"
+            } } } }),
+        );
+        let hello = setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        // Registering starts the telemetry thread, which starts the source.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "hello.ok",
+                "id": hello["id"],
+                "protocolVersion": "2.7",
+                "revision": {
+                    "inventorySeq": 1,
+                    "inventoryDigest": "d",
+                    "inventoryAcknowledgedAt": "2026-09-28T12:00:00.000Z"
+                }
+            })
+            .to_string(),
+        );
+        let shell = wait_for_file(&dir.join("shell.pid"));
+        let grand = wait_for_file(&dir.join("grand.pid"));
+        assert!(process_alive(&shell) && process_alive(&grand));
+        SourceRun {
+            setup,
+            socket,
+            shell,
+            grand,
+            _pids: pids,
+        }
+    }
+
+    /// Daemon exit by a signal during a custom metric source run must not
+    /// orphan the command's process group (it runs arbitrary commands, in its
+    /// own group).
+    #[test]
+    fn sigterm_kills_a_running_metric_source_group() {
+        let mut run = start_relay_with_running_source();
+        signal(run.setup.child.id(), "TERM");
+        let status = wait_for_exit(&mut run.setup.child);
+        assert!(
+            status.signal() == Some(15) || status.code() == Some(143),
+            "unexpected relay status {status:?}"
+        );
+        wait_until_gone(&run.shell);
+        wait_until_gone(&run.grand);
+    }
+
+    /// The same for an exit that is not a signal: a fatal relay error ends the
+    /// daemon at once, before the sampler thread notices its session is gone.
+    #[test]
+    fn a_fatal_relay_error_kills_a_running_metric_source_group() {
+        let mut run = start_relay_with_running_source();
+        write_text(
+            &mut run.socket,
+            &json!({ "type": "protocol.error", "failure": "protocol_error", "message": "boom" })
+                .to_string(),
+        );
+        let status = wait_for_exit(&mut run.setup.child);
+        assert!(
+            status.code().is_some_and(|code| code != 0),
+            "the daemon exits with an error: {status:?}"
+        );
+        wait_until_gone(&run.shell);
+        wait_until_gone(&run.grand);
+    }
+
+    /// `wsmp metrics test` runs the command in its own process group, which a
+    /// terminal's Ctrl-C does not reach: a signal must still end it.
+    #[test]
+    fn a_signal_during_metrics_test_kills_the_command_group() {
+        if inherited_ignored(15) {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical tempdir");
+        let config = dir.join("config.json");
+        write_config(
+            &config,
+            json!({
+                "version": 1,
+                "metrics": { "sources": { "slow": {
+                    "command": format!(
+                        "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+                        dir.join("shell.pid").display(),
+                        dir.join("grand.pid").display()
+                    ),
+                    "timeoutSecs": 300
+                } } }
+            }),
+        );
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
+            .args(["metrics", "test", "slow"])
+            .env("WSMP_CONFIG", &config)
+            .env("WSMP_STATE_DIR", dir.join("state"))
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start metrics test");
+        let shell = wait_for_file(&dir.join("shell.pid"));
+        let grand = wait_for_file(&dir.join("grand.pid"));
+        signal(child.id(), "TERM");
+        let status = wait_for_exit(&mut child);
+        assert!(
+            status.signal() == Some(15) || status.code() == Some(143),
+            "unexpected status {status:?}"
+        );
+        wait_until_gone(&shell);
+        wait_until_gone(&grand);
     }
 
     #[test]
@@ -1997,4 +2146,205 @@ fn a_tall_command_fits_the_screen_and_follows_a_resize() {
     child.type_keys(b"q");
     assert!(child.wait_for(b"Declined."));
     assert_eq!(child.exit_code(), 0);
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_remote_sources(state: &Path, sources: Value) {
+    fs::create_dir_all(state).expect("state dir");
+    fs::write(
+        state.join("remote-metric-sources.json"),
+        serde_json::to_vec_pretty(&json!({ "sources": sources })).expect("json"),
+    )
+    .expect("write remote sources");
+}
+
+#[test]
+fn config_metric_sources_round_trip_and_opt_in_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "metrics": { "sources": { "gpu_temp": { "command": "echo 70", "format": "number" } } }
+        }),
+    );
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowRemoteMetricSources"], true);
+    let source = &cfg["metrics"]["sources"]["gpu_temp"];
+    assert_eq!(source["command"], "echo 70");
+    assert_eq!(source["intervalSecs"], 10, "default interval");
+    assert_eq!(source["timeoutSecs"], 5, "default timeout");
+    assert_eq!(source["format"], "number");
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "off"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowRemoteMetricSources").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn metrics_list_and_test_report_local_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "metrics": { "sources": {
+                "gpu": { "command": "printf 'gpu_temp{gpu=\"0\"} 71\\n'; echo leak >&2", "format": "prometheus" },
+                "fast": { "command": "echo 1", "intervalSecs": 2 }
+            } }
+        }),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    let sources = listed["sources"].as_array().expect("sources");
+    let state_of = |name: &str| {
+        sources
+            .iter()
+            .find(|source| source["name"] == name)
+            .map(|source| source["state"].clone())
+    };
+    assert_eq!(state_of("gpu"), Some(json!("active")));
+    assert_eq!(state_of("fast"), Some(json!("disabled")));
+    let tested = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "test", "gpu", "--json"]);
+        cmd
+    });
+    assert_eq!(tested["ok"], true);
+    assert_eq!(tested["series"][0]["name"], "gpu_temp");
+    assert_eq!(tested["series"][0]["labels"]["gpu"], "0");
+    assert_eq!(tested["series"][0]["value"], 71.0);
+    assert!(
+        !tested.to_string().contains("leak"),
+        "stderr is never captured"
+    );
+}
+
+#[test]
+fn metrics_approve_pins_the_exact_remote_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1 }));
+    write_remote_sources(
+        &state,
+        json!([{ "name": "fans", "command": "echo 3", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "refused", "no opt-in yet");
+
+    cli(&config, &state)
+        .args(["config", "set-remote-metric-sources", "on"])
+        .assert()
+        .success();
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "pending_approval");
+    cli(&config, &state)
+        .args(["metrics", "test", "fans"])
+        .assert()
+        .failure();
+
+    // Approval by name alone (no reviewed hash) is refused and pins nothing:
+    // it would bind to whatever command the server stored last.
+    cli(&config, &state)
+        .args(["metrics", "approve", "fans"])
+        .assert()
+        .failure();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(
+        cfg.pointer("/metrics/approvedRemoteSources/fans").is_none(),
+        "nothing is pinned without a reviewed hash"
+    );
+
+    // The server swaps the command after the person read `echo 4`: the
+    // approval of the reviewed hash is refused and pins nothing.
+    cli(&config, &state)
+        .args([
+            "metrics",
+            "approve",
+            "fans",
+            "--sha256",
+            &sha256_hex("echo 4"),
+        ])
+        .assert()
+        .failure();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.pointer("/metrics/approvedRemoteSources/fans").is_none());
+    let approved = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "metrics",
+            "approve",
+            "fans",
+            "--sha256",
+            &sha256_hex("echo 3"),
+            "--json",
+        ]);
+        cmd
+    });
+    assert_eq!(approved["commandSha256"], sha256_hex("echo 3"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        cfg["metrics"]["approvedRemoteSources"]["fans"],
+        sha256_hex("echo 3")
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "active");
+
+    // The server changes the command: it needs a new approval.
+    write_remote_sources(
+        &state,
+        json!([{ "name": "fans", "command": "echo 3; rm -rf ~", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
+    );
+    let listed = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["metrics", "list", "--json"]);
+        cmd
+    });
+    assert_eq!(listed["sources"][0]["state"], "pending_approval");
+
+    cli(&config, &state)
+        .args(["metrics", "revoke", "fans"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("metrics").is_none());
+    cli(&config, &state)
+        .args(["metrics", "approve", "missing"])
+        .assert()
+        .failure();
 }

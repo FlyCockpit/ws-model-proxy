@@ -33,6 +33,51 @@ Empty AUTO discovery capacities are removed with model, endpoint, and device
 deletes, and an idempotent startup sweep repairs existing idle orphans.
 Owner-created empty capacities remain visible in `capacity_records_list`.
 
+`forwarder_device_metrics_get` also lists `series`: every metric a pool routing
+rule can name on that device (built-in `node.*` series such as
+`node.cpu.usage_percent`, `node.memory.used_percent` or
+`node.gpu.temperature_c{gpu="0"}`, and the CLI's custom series), with its
+labels, latest value and whether it is stale. It also returns the remote metric
+source definitions the server holds (`remoteMetricSources`, each with the
+`commandSha256` the CLI pins) next to the CLI's own view of every source in
+`nodeMetrics.sources` (`active`, `pending_approval`, `refused`, ...).
+
+Metric routing rules (S-B part 2):
+
+- `forwarder_pool_routing_rules_get` (`{ poolId }`) returns the pool's rules,
+  each primary member's current verdict (`full`, `avoid` or none), its state
+  (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
+  `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
+  `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
+  device.
+- `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
+  replaces the whole list (at most 16). A rule is a flat record
+  `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
+  threshold, effect: "full" | "avoid" }`; there is no expression language.
+  Label keys and values use the metric-name charset, and `__proto__` is not
+  accepted as a label key (the rule is rejected, never widened).
+  `full` makes the member FULL: the request queues, goes to another member, or
+  (for `:external` callers only) goes external after `externalAfterWaitMs`.
+  `avoid` ranks the member last among free members and never makes it
+  ineligible. A stale or missing metric makes its rule inert, and when every
+  candidate is metric-FULL a plain-name request is admitted by leases alone
+  (fail open), so metrics never make a pool sit idle. It is confirmed and
+  classified `cost` because a `full` rule can send `:external` traffic to paid
+  providers.
+- `forwarder_device_metric_sources_set` (`{ cliDeviceId, sources, confirm:
+  "RUN" }`) replaces a device's remotely defined metric sources
+  (`{ name, command, intervalSecs >= 5, timeoutSecs, format: "number" | "json"
+  | "prometheus" }`). The server accepts it only while the device's MCP command
+  mode is `unsupervised`, only for a personal token minted with the CLI
+  commands option (`allowCliCommands`; OAuth clients and other tokens neither
+  see nor can call it), and sends an empty list to the CLI whenever the mode
+  is anything else. The CLI refuses remote sources unless its local
+  `allowRemoteMetricSources` opt-in is on, and runs a command only after the
+  person approves that exact command string on the machine
+  (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
+  read); a changed command stops until it is approved
+  again. stderr and command output never leave the CLI; only parsed numbers do.
+
 ## Setup
 
 Required environment:

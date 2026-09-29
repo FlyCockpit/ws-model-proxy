@@ -39,6 +39,10 @@ enum Sub {
     SetMcpCommands { mode: McpMode },
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
+    /// Accept metric sources defined remotely (dashboard or MCP). Each one
+    /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
+    /// starts.
+    SetRemoteMetricSources { state: Switch },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -165,6 +169,16 @@ pub fn run(args: &Args) -> Result<()> {
                 state.enabled(),
                 |cfg| {
                     cfg.require_terminal_approval = state.enabled();
+                },
+            )?;
+        }
+        Sub::SetRemoteMetricSources { state } => {
+            set_flag(
+                args.json,
+                "allowRemoteMetricSources",
+                state.enabled(),
+                |cfg| {
+                    cfg.allow_remote_metric_sources = state.enabled();
                 },
             )?;
         }
