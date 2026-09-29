@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 use crate::approvals::{approved_public_key, record_pending};
 use crate::child_env::{self, scrub_parent_env};
 use crate::config::Config;
+use crate::output_mask::StreamMasker;
 #[cfg(unix)]
 use crate::protocol::SupervisedOutputPart;
 use crate::protocol::{
@@ -1227,6 +1228,9 @@ struct Supervised {
     #[cfg(unix)]
     child: supervised_pty::ChildLink,
     capture: Capture,
+    /// Masks secrets in what enters `capture` (the copy shared with the server
+    /// and MCP). The terminal viewers still get the raw bytes.
+    mask: StreamMasker,
     spawned_at: Instant,
     finished_at: Option<Instant>,
     /// Kept for the `term.exit` of a finished session.
@@ -1307,7 +1311,8 @@ impl TerminalSession {
                 match piece {
                     Piece::Bytes(bytes) => {
                         if supervised.phase == SupervisedPhase::Running {
-                            supervised.capture.push(&bytes);
+                            let masked = supervised.mask.push(&bytes);
+                            supervised.capture.push(&masked);
                         }
                         display.extend(bytes);
                     }
@@ -1883,6 +1888,7 @@ impl TerminalRegistry {
                     phase: SupervisedPhase::Starting,
                     child: supervised_pty::ChildLink::new(&marker),
                     capture: Capture::default(),
+                    mask: StreamMasker::new(&spawn.command),
                     spawned_at: now,
                     finished_at: None,
                     exit_status: (None, None),
@@ -1961,6 +1967,11 @@ impl TerminalRegistry {
                 return Vec::new();
             };
             supervised.exit_status = status;
+            if phase == SupervisedPhase::Running {
+                // The held partial last line is masked into the capture now.
+                let held = supervised.mask.finish();
+                supervised.capture.push(&held);
+            }
             (
                 status,
                 phase,
@@ -3174,6 +3185,9 @@ struct ExecSession {
     started: Instant,
     stdout_seq: u64,
     stderr_seq: u64,
+    /// Secret masking of what leaves the node, one line-buffered masker per stream.
+    stdout_mask: StreamMasker,
+    stderr_mask: StreamMasker,
     stdout_done: bool,
     stderr_done: bool,
     timed_out: bool,
@@ -3307,25 +3321,14 @@ impl ExecRegistry {
         if session.finished {
             return Vec::new();
         }
-        let seq = if stderr {
-            session.stderr_seq = session.stderr_seq.saturating_add(1);
-            session.stderr_seq
+        let masked = if stderr {
+            session.stderr_mask.push(bytes)
         } else {
-            session.stdout_seq = session.stdout_seq.saturating_add(1);
-            session.stdout_seq
+            session.stdout_mask.push(bytes)
         };
-        let metadata = if stderr {
-            RelayBinaryFrameMetadata::ExecStderr {
-                command_id: command_id.to_string(),
-                seq,
-            }
-        } else {
-            RelayBinaryFrameMetadata::ExecStdout {
-                command_id: command_id.to_string(),
-                seq,
-            }
-        };
-        vec![OutboundFrame::Binary(metadata, bytes.to_vec())]
+        exec_output_frame(command_id, session, stderr, masked)
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn on_eof(&mut self, command_id: &str, stderr: bool) -> Vec<OutboundFrame> {
@@ -3335,14 +3338,19 @@ impl ExecRegistry {
         if session.finished {
             return Vec::new();
         }
-        if stderr {
+        // The held partial last line is scanned now, so nothing stays unmasked.
+        let flushed = if stderr {
             session.stderr_done = true;
+            session.stderr_mask.finish()
         } else {
             session.stdout_done = true;
-        }
+            session.stdout_mask.finish()
+        };
         // Pipes can close while the process is still running (`sleep
         // >/dev/null`). Reaping happens on `poll` via `try_wait`.
-        Vec::new()
+        exec_output_frame(command_id, session, stderr, flushed)
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
@@ -3421,6 +3429,17 @@ impl ExecRegistry {
         let Some(mut session) = self.sessions.remove(command_id) else {
             return Vec::new();
         };
+        // Lines still held when the command ends (a pipe that never reached EOF)
+        // are masked and sent before the outcome.
+        let mut frames = Vec::new();
+        for stderr in [false, true] {
+            let flushed = if stderr {
+                session.stderr_mask.finish()
+            } else {
+                session.stdout_mask.finish()
+            };
+            frames.extend(exec_output_frame(command_id, &mut session, stderr, flushed));
+        }
         session.finished = true;
         session.stop.store(true, Ordering::SeqCst);
         // Reader threads exit on their own. Joining them can block if a
@@ -3428,12 +3447,13 @@ impl ExecRegistry {
         drop(session.stdout_thread.take());
         drop(session.stderr_thread.take());
         drop(session.child.take());
-        vec![exec_done(
+        frames.push(exec_done(
             command_id,
             status.0,
             status.1,
             timed_out || session.timed_out,
-        )]
+        ));
+        frames
     }
 
     #[cfg(test)]
@@ -3446,6 +3466,38 @@ impl Drop for ExecRegistry {
     fn drop(&mut self) {
         let _ = self.kill_all();
     }
+}
+
+/// One masked output frame with the next sequence number of its stream, or
+/// `None` when masking left nothing to send.
+fn exec_output_frame(
+    command_id: &str,
+    session: &mut ExecSession,
+    stderr: bool,
+    bytes: Vec<u8>,
+) -> Option<OutboundFrame> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let seq = if stderr {
+        session.stderr_seq = session.stderr_seq.saturating_add(1);
+        session.stderr_seq
+    } else {
+        session.stdout_seq = session.stdout_seq.saturating_add(1);
+        session.stdout_seq
+    };
+    let metadata = if stderr {
+        RelayBinaryFrameMetadata::ExecStderr {
+            command_id: command_id.to_string(),
+            seq,
+        }
+    } else {
+        RelayBinaryFrameMetadata::ExecStdout {
+            command_id: command_id.to_string(),
+            seq,
+        }
+    };
+    Some(OutboundFrame::Binary(metadata, bytes))
 }
 
 fn reap_child(child: Option<&mut std::process::Child>) -> (Option<i32>, Option<i32>) {
@@ -3559,6 +3611,8 @@ fn spawn_exec(
         started: Instant::now(),
         stdout_seq: 0,
         stderr_seq: 0,
+        stdout_mask: StreamMasker::new(command),
+        stderr_mask: StreamMasker::new(command),
         stdout_done: false,
         stderr_done: false,
         timed_out: false,
@@ -3667,6 +3721,156 @@ mod tests {
         assert_eq!(execs.sessions.len(), 2);
         drop(execs);
         drop(rx);
+    }
+
+    /// Run `command` to completion and return (stdout, stderr) as the server gets them.
+    #[cfg(unix)]
+    fn run_exec_masked(command: &str) -> (String, String) {
+        let (tx, rx) = channel();
+        let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
+        let startup = enabled_startup(false);
+        execs.start(&startup, &Config::default(), "cmd", command, None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut done = false;
+        while !done {
+            assert!(Instant::now() < deadline, "exec did not finish");
+            let mut frames = Vec::new();
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(FromWorker::ExecBytes {
+                    command_id,
+                    stderr,
+                    bytes,
+                }) => frames.extend(execs.on_bytes(&command_id, stderr, &bytes)),
+                Ok(FromWorker::ExecEof { command_id, stderr }) => {
+                    frames.extend(execs.on_eof(&command_id, stderr));
+                }
+                _ => {}
+            }
+            frames.extend(execs.poll(Instant::now()));
+            for frame in frames {
+                match frame {
+                    OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStdout { .. }, body) => {
+                        out.extend(body);
+                    }
+                    OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStderr { .. }, body) => {
+                        err.extend(body);
+                    }
+                    OutboundFrame::Control(ClientControlMessage::ExecDone { .. }) => done = true,
+                    _ => {}
+                }
+            }
+        }
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_output_is_masked_on_both_streams_across_reads_and_at_eof() {
+        // A token split over two writes on stdout, a flag value on stderr with no
+        // trailing newline, and the negative cases that must stay readable.
+        let (out, err) = run_exec_masked(
+            "printf 'MY_API_KEY=zq9x'; sleep 0.3; printf 'wv8u7t6s\\nmax_tokens=4096\\nghp_0123456789abcdef\\n'; \
+             printf 'llama --hf-token hf_secretvalue' >&2",
+        );
+        assert!(
+            out.contains("MY_API_KEY=\u{27E6}redacted:12\u{27E7}\n"),
+            "{out}"
+        );
+        assert!(!out.contains("zq9x") && !out.contains("wv8u7t6s"), "{out}");
+        assert!(out.contains("max_tokens=4096\n"), "{out}");
+        assert!(out.contains("ghp_0123456789abcdef\n"), "{out}");
+        assert_eq!(err, "llama --hf-token \u{27E6}redacted:14\u{27E7}");
+    }
+
+    /// A pipe that never reaches EOF (a daemonized child holds it) still gets its
+    /// held last line masked when the command is completed after the drain wait.
+    /// A stream that closes while the command keeps running has its held last
+    /// line masked and sent at EOF, before the command ends.
+    #[cfg(unix)]
+    #[test]
+    fn exec_flushes_each_closed_stream_at_eof_while_the_command_runs() {
+        let (tx, rx) = channel();
+        let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
+        let startup = enabled_startup(false);
+        execs.start(
+            &startup,
+            &Config::default(),
+            "cmd",
+            "printf 'X_TOKEN=abcdef'; printf 'y --api-key hhh' >&2; exec >&- 2>&-; sleep 5",
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut eofs = 0;
+        while eofs < 2 {
+            assert!(Instant::now() < deadline, "the streams did not close");
+            let frames = match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(FromWorker::ExecBytes {
+                    command_id,
+                    stderr,
+                    bytes,
+                }) => execs.on_bytes(&command_id, stderr, &bytes),
+                Ok(FromWorker::ExecEof { command_id, stderr }) => {
+                    eofs += 1;
+                    execs.on_eof(&command_id, stderr)
+                }
+                _ => Vec::new(),
+            };
+            for frame in frames {
+                match frame {
+                    OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStdout { .. }, body) => {
+                        out.extend(body);
+                    }
+                    OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStderr { .. }, body) => {
+                        err.extend(body);
+                    }
+                    _ => panic!("unexpected frame before the command ended"),
+                }
+            }
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "X_TOKEN=\u{27E6}redacted:6\u{27E7}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&err),
+            "y --api-key \u{27E6}redacted:3\u{27E7}"
+        );
+        drop(execs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_masks_the_held_line_when_the_command_completes_without_eof() {
+        if std::process::Command::new("setsid")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let (out, _) = run_exec_masked("printf 'LAST_SECRET=abcdef'; setsid sleep 8 >&1 &");
+        assert_eq!(out, "LAST_SECRET=\u{27E6}redacted:6\u{27E7}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_masks_a_printed_private_key_block_and_the_hf_token_file() {
+        let (out, _) = run_exec_masked(
+            "printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaC1rZXk\\n-----END OPENSSH PRIVATE KEY-----\\nafter\\n'",
+        );
+        assert!(!out.contains("b3BlbnNzaC1rZXk"), "{out}");
+        assert!(out.ends_with("after\n"), "{out}");
+        // The command names the HF token file, so a bare-word line is the token.
+        let (out, err) = run_exec_masked(
+            "echo hf_abcdefghijklmnop # cat ~/.cache/huggingface/token\necho 'two words'\necho hf_qrstuvwxyz123456 >&2",
+        );
+        assert_eq!(out, "\u{27E6}redacted:19\u{27E7}\ntwo words\n");
+        assert_eq!(err, "\u{27E6}redacted:19\u{27E7}\n");
     }
 
     #[test]
@@ -5683,6 +5887,12 @@ mod tests {
     /// then runs its "command" only once the daemon's `go` token arrives.
     #[cfg(unix)]
     fn fake_confirm(witness: Option<&Path>) -> String {
+        fake_confirm_output(witness, "printf 'after-accept\\n'")
+    }
+
+    /// [`fake_confirm`] whose command runs the shell line `output`.
+    #[cfg(unix)]
+    fn fake_confirm_output(witness: Option<&Path>, output: &str) -> String {
         let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
         let touch = witness.map_or(String::new(), |path| {
             format!("touch '{}'\n", path.display())
@@ -5699,7 +5909,7 @@ printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
 go=$(head -c {go_len})
 stty echo icanon
 [ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
-{touch}printf 'after-accept\n'
+{touch}{output}
 printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
 exit 3
 "#
@@ -5910,6 +6120,145 @@ exit 3
             .expect("done");
         assert_eq!(done, (Some(3), false, Some(head.len() as u64)));
         assert!(terminals.sessions.is_empty());
+    }
+
+    /// A secret that straddles the 8 KiB head cut, and one that straddles the
+    /// start of the retained tail, are masked before the capture keeps its parts.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_across_the_capture_head_and_tail_boundaries_is_masked_whole() {
+        let head_max = terminal_crypto::CAPTURE_HEAD_MAX;
+        let tail_max = terminal_crypto::CAPTURE_TAIL_MAX;
+        let secret = "VERYSECRETVALUE".repeat(3);
+        let secret_line = format!("API_TOKEN={secret}\n");
+        // Raw, the secret runs past the head cut; masked, its token fits before it.
+        let mut stream = "y\n".repeat((head_max - 36) / 2);
+        stream.push_str(&secret_line);
+        // A second secret line sits so that the last `tail_max` bytes of the raw
+        // stream would start inside its secret (the masked line is shorter, so
+        // only masking-before-capture keeps its remnant out of the tail).
+        stream.push_str(&"f\n".repeat(tail_max / 2));
+        stream.push_str(&secret_line);
+        stream.push_str(&"f\n".repeat((tail_max - 12) / 2));
+        let mut masker = StreamMasker::new("ls");
+        let mut capture = Capture::default();
+        for chunk in stream.as_bytes().chunks(997) {
+            capture.push(&masker.push(chunk));
+        }
+        capture.push(&masker.finish());
+        let (head, tail) = capture.parts();
+        let token = "API_TOKEN=\u{27E6}redacted:45\u{27E7}";
+        for (name, part) in [("head", &head), ("tail", &tail)] {
+            let text = String::from_utf8_lossy(part);
+            assert!(
+                !text.contains("VALUE") && !text.contains("SECRET"),
+                "{name} leaked"
+            );
+        }
+        assert!(String::from_utf8_lossy(&head).contains(token));
+        assert!(head.len() <= head_max && tail.len() <= tail_max);
+    }
+
+    /// The supervised command names the HF token file: its bare-word line is masked.
+    #[cfg(unix)]
+    #[test]
+    fn supervised_shared_output_masks_the_hf_token_file_when_the_command_names_it() {
+        let (tx, rx) = channel();
+        let script = fake_confirm_output(None, "printf 'hf_tokenfilecontents\\ntwo words\\n'");
+        let mut terminals = supervised_registry(tx, &script);
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut request = spawn_request(true);
+        request.command = "cat ~/.cache/huggingface/token".to_string();
+        let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+        let mut a = TestViewer::new(6);
+        let _ = attach_viewer(&mut terminals, &startup, &mut a);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        let shared = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Binary(RelayBinaryFrameMetadata::SupervisedOutput { .. }, body) => {
+                    Some(body.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<u8>>();
+        let shared = String::from_utf8_lossy(&shared).into_owned();
+        assert!(!shared.contains("hf_tokenfilecontents"), "{shared}");
+        assert!(shared.contains("\u{27E6}redacted:20\u{27E7}"), "{shared}");
+        assert!(shared.contains("two words"), "{shared}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_shared_output_is_masked_across_reads_and_the_viewer_stays_raw() {
+        let (tx, rx) = channel();
+        // The token is written in two PTY reads, and the last line has no newline.
+        let script = fake_confirm_output(
+            None,
+            "printf 'ok line\\nHF_TOKEN=zq9x'; sleep 0.3; printf 'wv8u7t6s\\nmax_tokens=4096\\n'; \
+             printf 'ghp_0123456789abcdef\\nserve --api-key sk-live-9999'",
+        );
+        let mut terminals = supervised_registry(tx, &script);
+        let startup = supervised_startup(McpCommandMode::Supervised, false);
+        let mut frames =
+            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
+        let mut a = TestViewer::new(5);
+        let joined = attach_viewer(&mut terminals, &startup, &mut a);
+        let mut seen = a.receive(MULTI_TERMINAL, &joined);
+        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+            phase(terminals) == Some(SupervisedPhase::Confirm)
+        });
+        let label = a.id.clone();
+        frames.extend(send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"ok\r".to_vec()),
+        ));
+        pump_until(&mut terminals, &rx, &mut frames, has_exit);
+        let shared = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Binary(RelayBinaryFrameMetadata::SupervisedOutput { .. }, body) => {
+                    Some(body.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<u8>>();
+        let shared = String::from_utf8_lossy(&shared).into_owned();
+        assert!(shared.contains("ok line"), "{shared}");
+        assert!(
+            shared.contains("HF_TOKEN=\u{27E6}redacted:12\u{27E7}"),
+            "{shared}"
+        );
+        assert!(
+            !shared.contains("zq9x") && !shared.contains("wv8u7t6s"),
+            "{shared}"
+        );
+        assert!(shared.contains("max_tokens=4096"), "{shared}");
+        assert!(shared.contains("ghp_0123456789abcdef"), "{shared}");
+        // The last line has no newline: it is masked when the command ends.
+        assert!(
+            shared.contains("serve --api-key \u{27E6}redacted:"),
+            "{shared}"
+        );
+        assert!(!shared.contains("sk-live-9999"), "{shared}");
+        // The person's terminal still shows the real bytes.
+        seen.extend(a.receive(MULTI_TERMINAL, &frames));
+        let shown = String::from_utf8_lossy(&seen_data(&seen)).into_owned();
+        assert!(shown.contains("HF_TOKEN=zq9xwv8u7t6s"), "{shown}");
     }
 
     #[cfg(unix)]

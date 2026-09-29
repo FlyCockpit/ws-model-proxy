@@ -10,7 +10,9 @@
 /**
  * Per-stream view the model sees. `totalBytes` is the full stream count.
  * `text` is lossy UTF-8 of the retained head and tail, with credential
- * substrings removed. Other secrets are not redacted.
+ * substrings removed. The CLI has already masked SSH private keys, secret-named
+ * environment assignments, HF token file contents and API-key flag values
+ * before the bytes left the node; other secrets are not masked.
  */
 export type CliStreamText = {
   text: string;

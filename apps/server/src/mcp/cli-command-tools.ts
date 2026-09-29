@@ -20,11 +20,13 @@ type CliCommandDeps = {
 };
 
 /**
- * Shown on both CLI command tools. Only the wsmp_ credential substrings
- * are removed; other secrets in command output are NOT redacted.
+ * Shown on the CLI command tools. The CLI masks a narrow set of secrets in
+ * command output before it leaves the node (`apps/cli/src/output_mask.rs`,
+ * the same rules as the file tools); the server removes wsmp_ credential
+ * substrings. Nothing else is redacted.
  */
 export const CLI_COMMAND_OUTPUT_NOTICE =
-  "Other secrets in command output are NOT redacted. Only substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed.";
+  "The CLI masks SSH/PEM private key blocks, secret-named environment variable assignments (names ending in _TOKEN, _KEY, _API_KEY, _SECRET or PASSWORD, as KEY=⟦redacted:N⟧), the Hugging Face token file when the command prints it, and the values of --api-key/--hf-token-style flags in command output before it leaves the machine. Other secrets (for example vendor tokens such as ghp_ or sk- keys, JWTs, or cloud credentials) are NOT masked. Substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed. On an unsupervised node this masking is not a security boundary: a command can print a secret in a form it does not recognize.";
 
 const CLI_REJECTION_MESSAGES = {
   not_found: "Not found",

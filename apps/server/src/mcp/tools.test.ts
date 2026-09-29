@@ -1209,7 +1209,7 @@ describe("CLI command tools", () => {
     expect(flagged).toContain("forwarder_cli_command_result");
   });
 
-  it("tells the model that other secrets in command output are NOT redacted", async () => {
+  it("tells the model what command output masks and that other secrets are NOT masked", async () => {
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo, "req-list", PAT_WITH_CLI);
     const handler = createMcpTransport();
@@ -1221,12 +1221,18 @@ describe("CLI command tools", () => {
     const resultTool = body.result?.tools?.find(
       (tool) => tool.name === "forwarder_cli_command_result",
     );
-    expect(run?.description).toContain("NOT redacted");
+    for (const description of [run?.description, resultTool?.description]) {
+      expect(description).toContain("private key blocks");
+      expect(description).toContain("--api-key");
+      expect(description).toContain("Hugging Face token file");
+      expect(description).toContain("NOT masked");
+      expect(description).toContain("not a security boundary");
+      expect(description).not.toContain("NOT redacted");
+    }
     expect(
       (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
         ?.destructiveHint,
     ).toBe(true);
-    expect(resultTool?.description).toContain("NOT redacted");
     expect(run?.description).toContain('confirm: "RUN"');
     expect(resultTool?.description).not.toContain('confirm: "RUN"');
   });

@@ -224,8 +224,18 @@ secret-bearing keys and product credentials under any key, and the serializer
 elides byte values. A test drives every tool with secret-laden results and
 searches the output for every seeded secret value in every encoding. The CLI
 command tools return what a command printed on your own CLI device (behind the
-separate `allowCliCommands` consent); WMP credentials in that text are
-scrubbed, but other device content is returned as printed.
+separate `allowCliCommands` consent). The CLI masks a narrow set of secrets in
+that output before it leaves the machine, for headless commands and for the
+shared copy of supervised output (the terminal a person watches is unchanged):
+`PRIVATE KEY` blocks, secret-named environment assignments (`*_TOKEN`, `*_KEY`,
+`*_API_KEY`, `*_SECRET`, `PASSWORD`, including `Environment=` and compose
+`environment:` entries) shown as `KEY=⟦redacted:N⟧`, the Hugging Face token file
+when the command prints it, and the values of `--api-key`/`--hf-token`-style
+flags. Masking is per line on the CLI (a secret split across reads is still
+masked whole, and it happens before the 8 KiB head / 40 KiB tail are cut) and
+never searches the disk. WMP credentials are scrubbed by the server. Other
+secrets (vendor tokens, JWTs, cloud credentials) are returned as printed, and on
+an `unsupervised` device the masking is not a security boundary.
 
 ## Tool errors
 
