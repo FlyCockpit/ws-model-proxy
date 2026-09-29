@@ -757,6 +757,81 @@ describe("revoked credentials", () => {
     manager.dispose();
   });
 
+  it("does not attribute a probe's disconnect after its headers arrived when a reconnect replaced it", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    const member = {
+      id: "member-1",
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      upstreamModelId: "model-a",
+      userId: "user-id",
+      capabilities: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: true },
+      },
+    };
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+
+    const probing = probe(member);
+    await vi.waitFor(() =>
+      expect(
+        first.sends.some((frame) => typeof frame === "string" && frame.includes("relay.request")),
+      ).toBe(true),
+    );
+    const request = first.sends
+      .filter((frame): frame is string => typeof frame === "string")
+      .map((frame) => JSON.parse(frame) as { type: string; requestId?: string })
+      .find((frame) => frame.type === "relay.request");
+    await manager.handleTextFrame(
+      first,
+      JSON.stringify({
+        type: "relay.response.headers",
+        requestId: request?.requestId,
+        status: 200,
+        headers: {},
+      }),
+      now,
+    );
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+
+    await expect(probing).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
+  it("does not probe when the owning session is gone at dispatch", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    await expect(
+      probe({
+        id: "member-1",
+        cliDeviceId: "no-such-device",
+        endpointSlug: "local-openai",
+        upstreamModelId: "model-a",
+        userId: "user-id",
+        capabilities: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true },
+        },
+      }),
+    ).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
   it("refuses a heartbeat write whose session generation was superseded", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

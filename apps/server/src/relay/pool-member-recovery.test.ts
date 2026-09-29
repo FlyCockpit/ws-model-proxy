@@ -147,6 +147,7 @@ describe("PoolMemberRecoveryScheduler", () => {
   it("does not settle a probe after ownership is lost", async () => {
     vi.useFakeTimers();
     let owned = true;
+    const abandon = vi.fn().mockResolvedValue(true);
     const settle = vi.fn().mockResolvedValue(true);
     const scheduler = new PoolMemberRecoveryScheduler({
       getOwnedCliDeviceIds: () => (owned ? ["local-cli"] : []),
@@ -156,11 +157,14 @@ describe("PoolMemberRecoveryScheduler", () => {
         return true;
       }),
       claim: vi.fn().mockImplementation((_id, now) => Promise.resolve(now)),
+      abandon,
       settle,
     });
     scheduler.wake();
     await vi.advanceTimersByTimeAsync(0);
     expect(settle).not.toHaveBeenCalled();
+    // The claimed trial is handed back, never left as a live half-open lease.
+    expect(abandon).toHaveBeenCalledTimes(1);
     scheduler.stop();
     vi.useRealTimers();
   });
@@ -193,6 +197,24 @@ describe("PoolMemberRecoveryScheduler", () => {
     expect(probe).toHaveBeenCalledTimes(2);
     expect(settle).toHaveBeenCalledTimes(1);
     expect(settle).toHaveBeenCalledWith(expect.objectContaining({ healthy: true }));
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("hands the claimed trial back when settling fails", async () => {
+    vi.useFakeTimers();
+    const abandon = vi.fn().mockResolvedValue(true);
+    const scheduler = new PoolMemberRecoveryScheduler({
+      getOwnedCliDeviceIds: () => ["local-cli"],
+      listDueMembers: vi.fn().mockResolvedValue([member]),
+      probe: vi.fn().mockResolvedValue(true),
+      claim: vi.fn().mockImplementation((_id, now) => Promise.resolve(now)),
+      abandon,
+      settle: vi.fn().mockRejectedValue(new Error("db down")),
+    });
+    scheduler.wake();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(abandon).toHaveBeenCalledTimes(1);
     scheduler.stop();
     vi.useRealTimers();
   });

@@ -877,13 +877,34 @@ export async function markPoolMembersForCliUnavailable({
   });
 }
 
-const DISCONNECT_TRANSACTION_MAX_ATTEMPTS = 3;
+const DISCONNECT_TRANSACTION_MAX_ATTEMPTS = 5;
 const DISCONNECT_TRANSACTION_TIMEOUT_MS = 10_000;
 const DISCONNECT_TRANSACTION_MAX_WAIT_MS = 5_000;
+/**
+ * The transaction holds the `cli_device` row (L0) while it waits for member
+ * rows (L7). Bound that wait so a slow member-row holder cannot make a
+ * reconnecting hello (which needs the device row) wait out its own transaction
+ * timeout: the attempt aborts and releases the device row, a successor that
+ * committed meanwhile makes the retry a fenced no-op, and otherwise it retries.
+ */
+const DISCONNECT_LOCK_TIMEOUT_MS = 2_000;
+const DISCONNECT_RETRY_BACKOFF_MS = 100;
+
+function isLockTimeout(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const meta = Reflect.get(error, "meta");
+  const sqlState =
+    typeof meta === "object" && meta !== null ? Reflect.get(meta, "code") : undefined;
+  const message = Reflect.get(error, "message");
+  return (
+    sqlState === "55P03" || (typeof message === "string" && /55P03|lock timeout/i.test(message))
+  );
+}
 
 /** P2028 = Prisma interactive transaction expired / could not start in `maxWait`. */
 function isRetryableDisconnectError(error: unknown): boolean {
   if (retryableSerializableTransactionCode(error) !== undefined) return true;
+  if (isLockTimeout(error)) return true;
   return typeof error === "object" && error !== null && Reflect.get(error, "code") === "P2028";
 }
 
@@ -923,6 +944,7 @@ export async function disconnectCliDeviceAtGeneration({
     try {
       return await prisma.$transaction(
         async (tx) => {
+          await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${DISCONNECT_LOCK_TIMEOUT_MS}ms`}, true)`;
           const claimed = await tx.cliDevice.updateMany({
             where: { id: cliDeviceId, connectionGeneration: generation },
             data: { status: cliStatus, lastDisconnectedAt: now },
@@ -942,6 +964,7 @@ export async function disconnectCliDeviceAtGeneration({
     } catch (error) {
       if (attempt >= DISCONNECT_TRANSACTION_MAX_ATTEMPTS || !isRetryableDisconnectError(error))
         throw error;
+      await new Promise((resolve) => setTimeout(resolve, DISCONNECT_RETRY_BACKOFF_MS * attempt));
     }
   }
 }

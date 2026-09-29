@@ -666,7 +666,7 @@ describe("modelPoolRouting", () => {
     });
   });
 
-  it("retries a disconnect transaction that expired, and gives up after three attempts", async () => {
+  it("retries a disconnect transaction that expired, and gives up after five attempts", async () => {
     const expired = Object.assign(new Error("expired"), { code: "P2028" });
     const tx = db as unknown as { $transaction: MockInstance };
     tx.$transaction.mockReset();
@@ -692,7 +692,25 @@ describe("modelPoolRouting", () => {
         failureClass: "WEBSOCKET_DISCONNECTED",
       }),
     ).rejects.toBe(expired);
-    expect(tx.$transaction).toHaveBeenCalledTimes(3);
+    expect(tx.$transaction).toHaveBeenCalledTimes(5);
+
+    // A lock timeout (55P03) is transient too: it releases the device row so a
+    // reconnecting hello is never stuck behind a slow member-row holder.
+    tx.$transaction.mockReset();
+    const lockTimeout = Object.assign(new Error("lock timeout"), {
+      code: "P2010",
+      meta: { code: "55P03" },
+    });
+    tx.$transaction.mockRejectedValueOnce(lockTimeout).mockResolvedValueOnce(false);
+    await expect(
+      disconnectCliDeviceAtGeneration({
+        cliDeviceId: "cli-1",
+        generation: 1,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      }),
+    ).resolves.toBe(false);
+    expect(tx.$transaction).toHaveBeenCalledTimes(2);
 
     // A non-transient error is not retried.
     tx.$transaction.mockReset();

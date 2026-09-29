@@ -280,4 +280,56 @@ integration("disconnect fence with real PostgreSQL", () => {
     expect(after.consecutiveRetryableFailures).toBe(3);
     expect(after.nextRetryAt?.getTime()).toBe(now.getTime());
   });
+
+  it("does not hold the device row hostage while a member-row holder is slow (bounded lock wait)", async () => {
+    const { prisma, routing, rows } = await seed("hostage");
+    const row = rows[0];
+    if (!row) throw new Error("seed");
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let locked: () => void = () => {};
+    const lockedP = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const blocker = prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRawUnsafe(
+          "SELECT id FROM pool_member WHERE id = $1 FOR UPDATE",
+          row.member.id,
+        );
+        locked();
+        await gate;
+      },
+      { timeout: 30_000 },
+    );
+    await lockedP;
+
+    const stale = routing.disconnectCliDeviceAtGeneration({
+      cliDeviceId: row.device.id,
+      generation: 1,
+      cliStatus: "DISCONNECTED",
+      failureClass: "WEBSOCKET_DISCONNECTED",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The reconnect's registration needs the device row. The disconnect gives
+    // it up after its lock timeout (about 2 s) even though the member holder is
+    // still running, so the reconnect commits long before the holder finishes.
+    const started = Date.now();
+    await prisma.cliDevice.update({
+      where: { id: row.device.id },
+      data: { connectionGeneration: { increment: 1 }, status: "CONNECTED" },
+    });
+    expect(Date.now() - started).toBeLessThan(6_000);
+    release();
+    await blocker;
+    // The retried disconnect finds the successor generation and is refused.
+    await expect(stale).resolves.toBe(false);
+    const device = await prisma.cliDevice.findUniqueOrThrow({ where: { id: row.device.id } });
+    const member = await prisma.poolMember.findUniqueOrThrow({ where: { id: row.member.id } });
+    expect(device.status).toBe("CONNECTED");
+    expect(device.connectionGeneration).toBe(2);
+    expect(member.healthStatus).toBe("HEALTHY");
+  }, 30_000);
 });

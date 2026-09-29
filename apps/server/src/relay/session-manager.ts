@@ -3068,6 +3068,9 @@ export class RelaySessionManager {
     // while it runs, its `disconnected` failure belongs to the old connection,
     // not the member, and must not be recorded against the successor.
     const dispatchedOn = this.sessionsByCliDeviceId.get(member.cliDeviceId);
+    // Nothing to probe through (the owner detached after the scheduler's check):
+    // a probe that could not be sent proves nothing about the member.
+    if (!dispatchedOn) return "superseded";
     const superseded = () => this.sessionsByCliDeviceId.get(member.cliDeviceId) !== dispatchedOn;
     const attempt = startRelayAttempt({
       manager: this,
