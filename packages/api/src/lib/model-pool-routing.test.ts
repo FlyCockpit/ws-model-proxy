@@ -7,13 +7,16 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 const {
+  POOL_MEMBER_HALF_OPEN_LEASE_MS,
   buildPoolRouteSequence,
   isRetryablePoolMemberRelayFailure,
   markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
   markPoolMembersForCliUnavailable,
   poolMemberFailureClassForRelayFailure,
+  poolMemberTrialLive,
   recordPoolMemberRelayFailure,
+  releasePoolMemberHalfOpenTrial,
   resetPoolMemberHealth,
   resetPoolMemberHealthForDiscoveredModels,
   transitionPoolMemberHealthAfterRetryableFailure,
@@ -255,6 +258,57 @@ describe("modelPoolRouting", () => {
       reason: "NO_ROUTABLE_POOL_MEMBERS",
       failureClass: "no_routable_member",
       retryable: true,
+    });
+  });
+
+  // Deterministic clock: every instant is `now` plus an explicit offset.
+  it.each([
+    ["never claimed", null, true],
+    ["claimed just now", 0, false],
+    ["one ms before the lease elapses", -(POOL_MEMBER_HALF_OPEN_LEASE_MS - 1), false],
+    ["exactly at the lease cutoff", -POOL_MEMBER_HALF_OPEN_LEASE_MS, true],
+    ["one ms past the lease", -(POOL_MEMBER_HALF_OPEN_LEASE_MS + 1), true],
+    ["claimed in the future (clock skew)", 1_000, false],
+  ] as const)("routes a half-open member whose trial is %s: %s", (_name, offset, routable) => {
+    const startedAt = offset === null ? null : new Date(now.getTime() + offset);
+    const result = buildPoolRouteSequence({
+      members: [
+        memberRow({ id: "member", healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: startedAt }),
+      ],
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+    expect(result.ok).toBe(routable);
+    expect(poolMemberTrialLive(startedAt, now)).toBe(!routable);
+  });
+
+  it("claims an unclaimed or expired half-open trial, complementing the routing lease predicate", async () => {
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    await markPoolMemberHalfOpenTrial({ poolMemberId: "member-id", now });
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        OR: expect.arrayContaining([
+          { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+          {
+            healthStatus: "HALF_OPEN",
+            halfOpenTrialStartedAt: {
+              lte: new Date(now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS),
+            },
+          },
+        ]),
+      }),
+      data: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: now },
+    });
+  });
+
+  it("fences a release on the claim's own timestamp", async () => {
+    db.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    await expect(
+      releasePoolMemberHalfOpenTrial({ poolMemberId: "member-id", trialStartedAt: now }),
+    ).resolves.toBe(false);
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "member-id", healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: now },
+      data: { halfOpenTrialStartedAt: null },
     });
   });
 

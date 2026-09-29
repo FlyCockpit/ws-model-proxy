@@ -2,6 +2,17 @@ import prisma from "@ws-model-proxy/db";
 
 export const POOL_MEMBER_UNHEALTHY_AFTER_RETRYABLE_FAILURES = 3;
 export const POOL_MEMBER_HEALTH_COOLDOWN_MS = 60_000;
+/**
+ * A half-open trial claim (`halfOpenTrialStartedAt`) is a lease, not a
+ * permanent latch: a claimant that dies or exits without settling (client
+ * abort, crash, lost finalizer) would otherwise keep the member out of
+ * rotation forever. Pool attempts are not heartbeated and may legitimately run
+ * for the whole relay budget (`MODEL_API_RELAY_TIMEOUT_MS`, 15 minutes), so the
+ * lease is that budget plus a one-minute margin: a live attempt can never be
+ * taken over, and a stranded claim recovers within this bound. Pinned against
+ * the relay budget by a test in apps/server.
+ */
+export const POOL_MEMBER_HALF_OPEN_LEASE_MS = 16 * 60_000;
 export const POOL_MEMBER_RECOVERY_BACKOFF_MS = [
   1_000, 3_000, 5_000, 10_000, 15_000, 20_000, 30_000,
 ] as const;
@@ -233,6 +244,15 @@ export function beginPoolMemberHalfOpenTrial(
   };
 }
 
+/**
+ * The one lease predicate: a trial is live iff it was claimed after
+ * `now - lease`. The claim `where` in markPoolMemberHalfOpenTrial is its exact
+ * complement (expired iff `startedAt <= cutoff`).
+ */
+export function poolMemberTrialLive(startedAt: Date | null, now: Date): boolean {
+  return startedAt !== null && startedAt.getTime() > now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS;
+}
+
 function effectiveHealthStatusForRouting(
   member: Pick<PoolMemberRouteRow, "healthStatus" | "nextRetryAt" | "halfOpenTrialStartedAt">,
   now: Date,
@@ -242,7 +262,7 @@ function effectiveHealthStatusForRouting(
     return "HEALTHY";
   }
   if (member.healthStatus === "HALF_OPEN") {
-    return member.halfOpenTrialStartedAt === null ? "HALF_OPEN" : null;
+    return poolMemberTrialLive(member.halfOpenTrialStartedAt, now) ? null : "HALF_OPEN";
   }
   // A one-member pool has no alternative. Permit its normal execution path to
   // decide availability/compatibility rather than making health state alone a
@@ -649,6 +669,12 @@ export async function markPoolMemberHalfOpenTrial({
       OR: [
         { healthStatus: "UNHEALTHY", nextRetryAt: { lte: now } },
         { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+        // An expired lease is reclaimable; the new timestamp fences the old
+        // holder's late release/settlement out (0 rows).
+        {
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: { lte: new Date(now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS) },
+        },
         ...(allowSingleDegradedFallback
           ? [{ healthStatus: "DEGRADED" as const, nextRetryAt: { lte: now } }]
           : []),

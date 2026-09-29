@@ -6566,7 +6566,10 @@ async function relayPool({
                     poolMemberId: candidate.poolMemberId,
                     failure: "protocol_error",
                   })
-                : Promise.resolve(),
+                : // A served attempt that settled neither way (client abort
+                  // mid-stream, non-member failure) gives its trial back; a
+                  // no-op once success/failure already cleared it.
+                  releaseUnusedTrial(),
             updatePoolRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
               status: terminalStatus(terminal),
@@ -6655,6 +6658,9 @@ async function relayPool({
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
       finalFailure = failure;
+      // Failures that write no member health (client abort, lease loss,
+      // non-member failures) would leave the claimed trial standing.
+      if (!(memberRetryable && isPoolRelayFailureClass(failure))) await releaseUnusedTrial();
       if (!operationRetryable) break;
       if (leaseLost) {
         await releaseCapacityAttempt();

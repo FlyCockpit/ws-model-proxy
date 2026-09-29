@@ -5,6 +5,7 @@ import type {
   VisibleDirectModelTarget,
   VisibleModelPoolTarget,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
+import { POOL_MEMBER_HALF_OPEN_LEASE_MS } from "@ws-model-proxy/api/lib/model-pool-routing";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
@@ -21,6 +22,7 @@ import type {
   CapacityAdmissionStore,
 } from "./capacity/types.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
+import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 import type { PublicOverflowRequest, PublicProviderTarget } from "./public-overflow.js";
 
@@ -8186,6 +8188,151 @@ describe("model API routes", () => {
         },
         data: { halfOpenTrialStartedAt: null },
       });
+    });
+
+    // #120: a client abort after dispatch settles neither success nor a
+    // member failure, so the served attempt gives the claimed trial back
+    // (fenced on the claim's timestamp) instead of stranding the member.
+    it("releases a claimed half-open trial when the client aborts after dispatch", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const controller = new AbortController();
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      controller.abort();
+      await Promise.resolve(responsePromise).catch(() => undefined);
+
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.halfOpenTrialStartedAt === null)).toBe(true),
+      );
+      const claim = writes().find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+      expect(claim).toBeDefined();
+      expect(writes().find((write) => write.data.halfOpenTrialStartedAt === null)).toEqual({
+        where: {
+          id: "member-a",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claim?.data.halfOpenTrialStartedAt,
+        },
+        data: { halfOpenTrialStartedAt: null },
+      });
+    });
+
+    // #120: the client cancels a stream already being served. The served
+    // attempt's finalizer writes neither success nor failure for a cancel, so
+    // it must give the trial back too.
+    it("releases a claimed half-open trial when the client cancels a served stream", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const controller = new AbortController();
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          stream: true,
+          messages: [{ role: "user", content: "secret prompt" }],
+        }),
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const { requestId } = requireSent(manager);
+      manager.headers(requestId, 200, { "content-type": "text/event-stream" });
+      manager.body(requestId, 'data: {"choices":[]}\n\n');
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      controller.abort();
+      await response.body?.cancel().catch(() => undefined);
+
+      const writes = () =>
+        updateMany.mock.calls.map(
+          ([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> },
+        );
+      await vi.waitFor(() =>
+        expect(writes().some((write) => write.data.halfOpenTrialStartedAt === null)).toBe(true),
+      );
+    });
+
+    // #120: an expired trial lease is routable again and the claim itself
+    // carries the expiry clause (deterministic clock: Date only is faked).
+    it("re-claims a half-open trial whose lease expired", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const clock = new Date("2026-06-01T12:00:00.000Z");
+        vi.setSystemTime(clock);
+        const claimedAt = new Date(clock.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS);
+        const stranded = poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        });
+        db.poolMember.findMany.mockResolvedValue([
+          { ...stranded, halfOpenTrialStartedAt: claimedAt },
+        ]);
+        const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+        updateMany.mockResolvedValue({ count: 1 });
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const controller = new AbortController();
+        const responsePromise = appWith(manager).request("/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(poolTarget.modelId),
+          signal: controller.signal,
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        controller.abort();
+        await Promise.resolve(responsePromise).catch(() => undefined);
+        const claim = updateMany.mock.calls
+          .map(([arg]) => arg as { where: { OR?: unknown[] }; data: Record<string, unknown> })
+          .find((write) => write.data.halfOpenTrialStartedAt instanceof Date);
+        const claimedNow = claim?.data.halfOpenTrialStartedAt as Date;
+        expect(claimedNow.getTime() - clock.getTime()).toBeLessThan(5_000);
+        expect(claim?.where.OR).toContainEqual({
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: {
+            lte: new Date(claimedNow.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS),
+          },
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps the pool trial lease longer than the relay budget", () => {
+      expect(POOL_MEMBER_HALF_OPEN_LEASE_MS).toBeGreaterThan(MODEL_API_RELAY_TIMEOUT_MS);
     });
 
     // C4-3: a refused send ends the request; no other member is admitted.
