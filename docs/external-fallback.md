@@ -48,6 +48,69 @@ expiry and the account state are evaluated together against the database's
 statement clock, again after that transaction's last lock wait. If any of them no longer holds, nothing is sent. A change
 saved after that point applies from the next send.
 
+The owner's two settings are also checked before the request takes a provider
+capacity slot, so a request whose owner turned fallback (or grantee coverage)
+off after it arrived does not wait on the owner's provider capacity; it gets
+the same refusal the send check would give.
+
+Each lock wait of the send check is bounded (2 s). If it cannot get its locks
+in time (for example while budget accounting holds the same provider account),
+nothing is sent, the reservation is released, and the attempt counts as
+temporarily unavailable (`503 external_unavailable` on a provider-only pool).
+Using a token for local traffic never waits on that check: the token's
+"last used" time is recorded at most once a minute and skipped while the row
+is busy.
+
+### Pool owner account state
+
+While a pool owner's account is banned (until a temporary ban expires) or has
+a pending deletion, the owner's pools are unavailable to everyone:
+
+- grantees no longer see them in `/v1/models`, the dashboard's model lists,
+  token allowlist choices, or the own-key fallback settings (a saved own-key
+  choice is kept and applies again when the owner's access returns); the
+  usage overview labels them like a pool no longer shared with you;
+- requests that name them get the not-found error any unknown model gets
+  (`404`), including stored-Responses follow-ups bound to them;
+- the send check above re-checks the owner's account against the database
+  clock, own-key sends included; a ban or deletion mark saved while a request
+  is in flight stops the send;
+- one local-send check runs before every send to the owner's machines. It
+  reads the owner's account, the requester's account (a requester banned or
+  marked for deletion while the request waited gets `401`, nothing is sent),
+  the exact grant the request was resolved under (revoked: `404`) and the
+  member (removed or disabled: skipped): each local attempt (including after a wait in the local queue and
+  before each retry on another member), the native context count, each media
+  transformer hop, and stored-Responses follow-ups bound to a local member;
+  a follow-up to a pool you can no longer see gets `404`, never `401` (a
+  visible pool reached through different access than the binding's is `401`);
+- a request that finds the owner inactive after it arrived (at a local send,
+  or at the external check) ends there with `404`, without
+  `x-wsmp-route`/`x-wsmp-fallback`: it does not resume the local wait. When
+  the external check instead finds the requester's own account banned or
+  marked for deletion, the request also ends without those headers: `401` on
+  pool requests, `403 external_not_permitted` on stored-Responses operations
+  bound to an external provider. Work already sent to the owner's machine or a
+  provider is not recalled.
+
+When a temporary ban expires, or an admin lifts the ban, the pools are
+available again under the same grants.
+
+### Provider target changes
+
+The same send check also confirms that the external member is still in the
+pool (and enabled for routing), that its provider model and account are still
+enabled, and that the provider endpoint and model are the ones the request was
+prepared for. If one of them changed since the request was routed, nothing is
+sent: the next external member is tried only when the operation can be safely
+retried; otherwise the request gets `503 external_unavailable` (a stored
+Responses follow-up whose member or endpoint is gone gets `404`, a disabled
+provider `503`).
+
+One availability condition is not re-checked at the send: a stored-Responses
+binding whose retention (`expiresAt`) lapses during a long wait is still
+honoured once.
+
 The request goes external only after local routing could not serve it:
 
 - the local wait expired (an `:external` caller waits at most the pool's
@@ -82,10 +145,12 @@ preserve the upstream status as described under [Own-key failure and accounting]
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
-| Pool has only external members, anything else (unhealthy, failure before the first byte, fallback or consent withdrawn) | `503 external_unavailable` |
-| Client cancels before a provider response is committed | `499 cancelled` (also recorded as 499, irrespective of a rejected upstream status) |
+| Pool has only external members, anything else (unhealthy, failure before the first byte, send check timed out, fallback or consent withdrawn) | `503 external_unavailable` |
+| Owner account banned or deletion pending (any pool shape) | `404`, the request ends (see [Pool owner account state](#pool-owner-account-state)) |
+| Requester account banned or deletion pending, seen by the external check | `401`, the request ends, no `x-wsmp-fallback` |
+| Client cancels before a provider response is committed | `499 cancelled` (also recorded as 499, irrespective of a rejected upstream status, and also when the external attempt had already ended as busy or unavailable) |
 
-All of these carry `x-wsmp-fallback: unavailable`.
+All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 
 ## Responses and headers
 
