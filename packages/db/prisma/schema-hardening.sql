@@ -547,6 +547,8 @@ DECLARE
   request_owner TEXT;
   request_pool TEXT;
   request_direct_target TEXT;
+  request_base_priority INTEGER;
+  request_priority_grant TEXT;
   target_owner TEXT;
   target_capacity TEXT;
   member_pool TEXT;
@@ -581,8 +583,9 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT "userId", "poolId", "directExecutionTargetId"
-    INTO request_owner, request_pool, request_direct_target
+  SELECT "userId", "poolId", "directExecutionTargetId", "basePriority", "priorityGrantId"
+    INTO request_owner, request_pool, request_direct_target, request_base_priority,
+      request_priority_grant
     FROM admission_request WHERE id = NEW."admissionRequestId";
   SELECT "userId", "inferenceCapacityId" INTO target_owner, target_capacity
     FROM execution_target WHERE id = NEW."executionTargetId";
@@ -638,7 +641,11 @@ BEGIN
         FROM pool_member member
         JOIN model_pool pool ON pool.id = member."poolId"
        WHERE member.id = NEW."poolMemberId"
-         AND NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
+         -- S-C: a grantee's grant queue priority (recorded on the request
+         -- when the attempt was created) replaces the pool/member priority.
+         AND (NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
+           OR (request_priority_grant IS NOT NULL
+             AND NEW."effectivePriority" = request_base_priority))
          AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM
            CASE member."capacityConcurrencyMode"
              WHEN 'LIMITED' THEN member."capacityConcurrencyLimit"
@@ -1296,6 +1303,29 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_cache_holder_wait_check;
 ALTER TABLE model_pool ADD CONSTRAINT model_pool_cache_holder_wait_check CHECK (
   "cacheHolderWaitMs" IS NULL OR "cacheHolderWaitMs" BETWEEN 0 AND 30000
+);
+
+-- Saturation S-C warm-session protection. Window 1 s..1 h, minimum size
+-- 0..10M tokens, percents 1..100 (0 = unprotected for the owner/grant
+-- overrides), and the fixed percent is present exactly for FIXED_PERCENT.
+ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_protection_check;
+ALTER TABLE model_pool ADD CONSTRAINT model_pool_protection_check CHECK (
+  "protectionWindowSeconds" BETWEEN 1 AND 3600
+  AND "protectMinTokens" BETWEEN 0 AND 10000000
+  AND ("ownerProtectionPercent" IS NULL OR "ownerProtectionPercent" BETWEEN 0 AND 100)
+  AND (("protectionShare" = 'FIXED_PERCENT' AND "protectionFixedPercent" BETWEEN 1 AND 100)
+    OR ("protectionShare" <> 'FIXED_PERCENT' AND "protectionFixedPercent" IS NULL))
+);
+
+ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_priority_grant_check;
+ALTER TABLE admission_request ADD CONSTRAINT admission_request_priority_grant_check CHECK (
+  "priorityGrantId" IS NULL OR "poolId" IS NOT NULL
+);
+
+ALTER TABLE pool_grant DROP CONSTRAINT IF EXISTS pool_grant_protection_priority_check;
+ALTER TABLE pool_grant ADD CONSTRAINT pool_grant_protection_priority_check CHECK (
+  ("protectionOverridePercent" IS NULL OR "protectionOverridePercent" BETWEEN 0 AND 100)
+  AND ("queuePriority" IS NULL OR "queuePriority" BETWEEN 0 AND 31)
 );
 
 ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_affinity_wait_check;
