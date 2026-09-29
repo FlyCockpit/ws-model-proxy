@@ -323,17 +323,18 @@ export const usersRouter = {
 
     // Sessions, accounts, two-factors, api keys, device codes and push subs
     // cascade, and so do the user's CLI devices and CLI credentials. Retained
-    // history (`onDelete: Restrict`: capacity leases, provider accounting)
-    // does not: the delete is refused up front with a friendly message
-    // suggesting "archive" instead.
+    // provider accounting (OWNER_RETAINED_HISTORY_TABLES) is refused up front
+    // with a friendly message suggesting "archive" instead.
     //
     // The delete is durable and bounded (packages/db/src/parent-deletion.ts):
     // a preflight refuses retained history before anything changes, then the
     // user is marked for deletion (and banned, sessions revoked), the request
-    // history is drained in short batches, and only the capacity graph is
-    // deleted under the capacity locks (L0-L6, then the user row). If that
-    // last step fails transiently the marker stays and the user-deletion
-    // sweeper finishes it, so the response reports `pending`.
+    // history is drained in short batches, and only the graph is deleted,
+    // under the owner fences of every user it writes (DL-1 writer class M).
+    // Hot-path history left behind (no foreign key reaches it) is removed by
+    // the deleted-user purge. If the last step fails transiently the marker
+    // stays and the user-deletion sweeper finishes it, so the response
+    // reports `pending`.
     const label = (err: unknown) =>
       // Constructor name only — Prisma rejections embed SQL + params.
       err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;

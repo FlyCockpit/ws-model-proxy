@@ -475,7 +475,8 @@ describe("modelPoolRouting", () => {
   });
 
   it("resets health on success and fresh inventory without changing routing status", async () => {
-    db.poolMember.updateMany.mockResolvedValue({ count: 2 });
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }, { id: "member-b" }]);
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     await markPoolMemberRelaySuccess("member-id", { trialStartedAt: null, now });
     await resetPoolMemberHealthForDiscoveredModels(["model-a", "model-b"]);
@@ -496,7 +497,7 @@ describe("modelPoolRouting", () => {
       },
       data: resetPoolMemberHealth(),
     });
-    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenCalledWith({
       where: {
         OR: [
           {
@@ -507,21 +508,44 @@ describe("modelPoolRouting", () => {
         ],
         routingStatus: { not: "DISABLED" },
       },
-      data: resetPoolMemberHealth(),
+      orderBy: { id: "asc" },
+      select: { id: true },
     });
+    // After the fenced success write: one single-row statement per member
+    // (hot-path writer class H).
+    expect(db.poolMember.updateMany.mock.calls.slice(1)).toEqual([
+      [
+        {
+          where: { id: "member-a", routingStatus: { not: "DISABLED" } },
+          data: resetPoolMemberHealth(),
+        },
+      ],
+      [
+        {
+          where: { id: "member-b", routingStatus: { not: "DISABLED" } },
+          data: resetPoolMemberHealth(),
+        },
+      ],
+    ]);
   });
 
   it("makes only disconnect-opened members of the device due on reconnect", async () => {
-    db.poolMember.updateMany.mockResolvedValue({ count: 2 });
+    db.poolMember.findMany.mockReset();
+    db.poolMember.updateMany.mockReset();
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }, { id: "member-b" }]);
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     const count = await markPoolMembersDueAfterCliReconnect({ cliDeviceId: "cli-1", now });
 
     expect(count).toBe(2);
-    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+    const eligible = {
+      healthStatus: "UNHEALTHY",
+      lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
+      nextRetryAt: { gt: now },
+    };
+    expect(db.poolMember.findMany).toHaveBeenCalledWith({
       where: {
-        healthStatus: "UNHEALTHY",
-        lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
-        nextRetryAt: { gt: now },
+        ...eligible,
         OR: [
           {
             executionTargetId: { not: null },
@@ -530,8 +554,15 @@ describe("modelPoolRouting", () => {
           { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
         ],
       },
-      data: { nextRetryAt: now },
+      orderBy: { id: "asc" },
+      select: { id: true },
     });
+    // Hot-path class H: one single-row statement per member, each re-checking
+    // the eligibility predicate, only the due time moves.
+    expect(db.poolMember.updateMany.mock.calls).toEqual([
+      [{ where: { id: "member-a", ...eligible }, data: { nextRetryAt: now } }],
+      [{ where: { id: "member-b", ...eligible }, data: { nextRetryAt: now } }],
+    ]);
   });
 
   it("persists relay failure and websocket disconnect health updates", async () => {
@@ -543,6 +574,7 @@ describe("modelPoolRouting", () => {
       nextRetryAt: null,
       halfOpenTrialStartedAt: null,
     });
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }, { id: "member-b" }]);
     db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await recordPoolMemberRelayFailure({
@@ -579,7 +611,7 @@ describe("modelPoolRouting", () => {
         lastFailureClass: "RELAY_TIMEOUT",
       }),
     });
-    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenCalledWith({
       where: {
         NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
@@ -599,11 +631,18 @@ describe("modelPoolRouting", () => {
           },
         ],
       },
-      data: expect.objectContaining({
-        healthStatus: "UNHEALTHY",
-        lastFailureClass: "WEBSOCKET_DISCONNECTED",
-      }),
+      orderBy: { id: "asc" },
+      select: { id: true },
     });
+    const disconnected = expect.objectContaining({
+      healthStatus: "UNHEALTHY",
+      lastFailureClass: "WEBSOCKET_DISCONNECTED",
+    });
+    // After the versioned failure write: one single-row statement per member.
+    expect(db.poolMember.updateMany.mock.calls.slice(1)).toEqual([
+      [{ where: { id: "member-a", NOT: expect.anything() }, data: disconnected }],
+      [{ where: { id: "member-b", NOT: expect.anything() }, data: disconnected }],
+    ]);
   });
 
   it("drops a relay disconnect outcome: the fenced device write owns that health", async () => {
@@ -636,7 +675,9 @@ describe("modelPoolRouting", () => {
   });
 
   it("keeps real failure provenance out of the disconnect write", async () => {
+    db.poolMember.findMany.mockReset();
     db.poolMember.updateMany.mockReset();
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }]);
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
     await markPoolMembersForCliUnavailable({
       cliDeviceId: "cli-1",
@@ -645,6 +686,10 @@ describe("modelPoolRouting", () => {
       now,
       db: prisma,
     });
+    // Judged in the scan and again in each per-member write.
+    expect(db.poolMember.findMany.mock.calls[0]?.[0]?.where?.NOT).toEqual(
+      db.poolMember.updateMany.mock.calls[0]?.[0]?.where?.NOT,
+    );
     const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
     expect(where?.NOT).toEqual({
       healthStatus: { in: ["UNHEALTHY", "DEGRADED"] },
@@ -748,37 +793,30 @@ describe("modelPoolRouting", () => {
     }
   });
 
-  it("fences the member scope with the device generation", async () => {
-    // Table over the branch a disconnect write takes. Each row is an accepted
-    // input; the driver is the mock's count: 0 stands for the SQL matching no
-    // rows (a successor hello already incremented the device generation).
-    const rows = [
-      { name: "current generation, rows matched", count: 1 },
-      { name: "superseded generation, no rows matched", count: 0 },
-    ];
-    for (const row of rows) {
-      db.poolMember.updateMany.mockReset();
-      db.poolMember.updateMany.mockResolvedValue({ count: row.count });
-      await markPoolMembersForCliUnavailable({
+  it("scopes the member scan to the device generation in both relation arms", async () => {
+    db.poolMember.findMany.mockReset();
+    db.poolMember.updateMany.mockReset();
+    db.poolMember.findMany.mockResolvedValue([]);
+    await markPoolMembersForCliUnavailable({
+      cliDeviceId: "cli-1",
+      failureClass: "WEBSOCKET_DISCONNECTED",
+      generation: 4,
+      db: prisma,
+    });
+    const where = db.poolMember.findMany.mock.calls[0]?.[0]?.where;
+    // The transaction's device-row lock is the fence; both arms also re-check
+    // the generation, so dropping it from either arm is caught here.
+    for (const arm of [where?.OR?.[0], where?.OR?.[1]]) {
+      const endpoint =
+        arm?.ExecutionTarget?.DiscoveredModel?.Endpoint ??
+        (arm?.DiscoveredModel?.Endpoint as { CliDevice?: unknown } | undefined);
+      expect(endpoint).toMatchObject({
         cliDeviceId: "cli-1",
-        failureClass: "WEBSOCKET_DISCONNECTED",
-        generation: 4,
-        db: prisma,
+        CliDevice: { connectionGeneration: 4 },
       });
-      const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
-      // Both relation arms must carry the fence: dropping it from either arm
-      // reintroduces the stale-write race for members of that shape.
-      const arms = [where?.OR?.[0], where?.OR?.[1]];
-      for (const arm of arms) {
-        const endpoint =
-          arm?.ExecutionTarget?.DiscoveredModel?.Endpoint ??
-          (arm?.DiscoveredModel?.Endpoint as { CliDevice?: unknown } | undefined);
-        expect(endpoint, row.name).toMatchObject({
-          cliDeviceId: "cli-1",
-          CliDevice: { connectionGeneration: 4 },
-        });
-      }
     }
+    // No members matched: nothing is written.
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   // Owner fence (#120 design pass): an outcome the attempt does not own is dropped

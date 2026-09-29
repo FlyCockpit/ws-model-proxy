@@ -1,5 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
@@ -25,12 +26,12 @@ integration("overview metrics with real PostgreSQL", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, router, metrics] = await Promise.all([
+    const [, router, metrics] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./overview"),
       import("@ws-model-proxy/config/usage-metrics"),
     ]);
-    prisma = db.default;
+    prisma = createFixturePrismaClient(databaseUrl!);
     overviewRouter = router.overviewRouter;
     latencyBucketIndex = metrics.latencyBucketIndex;
     emptyLatencyHistogram = metrics.emptyLatencyHistogram;
@@ -167,8 +168,11 @@ integration("CLI presence health with real PostgreSQL", () => {
     const { overviewRouter } = await import("./overview");
     const { markPoolMembersDueAfterCliReconnect } = await import("../lib/model-pool-routing");
     const { endpointEffectiveStatusWhere } = await import("../lib/cli-presence");
+    // Graph fixtures go through the fixture client (no owner fences); the
+    // code under test runs on the ordinary client.
+    const fixtures = createFixturePrismaClient(databaseUrl!);
     const suffix = crypto.randomUUID();
-    const user = await prisma.user.create({
+    const user = await fixtures.user.create({
       data: {
         name: "Presence",
         email: `presence-${suffix}@example.test`,
@@ -177,7 +181,7 @@ integration("CLI presence health with real PostgreSQL", () => {
     });
     try {
       const now = new Date();
-      const device = await prisma.cliDevice.create({
+      const device = await fixtures.cliDevice.create({
         data: {
           userId: user.id,
           slug: "desk",
@@ -185,7 +189,7 @@ integration("CLI presence health with real PostgreSQL", () => {
           lastHeartbeatAt: new Date(now.getTime() - 1_000),
         },
       });
-      const endpoint = await prisma.endpoint.create({
+      const endpoint = await fixtures.endpoint.create({
         data: {
           userId: user.id,
           cliDeviceId: device.id,
@@ -196,7 +200,7 @@ integration("CLI presence health with real PostgreSQL", () => {
       });
       // A second device with its own disconnect-opened member: a reconnect of
       // the first device must leave this device's cooldown untouched.
-      const otherDevice = await prisma.cliDevice.create({
+      const otherDevice = await fixtures.cliDevice.create({
         data: {
           userId: user.id,
           slug: "desk-2",
@@ -204,7 +208,7 @@ integration("CLI presence health with real PostgreSQL", () => {
           lastHeartbeatAt: new Date(now.getTime() - 1_000),
         },
       });
-      const otherEndpoint = await prisma.endpoint.create({
+      const otherEndpoint = await fixtures.endpoint.create({
         data: {
           userId: user.id,
           cliDeviceId: otherDevice.id,
@@ -213,7 +217,7 @@ integration("CLI presence health with real PostgreSQL", () => {
           status: "ONLINE",
         },
       });
-      const pool = await prisma.modelPool.create({
+      const pool = await fixtures.modelPool.create({
         data: { userId: user.id, slug: `pool-${suffix}`.slice(0, 60), name: "pool" },
       });
       const later = new Date(now.getTime() + 60_000);
@@ -221,7 +225,7 @@ integration("CLI presence health with real PostgreSQL", () => {
         failure: "WEBSOCKET_DISCONNECTED" | "STALE_SESSION" | "RELAY_TIMEOUT",
         on: { endpointId: string } = { endpointId: endpoint.id },
       ) => {
-        const model = await prisma.discoveredModel.create({
+        const model = await fixtures.discoveredModel.create({
           data: {
             userId: user.id,
             endpointId: on.endpointId,
@@ -229,7 +233,7 @@ integration("CLI presence health with real PostgreSQL", () => {
             encodedModelId: failure,
           },
         });
-        return prisma.poolMember.create({
+        return fixtures.poolMember.create({
           data: {
             poolId: pool.id,
             discoveredModelId: model.id,
@@ -301,7 +305,8 @@ integration("CLI presence health with real PostgreSQL", () => {
         }),
       ).toBe(1);
     } finally {
-      await prisma.user.deleteMany({ where: { id: user.id } });
+      await fixtures.user.deleteMany({ where: { id: user.id } });
+      await fixtures.$disconnect();
     }
   });
 });

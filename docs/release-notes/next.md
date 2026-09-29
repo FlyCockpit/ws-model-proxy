@@ -46,6 +46,20 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   schema hardening that carries the grantee trigger fix below; with
   `APPLY_SCHEMA=off` that fix is not installed.
 
+- **Capacity lock redesign and legacy storage drop (#78, #74): one more
+  `APPLY_SCHEMA=dangerous` deploy, after a backup, with every server stopped.**
+  The push drops the foreign keys between request history (admission,
+  capacity leases, relay requests, stickiness, usage rollups, provider
+  attempts and accounting) and the dashboard graph, moves the capacity
+  scheduler state and fencing counter from `inference_capacity` into the new
+  `capacity_runtime` table (the hardening re-seeds each fencing counter from
+  its highest lease token; scheduler fairness restarts once), and drops
+  `model_pool."publicEgressAcknowledged"`, the `dashboard_notice` table and an
+  unused `user` index. `APPLY_SCHEMA=safe` stops listing exactly those
+  columns and that table. Stop every running server first: an old server
+  writes the dropped columns. Then start the new image once with
+  `APPLY_SCHEMA=dangerous` and go back to `APPLY_SCHEMA=off`.
+
 ## Breaking changes
 
 - **Plain pool names never leave the deployment.** Provider-backed PRIMARY
@@ -83,6 +97,11 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   payload **after** the pool's media transformer.
 - **OpenRouter accounting is conservative for now.** Until OpenRouter usage
   normalization lands (#62), budgets over-count OpenRouter spend.
+
+- **Deleting a device, endpoint, model, pool, capacity or user no longer
+  waits for or is refused by its request history.** History keeps the deleted
+  ids and is removed by the retention sweeps; a deleted user's remaining history is purged after 24 h.
+  Accounts with provider accounting still cannot be deleted (archive them).
 
 ## Fixed
 

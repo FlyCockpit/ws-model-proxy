@@ -1,4 +1,8 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 
 // DL-1 lock-order regressions on real PostgreSQL. Every scenario pairs a
@@ -31,7 +35,7 @@ vi.mock("@ws-model-proxy/api/lib/discovered-inference-capacity", async (importOr
   };
 });
 
-type Client = ReturnType<typeof createPrismaClient>;
+type Client = ReturnType<typeof createFixturePrismaClient>;
 
 function namedUrl(name: string): string {
   if (!databaseUrl) throw new Error("PostgreSQL URL unavailable.");
@@ -104,9 +108,9 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     registrationRetryErrors.length = 0;
     process.env.DATABASE_URL = databaseUrl;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const admitter = createPrismaClient(namedUrl(`dl1-reg-admitter-${suffix}`));
-    const inspector = createPrismaClient(databaseUrl);
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const admitter = createFixturePrismaClient(namedUrl(`dl1-reg-admitter-${suffix}`));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await fixtures.user.create({
       data: {
         name: "Registration lock order",
@@ -202,7 +206,7 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
         async (tx) => {
           await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
           const pid = await backendPid(tx);
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+          await acquireFences(tx, [fences.capacity(capacityId)]);
           await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacityId} FOR UPDATE`;
           admitterReady(pid);
           await admitterMayInsert;
@@ -253,14 +257,15 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("stores engine facts and refreshes only an AUTO limit from engine slots, with a live lease", async () => {
-    // S-B (relay 2.7): registration writes engine facts under the L5 policy
-    // lock it already holds, refreshes an AUTO hard limit from reported slots
-    // on every update, and never touches a USER limit.
+    // S-B (relay 2.7): registration writes engine facts under the
+    // capacity-policy / capacity fences it already holds, refreshes an AUTO
+    // hard limit from reported slots on every update, and never touches a USER
+    // limit.
     if (!databaseUrl) return;
     registrationRetryErrors.length = 0;
     process.env.DATABASE_URL = databaseUrl;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
+    const fixtures = createFixturePrismaClient(databaseUrl);
     const user = await fixtures.user.create({
       data: {
         name: "Engine facts",
@@ -371,15 +376,16 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("expires terminal relay requests while an admitter updates one of them (no 40P01)", async () => {
-    // L6/L7. An admitter locks its admission_request row, then updates the
-    // relay_request row it references. Retention deletes that terminal relay
+    // Cross-capacity request and relay row locks. An admitter locks its
+    // admission_request row, then updates the relay_request row it references.
+    // Retention deletes that terminal relay
     // row, whose ON DELETE SET NULL rewrites the admission row. The delete
     // must never hold the relay row while it waits on the admission row.
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const admitter = createPrismaClient(namedUrl(`dl1-relay-admitter-${suffix}`));
-    const inspector = createPrismaClient(databaseUrl);
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const admitter = createFixturePrismaClient(namedUrl(`dl1-relay-admitter-${suffix}`));
+    const inspector = createFixturePrismaClient(databaseUrl);
     const user = await fixtures.user.create({
       data: { name: "Relay order", email: `dl1-relay-${suffix}@example.test` },
     });
@@ -473,19 +479,20 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("admits two overlapping multi-capacity requests from disjoint capacity sets (no 40P01)", async () => {
-    // L6. Two admitters hold disjoint capacity sets ({c1,c2} and {c3,c4}).
+    // Cross-capacity request locks. Two admitters hold disjoint capacity sets
+    // ({c1,c2} and {c3,c4}).
     // Request A waits on c1 and c4, request B on c2 and c3, so each admitter
     // wins one of them on its first capacity and the other on its second.
     // Admission-request row locks must be taken in one global order.
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
-    const fixtures = createPrismaClient(databaseUrl);
-    const inspector = createPrismaClient(databaseUrl);
-    const gate = createPrismaClient(namedUrl(`dl1-l6-gate-${suffix}`));
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const inspector = createFixturePrismaClient(databaseUrl);
+    const gate = createFixturePrismaClient(namedUrl(`dl1-l6-gate-${suffix}`));
     const names = [`dl1-l6-one-${suffix}`, `dl1-l6-two-${suffix}`];
     const attemptCounts = [0, 0];
     const countingClient = (index: number): Client => {
-      const client = createPrismaClient(namedUrl(names[index] ?? "dl1-l6"));
+      const client = createFixturePrismaClient(namedUrl(names[index] ?? "dl1-l6"));
       return new Proxy(client, {
         get(target, property) {
           const value = Reflect.get(target, property);
@@ -499,7 +506,7 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     };
     const clients = [countingClient(0), countingClient(1)];
     const user = await fixtures.user.create({
-      data: { name: "L6 order", email: `dl1-l6-${suffix}@example.test` },
+      data: { name: "cross-capacity order", email: `dl1-cross-${suffix}@example.test` },
     });
     let releaseGate!: () => void;
     const gateMayCommit = new Promise<void>((resolve) => {
@@ -623,17 +630,32 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
         where: { userId: user.id, attemptId: { startsWith: "holder-" }, state: "ADMITTED" },
         data: { state: "TERMINAL", terminalAt: new Date() },
       });
-      // The gate holds A's member on c1 and B's member on c3 so both
+      // The gate pauses A's lease insert on c1 and B's on c3 (a disposable
+      // trigger waiting on an advisory lock the gate holds), so both
       // admitters pause at their first lease insert, after their first
-      // admission-request row lock.
+      // admission-request row lock. (Before DL-1 (d) the lease insert's FK
+      // check on pool_member was the pause point; hot-path rows now carry no
+      // foreign key into the graph.)
+      const gateKey = 16_006_001;
+      await fixtures.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION dl1_l6_gate() RETURNS trigger LANGUAGE plpgsql AS $f$
+        BEGIN
+          IF (NEW."attemptId" = 'a-${suffix}' AND NEW."capacityId" = '${capacities[0]}')
+             OR (NEW."attemptId" = 'b-${suffix}' AND NEW."capacityId" = '${capacities[2]}') THEN
+            PERFORM pg_advisory_xact_lock(${gateKey});
+          END IF;
+          RETURN NEW;
+        END $f$`);
+      await fixtures.$executeRawUnsafe(
+        `CREATE TRIGGER dl1_l6_gate BEFORE INSERT ON capacity_lease FOR EACH ROW EXECUTE FUNCTION dl1_l6_gate()`,
+      );
       let gateReady!: () => void;
       const gateLocked = new Promise<void>((resolve) => {
         gateReady = resolve;
       });
       gateSide = gate.$transaction(
         async (tx) => {
-          const gated = [poolA.candidates[0]?.poolMemberId, poolB.candidates[1]?.poolMemberId];
-          await tx.$queryRaw`SELECT id FROM pool_member WHERE id = ANY(${gated}::text[]) ORDER BY id FOR UPDATE`;
+          await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(${gateKey})`);
           gateReady();
           await gateMayCommit;
         },
@@ -657,12 +679,118 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     } finally {
       releaseGate();
       await Promise.allSettled([gateSide, ...admissions]);
+      await fixtures.$executeRawUnsafe("DROP TRIGGER IF EXISTS dl1_l6_gate ON capacity_lease");
+      await fixtures.$executeRawUnsafe("DROP FUNCTION IF EXISTS dl1_l6_gate()");
       await cleanupLiveCapacityState(fixtures, user.id);
       await Promise.all([
         fixtures.$disconnect(),
         inspector.$disconnect(),
         gate.$disconnect(),
         ...clients.map((client) => client.$disconnect()),
+      ]);
+    }
+  }, 60_000);
+
+  it("orphan sweep takes the cross-capacity request locks in one sorted statement (no 40P01)", async () => {
+    // The sweep holds the fences of capA and capB (its orphaned request waits
+    // on both). Queued requests r5 (capA, capC) and r2 (capB, capC) are also
+    // reachable by a fill on capC, which locks {r2, r5} sorted. A sweep that
+    // locked capA's set (r5) and then capB's set (r2) as two statements would
+    // close a cycle with that fill. The test side plays the capC fill: it
+    // holds r2, waits until the sweep is queued behind it, then asks for r5.
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const fixtures = createFixturePrismaClient(databaseUrl);
+    const inspector = createFixturePrismaClient(databaseUrl);
+    const side = createFixturePrismaClient(namedUrl(`dl1-sweep-side-${suffix}`));
+    let sweepAttempts = 0;
+    const sweepClient = new Proxy(createFixturePrismaClient(namedUrl(`dl1-sweep-${suffix}`)), {
+      get(target, property) {
+        const value = Reflect.get(target, property);
+        if (property !== "$transaction" || typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          sweepAttempts += 1;
+          return Reflect.apply(value, target, args);
+        };
+      },
+    }) as Client;
+    const live = await fixtures.user.create({
+      data: { name: "sweep order", email: `dl1-sweep-${suffix}@example.test` },
+    });
+    const ids = {
+      orphan: `a-orphan-${suffix}`,
+      r2: `b-r2-${suffix}`,
+      r5: `b-r5-${suffix}`,
+    };
+    const caps = { a: `capA-${suffix}`, b: `capB-${suffix}`, c: `capC-${suffix}` };
+    const seed = async (id: string, userId: string, capacityIds: string[], sequence: number) => {
+      await fixtures.admissionRequest.create({
+        data: {
+          id,
+          userId,
+          requestId: id,
+          attemptId: id,
+          sourceKind: "POOL",
+          poolId: `pool-${id}`,
+          basePriority: 16,
+          enqueueSequence: sequence,
+          connectionOwner: id,
+          heartbeatAt: new Date(),
+          state: "WAITING",
+          deadlineAt: new Date(Date.now() + 600_000),
+        },
+      });
+      for (const [order, capacityId] of capacityIds.entries())
+        await fixtures.capacityWaiter.create({
+          data: {
+            userId,
+            admissionRequestId: id,
+            requestId: id,
+            attemptId: id,
+            capacityId,
+            executionTargetId: `target-${capacityId}`,
+            candidateOrder: order,
+            poolId: `pool-${id}`,
+            poolMemberId: `member-${id}-${order}`,
+            effectiveConcurrencyScope: "POOL",
+            effectiveConcurrencyScopeId: `pool-${id}`,
+            state: "WAITING",
+          },
+        });
+    };
+    try {
+      // The orphan's owner row does not exist: the sweep cancels its waiters.
+      await seed(ids.orphan, `gone-${suffix}`, [caps.a, caps.b], 1);
+      await seed(ids.r5, live.id, [caps.a, caps.c], 2);
+      await seed(ids.r2, live.id, [caps.b, caps.c], 3);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(sweepClient, `dl1-sweep-${suffix}`);
+      let sweep: Promise<number> | undefined;
+      const sideOutcome = side.$transaction(async (tx) => {
+        await tx.$executeRaw`SET LOCAL deadlock_timeout = '50ms'`;
+        const pid = await backendPid(tx);
+        await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${ids.r2} FOR UPDATE`;
+        sweep = store.sweepOrphans({ limit: 1 });
+        await waitUntilBlockedBy(inspector, pid);
+        // The capC fill's second row. Cyclic with a per-capacity sweep.
+        await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${ids.r5} FOR UPDATE`;
+      });
+      await expect(sideOutcome).resolves.toBeUndefined();
+      expect(await sweep).toBe(1);
+      expect(sweepAttempts).toBe(1);
+      expect(
+        (await fixtures.admissionRequest.findUniqueOrThrow({ where: { id: ids.orphan } })).state,
+      ).toBe("CANCELLED");
+    } finally {
+      await Promise.allSettled([
+        fixtures.admissionRequest.deleteMany({ where: { id: { in: Object.values(ids) } } }),
+      ]);
+      await fixtures.user.deleteMany({ where: { id: live.id } });
+      await Promise.all([
+        fixtures.$disconnect(),
+        inspector.$disconnect(),
+        side.$disconnect(),
+        sweepClient.$disconnect(),
       ]);
     }
   }, 60_000);

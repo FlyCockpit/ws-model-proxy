@@ -53,6 +53,19 @@ type DiscoveredModelRow = Prisma.DiscoveredModelGetPayload<{
 }>;
 type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof modelPoolSelect }>;
 type RelayRequestRow = Prisma.RelayRequestGetPayload<{ select: typeof relayRequestSelect }>;
+type RelayPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof relayPoolSelect }>;
+type RelayTokenRow = Prisma.ModelApiTokenGetPayload<{ select: typeof relayTokenSelect }>;
+/**
+ * The graph rows a relay row names by plain id (relay_request is hot-path
+ * history with no foreign key, @ws-model-proxy/db/capacity-lock-order),
+ * loaded per page. A deleted row is simply absent.
+ */
+type RelayRelations = {
+  users: Map<string, OwnerRow>;
+  tokens: Map<string, RelayTokenRow>;
+  models: Map<string, RelayModelRow>;
+  pools: Map<string, RelayPoolRow>;
+};
 type RelayModelRow = Prisma.DiscoveredModelGetPayload<{ select: typeof relayModelSelect }>;
 
 type ModelCapabilityValue =
@@ -117,6 +130,19 @@ function ownerWhere(ownerQuery: string | undefined) {
         },
       }
     : {};
+}
+
+/**
+ * The owner filter for relay rows, which name their owner by plain id (no
+ * relation): the matching users' ids.
+ */
+async function relayOwnerWhere(ownerQuery: string | undefined) {
+  if (!ownerQuery) return {};
+  const users = await prisma.user.findMany({
+    where: ownerWhere(ownerQuery).User?.is ?? {},
+    select: { id: true },
+  });
+  return { userId: { in: users.map((user) => user.id) } };
 }
 
 function createdAtWhere(input: { createdAfter?: Date; createdBefore?: Date }) {
@@ -338,17 +364,58 @@ function serializePool(row: ModelPoolRow, now: Date) {
   };
 }
 
-function serializeRelay(row: RelayRequestRow) {
+async function loadRelayRelations(rows: readonly RelayRequestRow[]): Promise<RelayRelations> {
+  const ids = (values: Array<string | null>) => [
+    ...new Set(values.filter((value): value is string => value !== null)),
+  ];
+  const [users, tokens, models, pools] = await Promise.all([
+    prisma.user.findMany({
+      where: { id: { in: ids(rows.map((row) => row.userId)) } },
+      select: ownerSelect,
+    }),
+    prisma.modelApiToken.findMany({
+      where: { id: { in: ids(rows.map((row) => row.modelApiTokenId)) } },
+      select: relayTokenSelect,
+    }),
+    prisma.discoveredModel.findMany({
+      where: {
+        id: {
+          in: ids(
+            rows.flatMap((row) => [row.requestedDiscoveredModelId, row.selectedDiscoveredModelId]),
+          ),
+        },
+      },
+      select: relayModelSelect,
+    }),
+    prisma.modelPool.findMany({
+      where: { id: { in: ids(rows.map((row) => row.requestedModelPoolId)) } },
+      select: relayPoolSelect,
+    }),
+  ]);
+  return {
+    users: new Map(users.map((user) => [user.id, user])),
+    tokens: new Map(tokens.map((token) => [token.id, token])),
+    models: new Map(models.map((model) => [model.id, model])),
+    pools: new Map(pools.map((pool) => [pool.id, pool])),
+  };
+}
+
+function serializeRelay(row: RelayRequestRow, relations: RelayRelations) {
+  const user = relations.users.get(row.userId);
+  const token = row.modelApiTokenId ? relations.tokens.get(row.modelApiTokenId) : undefined;
+  const pool = row.requestedModelPoolId ? relations.pools.get(row.requestedModelPoolId) : undefined;
+  const model = (id: string | null) => (id ? (relations.models.get(id) ?? null) : null);
   return {
     id: row.id,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-    owner: owner(row.User),
-    modelApiToken: row.ModelApiToken
+    // A deleted owner's history keeps its id until the purge sweeper takes it.
+    owner: user ? owner(user) : { id: row.userId, email: "", name: "", slug: "" },
+    modelApiToken: token
       ? {
-          id: row.ModelApiToken.id,
-          name: row.ModelApiToken.name,
-          lookupPrefix: row.ModelApiToken.lookupPrefix,
+          id: token.id,
+          name: token.name,
+          lookupPrefix: token.lookupPrefix,
         }
       : row.modelApiTokenLookupPrefix
         ? {
@@ -357,19 +424,19 @@ function serializeRelay(row: RelayRequestRow) {
             lookupPrefix: row.modelApiTokenLookupPrefix,
           }
         : null,
-    requestedModel: relayModel(row.RequestedDiscoveredModel),
-    requestedPool: row.RequestedModelPool
+    requestedModel: relayModel(model(row.requestedDiscoveredModelId)),
+    requestedPool: pool
       ? {
-          id: row.RequestedModelPool.id,
-          name: row.RequestedModelPool.name,
-          slug: row.RequestedModelPool.slug,
+          id: pool.id,
+          name: pool.name,
+          slug: pool.slug,
           canonicalModelId: poolModelId({
-            userSlug: row.RequestedModelPool.User.slug,
-            poolSlug: row.RequestedModelPool.slug,
+            userSlug: pool.User.slug,
+            poolSlug: pool.slug,
           }),
         }
       : null,
-    selectedModel: relayModel(row.SelectedDiscoveredModel),
+    selectedModel: relayModel(model(row.selectedDiscoveredModelId)),
     status: String(row.status),
     startedAt: row.startedAt,
     completedAt: row.completedAt,
@@ -579,19 +646,24 @@ const relayRequestSelect = {
   localAttemptId: true,
   firstClientByteAt: true,
   streamCommitted: true,
-  User: { select: ownerSelect },
-  ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
-  RequestedDiscoveredModel: { select: relayModelSelect },
-  RequestedModelPool: {
-    select: {
-      id: true,
-      slug: true,
-      name: true,
-      User: { select: { slug: true } },
-    },
-  },
-  SelectedDiscoveredModel: { select: relayModelSelect },
+  userId: true,
+  requestedDiscoveredModelId: true,
+  selectedDiscoveredModelId: true,
+  requestedModelPoolId: true,
 } satisfies Prisma.RelayRequestSelect;
+
+const relayTokenSelect = {
+  id: true,
+  name: true,
+  lookupPrefix: true,
+} satisfies Prisma.ModelApiTokenSelect;
+
+const relayPoolSelect = {
+  id: true,
+  slug: true,
+  name: true,
+  User: { select: { slug: true } },
+} satisfies Prisma.ModelPoolSelect;
 
 export const adminObservabilityRouter = {
   listCliDevices: adminProcedure
@@ -771,7 +843,7 @@ export const adminObservabilityRouter = {
       const page = input?.page ?? 1;
       const pageSize = input?.pageSize ?? 25;
       const where = {
-        ...ownerWhere(input?.ownerQuery),
+        ...(await relayOwnerWhere(input?.ownerQuery)),
         ...createdAtWhere({
           createdAfter: input?.createdAfter,
           createdBefore: input?.createdBefore,
@@ -812,7 +884,10 @@ export const adminObservabilityRouter = {
 
       return {
         ...paginatedResult({
-          items: rows.map(serializeRelay),
+          items: await (async () => {
+            const relations = await loadRelayRelations(rows);
+            return rows.map((row) => serializeRelay(row, relations));
+          })(),
           total,
           page,
           pageSize,

@@ -798,11 +798,12 @@ export async function releasePoolMemberHalfOpenTrial({
   return result.count === 1;
 }
 
+/** Hot-path health reset: one single-row statement per member (see below). */
 export async function resetPoolMemberHealthForDiscoveredModels(
   discoveredModelIds: string[],
 ): Promise<void> {
   if (discoveredModelIds.length === 0) return;
-  await prisma.poolMember.updateMany({
+  const members = await prisma.poolMember.findMany({
     where: {
       OR: [
         {
@@ -813,27 +814,35 @@ export async function resetPoolMemberHealthForDiscoveredModels(
       ],
       routingStatus: { not: "DISABLED" },
     },
-    data: resetPoolMemberHealth(),
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
+  for (const member of members) {
+    await prisma.poolMember.updateMany({
+      where: { id: member.id, routingStatus: { not: "DISABLED" } },
+      data: resetPoolMemberHealth(),
+    });
+  }
 }
 
 /**
  * A device's relay session went away: its members are circuit-opened for the
- * full health cooldown. `generation` is the device connection generation the
- * caller saw when it detached the session, and is required: the write is a
- * single conditional `updateMany` whose WHERE re-checks it on the device row,
- * so a stale disconnect (a close delivered after a successor's hello committed,
- * in this process or another replica) matches no member row instead of
- * re-imposing the cooldown over the successor's due-write. There is no
- * unfenced variant, so a disconnect can never be written without the fence.
+ * full health cooldown. Hot-path health write (writer class H,
+ * @ws-model-proxy/db/capacity-lock-order): one single-row statement per member
+ * in id order, so it never holds one member row while it waits on another (a
+ * multi-row UPDATE takes its rows in heap order and could wait on a management
+ * transaction that holds a later row and waits on an earlier one).
  *
- * Isolation: the `EXISTS` on the device row is read from the statement's
- * snapshot, so on its own it does not stop a write that waited on a member row
- * lock across a successor's commit. `db` is therefore REQUIRED and must be the
- * transaction that already ran the fenced `cliDevice` update (device row locked
- * first, then member rows: DL-1 order L0 then L7); the successor's registration
- * then waits for that transaction and its due-write always runs after this
- * write. The only caller is `disconnectCliDeviceAtGeneration`.
+ * `generation` is the device connection generation the caller saw when it
+ * detached the session, and is required. The fence is the caller's
+ * transaction (`db`, REQUIRED): `disconnectCliDeviceAtGeneration` first runs
+ * the fenced `cliDevice` update, which locks the device row, so a successor's
+ * registration (the only writer of a newer generation) waits for that
+ * transaction and its reconnect due-write always runs after these writes. The
+ * generation in the member scope below is a belt-and-braces re-check, not the
+ * fence (a statement-snapshot `EXISTS` alone does not stop a write that waited
+ * on a member row lock across a successor's commit). The only caller is
+ * `disconnectCliDeviceAtGeneration`.
  */
 export async function markPoolMembersForCliUnavailable({
   cliDeviceId,
@@ -849,20 +858,24 @@ export async function markPoolMembersForCliUnavailable({
   db: Pick<typeof prisma, "poolMember">;
 }): Promise<void> {
   const endpointScope = { cliDeviceId, CliDevice: { connectionGeneration: generation } };
-  await db.poolMember.updateMany({
+  // Real failure provenance survives a disconnect: a member circuit-open for a
+  // real upstream/transport failure with its cooldown still running keeps that
+  // class and cooldown, so the reconnect due-write (which only touches
+  // disconnect-class members) cannot cut it short. Members that were healthy,
+  // degraded, or whose cooldown ended are opened as before. Re-checked in each
+  // per-member write so a row that changed after the scan is judged as it is.
+  const notRealFailureCoolingDown = {
+    NOT: {
+      healthStatus: { in: ["UNHEALTHY" as const, "DEGRADED" as const] },
+      nextRetryAt: { gt: now },
+      // `not: null` keeps a NULL class out of the exclusion: SQL `NOT (NULL AND ..)`
+      // would otherwise skip the row instead of opening it.
+      lastFailureClass: { not: null, notIn: [...cliUnavailableFailureClasses] },
+    },
+  };
+  const members = await db.poolMember.findMany({
     where: {
-      // Real failure provenance survives a disconnect: a member circuit-open
-      // for a real upstream/transport failure with its cooldown still running
-      // keeps that class and cooldown, so the reconnect due-write (which only
-      // touches disconnect-class members) cannot cut it short. Members that
-      // were healthy, degraded, or whose cooldown ended are opened as before.
-      NOT: {
-        healthStatus: { in: ["UNHEALTHY", "DEGRADED"] },
-        nextRetryAt: { gt: now },
-        // `not: null` keeps a NULL class out of the exclusion: SQL `NOT (NULL AND ..)`
-        // would otherwise skip the row instead of opening it.
-        lastFailureClass: { not: null, notIn: [...cliUnavailableFailureClasses] },
-      },
+      ...notRealFailureCoolingDown,
       OR: [
         {
           executionTargetId: { not: null },
@@ -874,8 +887,16 @@ export async function markPoolMembersForCliUnavailable({
         },
       ],
     },
-    data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
+  const data = transitionPoolMemberHealthForCliUnavailable({ failureClass, now });
+  for (const member of members) {
+    await db.poolMember.updateMany({
+      where: { id: member.id, ...notRealFailureCoolingDown },
+      data,
+    });
+  }
 }
 
 const DISCONNECT_TRANSACTION_MAX_ATTEMPTS = 5;
@@ -992,11 +1013,13 @@ export async function disconnectCliDeviceAtGeneration({
  * was anything else (a real upstream/transport failure) keep their state.
  * Nothing is marked healthy here; the probe decides.
  *
- * The device-status fence already forces an executable/inventory path to
- * revisit the device before this runs, so this write needs no generation of
- * its own: it only moves `nextRetryAt` earlier for members that were opened by
- * a disconnect, and a late one cannot strand routing (the recovery scan and the
- * routing gate decide from the stored `CONNECTED` status and a live session).
+ * Hot-path health write (writer class H): one single-row statement per member
+ * in id order, each re-checking the eligibility predicate. The device-status
+ * fence already forces an executable/inventory path to revisit the device
+ * before this runs, so this write needs no generation of its own: it only
+ * moves `nextRetryAt` earlier for members that were opened by a disconnect,
+ * and a late one cannot strand routing (the recovery scan and the routing gate
+ * decide from the stored `CONNECTED` status and a live session).
  */
 export async function markPoolMembersDueAfterCliReconnect({
   cliDeviceId,
@@ -1005,11 +1028,14 @@ export async function markPoolMembersDueAfterCliReconnect({
   cliDeviceId: string;
   now?: Date;
 }): Promise<number> {
-  const result = await prisma.poolMember.updateMany({
+  const eligible = {
+    healthStatus: "UNHEALTHY" as const,
+    lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED" as const, "STALE_SESSION" as const] },
+    nextRetryAt: { gt: now },
+  };
+  const members = await prisma.poolMember.findMany({
     where: {
-      healthStatus: "UNHEALTHY",
-      lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
-      nextRetryAt: { gt: now },
+      ...eligible,
       OR: [
         {
           executionTargetId: { not: null },
@@ -1021,7 +1047,16 @@ export async function markPoolMembersDueAfterCliReconnect({
         },
       ],
     },
-    data: { nextRetryAt: now },
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
-  return result.count;
+  let count = 0;
+  for (const member of members) {
+    const result = await prisma.poolMember.updateMany({
+      where: { id: member.id, ...eligible },
+      data: { nextRetryAt: now },
+    });
+    count += result.count;
+  }
+  return count;
 }

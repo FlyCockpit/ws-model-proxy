@@ -1,25 +1,27 @@
 /**
- * The final-phase residual bound of an ordered parent delete (DL1-TXBOUND).
+ * Parent-deletion scope and the user-history contract (DL-1 design (d), #78).
  *
- * The contract data (which history tables reach which deleted parents
- * through which foreign keys, {@link HISTORY_DRAIN_EDGES}; trigger-driven
- * delete work, {@link PARENT_DELETE_TRIGGER_WORK}), the parent resolution and
- * the capped residual count live here so both halves of a parent delete use
- * one definition:
- *  - ./parent-deletion.ts drains by these edges and counts once before the
- *    ordered transaction (a cheap early exit);
- *  - ./capacity-lock-order.ts (`lockCapacityGraphForDelete`, the chokepoint
- *    of all seven ordered deletes) re-counts inside the ordered transaction
- *    after its last lock ({@link assertFinalPhaseResidualWithinBound}). That
- *    recount is the bound: the pre-lock count alone left rows committed
- *    between it and the locks uncounted.
+ * A parent delete is a plain delete under owner fences
+ * (`fenceParentDelete` in ./capacity-lock-order.ts). It cascades only into
+ * graph and auxiliary rows: no hot-path (H) table has a foreign key to the
+ * graph, so no delete reaches request history, and the old final-phase
+ * residual bound (DL1-TXBOUND) has nothing left to bound.
+ *
+ * Request history keeps plain ids of deleted parents and readers tolerate
+ * them. The one exception is the user's own history, which a user deletion
+ * removes for privacy: {@link HISTORY_DRAIN_EDGES} lists, for every H table,
+ * the columns naming the user whose deletion removes the row (drained by
+ * ./parent-deletion.ts before the user row is deleted, and purged afterwards
+ * by the history sweeper for rows that were still live) and the H-internal
+ * foreign keys its rows go with. The catalog test
+ * (packages/api/src/lib/parent-deletion-catalog.test.ts) checks it against
+ * the Prisma schema.
  */
 import { Prisma } from "../prisma/generated/client";
-import type { CapacityDeleteScope } from "./capacity-lock-order";
 
 /**
- * Read-only surface the resolution and the count need: the shared client, or
- * the transaction client of an ordered delete.
+ * Read-only surface the parent resolution needs: the shared client, or the
+ * transaction client of a delete.
  */
 type ResidualDb = Pick<
   Prisma.TransactionClient,
@@ -40,63 +42,6 @@ type ResidualDb = Pick<
 /** Rows per drain batch; each batch is one short transaction. */
 export const PARENT_DELETION_DRAIN_BATCH = 5_000;
 
-/**
- * Max history rows the capacity-locked final delete may still delete, detach
- * or trigger work for: every row of every history table the cascade reaches
- * from the resolved parents (live PENDING / WAITING rows, rows the drain
- * skipped as locked, rows that arrived during or after the drain), plus their
- * history-internal children and the requester-rollup trigger work of a user
- * delete. Counted by {@link countFinalPhaseResidualRows} for every
- * parent-delete kind, and enforced inside the ordered-delete transaction by
- * {@link assertFinalPhaseResidualWithinBound} after its last lock; above it
- * the delete returns pending instead of holding the capacity locks over an
- * unbounded cascade.
- */
-export const PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS = PARENT_DELETION_DRAIN_BATCH * 4;
-
-/**
- * Every DELETE trigger (schema-hardening.sql) on a table an ordered parent
- * delete removes or rewrites, with the work it adds to the final phase. The
- * catalog test parses the SQL and requires this list to match exactly, so a
- * new trigger cannot escape the residual count.
- * - `requester_usage_rollup_merge`: writes rows; counted by
- *   {@link countFinalPhaseResidualRows} (requester rollups of a user delete).
- * - `none`: a per-row check that returns OLD on DELETE; its cost is
- *   proportional to rows already counted.
- * - `retained_history_refused`: the table is retained history the preflight
- *   refuses (`findRetainedHistoryBlocker`), so the trigger never fires on a
- *   delete that proceeds.
- * - `refuses_delete`: raises 55000 on any DELETE with a message
- *   `isPermanentParentDeletionFailure` lists as a permanent refusal (other
- *   55000s are transient); it adds no rows.
- */
-export const PARENT_DELETE_TRIGGER_WORK = [
-  {
-    id: "usage_rollup_detach_requester",
-    parentTable: "user",
-    timing: "AFTER DELETE",
-    work: "requester_usage_rollup_merge",
-  },
-  {
-    id: "relay_execution_attempt_transition",
-    parentTable: "relay_execution_attempt",
-    timing: "BEFORE DELETE",
-    work: "none",
-  },
-  {
-    id: "provider_audit_event_immutable",
-    parentTable: "provider_audit_event",
-    timing: "BEFORE DELETE",
-    work: "retained_history_refused",
-  },
-  {
-    id: "provider_budget_rule_immutable",
-    parentTable: "provider_budget_rule",
-    timing: "BEFORE DELETE",
-    work: "refuses_delete",
-  },
-] as const;
-
 /** Parent tables whose rows a delete removes, by the id sets resolved below. */
 export type DeletedParentTable =
   | "user"
@@ -110,87 +55,45 @@ export type DeletedParentTable =
   | "provider_account"
   | "provider_model";
 
-export type DrainEdge = readonly [column: string, parent: DeletedParentTable];
+export type DrainEdge = readonly [column: string, parent: "user"];
 
 /**
- * Every foreign key from a drained history table into the deleted graph, with
- * the action the cascade would apply. The drain applies the same action in
- * batches. History-internal edges (relay_execution_event -> relay_request,
- * capacity_waiter -> admission_request, ...) are listed in `internal`: the
- * child goes with its drained history parent.
+ * For every H table: the columns naming a user whose deletion removes the row
+ * (`delete`; the user's own history, for privacy) and the H-internal foreign
+ * keys whose parent row takes it along (`internal`). Rows that name a deleted
+ * pool, target, model, device or capacity are kept with a dangling id.
  */
-// pool_fallback_preference is bounded configuration (one per exact grant),
-// cascading through pool_grant/provider_model; it has no history drain.
 export const HISTORY_DRAIN_EDGES = {
-  relay_request: {
-    cascade: [["userId", "user"]],
-    setNull: [
-      ["modelApiTokenId", "model_api_token"],
-      ["requestedDiscoveredModelId", "discovered_model"],
-      ["requestedModelPoolId", "model_pool"],
-      ["selectedDiscoveredModelId", "discovered_model"],
-      ["requestedExecutionTargetId", "execution_target"],
-      ["selectedExecutionTargetId", "execution_target"],
-      ["selectedPoolMemberId", "pool_member"],
+  relay_request: { delete: [["userId", "user"]], internal: [] },
+  relay_execution_event: { delete: [["userId", "user"]], internal: ["relayRequestId"] },
+  relay_execution_attempt: { delete: [["userId", "user"]], internal: ["relayRequestId"] },
+  admission_request: { delete: [["userId", "user"]], internal: ["relayRequestId"] },
+  capacity_waiter: { delete: [["userId", "user"]], internal: ["admissionRequestId"] },
+  capacity_lease: { delete: [["userId", "user"]], internal: ["admissionRequestId"] },
+  capacity_runtime: { delete: [["userId", "user"]], internal: [] },
+  cache_affinity_record: {
+    delete: [
+      ["userId", "user"],
+      ["tenantUserId", "user"],
     ],
     internal: [],
   },
-  relay_execution_event: {
-    // Deleted with its relay request (same owner by the relay FK).
-    cascade: [["userId", "user"]],
-    setNull: [],
-    internal: ["relayRequestId"],
-  },
-  relay_execution_attempt: {
-    cascade: [["userId", "user"]],
-    setNull: [],
-    internal: ["relayRequestId"],
-  },
-  admission_request: {
-    cascade: [
-      ["userId", "user"],
-      ["poolId", "model_pool"],
-      ["directExecutionTargetId", "execution_target"],
-    ],
-    setNull: [],
-    internal: ["relayRequestId"],
-  },
-  capacity_waiter: {
-    cascade: [
-      ["capacityId", "inference_capacity"],
-      ["executionTargetId", "execution_target"],
-      ["poolId", "model_pool"],
-      ["poolMemberId", "pool_member"],
-    ],
-    setNull: [],
-    internal: ["admissionRequestId"],
-  },
-  response_stickiness_record: {
-    cascade: [
-      ["userId", "user"],
-      ["modelApiTokenId", "model_api_token"],
-      ["targetDiscoveredModelId", "discovered_model"],
-      ["targetModelPoolId", "model_pool"],
-      ["targetExecutionTargetId", "execution_target"],
-      ["selectedExecutionTargetId", "execution_target"],
-      ["providerAccountId", "provider_account"],
-      ["providerModelId", "provider_model"],
-      ["poolGrantId", "pool_grant"],
-    ],
-    setNull: [["selectedDiscoveredModelId", "discovered_model"]],
-    internal: [],
-  },
-  usage_rollup_minute: { cascade: [["ownerUserId", "user"]], setNull: [], internal: [] },
-  usage_rollup_hour: { cascade: [["ownerUserId", "user"]], setNull: [], internal: [] },
-} as const satisfies Record<
-  string,
-  { cascade: readonly DrainEdge[]; setNull: readonly DrainEdge[]; internal: readonly string[] }
->;
+  response_stickiness_record: { delete: [["userId", "user"]], internal: [] },
+  usage_rollup_minute: { delete: [["ownerUserId", "user"]], internal: [] },
+  usage_rollup_hour: { delete: [["ownerUserId", "user"]], internal: [] },
+  // Provider accounting is retained history: a user who has any is refused
+  // deletion before anything is drained (`findRetainedHistoryBlocker`).
+  provider_attempt: { delete: [], internal: [] },
+  public_provider_attempt_event: { delete: [], internal: ["providerAttemptId"] },
+  provider_budget_reservation: { delete: [], internal: [] },
+  provider_budget_settlement: { delete: [], internal: ["reservationId"] },
+  provider_usage_ledger: { delete: [], internal: ["reservationId"] },
+} as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
 /**
- * Drain budget or residual bound exceeded, or a drain batch hit its own
- * timeout; completion should return pending. `timeout` is the SQLSTATE of a
- * batch timeout (55P03 lock wait, 57014 statement), absent otherwise.
+ * Drain budget exceeded, or a drain batch hit its own timeout; completion
+ * should return pending. `timeout` is the SQLSTATE of a batch timeout (55P03
+ * lock wait, 57014 statement), absent otherwise.
  */
 export class ParentDeletionDrainPendingError extends Error {
   readonly code = "PARENT_DELETION_DRAIN_PENDING";
@@ -203,12 +106,12 @@ export class ParentDeletionDrainPendingError extends Error {
 }
 
 /**
- * A whole-user drain or ordered delete was called without naming the
- * deletion generation it works for (or, for a drain, naming another user's).
- * A programming error in the caller: the operation refuses before touching
- * any row, since without an owner it would delete for a generation that may
+ * A whole-user drain or delete was called without naming the deletion
+ * generation it works for (or, for a drain, naming another user's). A
+ * programming error in the caller: the operation refuses before touching any
+ * row, since without an owner it would delete for a generation that may
  * already have been abandoned. Thrown by the drain (./parent-deletion.ts) and
- * by `lockCapacityGraphForDelete` (./capacity-lock-order.ts).
+ * by `fenceParentDelete` (./capacity-lock-order.ts).
  */
 export class ParentDeletionOwnerRequiredError extends Error {
   readonly code = "PARENT_DELETION_OWNER_REQUIRED";
@@ -218,8 +121,33 @@ export class ParentDeletionOwnerRequiredError extends Error {
   }
 }
 
-/** What a parent delete removes, for the drain and the preflight. */
-export type ParentDeletionScope = CapacityDeleteScope;
+/**
+ * What a parent delete removes. `fenceParentDelete` derives from it the rows
+ * the cascade reaches and the owners whose fences the delete needs.
+ */
+export type ParentDeletionScope = {
+  userId: string;
+  /** Devices whose endpoints, models and targets are deleted. */
+  cliDeviceIds?: readonly string[];
+  poolIds?: readonly string[];
+  poolMemberIds?: readonly string[];
+  /** Targets deleted directly or through a discovered/provider model cascade. */
+  executionTargetIds?: readonly string[];
+  capacityIds?: readonly string[];
+  /** The user row itself is deleted: every graph row of the user. */
+  wholeUser?: boolean;
+  /** Endpoints deleted directly (their models and targets follow). */
+  endpointIds?: readonly string[];
+  /** Discovered models deleted directly (their targets follow). */
+  discoveredModelIds?: readonly string[];
+  /**
+   * With `wholeUser`: the deletion generation the caller owns. The user row
+   * lock matches only a row still carrying it; otherwise the delete throws
+   * `UserDeletionGenerationChangedError` (the row is gone, or the deletion
+   * was abandoned or replaced), having taken only fences and pool locks.
+   */
+  userDeletionGeneration?: string;
+};
 
 /** The deleted rows of every parent table, sorted. */
 export type DeletedParents = Record<DeletedParentTable, string[]>;
@@ -231,9 +159,8 @@ function sorted(values: Iterable<string | null | undefined>): string[] {
 }
 
 /**
- * Resolves the rows a delete removes. Read-only and unlocked: rows created
- * afterwards are handled by the ordered delete (phase 3), which plans under
- * its own locks.
+ * Resolves the graph rows a delete removes. Read-only and unlocked; the
+ * delete re-resolves under its owner fences (`fenceParentDelete`).
  */
 export async function resolveDeletedParents(
   db: ResidualDb,
@@ -364,114 +291,4 @@ export function edgeFilters(
     filters.push(Prisma.sql`${Prisma.raw(`${alias}."${column}"`)} = ANY(${ids}::text[])`);
   }
   return filters;
-}
-
-/** Rows `sql` (a `SELECT 1 ... WHERE ...` without LIMIT) matches, counted up to `cap`. */
-async function countUpTo(db: ResidualDb, select: Prisma.Sql, cap: number): Promise<number> {
-  const [{ count }] = await db.$queryRaw<[{ count: bigint }]>`
-    SELECT count(*)::bigint AS count FROM (${select} LIMIT ${cap}) AS residual`;
-  return Number(count ?? 0);
-}
-
-/**
- * Upper bound (capped just above {@link PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS})
- * of the history rows the final ordered delete of `parents` will delete,
- * detach or run trigger work for. Enumerates, for every parent-delete kind:
- * - every {@link HISTORY_DRAIN_EDGES} table through each of its CASCADE and
- *   SET NULL edges into the resolved parents, whatever the row's status,
- *   creation time or lock state (so live PENDING/WAITING rows and rows the
- *   drain skipped with SKIP LOCKED are counted; rows committed after this
- *   count are counted by the in-transaction recount,
- *   {@link assertFinalPhaseResidualWithinBound});
- * - the history-internal children those rows cascade into on their own
- *   foreign keys (capacity waiters of a deleted admission request, admission
- *   requests of a deleted relay request; relay execution events and attempts
- *   carry the relay request's owner and are counted by their `userId` edge);
- * - the {@link PARENT_DELETE_TRIGGER_WORK} of a user delete (requester usage
- *   rollups merged by `usage_rollup_detach_requester`).
- * Each pass counts rows once per table (OR of edges within a pass). The
- * second pass can count some tables again, so totals may over-count; that
- * only makes the delete return pending sooner.
- */
-export async function countFinalPhaseResidualRows(
-  db: ResidualDb,
-  parents: DeletedParents,
-  cap = PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS + 1,
-): Promise<number> {
-  let total = 0;
-  const add = async (select: Prisma.Sql) => {
-    if (total >= cap) return;
-    total += await countUpTo(db, select, cap - total);
-  };
-  for (const [table, edges] of Object.entries(HISTORY_DRAIN_EDGES)) {
-    const filters = edgeFilters("x", [...edges.cascade, ...edges.setNull], parents);
-    if (filters.length === 0) continue;
-    await add(
-      Prisma.sql`SELECT 1 FROM ${Prisma.raw(`"${table}"`)} x WHERE ${Prisma.join(filters, " OR ")}`,
-    );
-  }
-  const admissionFilters = edgeFilters("r", HISTORY_DRAIN_EDGES.admission_request.cascade, parents);
-  if (admissionFilters.length > 0)
-    await add(Prisma.sql`
-      SELECT 1 FROM capacity_waiter w
-        JOIN admission_request r ON r.id = w."admissionRequestId"
-       WHERE ${Prisma.join(admissionFilters, " OR ")}`);
-  if (parents.user.length > 0) {
-    await add(Prisma.sql`
-      SELECT 1 FROM admission_request r
-        JOIN relay_request q ON q.id = r."relayRequestId"
-       WHERE q."userId" = ANY(${parents.user}::text[])`);
-    await add(Prisma.sql`
-      SELECT 1 FROM usage_rollup_minute WHERE "requesterUserId" = ANY(${parents.user}::text[])`);
-    await add(Prisma.sql`
-      SELECT 1 FROM usage_rollup_hour WHERE "requesterUserId" = ANY(${parents.user}::text[])`);
-  }
-  return total;
-}
-
-/**
- * The in-transaction recount (DL1-TXBOUND). Called by
- * `lockCapacityGraphForDelete` after its last lock, and before the caller's
- * DELETE, in the ordered delete's READ COMMITTED transaction, so it sees
- * every producer that committed while the locks were being taken. Resolves
- * the parents of `scope` under those locks and throws
- * {@link ParentDeletionDrainPendingError} when the residual exceeds
- * {@link PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS}: the transaction
- * rolls back with nothing deleted, a user delete stays pending for the
- * sweeper and a dashboard delete answers CONFLICT. The error is neither
- * retried inside the transaction runner nor a permanent refusal.
- *
- * Plain reads only: it takes no lock, so it adds nothing to the lock order.
- * Its cost under the locks is bounded by the cap: every count is
- * `LIMIT`-capped and filters on indexed foreign-key columns.
- *
- * Exactness per edge:
- * - `userId` / `ownerUserId` edges of a user delete: final. The L7 user lock
- *   (FOR UPDATE) blocks every new referencing insert until this transaction
- *   ends, and the insert then fails its foreign key.
- * - Rows that reference capacity state (admissions, waiters) are excluded by
- *   the held L4/L5/L6 locks.
- * - SET NULL / CASCADE edges into parents held only FOR NO KEY UPDATE or not
- *   locked at all (`cli_device`, `model_pool`, `execution_target`,
- *   `pool_member`, `discovered_model`, `model_api_token`, `provider_*`,
- *   `pool_grant`) are not closed to producers (FOR NO KEY UPDATE does not
- *   conflict with a child insert's FOR KEY SHARE). Known issue F2-01
- *   (user-accepted; closed by DL-1 design (d), which drops these cascades):
- *   rows such producers commit between this recount and the caller's DELETE,
- *   one statement later, are not counted. Its size is the producer rate times one statement, not
- *   a lock wait. Holding those parents FOR UPDATE would close it but needs
- *   its own lock-cycle proof against producers that hold FOR KEY SHARE.
- */
-export async function assertFinalPhaseResidualWithinBound(
-  db: ResidualDb,
-  scope: ParentDeletionScope,
-  cap = PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS,
-): Promise<void> {
-  const parents = await resolveDeletedParents(db, scope);
-  const residual = await countFinalPhaseResidualRows(db, parents, cap + 1);
-  if (residual > cap) {
-    throw new ParentDeletionDrainPendingError(
-      "Parent deletion still has more history rows than the final delete may take; retry later.",
-    );
-  }
 }

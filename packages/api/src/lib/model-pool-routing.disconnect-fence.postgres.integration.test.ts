@@ -1,3 +1,4 @@
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, describe, expect, it } from "vitest";
 
 /**
@@ -13,11 +14,14 @@ const integration = databaseUrl ? describe : describe.skip;
 
 integration("disconnect fence with real PostgreSQL", () => {
   const userIds: string[] = [];
+  // Graph fixtures are created and removed through the fixture client (no owner
+  // fences); the code under test runs on the ordinary shared client.
+  const fixtures = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
 
   afterAll(async () => {
-    if (!databaseUrl || userIds.length === 0) return;
-    const { default: prisma } = await import("@ws-model-proxy/db");
-    for (const id of userIds) await prisma.user.deleteMany({ where: { id } });
+    if (!fixtures) return;
+    for (const id of userIds) await fixtures.user.deleteMany({ where: { id } });
+    await fixtures.$disconnect();
   });
 
   async function loadModules() {
@@ -33,17 +37,19 @@ integration("disconnect fence with real PostgreSQL", () => {
   /** One user with `devices` devices, each with one endpoint/model/pool member. */
   async function seed(tag: string, devices = 1) {
     const { prisma, routing } = await loadModules();
+    const f = fixtures;
+    if (!f) throw new Error("fixtures client requires SCHEMA_VALIDATION_DATABASE_URL");
     const suffix = `${tag}-${crypto.randomUUID()}`;
-    const user = await prisma.user.create({
+    const user = await f.user.create({
       data: { name: "fence", email: `fence-${suffix}@example.test`, slug: `fence-${suffix}` },
     });
     userIds.push(user.id);
-    const pool = await prisma.modelPool.create({
+    const pool = await f.modelPool.create({
       data: { userId: user.id, slug: `pool-${suffix}`.slice(0, 60), name: "pool" },
     });
     const rows = [];
     for (let i = 0; i < devices; i++) {
-      const device = await prisma.cliDevice.create({
+      const device = await f.cliDevice.create({
         data: {
           userId: user.id,
           slug: `desk-${i}`,
@@ -52,7 +58,7 @@ integration("disconnect fence with real PostgreSQL", () => {
           lastHeartbeatAt: new Date(),
         },
       });
-      const endpoint = await prisma.endpoint.create({
+      const endpoint = await f.endpoint.create({
         data: {
           userId: user.id,
           cliDeviceId: device.id,
@@ -61,7 +67,7 @@ integration("disconnect fence with real PostgreSQL", () => {
           status: "ONLINE",
         },
       });
-      const model = await prisma.discoveredModel.create({
+      const model = await f.discoveredModel.create({
         data: {
           userId: user.id,
           endpointId: endpoint.id,
@@ -69,7 +75,7 @@ integration("disconnect fence with real PostgreSQL", () => {
           encodedModelId: "m",
         },
       });
-      const member = await prisma.poolMember.create({
+      const member = await f.poolMember.create({
         data: { poolId: pool.id, discoveredModelId: model.id, healthStatus: "HEALTHY" },
       });
       rows.push({ device, member });
