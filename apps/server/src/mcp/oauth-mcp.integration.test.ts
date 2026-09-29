@@ -1316,10 +1316,6 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
     expect(tokens.claims.sub).toEqual(expect.any(String));
   });
 
-  it.todo(
-    "row 6d — social-provider login continuation (needs-infra: an external IdP; SSO is not configured in this stack)",
-  );
-
   // -------------------------------------------------------------------------
   // Gap row 8: rolling refresh expiry + cached-retry window, compressed via
   // a TEST-CONSTRUCTED production-shaped auth instance with short lifetimes.

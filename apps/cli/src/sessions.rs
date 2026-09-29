@@ -32,8 +32,7 @@
 //! replay). Live output and PTY-size frames are sealed once under a shared
 //! per-terminal output key; the relay fans them out. The key rotates to a new
 //! epoch whenever a viewer leaves. The PTY size follows the writer, the viewer
-//! that most recently typed. Protocol 2.4 keeps one implicit viewer, v1 crypto,
-//! and attach-replaces-viewer.
+//! that most recently typed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
@@ -61,7 +60,7 @@ use crate::protocol::{
 use crate::relay_bus::FromWorker;
 use crate::startup::TerminalStartup;
 use crate::terminal_crypto::{
-    self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintext, TermPlaintextV2,
+    self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintextV2,
 };
 
 const MAX_TERMINALS: usize = 2;
@@ -97,8 +96,8 @@ const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 /// the PTY must not keep a dead terminal in its slot.
 #[cfg(unix)]
 const TERMINAL_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
-/// Map key for the single implicit viewer of a 2.4 (legacy) terminal. Never a
-/// valid wire viewer id, so it cannot collide with a 2.5 viewer.
+/// Map key for a handshake that names no viewer. Never a valid wire viewer id.
+/// Every accepted handshake carries a valid id, so this is only a fallback.
 const LEGACY_VIEWER: &str = "";
 
 const REASON_DISABLED: &str = "disabled";
@@ -171,9 +170,7 @@ enum Incoming {
     },
     /// Undecryptable or out-of-order sealed frames are dropped.
     Ignore,
-    /// 2.4: an authenticated frame with a bad payload closes the terminal.
-    Close,
-    /// 2.5: an authenticated frame with a bad payload removes only its viewer.
+    /// An authenticated frame with a bad payload removes only its viewer.
     DropViewer,
     /// A supervised command's "review output before sending" checkbox.
     ReviewToggle(bool),
@@ -1084,7 +1081,7 @@ fn wipe_capture_message(message: &mut TermPlaintextV2) {
     }
 }
 
-/// One browser tab. On a 2.4 terminal the single implicit viewer uses v1 keys.
+/// One browser tab.
 struct Viewer {
     keys: DirectionKeys,
     last_rx: u64,
@@ -1255,13 +1252,10 @@ impl Supervised {
 }
 
 struct TerminalSession {
-    /// Protocol 2.5: v2 crypto, broadcast output, and writer tracking.
-    multi: bool,
     viewers: BTreeMap<String, Viewer>,
-    /// 2.5 only. The viewer that most recently typed.
+    /// The viewer that most recently typed.
     writer: Option<String>,
     pty_size: (u16, u16),
-    /// 2.5 only. `None` on a 2.4 terminal.
     out: Option<OutputKey>,
     /// Set when the viewer set becomes empty; drives the idle close.
     detached_at: Option<Instant>,
@@ -1372,40 +1366,6 @@ impl TerminalSession {
         if let Some(mut message) = capture {
             frames.extend(self.seal_unicast(terminal_id, viewer_id, &message));
             wipe_capture_message(&mut message);
-        }
-        frames
-    }
-
-    /// v1 output for the single 2.4 viewer. Nothing when it is detached.
-    fn seal_legacy_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
-        let Some(viewer) = self.viewers.get_mut(LEGACY_VIEWER) else {
-            return Vec::new();
-        };
-        let mut frames = Vec::new();
-        for chunk in data.chunks(SEAL_CHUNK) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let Ok(plaintext) =
-                terminal_crypto::encode_plaintext(&TermPlaintext::Data(chunk.to_vec()))
-            else {
-                continue;
-            };
-            let seq = viewer.next_tx;
-            viewer.next_tx = viewer.next_tx.saturating_add(1);
-            match terminal_crypto::seal(
-                &viewer.keys.cli_to_browser,
-                terminal_id,
-                DIR_CLI_TO_BROWSER,
-                seq,
-                &plaintext,
-            ) {
-                Ok(body) => frames.push(sealed_frame(terminal_id, seq, None, None, body)),
-                Err(error) => {
-                    tracing::warn!(error = %error, terminal_id, "sealing terminal output failed");
-                    break;
-                }
-            }
         }
         frames
     }
@@ -1540,30 +1500,19 @@ impl TerminalSession {
         seq: u64,
         body: &[u8],
     ) -> Incoming {
-        let multi = self.multi;
         // The relay stamps the viewer id; pick that viewer's keys. Never
         // trial-decrypt under other viewers.
         let Some(viewer) = self.viewers.get_mut(viewer_id) else {
             return Incoming::Ignore;
         };
-        let opened = if multi {
-            terminal_crypto::open_v2(
-                &viewer.keys.browser_to_cli,
-                terminal_id,
-                viewer_id,
-                DIR_BROWSER_TO_CLI,
-                seq,
-                body,
-            )
-        } else {
-            terminal_crypto::open(
-                &viewer.keys.browser_to_cli,
-                terminal_id,
-                DIR_BROWSER_TO_CLI,
-                seq,
-                body,
-            )
-        };
+        let opened = terminal_crypto::open_v2(
+            &viewer.keys.browser_to_cli,
+            terminal_id,
+            viewer_id,
+            DIR_BROWSER_TO_CLI,
+            seq,
+            body,
+        );
         // Advance the replay cursor only after the frame authenticates.
         // A relay can rewrite the sequence in the cleartext metadata.
         let Ok(plaintext) = opened else {
@@ -1572,13 +1521,6 @@ impl TerminalSession {
         if !terminal_crypto::accept_seq(&mut viewer.last_rx, seq) {
             return Incoming::Ignore;
         };
-        if !multi {
-            return match terminal_crypto::decode_plaintext(&plaintext) {
-                Ok(TermPlaintext::Data(bytes)) => Incoming::Write(bytes),
-                Ok(TermPlaintext::Resize { cols, rows }) => Incoming::Resize { cols, rows },
-                Err(_) => Incoming::Close,
-            };
-        }
         match terminal_crypto::decode_plaintext_v2(&plaintext) {
             Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
             Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
@@ -1605,7 +1547,7 @@ struct PendingTerminal {
     attach: bool,
 }
 
-/// `(terminalId, viewerId)`; a 2.4 terminal uses [`LEGACY_VIEWER`].
+/// `(terminalId, viewerId)`.
 type PendingKey = (String, String);
 
 fn pending_key(terminal_id: &str, viewer_id: Option<&str>) -> PendingKey {
@@ -1625,8 +1567,6 @@ pub(crate) struct TerminalRegistry {
     #[cfg(unix)]
     tx: SyncSender<FromWorker>,
     idle_limit: Duration,
-    /// Protocol 2.5 multi-viewer mode. `false` runs the 2.4 single-viewer path.
-    multi: bool,
     /// The state dir from the last successful `term.auth`, for approval re-checks.
     state_dir: Option<PathBuf>,
     next_approval_check: Option<Instant>,
@@ -1656,7 +1596,7 @@ fn term_exit(terminal_id: &str, status: (Option<i32>, Option<i32>)) -> OutboundF
 }
 
 impl TerminalRegistry {
-    pub(crate) fn new(tx: SyncSender<FromWorker>, multi: bool) -> Self {
+    pub(crate) fn new(tx: SyncSender<FromWorker>) -> Self {
         // Windows spawns no PTY, so no worker thread needs the channel.
         #[cfg(not(unix))]
         drop(tx);
@@ -1666,7 +1606,6 @@ impl TerminalRegistry {
             #[cfg(unix)]
             tx,
             idle_limit: DEFAULT_IDLE,
-            multi,
             state_dir: None,
             next_approval_check: None,
             shut_down: false,
@@ -1717,7 +1656,7 @@ impl TerminalRegistry {
         if !valid_id(command_id) || !valid_id(&spawn.terminal_id) {
             return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
         }
-        if !terminal_supported() || !self.multi {
+        if !terminal_supported() {
             return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
         }
         if !startup.mcp_command_mode().allows_supervised() {
@@ -1868,7 +1807,6 @@ impl TerminalRegistry {
         self.sessions.insert(
             terminal_id.to_string(),
             TerminalSession {
-                multi: true,
                 viewers: BTreeMap::new(),
                 writer: None,
                 pty_size: (cols, rows),
@@ -2048,7 +1986,7 @@ impl TerminalRegistry {
         frames
     }
 
-    /// A 2.4 (single-viewer) registry with a test shell.
+    /// A registry with a test shell.
     #[cfg(all(unix, test))]
     fn with_shell(
         tx: SyncSender<FromWorker>,
@@ -2056,18 +1994,7 @@ impl TerminalRegistry {
         program: &str,
         args: &[&str],
     ) -> Self {
-        Self::with_shell_mode(tx, idle_limit, program, args, false)
-    }
-
-    #[cfg(all(unix, test))]
-    fn with_shell_mode(
-        tx: SyncSender<FromWorker>,
-        idle_limit: Duration,
-        program: &str,
-        args: &[&str],
-        multi: bool,
-    ) -> Self {
-        let mut registry = Self::new(tx, multi);
+        let mut registry = Self::new(tx);
         registry.idle_limit = idle_limit;
         registry.shell = Some((
             program.to_string(),
@@ -2076,22 +2003,9 @@ impl TerminalRegistry {
         registry
     }
 
-    /// 2.4 relays never send a viewer id; ignore one if it appears. 2.5
-    /// requires a valid one.
-    fn normalize<'a>(&self, handshake: TermHandshake<'a>) -> TermHandshake<'a> {
-        TermHandshake {
-            viewer_id: if self.multi {
-                handshake.viewer_id
-            } else {
-                None
-            },
-            ..handshake
-        }
-    }
-
-    fn ids_ok(&self, handshake: &TermHandshake<'_>) -> bool {
-        valid_id(handshake.terminal_id)
-            && (!self.multi || handshake.viewer_id.is_some_and(valid_id))
+    /// A handshake needs a valid terminal id and a valid viewer id.
+    fn ids_ok(handshake: &TermHandshake<'_>) -> bool {
+        valid_id(handshake.terminal_id) && handshake.viewer_id.is_some_and(valid_id)
     }
 
     fn pending_for(&self, terminal_id: &str) -> usize {
@@ -2122,15 +2036,13 @@ impl TerminalRegistry {
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
-        let handshake = self.normalize(handshake);
         if self.sessions.contains_key(handshake.terminal_id) {
             return vec![*handshake_rejected(&handshake, REASON_ALREADY_OPEN)];
         }
-        if !self.ids_ok(&handshake)
-            || (self.multi
-                && self
-                    .pending
-                    .contains_key(&pending_key(handshake.terminal_id, handshake.viewer_id)))
+        if !Self::ids_ok(&handshake)
+            || self
+                .pending
+                .contains_key(&pending_key(handshake.terminal_id, handshake.viewer_id))
         {
             return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
         }
@@ -2203,16 +2115,12 @@ impl TerminalRegistry {
                 return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
             }
         };
-        let out = if self.multi {
-            match OutputKey::first() {
-                Ok(out) => Some(out),
-                Err(error) => {
-                    tracing::warn!(error = %error, terminal_id, "generating a terminal output key failed");
-                    return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
-                }
+        let out = match OutputKey::first() {
+            Ok(out) => Some(out),
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "generating a terminal output key failed");
+                return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
             }
-        } else {
-            None
         };
         let env = terminal_env(config);
         let (program, args) = self.shell.clone().unwrap_or_else(child_env::login_shell);
@@ -2243,7 +2151,6 @@ impl TerminalRegistry {
             ),
         );
         let mut session = TerminalSession {
-            multi: self.multi,
             viewers,
             // The opener is the first writer.
             writer: viewer_id.map(str::to_string),
@@ -2273,7 +2180,6 @@ impl TerminalRegistry {
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
-        let handshake = self.normalize(handshake);
         let terminal_id = handshake.terminal_id;
         let Some(session) = self.sessions.get(terminal_id) else {
             return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
@@ -2295,7 +2201,7 @@ impl TerminalRegistry {
                 },
             )];
         }
-        if !self.ids_ok(&handshake) {
+        if !Self::ids_ok(&handshake) {
             return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
         }
         if let Some(viewer_id) = handshake.viewer_id {
@@ -2334,14 +2240,10 @@ impl TerminalRegistry {
         viewer_id: Option<&str>,
         signature: &str,
     ) -> Vec<OutboundFrame> {
-        let viewer_id = if self.multi {
-            let Some(viewer_id) = viewer_id else {
-                return Vec::new();
-            };
-            Some(viewer_id)
-        } else {
-            None
+        let Some(viewer_id) = viewer_id else {
+            return Vec::new();
         };
+        let viewer_id = Some(viewer_id);
         let key = pending_key(terminal_id, viewer_id);
         let Some(pending) = self.pending.get(&key) else {
             return Vec::new();
@@ -2497,18 +2399,12 @@ impl TerminalRegistry {
         let Ok(keys) = keys else {
             return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         };
-        let multi = self.multi;
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return vec![*handshake_rejected(handshake, REASON_NOT_FOUND)];
         };
         let viewer_key = viewer_id.unwrap_or(LEGACY_VIEWER);
-        if multi {
-            if session.viewers.contains_key(viewer_key) {
-                return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
-            }
-        } else {
-            // 2.4: attach replaces the single viewer.
-            session.viewers.clear();
+        if session.viewers.contains_key(viewer_key) {
+            return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         }
         session.viewers.insert(
             viewer_key.to_string(),
@@ -2520,32 +2416,18 @@ impl TerminalRegistry {
             viewer_id: viewer_id.map(str::to_string),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
-        if multi {
-            frames.extend(session.join_frames(terminal_id, viewer_key));
-            frames.extend(session.supervised_join_frames(terminal_id, viewer_key));
-        } else {
-            let replay = session.scrollback.iter().copied().collect::<Vec<_>>();
-            frames.extend(session.seal_legacy_data(terminal_id, &replay));
-        }
+        frames.extend(session.join_frames(terminal_id, viewer_key));
+        frames.extend(session.supervised_join_frames(terminal_id, viewer_key));
         frames
     }
 
-    /// 2.5: stop viewing (the tab's X, or the tab went away). A pending
-    /// approval for that viewer is dropped too. 2.4: the single viewer leaves.
+    /// Stop viewing (the tab's X, or the tab went away). A pending approval
+    /// for that viewer is dropped too.
     pub(crate) fn detach(
         &mut self,
         terminal_id: &str,
         viewer_id: Option<&str>,
     ) -> Vec<OutboundFrame> {
-        if !self.multi {
-            if let Some(session) = self.sessions.get_mut(terminal_id)
-                && !session.viewers.is_empty()
-            {
-                session.viewers.clear();
-                session.detached_at = Some(Instant::now());
-            }
-            return Vec::new();
-        }
         let Some(viewer_id) = viewer_id else {
             return Vec::new();
         };
@@ -2554,12 +2436,9 @@ impl TerminalRegistry {
         self.remove_viewer(terminal_id, viewer_id, None)
     }
 
-    /// A malformed relay frame that names a viewer. 2.5 removes only that
-    /// viewer (or its pending approval); 2.4 closes the terminal as before.
+    /// A malformed relay frame that names a viewer. Removes only that viewer
+    /// (or its pending approval).
     pub(crate) fn drop_viewer(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
-        if !self.multi {
-            return self.close(terminal_id);
-        }
         if self
             .pending
             .remove(&pending_key(terminal_id, Some(viewer_id)))
@@ -2640,15 +2519,11 @@ impl TerminalRegistry {
         seq: u64,
         body: &[u8],
     ) -> Vec<OutboundFrame> {
-        let viewer_key = if self.multi {
-            let Some(viewer_id) = viewer_id else {
-                tracing::warn!(terminal_id, "ignoring a sealed frame without a viewer id");
-                return Vec::new();
-            };
-            viewer_id.to_string()
-        } else {
-            LEGACY_VIEWER.to_string()
+        let Some(viewer_id) = viewer_id else {
+            tracing::warn!(terminal_id, "ignoring a sealed frame without a viewer id");
+            return Vec::new();
         };
+        let viewer_key = viewer_id.to_string();
         let action = {
             let Some(session) = self.sessions.get_mut(terminal_id) else {
                 tracing::warn!(
@@ -2671,13 +2546,11 @@ impl TerminalRegistry {
                     return Vec::new();
                 }
                 let mut frames = Vec::new();
-                if self.multi {
-                    match self.claim_writer(terminal_id, &viewer_key) {
-                        Ok(claimed) => frames.extend(claimed),
-                        Err(_) => {
-                            frames.extend(self.close(terminal_id));
-                            return frames;
-                        }
+                match self.claim_writer(terminal_id, &viewer_key) {
+                    Ok(claimed) => frames.extend(claimed),
+                    Err(_) => {
+                        frames.extend(self.close(terminal_id));
+                        return frames;
                     }
                 }
                 match self.enqueue_input(terminal_id, bytes) {
@@ -2695,13 +2568,6 @@ impl TerminalRegistry {
                 {
                     // A finished supervised command has no PTY to resize.
                     return Vec::new();
-                }
-                if !self.multi {
-                    return if self.resize_terminal(terminal_id, cols, rows).is_err() {
-                        self.close(terminal_id)
-                    } else {
-                        Vec::new()
-                    };
                 }
                 let applies = {
                     let Some(session) = self.sessions.get_mut(terminal_id) else {
@@ -2725,7 +2591,6 @@ impl TerminalRegistry {
             }
             Incoming::ReviewToggle(on) => self.toggle_review(terminal_id, &viewer_key, on),
             Incoming::Ignore => Vec::new(),
-            Incoming::Close => self.close(terminal_id),
             Incoming::DropViewer => {
                 tracing::warn!(terminal_id, "removing a viewer after a bad terminal frame");
                 self.remove_viewer(terminal_id, &viewer_key, Some(REASON_BAD_FRAME))
@@ -2855,11 +2720,7 @@ impl TerminalRegistry {
         }
         // Scrollback is always recorded; output is sealed only for viewers.
         push_scrollback(&mut session.scrollback, bytes);
-        if session.multi {
-            session.broadcast_data(terminal_id, bytes)
-        } else {
-            session.seal_legacy_data(terminal_id, bytes)
-        }
+        session.broadcast_data(terminal_id, bytes)
     }
 
     /// PTY EOF. A supervised terminal is finished only after its child is
@@ -2969,7 +2830,7 @@ impl TerminalRegistry {
 
     /// 2.5: a viewer whose approval was revoked leaves (and the key rotates).
     fn recheck_approvals(&mut self, now: Instant) -> Vec<OutboundFrame> {
-        if !self.multi || self.next_approval_check.is_some_and(|next| now < next) {
+        if self.next_approval_check.is_some_and(|next| now < next) {
             return Vec::new();
         }
         self.next_approval_check = Some(now + APPROVAL_RECHECK);
@@ -3798,7 +3659,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "term-1",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -3855,7 +3716,7 @@ mod tests {
                 None,
                 TermHandshake {
                     terminal_id,
-                    viewer_id: None,
+                    viewer_id: Some("viewer-a"),
                     cols: 80,
                     rows: 24,
                     browser_public_key: browser.public_b64url(),
@@ -3874,7 +3735,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "t3",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -3897,7 +3758,7 @@ mod tests {
         let (tx, _rx) = channel();
         let mut terminals = TerminalRegistry::with_shell(
             tx,
-            Duration::from_millis(200),
+            Duration::from_secs(60),
             "/bin/sh",
             &["-c", "sleep 30"],
         );
@@ -3910,7 +3771,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "idle",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 40,
                 rows: 12,
                 browser_public_key: browser.public_b64url(),
@@ -3918,9 +3779,9 @@ mod tests {
                 identity: None,
             },
         );
-        terminals.detach("idle", None);
-        std::thread::sleep(Duration::from_millis(250));
-        let frames = terminals.poll(Instant::now());
+        terminals.detach("idle", Some("viewer-a"));
+        // The poll clock is passed in, so no real waiting is needed.
+        let frames = terminals.poll(Instant::now() + Duration::from_secs(120));
         assert!(matches!(
             &frames[0],
             OutboundFrame::Control(ClientControlMessage::TermExit { terminal_id, .. })
@@ -4021,7 +3882,7 @@ mod tests {
             Some(dir.path()),
             TermHandshake {
                 terminal_id: "term-a",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -4041,9 +3902,10 @@ mod tests {
         assert_eq!(terminals.pending.len(), 1);
         crate::approvals::approve(dir.path(), &code).expect("approve");
         let cli_nonce_raw = terminal_crypto::decode_nonce(&cli_nonce).expect("nonce");
-        let signature = terminal_crypto::sign_approval(
+        let signature = terminal_crypto::sign_approval_v2(
             &identity,
             "term-a",
+            "viewer-a",
             browser.public_raw(),
             &[4_u8; 16],
             startup.key().public_raw(),
@@ -4055,7 +3917,7 @@ mod tests {
             &Config::default(),
             Some(dir.path()),
             "term-a",
-            None,
+            Some("viewer-a"),
             &terminal_crypto::encode_b64url(&signature),
         );
         assert!(matches!(
@@ -4203,7 +4065,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "held",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -4430,13 +4292,7 @@ mod tests {
 
     #[cfg(unix)]
     fn multi_registry(tx: SyncSender<FromWorker>) -> TerminalRegistry {
-        TerminalRegistry::with_shell_mode(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-            true,
-        )
+        TerminalRegistry::with_shell(tx, Duration::from_secs(60), "/bin/sh", &["-c", "sleep 30"])
     }
 
     #[cfg(unix)]
@@ -4880,14 +4736,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn viewer_cap_duplicates_and_idle_close() {
+        const IDLE_LIMIT: Duration = Duration::from_secs(60);
         let (tx, _rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell_mode(
-            tx,
-            Duration::from_millis(200),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-            true,
-        );
+        let mut terminals =
+            TerminalRegistry::with_shell(tx, IDLE_LIMIT, "/bin/sh", &["-c", "sleep 30"]);
         let startup = enabled_startup(false);
         let mut viewers = (1..=MAX_VIEWERS as u8)
             .map(TestViewer::new)
@@ -4928,11 +4780,11 @@ mod tests {
         for viewer in viewers.iter().skip(1) {
             terminals.detach(MULTI_TERMINAL, Some(&viewer.id));
         }
-        std::thread::sleep(Duration::from_millis(250));
-        assert!(terminals.poll(Instant::now()).is_empty());
+        let past_idle = || Instant::now() + IDLE_LIMIT * 2;
+        assert!(terminals.poll(past_idle()).is_empty());
         terminals.detach(MULTI_TERMINAL, Some(&viewers[0].id));
-        std::thread::sleep(Duration::from_millis(250));
-        let frames = terminals.poll(Instant::now());
+        // The poll clock is passed in, so no real waiting is needed.
+        let frames = terminals.poll(past_idle());
         assert!(matches!(
             controls(&frames)[0],
             ClientControlMessage::TermExit { terminal_id, .. } if terminal_id == MULTI_TERMINAL
@@ -5118,61 +4970,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn legacy_mode_sends_no_viewer_ids_writer_or_broadcast() {
-        let (tx, _rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-        );
-        let startup = enabled_startup(false);
-        let a = TestViewer::new(1);
-        // A viewer id from a 2.4 relay is ignored.
-        let frames = terminals.open(
-            &startup,
-            &Config::default(),
-            None,
-            a.handshake(MULTI_TERMINAL, 80, 24),
-        );
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::TermOpened {
-                viewer_id: None,
-                ..
-            }
-        ));
-        let output = terminals.on_bytes(MULTI_TERMINAL, b"x");
-        assert!(matches!(
-            &output[0],
-            OutboundFrame::Binary(
-                RelayBinaryFrameMetadata::TermSealed {
-                    viewer_id: None,
-                    epoch: None,
-                    ..
-                },
-                _
-            )
-        ));
-        // Attach replaces the viewer without a writer message.
-        let b = TestViewer::new(2);
-        let frames = terminals.attach(&startup, None, b.handshake(MULTI_TERMINAL, 0, 0));
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::TermAttached {
-                viewer_id: None,
-                ..
-            }
-        ));
-        assert!(writer_changes(&frames).is_empty());
-        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
-        assert_eq!(session.viewers.len(), 1);
-        assert!(session.out.is_none());
-    }
-
-    #[cfg(unix)]
     fn process_exists(pid: u32) -> bool {
         let Ok(raw) = i32::try_from(pid) else {
             return false;
@@ -5206,12 +5003,11 @@ mod tests {
         let (tx, rx) = channel();
         // Raw mode without echo: the program never reads, so the PTY input
         // buffer fills and a blocking write would stall the caller.
-        let mut terminals = TerminalRegistry::with_shell_mode(
+        let mut terminals = TerminalRegistry::with_shell(
             tx,
             Duration::from_secs(60),
             "/bin/sh",
             &["-c", "stty raw -echo; sleep 30"],
-            true,
         );
         let startup = enabled_startup(false);
         let mut a = TestViewer::new(1);
@@ -5265,60 +5061,6 @@ mod tests {
             ClientControlMessage::TermExit { .. }
         ));
         drop(rx);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_legacy_overflow_signals_without_a_viewer_id() {
-        let (tx, _rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "stty raw -echo; sleep 30"],
-        );
-        let startup = enabled_startup(false);
-        let a = TestViewer::new(1);
-        let frames = terminals.open(
-            &startup,
-            &Config::default(),
-            None,
-            TermHandshake {
-                viewer_id: None,
-                ..a.handshake(MULTI_TERMINAL, 80, 24)
-            },
-        );
-        let ikm = a
-            .browser
-            .shared_x(startup.key().public_raw())
-            .expect("ecdh");
-        let cli_nonce = terminal_crypto::decode_nonce(&cli_nonce_of(&frames)).expect("nonce");
-        let keys = terminal_crypto::derive_direction_keys_from_ikm(
-            &ikm,
-            startup.key().public_raw(),
-            a.browser.public_raw(),
-            &a.nonce,
-            &cli_nonce,
-            MULTI_TERMINAL,
-        )
-        .expect("keys");
-        std::thread::sleep(Duration::from_millis(200));
-        let plaintext =
-            terminal_crypto::encode_plaintext(&TermPlaintext::Data(vec![b'y'; 16 * 1024]))
-                .expect("plaintext");
-        let mut out = Vec::new();
-        for seq in 1..=128_u64 {
-            let body = terminal_crypto::seal(
-                &keys.browser_to_cli,
-                MULTI_TERMINAL,
-                DIR_BROWSER_TO_CLI,
-                seq,
-                &plaintext,
-            )
-            .expect("seal");
-            out.extend(terminals.handle_sealed(MULTI_TERMINAL, None, seq, &body));
-        }
-        assert_eq!(input_drops(&out), vec![None]);
     }
 
     #[cfg(unix)]
@@ -5401,7 +5143,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "jobs",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -5491,7 +5233,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "exited",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -5594,7 +5336,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "forced",
-                viewer_id: None,
+                viewer_id: Some("viewer-a"),
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -5687,8 +5429,11 @@ mod tests {
         let touch = witness.map_or(String::new(), |path| {
             format!("touch '{}'\n", path.display())
         });
+        let record_pid = witness.map_or(String::new(), |path| {
+            format!("echo $$ > '{}'\n", path.with_extension("pid").display())
+        });
         format!(
-            r#"sleep 0.4
+            r#"{record_pid}sleep 0.4
 printf 'SCREEN\n'
 printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
 IFS= read -r line
@@ -5704,6 +5449,23 @@ printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
 exit 3
 "#
         )
+    }
+
+    /// Waits until the confirm child recorded next to `witness` is gone. A dead
+    /// child cannot create the witness later, so the caller can then assert its
+    /// absence without guessing how long a live child would need.
+    #[cfg(unix)]
+    fn wait_for_confirm_child_exit(witness: &Path) {
+        let pid = std::fs::read_to_string(witness.with_extension("pid"))
+            .expect("the confirm child records its pid before it draws")
+            .trim()
+            .parse::<u32>()
+            .expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_exists(pid) {
+            assert!(Instant::now() < deadline, "the confirm child kept running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -5985,7 +5747,7 @@ exit 3
         for bytes in held {
             assert!(terminals.on_bytes(MULTI_TERMINAL, &bytes).is_empty());
         }
-        std::thread::sleep(Duration::from_millis(600));
+        wait_for_confirm_child_exit(&witness);
         assert!(
             !witness.exists(),
             "the command started without the daemon's go"
@@ -6123,7 +5885,7 @@ exit 3
         // A stop now ends the terminal without claiming anyone declined.
         let answer = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true);
         assert_eq!(outcome_kinds(&answer), vec!["exit"]);
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_confirm_child_exit(&witness);
         assert!(!witness.exists(), "the command started without go");
     }
 
