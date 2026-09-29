@@ -356,7 +356,7 @@ fn search_skips_secret_class_files_and_masks_other_files() {
     let flag = search(&fx, json!({ "root": fx.p("c"), "pattern": "api-key" }));
     assert!(
         flag.matches
-            .contains("--api-key \u{27E6}redacted:9\u{27E7} --x"),
+            .contains("--api-key \u{27E6}redacted:13\u{27E7}"),
         "{}",
         flag.matches
     );

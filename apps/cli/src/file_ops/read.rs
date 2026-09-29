@@ -172,6 +172,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
     if stat.size > STRONG_ETAG_MAX_BYTES {
         return read_large(
             ops, args, &mut file, &stat, class, echo, start, &opts_for, max_lines, max_bytes,
+            cancel,
         );
     }
 
@@ -201,7 +202,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
     // the whole-line classes get by with one line of context before the window
     // for the flag-continuation rule.
     let context_from = if class.needs_prefix() {
-        0
+        lookback_start(&bytes, offset)
     } else {
         prev_line_start(&bytes, offset)
     };
@@ -209,9 +210,7 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
     if offset > 0 {
         let context = &bytes[context_from..offset];
         for raw in context.split_inclusive(|b| *b == b'\n') {
-            if let Ok(line) = std::str::from_utf8(strip_eol(raw)) {
-                let _ = masker.scan(line);
-            }
+            masker.advance_bytes(strip_eol(raw));
         }
     }
     let mut lines = bytes[offset..]
@@ -252,6 +251,19 @@ fn line_offset(bytes: &[u8], n: usize) -> usize {
     bytes.len()
 }
 
+/// Start of the first whole line within [`redact::LOOKBACK_BYTES`] before
+/// `offset` (the window start).
+fn lookback_start(bytes: &[u8], offset: usize) -> usize {
+    let from = offset.saturating_sub(redact::LOOKBACK_BYTES);
+    if from == 0 {
+        return 0;
+    }
+    match bytes[from..offset].iter().position(|b| *b == b'\n') {
+        Some(idx) => from + idx + 1,
+        None => offset,
+    }
+}
+
 /// Start of the line before the one starting at `offset` (`0` when none).
 fn prev_line_start(bytes: &[u8], offset: usize) -> usize {
     if offset == 0 {
@@ -286,9 +298,16 @@ pub(crate) fn assemble(
             });
             break;
         }
-        let body = std::str::from_utf8(strip_eol(&raw))
-            .map_err(|_| binary_error("unknown", size, etag))?;
-        let (masked, count) = masker.mask_line_counted(body);
+        let stripped = strip_eol(&raw);
+        let (masked, count): (std::borrow::Cow<'_, str>, usize) =
+            match std::str::from_utf8(stripped) {
+                Ok(body) => masker.mask_line_counted(body),
+                Err(_) if masker.class().is_secret() => {
+                    let (token, count) = masker.mask_invalid(stripped);
+                    (std::borrow::Cow::Owned(token), count)
+                }
+                Err(_) => return Err(binary_error("unknown", size, etag)),
+            };
         let mut slice: &str = &masked;
         let mut consumed = 0_usize;
         if emitted == 0
@@ -362,6 +381,9 @@ pub(crate) fn assemble(
     })
 }
 
+/// How many lines of a huge file are read between cancellation checks.
+const CANCEL_CHECK_LINES: u64 = 512;
+
 /// Longest single line served from a file over 64 MiB. Masking needs the whole
 /// line in memory, so an unbounded line (a sparse or minified file) would be an
 /// allocation the file's owner controls.
@@ -398,7 +420,9 @@ fn read_large(
     opts_for: &dyn Fn(u64) -> WindowOpts,
     max_lines: usize,
     max_bytes: usize,
+    cancel: &Cancel,
 ) -> FileResult<ReadOutcome> {
+    cancel.check()?;
     let etag = ops.key.weak(&file.metadata()?);
     if args.if_none_match.as_deref() == Some(etag.as_str()) {
         return Ok(ReadOutcome::Unchanged {
@@ -423,6 +447,7 @@ fn read_large(
         tail_window(
             file,
             stat,
+            cancel,
             &mut masker,
             start.unsigned_abs() as usize,
             max_lines,
@@ -433,12 +458,21 @@ fn read_large(
         let first = start as u64;
         let mut reader = BufReader::with_capacity(1 << 20, &mut *file);
         let mut scanned = 0_u64;
-        // Feed the masker every line before the window for a class whose masking
-        // can span lines; otherwise the last line is the one line of context the
-        // flag-continuation rule needs.
-        let context_prefix = class.needs_prefix();
-        let mut context: Vec<u8> = Vec::new();
-        for _ in 1..first {
+        // Feed the masker the lines in the lookback before the window (state
+        // only): a value or key block opened there masks the window's first
+        // lines. Whole-line classes need only the one line before it.
+        let lookback = if class.needs_prefix() {
+            redact::LOOKBACK_BYTES as u64
+        } else {
+            1
+        };
+        let mut context: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+        let mut context_bytes = 0_u64;
+        for seen in 1..first {
+            // a 64 MiB prefix is millions of lines: observe cancellation as we go
+            if seen.is_multiple_of(CANCEL_CHECK_LINES) {
+                cancel.check()?;
+            }
             let mut buf = Vec::new();
             let n = read_line_bounded(&mut reader, &mut buf)?;
             if n == 0 {
@@ -451,18 +485,25 @@ fn read_large(
                     "startLine is more than 64 MiB into the file; use a negative startLine to read the end",
                 ));
             }
-            if context_prefix {
-                if let Ok(line) = std::str::from_utf8(strip_eol(&buf)) {
-                    let _ = masker.scan(line);
+            context_bytes += n as u64;
+            context.push_back(buf);
+            while context_bytes > lookback && context.len() > 1 {
+                if let Some(old) = context.pop_front() {
+                    context_bytes -= old.len() as u64;
                 }
-            } else {
-                context = buf;
             }
         }
-        if !context_prefix && let Ok(line) = std::str::from_utf8(strip_eol(&context)) {
-            let _ = masker.scan(line);
+        for buf in &context {
+            masker.advance_bytes(strip_eol(buf));
         }
+        let mut served = 0_u64;
         let mut lines = std::iter::from_fn(|| {
+            served += 1;
+            if served.is_multiple_of(CANCEL_CHECK_LINES)
+                && let Err(err) = cancel.check()
+            {
+                return Some(Err(err));
+            }
             let mut buf = Vec::new();
             match read_line_bounded(&mut reader, &mut buf) {
                 Ok(0) => None,
@@ -492,16 +533,20 @@ fn read_large(
 }
 
 /// The last `count` lines of a huge file, without line numbers.
+#[allow(clippy::too_many_arguments)]
 fn tail_window(
     file: &std::fs::File,
     stat: &Stat,
+    cancel: &Cancel,
     masker: &mut LineMasker,
     count: usize,
     max_lines: usize,
     max_bytes: usize,
     etag: &str,
 ) -> FileResult<(Window, Eol)> {
-    let chunk_len = ((max_bytes as u64) * 2 + 64 * 1024).min(stat.size);
+    cancel.check()?;
+    let chunk_len =
+        ((max_bytes as u64) * 2 + 64 * 1024 + redact::LOOKBACK_BYTES as u64).min(stat.size);
     let mut chunk = vec![0_u8; chunk_len as usize];
     file.read_exact_at(&mut chunk, stat.size - chunk_len)?;
     let mut raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
@@ -516,17 +561,23 @@ fn tail_window(
         ));
     }
     let first_index = raw_lines.len() - want;
-    if first_index > 0
-        && let Ok(line) = std::str::from_utf8(strip_eol(raw_lines[first_index - 1]))
-    {
-        let _ = masker.scan(line);
+    // The lines before the window (up to the lookback) give the masker its state.
+    for raw in &raw_lines[..first_index] {
+        masker.advance_bytes(strip_eol(raw));
     }
     let mut masked: Vec<String> = Vec::with_capacity(want);
     let mut redactions: Vec<u64> = Vec::with_capacity(want);
     for raw in &raw_lines[first_index..] {
-        let body = std::str::from_utf8(strip_eol(raw))
-            .map_err(|_| binary_error("unknown", stat.size, etag))?;
-        let (line, count) = masker.mask_line_counted(body);
+        let stripped = strip_eol(raw);
+        let (line, count): (std::borrow::Cow<'_, str>, usize) = match std::str::from_utf8(stripped)
+        {
+            Ok(body) => masker.mask_line_counted(body),
+            Err(_) if masker.class().is_secret() => {
+                let (token, count) = masker.mask_invalid(stripped);
+                (std::borrow::Cow::Owned(token), count)
+            }
+            Err(_) => return Err(binary_error("unknown", stat.size, etag)),
+        };
         masked.push(line.into_owned());
         redactions.push(count as u64);
     }

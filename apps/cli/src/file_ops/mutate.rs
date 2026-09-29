@@ -4,9 +4,7 @@
 use std::os::fd::AsFd;
 
 use nix::errno::Errno;
-use nix::fcntl::AtFlags;
-#[cfg(not(target_os = "linux"))]
-use nix::fcntl::renameat;
+use nix::fcntl::{AtFlags, renameat};
 use nix::sys::stat::mkdirat;
 use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 use serde::{Deserialize, Serialize};
@@ -161,6 +159,12 @@ pub(crate) fn rename(
                 "the destination already exists",
             ));
         }
+        if dst.kind() != src.kind() {
+            return Err(FileError::new(
+                ErrorCode::Exists,
+                "overwrite replaces a file with a file (or a symlink with a symlink), not across kinds",
+            ));
+        }
         if dst.kind() == Kind::Dir || dst.kind() == Kind::Other {
             return Err(FileError::new(
                 ErrorCode::Exists,
@@ -193,6 +197,10 @@ pub(crate) fn rename(
 ///
 /// Residual (documented in the plan): on non-Linux systems overwrite and
 /// directory moves have no atomic primitive here and rely on the checks above.
+/// Crash states: between the exchange and the unlink the old destination is
+/// under the source name; after `linkat` and before the unlink both names exist.
+/// Neither loses data. The undo moves the object now at the destination back only
+/// when it is the object that was moved.
 fn commit_rename(
     from: &Resolved,
     to: &Resolved,
@@ -270,6 +278,17 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
     ) {
         Ok(()) => {}
         Err(Errno::EEXIST) => return Err(exists_error()),
+        // A filesystem without hard links (FAT, some network shares): the
+        // existence check above is all that guards the destination there.
+        Err(Errno::EPERM | Errno::ENOTSUP | Errno::EMLINK) => {
+            return renameat(
+                from.dir.as_fd(),
+                from.name.as_os_str(),
+                to.dir.as_fd(),
+                to.name.as_os_str(),
+            )
+            .map_err(FileError::errno);
+        }
         Err(errno) => return Err(FileError::errno(errno)),
     }
     match from.lstat()? {
