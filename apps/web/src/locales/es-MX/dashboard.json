@@ -154,6 +154,7 @@
       "reasonLabel": "Motivo: {{reason}}",
       "reasons": {
         "local_wait_expired": "los miembros locales siguieron ocupados después del límite de espera",
+        "local_saturated_protected": "la capacidad libre de los miembros locales guarda conversaciones activas protegidas",
         "no_local_member": "no había un miembro local compatible disponible",
         "local_context_ceiling": "la solicitud superó el límite de contexto local",
         "local_failure": "el intento local falló",
@@ -204,7 +205,22 @@
         "cancel": "Mantener el modo actual",
         "confirm": "Permitir sin supervisión"
       },
-      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:"
+      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:",
+      "effective": "Lo que los agentes pueden ejecutar ahora",
+      "commandSwitches": "Un comando se ejecuta solo cuando el token MCP, este permiso y la configuración propia del CLI lo permiten. El modo efectivo es el más estricto de los dos últimos.",
+      "commandKind": {
+        "headless": "Comandos sin cabecera (headless)",
+        "supervised": "Comandos supervisados"
+      },
+      "commandAllowed": "permitido ahora",
+      "commandRefusal": {
+        "grant_disabled": "rechazado: el permiso del panel de arriba no lo permite. Sube el permiso para permitirlo.",
+        "offline": "rechazado: este CLI está desconectado o es demasiado antiguo. Funciona de nuevo cuando el CLI se reconecte con un wsmp actual.",
+        "feature_disabled": "rechazado: la configuración propia de este CLI no lo permite. En esa máquina ejecuta wsmp config set-mcp-commands y reinicia wsmp.",
+        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
+        "grant_supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel de arriba es Supervisado. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
+        "cli_supervised_only": "rechazado: requiere Sin supervisión, y la configuración propia de este CLI es Supervisado. En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
+      }
     },
     "rename": {
       "action": "Renombrar",
@@ -222,6 +238,8 @@
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     },
+    "serverUpgradeRequired": "Actualización del servidor necesaria: el protocolo {{protocol}} de la CLI es más nuevo de lo que admite este servidor",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}} porque es más nuevo que este servidor. Pide al administrador que actualice el servidor, o instala una versión anterior de wsmp en esta máquina.",
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",
@@ -434,6 +452,28 @@
         "valueLabel": "Espera por el miembro con la caché en milisegundos",
         "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
+    },
+    "protection": {
+      "title": "Proteger conversaciones activas",
+      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras conversaciones cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
+      "enabled": "Proteger conversaciones activas",
+      "windowSeconds": "Ventana de protección (segundos)",
+      "minTokens": "Tamaño mínimo de la conversación (tokens)",
+      "share": "Reparto entre usuarios",
+      "shareModes": {
+        "EQUAL_SHARE": "Parte igual por usuario activo",
+        "FIRST_COME": "Por orden de llegada (sin límite por usuario)",
+        "FIXED_PERCENT": "Porcentaje fijo por usuario"
+      },
+      "fixedPercent": "Porcentaje que cada usuario puede mantener protegido",
+      "ownerShare": "Tu propia parte",
+      "override": {
+        "INHERIT": "Usar la parte del pool",
+        "PERCENT": "Porcentaje fijo",
+        "UNPROTECTED": "Sin protección"
+      },
+      "percentLabel": "Porcentaje de la capacidad de un miembro (1 a 100)",
+      "hint": "El calor se estima con los registros de enrutamiento de todos los pools de este propietario en el miembro (solo tamaños y tiempos, nunca el contenido del prompt). Solo cuentan las conversaciones usadas dentro de la ventana y con al menos el tamaño mínimo. Por encima de su parte, las conversaciones más antiguas de un usuario pierden la protección primero."
     },
     "capacity": {
       "title": "Capacidad local compartida",
@@ -843,7 +883,24 @@
     "transformerTimeoutMs": "Tiempo de espera del transformador (ms)",
     "transformerMaxAssets": "Máximo de adjuntos por solicitud",
     "updated": "Pool actualizado",
-    "weight": "Peso"
+    "weight": "Peso",
+    "grantRouting": {
+      "edit": "Enrutamiento",
+      "editFor": "Ajustes de enrutamiento de {{email}}",
+      "title": "Enrutamiento para esta persona",
+      "description": "Ajustes que se aplican solo a las solicitudes de {{email}}.",
+      "protection": "Parte protegida",
+      "protectionHint": "Cuánta capacidad de un miembro pueden mantener protegida frente a conversaciones nuevas las conversaciones recientes de esta persona. Sin protección: sus conversaciones nunca se resguardan.",
+      "queuePriority": "Prioridad en la cola",
+      "prioritySet": "Fijar una prioridad",
+      "priorityValue": "Prioridad en la cola (0 a 31)",
+      "priorityHint": "Sustituye la prioridad de cola del pool y del miembro para las solicitudes en espera de esta persona. Los números más altos reciben una parte mayor de los espacios liberados.",
+      "inherit": "Valor del pool",
+      "percentValue": "{{percent}} %",
+      "summary": "Parte protegida: {{protection}} · Prioridad en la cola: {{priority}}",
+      "saved": "Ajustes de enrutamiento guardados.",
+      "failed": "No se pudieron guardar los ajustes de enrutamiento."
+    }
   },
   "providers": {
     "title": "Proveedores externos",

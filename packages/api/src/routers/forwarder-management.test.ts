@@ -113,7 +113,10 @@ const db = prisma as unknown as {
     upsert: MockInstance;
     deleteMany: MockInstance;
     findMany: MockInstance;
+    updateMany: MockInstance;
+    findUniqueOrThrow: MockInstance;
   };
+  $queryRaw: MockInstance;
   capacityAuditEvent: { create: MockInstance };
   cacheAffinityRecord: {
     count: MockInstance;
@@ -225,6 +228,12 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
     cacheHolderWaitMs: null,
+    protectionEnabled: true,
+    protectionWindowSeconds: 300,
+    protectMinTokens: 8192,
+    protectionShare: "EQUAL_SHARE",
+    protectionFixedPercent: null,
+    ownerProtectionPercent: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -2200,6 +2209,129 @@ describe("forwarderManagementRouter", () => {
     await client().updateModelPool({ id: "pool-id", name: "Renamed" });
     const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
     expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
+  });
+
+  it("stores warm-session protection settings and keeps the share mode consistent", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    db.modelPool.update.mockResolvedValue(poolRow());
+    const lastUpdate = () =>
+      (db.modelPool.update.mock.calls.at(-1)![0] as { data: Record<string, unknown> }).data;
+
+    await client().updateModelPool({
+      id: "pool-id",
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectMinTokens: 4096,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+    expect(lastUpdate()).toMatchObject({
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectMinTokens: 4096,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+    // FIXED_PERCENT needs a percent; any other mode stores none.
+    await expect(
+      client().updateModelPool({ id: "pool-id", protectionShare: "FIXED_PERCENT" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", protectionShare: "FIXED_PERCENT", protectionFixedPercent: 25 }),
+    );
+    await client().updateModelPool({ id: "pool-id", protectionShare: "EQUAL_SHARE" });
+    expect(lastUpdate()).toMatchObject({
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+    });
+    // Changing only the percent of a FIXED_PERCENT pool keeps the mode.
+    await client().updateModelPool({ id: "pool-id", protectionFixedPercent: 60 });
+    expect(lastUpdate()).toMatchObject({
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 60,
+    });
+    // Out-of-range values never reach the database.
+    const updates = db.modelPool.update.mock.calls.length;
+    for (const input of [
+      { protectionWindowSeconds: 0 },
+      { protectionWindowSeconds: 3_601 },
+      { ownerProtectionPercent: 101 },
+      { protectionFixedPercent: 0 },
+    ])
+      await expect(client().updateModelPool({ id: "pool-id", ...input })).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+      });
+    expect(db.modelPool.update).toHaveBeenCalledTimes(updates);
+    // Unrelated saves leave the protection settings untouched.
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    expect(Object.keys(lastUpdate()).filter((key) => key.startsWith("protect"))).toEqual([]);
+  });
+
+  it("creates a pool with protection on by default", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+    await client().createModelPool({ slug: "fresh", name: "Fresh" });
+    expect(
+      (db.modelPool.create.mock.calls.at(-1)![0] as { data: Record<string, unknown> }).data,
+    ).toMatchObject({
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+      ownerProtectionPercent: null,
+    });
+  });
+
+  it("lets only the pool owner set a grant's protection override and queue priority", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.$queryRaw.mockResolvedValue([{ id: "pool-id" }]);
+    db.poolGrant.updateMany.mockResolvedValue({ count: 1 });
+    db.poolGrant.findUniqueOrThrow.mockResolvedValue({
+      id: "grant-id",
+      poolId: "pool-id",
+      granteeUserId: "grantee-id",
+      protectionOverridePercent: 0,
+      queuePriority: 24,
+    });
+
+    await expect(
+      client().updatePoolGrant({
+        poolId: "pool-id",
+        grantId: "grant-id",
+        protectionOverridePercent: 0,
+        queuePriority: 24,
+      }),
+    ).resolves.toMatchObject({ protectionOverridePercent: 0, queuePriority: 24 });
+    expect(db.poolGrant.updateMany).toHaveBeenCalledWith({
+      where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
+      data: { protectionOverridePercent: 0, queuePriority: 24 },
+    });
+    // Omitted fields stay; null means "inherit".
+    await client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: null });
+    expect(db.poolGrant.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
+      data: { queuePriority: null },
+    });
+    // Ranges are 0..100 and 0..31.
+    for (const input of [{ protectionOverridePercent: 101 }, { queuePriority: 32 }])
+      await expect(
+        client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", ...input }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // A grant of another pool (or owner) is not found, never written.
+    db.poolGrant.updateMany.mockResolvedValue({ count: 0 });
+    await expect(
+      client().updatePoolGrant({ poolId: "pool-id", grantId: "other-grant", queuePriority: 1 }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    // A grantee (not the owner) cannot reach it: the pool is not theirs.
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "someone-else" });
+    const writes = db.poolGrant.updateMany.mock.calls.length;
+    await expect(
+      client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: 31 }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.poolGrant.updateMany).toHaveBeenCalledTimes(writes);
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {
@@ -5206,13 +5338,17 @@ describe("setCliDeviceFeatureGrants", () => {
         supported: true,
         live: false,
         effectiveMode: "off",
+        refusals: { headless: "offline", supervised: "offline" },
         available: false,
       },
     });
     expect(offline[0]?.displayName).toBe("Desk");
     expect(offline[0]?.cliVersion).toBe("0.4.0");
 
-    const liveClient = (mcpCommandMode: "off" | "supervised" | "unsupervised") =>
+    const liveClient = (
+      mcpCommandMode: "off" | "supervised" | "unsupervised",
+      terminalSupported = true,
+    ) =>
       createRouterClient(forwarderManagementRouter, {
         context: {
           ...buildContext(),
@@ -5227,7 +5363,7 @@ describe("setCliDeviceFeatureGrants", () => {
                     humanTerminal: true,
                     mcpCommandMode,
                     supervisedCommands: true,
-                    terminalSupported: true,
+                    terminalSupported,
                     terminalApproval: false,
                     terminalPublicKey: "key",
                   },
@@ -5238,21 +5374,85 @@ describe("setCliDeviceFeatureGrants", () => {
       });
     const live = await liveClient("supervised").listCliDevices();
     expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
-    // Grant unsupervised, live CLI supervised: the lower one applies.
+    // Grant unsupervised, live CLI supervised: the lower one applies, and only
+    // headless is refused (the relay's supervised_only, attributed to the CLI config).
     expect(live[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "supervised",
+      refusals: { headless: "cli_supervised_only", supervised: null },
       available: true,
     });
     const liveOff = await liveClient("off").listCliDevices();
     expect(liveOff[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "off",
+      refusals: { headless: "feature_disabled", supervised: "feature_disabled" },
       available: false,
+    });
+    const liveFull = await liveClient("unsupervised").listCliDevices();
+    expect(liveFull[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: null },
+      available: true,
+    });
+    // No PTY (Windows): supervised is refused although the mode allows it, and
+    // headless still works on an unsupervised device.
+    const noPty = await liveClient("unsupervised", false).listCliDevices();
+    expect(noPty[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: "unsupported" },
+      available: true,
+    });
+    // A connected CLI older than protocol 2.6 has no command support: offline.
+    const oldClient = createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.5",
+                  cliVersion: "0.3.0",
+                  humanTerminal: true,
+                  mcpCommandMode: "unsupervised" as const,
+                  supervisedCommands: true,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  terminalPublicKey: "key",
+                },
+              ],
+            ]),
+        },
+      },
+    });
+    const preCommands = await oldClient.listCliDevices();
+    expect(preCommands[0]?.features.commands).toMatchObject({
+      live: false,
+      effectiveMode: "off",
+      refusals: { headless: "offline", supervised: "offline" },
+      available: false,
+    });
+    const [row] = await db.cliDevice.findMany();
+    db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "SUPERVISED" }]);
+    // A supervised-only device without a PTY cannot run anything: not available.
+    const nothing = await liveClient("supervised", false).listCliDevices();
+    expect(nothing[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: "unsupported" },
+      available: false,
+    });
+    // The relay checks the grant first: a supervised grant refuses headless as
+    // supervised_only whatever the CLI reports (attributed to the grant).
+    const grantLimited = await liveClient("unsupervised").listCliDevices();
+    expect(grantLimited[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: null },
     });
   });
 
-  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+  it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {
     const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
     const row = {
       id: "cli-id",
@@ -5281,6 +5481,13 @@ describe("setCliDeviceFeatureGrants", () => {
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
+      {
+        ...row,
+        id: "cli-newer",
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0",
+        relayRejectedAt: rejectedAt,
+      },
     ]);
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: buildContext(),
@@ -5289,8 +5496,13 @@ describe("setCliDeviceFeatureGrants", () => {
       protocolVersion: "2.6",
       cliVersion: "0.4.0",
       rejectedAt,
+      reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
+    expect(devices[2]?.upgradeRequired).toMatchObject({
+      protocolVersion: "2.8",
+      reason: "cli_too_new",
+    });
   });
 });
 

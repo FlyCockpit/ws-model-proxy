@@ -21,9 +21,10 @@ export const Route = createFileRoute("/$lang/_auth/settings/mcp")({
 
 function McpSettingsPage() {
   const { mcpEnabled, mcpPatAllowNoExpiry } = Route.useRouteContext();
+  const { lang } = Route.useParams();
   return (
     <div className="space-y-6">
-      <McpTokensPanel createEnabled={mcpEnabled} allowNoExpiry={mcpPatAllowNoExpiry} />
+      <McpTokensPanel createEnabled={mcpEnabled} allowNoExpiry={mcpPatAllowNoExpiry} lang={lang} />
       <McpGrantsPanel />
     </div>
   );

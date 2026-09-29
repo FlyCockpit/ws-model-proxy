@@ -3350,3 +3350,169 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
     }
   });
 });
+
+/**
+ * Saturation S-C: a grantee's `PoolGrant.queuePriority` replaces the
+ * pool/member capacity priority of that grantee's waiters (the DRR scheduler
+ * itself is unchanged). Null inherits; a grant of another pool is ignored.
+ */
+integration("PostgreSQL per-grant queue priority", () => {
+  it("feeds the grant priority into the waiters and changes their DRR share", async () => {
+    if (!databaseUrl) return;
+    // The store module imports the default client, which validates DATABASE_URL.
+    process.env.DATABASE_URL ??= databaseUrl;
+    const db = createFixturePrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "grant-priority-proof");
+    const suffix = crypto.randomUUID();
+    const user = (label: string) =>
+      db.user.create({
+        data: {
+          name: `Grant priority ${label}`,
+          email: `grant-priority-${label}-${suffix}@example.test`,
+          slug: `grant-priority-${label}-${suffix}`,
+        },
+      });
+    const owner = await user("owner");
+    const low = await user("low");
+    const high = await user("high");
+    const inherit = await user("inherit");
+    try {
+      const device = await db.cliDevice.create({
+        data: { userId: owner.id, slug: `device-${suffix}` },
+      });
+      const endpoint = await db.endpoint.create({
+        data: { userId: owner.id, cliDeviceId: device.id, slug: `endpoint-${suffix}`, label: "G" },
+      });
+      const pool = await db.modelPool.create({
+        data: {
+          userId: owner.id,
+          slug: `pool-${suffix}`,
+          name: "Grant pool",
+          capacityPriority: 16,
+        },
+      });
+      const otherPool = await db.modelPool.create({
+        data: { userId: owner.id, slug: `other-${suffix}`, name: "Other pool" },
+      });
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: owner.id,
+          label: `grant-${suffix}`,
+          runtimeIdentityKey: `grant-${suffix}`,
+          runtimeModel: "grant-proof",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: owner.id,
+          endpointId: endpoint.id,
+          upstreamModelId: "grant",
+          encodedModelId: `grant-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const member = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: target.id },
+      });
+      const grant = (granteeUserId: string, queuePriority: number | null, poolId = pool.id) =>
+        db.poolGrant.create({
+          data: { poolId, ownerUserId: owner.id, granteeUserId, queuePriority },
+        });
+      const lowGrant = await grant(low.id, 0);
+      const highGrant = await grant(high.id, 31);
+      const inheritGrant = await grant(inherit.id, null);
+      // A grant of ANOTHER pool never applies (the store matches the pool).
+      const foreignGrant = await grant(low.id, 31, otherPool.id);
+      const attempt = (name: string, accessGrantId: string | null) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: owner.id,
+        sourceKind: "POOL" as const,
+        poolId: pool.id,
+        basePriority: 16,
+        accessGrantId,
+        connectionOwner: "grant-priority-proof",
+        deadlineAt: new Date(Date.now() + 10 * 60_000),
+        candidates: [
+          {
+            capacityId: capacity.id,
+            executionTargetId: target.id,
+            poolMemberId: member.id,
+            candidateOrder: 0,
+          },
+        ],
+      });
+      const blocker = await store.acquire(attempt("blocker", null));
+      if (blocker.state !== "ADMITTED") throw new Error("Expected blocker admission.");
+      // FIFO alone would serve every low-grant request first: they queue first.
+      const waiting = [
+        attempt("low-1", lowGrant.id),
+        attempt("low-2", lowGrant.id),
+        attempt("low-3", lowGrant.id),
+        attempt("high-1", highGrant.id),
+        attempt("high-2", highGrant.id),
+        attempt("high-3", highGrant.id),
+      ];
+      for (const request of waiting)
+        await expect(store.acquire(request)).resolves.toMatchObject({ state: "WAITING" });
+      const waiterPriority = async (name: string) =>
+        (
+          await db.capacityWaiter.findFirstOrThrow({
+            where: { attemptId: `${name}-${suffix}` },
+          })
+        ).effectivePriority;
+      expect(await waiterPriority("low-1")).toBe(0);
+      expect(await waiterPriority("high-1")).toBe(31);
+      expect(
+        (await db.admissionRequest.findFirstOrThrow({ where: { attemptId: `high-1-${suffix}` } }))
+          .basePriority,
+      ).toBe(31);
+
+      // Inherit (null) and a foreign-pool grant both keep the pool priority.
+      for (const [name, grantId] of [
+        ["inherit", inheritGrant.id],
+        ["foreign", foreignGrant.id],
+      ] as const) {
+        await expect(store.acquire(attempt(name, grantId))).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        expect(await waiterPriority(name)).toBe(16);
+        await store.terminalizeAttempt(`${name}-${suffix}`, "CANCELLED");
+      }
+
+      // Drain the slot one grant at a time and record who is served.
+      const served: string[] = [];
+      let lease = blocker.lease;
+      for (let step = 0; step < waiting.length; step++) {
+        await store.release(lease);
+        let next: typeof lease | undefined;
+        for (const request of waiting) {
+          if (served.includes(request.attemptId)) continue;
+          const polled = await store.acquire({ ...request, candidates: [] });
+          if (polled.state === "ADMITTED") {
+            served.push(request.attemptId);
+            next = polled.lease;
+            break;
+          }
+        }
+        if (!next) throw new Error("A queued grant must be served after each release.");
+        lease = next;
+      }
+      await store.release(lease);
+      const order = served.map((attemptId) => attemptId.replace(`-${suffix}`, ""));
+      // DRR over 32 classes (quantum 1 + priority): class 0 is visited once,
+      // then class 31 drains before the low grantee's later requests, even
+      // though they were enqueued first.
+      expect(order.slice(0, 4).filter((name) => name.startsWith("high"))).toHaveLength(3);
+      expect(order.indexOf("high-3")).toBeLessThan(order.indexOf("low-2"));
+    } finally {
+      await cleanupCapacityFixture(db, owner.id);
+      await db.$disconnect();
+    }
+  }, 30_000);
+});

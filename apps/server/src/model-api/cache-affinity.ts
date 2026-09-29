@@ -218,6 +218,7 @@ export async function rankAffinityTargets({
   surface,
   payload,
   targets,
+  scoreSingleTarget = false,
   now = new Date(),
 }: {
   ownerId: string;
@@ -229,6 +230,8 @@ export async function rankAffinityTargets({
   surface: string;
   payload: Record<string, unknown>;
   targets: AffinityTarget[];
+  /** Score one target too (local pool routing with warm-session protection). */
+  scoreSingleTarget?: boolean;
   now?: Date;
 }): Promise<AffinityDecision> {
   const unchanged = {
@@ -240,7 +243,10 @@ export async function rankAffinityTargets({
     reasons: {},
     matchedPrefixDepth: 0,
   };
-  if (!policy.enabled || targets.length < 2) return unchanged;
+  // With `scoreSingleTarget`, a single target is still scored: warm-session
+  // protection (S-C) needs to know whether this request continues a session
+  // on it (an affinity hit is never redirected), even with nothing to reorder.
+  if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
   const materialByIdentity = new Map(
     targets.map((target) => [
@@ -511,6 +517,9 @@ export async function rememberAffinity({
     return;
   }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
+  // Every record this call writes (created or refreshed) carries the same
+  // `lastUsedAt`: warm-session protection (S-C, ./warm-protection.ts) groups
+  // them into one session by it, and sizes the session by `estimatedTokens`.
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
     // requests cannot race past the configured bound: the cache-affinity
@@ -557,6 +566,7 @@ export async function rememberAffinity({
           digestVersion: DIGEST_VERSION,
           estimatedTokens,
           engineCacheConfirmed: engineCacheConfirmed ?? false,
+          lastUsedAt: now,
           expiresAt,
         },
         update: {
@@ -606,6 +616,7 @@ export async function rememberAffinity({
             digestVersion: DIGEST_VERSION,
             estimatedTokens,
             engineCacheConfirmed: engineCacheConfirmed ?? false,
+            lastUsedAt: now,
             expiresAt,
           },
         });

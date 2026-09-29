@@ -181,7 +181,12 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      const resolvedCandidates = existing ? [] : await this.#resolveCandidates(tx, attempt);
+      // S-C: a grantee's queue priority is read with the policy snapshot
+      // (plain read, no lock) and replaces the pool/member priority.
+      const grantQueuePriority = existing ? null : await resolveGrantQueuePriority(tx, attempt);
+      const resolvedCandidates = existing
+        ? []
+        : await this.#resolveCandidates(tx, attempt, grantQueuePriority);
       const orderedCapacityIds = [
         ...new Set(
           (existing
@@ -437,7 +442,10 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               attempt.sourceKind === "DIRECT"
                 ? attempt.candidates[0]?.executionTargetId
                 : undefined,
-            basePriority: attempt.basePriority,
+            basePriority: grantQueuePriority ?? attempt.basePriority,
+            // The schema trigger accepts the grant priority as the waiters'
+            // policy snapshot only when the request names its grant.
+            priorityGrantId: grantQueuePriority === null ? null : attempt.accessGrantId,
             enqueueSequence,
             // The database-clock schedule anchor of this attempt (see
             // AdmissionAttempt.schedule); never a process clock. The hardening
@@ -535,7 +543,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     return result.result;
   }
 
-  async #resolveCandidates(tx: Prisma.TransactionClient, attempt: AdmissionAttempt) {
+  async #resolveCandidates(
+    tx: Prisma.TransactionClient,
+    attempt: AdmissionAttempt,
+    grantQueuePriority: number | null,
+  ) {
     if (!attempt.candidates.length) throw new Error("Admission requires at least one candidate.");
     const orders = new Set<number>();
     const targets = new Set<string>();
@@ -596,7 +608,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               : (member.ModelPool.capacityConcurrencyLimit ?? undefined);
         return {
           ...candidate,
-          priority: member.capacityPriority ?? member.ModelPool.capacityPriority,
+          priority:
+            grantQueuePriority ?? member.capacityPriority ?? member.ModelPool.capacityPriority,
           memberConcurrencyCeiling,
           concurrencyScope:
             member.capacityConcurrencyMode === "INHERIT" ||
@@ -1736,6 +1749,27 @@ export function candidateDeadlineAt(
     spillAt.getTime() + (deferred ? Math.max(budgetMs, DEFERRED_MIN_ELIGIBLE_WINDOW_MS) : budgetMs),
   );
   return relative < upperBound ? relative : upperBound;
+}
+
+/**
+ * Saturation S-C per-grant queue priority: for a grantee's pool admission,
+ * `PoolGrant.queuePriority` replaces the pool/member capacity priority,
+ * clamped to 0..31; null (or no grant, or a grant of another pool) inherits.
+ * A plain read inside the admission transaction: `pool_grant` is outside the
+ * capacity lock order and is never locked here.
+ */
+async function resolveGrantQueuePriority(
+  tx: Prisma.TransactionClient,
+  attempt: AdmissionAttempt,
+): Promise<number | null> {
+  if (attempt.sourceKind !== "POOL" || !attempt.poolId || !attempt.accessGrantId) return null;
+  const grant = await tx.poolGrant.findFirst({
+    where: { id: attempt.accessGrantId, poolId: attempt.poolId, ownerUserId: attempt.ownerId },
+    select: { queuePriority: true },
+  });
+  const priority = grant?.queuePriority;
+  if (priority === null || priority === undefined) return null;
+  return Math.min(31, Math.max(0, Math.trunc(priority)));
 }
 
 /**

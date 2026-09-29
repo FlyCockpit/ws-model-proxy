@@ -224,6 +224,14 @@ const editablePool = {
   capacityContextMargin: 1_024,
   capacityBorrowPolicy: "WHEN_IDLE" as const,
   cacheHolderWaitMs: null as number | null,
+  protection: {
+    enabled: true,
+    windowSeconds: 300,
+    minTokens: 8192,
+    share: "EQUAL_SHARE" as "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT",
+    fixedPercent: null as number | null,
+    ownerPercent: null as number | null,
+  },
   affinity: {
     enabled: false,
     ttlSeconds: 3600,
@@ -609,6 +617,87 @@ describe("PoolForm affinity defaults", () => {
     expect(state.mutationPayloads[1]?.input).toMatchObject({ cacheHolderWaitMs: 0 });
   });
 
+  it("saves warm-session protection settings (share mode, fixed percent, owner share)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+      ownerProtectionPercent: null,
+    });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.share"), {
+      target: { value: "FIXED_PERCENT" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
+      target: { value: "25" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.ownerShare"), {
+      target: { value: "UNPROTECTED" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.windowSeconds"), {
+      target: { value: "120" },
+    });
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protection.enabled"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(2));
+    expect(state.mutationPayloads[1]?.input).toMatchObject({
+      protectionEnabled: false,
+      protectionWindowSeconds: 120,
+      protectionShare: "FIXED_PERCENT",
+      protectionFixedPercent: 25,
+      ownerProtectionPercent: 0,
+    });
+  });
+
+  it("does not validate hidden percent fields (a stale invalid value never blocks save)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const share = screen.getByLabelText("dashboard:pools.protection.share");
+    fireEvent.change(share, { target: { value: "FIXED_PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
+      target: { value: "0" },
+    });
+    // Back to a mode without the field: the invalid hidden value is not sent or checked.
+    fireEvent.change(share, { target: { value: "EQUAL_SHARE" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+    });
+  });
+
+  it("does not validate a hidden owner percent (PERCENT back to INHERIT still saves)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const owner = screen.getByLabelText("dashboard:pools.protection.ownerShare");
+    fireEvent.change(owner, { target: { value: "PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(owner, { target: { value: "INHERIT" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ ownerProtectionPercent: null });
+  });
+
+  it("loads a stored owner protection percent", () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protection: { ...editablePool.protection, ownerPercent: 40 } },
+    });
+    expect(
+      (screen.getByLabelText("dashboard:pools.protection.ownerShare") as HTMLSelectElement).value,
+    ).toBe("PERCENT");
+    expect(
+      (screen.getByLabelText("dashboard:pools.protection.percentLabel") as HTMLInputElement).value,
+    ).toBe("40");
+  });
+
   it("loads a stored fixed cache-holder wait", () => {
     mount(true, {
       mode: "edit",
@@ -796,6 +885,7 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
           protocolVersion: "2.6",
           cliVersion: "0.4.0",
           rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_old",
         },
       },
       { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", upgradeRequired: null },
@@ -810,6 +900,29 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     expect(screen.getByText(/^dashboard:clis\.upgradeRequiredDetail\|/).textContent).toContain(
       '"version":"0.4.0"',
     );
+  });
+
+  it("says the server must be upgraded when the refused CLI is newer", () => {
+    state.cliDevices = [
+      {
+        ...cliDeviceWithModel,
+        upgradeRequired: {
+          protocolVersion: "2.8",
+          cliVersion: "0.9.0",
+          rejectedAt: new Date("2026-09-28T10:00:00.000Z"),
+          reason: "cli_too_new",
+        },
+      },
+    ];
+    mountModelsSection();
+
+    expect(screen.queryByText(/^dashboard:clis\.upgradeRequired/)).toBeNull();
+    expect(screen.getByText(/^dashboard:clis\.serverUpgradeRequired\|/).textContent).toBe(
+      `dashboard:clis.serverUpgradeRequired|${JSON.stringify({ protocol: "2.8" })}`,
+    );
+    expect(
+      screen.getByText(/^dashboard:clis\.serverUpgradeRequiredDetail\|/).textContent,
+    ).toContain('"version":"0.9.0"');
   });
 
   it("keeps the plain success toast on clean responses", async () => {
@@ -927,6 +1040,30 @@ describe("CliEndpointsModelsSection device names", () => {
       fireEvent.change(search, { target: { value: query } });
       expect(screen.getByRole("heading", { name: "Work laptop" })).toBeTruthy();
       expect(screen.queryByRole("heading", { name: "desk-01.local" })).toBeNull();
+    }
+  });
+
+  it("anchors each device card with cli-<deviceId> matching the token form's link", () => {
+    state.cliDevices = [
+      cliDeviceWithModel,
+      {
+        ...cliDeviceWithModel,
+        id: "cli-2",
+        slug: "tower",
+        name: "Work laptop",
+        reportedHostname: "tower.lan",
+        displayName: "Work laptop",
+        endpoints: [],
+      },
+    ];
+    mountDevices();
+
+    // The token form links to `#cli-<id>` (cli-command-devices.tsx), so each
+    // card must carry a matching id for the browser to scroll to it.
+    for (const id of ["cli-1", "cli-2"]) {
+      const anchor = document.getElementById(`cli-${id}`);
+      expect(anchor).toBeTruthy();
+      expect(anchor?.id).toBe(`cli-${id}`);
     }
   });
 

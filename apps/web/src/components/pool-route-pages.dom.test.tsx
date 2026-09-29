@@ -150,6 +150,7 @@ vi.mock("@/utils/orpc", () => {
         updatePoolMember: mutation(),
         removePoolMember: mutation("removePoolMember"),
         grantPoolAccessByEmail: mutation(),
+        updatePoolGrant: mutation("updatePoolGrant"),
         revokePoolAccessByEmail: mutation(),
       },
       providerManagement: {
@@ -407,6 +408,125 @@ describe("dedicated pool pages", () => {
     expect(
       state.auditQueryInputs.every((input) => (input as { poolId?: string }).poolId === "pool-1"),
     ).toBe(true);
+  });
+
+  describe("grant routing (warm-session protection and queue priority)", () => {
+    const grantPool = (grant: Record<string, unknown> = {}) => ({
+      id: "pool-1",
+      slug: "primary",
+      name: "Primary",
+      description: null,
+      canonicalModelId: "owner/pool/primary",
+      members: [],
+      grants: [
+        {
+          id: "grant-1",
+          createdAt: new Date(0),
+          granteeUserId: "grantee-1",
+          granteeEmail: "grantee@example.test",
+          granteeName: "Grantee",
+          protectionOverridePercent: null,
+          queuePriority: null,
+          ...grant,
+        },
+      ],
+      compatibility: { recommendedSurface: null },
+      transformer: { model: null },
+    });
+
+    it("saves an unprotected override and a queue priority for one grantee", async () => {
+      state.tab = "access";
+      state.pools = [grantPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.protection"), {
+        target: { value: "UNPROTECTED" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.queuePriority"), {
+        target: { value: "SET" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.priorityValue"), {
+        target: { value: "24" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: 0,
+            queuePriority: 24,
+          },
+        }),
+      );
+    });
+
+    it("loads stored values and saves 'pool default' as null", async () => {
+      state.tab = "access";
+      state.pools = [grantPool({ protectionOverridePercent: 30, queuePriority: 5 })];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      expect(
+        (screen.getByLabelText("dashboard:pools.protection.percentLabel") as HTMLInputElement)
+          .value,
+      ).toBe("30");
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.protection"), {
+        target: { value: "INHERIT" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.queuePriority"), {
+        target: { value: "INHERIT" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: null,
+            queuePriority: null,
+          },
+        }),
+      );
+    });
+
+    it("does not validate a hidden percent field (a stale invalid value never blocks save)", async () => {
+      state.tab = "access";
+      state.pools = [grantPool({ protectionOverridePercent: 30, queuePriority: 5 })];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
+        target: { value: "150" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.protection"), {
+        target: { value: "UNPROTECTED" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: 0,
+            queuePriority: 5,
+          },
+        }),
+      );
+    });
   });
 
   describe("fallback settings form", () => {
