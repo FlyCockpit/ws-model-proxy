@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::super::policy::Access;
-use super::super::policy::Deny;
+use super::super::policy::{Deny, Protected};
 use super::super::resolve::{MAX_SYMLINK_HOPS, ResolveOpts, resolve};
 use super::super::{ErrorCode, Policy};
 use super::{Fx, args, code};
@@ -349,7 +349,7 @@ fn special_files_and_trees_are_refused() {
 fn non_utf8_symlink_target_is_invalid_input() {
     use std::os::unix::ffi::OsStrExt;
     let fx = Fx::new();
-    let target = std::ffi::OsStr::from_bytes(b"caf\xff");
+    let target = std::ffi::OsStr::from_bytes(b"file\xff");
     std::os::unix::fs::symlink(target, fx.root.join("bad")).unwrap();
     assert_eq!(
         code(
@@ -446,4 +446,77 @@ fn leaf_swapped_for_symlink_before_commit_is_a_conflict() {
     assert_eq!(fx.get("victim.txt"), "victim\n");
     assert!(fx.leftovers("").is_empty(), "temp file left behind");
     let _ = std::fs::metadata(fx.root.join("victim.txt")).map(|m| m.permissions().mode());
+}
+
+/// A protected inode is refused by `check_identity` even when the caller names a
+/// hard link to it (a name-only check would let the alias through).
+#[test]
+fn a_protected_inode_cannot_be_deleted_through_a_hard_link_alias() {
+    let fx = Fx::with_policy(Fx::protecting(&[(
+        "state/device-auth.json",
+        Deny::ReadWrite,
+    )]));
+    fx.put("state/device-auth.json", "{\"token\":\"abc\"}");
+    std::fs::hard_link(
+        fx.root.join("state/device-auth.json"),
+        fx.root.join("alias.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        code(
+            fx.ops
+                .delete(&args(json!({ "path": fx.p("alias.json") })), &fx.cancel)
+        ),
+        ErrorCode::PathDenied
+    );
+    assert!(fx.root.join("alias.json").exists());
+    assert!(fx.root.join("state/device-auth.json").exists());
+    // a directory holding the protected file is refused too
+    assert_eq!(
+        code(
+            fx.ops
+                .delete(&args(json!({ "path": fx.p("state") })), &fx.cancel)
+        ),
+        ErrorCode::PathDenied
+    );
+}
+
+/// A protected directory subtree under the walk root is never descended into: the
+/// directory itself is listed by name, but nothing below it is reachable through
+/// `dir_list` or `search`.
+#[test]
+fn a_protected_subtree_is_never_descended_into() {
+    let fx = Fx::with_policy(|root| {
+        Policy::new(
+            vec![],
+            vec![Protected {
+                path: root.join("vault"),
+                subtree: true,
+                deny: Deny::ReadWrite,
+            }],
+            true,
+        )
+    });
+    fx.put("vault/deep/secret.txt", "NEEDLE-in-vault");
+    fx.put("vault/leaf.txt", "NEEDLE-leaf");
+    fx.put("open/visible.txt", "NEEDLE-visible");
+    let listed = fx
+        .ops
+        .dir_list(&args(json!({ "path": fx.p(""), "depth": 4 })), &fx.cancel)
+        .unwrap();
+    assert!(listed.entries.contains("visible.txt"), "{}", listed.entries);
+    assert!(
+        !listed.entries.contains("deep") && !listed.entries.contains("leaf.txt"),
+        "{}",
+        listed.entries
+    );
+    let found = fx
+        .ops
+        .search(
+            &args(json!({ "root": fx.p(""), "pattern": "NEEDLE" })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert!(found.matches.contains("visible.txt"));
+    assert_eq!(found.count, 1, "{}", found.matches);
 }

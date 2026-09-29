@@ -104,6 +104,9 @@ fn walk_dir(
             depth,
         };
         let flow = visit(&entry)?;
+        // Hidden (read-denied protected) directories are listed by name so the
+        // operator can see they exist, but are never entered.
+        let hidden = policy.hidden_from_walk(&full);
         match flow {
             Flow::Stop => {
                 stats.stopped = true;
@@ -113,7 +116,7 @@ fn walk_dir(
             Flow::Continue => {
                 if st.kind() == Kind::Dir
                     && depth < max_depth
-                    && !policy.hidden_from_walk(&full)
+                    && !hidden
                     && let Ok(child) = openat(
                         dir.as_fd(),
                         raw.as_os_str(),

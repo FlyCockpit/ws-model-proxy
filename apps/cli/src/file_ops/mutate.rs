@@ -5,17 +5,18 @@ use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 use nix::fcntl::renameat;
-use nix::sys::stat::{Mode, mkdirat};
+use nix::sys::stat::mkdirat;
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::{Deserialize, Serialize};
 
+use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 use super::policy::Access;
 use super::read::current_etag;
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, FileOps, Step, check_reason};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -265,7 +266,7 @@ fn mkdir_resolved(
     match mkdirat(
         resolved.dir.as_fd(),
         resolved.name.as_os_str(),
-        Mode::from_bits_truncate(mode),
+        perm_mode(mode),
     ) {
         Ok(()) => {
             resolved.created.clear();
@@ -313,6 +314,8 @@ pub fn delete(ops: &FileOps, args: &DeleteArgs, cancel: &Cancel) -> FileResult<D
         }
     }
     cancel.check()?;
+    // Observable seam for the pre-unlink re-check (race tests swap the name here).
+    ops.step(Step::EtagRechecked)?;
     // The name must still be the object we inspected.
     match resolved.lstat()? {
         Some(now) if now.same_object(&st) => {}

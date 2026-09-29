@@ -11,6 +11,7 @@ use super::error::{FileError, FileResult};
 use super::glob::Glob;
 use super::policy::Access;
 use super::resolve::{Kind, ResolveOpts, resolve};
+use super::text::name_for_display;
 use super::walk::{Flow, walk};
 use super::{Cancel, FileOps, fmt};
 
@@ -82,7 +83,7 @@ pub fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListR
     )?;
     let root = resolved.open_dir()?;
     let root_path = resolved.full_path();
-    let prefix = args.path.trim_end_matches('/').to_string();
+    let prefix = name_for_display(args.path.trim_end_matches('/'));
 
     let mut lines: Vec<String> = Vec::new();
     let mut last_rel = String::new();
@@ -119,7 +120,7 @@ pub fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListR
             });
             return Ok(Flow::Stop);
         }
-        let shown = format!("{prefix}/{}", entry.rel);
+        let shown = format!("{prefix}/{}", name_for_display(entry.rel));
         lines.push(match entry.kind {
             Kind::Dir => format!("d {shown}/"),
             Kind::File => format!(
@@ -132,7 +133,7 @@ pub fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListR
                     .ok()
                     .and_then(|t| t.into_string().ok())
                     .unwrap_or_default();
-                format!("l {shown} -> {target}")
+                format!("l {shown} -> {}", name_for_display(&target))
             }
             Kind::Other => format!("o {shown}"),
         });

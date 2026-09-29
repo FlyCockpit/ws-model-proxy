@@ -14,6 +14,10 @@
 //! Refused up front: files owned by another uid (a non-root rename would change
 //! the owner), hard-linked files (the rename would break the link), and
 //! setuid/setgid files.
+//!
+//! Only mode, owner and group are carried over: extended attributes and POSIX
+//! ACLs (SELinux labels, `security.*`, `user.*`, inherit-only ACEs) are **not**
+//! copied, so a replaced file loses them.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -23,7 +27,7 @@ use std::os::unix::ffi::OsStringExt;
 
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, openat, renameat};
-use nix::sys::stat::{Mode, fchmod, fstatat};
+use nix::sys::stat::{Mode, fchmod, fstatat, mode_t};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat};
 use rand::distr::{Alphanumeric, SampleString};
 
@@ -35,6 +39,13 @@ use super::{Cancel, FileOps, Step};
 
 /// Longest base name kept in the temp name (NAME_MAX is 255).
 const TEMP_BASE_MAX: usize = 200;
+
+/// Permission bits as a [`Mode`]. `mode_t` is `u32` on Linux and `u16` on macOS,
+/// so the cast is what makes `Mode::from_bits_truncate` portable.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn perm_mode(bits: u32) -> Mode {
+    Mode::from_bits_truncate(bits as mode_t)
+}
 
 /// Refuse files an atomic replace would damage.
 pub fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
@@ -104,7 +115,7 @@ pub fn replace(
         dir.as_fd(),
         tmp.as_os_str(),
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-        Mode::from_bits_truncate(0o600),
+        perm_mode(0o600),
     )
     .map_err(FileError::errno)?;
     let mut guard = TempGuard {
@@ -127,11 +138,7 @@ pub fn replace(
     )
     .map_err(FileError::errno)?;
     ops.step(Step::Chowned)?;
-    fchmod(
-        tmp_file.as_fd(),
-        Mode::from_bits_truncate(orig_stat.mode & 0o7777),
-    )
-    .map_err(FileError::errno)?;
+    fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
     ops.step(Step::Chmodded)?;
 
     recheck(ops, dir, name, orig, orig_stat, orig_etag)?;
@@ -186,7 +193,7 @@ pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> Fil
         dir.as_fd(),
         name,
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-        Mode::from_bits_truncate(mode & 0o777),
+        perm_mode(mode & 0o777),
     )
     .map_err(FileError::errno)?;
     let mut file = File::from(fd);
