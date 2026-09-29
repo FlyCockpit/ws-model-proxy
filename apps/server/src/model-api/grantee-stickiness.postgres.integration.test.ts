@@ -173,6 +173,27 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           },
         }),
       ).rejects.toThrow(/stickiness target must match its owner and discovered model/);
+      // Setting a target and clearing its paired column in one statement
+      // (which bypasses canonicalization) is re-checked too.
+      const direct = await binding({
+        userId: owner.id,
+        targetModelPoolId: null,
+        poolGrantId: null,
+        targetExecutionTargetId: memberA.target.id,
+      });
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: direct.id },
+          data: { targetExecutionTargetId: foreign.target.id, targetDiscoveredModelId: null },
+        }),
+      ).rejects.toThrow(/stickiness target must match its owner and discovered model/);
+      await db.responseStickinessRecord.delete({ where: { id: direct.id } });
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: accepted.id },
+          data: { selectedExecutionTargetId: foreign.target.id, selectedDiscoveredModelId: null },
+        }),
+      ).rejects.toThrow(/stickiness selection must match its owner and discovered model/);
       // A pool binding never also names a direct target (routing would take
       // the direct branch and skip the pool's checks).
       await expect(

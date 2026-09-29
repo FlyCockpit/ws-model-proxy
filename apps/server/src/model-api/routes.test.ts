@@ -9176,7 +9176,12 @@ describe("model API routes", () => {
       expiresAt: new Date(Date.now() + 60_000),
       ...overrides,
     });
-    const memberA = (overrides: { routingStatus?: "ACTIVE" | "DRAINING" | "DISABLED" } = {}) =>
+    const memberA = (
+      overrides: {
+        routingStatus?: "ACTIVE" | "DRAINING" | "DISABLED";
+        countStrategy?: "CONSERVATIVE_ESTIMATE";
+      } = {},
+    ) =>
       poolMemberRow({
         id: "member-a",
         discoveredModelId: "model-a",
@@ -9415,12 +9420,16 @@ describe("model API routes", () => {
 
     it.each([
       ["a create", false, false],
+      ["an admitted create", false, true],
       ["a follow-up", true, false],
       ["an admitted follow-up", true, true],
     ])(
       "treats a failed send-boundary read on %s as a denial and releases every lease",
       async (_name, isFollowUp, withRuntime) => {
-        db.poolMember.findMany.mockResolvedValue([memberA()]);
+        // A local estimate, so an admitted create needs no native count relay.
+        db.poolMember.findMany.mockResolvedValue([
+          memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+        ]);
         if (isFollowUp) db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
         db.poolGrant.findFirst.mockRejectedValue(new Error("connection pool timeout"));
         const limiter = new ModelApiConcurrencyLimiter();
@@ -9450,6 +9459,8 @@ describe("model API routes", () => {
           expect(runtime.acquire).toHaveBeenCalledOnce();
           expect(runtime.release).toHaveBeenCalledOnce();
         }
+        // The request is finalized as failed, not left pending.
+        expect(stringifyPersistenceCalls(db.relayRequest.update.mock.calls)).toContain('"FAILED"');
       },
     );
 
@@ -9486,6 +9497,7 @@ describe("model API routes", () => {
         upstreamModelId: "upstream-b",
         cliDeviceId: "cli-b",
         weight: 1,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
       });
       const first = poolMemberRow({
         id: "member-a",
@@ -9493,12 +9505,16 @@ describe("model API routes", () => {
         upstreamModelId: "upstream-a",
         cliDeviceId: "cli-a",
         weight: 10,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
       });
       // Routing sees both members; by the send boundary member-a is gone.
       db.poolMember.findMany.mockResolvedValueOnce([first, memberB]).mockResolvedValue([memberB]);
+      const limiter = new ModelApiConcurrencyLimiter();
+      const outstanding = trackLeases(limiter);
+      const runtime = admittingCapacityRuntime();
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a", "cli-b"];
-      const responsePromise = appWith(manager).request("/responses", {
+      const responsePromise = appWith(manager, runtime, limiter).request("/responses", {
         method: "POST",
         headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
         body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
@@ -9510,6 +9526,16 @@ describe("model API routes", () => {
       expect((await responsePromise).status).toBe(200);
       // Both candidates reached the send boundary: member-a first, then member-b.
       expect(db.poolMember.findMany).toHaveBeenCalledTimes(3);
+      // member-a's admission was released before member-b was admitted.
+      expect(runtime.acquire).toHaveBeenCalledTimes(2);
+      expect(runtime.release).toHaveBeenCalled();
+      const releasedFirst = (runtime.release as unknown as MockInstance).mock
+        .invocationCallOrder[0]!;
+      const acquiredSecond = (runtime.acquire as unknown as MockInstance).mock
+        .invocationCallOrder[1]!;
+      expect(releasedFirst).toBeLessThan(acquiredSecond);
+      await (await responsePromise).text();
+      await vi.waitFor(() => expect(outstanding()).toBe(0));
     });
 
     it("writes no binding for a failed response even when its id was captured", async () => {

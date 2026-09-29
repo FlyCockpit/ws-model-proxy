@@ -193,9 +193,12 @@ integration("own-key preference integrity and requester capacity", () => {
         return {
           ...actual,
           // CHAT_TEST avoids a synthetic token FK in real relay_request rows.
-          listVisibleModelTargetsForUser: async () => ({
+          // As in production, the owner sees their own pool without a grant.
+          listVisibleModelTargetsForUser: async (userId: string) => ({
             directModels: [],
-            modelPools: [visiblePool],
+            modelPools: [
+              userId === owner.id ? { ...visiblePool, accessGrantId: null } : visiblePool,
+            ],
           }),
         };
       });
