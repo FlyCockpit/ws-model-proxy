@@ -829,9 +829,12 @@ export async function resetPoolMemberHealthForDiscoveredModels(
  * A device's relay session went away: its members are circuit-opened for the
  * full health cooldown. Hot-path health write (writer class H,
  * @ws-model-proxy/db/capacity-lock-order): one single-row statement per member
- * in id order, so it never holds one member row while it waits on another (a
- * multi-row UPDATE takes its rows in heap order and could wait on a management
- * transaction that holds a later row and waits on an earlier one).
+ * in id order (a multi-row UPDATE takes its rows in heap order). It runs inside
+ * the disconnect transaction, so each member row stays locked until commit
+ * together with the device row: a documented exception to "holds nothing
+ * else" (see the H entry in capacity-lock-order.ts). Its waits are bounded by
+ * the transaction's `lock_timeout`, and a deadlock with a management cascade
+ * is broken by PostgreSQL and retried.
  *
  * `generation` is the device connection generation the caller saw when it
  * detached the session, and is required. The fence is the caller's
