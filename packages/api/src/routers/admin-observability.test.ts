@@ -341,6 +341,93 @@ describe("adminObservabilityRouter", () => {
     });
   });
 
+  it("derives a pool member's endpoint status from its device presence", async () => {
+    // serializePool projects each member's endpoint status with the shared
+    // derived helper. Without that projection (reverting to the stored
+    // `Endpoint.status`) an offline device's member would read ONLINE.
+    db.modelPool.count.mockResolvedValue(1);
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        id: "pool-id",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+        slug: "general",
+        name: "General",
+        description: null,
+        User: owner(),
+        PoolMembers: [
+          {
+            id: "member-offline",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+            discoveredModelId: null,
+            weight: 1,
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            lastFailureClass: null,
+            consecutiveRetryableFailures: 0,
+            lastFailureAt: null,
+            nextRetryAt: null,
+            halfOpenTrialStartedAt: null,
+            lastRoutedAt: null,
+            DiscoveredModel: null,
+            ExecutionTarget: {
+              kind: "DISCOVERED_MODEL",
+              DiscoveredModel: {
+                id: "model-offline",
+                upstreamModelId: "llama",
+                User: { slug: "owner" },
+                Endpoint: {
+                  id: "endpoint-offline",
+                  slug: "local",
+                  label: "Local",
+                  status: "ONLINE",
+                  CliDevice: {
+                    id: "cli-offline",
+                    slug: "desk",
+                    name: null,
+                    reportedHostname: "desk-01.local",
+                    status: "DISCONNECTED",
+                    lastHeartbeatAt: new Date(Date.now() - 1_000),
+                  },
+                },
+              },
+            },
+          },
+        ],
+        _count: { PoolGrants: 0, ModelApiTokenAllowlistEntries: 0 },
+      },
+    ]);
+
+    const result = await client().listPools();
+
+    expect(result.items[0]?.members[0]?.model).toMatchObject({
+      endpointStatus: "OFFLINE",
+      cliDeviceStatus: "DISCONNECTED",
+    });
+  });
+
+  it("filters listModels by the derived endpoint status, not the stored column", async () => {
+    db.discoveredModel.count.mockResolvedValue(0);
+    db.discoveredModel.findMany.mockResolvedValue([]);
+
+    await client().listModels({ endpointStatus: "OFFLINE" });
+
+    // The filter must reach endpoint.status through the device relation; a
+    // revert to a raw `{ Endpoint: { is: { status: "OFFLINE" } } }` would drop
+    // the device clauses (the device decides reachability).
+    const where = db.discoveredModel.findMany.mock.calls.at(-1)?.[0]?.where;
+    expect(where.Endpoint).toMatchObject({
+      is: expect.objectContaining({ OR: expect.any(Array) }),
+    });
+    expect(where.Endpoint.is.OR).toEqual(
+      expect.arrayContaining([
+        { status: "OFFLINE" },
+        expect.objectContaining({ CliDevice: expect.anything() }),
+      ]),
+    );
+  });
+
   it("returns effective model capability summaries and applies capability filters", async () => {
     db.discoveredModel.count.mockResolvedValue(1);
     db.discoveredModel.findMany.mockResolvedValue([

@@ -11,6 +11,12 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 
 ## Before you deploy
 
+- **Schema: `cli_device.connectionGeneration` is added (#129).** An additive
+  non-null `int` with a default of `0`, so `APPLY_SCHEMA=safe` applies it
+  without a "possible data loss" stop. It fences disconnect writes to the
+  connection a session was accepted under, so a close delivered after a
+  reconnect cannot re-open the pool members of a live device.
+
 - **Set a stop grace of at least 52 s.** The server can take up to 47 s to shut
   down (`PROCESS_SHUTDOWN_DEADLINE_MS`). Docker's default of 10 s cuts the HTTP
   drain and relay close short. Use `docker stop -t 52`, compose
@@ -80,6 +86,13 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 
 ## Fixed
 
+- **A disconnect that arrives just after a CLI reconnects no longer re-opens
+  its pool members (#113, #129).** The reconnect hello had already made the
+  members due, but the old socket's close could still be processed during the
+  new registration and re-impose the full 60 s circuit-open (and a
+  `DISCONNECTED` device status) over the live session. Disconnect writes now
+  carry the connection generation they were issued under and apply only while
+  the device still holds it, so the stale close matches no row.
 - **Grantees of shared pools could not use local members.** Since #26
   (2026-08-25), on databases with schema hardening applied, a grantee's
   request to a shared pool's local member failed: the database rejected the

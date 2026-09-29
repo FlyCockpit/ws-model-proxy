@@ -330,6 +330,12 @@ type SessionState = {
   connectedAt: Date;
   lastHeartbeatAt: Date;
   cliDeviceId: string | null;
+  /**
+   * The device's connection generation this session was accepted under
+   * (from its registration). A disconnect write presents it and is refused
+   * once the device has accepted a later connection.
+   */
+  connectionGeneration: number | null;
   cli: { slug: string } | null;
   registered: boolean;
   inventoryConfirmed: boolean;
@@ -582,6 +588,7 @@ export class RelaySessionManager {
       connectedAt: now,
       lastHeartbeatAt: now,
       cliDeviceId: null,
+      connectionGeneration: null,
       cli: null,
       registered: false,
       inventoryConfirmed: false,
@@ -658,10 +665,15 @@ export class RelaySessionManager {
           // revoked / device deleted). The registration committed CONNECTED
           // for a session that no longer exists: do not route to it, and put
           // the device status back unless another live session owns it.
-          await this.settleDetachedRegistration(registration.cliDeviceId, now);
+          await this.settleDetachedRegistration(
+            registration.cliDeviceId,
+            now,
+            registration.connectionGeneration,
+          );
           return;
         }
         session.cliDeviceId = registration.cliDeviceId;
+        session.connectionGeneration = registration.connectionGeneration;
         session.cli = { slug: message.cli.slug };
         session.registered = true;
         session.inventoryConfirmed = true;
@@ -986,12 +998,26 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
-    return () => this.writeDeviceDisconnected(cliDeviceId, { now, cliStatus, failureClass });
+    const connectionGeneration = session.connectionGeneration;
+    return () =>
+      this.writeDeviceDisconnected(cliDeviceId, {
+        now,
+        cliStatus,
+        failureClass,
+        connectionGeneration,
+      });
   }
 
   /**
    * Persists that no session serves this device. `updateMany` because the
    * device may have been deleted (its sessions are closed right after).
+   *
+   * Durable-ownership fence: both writes carry `connectionGeneration`, the
+   * generation the detached session was accepted under. A hello that commits
+   * after the detach increments it and makes every write below match nothing,
+   * so a stale close can never overwrite the status or pool-member health of a
+   * live successor — including a successor on another replica, which this
+   * process cannot see in `sessionsByCliDeviceId`.
    */
   private async writeDeviceDisconnected(
     cliDeviceId: string,
@@ -999,17 +1025,35 @@ export class RelaySessionManager {
       now,
       cliStatus,
       failureClass,
+      connectionGeneration,
     }: {
       now: Date;
       cliStatus: "DISCONNECTED" | "STALE";
       failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+      connectionGeneration: number | null;
     },
   ) {
-    await prisma.cliDevice.updateMany({
-      where: { id: cliDeviceId },
+    // Never pass `undefined` to a Prisma filter: it would drop the key and
+    // remove the fence. Fail closed on anything but a real generation, so a
+    // session that never registered (or a registration that did not report
+    // one) writes nothing instead of an unfenced disconnect.
+    if (
+      connectionGeneration === null ||
+      !Number.isInteger(connectionGeneration) ||
+      connectionGeneration < 1
+    )
+      return;
+    const claimed = await prisma.cliDevice.updateMany({
+      where: { id: cliDeviceId, connectionGeneration },
       data: { status: cliStatus, lastDisconnectedAt: now },
     });
-    await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
+    if (claimed.count === 0) return;
+    await markPoolMembersForCliUnavailable({
+      cliDeviceId,
+      failureClass,
+      generation: connectionGeneration,
+      now,
+    });
     this.poolMemberRecovery.wake();
   }
 
@@ -1018,13 +1062,28 @@ export class RelaySessionManager {
    * detached. The session never entered routing; undo the connected status
    * unless another live session now owns the device (its own registration
    * wrote CONNECTED and routing points at it).
+   *
+   * The write is fenced by the registration's own generation: any successor —
+   * in this process or another replica — has incremented the stored generation
+   * and this write matches no row. The in-memory check is a cheap in-process
+   * fast path for that same case, kept from before the fence.
+   *
+   * A process restart loses `sessionsByCliDeviceId`; then only the generation
+   * orders the writers, and a successor that had already committed before this
+   * stale undo leaves the row DISCONNECTED until its next heartbeat (the same
+   * self-healing window a stale hello always had).
    */
-  private async settleDetachedRegistration(cliDeviceId: string, now: Date) {
+  private async settleDetachedRegistration(
+    cliDeviceId: string,
+    now: Date,
+    connectionGeneration: number,
+  ) {
     if (this.sessionsByCliDeviceId.has(cliDeviceId)) return;
     await this.writeDeviceDisconnected(cliDeviceId, {
       now,
       cliStatus: "DISCONNECTED",
       failureClass: "WEBSOCKET_DISCONNECTED",
+      connectionGeneration,
     });
   }
 

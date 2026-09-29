@@ -688,25 +688,38 @@ export async function resetPoolMemberHealthForDiscoveredModels(
   });
 }
 
+/**
+ * A device's relay session went away: its members are circuit-opened for the
+ * full health cooldown. `generation` is the device connection generation the
+ * caller saw when it detached the session, and is required: the write is a
+ * single conditional `updateMany` whose WHERE re-checks it on the device row,
+ * so a stale disconnect (a close delivered after a successor's hello committed,
+ * in this process or another replica) matches no member row instead of
+ * re-imposing the cooldown over the successor's due-write. There is no
+ * unfenced variant, so a disconnect can never be written without the fence.
+ */
 export async function markPoolMembersForCliUnavailable({
   cliDeviceId,
   failureClass,
+  generation,
   now = new Date(),
 }: {
   cliDeviceId: string;
   failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+  generation: number;
   now?: Date;
 }): Promise<void> {
+  const endpointScope = { cliDeviceId, CliDevice: { connectionGeneration: generation } };
   await prisma.poolMember.updateMany({
     where: {
       OR: [
         {
           executionTargetId: { not: null },
-          ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId } } },
+          ExecutionTarget: { DiscoveredModel: { Endpoint: endpointScope } },
         },
         {
           executionTargetId: null,
-          DiscoveredModel: { Endpoint: { cliDeviceId } },
+          DiscoveredModel: { Endpoint: endpointScope },
         },
       ],
     },
@@ -720,6 +733,12 @@ export async function markPoolMembersForCliUnavailable({
  * once instead of after the disconnect cooldown. Members whose last failure
  * was anything else (a real upstream/transport failure) keep their state.
  * Nothing is marked healthy here; the probe decides.
+ *
+ * The device-status fence already forces an executable/inventory path to
+ * revisit the device before this runs, so this write needs no generation of
+ * its own: it only moves `nextRetryAt` earlier for members that were opened by
+ * a disconnect, and a late one cannot strand routing (the recovery scan and the
+ * routing gate decide from the stored `CONNECTED` status and a live session).
  */
 export async function markPoolMembersDueAfterCliReconnect({
   cliDeviceId,

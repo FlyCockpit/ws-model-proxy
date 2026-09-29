@@ -313,6 +313,12 @@ model CliDevice {
   lastDisconnectedAt           DateTime?
   lastHeartbeatAt              DateTime?
   connectionCount              Int                   @default(0)
+  /// Monotonic fence for connection generations: incremented by every accepted
+  /// hello (relay registration) and never by a disconnect. A disconnect write
+  /// carries the generation it saw when its session was detached and is refused
+  /// when the device has since accepted a later connection, so a stale close
+  /// cannot overwrite the status and pool-member health of a live successor.
+  connectionGeneration         Int                   @default(0)
   inventorySeq                 Int                   @default(0)
   inventoryDigest              String?
   inventoryAcknowledgedAt      DateTime?

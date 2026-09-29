@@ -194,17 +194,37 @@ integration("CLI presence health with real PostgreSQL", () => {
           status: "ONLINE",
         },
       });
+      // A second device with its own disconnect-opened member: a reconnect of
+      // the first device must leave this device's cooldown untouched.
+      const otherDevice = await prisma.cliDevice.create({
+        data: {
+          userId: user.id,
+          slug: "desk-2",
+          status: "DISCONNECTED",
+          lastHeartbeatAt: new Date(now.getTime() - 1_000),
+        },
+      });
+      const otherEndpoint = await prisma.endpoint.create({
+        data: {
+          userId: user.id,
+          cliDeviceId: otherDevice.id,
+          slug: "ep-2",
+          label: "ep-2",
+          status: "ONLINE",
+        },
+      });
       const pool = await prisma.modelPool.create({
         data: { userId: user.id, slug: `pool-${suffix}`.slice(0, 60), name: "pool" },
       });
       const later = new Date(now.getTime() + 60_000);
       const member = async (
         failure: "WEBSOCKET_DISCONNECTED" | "STALE_SESSION" | "RELAY_TIMEOUT",
+        on: { endpointId: string } = { endpointId: endpoint.id },
       ) => {
         const model = await prisma.discoveredModel.create({
           data: {
             userId: user.id,
-            endpointId: endpoint.id,
+            endpointId: on.endpointId,
             upstreamModelId: failure,
             encodedModelId: failure,
           },
@@ -220,6 +240,9 @@ integration("CLI presence health with real PostgreSQL", () => {
           },
         });
       };
+      const otherDeviceMember = await member("WEBSOCKET_DISCONNECTED", {
+        endpointId: otherEndpoint.id,
+      });
       const [dropped, stale, real] = await Promise.all([
         member("WEBSOCKET_DISCONNECTED"),
         member("STALE_SESSION"),
@@ -230,7 +253,13 @@ integration("CLI presence health with real PostgreSQL", () => {
         context: { session: { user } as unknown as Session } as Context,
       });
       const before = await asUser.health();
-      expect(before.endpoints.unhealthy).toMatchObject([{ id: endpoint.id, status: "OFFLINE" }]);
+      // Both devices are offline, so both endpoints are unhealthy/OFFLINE.
+      expect(before.endpoints.unhealthy).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: endpoint.id, status: "OFFLINE" }),
+          expect.objectContaining({ id: otherEndpoint.id, status: "OFFLINE" }),
+        ]),
+      );
       expect(
         await prisma.endpoint.count({ where: endpointEffectiveStatusWhere("OFFLINE", now) }),
       ).toBeGreaterThanOrEqual(1);
@@ -243,20 +272,29 @@ integration("CLI presence health with real PostgreSQL", () => {
       const count = await markPoolMembersDueAfterCliReconnect({ cliDeviceId: device.id, now });
       expect(count).toBe(2);
       const rows = await prisma.poolMember.findMany({
-        where: { id: { in: [dropped.id, stale.id, real.id] } },
+        where: { id: { in: [dropped.id, stale.id, real.id, otherDeviceMember.id] } },
         select: { id: true, nextRetryAt: true, healthStatus: true, lastFailureClass: true },
       });
       const byId = new Map(rows.map((row) => [row.id, row]));
       expect(byId.get(dropped.id)).toMatchObject({ nextRetryAt: now, healthStatus: "UNHEALTHY" });
       expect(byId.get(stale.id)?.nextRetryAt).toEqual(now);
       expect(byId.get(real.id)?.nextRetryAt).toEqual(later);
+      // Another device's disconnect-opened member keeps its full cooldown.
+      expect(byId.get(otherDeviceMember.id)).toMatchObject({
+        nextRetryAt: later,
+        healthStatus: "UNHEALTHY",
+        lastFailureClass: "WEBSOCKET_DISCONNECTED",
+      });
 
       await prisma.cliDevice.update({
         where: { id: device.id },
         data: { status: "CONNECTED", lastHeartbeatAt: new Date() },
       });
       const after = await asUser.health();
-      expect(after.endpoints.unhealthy).toEqual([]);
+      // The other device is still offline, so only its endpoint stays unhealthy.
+      expect(after.endpoints.unhealthy).toEqual([
+        expect.objectContaining({ id: otherEndpoint.id, status: "OFFLINE" }),
+      ]);
       expect(
         await prisma.endpoint.count({
           where: { id: endpoint.id, ...endpointEffectiveStatusWhere("ONLINE", new Date()) },

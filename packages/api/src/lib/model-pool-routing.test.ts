@@ -17,12 +17,14 @@ const {
   recordPoolMemberRelayFailure,
   resetPoolMemberHealth,
   resetPoolMemberHealthForDiscoveredModels,
+  selectPoolRouteSequence,
   transitionPoolMemberHealthAfterRetryableFailure,
 } = await import("./model-pool-routing");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
   poolMember: {
+    findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
@@ -86,6 +88,66 @@ function memberRow({
 describe("modelPoolRouting", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("routes a request right after a reconnect (disconnect -> reconnect -> routable)", async () => {
+    // AC #113's acceptance sentence ("disconnect, reconnect, and a request
+    // succeeds within about 2 s") composed across the real writers and the real
+    // routing decision, driven by the logical chain rather than wall-clock
+    // timing: a disconnect parks the members for the full 60 s cooldown, the
+    // reconnect hello's due-write pulls them due, and the same members read as
+    // routable to the dispatcher (via -- but not limited to -- the
+    // UNHEALTHY+HALF_OPEN path).
+    const cooldownUntil = new Date(now.getTime() + 60_000);
+    const members: PoolMemberRouteRow[] = [
+      memberRow({ id: "member-a", healthStatus: "UNHEALTHY", nextRetryAt: cooldownUntil }),
+    ];
+    const selectFor = async () => {
+      const result = await selectPoolRouteSequence({
+        poolId: "pool-1",
+        activeCliDeviceIds: ["cli-1"],
+        now,
+      });
+      return result.ok ? result.candidates.map((candidate) => candidate.poolMemberId) : [];
+    };
+    // The stored rows selectPoolRouteSequence -> routablePoolMembers sees after
+    // each write. The mock applies the same conditional transition each
+    // writer's SQL does: a due-write only moves a still-cooling member, so if
+    // the transition's own predicate regresses the member stays cooling and
+    // the routable assertion below fails.
+    db.poolMember.findMany.mockImplementation(async () => members);
+    db.poolMember.updateMany.mockImplementation(
+      async (arg: { where: { healthStatus?: string }; data: { nextRetryAt?: Date } }) => {
+        const dueWrite = arg.data?.nextRetryAt !== undefined;
+        let matched = 0;
+        for (const member of members) {
+          if (dueWrite) {
+            const cooling =
+              member.nextRetryAt !== null && member.nextRetryAt.getTime() > now.getTime();
+            if (member.healthStatus !== "UNHEALTHY" || !cooling) continue;
+            member.nextRetryAt = arg.data.nextRetryAt ?? null;
+          }
+          matched += 1;
+        }
+        return { count: matched };
+      },
+    );
+
+    // Before the reconnect: the cooldown still holds the member back.
+    expect(await selectFor()).toEqual([]);
+
+    const due = await markPoolMembersDueAfterCliReconnect({ cliDeviceId: "cli-1", now });
+    expect(due).toBe(1);
+    // The same member is now a routable HALF_OPEN candidate.
+    const route = await selectPoolRouteSequence({
+      poolId: "pool-1",
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+    expect(route).toMatchObject({
+      ok: true,
+      candidates: [{ poolMemberId: "member-a", healthStatus: "HALF_OPEN" }],
+    });
   });
 
   it("routes a single healthy connected pool member", () => {
@@ -427,6 +489,7 @@ describe("modelPoolRouting", () => {
     await markPoolMembersForCliUnavailable({
       cliDeviceId: "cli-1",
       failureClass: "WEBSOCKET_DISCONNECTED",
+      generation: 7,
       now,
     });
 
@@ -451,9 +514,18 @@ describe("modelPoolRouting", () => {
         OR: [
           {
             executionTargetId: { not: null },
-            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+            ExecutionTarget: {
+              DiscoveredModel: {
+                Endpoint: { cliDeviceId: "cli-1", CliDevice: { connectionGeneration: 7 } },
+              },
+            },
           },
-          { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+          {
+            executionTargetId: null,
+            DiscoveredModel: {
+              Endpoint: { cliDeviceId: "cli-1", CliDevice: { connectionGeneration: 7 } },
+            },
+          },
         ],
       },
       data: expect.objectContaining({
@@ -461,6 +533,38 @@ describe("modelPoolRouting", () => {
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
       }),
     });
+  });
+
+  it("fences the member scope with the device generation", async () => {
+    // Table over the branch a disconnect write takes. Each row is an accepted
+    // input; the driver is the mock's count: 0 stands for the SQL matching no
+    // rows (a successor hello already incremented the device generation).
+    const rows = [
+      { name: "current generation, rows matched", count: 1 },
+      { name: "superseded generation, no rows matched", count: 0 },
+    ];
+    for (const row of rows) {
+      db.poolMember.updateMany.mockReset();
+      db.poolMember.updateMany.mockResolvedValue({ count: row.count });
+      await markPoolMembersForCliUnavailable({
+        cliDeviceId: "cli-1",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+        generation: 4,
+      });
+      const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
+      // Both relation arms must carry the fence: dropping it from either arm
+      // reintroduces the stale-write race for members of that shape.
+      const arms = [where?.OR?.[0], where?.OR?.[1]];
+      for (const arm of arms) {
+        const endpoint =
+          arm?.ExecutionTarget?.DiscoveredModel?.Endpoint ??
+          (arm?.DiscoveredModel?.Endpoint as { CliDevice?: unknown } | undefined);
+        expect(endpoint, row.name).toMatchObject({
+          cliDeviceId: "cli-1",
+          CliDevice: { connectionGeneration: 4 },
+        });
+      }
+    }
   });
 
   it("atomically claims a due degraded fallback only when it is the sole configured member", async () => {
