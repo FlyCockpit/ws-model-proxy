@@ -113,35 +113,32 @@ export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 /** The only names a stored program may have: no spaces, quotes, NUL or non-ASCII. */
 const PROGRAM_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/;
 
-/** A leading `NAME=value` assignment whose NAME is a valid shell env name. */
-const ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * A leading `NAME=value` assignment that is safe to skip: a valid shell env
+ * NAME and a value made only of plain characters. Anything else in the value
+ * (quotes, backslash, `$`, backtick, parentheses, braces, redirection, glob
+ * or history characters, whitespace other than space and tab) can keep a
+ * space inside ONE shell word, so the next space-separated piece would be a
+ * fragment of the value, not a program. Such a command fails closed.
+ */
+const SAFE_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,=-]*$/;
+
+/** A word that starts like an assignment (valid NAME then `=`), safe or not. */
+const ASSIGNMENT_START_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
- * Splits a command into whitespace-separated tokens, keeping single- and
- * double-quoted spans (with their contents) inside one token so an argument
- * such as `FOO="a b"` never splits. Quote characters are part of the token
- * text and are stripped only when a token is used as a program candidate.
+ * Splits a command into tokens at spaces and tabs ONLY. There is no quote or
+ * escape handling on purpose: a word is never re-assembled, so no piece of an
+ * argument or assignment value can be mistaken for the program. Any other
+ * whitespace (LF, CR, VT, FF, Unicode spaces) stays inside its token, which
+ * then fails the program charset. Leading whitespace of any kind is trimmed
+ * first.
  */
 function tokenizeCommand(command: string): string[] {
-  const tokens: string[] = [];
-  let current = "";
-  let quote: '"' | "'" | null = null;
-  let started = false;
-  for (const char of command) {
-    if (quote === null && (char === " " || char === "\t" || char === "\n" || char === "\r")) {
-      if (started) tokens.push(current);
-      current = "";
-      started = false;
-      continue;
-    }
-    started = true;
-    current += char;
-    if (char === "\\") continue;
-    if (quote === null && (char === '"' || char === "'")) quote = char;
-    else if (quote === char) quote = null;
-  }
-  if (started) tokens.push(current);
-  return tokens;
+  return command
+    .replace(/^\s+/u, "")
+    .split(/[ \t]+/)
+    .filter((token) => token.length > 0);
 }
 
 /** The basename of a word: `"/usr/bin/git"` -> `git`; empty for a trailing slash. */
@@ -162,7 +159,8 @@ function unquote(word: string): string {
 
 /**
  * The program of a command for the audit `path`: the basename of the first
- * word that is not a leading `NAME=value` assignment (`env`, `sudo` and the
+ * word that is not a leading plain `NAME=value` assignment (an assignment with
+ * a quote, escape, expansion or other non-plain value fails closed) (`env`, `sudo` and the
  * other wrappers are stored by their own name, never unwrapped). Returns
  * {@link CLI_AGENT_ACTION_UNKNOWN_PROGRAM} for anything outside the accepted
  * shape: a word that starts with `-` is a flag, not a program, so it fails
@@ -173,7 +171,12 @@ export function commandProgram(command: unknown): string {
     return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
   for (const token of tokenizeCommand(command)) {
-    if (ASSIGNMENT_PATTERN.test(token)) continue;
+    if (ASSIGNMENT_START_PATTERN.test(token)) {
+      // Skip only a plain assignment; any other shape may hide a value that
+      // spans several tokens, so the program cannot be told and fails closed.
+      if (SAFE_ASSIGNMENT_PATTERN.test(token)) continue;
+      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+    }
     const base = basename(unquote(token));
     if (base.startsWith("-")) return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
     return PROGRAM_PATTERN.test(base) ? base : CLI_AGENT_ACTION_UNKNOWN_PROGRAM;

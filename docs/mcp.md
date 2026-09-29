@@ -506,15 +506,19 @@ the command text itself), when, and how it ended (`completed`, `refused`, `faile
 stored as `rejected`, so CLI-supplied text never reaches the column. File
 content, diffs and command output are never stored, and the command's arguments
 are never stored: the server reduces the command text to its program (the
-basename of the first word that is not a leading `NAME=value` assignment, so a
-secret-bearing assignment is skipped) and hashes the whole text. The digest is
+basename of the first word that is not a leading plain `NAME=value` assignment;
+an assignment whose value has a quote, escape, expansion or any character
+outside a plain set makes the program `?`, so no piece of a secret value can
+be stored) and hashes the whole text. The digest is
 HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
 (fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
 used to check a guessed command; when the key cannot be derived the hash is
 stored as `hmac-sha256:unavailable` and still leaks nothing. Writing an
 event never blocks or fails the operation (a bounded in-process queue, dropped
 and counted when the database cannot keep up). Rows are deleted after **90
-days** by the hourly retention sweep, and with the user on account deletion.
+days** by the hourly retention sweep, and with the user on account deletion
+(a row recorded after that drain, such as the cancellation of a command still
+running when the account is deleted, is removed by the same 90-day sweep).
 The owner reads them under `Dashboard → CLIs → Agent activity` and through
 `forwarder_cli_activity_list` (read scope; visible only to a personal token
 minted with CLI commands, like the other CLI tools).

@@ -87,7 +87,9 @@ describe("commandProgram", () => {
     ["a quoted program containing a space", "'my tool' x", UNKNOWN],
     ["a relative script", "./run.sh", "run.sh"],
     ["a path with a trailing slash", "/usr/bin/", UNKNOWN],
-    ["a quoted assignment value with a space does not leak", 'FOO="a b" curl', "curl"],
+    ["a quoted assignment value with a space fails closed", 'FOO="a b" curl', UNKNOWN],
+    ["a plain assignment with path-ish value is skipped", "A=/x/y:z@1.2,3+4=5 prog", "prog"],
+    ["an empty assignment value is skipped", "A= prog", "prog"],
     ["an assignment-looking invalid name is a candidate", "1A=b", UNKNOWN],
     ["a dashed assignment-looking name is a candidate", "a-b=c", UNKNOWN],
     ["a leading long flag is not a program", "--api-key x", UNKNOWN],
@@ -99,6 +101,37 @@ describe("commandProgram", () => {
   it.each(rows)("%s", (_name, input, expected) => {
     expect(commandProgram(input)).toBe(expected);
   });
+
+  // C1b-1: a shell word can keep whitespace inside ONE assignment value, so a
+  // later piece of the secret must never be stored as the program.
+  const secretFragmentRows: ReadonlyArray<readonly [string, string, string]> = [
+    ["escaped space", "PASSWORD=correct\\ horsebattery mysql", "horsebattery"],
+    [
+      "escaped quote in a double-quoted value",
+      'PASSWORD="pa\\"ss secretword x" mysql',
+      "secretword",
+    ],
+    ["parameter expansion default", "PASS=$" + "{D:-my secretpw x} mysql", "secretpw"],
+    ["command substitution", "PASS=$(printf hunter2word x) mysql", "hunter2word"],
+    ["backtick substitution", "PASS=`printf hunter2tick x` mysql", "hunter2tick"],
+    ["array assignment", "KEYS=(aaakey bbbkey ccc) prog", "bbbkey"],
+    ["carriage return in the value", "PASS=abc\rsecretcr prog", "secretcr"],
+    ["backslash-newline in the value", "PASS=abc\\\nsecretnl prog", "secretnl"],
+    ["single-quoted value with spaces", "PASS='top secretpiece x' prog", "secretpiece"],
+    ["unicode space in the value", "PASS=abc\u00a0secretnb prog", "secretnb"],
+    ["vertical tab in the value", "PASS=abc\vsecretvt prog", "secretvt"],
+    ["semicolon then a word", "PASS=abc;secretsemi prog", "secretsemi"],
+    ["arithmetic expansion", "PASS=$((1 + secretar)) prog", "secretar"],
+  ];
+  it.each(secretFragmentRows)(
+    "never stores a fragment of an assignment value: %s",
+    (_n, input, fragment) => {
+      const program = commandProgram(input);
+      expect(program).toBe(UNKNOWN);
+      expect(program).not.toContain(fragment);
+      expect(commandAuditPath(input, () => "H")).toBe("hmac-sha256:H ?");
+    },
+  );
 
   it("returns the unknown program for non-string and non-well-formed input", () => {
     expect(commandProgram(undefined)).toBe(UNKNOWN);
