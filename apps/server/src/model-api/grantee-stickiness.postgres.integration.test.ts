@@ -220,9 +220,10 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         selectedExecutionTargetId: memberB.target.id,
       });
       // Membership is checked when a selection is written, not re-checked on
-      // later writes: after the member is removed, re-writing the unchanged
-      // binding (the application's upsert) and an update that keeps its
-      // selection still succeed, while selecting that target anew fails.
+      // UPDATEs that keep it (cascades, the deletion drain): after the member
+      // is removed, such updates still succeed, while selecting that target
+      // anew fails. The application's writer is INSERT ... ON CONFLICT, whose
+      // BEFORE INSERT check runs in full, so it re-checks membership too.
       await db.poolMember.delete({ where: { id: poolMembers.get(memberB.cli.id)! } });
       await db.responseStickinessRecord.update({
         where: { id: ownerBinding.id },
@@ -237,6 +238,25 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         where: { id: ownerBinding.id },
         data: { routingVersion: 1 },
       });
+      await expect(
+        db.responseStickinessRecord.upsert({
+          where: {
+            userId_routingKeyDigest: {
+              userId: owner.id,
+              routingKeyDigest: ownerBinding.routingKeyDigest,
+            },
+          },
+          create: {
+            userId: owner.id,
+            routingKeyDigest: ownerBinding.routingKeyDigest,
+            routingVersion: 2,
+            targetModelPoolId: pool.id,
+            selectedExecutionTargetId: memberB.target.id,
+            expiresAt: new Date(Date.now() + 60_000),
+          },
+          update: { routingVersion: 2, selectedExecutionTargetId: memberB.target.id },
+        }),
+      ).rejects.toThrow(/stickiness selection must be a local member of its pool/);
       await expect(
         binding({
           userId: owner.id,
@@ -669,12 +689,23 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         ).toBe(true);
       });
       expect(await db.usageRollupMinute.count({ where: { ownerUserId: lateOwner.id } })).toBe(0);
+      // No live admission state leaks from this test's capacities (checked
+      // before the runtime is closed, which would release any leak).
+      await vi.waitFor(async () =>
+        expect(
+          await db.capacityLease.count({
+            where: {
+              state: "ACTIVE",
+              executionTargetId: { in: [memberA.target.id, memberB.target.id] },
+            },
+          }),
+        ).toBe(0),
+      );
     } finally {
       await runtime?.close();
       // Capacity lease rows keep immutable target history through RESTRICT
       // foreign keys, so these users stay in the disposable validation
-      // database (as in the capacity PG suites); no live admission state leaks.
-      expect(await db.capacityLease.count({ where: { state: "ACTIVE" } })).toBe(0);
+      // database (as in the capacity PG suites).
       await db.$disconnect();
     }
   }, 60_000);
