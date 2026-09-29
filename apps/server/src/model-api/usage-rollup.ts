@@ -40,7 +40,9 @@ export const relayRollupSelect = {
   cacheReadTokens: true,
   cacheWriteTokens: true,
   usageKnown: true,
-  // Resource owners, for the rollup's owner key (see resourceOwnerUserId).
+  // Durable resource owner (database-derived at insert; survives pool deletion).
+  resourceOwnerUserId: true,
+  // Legacy resource owners, for rows written before resourceOwnerUserId existed.
   RequestedModelPool: { select: { userId: true } },
   SelectedExecutionTarget: { select: { userId: true } },
   RequestedExecutionTarget: { select: { userId: true } },
@@ -57,7 +59,10 @@ export type RelayRequestSourceValue = RelayRollupRow["source"];
  *    traffic, else the execution target's owner for direct traffic, else
  *    (nothing resolved) the requester. Owners see every requester's traffic
  *    on what they own. FK to user, ON DELETE CASCADE: deleting the owner
- *    removes the history of their resources.
+ *    removes the history of their resources. The owner comes from the
+ *    request's durable `resourceOwnerUserId`, which is not a foreign key; an
+ *    increment whose owner no longer exists is skipped (rollupUpsertSql), as
+ *    the owner's deletion would have removed it.
  *  - `requesterUserId`: the RelayRequest owner (API token / chat-test /
  *    MCP user). Not a foreign key: when the requester is deleted, a database
  *    trigger merges their rows into the '' sentinel requester, so owners keep
@@ -162,9 +167,14 @@ export function rollupIncrementForRequest(
   };
 }
 
-/** See UsageRollupKey: own-key requester, else pool/target owner or requester. */
+/**
+ * See UsageRollupKey: own-key requester, else the durable resource owner the
+ * database recorded at insert (the pool owner even after the pool is deleted),
+ * else (legacy rows) the live pool/target owner or the requester.
+ */
 export function resourceOwnerUserId(row: RelayRollupRow): string {
   if (row.fallbackRoute === "own-key") return row.userId;
+  if (row.resourceOwnerUserId) return row.resourceOwnerUserId;
   if (row.requestedModelPoolId && row.RequestedModelPool) return row.RequestedModelPool.userId;
   if (!row.requestedModelPoolId) {
     const target = row.selectedExecutionTargetId
@@ -294,7 +304,8 @@ export function rollupUpsertSql(
       "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
       "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs",
       "latencyHistogram", "ttftCount", "ttftSumMs", "ttftHistogram"
-    ) VALUES (
+    )
+    SELECT
       ${increment.bucketStart}, ${increment.ownerUserId}, ${increment.requesterUserId},
       ${increment.poolId}, ${increment.poolMemberId},
       ${increment.executionTargetId}, ${increment.source}::"RelayRequestSource", now(),
@@ -305,7 +316,10 @@ export function rollupUpsertSql(
       ${increment.cacheKnownInputTokens}, ${increment.durationCount}, ${increment.durationSumMs},
       ${increment.latencyHistogram}::integer[], ${increment.ttftCount}, ${increment.ttftSumMs},
       ${increment.ttftHistogram}::integer[]
-    )
+    -- The owner key is a durable plain id (relay_request.resourceOwnerUserId):
+    -- a deleted owner's history is gone, so its late increment is skipped
+    -- instead of failing the finalizer on the foreign key.
+    WHERE EXISTS (SELECT 1 FROM "user" WHERE id = ${increment.ownerUserId})
     ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
       "executionTargetId", "source")
     DO UPDATE SET ${updates}`;

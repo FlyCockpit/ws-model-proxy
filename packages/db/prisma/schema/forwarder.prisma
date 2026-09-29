@@ -1530,6 +1530,12 @@ model RelayRequest {
   auxiliaryAttemptCount      Int                     @default(0)
   auxiliaryRequestBytes      BigInt                  @default(0)
   auxiliaryResponseBytes     BigInt                  @default(0)
+  /// Durable owner of the requested resource, for usage attribution: the
+  /// requested pool's owner, else the requester. Derived by the database at
+  /// insert (schema-hardening.sql, derive_relay_request_resource_owner) and
+  /// immutable afterwards, so it survives the pool's deletion. Deliberately a
+  /// plain id, not a foreign key: readers tolerate a deleted owner.
+  resourceOwnerUserId        String?
   User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)

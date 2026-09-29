@@ -89,6 +89,7 @@ integration("usage rollups with real PostgreSQL", () => {
       cacheReadTokens: 4,
       cacheWriteTokens: null,
       usageKnown: true,
+      resourceOwnerUserId: null,
       RequestedModelPool: null,
       SelectedExecutionTarget: null,
       RequestedExecutionTarget: null,

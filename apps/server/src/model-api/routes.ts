@@ -617,6 +617,8 @@ type ResponseStickinessCapture = {
   requester: RelayRequester;
   targetDiscoveredModelId?: string;
   targetModelPoolId?: string;
+  /** Exact grant a grantee reached `targetModelPoolId` through; null for its owner. */
+  poolGrantId?: string | null;
 };
 
 type StickyRoute =
@@ -2679,6 +2681,7 @@ async function writeResponseStickiness({
   responseId,
   targetDiscoveredModelId,
   targetModelPoolId,
+  poolGrantId,
   selectedDiscoveredModelId,
 }: ResponseStickinessCapture & {
   responseId: string;
@@ -2686,6 +2689,10 @@ async function writeResponseStickiness({
 }) {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
   const expiresAt = new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS);
+  // A grantee's pool binding belongs to the owner's graph and is tied to the
+  // exact grant (its deletion cascades the binding away); see the database
+  // consistency trigger for the ownership rule.
+  const boundGrantId = targetModelPoolId ? (poolGrantId ?? null) : null;
   const [targetExecutionTarget, selectedExecutionTarget] = await Promise.all([
     targetDiscoveredModelId
       ? prisma.executionTarget.findUnique({
@@ -2713,6 +2720,7 @@ async function writeResponseStickiness({
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
+      poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
@@ -2723,6 +2731,7 @@ async function writeResponseStickiness({
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
+      poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
@@ -2734,6 +2743,72 @@ async function writeResponseStickiness({
 function stickinessWriteError(error: unknown) {
   void error;
   console.warn("[model-api] responses stickiness write failed");
+}
+
+/**
+ * The local Responses binding write for one served attempt, run at most once.
+ * It waits for the attempt's terminal and writes the binding only for a
+ * successful response whose id was captured. Both the client EOF gate
+ * ({@link holdEofUntilDurable}) and the detached finalizer await the same
+ * write, so a client that disconnects early still gets its binding.
+ */
+function localStickinessPersister(input: {
+  terminal: Promise<{ ok: boolean }>;
+  capture: ReturnType<typeof createResponseIdCapture> | null;
+  streaming: boolean;
+  write: ((responseId: string) => Promise<void>) | null;
+}): (() => Promise<void>) | null {
+  const { capture, write } = input;
+  if (!capture || !write) return null;
+  let persisted: Promise<void> | undefined;
+  return () => {
+    persisted ??= (async () => {
+      const terminal = await input.terminal;
+      if (!terminal.ok) return;
+      const responseId = capture.finish(input.streaming);
+      if (responseId) await write(responseId);
+    })();
+    return persisted;
+  };
+}
+
+/**
+ * Holds the client-visible end of a successful response until `durable`
+ * settles, as the provider path does (captureProviderResponseBinding): a
+ * follow-up sent as soon as EOF is observed can then never race the binding
+ * row. If the write fails, the stream errors instead of ending cleanly, so
+ * the client never sees a completed response it cannot continue.
+ */
+function holdEofUntilDurable(
+  body: ReadableStream<Uint8Array>,
+  durable: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (!next.done) {
+          controller.enqueue(next.value);
+          return;
+        }
+      } catch (error) {
+        controller.error(error);
+        return;
+      }
+      try {
+        await durable();
+      } catch (error) {
+        stickinessWriteError(error);
+        controller.error(new Error("Response routing metadata could not be persisted"));
+        return;
+      }
+      controller.close();
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
 }
 
 function reportCleanupFailures(results: readonly PromiseSettledResult<unknown>[]) {
@@ -3056,7 +3131,20 @@ async function resolveStickyRoute({
   if (record.targetModelPoolId) {
     const visibleTarget =
       targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null;
-    if (!visibleTarget) {
+    // Honor a local pool binding only through the access that created it: the
+    // owner's own (no grant), or the grantee's same live exact grant. A
+    // replaced grant never resurrects an older binding.
+    const recordGrantId = record.poolGrantId ?? null;
+    const sameAccess =
+      visibleTarget !== null &&
+      visibleTarget.accessGrantId === recordGrantId &&
+      (recordGrantId === null
+        ? visibleTarget.ownerUserId === requester.userId
+        : record.PoolGrant?.id === recordGrantId &&
+          record.PoolGrant.poolId === visibleTarget.id &&
+          record.PoolGrant.ownerUserId === visibleTarget.ownerUserId &&
+          record.PoolGrant.granteeUserId === requester.userId);
+    if (!visibleTarget || !sameAccess) {
       return openAiFailureJsonResponse(
         "access_denied",
         "Response routing metadata is no longer accessible.",
@@ -3099,6 +3187,50 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
     if (!discoveredModel) return [];
     return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
   });
+}
+
+/**
+ * The local pool send boundary: the last step before a local pool attempt is
+ * dispatched, after every wait (capacity admission, limiter). Pool access is
+ * resolved at arrival, so a revocation or member removal that committed while
+ * the request waited would otherwise still be served. Re-reads from current
+ * state that the requester still reaches the pool through the exact access
+ * the request was resolved under (the owner with no grant, or the grantee's
+ * same grant row: a replacement grant is different access), and that the
+ * member is still a local (PRIMARY) member of the pool and not DISABLED.
+ *
+ * Unlocked on purpose: nothing may hold database locks across relay I/O. A
+ * revoke or removal that commits before these reads is refused here; one
+ * that commits afterwards is ordered after the send, as for the provider send
+ * boundary (claimPublicProviderCredentialForSend).
+ */
+async function localPoolSendDenial(input: {
+  poolId: string;
+  ownerUserId: string;
+  requesterUserId: string;
+  accessGrantId: string | null;
+  poolMemberId: string;
+}): Promise<"ACCESS_REVOKED" | "MEMBER_UNAVAILABLE" | null> {
+  const requesterIsOwner = input.requesterUserId === input.ownerUserId;
+  if (requesterIsOwner !== (input.accessGrantId === null)) return "ACCESS_REVOKED";
+  const [grant, members] = await Promise.all([
+    input.accessGrantId === null
+      ? null
+      : prisma.poolGrant.findFirst({
+          where: {
+            id: input.accessGrantId,
+            poolId: input.poolId,
+            ownerUserId: input.ownerUserId,
+            granteeUserId: input.requesterUserId,
+          },
+          select: { id: true },
+        }),
+    poolMemberRows(input.poolId),
+  ]);
+  if (input.accessGrantId !== null && grant?.id !== input.accessGrantId) return "ACCESS_REVOKED";
+  const member = members.find((row) => row.id === input.poolMemberId);
+  if (!member || member.routingStatus === "DISABLED") return "MEMBER_UNAVAILABLE";
+  return null;
 }
 
 /**
@@ -3648,15 +3780,35 @@ async function relayDirect({
 
   try {
     const started = await attempt.started;
+    const stickiness = operation.responseStickiness;
+    // The client sees EOF only once this response's binding is durable.
+    const persistBinding = localStickinessPersister({
+      terminal: attempt.terminal.catch(() => rejectedRelayTerminal()),
+      capture: responseIdCapture,
+      streaming: operation.stream,
+      write: stickiness
+        ? (responseId) =>
+            writeResponseStickiness({
+              ...stickiness,
+              responseId,
+              targetDiscoveredModelId: target.id,
+              selectedDiscoveredModelId: selected.id,
+            })
+        : null,
+    });
+    const responseBody = responseBodyForOperation({
+      body: started.body,
+      headers: started.headers,
+      terminal: attempt.terminal,
+      operation,
+    });
     const response = responseWithFirstClientByte(
       new Response(
-        responseBodyForOperation({
-          body: started.body,
+        persistBinding ? holdEofUntilDurable(responseBody, persistBinding) : responseBody,
+        {
+          status: started.status,
           headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
-        }),
-        { status: started.status, headers: started.headers },
+        },
       ),
       () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
@@ -3683,7 +3835,6 @@ async function relayDirect({
           operation.dispose?.() ?? Promise.resolve(),
         ]);
         reportCleanupFailures(cleanup);
-        const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         await Promise.allSettled([
           updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
@@ -3694,14 +3845,7 @@ async function relayDirect({
             localExecution,
             userId: requester.userId,
           }).catch(metadataUpdateError),
-          terminal.ok && responseId && operation.responseStickiness
-            ? writeResponseStickiness({
-                ...operation.responseStickiness,
-                responseId,
-                targetDiscoveredModelId: target.id,
-                selectedDiscoveredModelId: selected.id,
-              }).catch(stickinessWriteError)
-            : Promise.resolve(),
+          persistBinding ? persistBinding().catch(stickinessWriteError) : Promise.resolve(),
         ]);
       })
       .catch(metadataUpdateError);
@@ -5183,6 +5327,44 @@ async function relayPool({
       break;
     }
 
+    // Send boundary: pool access and membership were resolved before the
+    // admission and limiter waits, which are all behind us now. It runs
+    // before a half-open trial is claimed, so a denial never strands a
+    // claim. A revoked grant ends the request; a member removed or disabled
+    // meanwhile is skipped like any other unavailable member. A failed read
+    // is a denial (never a pass) and ends the request.
+    let sendDenial: Awaited<ReturnType<typeof localPoolSendDenial>> | "CHECK_FAILED";
+    try {
+      sendDenial = await localPoolSendDenial({
+        poolId: target.id,
+        ownerUserId: target.ownerUserId,
+        requesterUserId: requester.userId,
+        accessGrantId: target.accessGrantId,
+        poolMemberId: member.id,
+      });
+    } catch {
+      sendDenial = "CHECK_FAILED";
+    }
+    if (sendDenial) {
+      await settleRelayCleanup([() => cliLease.release()]);
+      await releaseCapacityAttempt();
+      if (sendDenial === "MEMBER_UNAVAILABLE") {
+        finalFailure = "not_found";
+        continue;
+      }
+      const failure: RelayFailure = sendDenial === "CHECK_FAILED" ? "unknown" : "not_found";
+      await settleRelayCleanup([() => globalLease?.release(), () => operation.dispose?.()]);
+      await failPoolRelayMetadata({
+        relayRequestId,
+        startedAt,
+        failure,
+        attemptCount,
+        requestBytes: cumulativeRequestBytes,
+        responseBytes: cumulativeResponseBytes,
+      }).catch(metadataUpdateError);
+      return operationFailureResponse(operation, failure);
+    }
+
     if (candidate.healthStatus === "HALF_OPEN") {
       let claimed: number;
       try {
@@ -5622,12 +5804,51 @@ async function relayPool({
             );
         }
       }
+      // The adapted outcome decides success: an adaptation failure is not a
+      // successful response and writes no binding.
+      const attemptOutcome = Promise.allSettled([attempt.terminal, adaptationCompletion]).then(
+        ([terminalResult, adaptationResult]) => {
+          const upstreamTerminal =
+            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
+          const adaptationOutcome =
+            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
+          const terminal: RelayAttemptTerminal =
+            adaptationOutcome !== "ok" && upstreamTerminal.ok
+              ? {
+                  ...upstreamTerminal,
+                  ok: false,
+                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
+                }
+              : upstreamTerminal;
+          return { upstreamTerminal, adaptationOutcome, terminal };
+        },
+      );
+      const stickiness = operation.responseStickiness;
+      // The client sees EOF only once this response's binding is durable.
+      const persistBinding = localStickinessPersister({
+        terminal: attemptOutcome.then(({ terminal }) => terminal),
+        capture: responseIdCapture,
+        streaming: operation.stream,
+        write: stickiness
+          ? (responseId) =>
+              writeResponseStickiness({
+                ...stickiness,
+                responseId,
+                targetModelPoolId: target.id,
+                poolGrantId: target.accessGrantId,
+                selectedDiscoveredModelId: member.discoveredModelId,
+              })
+          : null,
+      });
       const response = responseWithFirstClientByte(
-        new Response(responseBody, {
-          status:
-            nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
-          headers: responseHeaders,
-        }),
+        new Response(
+          persistBinding ? holdEofUntilDurable(responseBody, persistBinding) : responseBody,
+          {
+            status:
+              nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
+            headers: responseHeaders,
+          },
+        ),
         () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
       );
       const served =
@@ -5645,20 +5866,8 @@ async function relayPool({
       // attempt's single claimant: it either records the error the client
       // receives or finalizes only the attempt and moves on to the next
       // member, whose attempt then decides the request's outcome.
-      const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
-        .then(async ([terminalResult, adaptationResult]) => {
-          const upstreamTerminal =
-            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
-          const adaptationOutcome =
-            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
-          const terminal: RelayAttemptTerminal =
-            adaptationOutcome !== "ok" && upstreamTerminal.ok
-              ? {
-                  ...upstreamTerminal,
-                  ok: false,
-                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
-                }
-              : upstreamTerminal;
+      const finalize = attemptOutcome
+        .then(async ({ upstreamTerminal, adaptationOutcome, terminal }) => {
           const cumulativeTerminal = {
             ...terminal,
             requestBytes: cumulativeRequestBytes + terminal.requestBytes,
@@ -5673,7 +5882,6 @@ async function relayPool({
             operation.dispose?.() ?? Promise.resolve(),
           ]);
           reportCleanupFailures(cleanup);
-          const responseId = responseIdCapture?.finish(operation.stream) ?? null;
           // The relay executor retains the bounded prefix and tail windows of
           // THIS attempt's response (per-attempt, so retries cannot
           // contaminate each other's evidence); the prefix keeps early usage
@@ -5733,14 +5941,7 @@ async function relayPool({
                 reason: selectedAffinityReason,
               },
             }).catch(metadataUpdateError),
-            terminal.ok && responseId && operation.responseStickiness
-              ? writeResponseStickiness({
-                  ...operation.responseStickiness,
-                  responseId,
-                  targetModelPoolId: target.id,
-                  selectedDiscoveredModelId: member.discoveredModelId,
-                }).catch(stickinessWriteError)
-              : Promise.resolve(),
+            persistBinding ? persistBinding().catch(stickinessWriteError) : Promise.resolve(),
             terminal.ok && requestedSurface && affinityPayload && affinityTarget
               ? rememberAffinity({
                   ownerId: requester.userId,
@@ -5865,6 +6066,7 @@ async function relaySelectedModelNoFailover({
   selectedDiscoveredModelId,
   requestedDiscoveredModelId,
   requestedModelPoolId,
+  poolAccess,
   operation,
   manager,
   limiter,
@@ -5875,6 +6077,8 @@ async function relaySelectedModelNoFailover({
   selectedDiscoveredModelId: string;
   requestedDiscoveredModelId?: string;
   requestedModelPoolId?: string;
+  /** How the requester reaches `requestedModelPoolId`: re-checked at the send boundary. */
+  poolAccess?: { ownerUserId: string; accessGrantId: string | null };
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
@@ -5929,6 +6133,17 @@ async function relaySelectedModelNoFailover({
         (member) => member.discoveredModelId === selectedDiscoveredModelId,
       )
     : undefined;
+  // A pool binding is honored only while its member is still a local member
+  // of that pool and not disabled; a removed member is no longer reachable
+  // through the pool (or its grant), even for a stored response.
+  if (
+    requestedModelPoolId &&
+    (!selectedPoolMember || selectedPoolMember.routingStatus === "DISABLED")
+  ) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
+    return operationFailureResponse(operation, "not_found");
+  }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
@@ -5947,6 +6162,7 @@ async function relaySelectedModelNoFailover({
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
+          poolId: requestedModelPoolId,
           basePriority: 16,
           connectionOwner: "model-api",
           deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
@@ -6017,6 +6233,42 @@ async function relaySelectedModelNoFailover({
     });
     return operationFailureResponse(operation, "unknown");
   }
+  // Send boundary: the binding's pool access and member were resolved before
+  // the admission wait. A grant revoked or replaced, or a member removed or
+  // disabled meanwhile, is refused like at arrival (404), before any send.
+  // A failed read is a denial, never a pass.
+  if (requestedModelPoolId) {
+    let failure: RelayFailure | null = "not_found";
+    if (poolAccess && selectedPoolMember) {
+      try {
+        failure = (await localPoolSendDenial({
+          poolId: requestedModelPoolId,
+          ownerUserId: poolAccess.ownerUserId,
+          requesterUserId: requester.userId,
+          accessGrantId: poolAccess.accessGrantId,
+          poolMemberId: selectedPoolMember.id,
+        }))
+          ? "not_found"
+          : null;
+      } catch {
+        failure = "unknown";
+      }
+    }
+    if (failure) {
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => globalLease.release(),
+        () =>
+          capacityLease?.state === "ADMITTED"
+            ? capacityRuntime?.release(capacityLease.lease)
+            : undefined,
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+        () => operation.dispose?.(),
+      ]);
+      await failRelayMetadata({ relayRequestId, startedAt, failure });
+      return operationFailureResponse(operation, failure);
+    }
+  }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
@@ -6083,15 +6335,34 @@ async function relaySelectedModelNoFailover({
 
   try {
     const started = await attempt.started;
+    const stickiness = operation.responseStickiness;
+    // The client sees EOF only once this response's binding is durable.
+    const persistBinding = localStickinessPersister({
+      terminal: attempt.terminal.catch(() => rejectedRelayTerminal()),
+      capture: responseIdCapture,
+      streaming: operation.stream,
+      write: stickiness
+        ? (responseId) =>
+            writeResponseStickiness({
+              ...stickiness,
+              responseId,
+              selectedDiscoveredModelId: selected.id,
+            })
+        : null,
+    });
+    const responseBody = responseBodyForOperation({
+      body: started.body,
+      headers: started.headers,
+      terminal: attempt.terminal,
+      operation,
+    });
     const response = responseWithFirstClientByte(
       new Response(
-        responseBodyForOperation({
-          body: started.body,
+        persistBinding ? holdEofUntilDurable(responseBody, persistBinding) : responseBody,
+        {
+          status: started.status,
           headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
-        }),
-        { status: started.status, headers: started.headers },
+        },
       ),
       () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
@@ -6118,7 +6389,6 @@ async function relaySelectedModelNoFailover({
           operation.dispose?.() ?? Promise.resolve(),
         ]);
         reportCleanupFailures(cleanup);
-        const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         await Promise.allSettled([
           updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
@@ -6129,13 +6399,7 @@ async function relaySelectedModelNoFailover({
             localExecution,
             userId: requester.userId,
           }).catch(metadataUpdateError),
-          terminal.ok && responseId && operation.responseStickiness
-            ? writeResponseStickiness({
-                ...operation.responseStickiness,
-                responseId,
-                selectedDiscoveredModelId: selected.id,
-              }).catch(stickinessWriteError)
-            : Promise.resolve(),
+          persistBinding ? persistBinding().catch(stickinessWriteError) : Promise.resolve(),
         ]);
       })
       .catch(metadataUpdateError);
@@ -7778,6 +8042,13 @@ export async function responsesCreateHandler({
       stickyRoute.target === "DIRECT_MODEL" ? stickyRoute.visibleTarget.id : undefined,
     requestedModelPoolId:
       stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.id : undefined,
+    poolAccess:
+      stickyRoute.target === "MODEL_POOL"
+        ? {
+            ownerUserId: stickyRoute.visibleTarget.ownerUserId,
+            accessGrantId: stickyRoute.visibleTarget.accessGrantId,
+          }
+        : undefined,
     operation: {
       ...operation,
       stream: prepared.stream,
@@ -7788,6 +8059,8 @@ export async function responsesCreateHandler({
           stickyRoute.target === "DIRECT_MODEL" ? stickyRoute.visibleTarget.id : undefined,
         targetModelPoolId:
           stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.id : undefined,
+        poolGrantId:
+          stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.accessGrantId : null,
       },
     },
     manager,
@@ -7905,6 +8178,13 @@ async function responsesStickyHandler({
       stickyRoute.target === "DIRECT_MODEL" ? stickyRoute.visibleTarget.id : undefined,
     requestedModelPoolId:
       stickyRoute.target === "MODEL_POOL" ? stickyRoute.visibleTarget.id : undefined,
+    poolAccess:
+      stickyRoute.target === "MODEL_POOL"
+        ? {
+            ownerUserId: stickyRoute.visibleTarget.ownerUserId,
+            accessGrantId: stickyRoute.visibleTarget.accessGrantId,
+          }
+        : undefined,
     operation: {
       family: "responses",
       method,

@@ -129,6 +129,18 @@ revoked or replaced) gives `404`, whether detected on arrival or at the send
 boundary. Re-granting access cannot revive an old binding. `:external`
 follow-ups to locally served responses stay on their local member.
 
+Locally served responses work the same way for owners and grantees: a
+follow-up returns to the member (and backend) that stored the response. A
+grantee's binding is tied to their exact grant, so revoking or replacing the
+grant removes it (`404` afterwards). A member that was removed from the pool or
+disabled is no longer reachable through the binding (`404`); a draining member
+still serves its follow-ups. These checks run again right before the request is
+sent, so a revoke or removal while a request waits for capacity also gives
+`404`. A locally served response ends only once its follow-up binding is
+saved. If the binding cannot be saved (for example, the member was removed or
+the grant revoked while the response was generated), the response ends with a
+stream error instead of a clean end, because it could not be continued.
+
 ## Breaking changes in this release
 
 The consolidated upgrade notes, including deploy requirements and the grantee

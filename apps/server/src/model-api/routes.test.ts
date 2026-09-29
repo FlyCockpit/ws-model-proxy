@@ -120,6 +120,7 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     findMany: MockInstance;
   };
+  poolGrant: { findFirst: MockInstance };
   poolMember: {
     findMany: MockInstance;
     findUnique: MockInstance;
@@ -734,6 +735,10 @@ describe("model API routes", () => {
     db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
+    // The local pool send boundary re-reads the exact grant: it still exists.
+    db.poolGrant.findFirst.mockImplementation(async ({ where }: { where: { id: string } }) => ({
+      id: where.id,
+    }));
     affinity.rank.mockImplementation(async ({ targets }) => ({
       orderedTargetIds: targets.map(
         (target: { executionTargetId: string }) => target.executionTargetId,
@@ -9144,6 +9149,500 @@ describe("model API routes", () => {
     await response.text();
     expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
+  });
+
+  describe("grantee local Responses bindings", () => {
+    const granteePool: VisibleModelPoolTarget = {
+      ...poolTarget,
+      ownerUserId: "pool-owner-id",
+      accessGrantId: "grant-id",
+    };
+    const granteeBinding = (overrides: Record<string, unknown> = {}) => ({
+      routingVersion: 2,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      poolGrantId: "grant-id",
+      PoolGrant: {
+        id: "grant-id",
+        poolId: "pool-id",
+        ownerUserId: "pool-owner-id",
+        granteeUserId: "user-id",
+      },
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      expiresAt: new Date(Date.now() + 60_000),
+      ...overrides,
+    });
+    const memberA = (
+      overrides: {
+        routingStatus?: "ACTIVE" | "DRAINING" | "DISABLED";
+        countStrategy?: "CONSERVATIVE_ESTIMATE";
+      } = {},
+    ) =>
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        ...overrides,
+      });
+    const followUp = (manager: FakeRelayManager) =>
+      appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: granteePool.modelId,
+          previous_response_id: "resp_local",
+          input: "next",
+        }),
+      });
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [granteePool],
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+      );
+    });
+
+    it("binds a grantee's locally served response to its exact grant", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_local", object: "response" }));
+      manager.complete(sent.requestId);
+      expect((await responsePromise).status).toBe(200);
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+      const upsert = db.responseStickinessRecord.upsert.mock.calls[0]?.[0];
+      expect(upsert).toMatchObject({
+        create: {
+          routingVersion: 2,
+          userId: "user-id",
+          targetModelPoolId: "pool-id",
+          poolGrantId: "grant-id",
+          selectedDiscoveredModelId: "model-a",
+        },
+        update: { targetModelPoolId: "pool-id", poolGrantId: "grant-id" },
+      });
+    });
+
+    it("sticks a grantee follow-up to its member and re-binds it to the same grant", async () => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      db.poolMember.findMany.mockResolvedValue([memberA({ routingStatus: "DRAINING" })]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = followUp(manager);
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.cliDeviceId).toBe("cli-a");
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_next", object: "response" }));
+      manager.complete(sent.requestId);
+      expect((await responsePromise).status).toBe(200);
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+      expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0]).toMatchObject({
+        create: { targetModelPoolId: "pool-id", poolGrantId: "grant-id" },
+      });
+    });
+
+    it.each([
+      ["a replaced grant", { poolGrantId: "old-grant", PoolGrant: null }],
+      [
+        "a grant for another grantee",
+        {
+          PoolGrant: {
+            id: "grant-id",
+            poolId: "pool-id",
+            ownerUserId: "pool-owner-id",
+            granteeUserId: "someone-else",
+          },
+        },
+      ],
+      ["an owner-style binding without a grant", { poolGrantId: null, PoolGrant: null }],
+    ])("does not honor a grantee binding through %s", async (_name, overrides) => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding(overrides));
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await followUp(manager);
+      // access_denied: the binding is no longer reachable through this access.
+      expect(response.status).toBe(401);
+      expect(manager.sent).toEqual([]);
+    });
+
+    it.each([
+      ["removed from the pool", []],
+      ["disabled", [memberA({ routingStatus: "DISABLED" })]],
+    ])("does not route a follow-up to a member %s", async (_name, members) => {
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      db.poolMember.findMany.mockResolvedValue(members);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await followUp(manager);
+      expect(response.status).toBe(404);
+      expect(manager.sent).toEqual([]);
+    });
+
+    const serveCreate = async (manager: FakeRelayManager) => {
+      const responsePromise = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_local", object: "response" }));
+      manager.complete(sent.requestId);
+      return responsePromise;
+    };
+
+    it("ends a served response only once its binding is durable", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      let persist!: () => void;
+      db.responseStickinessRecord.upsert.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            persist = () => resolve({ id: "stickiness-id" });
+          }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await serveCreate(manager);
+      expect(response.status).toBe(200);
+      let ended = false;
+      const text = response.text().then((body) => {
+        ended = true;
+        return body;
+      });
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalledOnce());
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(ended).toBe(false);
+      persist();
+      expect(JSON.parse(await text)).toMatchObject({ id: "resp_local" });
+    });
+
+    it("errors a served response whose binding cannot be persisted", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      db.responseStickinessRecord.upsert.mockRejectedValueOnce(new Error("write failed"));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await serveCreate(manager);
+      expect(response.status).toBe(200);
+      await expect(response.text()).rejects.toThrow();
+      warn.mockRestore();
+    });
+
+    it("refuses a grantee request whose grant is revoked before the send", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      db.poolGrant.findFirst.mockResolvedValue(null);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      expect(response.status).toBe(404);
+      expect(manager.sent).toEqual([]);
+      expect(db.poolGrant.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: "grant-id",
+            poolId: "pool-id",
+            ownerUserId: granteePool.ownerUserId,
+            granteeUserId: "user-id",
+          },
+        }),
+      );
+    });
+
+    it.each([
+      ["its grant is revoked", () => db.poolGrant.findFirst.mockResolvedValue(null)],
+      [
+        "its member is removed",
+        () => db.poolMember.findMany.mockResolvedValueOnce([memberA()]).mockResolvedValue([]),
+      ],
+      [
+        "its member is disabled",
+        () =>
+          db.poolMember.findMany
+            .mockResolvedValueOnce([memberA()])
+            .mockResolvedValue([memberA({ routingStatus: "DISABLED" })]),
+      ],
+    ])(
+      "refuses a follow-up at the send boundary when %s after resolution",
+      async (_name, arrange) => {
+        db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        db.poolMember.findMany.mockResolvedValue([memberA()]);
+        arrange();
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const response = await followUp(manager);
+        expect(response.status).toBe(404);
+        expect(manager.sent).toEqual([]);
+      },
+    );
+    // Counts limiter leases taken and not yet released.
+    const trackLeases = (limiter: InstanceType<typeof ModelApiConcurrencyLimiter>) => {
+      let outstanding = 0;
+      const track = <T extends { release(): void }>(lease: T): T => {
+        outstanding += 1;
+        let released = false;
+        const release = lease.release.bind(lease);
+        lease.release = () => {
+          if (!released) outstanding -= 1;
+          released = true;
+          release();
+        };
+        return lease;
+      };
+      const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+      const acquireCli = limiter.acquireCli.bind(limiter);
+      vi.spyOn(limiter, "acquireGlobal").mockImplementation((input) => track(acquireGlobal(input)));
+      vi.spyOn(limiter, "acquireCli").mockImplementation((id) => track(acquireCli(id)));
+      return () => outstanding;
+    };
+
+    it.each([
+      ["a create", false, false],
+      ["an admitted create", false, true],
+      ["a follow-up", true, false],
+      ["an admitted follow-up", true, true],
+    ])(
+      "treats a failed send-boundary read on %s as a denial and releases every lease",
+      async (_name, isFollowUp, withRuntime) => {
+        // A local estimate, so an admitted create needs no native count relay.
+        db.poolMember.findMany.mockResolvedValue([
+          memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+        ]);
+        if (isFollowUp) db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        db.poolGrant.findFirst.mockRejectedValue(new Error("connection pool timeout"));
+        const limiter = new ModelApiConcurrencyLimiter();
+        const outstanding = trackLeases(limiter);
+        const runtime = admittingCapacityRuntime();
+        const manager = new FakeRelayManager();
+        manager.activeCliDeviceIds = ["cli-a"];
+        const response = await appWith(manager, withRuntime ? runtime : undefined, limiter).request(
+          "/responses",
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer wsmp_model_test",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(
+              isFollowUp
+                ? { model: granteePool.modelId, previous_response_id: "resp_local", input: "next" }
+                : { model: granteePool.modelId, input: "first" },
+            ),
+          },
+        );
+        expect(response.status).toBe(500);
+        expect(manager.sent).toEqual([]);
+        expect(outstanding()).toBe(0);
+        if (withRuntime) {
+          expect(runtime.acquire).toHaveBeenCalledOnce();
+          expect(runtime.release).toHaveBeenCalledOnce();
+        }
+        // The request is finalized as failed, not left pending.
+        expect(stringifyPersistenceCalls(db.relayRequest.update.mock.calls)).toContain('"FAILED"');
+      },
+    );
+
+    it("checks the send boundary before claiming a half-open trial", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      db.poolGrant.findFirst.mockResolvedValue(null);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const response = await appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      expect(response.status).toBe(404);
+      expect(manager.sent).toEqual([]);
+      // No trial was claimed, so none is left stranded.
+      expect(updateMany).not.toHaveBeenCalled();
+    });
+
+    it("skips a member removed before the send and serves the request from the next member", async () => {
+      const memberB = poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+        weight: 1,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      });
+      const first = poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        weight: 10,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      });
+      // Routing sees both members; by the send boundary member-a is gone.
+      db.poolMember.findMany.mockResolvedValueOnce([first, memberB]).mockResolvedValue([memberB]);
+      const limiter = new ModelApiConcurrencyLimiter();
+      const outstanding = trackLeases(limiter);
+      const runtime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager, runtime, limiter).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.cliDeviceId).toBe("cli-b");
+      replyJson(manager, sent.requestId);
+      expect((await responsePromise).status).toBe(200);
+      // Both candidates reached the send boundary: member-a first, then member-b.
+      expect(db.poolMember.findMany).toHaveBeenCalledTimes(3);
+      // member-a's admission was released before member-b was admitted.
+      expect(runtime.acquire).toHaveBeenCalledTimes(2);
+      expect(runtime.release).toHaveBeenCalled();
+      const releasedFirst = (runtime.release as unknown as MockInstance).mock
+        .invocationCallOrder[0]!;
+      const acquiredSecond = (runtime.acquire as unknown as MockInstance).mock
+        .invocationCallOrder[1]!;
+      expect(releasedFirst).toBeLessThan(acquiredSecond);
+      await (await responsePromise).text();
+      await vi.waitFor(() => expect(outstanding()).toBe(0));
+    });
+
+    it("writes no binding for a failed response even when its id was captured", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: granteePool.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_failed", object: "response" }));
+      manager.error(sent.requestId, "transport");
+      const response = await responsePromise;
+      await response.text().catch(() => undefined);
+      await vi.waitFor(() => expect(db.relayRequest.update).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(db.responseStickinessRecord.upsert).not.toHaveBeenCalled();
+    });
+
+    const holdsEofUntilDurable = async (
+      body: Record<string, unknown>,
+      reply: (manager: FakeRelayManager, requestId: string) => void,
+      expectedId: string,
+    ) => {
+      let persist!: () => void;
+      db.responseStickinessRecord.upsert.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            persist = () => resolve({ id: "stickiness-id" });
+          }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      reply(manager, requireSent(manager).requestId);
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      let ended = false;
+      const text = response.text().then((value) => {
+        ended = true;
+        return value;
+      });
+      await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalledOnce());
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(ended).toBe(false);
+      persist();
+      expect(await text).toContain(expectedId);
+    };
+    const replyJson = (manager: FakeRelayManager, requestId: string) => {
+      manager.headers(requestId, 200, { "content-type": "application/json" });
+      manager.body(requestId, JSON.stringify({ id: "resp_next", object: "response" }));
+      manager.complete(requestId);
+    };
+
+    it("holds a follow-up's EOF until its binding is durable", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      await holdsEofUntilDurable(
+        { model: granteePool.modelId, previous_response_id: "resp_local", input: "next" },
+        replyJson,
+        "resp_next",
+      );
+    });
+
+    it("holds a streaming follow-up's EOF until its binding is durable", async () => {
+      db.poolMember.findMany.mockResolvedValue([memberA()]);
+      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      await holdsEofUntilDurable(
+        {
+          model: granteePool.modelId,
+          previous_response_id: "resp_local",
+          input: "next",
+          stream: true,
+        },
+        (manager, requestId) => {
+          manager.headers(requestId, 200, { "content-type": "text/event-stream" });
+          for (const type of ["response.created", "response.completed"])
+            manager.body(
+              requestId,
+              `event: ${type}\ndata: ${JSON.stringify({ type, response: { id: "resp_sse" } })}\n\n`,
+            );
+          manager.complete(requestId);
+        },
+        "resp_sse",
+      );
+    });
+
+    it("holds a direct create's EOF until its binding is durable", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [{ ...directTarget, id: "model-a" }],
+        modelPools: [],
+      });
+      await holdsEofUntilDurable(
+        { model: directTarget.modelId, input: "first" },
+        replyJson,
+        "resp_next",
+      );
+    });
   });
 
   describe("pool media transformer", () => {
