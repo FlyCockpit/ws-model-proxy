@@ -86,4 +86,7 @@ pub enum Command {
 
     /// Approve browser identities and show the CLI identity for terminals.
     Terminal(crate::commands::terminal::Args),
+
+    /// List, test and approve custom metric sources.
+    Metrics(crate::commands::metrics::Args),
 }

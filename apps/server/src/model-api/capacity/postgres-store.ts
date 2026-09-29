@@ -11,6 +11,7 @@ import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy
 import {
   type AdmissionSnapshot,
   type GrantPlan,
+  inWindow,
   type PlannedGrant,
   type PlannerWaiter,
   planGrants,
@@ -454,6 +455,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
+            metricFailOpen: attempt.metricFailOpen ?? true,
             Waiters: {
               create: resolvedCandidates.map((candidate, index) => ({
                 userId: attempt.ownerId,
@@ -771,6 +773,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     now: Date,
     /** The attempt created in this transaction: its zero-budget waiters are still eligible. */
     creatingRequestId: string | undefined,
+    /** Deferred waiters owed a last-chance check in this pass (planner exception). */
+    lastChanceWaiterIds: readonly string[],
     projections: RelayAdmissionProjection[],
   ): Promise<{
     snapshot: AdmissionSnapshot;
@@ -870,7 +874,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { id: { in: ids }, AdmissionRequest: { state: "WAITING" } },
         include: {
           AdmissionRequest: {
-            select: { requestId: true, attemptId: true, enqueueSequence: true, deadlineAt: true },
+            select: {
+              requestId: true,
+              attemptId: true,
+              enqueueSequence: true,
+              deadlineAt: true,
+              metricFailOpen: true,
+            },
           },
         },
       });
@@ -885,13 +895,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     // No foreign key keeps the graph behind a waiter (DL-1 design (d)): a
     // candidate whose target, member or pool was deleted, or whose target
     // moved to another capacity, is cancelled here instead of planned.
-    const waiters = await this.#dropOrphanedWaiters(
+    const livingWaiters = await this.#dropOrphanedWaiters(
       tx,
       capacityId,
       queuedWaiters,
       now,
       projections,
     );
+    // Metric routing (S-B part 2): a waiter whose member is metric-FULL is not
+    // planned, unless its whole request fails open (see #metricFullWaiterIds).
+    const metricFull = await this.#metricFullWaiterIds(tx, livingWaiters, now, {
+      creatingRequestId,
+      lastChance: new Set(lastChanceWaiterIds),
+    });
+    const waiters = livingWaiters.filter((waiter) => !metricFull.has(waiter.id));
     const configuredReservationMembers = await tx.poolMember.findMany({
       // Every PRIMARY (always local) execution target sharing this physical
       // capacity takes part in the same reservation accounting. External
@@ -1028,6 +1045,131 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       rows,
       userId: capacity.userId,
     };
+  }
+
+  /**
+   * Waiters that must not be granted because their pool member is
+   * metric-FULL (a fresh `full` verdict in `pool_member_routing_verdict`).
+   *
+   * Plain, non-locking reads only: the verdict table is H-class (no foreign
+   * keys, written by the relay's rule evaluator outside any capacity lock),
+   * and the sibling-waiter read takes no row lock, so this adds no lock-order
+   * edge to the admission transaction (DL-1).
+   *
+   * Fail open per request: when every live candidate of a request is
+   * metric-FULL, metric FULL is ignored for that request and it falls back to
+   * lease-only admission, so a plain-name caller never waits on a queue that
+   * a metric keeps from draining. A request created with
+   * `metricFailOpen = false` (an `:external` caller's shortened local phase)
+   * does not fail open: its wait ends at externalAfterWaitMs and it goes
+   * external through the existing LOCAL_WAIT_EXPIRED path.
+   */
+  async #metricFullWaiterIds(
+    tx: Prisma.TransactionClient,
+    waiters: ReadonlyArray<{
+      id: string;
+      admissionRequestId: string;
+      poolMemberId: string | null;
+      AdmissionRequest: { metricFailOpen: boolean };
+    }>,
+    now: Date,
+    /** The planner's eligibility exceptions for this pass; siblings are judged by the same rule. */
+    window: { creatingRequestId: string | undefined; lastChance: ReadonlySet<string> },
+  ): Promise<Set<string>> {
+    const memberIds = [
+      ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
+    ];
+    if (memberIds.length === 0) return new Set();
+    const fullMembers = await metricFullMemberIds(tx, memberIds, now);
+    if (fullMembers.size === 0) return new Set();
+    const blocked = waiters.filter(
+      (waiter) => waiter.poolMemberId !== null && fullMembers.has(waiter.poolMemberId),
+    );
+    const failOpenCandidates = [
+      ...new Set(
+        blocked
+          .filter((waiter) => waiter.AdmissionRequest.metricFailOpen)
+          .map((waiter) => waiter.admissionRequestId),
+      ),
+    ];
+    const failOpen = new Set<string>();
+    if (failOpenCandidates.length > 0) {
+      // Every live sibling, by the PLANNER's own window rule (creating and
+      // last-chance exceptions, request deadline): a sibling the planner would
+      // still grant is a real alternative and blocks the fail-open.
+      const siblingRows = await tx.capacityWaiter.findMany({
+        where: {
+          admissionRequestId: { in: failOpenCandidates },
+          state: "WAITING",
+          AdmissionRequest: { state: "WAITING" },
+        },
+        select: {
+          id: true,
+          admissionRequestId: true,
+          poolMemberId: true,
+          deadlineAt: true,
+          notBefore: true,
+          AdmissionRequest: { select: { deadlineAt: true, heartbeatAt: true } },
+        },
+      });
+      // A sibling is live by the planner's window for THIS pass, or because
+      // its owner is still owed the last-chance check (release and reclaim
+      // passes do not carry the owner's last-chance set, so it is derived
+      // from the rows exactly as `acquire` derives it: deferred, `notBefore`
+      // after the owner's previous poll, deadline reached). Such a waiter
+      // stays WAITING until its owner polls, so it is still a real
+      // alternative to the metric-FULL member.
+      const siblings = siblingRows.filter((sibling) => {
+        const requestOpen =
+          sibling.AdmissionRequest.deadlineAt === null || sibling.AdmissionRequest.deadlineAt > now;
+        const owedLastChance =
+          requestOpen &&
+          sibling.notBefore !== null &&
+          sibling.notBefore > sibling.AdmissionRequest.heartbeatAt &&
+          sibling.deadlineAt !== null &&
+          sibling.deadlineAt <= now;
+        return (
+          owedLastChance ||
+          inWindow(
+            {
+              waiterId: sibling.id,
+              admissionRequestId: sibling.admissionRequestId,
+              deadlineAt: sibling.deadlineAt,
+              requestDeadlineAt: sibling.AdmissionRequest.deadlineAt,
+            },
+            now,
+            window.creatingRequestId,
+            window.lastChance,
+          )
+        );
+      });
+      const unknownMembers = [
+        ...new Set(
+          siblings.flatMap((sibling) =>
+            sibling.poolMemberId && !memberIds.includes(sibling.poolMemberId)
+              ? [sibling.poolMemberId]
+              : [],
+          ),
+        ),
+      ];
+      for (const id of await metricFullMemberIds(tx, unknownMembers, now)) fullMembers.add(id);
+      for (const requestId of failOpenCandidates) {
+        const candidates = siblings.filter((sibling) => sibling.admissionRequestId === requestId);
+        if (
+          candidates.every(
+            (sibling) => sibling.poolMemberId !== null && fullMembers.has(sibling.poolMemberId),
+          )
+        ) {
+          failOpen.add(requestId);
+          logMetricFailOpen(requestId);
+        }
+      }
+    }
+    return new Set(
+      blocked
+        .filter((waiter) => !failOpen.has(waiter.admissionRequestId))
+        .map((waiter) => waiter.id),
+    );
   }
 
   /**
@@ -1188,6 +1330,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         capacityId,
         now,
         options.creatingRequestId,
+        options.lastChanceWaiterIds ?? [],
         projections,
       );
       // A deleted capacity admits nothing; its waiters are orphans the
@@ -1817,6 +1960,33 @@ async function noLiveCandidateReason(
     where: { admissionRequestId, terminalReason: MEMBER_UNROUTABLE_REASON },
   });
   return unroutable > 0 ? MEMBER_UNROUTABLE_REASON : "candidate_deadlines";
+}
+
+/** Members with a fresh `full` routing verdict (plain read of an H-class table). */
+async function metricFullMemberIds(
+  tx: Prisma.TransactionClient,
+  memberIds: readonly string[],
+  now: Date,
+): Promise<Set<string>> {
+  if (memberIds.length === 0) return new Set();
+  const rows = await tx.poolMemberRoutingVerdict.findMany({
+    where: { poolMemberId: { in: [...memberIds] }, verdict: "FULL", expiresAt: { gt: now } },
+    select: { poolMemberId: true },
+  });
+  return new Set(rows.map((row) => row.poolMemberId));
+}
+
+const METRIC_FAIL_OPEN_LOGGED_MAX = 1_000;
+const metricFailOpenLogged = new Set<string>();
+
+/** Once per admission request (bounded): a metric-FULL fail-open happened. */
+function logMetricFailOpen(admissionRequestId: string) {
+  if (metricFailOpenLogged.has(admissionRequestId)) return;
+  if (metricFailOpenLogged.size >= METRIC_FAIL_OPEN_LOGGED_MAX) metricFailOpenLogged.clear();
+  metricFailOpenLogged.add(admissionRequestId);
+  console.warn("[capacity] every candidate is metric-FULL; admitting by leases only", {
+    admissionRequestId,
+  });
 }
 
 function schedulerDeficits(value: Prisma.JsonValue): number[] {

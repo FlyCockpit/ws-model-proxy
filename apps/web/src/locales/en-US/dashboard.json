@@ -94,7 +94,38 @@
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
     "upgradeUnknownProtocol": "unknown",
-    "upgradeUnknownVersion": "(unknown version)"
+    "upgradeUnknownVersion": "(unknown version)",
+    "metricSources": {
+      "title": "Metric sources",
+      "loadFailed": "Could not load this device's metric sources.",
+      "empty": "No metric sources.",
+      "origins": {
+        "local": "Local",
+        "remote": "Remote"
+      },
+      "states": {
+        "active": "Active",
+        "pending_approval": "Pending approval",
+        "refused": "Refused",
+        "unsupported": "Unsupported",
+        "disabled": "Disabled",
+        "failing": "Failing"
+      },
+      "errors": {
+        "spawn": "could not start",
+        "timeout": "timed out",
+        "exit_status": "exited with an error",
+        "output_too_large": "output too large",
+        "parse": "output not numeric"
+      },
+      "interval": "every {{seconds}} s",
+      "pendingHint": "Read its command with `wsmp metrics list` on the machine, then approve it with `wsmp metrics approve {{name}} --sha256 <hash>` using the hash shown there.",
+      "refusedHint": "The CLI refuses remote sources unless `allowRemoteMetricSources` is on locally.",
+      "notReported": "Defined on the server; the CLI has not reported it yet.",
+      "remoteNotAllowed": "Remote sources are sent to the CLI only while its MCP command mode is unsupervised.",
+      "valuesTitle": "Latest values",
+      "stale": "stale"
+    }
   },
   "chatTest": {
     "announcements": {
@@ -884,6 +915,46 @@
     "transformerMaxAssets": "Max attachments per request",
     "updated": "Pool updated",
     "weight": "Weight",
+    "metricRules": {
+      "title": "Metric routing rules",
+      "description": "Mark a member FULL or avoid it using its device's metrics. FULL members get no new requests (they queue, go to another member, or go external for :external callers). Avoided members are used last. A stale or missing metric is ignored, and when every member is FULL requests are still served.",
+      "hint": "Each rule compares the highest value of one metric (optionally filtered by labels) with a threshold.",
+      "empty": "No rules. Routing uses capacity only.",
+      "ruleLegend": "Rule {{number}}",
+      "metric": "Metric",
+      "labels": "Labels (optional)",
+      "op": "Compare",
+      "threshold": "Threshold",
+      "effect": "Effect",
+      "effects": {
+        "full": "Mark FULL",
+        "avoid": "Avoid"
+      },
+      "add": "Add rule",
+      "remove": "Remove rule {{number}}",
+      "save": "Save rules",
+      "saved": "Routing rules saved.",
+      "saveFailed": "Could not save the routing rules.",
+      "loadFailed": "Could not load the routing rules.",
+      "metricInvalid": "Use 1-64 letters, digits, or _ . : -",
+      "labelsInvalid": "Use key=value pairs separated by commas (letters, digits, _ . : -).",
+      "thresholdInvalid": "Enter a number.",
+      "membersTitle": "Members",
+      "badges": {
+        "full": "Metric FULL",
+        "avoid": "Avoided",
+        "clear": "Rules clear",
+        "stale": "Metric stale",
+        "unevaluated": "Not evaluated yet",
+        "rulesStale_one": "{{count}} rule ignored (stale metric)",
+        "rulesStale_other": "{{count}} rules ignored (stale metrics)"
+      },
+      "seriesTitle": "Available metrics",
+      "seriesHint": "Metrics the members' devices report now. endpoint.* metrics (running, waiting, kv_usage, slots_busy) use each member's own endpoint.",
+      "offline": "offline (stored snapshot)",
+      "noSeries": "No metrics reported yet.",
+      "staleValue": "stale"
+    },
     "grantRouting": {
       "edit": "Routing",
       "editFor": "Routing settings for {{email}}",

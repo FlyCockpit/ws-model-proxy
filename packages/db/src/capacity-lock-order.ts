@@ -37,7 +37,16 @@
  *   schema-hardening.sql leaves unfenced (health, last-used, connection
  *   state), each as a single-row statement or, for provider health, account
  *   row then model row (the provider order below). It reads the graph without
- *   row locks, after its fences, and never takes an `owner` fence.
+ *   row locks, after its fences, and never takes an `owner` fence. One
+ *   documented exception: the relay disconnect
+ *   (`disconnectCliDeviceAtGeneration`, packages/api/src/lib/model-pool-routing.ts)
+ *   runs its per-member health statements (single-row, id order) inside a
+ *   transaction that holds the `cli_device` row, because that row lock is the
+ *   fence against a reconnect's registration. Every wait in it is bounded by a
+ *   transaction-local `lock_timeout`, and it retries. A management cascade that
+ *   takes the same device's members in a different order (a pool, endpoint or
+ *   model delete) can deadlock with it; PostgreSQL aborts one side within
+ *   about a second and both retry, so nothing is lost or left stuck.
  * - M (management): relay registration, dashboard and MCP writes, provider
  *   management, parent deletes, startup backfills. It first takes the `owner`
  *   fence of every user whose graph rows it writes (sorted; cascades
@@ -333,6 +342,7 @@ export const HOT_PATH_TABLES = [
   "provider_budget_reservation",
   "provider_budget_settlement",
   "provider_usage_ledger",
+  "pool_member_routing_verdict",
 ] as const;
 
 /** The graph (configuration) tables: fence triggers guard their writes. */
