@@ -102,11 +102,18 @@ describe("commandProgram", () => {
     ["a name of exactly 64", `${"a".repeat(64)} x`, "a".repeat(64)],
     ["leading whitespace and tabs", "\t  /bin/ls", "ls"],
     ["a newline before the program", "\n\npython -c x", "python"],
-    ["single quotes around the program", "'/bin/ls' x", "ls"],
+    [
+      "single quotes around the program fail closed (cmd does not quote with ')",
+      "'/bin/ls' x",
+      UNKNOWN,
+    ],
+    ["double quotes around the program fail closed", '"ls" x', UNKNOWN],
     ["an unterminated double quote fails closed", '"echo', UNKNOWN],
     ["an unterminated single quote fails closed", "'ls", UNKNOWN],
     ["a quoted program containing a space", "'my tool' x", UNKNOWN],
-    ["a relative script", "./run.sh", "run.sh"],
+    ["a relative script fails closed (cmd reads ./ differently)", "./run.sh", UNKNOWN],
+    ["a bare script name", "run.sh", "run.sh"],
+    ["a plus in the name fails closed", "g++ x", UNKNOWN],
     ["a path with a trailing slash", "/usr/bin/", UNKNOWN],
     ["a quoted assignment value with a space fails closed", 'FOO="a b" curl', UNKNOWN],
     ["a plain assignment with path-ish value is skipped", "A=/x/y:z@1.2,3+4=5 prog", "prog"],
@@ -204,6 +211,31 @@ describe("commandProgram", () => {
     expect(commandProgram(" \t\n\n /usr/bin/git push")).toBe("git");
   });
 
+  // C4b-1: the CLI may run the command through `cmd /C` (Windows without sh),
+  // which ends the command token at `/`, `+` and, after a built-in, `.`.
+  it.each([
+    "echo/hunter2Secret",
+    "type/hunter2Secret",
+    "./hunter2Secret",
+    "../hunter2Secret",
+    "echo.hunter2Secret",
+    "ECHO.hunter2Secret",
+    "echo+hunter2Secret",
+    "dir/s/b",
+    "ping/n 1 host",
+    "a/b/hunter2Secret",
+  ])("stores ? for a word cmd would split differently: %s", (input) => {
+    expect(commandProgram(input)).toBe(UNKNOWN);
+  });
+
+  it("keeps plain names, absolute paths and dotted non-built-in names", () => {
+    expect(commandProgram("git status")).toBe("git");
+    expect(commandProgram("echo hi")).toBe("echo");
+    expect(commandProgram("/usr/bin/git status")).toBe("git");
+    expect(commandProgram("python3.12 x")).toBe("python3.12");
+    expect(commandProgram("node.exe x")).toBe("node.exe");
+  });
+
   it("returns the unknown program for non-string and non-well-formed input", () => {
     expect(commandProgram(undefined)).toBe(UNKNOWN);
     expect(commandProgram(null)).toBe(UNKNOWN);
@@ -237,6 +269,13 @@ describe("commandAuditPath", () => {
     const path = commandAuditPath("pwd", () => "unavailable");
     expect(path).toBe("hmac-sha256:unavailable pwd");
     expect(path.startsWith("sha256:")).toBe(false);
+  });
+
+  it("stores ? as the program of a truncated command", () => {
+    expect(commandAuditPath("/usr/bin/git status", hex, { truncated: true })).toBe(
+      "hmac-sha256:H<19> ?",
+    );
+    expect(commandAuditPath("/usr/bin/git status", hex)).toBe("hmac-sha256:H<19> git");
   });
 
   it("stores no argument text for any adversarial command", () => {

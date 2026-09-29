@@ -81,7 +81,9 @@ const AUDIT_COMMAND_MAX_CHARS = 16_384;
 function auditPathOf(command: unknown): string {
   try {
     if (typeof command !== "string") return "";
-    return commandAuditPath(command.slice(0, AUDIT_COMMAND_MAX_CHARS), commandAuditDigest);
+    return commandAuditPath(command.slice(0, AUDIT_COMMAND_MAX_CHARS), commandAuditDigest, {
+      truncated: command.length > AUDIT_COMMAND_MAX_CHARS,
+    });
   } catch {
     return "";
   }

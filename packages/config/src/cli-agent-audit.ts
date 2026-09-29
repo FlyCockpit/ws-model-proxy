@@ -170,11 +170,66 @@ export const CLI_AGENT_ACTION_UNKNOWN_DEVICE = "unknown";
  */
 export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 
-/** The only names a stored program may have: no spaces, quotes, NUL or non-ASCII. */
-const PROGRAM_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/;
+/** The only names a stored program may have: no spaces, quotes, `+`, NUL or non-ASCII. */
+const PROGRAM_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 /** The whole program word: a plain path (program charset plus `/`). */
-const PROGRAM_WORD_PATTERN = /^[A-Za-z0-9._+/-]+$/;
+const PROGRAM_WORD_PATTERN = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * The CLI runs a headless command through `sh -c`, or through `cmd /C` on a
+ * Windows device without `sh` (apps/cli/src/child_env.rs `exec_shell`), and
+ * the relay does not know which. `cmd` ends a command token at `/`, `+` and,
+ * after a built-in such as `echo`, at `.`, so a word only counts as the
+ * program when both shells read it the same way: no `+`, `/` only in an
+ * absolute path (a leading `/`), and no built-in name followed by `.`. Anything
+ * else stores `?`.
+ */
+const CMD_BUILTINS: ReadonlySet<string> = new Set([
+  "assoc",
+  "break",
+  "call",
+  "cd",
+  "chdir",
+  "cls",
+  "color",
+  "copy",
+  "date",
+  "del",
+  "dir",
+  "echo",
+  "endlocal",
+  "erase",
+  "exit",
+  "for",
+  "ftype",
+  "goto",
+  "if",
+  "md",
+  "mkdir",
+  "mklink",
+  "move",
+  "path",
+  "pause",
+  "popd",
+  "prompt",
+  "pushd",
+  "rd",
+  "rem",
+  "ren",
+  "rename",
+  "rmdir",
+  "set",
+  "setlocal",
+  "shift",
+  "start",
+  "time",
+  "title",
+  "type",
+  "ver",
+  "verify",
+  "vol",
+]);
 
 /**
  * A leading `NAME=value` assignment that is safe to skip: a valid shell env
@@ -212,15 +267,6 @@ function basename(word: string): string {
   return index === -1 ? word : word.slice(index + 1);
 }
 
-/** `word` with surrounding matching quotes removed (one layer). */
-function unquote(word: string): string {
-  if (word.length >= 2) {
-    const first = word[0];
-    if ((first === '"' || first === "'") && word.endsWith(first)) return word.slice(1, -1);
-  }
-  return word;
-}
-
 /**
  * The program of a command for the audit `path`: the basename of the first
  * word that is not a leading plain `NAME=value` assignment (an assignment with
@@ -228,7 +274,8 @@ function unquote(word: string): string {
  * other wrappers are stored by their own name, never unwrapped). Returns
  * {@link CLI_AGENT_ACTION_UNKNOWN_PROGRAM} for anything outside the accepted
  * shape: a word that starts with `-` is a flag, not a program, so it fails
- * closed too. Never returns any argument text.
+ * closed too. The rule is proven against both `sh` and `cmd /C` word
+ * boundaries (see CMD_BUILTINS). Never returns any argument text.
  */
 export function commandProgram(command: unknown): string {
   if (typeof command !== "string" || command.length === 0) {
@@ -245,11 +292,17 @@ export function commandProgram(command: unknown): string {
     // redirection (`2>/x/y`), a slash-bearing flag (`--opt=/x/y`, `-p/x/y`) or
     // any word with a character outside the path charset would otherwise leak
     // its last path segment as the "program".
-    const word = unquote(token);
+    const word = token;
     if (!PROGRAM_WORD_PATTERN.test(word) || word.startsWith("-")) {
       return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
     }
+    // Only the shells' common reading: `/` only in an absolute path, and a
+    // built-in name is not followed by `.` (see CMD_BUILTINS).
+    if (word.includes("/") && !word.startsWith("/")) return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
     const base = basename(word);
+    const stem = base.split(".")[0] ?? "";
+    if (stem !== base && CMD_BUILTINS.has(stem.toLowerCase()))
+      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
     return PROGRAM_PATTERN.test(base) ? base : CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
   return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
@@ -284,10 +337,17 @@ export const CLI_AGENT_ACTION_AUDIT_HKDF_INFO = "wsmp-cli-agent-audit-v1";
  * The digest is over the well-formed command text itself (no mask), so with the
  * server-held key it can verify a guess but never reveals text; without the key
  * it reveals nothing. The only other field is {@link commandProgram}, a
- * validated program name. `digest` is injected to keep this module free of Node
+ * validated program name (`?` when the caller had to truncate the command). `digest` is injected to keep this module free of Node
  * built-ins; it must return {@link CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE} when
  * it has no key, and its output is stored verbatim after the prefix.
  */
-export function commandAuditPath(command: string, digest: (text: string) => string): string {
-  return `${CLI_AGENT_ACTION_AUDIT_PATH_PREFIX}${digest(command.toWellFormed())} ${commandProgram(command)}`;
+export function commandAuditPath(
+  command: string,
+  digest: (text: string) => string,
+  { truncated = false }: { truncated?: boolean } = {},
+): string {
+  // A truncated command is not a complete shell word sequence: its cut can end
+  // inside a directory component, so no program is derived from it.
+  const program = truncated ? CLI_AGENT_ACTION_UNKNOWN_PROGRAM : commandProgram(command);
+  return `${CLI_AGENT_ACTION_AUDIT_PATH_PREFIX}${digest(command.toWellFormed())} ${program}`;
 }

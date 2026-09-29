@@ -867,6 +867,15 @@ describe("cli commands", () => {
       });
     });
 
+    it("stores ? as the program of an oversized refused command, never a cut path component", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockResolvedValue(null);
+      const command = `${"/".repeat(16_384 - "AUDIT_DIRECTORY".length)}AUDIT_DIRECTORY/git ARG`;
+      await startCliCommand({ ...base, command });
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} \?$/);
+      expect(JSON.stringify(events())).not.toContain("AUDIT_DIRECTORY");
+    });
+
     it("stores an unknown device for a token_inactive refusal raised before the ownership check", async () => {
       await connect();
       await startCliCommand({
