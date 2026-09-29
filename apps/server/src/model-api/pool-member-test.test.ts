@@ -18,7 +18,9 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 const { createPoolMemberTestRoutes } = await import("./pool-member-test.js");
-const { isSuccessfulChatProbeReply } = await import("./diagnostics.js");
+const { classifyChatProbeReply } = await import("./diagnostics.js");
+const isSuccessfulChatProbeReply = (status: number, raw: string) =>
+  classifyChatProbeReply(status, raw) === "pong";
 const { ModelApiConcurrencyLimiter } = await import("./limits.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
@@ -315,6 +317,28 @@ describe("pool member test routes", () => {
     ).toThrow(/Too many active/);
     for (const lease of leases) lease.release();
     expect(() => limiter.acquireCli("cli-device-id")).not.toThrow();
+  });
+
+  it("reports a reasoning-only length-capped reply as ok with a distinct detail", async () => {
+    const { app, manager } = appWith();
+    const responsePromise = app.request("/members/member-id/test", { method: "POST" });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({
+        choices: [
+          { finish_reason: "length", message: { content: "", reasoning_content: "Thinking" } },
+        ],
+      }),
+    );
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    const json = (await response.json()) as { ok: boolean; detail?: string };
+    expect(json.ok).toBe(true);
+    expect(json.detail).toMatch(/reasoning/i);
+    expect(json.detail).not.toMatch(/did not return/i);
   });
 
   it("does not reset health on HTML 200 or a chat completion without pong", async () => {
