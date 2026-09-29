@@ -248,6 +248,7 @@ function pick(source: Record<string, unknown>, keys: readonly string[]) {
 }
 
 const READ_FIELDS = [
+  "unchanged",
   "etag",
   "size",
   "mtime",

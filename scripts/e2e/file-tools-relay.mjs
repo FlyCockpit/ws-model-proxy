@@ -418,7 +418,7 @@ try {
   });
   assert(protectedWrite.isError);
   assert.equal(protectedWrite.error.code, "path_denied");
-  assert.match(await readFile(configPath, "utf8"), /"mcpCommandMode":"unsupervised"/);
+  assert.match(await readFile(configPath, "utf8"), /"mcpCommandMode":\s*"unsupervised"/);
   const specialRead = await tool("forwarder_cli_file_read", {
     cliDeviceId: deviceId,
     path: "/proc/self/environ",
@@ -437,7 +437,8 @@ try {
   const masked = await tool("forwarder_cli_file_read", { cliDeviceId: deviceId, path: envPath });
   assert(!masked.isError, `read .env failed: ${masked.text}`);
   assert.match(masked.result.text, /API_TOKEN=⟦redacted:\d+⟧/);
-  assert.match(masked.result.text, /PUBLIC_NAME=visible/);
+  // Every value of a dotenv file is masked; the names stay visible.
+  assert.match(masked.result.text, /PUBLIC_NAME=⟦redacted:7⟧/);
   assert.equal(masked.result.secretFile, true);
   assert(!masked.text.includes(secretValue), "the secret value reached the MCP result");
   const maskedSearch = await tool("forwarder_cli_file_search", {

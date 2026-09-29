@@ -2039,6 +2039,23 @@ describe("CLI file tools", () => {
     expect(resultText(result)).toContain("⟦redacted:12⟧");
   });
 
+  it("keeps unchanged:true in the ifNoneMatch answer", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: { unchanged: true, etag: "h:AAAAAAAAAAAAAAAAAAAAAA", junk: 1 },
+    });
+    const result = await call("forwarder_cli_file_read", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      ifNoneMatch: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    });
+    expect(structured(result).result).toEqual({
+      unchanged: true,
+      etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    });
+  });
+
   it("clamps a read window to the MCP output budget", async () => {
     fileRuntime.runFileOp.mockResolvedValue({ ok: true, op: "read", result: READ_RESULT });
     await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", maxBytes: 131072 });
