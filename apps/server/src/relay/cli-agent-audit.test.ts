@@ -27,6 +27,8 @@ const {
 const createMany = (prisma as unknown as { cliAgentActionEvent: { createMany: MockInstance } })
   .cliAgentActionEvent.createMany;
 
+const findUsers = (prisma as unknown as { user: { findMany: MockInstance } }).user.findMany;
+
 const startedAt = new Date("2026-01-01T00:00:00.000Z");
 
 function event(overrides: Partial<CliAgentActionEventInput> = {}): CliAgentActionEventInput {
@@ -54,6 +56,11 @@ describe("recordCliAgentAction", () => {
     resetCliAgentAuditForTests();
     createMany.mockReset();
     createMany.mockResolvedValue({ count: 0 });
+    findUsers.mockReset();
+    // Every owner exists unless a test says otherwise.
+    findUsers.mockImplementation(async (args: { where: { id: { in: string[] } } }) =>
+      args.where.id.in.map((id) => ({ id })),
+    );
     disarmDbShutdownFence();
   });
   afterEach(() => {
@@ -69,6 +76,23 @@ describe("recordCliAgentAction", () => {
     await vi.advanceTimersByTimeAsync(CLI_AGENT_AUDIT_FLUSH_DELAY_MS);
     expect(createMany).toHaveBeenCalledTimes(1);
     expect(written().map((row) => row.path)).toEqual(["/etc/hosts", "/etc/passwd"]);
+  });
+
+  it("does not write events of a user that no longer exists", async () => {
+    findUsers.mockImplementation(async () => [{ id: "user-live" }]);
+    recordCliAgentAction(event({ userId: "user-gone", path: "gone" }));
+    recordCliAgentAction(event({ userId: "user-live", path: "live" }));
+    await vi.advanceTimersByTimeAsync(CLI_AGENT_AUDIT_FLUSH_DELAY_MS);
+    expect(written().map((row) => row.path)).toEqual(["live"]);
+    expect(cliAgentAuditDroppedCount()).toBe(1);
+  });
+
+  it("drops the batch, without throwing, when the owner lookup fails", async () => {
+    findUsers.mockRejectedValue(new Error(DB_ERROR_SENTINEL));
+    recordCliAgentAction(event());
+    await vi.advanceTimersByTimeAsync(CLI_AGENT_AUDIT_FLUSH_DELAY_MS);
+    expect(createMany).not.toHaveBeenCalled();
+    expect(cliAgentAuditDroppedCount()).toBe(1);
   });
 
   it("stores only the allow-listed metadata, never content passed alongside", async () => {

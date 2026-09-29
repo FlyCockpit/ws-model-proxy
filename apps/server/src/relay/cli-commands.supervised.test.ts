@@ -1379,6 +1379,15 @@ describe("supervised commands", () => {
       expect(serialized).not.toContain("sudo password");
     });
 
+    it("stores an unknown device, never the request's text, when the device is not verified", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockResolvedValueOnce(null);
+      await start({ cliDeviceId: "NAME=AUDIT_MARKER" });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ reason: "not_found", cliDeviceId: "unknown" });
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
     it("records a failed internal_error once and rethrows when admission throws", async () => {
       await connect();
       const boom = new TypeError("admission read failed");
@@ -1389,7 +1398,7 @@ describe("supervised commands", () => {
       ]);
       expect(events()[0]).toMatchObject({
         userId: "user-id",
-        cliDeviceId: "desktop",
+        cliDeviceId: "unknown",
         mcpTokenId: "token-a",
       });
     });

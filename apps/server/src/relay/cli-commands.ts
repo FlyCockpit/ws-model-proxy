@@ -13,6 +13,7 @@ import type {
   SupervisedOutputMode,
 } from "@ws-model-proxy/api/lib/supervised-command-types";
 import {
+  CLI_AGENT_ACTION_UNKNOWN_DEVICE,
   type CliAgentActionKind,
   type CliAgentActionOutcome,
   cliAgentSignalReason,
@@ -97,6 +98,19 @@ function exitReason(fields: {
   return fields.exitCode !== null ? `exit:${fields.exitCode}` : "exit";
 }
 
+/**
+ * Refusals raised before (or without) the ownership check of the requested
+ * device: its id is caller-supplied text there, so the row stores
+ * {@link CLI_AGENT_ACTION_UNKNOWN_DEVICE} instead. Every other refusal comes
+ * after the device was resolved to one of the caller's own (see
+ * `admitCliCommand`, `admitSupervisedCommand`).
+ */
+const UNVERIFIED_DEVICE_REFUSALS: ReadonlySet<string> = new Set([
+  "not_found",
+  "token_inactive",
+  "internal_error",
+]);
+
 function auditRefusal(
   kind: Extract<CliAgentActionKind, "command" | "supervised_command">,
   input: { userId: string; tokenId: string; cliDeviceId: string; command: string },
@@ -106,7 +120,9 @@ function auditRefusal(
 ): void {
   recordCliAgentAction({
     userId: input.userId,
-    cliDeviceId: input.cliDeviceId,
+    cliDeviceId: UNVERIFIED_DEVICE_REFUSALS.has(reason)
+      ? CLI_AGENT_ACTION_UNKNOWN_DEVICE
+      : input.cliDeviceId,
     mcpTokenId: input.tokenId,
     kind,
     path: auditPathOf(input.command),

@@ -158,6 +158,13 @@ export function cliAgentSignalReason(signal: string): string {
 }
 
 /**
+ * Stored as the device of a refusal row when the request's device id was not
+ * verified as one of the caller's own (an unknown or foreign id, or a refusal
+ * before the check): request text is never stored as an identifier.
+ */
+export const CLI_AGENT_ACTION_UNKNOWN_DEVICE = "unknown";
+
+/**
  * Stored as the program of a command event when it cannot be extracted (empty,
  * unparsable, or a name outside the allowed charset/length).
  */

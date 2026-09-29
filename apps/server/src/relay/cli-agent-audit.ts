@@ -168,7 +168,21 @@ async function writeBatches(): Promise<void> {
     }
     const batch = queue.splice(0, CLI_AGENT_AUDIT_BATCH);
     try {
-      await runWithDbShutdownPermit(() => prisma.cliAgentActionEvent.createMany({ data: batch }));
+      await runWithDbShutdownPermit(async () => {
+        // Rows of a user that no longer exists are not written: a delayed event
+        // (a paused replica, a slow database) must not recreate the history of a
+        // deleted user once the deleted-user purge entry has been retired. An
+        // event racing the delete itself lands within a statement of it, well
+        // inside the purge queue's grace period.
+        const owners = await prisma.user.findMany({
+          where: { id: { in: [...new Set(batch.map((row) => row.userId))] } },
+          select: { id: true },
+        });
+        const live = new Set(owners.map((owner) => owner.id));
+        const rows = batch.filter((row) => live.has(row.userId));
+        if (rows.length < batch.length) noteDropped(batch.length - rows.length);
+        if (rows.length > 0) await prisma.cliAgentActionEvent.createMany({ data: rows });
+      });
     } catch (error) {
       noteDropped(batch.length);
       // Prisma errors can carry SQL and parameters; log the class only.

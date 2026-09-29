@@ -867,6 +867,15 @@ describe("cli commands", () => {
       });
     });
 
+    it("stores an unknown device, never the request's text, when the device is not verified", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockResolvedValue(null);
+      await startCliCommand({ ...base, cliDeviceId: "NAME=AUDIT_MARKER", command: "pwd" });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ reason: "not_found", cliDeviceId: "unknown" });
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
     it("records a failed internal_error once and rethrows when admission throws", async () => {
       await connect();
       const boom = new TypeError("admission read failed");
@@ -877,7 +886,7 @@ describe("cli commands", () => {
       ]);
       expect(events()[0]).toMatchObject({
         userId: "user-id",
-        cliDeviceId: "desktop",
+        cliDeviceId: "unknown",
         mcpTokenId: "token-audit",
         path: expect.stringMatching(/^hmac-sha256:[0-9a-f]{64} pwd$/),
       });
