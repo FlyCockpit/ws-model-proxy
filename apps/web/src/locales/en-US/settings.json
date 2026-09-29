@@ -90,7 +90,31 @@
       "lastUsed": "Last used {{date}}",
       "neverUsed": "Never used",
       "expires": "Expires {{date}}",
-      "noExpiry": "No expiry"
+      "noExpiry": "No expiry",
+      "cliDevicesTitle": "Where this token's commands can run",
+      "cliDevicesHelp": "A command runs only when this token, the device's dashboard grant and the CLI's own config all allow it. This form does not change device grants.",
+      "cliDevicesLoadFailed": "Couldn't load your CLIs' command settings.",
+      "cliDevicesEmpty": "You have no CLIs yet. Commands need a connected CLI whose grant allows them.",
+      "cliDevicesNoneAllow": "None of your CLIs can run a command right now, so this token's commands will fail. Each device below says why: some need a dashboard grant, others need the CLI's own config or a connection.",
+      "cliDeviceMode": {
+        "off": "Off",
+        "supervised": "Supervised",
+        "unsupervised": "Unsupervised"
+      },
+      "cliDeviceGrantLink": "Open grant setting for {{name}}",
+      "cliDeviceKind": {
+        "headless": "headless",
+        "supervised": "supervised"
+      },
+      "cliDeviceAllowed": "allowed",
+      "cliDeviceRefusal": {
+        "grant_disabled": "refused, the dashboard grant is Off",
+        "offline": "refused, CLI offline or too old",
+        "feature_disabled": "refused, the CLI's own config is Off",
+        "unsupported": "refused, no terminal support on this CLI",
+        "grant_supervised_only": "refused, needs Unsupervised (the dashboard grant is Supervised)",
+        "cli_supervised_only": "refused, needs Unsupervised (the CLI's own config is Supervised)"
+      }
     }
   },
   "title": "Settings",

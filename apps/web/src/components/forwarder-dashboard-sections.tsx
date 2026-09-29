@@ -755,7 +755,7 @@ export function CliEndpointsModelsSection() {
       ) : (
         <div className="space-y-4">
           {matchingDevices.map((device) => (
-            <div key={device.id} className="rounded-md border">
+            <div key={device.id} id={`cli-${device.id}`} className="scroll-mt-20 rounded-md border">
               <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">

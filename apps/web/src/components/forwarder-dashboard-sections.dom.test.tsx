@@ -930,6 +930,30 @@ describe("CliEndpointsModelsSection device names", () => {
     }
   });
 
+  it("anchors each device card with cli-<deviceId> matching the token form's link", () => {
+    state.cliDevices = [
+      cliDeviceWithModel,
+      {
+        ...cliDeviceWithModel,
+        id: "cli-2",
+        slug: "tower",
+        name: "Work laptop",
+        reportedHostname: "tower.lan",
+        displayName: "Work laptop",
+        endpoints: [],
+      },
+    ];
+    mountDevices();
+
+    // The token form links to `#cli-<id>` (cli-command-devices.tsx), so each
+    // card must carry a matching id for the browser to scroll to it.
+    for (const id of ["cli-1", "cli-2"]) {
+      const anchor = document.getElementById(`cli-${id}`);
+      expect(anchor).toBeTruthy();
+      expect(anchor?.id).toBe(`cli-${id}`);
+    }
+  });
+
   it("renames a device with a trimmed name", async () => {
     state.cliDevices = [cliDeviceWithModel];
     mountDevices();

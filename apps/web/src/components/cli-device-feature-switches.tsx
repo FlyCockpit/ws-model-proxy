@@ -18,8 +18,10 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
+  COMMAND_KINDS,
   type CommandFeature,
   commandModeOptionState,
+  commandRefusals,
   type FeatureSwitchReason,
   featureReasonKey,
   featureSwitchState,
@@ -73,6 +75,41 @@ function FeatureSwitch({
           {t(featureReasonKey(reason))}
         </p>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * What agents can run right now: the stricter of the dashboard grant and the
+ * CLI's own config, then, per command kind, whether the relay would admit it
+ * or why not (its own refusal order). The MCP token is the third switch; it
+ * is per token, so it is only named.
+ */
+function EffectiveCommandMode({ feature }: { feature: CommandFeature }) {
+  const { t } = useTranslation("dashboard");
+  const refusals = commandRefusals(feature);
+  return (
+    <div className="mt-2 min-w-0 text-xs text-muted-foreground" data-testid="command-effective">
+      <p>
+        {t("dashboard:clis.features.effective")}:{" "}
+        <span className="font-medium text-foreground">
+          {t(`dashboard:clis.features.commandModes.${feature.effectiveMode}`)}
+        </span>
+      </p>
+      {refusals
+        ? COMMAND_KINDS.map((kind) => {
+            const refusal = refusals[kind];
+            return (
+              <p key={kind} data-testid={`command-${kind}`}>
+                {t(`dashboard:clis.features.commandKind.${kind}`)}:{" "}
+                {refusal
+                  ? t(`dashboard:clis.features.commandRefusal.${refusal}`)
+                  : t("dashboard:clis.features.commandAllowed")}
+              </p>
+            );
+          })
+        : null}
+      <p>{t("dashboard:clis.features.commandSwitches")}</p>
     </div>
   );
 }
@@ -175,6 +212,7 @@ function CommandModeControl({
           {t(featureReasonKey(firstReason))}
         </p>
       ) : null}
+      <EffectiveCommandMode feature={feature} />
     </fieldset>
   );
 }

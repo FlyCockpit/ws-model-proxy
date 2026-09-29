@@ -58,6 +58,7 @@ import {
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
+  mcpCommandRefusals,
 } from "../lib/mcp-command-mode";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -651,6 +652,17 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
   const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
+  const refusals = mcpCommandRefusals({
+    grant: commandsGrant,
+    live:
+      live && commandsLive
+        ? {
+            mode: live.mcpCommandMode,
+            supervisedCommands: live.supervisedCommands,
+            terminalSupported: live.terminalSupported,
+          }
+        : null,
+  });
   const staleAt = row.lastHeartbeatAt
     ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
     : null;
@@ -713,7 +725,13 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         live: commandsLive,
         /** What an MCP agent can do right now: the lowest of grant and live CLI mode. */
         effectiveMode: commandsEffective,
-        available: commandsEffective !== "off",
+        /**
+         * Why the relay would refuse each command kind right now (its refusal
+         * order), or null when it would admit it.
+         */
+        refusals,
+        /** Some command kind would be admitted (headless or supervised). */
+        available: refusals.headless === null || refusals.supervised === null,
       },
     },
     endpoints: row.Endpoints.map((endpoint) => ({

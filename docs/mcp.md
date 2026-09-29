@@ -238,6 +238,8 @@ searches the output for every seeded secret value in every encoding. The CLI
 command tools return what a command printed on your own CLI device (behind the
 separate `allowCliCommands` consent); WMP credentials in that text are
 scrubbed, but other device content is returned as printed.
+Three independent switches gate each command (the token, the device's dashboard
+grant and the CLI's own config); see [CLI command switches](cli-command-switches.md).
 
 ## Tool input schemas
 

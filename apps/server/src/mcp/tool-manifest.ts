@@ -403,6 +403,8 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     scope: "read",
     confirmation: null,
     classification: "pure",
+    descriptionNote:
+      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A token also needs mcp:write and allowCliCommands.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },
   {
