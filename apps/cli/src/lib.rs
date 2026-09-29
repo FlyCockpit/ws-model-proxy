@@ -14,6 +14,8 @@ pub mod control;
 pub mod daemon;
 pub mod display_escape;
 pub mod exit;
+#[cfg(unix)]
+pub mod file_ops;
 pub mod hostname;
 pub mod logging;
 pub mod media;
