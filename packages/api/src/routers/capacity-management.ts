@@ -12,6 +12,7 @@ import {
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import { deletionConflict } from "../lib/deletion-conflict";
+import { enginePreset } from "../lib/engine-facts";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -163,7 +164,7 @@ const memberPolicy = z
 export const capacityManagementRouter = {
   list: protectedProcedure.handler(async ({ context }) => {
     const userId = context.session.user.id;
-    return prisma.inferenceCapacity.findMany({
+    const rows = await prisma.inferenceCapacity.findMany({
       where: { userId },
       orderBy: [{ label: "asc" }, { id: "asc" }],
       include: {
@@ -176,6 +177,9 @@ export const capacityManagementRouter = {
         },
       },
     });
+    // The engine preset is derived from the stored engine kind (relay 2.7
+    // engine facts); S-C and S-D read it, this list only shows it.
+    return rows.map((row) => ({ ...row, enginePreset: enginePreset(row.engineKind) }));
   }),
 
   listAudit: protectedProcedure

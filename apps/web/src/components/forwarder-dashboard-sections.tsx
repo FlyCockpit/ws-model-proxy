@@ -764,8 +764,27 @@ export function CliEndpointsModelsSection() {
                     {device.isStale ? (
                       <StatusPill muted>{t("dashboard:status.stale")}</StatusPill>
                     ) : null}
+                    {device.upgradeRequired ? (
+                      <StatusPill status="OFFLINE">
+                        {t("dashboard:clis.upgradeRequired", {
+                          protocol:
+                            device.upgradeRequired.protocolVersion ??
+                            t("dashboard:clis.upgradeUnknownProtocol"),
+                        })}
+                      </StatusPill>
+                    ) : null}
                   </div>
                   <p className="mt-1 font-mono text-xs text-muted-foreground">{device.slug}</p>
+                  {device.upgradeRequired ? (
+                    <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                      {t("dashboard:clis.upgradeRequiredDetail", {
+                        version:
+                          device.upgradeRequired.cliVersion ??
+                          t("dashboard:clis.upgradeUnknownVersion"),
+                        value: formatDate(device.upgradeRequired.rejectedAt),
+                      })}
+                    </p>
+                  ) : null}
                   <p className="mt-2 text-xs text-muted-foreground">
                     {t("dashboard:clis.lastHeartbeat", {
                       value: formatDate(device.lastHeartbeatAt),

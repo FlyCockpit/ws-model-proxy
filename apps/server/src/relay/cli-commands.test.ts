@@ -95,13 +95,13 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.6",
+        protocolVersion: "2.7",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -119,10 +119,12 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
           mcpCommandMode: features.mcpCommandMode,
           terminalApproval: false,
           terminalSupported: false,
+          remoteMetricSources: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
+        nodeTelemetry: true,
       },
     },
     endpoints: [],

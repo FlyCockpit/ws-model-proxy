@@ -221,7 +221,11 @@
       "saved": "Se renombró el CLI",
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
-    }
+    },
+    "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
+    "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
+    "upgradeUnknownProtocol": "desconocido",
+    "upgradeUnknownVersion": "(versión desconocida)"
   },
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
@@ -491,6 +495,33 @@
         "template": "Usar un tokenizador y plantilla registrados coincidentes",
         "engineRequirement": "Requiere soporte para contar tokens en el destino seleccionado. WSMP usa una estimación conservadora cuando no está disponible.",
         "registeredRequirement": "Requiere un contador registrado que coincida con esta identidad de runtime. WSMP usa una estimación conservadora cuando no hay coincidencia."
+      },
+      "engineFacts": {
+        "engine": "Motor: {{engine}}",
+        "slots_one": "{{count}} ranura",
+        "slots_other": "{{count}} ranuras",
+        "kvBudget": "Presupuesto KV: {{value}} tokens",
+        "maxModelLen": "Contexto máximo: {{value}} tokens",
+        "preset": "Preajuste: {{preset}}",
+        "kinds": {
+          "GENERIC": "Genérico",
+          "LLAMA_CPP": "llama.cpp",
+          "VLLM": "vLLM",
+          "SGLANG": "SGLang",
+          "OLLAMA": "Ollama",
+          "LM_STUDIO": "LM Studio"
+        },
+        "presets": {
+          "llama.cpp": "llama.cpp (lleno al alcanzar sus ranuras)",
+          "vllm-sglang": "vLLM / SGLang (tu límite y luego la carga del motor)",
+          "ollama-lm-studio": "Ollama / LM Studio (tu ajuste de paralelismo)",
+          "generic": "Genérico (tu límite)"
+        },
+        "sources": {
+          "PROBE": "detectado por la CLI",
+          "CONFIG": "desde la configuración de la CLI",
+          "MIXED": "detectado y configurado"
+        }
       }
     },
     "noneAvailable": "Ninguna disponible",

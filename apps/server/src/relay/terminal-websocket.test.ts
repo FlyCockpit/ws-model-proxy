@@ -174,13 +174,13 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.6",
+    protocolVersion: "2.7",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.6",
+        protocolVersion: "2.7",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -198,10 +198,12 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
           mcpCommandMode: features?.mcpCommandMode ?? "off",
           terminalApproval: features?.terminalApproval ?? false,
           terminalSupported: features?.terminalSupported ?? true,
+          remoteMetricSources: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
+        nodeTelemetry: true,
         ...(protocol === "2.5" ? { terminalIdentity: cliIdentity() } : {}),
       },
     },
@@ -227,7 +229,7 @@ function device(id: string, overrides: Record<string, unknown> = {}) {
     allowHumanTerminal: true,
     reportedHumanTerminal: true,
     reportedTerminalSupported: true,
-    relayProtocolVersion: "2.6",
+    relayProtocolVersion: "2.7",
     ...overrides,
   };
 }

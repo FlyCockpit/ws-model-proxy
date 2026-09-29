@@ -59,25 +59,37 @@ struct AddArgs {
     /// Hard concurrency registered for every model on this endpoint (1–10000).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     concurrency_limit: Option<u32>,
-    /// Upstream engine. `llama.cpp` and `vllm` advertise `top_k`.
+    /// Upstream engine (default `auto`: detected at probe time). An explicit
+    /// `llama.cpp` or `vllm` also advertises `top_k`.
     #[arg(long, value_enum)]
     engine: Option<EngineChoice>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum EngineChoice {
+    /// Detect the engine at probe time.
+    Auto,
+    /// No engine detection or load sampling (remote providers).
     Generic,
     #[value(name = "llama.cpp")]
     LlamaCpp,
     Vllm,
+    Sglang,
+    Ollama,
+    #[value(name = "lm-studio")]
+    LmStudio,
 }
 
 impl From<EngineChoice> for EndpointEngine {
     fn from(choice: EngineChoice) -> Self {
         match choice {
+            EngineChoice::Auto => Self::Auto,
             EngineChoice::Generic => Self::Generic,
             EngineChoice::LlamaCpp => Self::LlamaCpp,
             EngineChoice::Vllm => Self::Vllm,
+            EngineChoice::Sglang => Self::Sglang,
+            EngineChoice::Ollama => Self::Ollama,
+            EngineChoice::LmStudio => Self::LmStudio,
         }
     }
 }

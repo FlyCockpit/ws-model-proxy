@@ -469,6 +469,15 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },
   {
+    name: "forwarder_device_metrics_get",
+    target: "forwarderManagement.getCliDeviceMetrics",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
+  },
+  {
     name: "forwarder_model_pools_list",
     target: "forwarderManagement.listModelPools",
     scope: "read",

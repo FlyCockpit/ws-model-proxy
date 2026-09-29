@@ -266,8 +266,10 @@ pub struct EndpointConfig {
     /// server fallback of 1. An existing non-null capacity is left unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
-    /// Upstream engine. llama.cpp and vLLM advertise `top_k` in the inventory.
-    #[serde(default, skip_serializing_if = "is_generic_engine")]
+    /// Upstream engine. `auto` (the default) detects it at probe time; an
+    /// explicit value overrides detection. llama.cpp and vLLM advertise
+    /// `top_k` in the inventory only when declared explicitly.
+    #[serde(default, skip_serializing_if = "is_auto_engine")]
     pub engine: EndpointEngine,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
@@ -287,7 +289,7 @@ impl Default for EndpointConfig {
             enabled: true,
             expand_media: false,
             concurrency_limit: None,
-            engine: EndpointEngine::Generic,
+            engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
             auth: None,
@@ -304,19 +306,25 @@ pub struct EndpointAuthConfig {
     pub env: String,
 }
 
-fn is_generic_engine(engine: &EndpointEngine) -> bool {
-    *engine == EndpointEngine::Generic
+fn is_auto_engine(engine: &EndpointEngine) -> bool {
+    *engine == EndpointEngine::Auto
 }
 
-/// Declared upstream engine. Only llama.cpp and vLLM advertise `top_k`.
+/// Declared upstream engine. `Auto` means "detect at probe time"; every other
+/// value is the person's declaration and turns detection off. Only an explicit
+/// llama.cpp or vLLM advertises `top_k`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EndpointEngine {
     #[default]
+    Auto,
     Generic,
     #[serde(rename = "llama.cpp")]
     LlamaCpp,
     Vllm,
+    Sglang,
+    Ollama,
+    LmStudio,
 }
 
 impl EndpointEngine {
@@ -326,9 +334,27 @@ impl EndpointEngine {
 
     pub fn as_config_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Generic => "generic",
             Self::LlamaCpp => "llama.cpp",
             Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+            Self::Ollama => "ollama",
+            Self::LmStudio => "lm-studio",
+        }
+    }
+
+    /// The engine kind this declaration names, or `None` for `auto`.
+    pub fn declared_kind(self) -> Option<crate::engine::EngineKind> {
+        use crate::engine::EngineKind;
+        match self {
+            Self::Auto => None,
+            Self::Generic => Some(EngineKind::Generic),
+            Self::LlamaCpp => Some(EngineKind::LlamaCpp),
+            Self::Vllm => Some(EngineKind::Vllm),
+            Self::Sglang => Some(EngineKind::Sglang),
+            Self::Ollama => Some(EngineKind::Ollama),
+            Self::LmStudio => Some(EngineKind::LmStudio),
         }
     }
 }
@@ -397,6 +423,10 @@ pub struct ProbeSnapshot {
     pub status: ProbeStatus,
     pub models: Vec<String>,
     pub suggested_capabilities: OpenAiCompatibleCapabilities,
+    /// Static engine facts from the last probe (engine detection). Reported in
+    /// the inventory and never part of the inventory digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<crate::engine::DetectedEngine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1985,6 +2015,7 @@ mod tests {
             status: ProbeStatus::Online,
             models: Vec::new(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+            engine: None,
         });
         assert!(config.validate().is_err());
 

@@ -1,0 +1,10 @@
+{
+  "model_path": "Qwen/Qwen3-8B",
+  "served_model_name": "qwen",
+  "context_length": 40960,
+  "max_running_requests": 48,
+  "max_total_num_tokens": 412000,
+  "chunked_prefill_size": 8192,
+  "tp_size": 1,
+  "version": "0.4.9"
+}
