@@ -290,6 +290,11 @@ describe("capacity lease release", () => {
     return { tx, transaction, relayRequest, store, lease, waiter };
   }
 
+  const leaseInserts = (tx: { $executeRaw: { mock: { calls: unknown[][] } } }) =>
+    tx.$executeRaw.mock.calls.filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("INSERT INTO capacity_lease"),
+    );
+
   it("retries a deadlocked release under the real permit proxy and skips the fill while the fence is armed", async () => {
     const { tx, transaction, store, lease } = releaseFixture();
     armDbShutdownFence();
@@ -306,7 +311,7 @@ describe("capacity lease release", () => {
     });
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
-    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
+    expect(leaseInserts(tx)).toHaveLength(0);
     expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
   });
 
@@ -316,7 +321,7 @@ describe("capacity lease release", () => {
     const { tx, transaction, relayRequest, store, lease } = releaseFixture();
     await expect(store.release(lease)).resolves.toBe(true);
     expect(transaction).toHaveBeenCalledTimes(2);
-    expect(tx.capacityLease.createMany).toHaveBeenCalled();
+    expect(leaseInserts(tx).length).toBeGreaterThan(0);
     const sqlOf = (call: unknown[]) => (call[0] as TemplateStringsArray).join("?");
     // The capacity fence (no inference_capacity row lock) opens each attempt.
     const fenceCalls = tx.$queryRaw.mock.calls.filter((call) =>
@@ -342,9 +347,10 @@ describe("capacity lease release", () => {
       where: { capacityId: "capacity" },
       data: expect.objectContaining({ nextFencingToken: { increment: 1 } }),
     });
-    expect(tx.capacityLease.createMany).toHaveBeenCalledWith({
-      data: [expect.objectContaining({ fencingToken: 1n, admissionRequestId: "request-1" })],
-    });
+    // Leases are one INSERT ... SELECT over unnested arrays (parameters:
+    // scalars first, then one array per column): token 1 for request-1.
+    const insert = leaseInserts(tx)[0]!;
+    expect(insert.slice(1)).toEqual(expect.arrayContaining([[1n], ["request-1"]]));
     // The waiter's graph was checked (batched, one read) before it was planned.
     expect(tx.executionTarget.findMany).toHaveBeenCalledWith({
       where: { id: { in: ["target"] }, inferenceCapacityId: "capacity" },
@@ -357,7 +363,7 @@ describe("capacity lease release", () => {
       data: { admissionTerminalState: "TERMINAL" },
     });
     expect(relayRequest.updateMany.mock.invocationCallOrder[0]).toBeGreaterThan(
-      Math.max(...tx.capacityLease.createMany.mock.invocationCallOrder),
+      Math.max(...tx.$executeRaw.mock.invocationCallOrder),
     );
   });
 
@@ -428,7 +434,7 @@ describe("capacity wakeup polling", () => {
     ).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "23505" })).toBe(false);
   });
-  it.each(["P2034", "40001", "40P01"])(
+  it.each(["P2034", "40001", "40P01", "FENCE_SET_CHANGED"])(
     "retries %s after rollback without leaking work",
     async (code) => {
       let attempts = 0;
@@ -478,6 +484,18 @@ describe("capacity wakeup polling", () => {
     expect(pauses).toHaveLength(4);
     expect(pauses.every((pause, index) => pause >= 0 && pause <= 7 + index * 8)).toBe(true);
     expect(pauses.reduce((total, pause) => total + pause, 0)).toBeLessThanOrEqual(76);
+  });
+  it("fails closed after four retries under continuing scope churn", async () => {
+    const changed = Object.assign(new Error("scope set grew"), { code: "FENCE_SET_CHANGED" });
+    const transaction = vi.fn().mockRejectedValue(changed);
+    await expect(
+      runCapacitySerializable(
+        { $transaction: transaction } as never,
+        async () => undefined,
+        async () => undefined,
+      ),
+    ).rejects.toBe(changed);
+    expect(transaction).toHaveBeenCalledTimes(5);
   });
   it("treats notifications as hints and re-polls durable state", async () => {
     const admitted = {

@@ -491,15 +491,13 @@ export async function fenceOwners(tx: Tx, userIds: Iterable<string>): Promise<vo
  * it sees every capacity policy and admission write committed by the previous
  * holder of these fences.
  *
- * KNOWN LIMITATION (pre-existing, carried in from master's
- * `lockCapacityAdmissionResources`): the durable scope set is derived from a
- * plain read BEFORE the capacity fences are taken. A waiter committed while
- * this transaction waits for a capacity fence brings a new scope fence that
- * can no longer be taken (WMPF2 forbids a fence below one already held). Two
- * fill-mode passes on different capacities that share such a scope can
- * therefore briefly over-admit one lease, transiently and bounded by one lease
- * lifetime. Closing it means re-deriving the scope set after the capacity
- * fences and restarting on change; that is deliberately not done here.
+ * Re-read the scope set UNDER the capacity fences before allowing admission.
+ * Waiter writers on these capacities require the same capacity fences, so
+ * that read is exact. A new scope cannot be acquired in place: level 07
+ * sorts below the held level 08 fences (WMPF2). Throw FenceSetChangedError
+ * before any row lock/write so the caller restarts its transaction within
+ * its retry bound; non-waiting sweepers return false and retry next run.
+ * A shrinking set is safe: extra held scope fences are harmless.
  */
 export async function fenceCapacityAdmission(
   tx: Tx,
@@ -507,33 +505,36 @@ export async function fenceCapacityAdmission(
   additionalScopeFences: readonly Fence[] = [],
   options: { wait?: boolean } = {},
 ): Promise<boolean> {
-  const durableScopes = capacityIds.length
-    ? await tx.capacityWaiter.findMany({
-        where: {
-          capacityId: { in: [...capacityIds] },
-          effectiveConcurrencyLimit: { not: null },
-        },
-        select: {
-          effectiveConcurrencyScope: true,
-          effectiveConcurrencyScopeId: true,
-        },
-        distinct: ["effectiveConcurrencyScope", "effectiveConcurrencyScopeId"],
-      })
-    : [];
-  return acquireFences(
-    tx,
-    [
-      ...durableScopes.map((waiter) =>
-        fences.concurrencyScope(
-          waiter.effectiveConcurrencyScope,
-          waiter.effectiveConcurrencyScopeId,
-        ),
-      ),
-      ...additionalScopeFences,
-      ...capacityIds.map((capacityId) => fences.capacity(capacityId)),
-    ],
-    options,
-  );
+  const readScopes = async () =>
+    capacityIds.length
+      ? await tx.capacityWaiter.findMany({
+          where: {
+            capacityId: { in: [...capacityIds] },
+            effectiveConcurrencyLimit: { not: null },
+          },
+          select: {
+            effectiveConcurrencyScope: true,
+            effectiveConcurrencyScopeId: true,
+          },
+          distinct: ["effectiveConcurrencyScope", "effectiveConcurrencyScopeId"],
+        })
+      : [];
+  const scopeFence = (waiter: Awaited<ReturnType<typeof readScopes>>[number]) =>
+    fences.concurrencyScope(waiter.effectiveConcurrencyScope, waiter.effectiveConcurrencyScopeId);
+  const heldScopes = new Set([...(await readScopes()).map(scopeFence), ...additionalScopeFences]);
+  if (
+    !(await acquireFences(
+      tx,
+      [...heldScopes, ...capacityIds.map((capacityId) => fences.capacity(capacityId))],
+      options,
+    ))
+  )
+    return false;
+  if ((await readScopes()).some((waiter) => !heldScopes.has(scopeFence(waiter)))) {
+    if (options.wait === false) return false;
+    throw new FenceSetChangedError();
+  }
+  return true;
 }
 
 /**
@@ -640,15 +641,14 @@ export async function deleteTerminalRelayRequestsWithoutWaiting(
 export type CapacityDeleteScope = ParentDeletionScope;
 
 /**
- * The owner set a delete planned from changed once its fences were held: a
- * grant or allowlist entry that links another user to the deleted rows
- * committed between the plan and the fences. Retried with a fresh plan (the
- * transaction rolled back after taking only fences).
+ * A resource set grew between discovery and its fences (admission scopes or
+ * parent-delete owners). Roll back and retry with a fresh set; never acquire
+ * missing lower-level fences in place. No row is locked or written yet.
  */
 export class FenceSetChangedError extends Error {
   readonly code = "FENCE_SET_CHANGED";
   constructor() {
-    super("The users affected by this delete changed while it was taking its fences. Retry.");
+    super("The required fence set grew while the transaction was taking its fences. Retry.");
     this.name = "FenceSetChangedError";
   }
 }

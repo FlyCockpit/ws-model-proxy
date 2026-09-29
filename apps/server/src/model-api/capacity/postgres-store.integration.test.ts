@@ -2993,6 +2993,96 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
     }, 240_000);
   });
 
+  it("fills 5000 waiting requests on one capacity in one release transaction", async () => {
+    if (!databaseUrl) return;
+    const db = createFixturePrismaClient(databaseUrl);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const store = new PostgresCapacityAdmissionStore(db, "volume-5000");
+    const fixture = await spillFixture(db, 1, [1]);
+    const member = fixture.members[0]!;
+    const count = 5000;
+    try {
+      const holder = await store.acquire(fixture.attempt("holder", [{ member: 0 }]));
+      if (holder.state !== "ADMITTED") throw new Error("Expected the holder lease.");
+      const now = await dbNow(db);
+      const deadlineAt = new Date(now.getTime() + 300_000);
+      // Seed durable WAITING rows in parameter-bounded chunks. This avoids
+      // measuring 5000 separate enqueue transactions instead of a single fill.
+      for (let start = 0; start < count; start += 250) {
+        const requests = Array.from({ length: Math.min(250, count - start) }, (_, offset) => {
+          const id = `volume-${start + offset}-${fixture.suffix}`;
+          return {
+            id,
+            userId: fixture.user.id,
+            requestId: id,
+            attemptId: id,
+            sourceKind: "POOL" as const,
+            poolId: fixture.pool.id,
+            basePriority: 16,
+            enqueueSequence: BigInt(start + offset + 1),
+            connectionOwner: "volume-5000",
+            heartbeatAt: now,
+            deadlineAt,
+          };
+        });
+        await db.admissionRequest.createMany({ data: requests });
+        await db.capacityWaiter.createMany({
+          data: requests.map((request) => ({
+            userId: request.userId,
+            admissionRequestId: request.id,
+            requestId: request.id,
+            attemptId: request.id,
+            enqueueSequence: request.enqueueSequence,
+            capacityId: member.capacityId,
+            executionTargetId: member.executionTargetId,
+            poolId: fixture.pool.id,
+            poolMemberId: member.poolMemberId,
+            candidateOrder: 0,
+            deadlineAt,
+            effectivePriority: 16,
+            effectiveConcurrencyScope: "POOL",
+            effectiveConcurrencyScopeId: fixture.pool.id,
+          })),
+        });
+      }
+      expect(
+        await db.capacityWaiter.count({
+          where: { capacityId: member.capacityId, state: "WAITING" },
+        }),
+      ).toBe(count);
+      await db.inferenceCapacity.update({
+        where: { id: member.capacityId },
+        data: { hardConcurrencyLimit: null },
+      });
+      const started = performance.now();
+      await expect(store.release(holder.lease)).resolves.toBe(true);
+      const elapsed = performance.now() - started;
+      console.log(`[volume-5000] one release: ${elapsed.toFixed(0)} ms`);
+      // Loose bound (measured about 3-6 s on a loaded host) under the 15 s transaction ceiling.
+      expect(elapsed).toBeLessThan(10_000);
+      const leases = await db.capacityLease.findMany({
+        where: { capacityId: member.capacityId, state: "ACTIVE" },
+        select: { fencingToken: true },
+      });
+      expect(leases).toHaveLength(count);
+      expect(new Set(leases.map((lease) => lease.fencingToken)).size).toBe(count);
+      expect(
+        await db.admissionRequest.count({ where: { userId: fixture.user.id, state: "ADMITTED" } }),
+      ).toBe(count);
+      expect(
+        await db.capacityWaiter.count({
+          where: { capacityId: member.capacityId, state: "WAITING" },
+        }),
+      ).toBe(0);
+      expect(
+        await db.capacityRuntime.findUniqueOrThrow({ where: { capacityId: member.capacityId } }),
+      ).toMatchObject({ nextFencingToken: BigInt(count) + 2n });
+    } finally {
+      await cleanupCapacityFixture(db, fixture.user.id);
+      await db.$disconnect();
+    }
+  }, 60_000);
+
   /**
    * C4-2: scope limits (pool, member, direct target) are consumed by EACH grant
    * of one plan (the planner advances scope counts in memory through the
