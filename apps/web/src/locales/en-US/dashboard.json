@@ -987,7 +987,7 @@
     "noAttempts": "No provider attempt events in this window.",
     "noAudit": "No audit events for this account.",
     "noCapabilities": "No validated native capability inventory",
-    "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning and optional reasoningConfig, hosted tools, context limits, source, and confidence.",
+    "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning and optional reasoningConfig, hosted tools, context limits, Chat streamUsage (false when the endpoint rejects stream_options.include_usage), source, and confidence.",
     "visibilityDisclosure": "Visible pools remain local by default. External requests need <pool>:external, token permission, and the owner’s fallback settings, and can consume provider budgets only when local members cannot serve the request.",
     "fields": {
       "label": "Account label",

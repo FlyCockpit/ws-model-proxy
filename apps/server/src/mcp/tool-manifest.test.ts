@@ -344,6 +344,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
       "cliCredentials.deviceLoginRequest",
+      "cliCredentials.approveDeviceLogin",
       "providerManagement.createCredential",
       "providerManagement.replaceCredential",
       "providerManagement.listUsageReport",

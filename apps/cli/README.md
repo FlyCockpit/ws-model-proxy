@@ -190,6 +190,15 @@ they are unknown; `reasoning: true` remains the routing gate. Upgrade the WMP
 server before publishing this optional field, because older servers reject it
 as an unknown capability property.
 
+### Stream usage opt-out
+
+A version 3 or 4 `openaiChatCompletions` surface may declare `streamUsage: false`
+when the endpoint rejects `stream_options.include_usage`; adapted streaming
+requests then omit it, and settlement keeps the conservative liability because
+no stream usage is reported. Absent means `true`. The CLI rejects `streamUsage`
+on any other surface. Upgrade the WMP server first: older servers reject the
+field as an unknown capability property.
+
 Only URLs whose origin matches the connected WMP server (derived from
 `serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from
 request bodies are never followed (SSRF guard). Add extra trusted origins with

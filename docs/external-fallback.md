@@ -312,12 +312,35 @@ compatibility. Own-key durable records and headers use `own-key`.
 
 Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
-Audio rates bound both input/output and additional-token accounting. The shared
-usage parser supports existing token categories and direct cost, but does not
-normalize OpenRouter `cache_write_tokens`, `is_byok`, or `cost_details` metadata.
-Those unknown categories keep accounting on the conservative liability path.
-Complete OpenRouter usage normalization is deferred to a separate PR with
-provider-specific tests. Provider
+Audio rates bound both input/output and additional-token accounting.
+Usage from `openrouter` provider accounts is parsed with an OpenRouter-specific
+dialect, checked against live captures (Chat Completions, Messages and Responses,
+2026-09-29). `prompt_tokens_details.cache_write_tokens` (Messages:
+`cache_creation_input_tokens`) is settled as cache-write tokens; on Chat
+(verified by a cache-write capture) and Responses (inferred from Chat: the
+captured Responses calls had no cache activity) it is a subset of the prompt
+count, like `cached_tokens`. One-hour
+cache writes (`cache_creation.ephemeral_1h_input_tokens`), positive
+`video_tokens` / `image_tokens`, two spellings of the same count, a non-object
+detail container, and any other unrecognized or malformed field keep the
+response on the conservative liability path. Spend settles from OpenRouter's
+`cost` ("the total amount charged to your account"). With `is_byok: true` the
+upstream provider also bills the key owner, so spend is `cost +
+cost_details.upstream_inference_cost` ("the actual cost charged by the upstream
+AI provider"); a BYOK usage without a valid upstream cost keeps the liability.
+A response settles only from its one authoritative usage record: Chat, the
+root `usage` (final chunk when streaming); Messages, the `message` body or the
+`message_delta` event (the partial `message_start` snapshot is superseded);
+Responses, the `response` body or the terminal `response.completed` event
+(`usage: null` is absence). Several different authoritative usages, usage in
+any other root carrier (`usage`, `response.usage`, `message.usage`; nested
+objects are never read), a second usage container in one record, a non-JSON `data:`
+record, or a stream that stops being valid SSE keep the usage as audit evidence
+only: no charge and no total from it settles below the liability. Usage-looking
+text outside a record (for example in SSE comments or a truncated body) is
+never read. Other provider types do not accept this
+vocabulary: the same payload from an `openai` or `*-compatible` account still
+fails closed. Provider
 search, image and audio service charges can be non-token charges: token prices
 and token-based budgets are not a bound on the provider's total bill. The
 picker and import summary disclose this limitation.

@@ -1169,12 +1169,23 @@ impl Drop for OutputKey {
 
 /// The bytes a command printed after Enter, bounded like the server's exec
 /// buffers: the first [`terminal_crypto::CAPTURE_HEAD_MAX`] bytes and a
-/// rolling last [`terminal_crypto::CAPTURE_TAIL_MAX`] bytes of the stream.
+/// rolling last [`terminal_crypto::CAPTURE_TAIL_MAX`] bytes of the stream,
+/// whose start is moved on to a terminal-parser boundary (see
+/// [`crate::terminal_parse`]).
 #[derive(Default)]
 struct Capture {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: u64,
+    /// The terminal parser across the bytes dropped from the tail's front.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the Unix PTY path (`supervised_pty`) pushes into a capture"
+        )
+    )]
+    tail_state: crate::terminal_parse::TerminalByteState,
 }
 
 impl Capture {

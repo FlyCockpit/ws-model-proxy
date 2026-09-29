@@ -257,14 +257,87 @@ fn terminal_size() -> (usize, usize) {
         })
 }
 
+/// The terminal settings to restore when the confirm screen ends, however it
+/// ends. Dropping the guard restores them, so every `?`, early return and
+/// unwinding panic leaves the user's terminal as it was; [`RawMode::restore`]
+/// does it at a chosen point. A release build aborts on panic (`panic =
+/// "abort"`), which runs no destructor, so [`run`] also installs a panic hook
+/// that restores the same settings on stdin.
+struct RawMode<F: std::os::fd::AsFd> {
+    fd: F,
+    original: nix::sys::termios::Termios,
+}
+
+impl<F: std::os::fd::AsFd> RawMode<F> {
+    /// Saves `fd`'s settings and applies what `make_raw` makes of a copy.
+    fn enter(fd: F, make_raw: impl FnOnce(&mut nix::sys::termios::Termios)) -> Result<Self> {
+        use nix::sys::termios::{self, SetArg};
+        let original = termios::tcgetattr(&fd).context("reading terminal settings")?;
+        let mut raw = original.clone();
+        make_raw(&mut raw);
+        // The guard exists before the change, so a failed or partial apply is
+        // still undone.
+        let guard = Self { fd, original };
+        termios::tcsetattr(&guard.fd, SetArg::TCSANOW, &raw).context("entering raw mode")?;
+        Ok(guard)
+    }
+
+    fn fd(&self) -> &F {
+        &self.fd
+    }
+
+    fn original(&self) -> &nix::sys::termios::Termios {
+        &self.original
+    }
+
+    /// Restores the saved settings now.
+    fn restore(self) {
+        drop(self);
+    }
+}
+
+impl<F: std::os::fd::AsFd> Drop for RawMode<F> {
+    fn drop(&mut self) {
+        use nix::sys::termios::{self, SetArg};
+        let _ = termios::tcsetattr(&self.fd, SetArg::TCSANOW, &self.original);
+    }
+}
+
+/// The confirm screen's terminal mode: no line buffering, echo, signals or
+/// flow control, one byte per read.
+fn confirm_raw_mode(raw: &mut nix::sys::termios::Termios) {
+    use nix::sys::termios::{InputFlags, LocalFlags, SpecialCharacterIndices};
+    raw.local_flags
+        .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN);
+    raw.input_flags.remove(InputFlags::IXON | InputFlags::ICRNL);
+    raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
+    raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+}
+
+/// Restores `original` on `fd` before the default panic output, for a
+/// release build whose panic aborts without running [`RawMode`]'s drop.
+fn restore_terminal_on_panic<F>(fd: F, original: nix::sys::termios::Termios)
+where
+    F: std::os::fd::AsFd + Send + Sync + 'static,
+{
+    // `Termios` is `Send` but not `Sync`; the hook must be both.
+    let original = std::sync::Mutex::new(original);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(original) = original.lock() {
+            let _ =
+                nix::sys::termios::tcsetattr(&fd, nix::sys::termios::SetArg::TCSANOW, &original);
+        }
+        previous(info);
+    }));
+}
+
 pub fn run() -> Result<()> {
     use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::process::CommandExt;
 
-    use nix::sys::termios::{
-        self, FlushArg, InputFlags, LocalFlags, SetArg, SpecialCharacterIndices,
-    };
+    use nix::sys::termios::{self, FlushArg};
 
     let command = required_env(SUPERVISED_ENV_COMMAND)?;
     let reason = required_env(SUPERVISED_ENV_REASON)?;
@@ -291,19 +364,10 @@ pub fn run() -> Result<()> {
         share_output,
     };
 
-    let stdin = std::io::stdin();
-    let original = termios::tcgetattr(&stdin).context("reading terminal settings")?;
-    let mut raw = original.clone();
-    raw.local_flags
-        .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN);
-    raw.input_flags.remove(InputFlags::IXON | InputFlags::ICRNL);
-    raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-    raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-    termios::tcsetattr(&stdin, SetArg::TCSANOW, &raw).context("entering raw mode")?;
-    let restore = |stdin: &std::io::Stdin| {
-        let _ = termios::tcsetattr(stdin, SetArg::TCSANOW, &original);
-    };
-    let _ = termios::tcflush(&stdin, FlushArg::TCIFLUSH);
+    let raw_mode = RawMode::enter(std::io::stdin(), confirm_raw_mode)?;
+    restore_terminal_on_panic(std::io::stdin(), raw_mode.original().clone());
+    let stdin = raw_mode.fd();
+    let _ = termios::tcflush(stdin, FlushArg::TCIFLUSH);
 
     let mut stdout = std::io::stdout().lock();
     // Re-read by the key loop while it waits (see `RESIZE_CHECK_MS`).
@@ -313,17 +377,15 @@ pub fn run() -> Result<()> {
         .write_all(screen.paint().as_bytes())
         .and_then(|()| stdout.flush());
     if let Err(error) = drawn {
-        restore(&stdin);
         return Err(error).context("drawing the confirm screen");
     }
     // Keys pressed before the screen could be seen do not count.
     std::thread::sleep(SETTLE);
-    let _ = termios::tcflush(&stdin, FlushArg::TCIFLUSH);
+    let _ = termios::tcflush(stdin, FlushArg::TCIFLUSH);
     let ready = stdout
         .write_all(&crate::sessions::supervised_marker("ready", &marker))
         .and_then(|()| stdout.flush());
     if let Err(error) = ready {
-        restore(&stdin);
         return Err(error).context("drawing the confirm screen");
     }
 
@@ -353,26 +415,19 @@ pub fn run() -> Result<()> {
                 continue;
             }
             Err(error) => {
-                restore(&stdin);
                 return Err(error).context("waiting for the confirm key");
             }
         }
-        let byte = match read_byte(&stdin) {
+        let byte = match read_byte(stdin) {
             Ok(Some(byte)) => byte,
-            Ok(None) => {
-                restore(&stdin);
-                anyhow::bail!("terminal closed before the command was confirmed");
-            }
-            Err(error) => {
-                restore(&stdin);
-                return Err(error);
-            }
+            Ok(None) => anyhow::bail!("terminal closed before the command was confirmed"),
+            Err(error) => return Err(error),
         };
         let key = keys.feed(byte);
         match key {
             Key::Run => break 'confirm,
             Key::Decline => {
-                restore(&stdin);
+                raw_mode.restore();
                 let _ = stdout.write_all(b"\r\nDeclined.\r\n");
                 let _ = stdout.flush();
                 return Ok(());
@@ -397,23 +452,17 @@ pub fn run() -> Result<()> {
     let go = crate::sessions::supervised_marker("go", &marker);
     let mut matcher = TokenMatcher::new(&go);
     loop {
-        match read_byte(&stdin) {
+        match read_byte(stdin) {
             Ok(Some(byte)) => {
                 if matcher.feed(byte) {
                     break;
                 }
             }
-            Ok(None) => {
-                restore(&stdin);
-                anyhow::bail!("terminal closed before the command could start");
-            }
-            Err(error) => {
-                restore(&stdin);
-                return Err(error);
-            }
+            Ok(None) => anyhow::bail!("terminal closed before the command could start"),
+            Err(error) => return Err(error),
         }
     }
-    restore(&stdin);
+    raw_mode.restore();
     drop(stdout);
 
     let (program, flag) = crate::child_env::exec_shell();
@@ -431,6 +480,96 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use crate::supervised_run::tests::request;
+
+    fn local_flags(fd: &impl std::os::fd::AsFd) -> nix::sys::termios::LocalFlags {
+        nix::sys::termios::tcgetattr(fd)
+            .expect("reading pty settings")
+            .local_flags
+    }
+
+    /// The two tests that panic on purpose: the panic hook one installs is
+    /// process-global, so a sibling's panic must not run it mid-test.
+    static PANIC_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn panic_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+        PANIC_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn raw_mode_is_restored_when_the_run_panics() {
+        use nix::sys::termios::LocalFlags;
+
+        let _serial = panic_tests_lock();
+
+        let pty = nix::pty::openpty(None, None).expect("opening a pty");
+        let tty = pty.slave;
+        let cooked = LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG;
+        assert!(local_flags(&tty).contains(cooked));
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let raw_mode = RawMode::enter(&tty, confirm_raw_mode).expect("entering raw mode");
+            assert!(!local_flags(raw_mode.fd()).intersects(cooked));
+            panic!("forced panic inside the supervised run");
+        }));
+
+        assert!(outcome.is_err());
+        assert!(local_flags(&tty).contains(cooked));
+    }
+
+    #[test]
+    fn the_panic_hook_restores_the_terminal_when_no_destructor_runs() {
+        use nix::sys::termios::LocalFlags;
+
+        let _serial = panic_tests_lock();
+
+        let pty = nix::pty::openpty(None, None).expect("opening a pty");
+        let tty = pty.slave;
+        let hook_fd = tty.try_clone().expect("duplicating the pty fd");
+        let raw_mode = RawMode::enter(&tty, confirm_raw_mode).expect("entering raw mode");
+        restore_terminal_on_panic(hook_fd, raw_mode.original().clone());
+        // What `panic = "abort"` does to the guard: its drop never runs.
+        std::mem::forget(raw_mode);
+        assert!(!local_flags(&tty).contains(LocalFlags::ICANON));
+
+        let outcome = std::panic::catch_unwind(|| panic!("forced panic with no unwinding drop"));
+
+        assert!(outcome.is_err());
+        assert!(local_flags(&tty).contains(LocalFlags::ICANON | LocalFlags::ECHO));
+    }
+
+    #[test]
+    fn raw_mode_is_restored_on_an_early_return() {
+        use nix::sys::termios::LocalFlags;
+
+        let pty = nix::pty::openpty(None, None).expect("opening a pty");
+        let tty = pty.slave;
+        let early = || -> Result<()> {
+            let _raw_mode = RawMode::enter(&tty, confirm_raw_mode)?;
+            anyhow::bail!("terminal closed before the command was confirmed")
+        };
+        assert!(early().is_err());
+        assert!(local_flags(&tty).contains(LocalFlags::ICANON | LocalFlags::ECHO));
+    }
+
+    #[test]
+    fn raw_mode_restore_puts_back_the_saved_settings_exactly() {
+        let pty = nix::pty::openpty(None, None).expect("opening a pty");
+        let tty = pty.slave;
+        let before = nix::sys::termios::tcgetattr(&tty).expect("reading pty settings");
+        let raw_mode = RawMode::enter(&tty, confirm_raw_mode).expect("entering raw mode");
+        raw_mode.restore();
+        let after = nix::sys::termios::tcgetattr(&tty).expect("reading pty settings");
+        // PENDIN is kernel state, not a setting: BSD kernels (macOS) set it
+        // when a terminal returns to canonical mode.
+        let settings = |flags: nix::sys::termios::LocalFlags| {
+            flags.difference(nix::sys::termios::LocalFlags::PENDIN)
+        };
+        assert_eq!(settings(after.local_flags), settings(before.local_flags));
+        assert_eq!(after.input_flags, before.input_flags);
+        assert_eq!(after.control_chars, before.control_chars);
+    }
 
     #[test]
     fn directory_text_refuses_non_utf8_instead_of_rendering_it_lossily() {

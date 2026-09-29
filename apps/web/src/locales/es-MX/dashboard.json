@@ -898,7 +898,7 @@
     "noAttempts": "No hay eventos de intentos en esta ventana.",
     "noAudit": "No hay eventos de auditoría para esta cuenta.",
     "noCapabilities": "No hay un inventario validado de capacidades nativas",
-    "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento y reasoningConfig opcional, límites de contexto, fuente y confianza.",
+    "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento y reasoningConfig opcional, límites de contexto, streamUsage de Chat (false cuando el endpoint rechaza stream_options.include_usage), fuente y confianza.",
     "visibilityDisclosure": "Los pools visibles permanecen locales de forma predeterminada. Las solicitudes externas necesitan <pool>:external, permiso del token y la configuración de respaldo del propietario, y solo consumen presupuestos de proveedores cuando los miembros locales no pueden atenderlas.",
     "fields": {
       "label": "Etiqueta de cuenta",

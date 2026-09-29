@@ -2,8 +2,13 @@ import {
   parseAnthropicMessagesRequest,
   renderAnthropicMessagesRequest,
 } from "./anthropic-messages.js";
-import type { CanonicalEvent, CanonicalRequest, ProtocolSurface } from "./canonical.js";
-import { logAdapterRejection } from "./errors.js";
+import type {
+  CanonicalEvent,
+  CanonicalRequest,
+  CanonicalUsage,
+  ProtocolSurface,
+} from "./canonical.js";
+import { type AdapterLogContext, logAdapterRejection } from "./errors.js";
 import { parseProtocolResponse, renderProtocolResponse } from "./nonstream.js";
 import { parseOpenAiChatRequest, renderOpenAiChatRequest } from "./openai-chat.js";
 import { parseOpenAiResponsesRequest, renderOpenAiResponsesRequest } from "./openai-responses.js";
@@ -22,6 +27,7 @@ export function renderCanonicalRequest({
   model,
   allowLossyDeveloperRoleCollapse = false,
   acceptsTopK = false,
+  streamUsage = true,
   reasoning,
 }: {
   request: CanonicalRequest;
@@ -30,10 +36,12 @@ export function renderCanonicalRequest({
   allowLossyDeveloperRoleCollapse?: boolean;
   /** Chat targets that accept a top-level `top_k`. Default rejects. */
   acceptsTopK?: boolean;
+  /** Chat targets that accept `stream_options.include_usage`. Default asks. */
+  streamUsage?: boolean;
   reasoning?: ReasoningRenderControl;
 }): Record<string, unknown> {
   if (target === "openai-chat")
-    return renderOpenAiChatRequest(request, model, { acceptsTopK, reasoning });
+    return renderOpenAiChatRequest(request, model, { acceptsTopK, reasoning, streamUsage });
   if (target === "openai-responses")
     return renderOpenAiResponsesRequest(request, model, { reasoning });
   return renderAnthropicMessagesRequest(request, model, {
@@ -90,12 +98,14 @@ export function adaptNonstreamResponse({
   body,
   status,
   headers,
+  logContext,
 }: {
   source: ProtocolSurface;
   target: ProtocolSurface;
   body: unknown;
   status: number;
   headers?: Headers;
+  logContext?: AdapterLogContext;
 }) {
   try {
     const parsed = parseProtocolResponse({ surface: source, body, status, headers });
@@ -108,7 +118,7 @@ export function adaptNonstreamResponse({
       : { ok: false as const, metadata: parsed.metadata, error: parsed.error };
   } catch (error) {
     // Callers map a rejection to a generic 502 without the parameter.
-    logAdapterRejection(error, { source, target });
+    logAdapterRejection(error, { source, target }, logContext);
     throw error;
   }
 }
@@ -120,8 +130,10 @@ export function createProtocolAdaptationTransform({
   maxEventBytes,
   maxAggregateBytes,
   recoverProtocolErrors = false,
+  recoverBeforeOutput = false,
   onProtocolError,
   request,
+  logContext,
 }: {
   source: ProtocolSurface;
   target: ProtocolSurface;
@@ -129,17 +141,36 @@ export function createProtocolAdaptationTransform({
   maxEventBytes?: number;
   maxAggregateBytes?: number;
   recoverProtocolErrors?: boolean;
+  /**
+   * Also render the terminal error when nothing was output yet. For callers
+   * that already committed response headers and cannot retry elsewhere.
+   */
+  recoverBeforeOutput?: boolean;
   onProtocolError?: (error: unknown) => void;
   request?: CanonicalRequest;
+  logContext?: AdapterLogContext;
 }): TransformStream<Uint8Array, Uint8Array> {
   const parser = new CanonicalStreamParser(source, { signal, maxEventBytes, maxAggregateBytes });
   const renderer = new CanonicalStreamRenderer(target, { signal, maxAggregateBytes });
   let failed = false;
   let hasOutput = false;
-  let observedUsage: { inputTokens?: number; outputTokens?: number } = {};
-  const mergeUsage = (usage: { inputTokens?: number; outputTokens?: number }) => {
-    if (usage.inputTokens !== undefined) observedUsage.inputTokens = usage.inputTokens;
-    if (usage.outputTokens !== undefined) observedUsage.outputTokens = usage.outputTokens;
+  let observedUsage: CanonicalUsage = {};
+  // Cache counts are a subset of input and travel with it: an event that
+  // carries input replaces them, and an output-only event keeps them.
+  const mergeUsage = (usage: CanonicalUsage) => {
+    if (usage.inputTokens !== undefined) {
+      const { cacheReadTokens: _read, cacheWriteTokens: _write, ...rest } = observedUsage;
+      observedUsage = {
+        ...rest,
+        inputTokens: usage.inputTokens,
+        ...(usage.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+        ...(usage.cacheWriteTokens !== undefined
+          ? { cacheWriteTokens: usage.cacheWriteTokens }
+          : {}),
+      };
+    }
+    if (usage.outputTokens !== undefined)
+      observedUsage = { ...observedUsage, outputTokens: usage.outputTokens };
   };
   const withCumulativeUsage = (event: CanonicalEvent): CanonicalEvent => {
     if (event.type === "usage") {
@@ -156,8 +187,8 @@ export function createProtocolAdaptationTransform({
     withAnthropicInitialUsage(withCumulativeUsage(event), target, request);
   const recover = (error: unknown, controller: TransformStreamDefaultController<Uint8Array>) => {
     // Every parser and renderer failure passes here, recovered or rethrown.
-    logAdapterRejection(error, { source, target });
-    if (!recoverProtocolErrors || !hasOutput) throw error;
+    logAdapterRejection(error, { source, target }, logContext);
+    if (!recoverProtocolErrors || (!hasOutput && !recoverBeforeOutput)) throw error;
     failed = true;
     onProtocolError?.(error);
     try {

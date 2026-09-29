@@ -1,0 +1,461 @@
+{
+  "description": "Rolling-tail boundary vectors: feed streamHex in chunk-byte pieces into a tail of at most max bytes that also drops bytes from its front until the terminal parser is in its ground state on a whole character; the result must equal tailHex. Generated from appendRollingTail (packages/config/src/cli-command-output.ts); checked by packages/config/src/cli-command-output.test.ts and apps/cli/src/terminal_parse.rs.",
+  "vectors": [
+    {
+      "streamHex": "706c61696e20746578742074686174206973206c6f6e676572207468616e20746865207461696c",
+      "chunk": 5,
+      "max": 12,
+      "tailHex": "68616e20746865207461696c"
+    },
+    {
+      "streamHex": "56495349424c450a1b5071787878787878787878787878787878787878787878787878787878787878787878787878787878780a48494444454e0a1b5c2041465445520a",
+      "chunk": 7,
+      "max": 16,
+      "tailHex": "2041465445520a"
+    },
+    {
+      "streamHex": "56495349424c450a1b5f787878787878787878787878787878787878787878787878787878787878787878787878787878780a48494444454e0a1b5b306d2041465445520a",
+      "chunk": 3,
+      "max": 16,
+      "tailHex": "2041465445520a"
+    },
+    {
+      "streamHex": "611b5d35323b633b78787878787878787878787878787878787878787878787878787878787807204146544552",
+      "chunk": 4,
+      "max": 10,
+      "tailHex": "204146544552"
+    },
+    {
+      "streamHex": "611b5b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b313b6d204146544552",
+      "chunk": 2,
+      "max": 10,
+      "tailHex": "204146544552"
+    },
+    {
+      "streamHex": "61c29f7878787878787878787878787878787878787878c29c204146544552",
+      "chunk": 1,
+      "max": 10,
+      "tailHex": "204146544552"
+    },
+    {
+      "streamHex": "616263c29f48494444454ec29c204146544552",
+      "chunk": 1,
+      "max": 15,
+      "tailHex": "204146544552"
+    },
+    {
+      "streamHex": "78787878787878787878f09f98807461696c",
+      "chunk": 1,
+      "max": 6,
+      "tailHex": "7461696c"
+    },
+    {
+      "streamHex": "78787878787878787878e08041ffeda0807461696c",
+      "chunk": 2,
+      "max": 7,
+      "tailHex": "eda0807461696c"
+    },
+    {
+      "streamHex": "611b5031c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9781b5c204146544552",
+      "chunk": 3,
+      "max": 10,
+      "tailHex": "204146544552"
+    },
+    {
+      "streamHex": "611b5b31c3a973686f776e2074657874",
+      "chunk": 1,
+      "max": 8,
+      "tailHex": "6f776e2074657874"
+    },
+    {
+      "streamHex": "1b5f7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+      "chunk": 8,
+      "max": 16,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "078061f45f",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b5fc29d5fc29d5b07c29d5b61f45b07ff619f5b80075b07",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "e05f5f5f9fc29d5b5be0ffffc29d80",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5e5b5bc29dc29d61075f5b075f5bc29d07c261075f616161c29ded5b5bc29d5bc29dc29dc29dc29d61c29dc29d5f5f61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29d9f616107075fc29dc29d5b61c29d61615b5b9f5f5f5b07",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5bc29d5f5bc29d",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "619f5f6161ff5fc29dff615fc29d5f075f6107075b615b",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": "5b"
+    },
+    {
+      "streamHex": "07c29d5f075f5b615f5f5bc29d075b5bc29d61c29d9fc29dc29df4",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "61c29d5b0707075bc25f5b5fc29d07c29d5f61c29dc29d5f075b61e0c29d5b5fc29d615b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "61079f5f5f",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "5f"
+    },
+    {
+      "streamHex": "5b5bf4c261",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "ed61075b5be0070707075f07edc29d615bc29dc29dc29d5bedc29dc29d5bc29dc29d80e05f",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b07800761",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "61"
+    },
+    {
+      "streamHex": "805f5f5f5f5f615f5f5f5f61ed6161c29d5f5f5f6161",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29dc29dc29d070707615b5f5f80615b07ff5b5b5f615b07",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "5b616107c29dc261c29d5f5bc29d5b61805f5f616161610707c29d61076107c29d80075b5f5bc29d5b5fc29d",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29dc29d5fc29dff9f61c29d5bc29d075b619f5e5f07075f5f075fc29d61c29df4075f5b5be05f07c29d615b5f",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29df461c29df4070707c29dc2c29dc29d07c29d61e007f45b5b5b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "5b"
+    },
+    {
+      "streamHex": "5f80075b5b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "5b"
+    },
+    {
+      "streamHex": "e05f6161c29d5f5ff407c29dc25b61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "9f075b5f075f5fc29d61c28061e06107ed075b5f61f4075f6161c29d5f5b5f61615f805f5b615b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29de0076180",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "80"
+    },
+    {
+      "streamHex": "9f5b5b5f80",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "80"
+    },
+    {
+      "streamHex": "5f5fc29d5b5f075b616161805fc29d",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b61ff6161c29d80075f075fc29d07",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "61075b5b075fc29d5b5f80615b80",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "0707615f61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "61"
+    },
+    {
+      "streamHex": "5b5b805f5b5b615b07c29dc29d8007e05b615f619f5b5fc29dc29d615b075f5fc29d",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5f5b5b075f",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "5f"
+    },
+    {
+      "streamHex": "c29d5bc29de00761c29d800761f49fc29d6107e0c29dc29d61c29d615fc29d075bc29d5f5f80",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5f9f805b075f61c29d07075f07c29d",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b0707c29dc25bc29d5f61615b61ff07f4ffc29d075fc29d5b6107615f5b805bc29dff5b07c29d616107c29d",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b5b615b9f5fc29d5b5f6107615b07ed80c29d5f070707",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "610761c29dc29d615f070761805f5b",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "5b"
+    },
+    {
+      "streamHex": "5f5f61075f5b8061f4610707ff",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "ff"
+    },
+    {
+      "streamHex": "6107615fc29d5b9f9f5b5f5f5bc29d07075b075f0707ed5bc29d07615f805b61",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": "61"
+    },
+    {
+      "streamHex": "075b615b5f07615f07c29d5b9f61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "075b075f5bc29dff615b619f61c29d80c29df4075b615fe0",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "e0"
+    },
+    {
+      "streamHex": "c29d5f61075b07f407615b5f61ff5b5f5f5f8080c29dc29d5f5f5fc29d07075f075f9f5f61c29de05f5b",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "61c29d80c29d5b",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "070761f4075fc29dc29d5bc29dc29d07c29d",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "07c29d5bc29d5f805b5f0707075f5f07075b61805b805b61c29dc29d5f61615b5ff45b61615f075b07",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "07075f079f616161ed075b61ff",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "ff"
+    },
+    {
+      "streamHex": "5b5f5f5b615fc29d5f5f5f5f5f61c29dc29d07c2075bf4ff5f5b5f0707ff5b5f",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": "5f"
+    },
+    {
+      "streamHex": "5fc29dc29d615f610761ff0707c29d07c29d61615f5f0761ed07c2c29de05bc29d6161",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "c29d5bed61ff61f45fc29d5f5b615bc261c29dc29dc29d615b075fc29df45f07c29d5b07",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b5f800761",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "61"
+    },
+    {
+      "streamHex": "9f80616107",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "c29d61c29df4615fc29d5f6161075b5fc2075fc207616107fff45b5b07c29dff61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "618007075f5f6107c29dc29d075b07",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "61c29d5b6107",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5b07075f5b5bff61c25f07c29dc2",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "615b07c29dc29ded5bc29dc29d5f5b075f5f5b615b615b8007079f5b0707c29dc29dc29d61c29d5b5bc29d5b0707",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "07"
+    },
+    {
+      "streamHex": "c29dc29d615f5f",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5bf4e05f615fff615b07c29d5fc29d5b8007c29dc29d07c29d5b",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "80075bc29d5b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "5f07c29dc280ffc29d5fc29ded5fc29dc29dc29d805f5f5f075f5f5b5f5f5fedc29d5f61",
+      "chunk": 3,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "6107edf407c29d61c29dff61c29d075be05b5bc29d07c29d0761075b07c29d5f5b5f5f",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "6107615b5be05ff4ed5f07c29d5bc29d5f615fc29d80f461",
+      "chunk": 5,
+      "max": 1,
+      "tailHex": ""
+    },
+    {
+      "streamHex": "075fc29d615fc29d5fe05f615f075b",
+      "chunk": 1,
+      "max": 1,
+      "tailHex": "5b"
+    },
+    {
+      "streamHex": "78787878f09f8fb4f3a081a7f3a081a2f3a081a5f3a081aef3a081a7f3a081bf20646f6e65",
+      "chunk": 1,
+      "max": 22,
+      "tailHex": "f3a081a5f3a081aef3a081a7f3a081bf20646f6e65"
+    },
+    {
+      "streamHex": "78787878f09f8fb4f3a081a7f3a081a2f3a081a5f3a081aef3a081a7f3a081bf20646f6e65",
+      "chunk": 3,
+      "max": 21,
+      "tailHex": "f3a081a5f3a081aef3a081a7f3a081bf20646f6e65"
+    },
+    {
+      "streamHex": "6162f18080807461696c",
+      "chunk": 1,
+      "max": 6,
+      "tailHex": "7461696c"
+    },
+    {
+      "streamHex": "6162f28fbfbff3807879",
+      "chunk": 2,
+      "max": 5,
+      "tailHex": "f3807879"
+    }
+  ]
+}
