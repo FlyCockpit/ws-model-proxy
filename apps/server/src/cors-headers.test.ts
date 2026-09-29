@@ -127,6 +127,14 @@ describe("createApp CORS preflight (CORS_ALLOW_HEADERS wiring)", () => {
     for (const header of CORS_ALLOW_HEADERS) expect(allowed).toContain(header.toLowerCase());
   });
 
+  it("does not echo a header outside CORS_ALLOW_HEADERS (allowlist stays explicit)", async () => {
+    const res = await preflight("content-type,x-not-allowlisted");
+    const allowed = allowedHeaders(res);
+    expect(allowed).toContain("content-type");
+    expect(allowed).not.toContain("x-not-allowlisted");
+    expect(allowed.slice().sort()).toEqual(CORS_ALLOW_HEADERS.map((h) => h.toLowerCase()).sort());
+  });
+
   it("allows the locale header the auth client sets on every request", async () => {
     expect(CORS_ALLOW_HEADERS).toContain(APP_LOCALE_HEADER);
     const res = await preflight(`content-type,${APP_LOCALE_HEADER}`);
