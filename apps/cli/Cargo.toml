@@ -101,7 +101,8 @@ similar = { version = "3", default-features = false, features = ["std", "text"] 
 # without unsafe FFI. `signal` covers process-group SIGKILL. `hostname` is
 # reported in hello and suggests the login slug. `term` puts the supervised
 # command confirm screen in raw mode and flushes typed-ahead input. `fs`
-# (statvfs) and `net` (getifaddrs) feed relay 2.7 node telemetry.
+# (statvfs) and `net` (getifaddrs) feed relay 2.7 node telemetry. `dir` backs
+# the file_ops fd-based directory walker.
 nix = { version = "0.31", default-features = false, features = ["fs", "dir", "hostname", "net", "socket", "user", "signal", "process", "poll", "term"] }
 # Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
 # here). Windows v1 reports terminals unsupported and does not link this crate.

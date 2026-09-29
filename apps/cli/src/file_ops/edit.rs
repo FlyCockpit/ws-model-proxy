@@ -25,6 +25,10 @@ use super::{Cancel, FileOps, check_reason};
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
 pub const MAX_EDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Longest `newText` of one edit (the write body cap).
+pub const MAX_NEW_TEXT_BYTES: usize = 1024 * 1024;
+/// Most matches one `oldText` may replace (bounds planning memory and time).
+pub const MAX_MATCHES_PER_EDIT: usize = 100_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -75,10 +79,34 @@ pub struct EditResult {
 
 struct Planned {
     orig: Range<usize>,
-    replacement: String,
+    /// Index into the per-edit replacement texts (no per-match copy).
+    edit: usize,
 }
 
-pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+/// Running size of the edited file. The deltas of all edits are summed and the
+/// total is checked once, before anything is materialised, so the verdict does
+/// not depend on the order of the edits.
+struct SizeBudget {
+    size: i128,
+}
+
+impl SizeBudget {
+    fn add(&mut self, replaced: usize, with: usize) {
+        self.size += with as i128 - replaced as i128;
+    }
+
+    fn check(&self) -> FileResult<()> {
+        if self.size > MAX_EDIT_FILE_BYTES as i128 {
+            return Err(FileError::new(
+                ErrorCode::TooLarge,
+                "the edited file would exceed 16 MiB",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     check_reason(&args.reason)?;
     if args.edits.is_empty() || args.edits.len() > MAX_EDITS {
         return Err(FileError::invalid(format!(
@@ -99,6 +127,9 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
                     "each edit is either {oldText,newText[,expectedMatches]} or {startLine,endLine,newText}",
                 ));
             }
+        }
+        if op.new_text.len() > MAX_NEW_TEXT_BYTES {
+            return Err(FileError::invalid("newText is longer than 1 MiB"));
         }
         if op.new_text.contains(MASK_OPEN) {
             return Err(FileError::new(
@@ -122,9 +153,11 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
             access: Access::Write,
         },
     )?;
-    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    // Lock first (as `write` does): a queued edit then opens the file after the
+    // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
+    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
     let previous_etag = ops.key.strong(&original);
@@ -143,21 +176,36 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
     let crlf = text::detect_eol(&original) == Eol::Crlf;
 
     let mut planned: Vec<Planned> = Vec::new();
+    let mut budget = SizeBudget {
+        size: original.len() as i128,
+    };
+    let mut new_texts: Vec<String> = Vec::with_capacity(args.edits.len());
     for (index, op) in args.edits.iter().enumerate() {
-        let new_text = translate_eol(&op.new_text, crlf);
+        new_texts.push(translate_eol(&op.new_text, crlf));
+        let new_text = &new_texts[index];
         match (&op.old_text, op.start_line, op.end_line) {
             (Some(old), _, _) => {
                 plan_exact(
                     &view,
                     &translate_eol(old, crlf),
-                    &new_text,
+                    new_text.len(),
                     op,
                     index,
                     &mut planned,
+                    &mut budget,
+                    cancel,
                 )?;
             }
             (None, Some(start), Some(end)) => {
-                planned.push(plan_lines(&view, &original, start, end, new_text, index)?);
+                planned.push(plan_lines(
+                    &view,
+                    &original,
+                    start,
+                    end,
+                    new_text.len(),
+                    index,
+                    &mut budget,
+                )?);
             }
             _ => return Err(FileError::invalid("malformed edit")),
         }
@@ -171,11 +219,12 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
         }
     }
 
+    budget.check()?;
     let mut updated: Vec<u8> = Vec::with_capacity(original.len());
     let mut cursor = 0;
     for plan in &planned {
         updated.extend_from_slice(&original[cursor..plan.orig.start]);
-        updated.extend_from_slice(plan.replacement.as_bytes());
+        updated.extend_from_slice(new_texts[plan.edit].as_bytes());
         cursor = plan.orig.end;
     }
     updated.extend_from_slice(&original[cursor..]);
@@ -189,6 +238,16 @@ pub fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditR
         .map_err(|_| FileError::invalid("the edit would produce invalid UTF-8"))?;
 
     let after_view = redact::mask(class, updated_text);
+    // Masking depends on context (the name, the assignment shape, an open quote).
+    // An edit that touches no masked value can still change that context, so no
+    // masked byte of the original may show up unmasked in the result or in its
+    // diff, `dryRun` included.
+    if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "the edit would expose a redacted value; masked text cannot change context",
+        ));
+    }
     let summary = diff_lines(&view.text, &after_view.text);
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
@@ -266,16 +325,31 @@ fn line_of(text: &str, byte: usize) -> usize {
     text[..byte].matches('\n').count() + 1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_exact(
     view: &MaskedView,
     old: &str,
-    new_text: &str,
+    new_len: usize,
     op: &EditOp,
     index: usize,
     planned: &mut Vec<Planned>,
+    budget: &mut SizeBudget,
+    cancel: &Cancel,
 ) -> FileResult<()> {
-    let matches: Vec<usize> = view.text.match_indices(old).map(|(at, _)| at).collect();
+    let matches: Vec<usize> = view
+        .text
+        .match_indices(old)
+        .map(|(at, _)| at)
+        .take(MAX_MATCHES_PER_EDIT + 1)
+        .collect();
     let found = matches.len();
+    if found > MAX_MATCHES_PER_EDIT {
+        return Err(FileError::new(
+            ErrorCode::MatchCount,
+            format!("edit {index}: more than {MAX_MATCHES_PER_EDIT} matches; narrow oldText"),
+        )
+        .with_detail(json!({ "edit": index, "moreThan": MAX_MATCHES_PER_EDIT })));
+    }
     if found == 0 {
         return Err(FileError::new(
             ErrorCode::NoMatch,
@@ -314,7 +388,10 @@ fn plan_exact(
             json!({ "edit": index, "expected": expected, "found": found, "lines": lines }),
         ));
     }
-    for at in matches {
+    for (n, at) in matches.into_iter().enumerate() {
+        if n % 1024 == 1023 {
+            cancel.check()?;
+        }
         let range = at..at + old.len();
         if view.overlaps_span(&range) {
             return Err(FileError::new(
@@ -323,12 +400,50 @@ fn plan_exact(
             )
             .with_detail(json!({ "edit": index, "line": line_of(&view.text, at) })));
         }
+        budget.add(old.len(), new_len);
         planned.push(Planned {
             orig: view.to_orig(range.start)..view.to_orig(range.end),
-            replacement: new_text.to_string(),
+            edit: index,
         });
     }
     Ok(())
+}
+
+/// Whether every masked span of `before` that survives the edits lies inside a
+/// masked span of `after` (positions shifted by the planned replacements).
+fn masked_bytes_stay_masked(
+    before: &MaskedView,
+    planned: &[Planned],
+    new_texts: &[String],
+    after: &MaskedView,
+) -> bool {
+    // `planned` is sorted by original start and non-overlapping.
+    let mut prefix: Vec<i64> = Vec::with_capacity(planned.len());
+    let mut running = 0_i64;
+    for plan in planned {
+        running += new_texts[plan.edit].len() as i64 - plan.orig.len() as i64;
+        prefix.push(running);
+    }
+    for span in &before.spans {
+        // planned replacements that end at or before this span
+        let idx = planned.partition_point(|plan| plan.orig.end <= span.orig.start);
+        let delta = if idx == 0 { 0 } else { prefix[idx - 1] };
+        let start = (span.orig.start as i64 + delta) as usize;
+        let end = start + span.orig.len();
+        // masked-view spans of `after` are sorted; walk the run that covers `start`
+        let mut at = after.spans.partition_point(|s| s.orig.end <= start);
+        let mut cursor = start;
+        while cursor < end {
+            match after.spans.get(at) {
+                Some(s) if s.orig.start <= cursor => {
+                    cursor = s.orig.end;
+                    at += 1;
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 fn plan_lines(
@@ -336,11 +451,12 @@ fn plan_lines(
     original: &[u8],
     start: u64,
     end: u64,
-    new_text: String,
+    new_len: usize,
     index: usize,
+    budget: &mut SizeBudget,
 ) -> FileResult<Planned> {
     let total = text::count_lines(original) as u64;
-    if start == 0 || end + 1 < start || start > total + 1 || end > total {
+    if start == 0 || end > total || end < start - 1 || start > total + 1 {
         return Err(FileError::invalid(format!(
             "edit {index}: line range {start}..{end} is outside the file ({total} lines)"
         )));
@@ -359,9 +475,10 @@ fn plan_lines(
         )
         .with_detail(json!({ "edit": index })));
     }
+    budget.add(range.len(), new_len);
     Ok(Planned {
         orig: range,
-        replacement: new_text,
+        edit: index,
     })
 }
 
@@ -403,6 +520,47 @@ fn nearest_line(haystack: &str, old: &str) -> Option<usize> {
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    #[test]
+    fn the_size_budget_does_not_depend_on_edit_order() {
+        let cap = MAX_EDIT_FILE_BYTES as usize;
+        for order in [[(0, 1 << 20), (1 << 20, 0)], [(1 << 20, 0), (0, 1 << 20)]] {
+            let mut budget = SizeBudget {
+                size: (cap - 100) as i128,
+            };
+            for (replaced, with) in order {
+                budget.add(replaced, with);
+            }
+            assert!(budget.check().is_ok());
+        }
+        let mut over = SizeBudget { size: cap as i128 };
+        over.add(0, 1);
+        assert!(over.check().is_err());
+        let mut exact = SizeBudget {
+            size: cap as i128 - 1,
+        };
+        exact.add(0, 1);
+        assert!(
+            exact.check().is_ok(),
+            "a result exactly at the cap is allowed"
+        );
+    }
+
+    #[test]
+    fn masked_bytes_stay_masked_maps_positions_through_the_replacements() {
+        let before = redact::mask(redact::FileClass::Plain, "A=1\nX_KEY=secret\n");
+        let planned = [Planned {
+            orig: 0..3,
+            edit: 0,
+        }];
+        let texts = ["A=10000".to_string()];
+        let after = redact::mask(redact::FileClass::Plain, "A=10000\nX_KEY=secret\n");
+        assert!(masked_bytes_stay_masked(&before, &planned, &texts, &after));
+        let unmasked = redact::mask(redact::FileClass::Plain, "A=10000\nX KEY=secret\n");
+        assert!(!masked_bytes_stay_masked(
+            &before, &planned, &texts, &unmasked
+        ));
+    }
 
     #[test]
     fn crlf_translation_keeps_existing_crlf() {

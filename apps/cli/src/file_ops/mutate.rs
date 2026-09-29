@@ -4,18 +4,19 @@
 use std::os::fd::AsFd;
 
 use nix::errno::Errno;
-use nix::fcntl::renameat;
-use nix::sys::stat::{Mode, mkdirat};
-use nix::unistd::{UnlinkatFlags, unlinkat};
+use nix::fcntl::{AtFlags, renameat};
+use nix::sys::stat::mkdirat;
+use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 use serde::{Deserialize, Serialize};
 
+use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 use super::policy::Access;
 use super::read::current_etag;
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, FileOps, Step, check_reason};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,7 +98,11 @@ fn object_etag(ops: &FileOps, resolved: &Resolved, stat: &Stat) -> FileResult<Op
     })
 }
 
-pub fn rename(ops: &FileOps, args: &RenameArgs, cancel: &Cancel) -> FileResult<RenameResult> {
+pub(crate) fn rename(
+    ops: &FileOps,
+    args: &RenameArgs,
+    cancel: &Cancel,
+) -> FileResult<RenameResult> {
     check_reason(&args.reason)?;
     let overwrite = args.overwrite.unwrap_or(false);
     if overwrite && args.expected_etag.is_none() {
@@ -146,11 +151,18 @@ pub fn rename(ops: &FileOps, args: &RenameArgs, cancel: &Cancel) -> FileResult<R
         }
     }
 
-    if let Some(dst) = to.lstat()? {
+    let dst = to.lstat()?;
+    if let Some(dst) = &dst {
         if !overwrite {
             return Err(FileError::new(
                 ErrorCode::Exists,
                 "the destination already exists",
+            ));
+        }
+        if dst.kind() != src.kind() {
+            return Err(FileError::new(
+                ErrorCode::Exists,
+                "overwrite replaces a file with a file (or a symlink with a symlink), not across kinds",
             ));
         }
         if dst.kind() == Kind::Dir || dst.kind() == Kind::Other {
@@ -159,22 +171,95 @@ pub fn rename(ops: &FileOps, args: &RenameArgs, cancel: &Cancel) -> FileResult<R
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
-        ops.policy.check_identity(Access::Write, &dst)?;
-        let current = object_etag(ops, &to, &dst)?.unwrap_or_default();
+        ops.policy.check_identity(Access::Write, dst)?;
+        let current = object_etag(ops, &to, dst)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
         }
     }
 
     cancel.check()?;
-    do_rename(&from, &to, overwrite)?;
+    // Test seam: the last point at which the world can change before the commit.
+    ops.step(Step::EtagRechecked)?;
+    commit_rename(&from, &to, overwrite, &src, dst.as_ref())?;
     Ok(RenameResult { etag: src_etag })
 }
 
+/// Commit the rename and verify that the objects that moved are the ones that
+/// were checked. `dst` is the destination object that `expectedEtag` covered
+/// (`None` when nothing was at the destination).
+///
+/// * No overwrite (or an empty destination): an atomic no-replace rename, so a
+///   destination that appeared after the check is never replaced.
+/// * Overwrite of a checked destination (Linux): `RENAME_EXCHANGE`, then the old
+///   destination is at the source name and is removed only when it is the object
+///   whose etag was checked; otherwise the exchange is undone.
+///
+/// Residual (documented in the plan): on non-Linux systems overwrite and
+/// directory moves have no atomic primitive here and rely on the checks above.
+/// Crash states: between the exchange and the unlink the old destination is
+/// under the source name; after `linkat` and before the unlink both names exist.
+/// Neither loses data. The undo moves the object now at the destination back only
+/// when it is the object that was moved.
+fn commit_rename(
+    from: &Resolved,
+    to: &Resolved,
+    overwrite: bool,
+    src: &Stat,
+    dst: Option<&Stat>,
+) -> FileResult<()> {
+    match (overwrite, dst) {
+        (true, Some(dst)) => exchange_over(from, to, src, dst),
+        _ => {
+            move_no_replace(from, to, src)?;
+            verify_moved(from, to, src)
+        }
+    }
+}
+
+/// After a move: the destination name must hold the source object.
+fn verify_moved(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
+    match to.lstat()? {
+        Some(now) if now.same_object(src) => Ok(()),
+        _ => {
+            // Another object was moved. Put it back when nothing took its place.
+            let _ = move_no_replace(to, from, src);
+            Err(FileError::conflict("replaced"))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn do_rename(from: &Resolved, to: &Resolved, overwrite: bool) -> FileResult<()> {
-    use nix::fcntl::{RenameFlags, renameat2};
-    if overwrite {
+fn unsupported_atomic() -> FileError {
+    FileError::new(
+        ErrorCode::Unsupported,
+        "this filesystem has no atomic no-replace rename for directories",
+    )
+}
+
+/// Rename without replacing an existing destination, atomically.
+fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{RenameFlags, renameat2};
+        match renameat2(
+            from.dir.as_fd(),
+            from.name.as_os_str(),
+            to.dir.as_fd(),
+            to.name.as_os_str(),
+            RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(Errno::EEXIST) => return Err(exists_error()),
+            Err(Errno::EINVAL | Errno::ENOSYS) => {}
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+    }
+    if src.kind() == Kind::Dir {
+        #[cfg(target_os = "linux")]
+        return Err(unsupported_atomic());
+        // Non-Linux: no atomic primitive for directories; existence was checked.
+        #[cfg(not(target_os = "linux"))]
         return renameat(
             from.dir.as_fd(),
             from.name.as_os_str(),
@@ -183,39 +268,110 @@ fn do_rename(from: &Resolved, to: &Resolved, overwrite: bool) -> FileResult<()> 
         )
         .map_err(FileError::errno);
     }
-    match renameat2(
+    // link + unlink: `linkat` fails with EEXIST instead of replacing.
+    match linkat(
         from.dir.as_fd(),
         from.name.as_os_str(),
         to.dir.as_fd(),
         to.name.as_os_str(),
-        RenameFlags::RENAME_NOREPLACE,
+        AtFlags::empty(),
     ) {
-        Ok(()) => Ok(()),
-        // Filesystems without RENAME_NOREPLACE: existence was checked above.
-        Err(Errno::EINVAL | Errno::ENOSYS) => renameat(
+        Ok(()) => {}
+        Err(Errno::EEXIST) => return Err(exists_error()),
+        // A filesystem without hard links (FAT, some network shares): the
+        // existence check above is all that guards the destination there.
+        Err(Errno::EPERM | Errno::ENOTSUP | Errno::EMLINK) => {
+            return renameat(
+                from.dir.as_fd(),
+                from.name.as_os_str(),
+                to.dir.as_fd(),
+                to.name.as_os_str(),
+            )
+            .map_err(FileError::errno);
+        }
+        Err(errno) => return Err(FileError::errno(errno)),
+    }
+    match from.lstat()? {
+        Some(now) if now.same_object(src) => unlinkat(
+            from.dir.as_fd(),
+            from.name.as_os_str(),
+            UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(FileError::errno),
+        _ => {
+            // The source name changed hands: undo our new link, keep theirs.
+            let _ = unlinkat(
+                to.dir.as_fd(),
+                to.name.as_os_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
+            Err(FileError::conflict("replaced"))
+        }
+    }
+}
+
+fn exists_error() -> FileError {
+    FileError::new(ErrorCode::Exists, "the destination already exists")
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> FileResult<()> {
+    use nix::fcntl::{RenameFlags, renameat2};
+    let swap = || {
+        renameat2(
             from.dir.as_fd(),
             from.name.as_os_str(),
             to.dir.as_fd(),
             to.name.as_os_str(),
+            RenameFlags::RENAME_EXCHANGE,
         )
-        .map_err(FileError::errno),
-        Err(errno) => Err(FileError::errno(errno)),
+    };
+    match swap() {
+        Ok(()) => {}
+        Err(Errno::EINVAL | Errno::ENOSYS) => {
+            return Err(FileError::new(
+                ErrorCode::Unsupported,
+                "this filesystem cannot replace a destination atomically",
+            ));
+        }
+        Err(errno) => return Err(FileError::errno(errno)),
     }
+    let moved_ok = matches!(to.lstat(), Ok(Some(ref now)) if now.same_object(src));
+    let old_ok = matches!(from.lstat(), Ok(Some(ref now)) if now.same_object(dst));
+    if !(moved_ok && old_ok) {
+        // A different object was in play: exchange back, refuse.
+        let _ = swap();
+        return Err(FileError::conflict("replaced"));
+    }
+    unlinkat(
+        from.dir.as_fd(),
+        from.name.as_os_str(),
+        UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(FileError::errno)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn do_rename(from: &Resolved, to: &Resolved, _overwrite: bool) -> FileResult<()> {
-    // No atomic no-replace rename in nix here: existence was checked above.
+fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, _dst: &Stat) -> FileResult<()> {
     renameat(
         from.dir.as_fd(),
         from.name.as_os_str(),
         to.dir.as_fd(),
         to.name.as_os_str(),
     )
-    .map_err(FileError::errno)
+    .map_err(FileError::errno)?;
+    verify_moved_after(to, src)
 }
 
-pub fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
+#[cfg(not(target_os = "linux"))]
+fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
+    match to.lstat()? {
+        Some(now) if now.same_object(src) => Ok(()),
+        _ => Err(FileError::conflict("replaced")),
+    }
+}
+
+pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
     check_reason(&args.reason)?;
     let mode = args
         .mode
@@ -265,7 +421,7 @@ fn mkdir_resolved(
     match mkdirat(
         resolved.dir.as_fd(),
         resolved.name.as_os_str(),
-        Mode::from_bits_truncate(mode),
+        perm_mode(mode),
     ) {
         Ok(()) => {
             resolved.created.clear();
@@ -282,7 +438,11 @@ fn mkdir_resolved(
     }
 }
 
-pub fn delete(ops: &FileOps, args: &DeleteArgs, cancel: &Cancel) -> FileResult<DeleteResult> {
+pub(crate) fn delete(
+    ops: &FileOps,
+    args: &DeleteArgs,
+    cancel: &Cancel,
+) -> FileResult<DeleteResult> {
     check_reason(&args.reason)?;
     let resolved = resolve_for(ops, &args.path, Access::Remove, false)?;
     if resolved.is_self() {
@@ -313,6 +473,8 @@ pub fn delete(ops: &FileOps, args: &DeleteArgs, cancel: &Cancel) -> FileResult<D
         }
     }
     cancel.check()?;
+    // Observable seam for the pre-unlink re-check (race tests swap the name here).
+    ops.step(Step::EtagRechecked)?;
     // The name must still be the object we inspected.
     match resolved.lstat()? {
         Some(now) if now.same_object(&st) => {}

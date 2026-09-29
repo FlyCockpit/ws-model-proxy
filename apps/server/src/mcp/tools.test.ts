@@ -2136,7 +2136,8 @@ describe("CLI file tools", () => {
         "startLine",
       ].sort(),
     );
-    expect(schema?.additionalProperties).toBe(false);
+    // The generated schema is advisory and loose (#117); the core enforces the strict shape.
+    expect(schema?.additionalProperties).toEqual({});
   });
 
   it("runs a read with exactly the documented arguments, and projects only documented fields", async () => {
@@ -2150,7 +2151,6 @@ describe("CLI file tools", () => {
       path: "~/.env",
       startLine: 1,
       maxLines: 10,
-      unknownField: "ignored",
     });
     expect(result.isError).toBeUndefined();
     expect(fileRuntime.runFileOp).toHaveBeenCalledWith({
@@ -2168,6 +2168,26 @@ describe("CLI file tools", () => {
     // The boolean secretFile flag survives the generic key redactor.
     expect(payload?.secretFile).toBe(true);
     expect(resultText(result)).toContain("⟦redacted:12⟧");
+  });
+
+  it("names the failing fields of an invalid input without echoing values (#117)", async () => {
+    const cases: Array<[Record<string, unknown>, RegExp, string]> = [
+      [{ path: "~/a", surprise: "SECRET-VALUE-XYZ" }, /Unrecognized field/, "(input)"],
+      [{ path: "~/a", maxLines: 5000 }, /maxLines/, "maxLines"],
+      [{ path: 42 }, /path/, "path"],
+      [{}, /path/, "path"],
+    ];
+    for (const [extra, pattern, field] of cases) {
+      const result = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", ...extra });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("invalid_input");
+      const issues = structured(result).error?.issues as Array<{ path: unknown[] }> | undefined;
+      expect(issues?.length).toBeGreaterThan(0);
+      expect(resultText(result)).toMatch(pattern);
+      expect(JSON.stringify(result)).not.toContain("SECRET-VALUE-XYZ");
+      if (field !== "(input)") expect(issues?.some((i) => i.path.join(".") === field)).toBe(true);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 
   it("keeps unchanged:true in the ifNoneMatch answer", async () => {
@@ -2390,6 +2410,35 @@ describe("CLI file tools", () => {
       expect(structured(result).error).toEqual(expected);
       expect(resultText(result).length).toBeGreaterThan(0);
       expect(resultText(result)).not.toContain("~/a");
+    }
+  });
+
+  it("tells the agent that secret files are read-only masked views (secret_file)", async () => {
+    for (const [tool, args] of [
+      ["forwarder_cli_file_write", { path: "~/.env", content: "A=1", confirm: "RUN" }],
+      [
+        "forwarder_cli_file_edit",
+        { path: "~/.env", edits: [{ oldText: "a", newText: "b" }], confirm: "RUN" },
+      ],
+      ["forwarder_cli_file_rename", { from: "~/.env", to: "~/x", confirm: "RUN" }],
+      ["forwarder_cli_file_delete", { path: "~/.env", confirm: "DELETE" }],
+      ["forwarder_cli_dir_create", { path: "~/.ssh/new", confirm: "RUN" }],
+    ] as const) {
+      fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "secret_file" });
+      const result = await call(tool, { cliDeviceId: "cli-1", ...args });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("secret_file");
+      expect(resultText(result)).toContain("read-only masked views");
+    }
+    const tools = await listedTools(PAT_WITH_CLI, ["mcp:write"]);
+    for (const name of [
+      "forwarder_cli_file_edit",
+      "forwarder_cli_file_write",
+      "forwarder_cli_file_rename",
+      "forwarder_cli_dir_create",
+      "forwarder_cli_file_delete",
+    ]) {
+      expect(tools.find((tool) => tool.name === name)?.description, name).toContain("secret_file");
     }
   });
 

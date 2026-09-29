@@ -428,12 +428,17 @@ try {
 
   const secretValue = `supersecret-${randomUUID()}`;
   const envPath = join(work, ".env");
-  await tool("forwarder_cli_file_write", {
+  // Secret-class paths are read-only through the tools: creating one is refused too.
+  const createEnv = await tool("forwarder_cli_file_write", {
     cliDeviceId: deviceId,
     path: envPath,
     content: `API_TOKEN=${secretValue}\nPUBLIC_NAME=visible\n`,
     confirm: "RUN",
   });
+  assert(createEnv.isError);
+  assert.equal(createEnv.error.code, "secret_file");
+  await assert.rejects(readFile(envPath), { code: "ENOENT" });
+  await writeFile(envPath, `API_TOKEN=${secretValue}\nPUBLIC_NAME=visible\n`);
   const masked = await tool("forwarder_cli_file_read", { cliDeviceId: deviceId, path: envPath });
   assert(!masked.isError, `read .env failed: ${masked.text}`);
   assert.match(masked.result.text, /API_TOKEN=⟦redacted:\d+⟧/);
@@ -456,6 +461,19 @@ try {
     confirm: "RUN",
   });
   assert(overwrite.isError, "a masked value must never be written back");
+  assert.equal(overwrite.error.code, "secret_file");
+  for (const [name, args] of [
+    [
+      "forwarder_cli_file_edit",
+      { path: envPath, edits: [{ oldText: "PUBLIC", newText: "X" }], confirm: "RUN" },
+    ],
+    ["forwarder_cli_file_rename", { from: envPath, to: join(work, "moved.env"), confirm: "RUN" }],
+    ["forwarder_cli_file_delete", { path: envPath, confirm: "DELETE" }],
+  ]) {
+    const refused = await tool(name, { cliDeviceId: deviceId, ...args });
+    assert(refused.isError, `${name} on a secret file must be refused`);
+    assert.equal(refused.error.code, "secret_file");
+  }
   assert.match(await readFile(envPath, "utf8"), new RegExp(secretValue));
 
   // The relay logs carry no file content and no secret value.

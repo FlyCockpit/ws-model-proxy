@@ -1,0 +1,512 @@
+//! Cases added by the stage-3 review: protected paths compared physically,
+//! rename bound to the checked objects, multi-line quoted values in any file,
+//! bounded work on adversarial input.
+
+use std::io::Write;
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+
+use super::*;
+use crate::file_ops::policy::Deny;
+
+// ---- protected paths are compared in the resolver's (physical) namespace ----
+
+#[test]
+fn protected_entries_behind_a_symlinked_state_dir_are_protected_by_physical_name() {
+    // WSMP_STATE_DIR reached through a symlink; the leaf does not exist yet.
+    let fx = Fx::with_policy(|root| {
+        std::fs::create_dir(root.join("real-state")).unwrap();
+        std::os::unix::fs::symlink(root.join("real-state"), root.join("configured-state")).unwrap();
+        Policy::new(
+            vec![],
+            vec![Protected {
+                path: root.join("configured-state/device-auth.json"),
+                subtree: false,
+                deny: Deny::ReadWrite,
+            }],
+            true,
+        )
+    });
+    // create a missing protected file through its physical parent
+    let r = fx.ops.write(
+        &args(json!({ "path": fx.p("real-state/device-auth.json"), "content": "x" })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::PathDenied);
+    assert!(!fx.root.join("real-state/device-auth.json").exists());
+    // and through the configured (symlink) name
+    let r = fx.ops.write(
+        &args(json!({ "path": fx.p("configured-state/device-auth.json"), "content": "x" })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::PathDenied);
+    // the physical parent of a protected file cannot be moved or removed
+    fx.put("real-state/other.txt", "keep");
+    for op in ["delete", "rename"] {
+        let r = fx.ops.execute(
+            op,
+            if op == "delete" {
+                json!({ "path": fx.p("real-state") })
+            } else {
+                json!({ "from": fx.p("real-state"), "to": fx.p("moved") })
+            },
+            &fx.cancel,
+        );
+        assert_eq!(
+            r.expect_err("protected parent").code,
+            ErrorCode::PathDenied,
+            "{op}"
+        );
+    }
+    assert!(fx.root.join("real-state/other.txt").exists());
+}
+
+#[test]
+fn an_unreadable_protected_identity_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    if real_uid() == 0 {
+        return;
+    }
+    let fx = Fx::with_policy(Fx::protecting(&[(
+        "locked/device-auth.json",
+        Deny::ReadWrite,
+    )]));
+    fx.put("locked/device-auth.json", "{}");
+    fx.put("plain.txt", "hello\n");
+    std::fs::set_permissions(
+        fx.root.join("locked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    // the protected file's inode cannot be examined: the check refuses instead of skipping
+    let r = fx
+        .ops
+        .read(&args(json!({ "path": fx.p("plain.txt") })), &fx.cancel);
+    std::fs::set_permissions(
+        fx.root.join("locked"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_eq!(code(r), ErrorCode::PathDenied);
+}
+
+// ---- rename is bound to the objects that were checked -----------------------
+
+fn rename(fx: &Fx, value: serde_json::Value) -> FileResult<super::super::mutate::RenameResult> {
+    fx.ops.rename(&args(value), &fx.cancel)
+}
+
+/// A hook that runs `act` once, at the last point before the rename commits.
+fn once_before_commit(act: impl Fn() + Send + Sync + 'static) -> impl Fn(Step) -> FileResult<()> {
+    let done = std::sync::atomic::AtomicBool::new(false);
+    move |step| {
+        if step == Step::EtagRechecked && !done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            act();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn rename_without_overwrite_never_replaces_a_destination_created_after_the_check() {
+    let dst = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+    let seen = Arc::clone(&dst);
+    let fx = Fx::new().with_hook(once_before_commit(move || {
+        std::fs::write(&*seen.lock().unwrap(), "theirs").unwrap();
+    }));
+    *dst.lock().unwrap() = fx.root.join("dst.txt");
+    fx.put("src.txt", "mine");
+    let r = rename(
+        &fx,
+        json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt") }),
+    );
+    assert_eq!(code(r), ErrorCode::Exists);
+    assert_eq!(fx.get("dst.txt"), "theirs");
+    assert_eq!(fx.get("src.txt"), "mine");
+}
+
+// Linux only: elsewhere an overwrite has no atomic exchange here (documented residual).
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_overwrite_never_replaces_a_destination_swapped_after_the_etag_check() {
+    let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+    let seen = Arc::clone(&root);
+    let fx = Fx::new().with_hook(once_before_commit(move || {
+        let root = seen.lock().unwrap();
+        // a successor object at the destination name (new inode)
+        std::fs::write(root.join("successor.tmp"), "successor").unwrap();
+        std::fs::rename(root.join("successor.tmp"), root.join("dst.txt")).unwrap();
+    }));
+    *root.lock().unwrap() = fx.root.clone();
+    fx.put("src.txt", "mine");
+    fx.put("dst.txt", "old");
+    let etag = fx.etag("dst.txt");
+    let r = rename(
+        &fx,
+        json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+    );
+    assert_eq!(code(r), ErrorCode::Conflict);
+    assert_eq!(
+        fx.get("dst.txt"),
+        "successor",
+        "the unchecked successor survives"
+    );
+    assert_eq!(
+        fx.get("src.txt"),
+        "mine",
+        "the source is back under its name"
+    );
+}
+
+#[test]
+fn rename_moves_back_a_source_that_was_swapped_after_the_check() {
+    let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+    let seen = Arc::clone(&root);
+    let fx = Fx::new().with_hook(once_before_commit(move || {
+        let root = seen.lock().unwrap();
+        std::fs::write(root.join("replacement.tmp"), "replacement").unwrap();
+        std::fs::rename(root.join("replacement.tmp"), root.join("src.txt")).unwrap();
+    }));
+    *root.lock().unwrap() = fx.root.clone();
+    fx.put("src.txt", "checked");
+    let r = rename(
+        &fx,
+        json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt") }),
+    );
+    assert_eq!(code(r), ErrorCode::Conflict);
+    assert!(
+        !fx.root.join("dst.txt").exists(),
+        "the unchecked object was not left at the destination"
+    );
+    assert_eq!(fx.get("src.txt"), "replacement");
+}
+
+#[test]
+fn rename_overwrite_still_replaces_the_checked_destination() {
+    let fx = Fx::new();
+    fx.put("src.txt", "mine");
+    fx.put("dst.txt", "old");
+    let etag = fx.etag("dst.txt");
+    rename(
+        &fx,
+        json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+    )
+    .unwrap();
+    assert_eq!(fx.get("dst.txt"), "mine");
+    assert!(!fx.root.join("src.txt").exists());
+    assert!(fx.leftovers("").is_empty());
+}
+
+// ---- multi-line quoted values are masked in ordinary files too --------------
+
+#[test]
+fn a_multi_line_quoted_value_in_a_plain_file_is_masked_in_every_window() {
+    let fx = Fx::new();
+    fx.put(
+        "notes.txt",
+        "intro\nX_TOKEN=\"first-secret\nsecond-secret\nthird-secret\" # note\n\nafter\n",
+    );
+    for start in 1..=5 {
+        let r = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": start }));
+        for leaked in ["first-secret", "second-secret", "third-secret"] {
+            assert!(!r.text.contains(leaked), "startLine {start}: {}", r.text);
+        }
+    }
+    // a closing quote does not end masking (`# note` is part of the masked line);
+    // the blank line does
+    let r = fx.read_with(json!({ "path": fx.p("notes.txt"), "startLine": 4 }));
+    assert!(
+        !r.text.contains("# note") && r.text.contains("after"),
+        "{}",
+        r.text
+    );
+    // edits address the masked view, so the continuation cannot be probed either
+    let probe = fx.ops.edit(
+        &args(json!({ "path": fx.p("notes.txt"), "edits": [{ "oldText": "second-secret", "newText": "x" }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(probe), ErrorCode::NoMatch);
+}
+
+#[test]
+fn colon_assignments_without_a_space_are_masked_by_read_search_and_edit() {
+    let fx = Fx::new();
+    fx.put("cfg.txt", "HF_TOKEN:hunter2\nother\n");
+    assert!(!fx.read("cfg.txt").text.contains("hunter2"));
+    let probe = fx.ops.edit(
+        &args(
+            json!({ "path": fx.p("cfg.txt"), "edits": [{ "oldText": "hunter2", "newText": "x" }] }),
+        ),
+        &fx.cancel,
+    );
+    assert_eq!(code(probe), ErrorCode::NoMatch);
+}
+
+// ---- adversarial input stays bounded -----------------------------------------
+
+#[test]
+fn edit_that_would_exceed_the_size_cap_fails_before_materialising_replacements() {
+    let fx = Fx::new();
+    fx.put("a.txt", "a".repeat(50_000));
+    let started = Instant::now();
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("a.txt"), "edits": [{
+            "oldText": "a", "newText": "b".repeat(1024), "expectedMatches": "all" }],
+            "dryRun": true })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::TooLarge);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // newText and match counts are capped up front
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("a.txt"), "edits": [{
+            "oldText": "a", "newText": "b".repeat(1024 * 1024 + 1) }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::InvalidInput);
+    fx.put("many.txt", "a".repeat(100_001));
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("many.txt"), "edits": [{
+            "oldText": "a", "newText": "b", "expectedMatches": "all" }] })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::MatchCount);
+}
+
+#[test]
+fn edit_planning_over_many_masked_spans_is_not_quadratic() {
+    let fx = Fx::new();
+    let mut body = String::new();
+    for i in 0..30_000 {
+        body.push_str(&format!("K{i}_KEY=value{i}\n"));
+    }
+    fx.put("big.conf", &body);
+    let started = Instant::now();
+    // every match is between two masked values, so none touches a span
+    let r = fx.ops.edit(
+        &args(json!({ "path": fx.p("big.conf"), "edits": [{
+            "oldText": "\n", "newText": "\n", "expectedMatches": "all" }],
+            "dryRun": true })),
+        &fx.cancel,
+    );
+    r.expect("30k matches are within the cap");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_line_longer_than_16_mib_in_a_file_over_64_mib_is_refused_not_buffered() {
+    let fx = Fx::new();
+    let path = fx.root.join("sparse.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&[b'a'; 9000]).unwrap();
+    file.set_len(70 * 1024 * 1024).unwrap();
+    drop(file);
+    let r = fx
+        .ops
+        .read(&args(json!({ "path": fx.p("sparse.txt") })), &fx.cancel);
+    assert_eq!(code(r), ErrorCode::TooLarge);
+    let r = fx.ops.read(
+        &args(json!({ "path": fx.p("sparse.txt"), "startLine": 2 })),
+        &fx.cancel,
+    );
+    assert_eq!(code(r), ErrorCode::TooLarge);
+}
+
+#[test]
+fn edits_to_one_path_queue_instead_of_failing_their_recheck() {
+    let fx = Arc::new(Fx::new());
+    let body: String = (1..=6).map(|i| format!("l{i}\n")).collect();
+    fx.put("q.txt", body);
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (1..=6)
+        .map(|i| {
+            let (fx, barrier) = (Arc::clone(&fx), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                fx.ops.edit(
+                    &args(json!({ "path": fx.p("q.txt"),
+                        "edits": [{ "oldText": format!("l{i}\n"), "newText": format!("L{i}\n") }] })),
+                    &fx.cancel,
+                )
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join()
+            .unwrap()
+            .expect("a queued edit without expectedEtag applies to the newer content");
+    }
+    assert_eq!(fx.get("q.txt"), "L1\nL2\nL3\nL4\nL5\nL6\n");
+}
+
+// ---- masking context comes from a bounded lookback, lossy for bad UTF-8 -----
+
+#[test]
+fn context_lines_that_are_not_utf8_still_advance_the_masking_state() {
+    let fx = Fx::new();
+    fx.put(
+        "latin1.txt",
+        b"X_TOKEN=\"v\xe9 opens\nsecond-line-secret\"\nB=1\n",
+    );
+    let r = fx.read_with(json!({ "path": fx.p("latin1.txt"), "startLine": 2 }));
+    assert!(!r.text.contains("second-line-secret"), "{}", r.text);
+    fx.put("app.env", b"NOTE=\"v\xe9 opens\nsecond-env-secret\"\nB=1\n");
+    let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 2 }));
+    assert!(!r.text.contains("second-env-secret"), "{}", r.text);
+    // an invalid line INSIDE the window of an env file is masked whole, not a binary error
+    let r = fx.read_with(json!({ "path": fx.p("app.env"), "startLine": 1 }));
+    assert!(
+        r.text.starts_with("1|\u{27E6}redacted\u{27E7}"),
+        "{}",
+        r.text
+    );
+    let key = pem("RSA PRIVATE KEY", "MIIEsecretbase64\n");
+    let (first, rest) = key.split_once('\n').unwrap();
+    let mut bytes = b"# v\xe9 ".to_vec();
+    bytes.extend_from_slice(first.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(rest.as_bytes());
+    fx.put("k.pem", bytes);
+    let r = fx.read_with(json!({ "path": fx.p("k.pem"), "startLine": 2 }));
+    assert!(!r.text.contains("MIIEsecretbase64"), "{}", r.text);
+}
+
+#[test]
+fn a_window_inside_a_multi_line_value_is_masked_from_the_lookback() {
+    let fx = Fx::new();
+    let mut body = String::from("X_TOKEN=\"start\n");
+    for i in 0..30_000 {
+        body.push_str(&format!("secret-line-{i}\n"));
+    }
+    body.push_str("end\"\n\nvisible\n");
+    fx.put("long.txt", &body);
+    // the window starts ~400 KiB inside the value, well within the 1 MiB lookback
+    let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 29_000, "maxLines": 5 }));
+    assert!(!r.text.contains("secret-line"), "{}", r.text);
+    let r = fx.read_with(json!({ "path": fx.p("long.txt"), "startLine": 30_002 }));
+    assert!(r.text.contains("visible"), "{}", r.text);
+    assert!(
+        !r.text.contains("secret-line") && !r.text.contains("end\""),
+        "{}",
+        r.text
+    );
+}
+
+#[test]
+fn the_tail_window_of_a_huge_file_sees_a_value_opened_in_the_lookback() {
+    let fx = Fx::new();
+    let path = fx.root.join("huge.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(20_000);
+    for _ in 0..70 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.write_all(b"X_TOKEN=\"opening\n").unwrap();
+    for i in 0..20 {
+        writeln!(file, "tail-secret-{i}").unwrap();
+    }
+    file.write_all(b"end\"\n\nafter\n").unwrap();
+    file.flush().unwrap();
+    drop(file);
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+    let r = fx.read_with(json!({ "path": fx.p("huge.log"), "startLine": -5 }));
+    assert!(!r.text.contains("tail-secret"), "{}", r.text);
+    assert!(r.text.contains("after"), "{}", r.text);
+}
+
+#[test]
+fn rename_overwrite_refuses_a_different_object_kind() {
+    let fx = Fx::new();
+    fx.put("d/x", "x");
+    fx.put("f.txt", "file");
+    let etag = fx.etag("f.txt");
+    let r = rename(
+        &fx,
+        json!({ "from": fx.p("d"), "to": fx.p("f.txt"), "overwrite": true, "expectedEtag": etag }),
+    );
+    assert_eq!(code(r), ErrorCode::Exists);
+    assert_eq!(fx.get("f.txt"), "file");
+    assert!(fx.root.join("d/x").exists());
+}
+
+// ---- cancellation reaches the large-file read loops ---------------------------
+
+#[test]
+fn a_cancelled_read_of_a_huge_file_stops_instead_of_scanning_it() {
+    let fx = Arc::new(Fx::new());
+    let path = fx.root.join("huge.log");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let block = "log line 0123456789012345678901234567890123456789\n".repeat(20_000);
+    for _ in 0..70 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    // already cancelled: refused up front, in the head path and the tail path
+    fx.cancel.cancel();
+    for start in [1_i64, -3, 1_000_000] {
+        let r = fx.ops.read(
+            &args(json!({ "path": fx.p("huge.log"), "startLine": start })),
+            &fx.cancel,
+        );
+        assert_eq!(code(r), ErrorCode::Cancelled, "startLine {start}");
+    }
+    // cancelled while the prefix is being scanned: observed at the next check, long
+    // before the 1.4 M lines are read
+    let fx2 = Arc::new(Fx::new());
+    std::fs::copy(&path, fx2.root.join("huge.log")).unwrap();
+    let canceller = {
+        let fx2 = Arc::clone(&fx2);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            fx2.cancel.cancel();
+        })
+    };
+    let started = Instant::now();
+    let r = fx2.ops.read(
+        &args(json!({ "path": fx2.p("huge.log"), "startLine": 1_400_000 })),
+        &fx2.cancel,
+    );
+    canceller.join().unwrap();
+    let elapsed = started.elapsed();
+    match r {
+        Err(err) => assert_eq!(err.code, ErrorCode::Cancelled, "{elapsed:?}"),
+        // the scan finished before the flag was set on a very fast machine: not a failure
+        Ok(_) => assert!(elapsed < Duration::from_millis(50), "{elapsed:?}"),
+    }
+}
+
+#[test]
+fn an_extreme_line_range_is_invalid_input_not_a_panic() {
+    let fx = Fx::new();
+    fx.put("a.txt", "one\ntwo\n");
+    let etag = fx.etag("a.txt");
+    for (start, end) in [
+        (1_u64, u64::MAX),
+        (u64::MAX, u64::MAX),
+        (4, 2),
+        (u64::MAX, 1),
+    ] {
+        let r = fx.ops.edit(
+            &args(json!({ "path": fx.p("a.txt"), "expectedEtag": etag,
+                "edits": [{ "startLine": start, "endLine": end, "newText": "x\n" }] })),
+            &fx.cancel,
+        );
+        assert!(matches!(code(r), ErrorCode::InvalidInput), "{start}..{end}");
+    }
+    // the supported empty insertion range still works
+    fx.ops
+        .edit(
+            &args(json!({ "path": fx.p("a.txt"), "expectedEtag": etag,
+                "edits": [{ "startLine": 2, "endLine": 1, "newText": "x\n" }] })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert_eq!(fx.get("a.txt"), "one\nx\ntwo\n");
+}

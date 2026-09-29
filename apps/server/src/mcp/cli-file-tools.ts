@@ -158,7 +158,8 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   upgrade_required: "This CLI speaks an older relay protocol; upgrade wsmp",
   invalid_input: "Invalid input for this file operation",
   path_denied: "That path is not allowed",
-  secret_file: "Refused: this is a secret file",
+  secret_file:
+    "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
   not_a_file: "The path is not a regular file",
   not_a_dir: "The path is not a directory",
   binary_file: "The file is not text",
@@ -366,7 +367,7 @@ export function projectFileToolOutput(output: unknown): unknown {
 // Descriptions
 
 export const FILE_MASKING_NOTICE =
-  "Masking is narrow: only SSH private keys, environment-variable secrets (dotenv and env files, and secret-named KEY=value assignments) and the Hugging Face token file and --api-key/--hf-token flag values are masked, shown as ⟦redacted:N⟧. Anything else in a file is returned as is. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Only the wsmp_ credential substrings are additionally removed by the server.";
+  "Masking is narrow: only SSH private keys, environment-variable secrets (dotenv and env files, and secret-named KEY=value assignments) and the Hugging Face token file and --api-key/--hf-token flag values are masked, shown as ⟦redacted:N⟧. Anything else in a file is returned as is. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
 
 export const FILE_ACCESS_NOTICE =
   "Runs headless only on a CLI whose MCP command mode is unsupervised (the lowest of the dashboard grant and the CLI config); a supervised or off node refuses. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
@@ -389,8 +390,8 @@ export const FILE_TOOL_NOTES: Readonly<Record<FileToolName, string>> = {
   forwarder_cli_dir_list: `Lists a directory as compact text, one entry per line (depth 1 to 4, glob, includeHidden, up to 2000 entries); more.cursor continues. Symlinked directories are not followed. ${FILE_FRAME_NOTICE} ${FILE_ACCESS_NOTICE}`,
   forwarder_cli_file_search: `Searches text files under a root (literal or regex, glob, up to 500 matches); binary, oversized and secret-class files are skipped and matches are masked. ${FILE_FRAME_NOTICE} ${FILE_ACCESS_NOTICE} ${FILE_MASKING_NOTICE}`,
   forwarder_cli_file_edit: `Exact-string and line-range edits (1 to 20, applied to the original content, all or nothing; line ranges require expectedEtag). ${FILE_FRAME_NOTICE} use file_write for large content. Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE} ${FILE_MASKING_NOTICE}`,
-  forwarder_cli_file_write: `Creates a file, or replaces it with ifExists replace plus expectedEtag. content is utf-8 text or base64 (encoding), at most 1 MiB decoded; a base64 request encodes to more, and every /mcp request body is capped at 1 MB, so base64 content above roughly 768 KiB (786,432 bytes decoded) cannot be sent in one call. Content containing the mask token ⟦redacted is refused and an existing secret-class file is never replaced. Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_file_rename: `Renames within one filesystem; overwrite requires expectedEtag of the destination. Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_dir_create: `Creates a directory (parents true creates missing parents). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_write: `Creates a file, or replaces it with ifExists replace plus expectedEtag. content is utf-8 text or base64 (encoding), at most 1 MiB decoded; a base64 request encodes to more, and every /mcp request body is capped at 1 MB, so base64 content above roughly 768 KiB (786,432 bytes decoded) cannot be sent in one call. Content containing the mask token ⟦redacted is refused, and a secret-class path (dotenv or key file, or its directory) can never be created or replaced (secret_file). Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_rename: `Renames within one filesystem; overwrite requires expectedEtag of the destination. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_dir_create: `Creates a directory (parents true creates missing parents). Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
 };

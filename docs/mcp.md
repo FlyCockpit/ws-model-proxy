@@ -64,7 +64,9 @@ and `service.env`, plus secret-named `KEY=value` assignments in any file), shown
 flag values. Masking happens before windowing, edits cannot target a masked span, and the
 etag is keyed. **On an `unsupervised` node masking is not a security boundary**: an agent
 with command access can `cat .env`. It keeps those secrets out of transcripts on the
-normal path. The server never logs or stores file content, and it additionally removes
+normal path. Secret-class files are read-only masked views: every write, edit, rename,
+delete or mkdir that touches one, or its directory, is refused as `secret_file` (compared
+case-insensitively on every OS); use a command to change such a file. The server never logs or stores file content, and it additionally removes
 `wsmp_` credential substrings from every returned string.
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`

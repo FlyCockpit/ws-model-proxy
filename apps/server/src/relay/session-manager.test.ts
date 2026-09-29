@@ -1672,9 +1672,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.8";
+    frame.protocolVersion = "2.9";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.8";
+    frame.cli.capabilities.protocolVersion = "2.9";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -1692,7 +1692,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.8",
+        rejectedRelayProtocolVersion: "2.9",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },

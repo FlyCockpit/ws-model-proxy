@@ -12,6 +12,7 @@ use super::read::{ReadOutcome, ReadResult};
 use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
 mod edit_write;
+mod hardening;
 mod misc;
 mod read_tests;
 mod resolve_policy;
@@ -35,6 +36,20 @@ pub fn code<T: std::fmt::Debug>(result: FileResult<T>) -> ErrorCode {
 
 pub fn real_uid() -> u32 {
     nix::unistd::geteuid().as_raw()
+}
+
+/// A PEM block built at run time: the committed source must not contain a
+/// literal `-----BEGIN ... PRIVATE KEY-----` line (the CI secret scan and the
+/// CLI policy checks grep for it).
+/// An AWS-style access-key-id placeholder, built at run time: the committed
+/// source must not contain a 20-character id of that shape (the CLI policy
+/// checks and the CI secret scan grep for it).
+pub fn aws_style_id() -> String {
+    format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE")
+}
+
+pub fn pem(label: &str, body: &str) -> String {
+    format!("-----BEGIN {label}-----\n{body}-----END {label}-----\n")
 }
 
 impl Fx {

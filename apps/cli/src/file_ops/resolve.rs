@@ -17,11 +17,19 @@
 //! from `/proc/self/fd` on Linux, which reflects the directory actually held
 //! even if a name was swapped after the walk; on other Unixes the path built
 //! from the names walked is used).
+//!
+//! Residual (owner decision: `openat2` deferred; the plan's threat model is the
+//! MCP agent, not a second process of the same user): the policy verdict is
+//! taken on the held directory at resolution time. A process running as the
+//! same user that renames a traversed directory out of a configured root between
+//! that verdict and the operation can make the operation land outside the root,
+//! because the effect goes through the held fd. Symlink swaps during the walk
+//! cannot, and roots are not a boundary against a shell (see `policy`).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +39,7 @@ use nix::fcntl::{OFlag, openat, readlinkat};
 use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
+use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 use super::policy::{Access, Policy};
 
@@ -296,6 +305,7 @@ fn open_dir_at(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
 fn fd_path(fd: &OwnedFd) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
+        use std::os::fd::AsRawFd;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()?;
         // A directory unlinked after the walk reads as "<path> (deleted)".
         if path.as_os_str().as_bytes().ends_with(b" (deleted)") {
@@ -358,12 +368,8 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     let mode = opts.make_parents.unwrap_or(0o755);
                     let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
                     opts.policy.check_path(Access::Write, &here.join(&comp))?;
-                    mkdirat(
-                        cur.as_fd(),
-                        comp.as_os_str(),
-                        Mode::from_bits_truncate(mode),
-                    )
-                    .map_err(FileError::errno)?;
+                    mkdirat(cur.as_fd(), comp.as_os_str(), perm_mode(mode))
+                        .map_err(FileError::errno)?;
                     let parent = cur.try_clone()?;
                     created.push(CreatedDir {
                         parent,

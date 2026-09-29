@@ -101,7 +101,7 @@ impl Loop {
 #[test]
 fn slow_file_ops_never_stall_the_relay_loop() {
     let dir = tempfile::tempdir().expect("dir");
-    let policy = Policy::from_environment(Vec::new(), false).with_euid(1000);
+    let policy = Policy::from_environment(Vec::new(), false);
     let slow_paths: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let hook_counter = Arc::clone(&slow_paths);
     let ops = FileOps::new(policy, EtagKey::random()).with_step_hook(Arc::new(move |step| {

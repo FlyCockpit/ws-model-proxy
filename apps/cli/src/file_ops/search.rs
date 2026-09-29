@@ -1,8 +1,10 @@
 //! `forwarder_cli_file_search`: literal or regex search under a root.
 //!
 //! Matching runs on the **masked** text of each file, so a search can neither
-//! return nor probe a secret. Uses the `regex` crate (linear time, no
-//! backreferences) over an fd-based walk that never follows symlinks.
+//! return nor probe a secret. Secret-class files (`redact::classify`) are skipped
+//! entirely (issue 19), like binary files and files over [`MAX_FILE_BYTES`]. Uses
+//! the `regex` crate (linear time, no backreferences) over an fd-based walk that
+//! never follows symlinks.
 
 use std::io::Read;
 use std::time::Instant;
@@ -15,7 +17,7 @@ use super::glob::Glob;
 use super::policy::Access;
 use super::redact;
 use super::resolve::{Kind, ResolveOpts, resolve};
-use super::text::{self, floor_boundary, strip_eol};
+use super::text::{self, floor_boundary, name_for_display, strip_eol};
 use super::walk::{Entry, Flow, walk};
 use super::{Cancel, FileOps};
 
@@ -67,7 +69,11 @@ pub struct SearchResult {
     pub more: Option<SearchMore>,
 }
 
-pub fn search(ops: &FileOps, args: &SearchArgs, cancel: &Cancel) -> FileResult<SearchResult> {
+pub(crate) fn search(
+    ops: &FileOps,
+    args: &SearchArgs,
+    cancel: &Cancel,
+) -> FileResult<SearchResult> {
     if args.pattern.is_empty() || args.pattern.len() > MAX_PATTERN_BYTES {
         return Err(FileError::invalid("pattern must be 1 to 1024 bytes"));
     }
@@ -113,7 +119,7 @@ pub fn search(ops: &FileOps, args: &SearchArgs, cancel: &Cancel) -> FileResult<S
     )?;
     let started = Instant::now();
     let deadline = ops.limits.search_deadline;
-    let prefix = args.root.trim_end_matches('/').to_string();
+    let prefix = name_for_display(args.root.trim_end_matches('/'));
 
     let mut state = State {
         out: String::new(),
@@ -157,6 +163,12 @@ pub fn search(ops: &FileOps, args: &SearchArgs, cancel: &Cancel) -> FileResult<S
             return Ok(());
         };
         let class = redact::classify(entry.full);
+        if class.is_secret() {
+            // Secret-class files are skipped (issue 19/AC19): a match would
+            // reveal key names and masked-value lengths, and the tool must not
+            // scan a file it would refuse to serve.
+            return Ok(());
+        }
         let view = redact::mask(class, content);
         let lines: Vec<&str> = view
             .text
@@ -257,7 +269,7 @@ pub fn search(ops: &FileOps, args: &SearchArgs, cancel: &Cancel) -> FileResult<S
                 ));
                 return Ok(Flow::Stop);
             }
-            let shown = format!("{prefix}/{}", entry.rel);
+            let shown = format!("{prefix}/{}", name_for_display(entry.rel));
             scan_file(&mut state, entry, &shown)?;
             Ok(if state.note.is_some() {
                 Flow::Stop

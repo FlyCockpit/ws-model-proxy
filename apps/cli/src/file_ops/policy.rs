@@ -53,14 +53,16 @@ pub struct Policy {
 const SPECIAL_TREES: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 impl Policy {
-    pub fn new(roots: Vec<PathBuf>, protected: Vec<Protected>, allow_root: bool) -> Self {
+    /// Crate-private on purpose: a policy built outside
+    /// [`Self::from_environment`] could omit the protected set.
+    pub(crate) fn new(roots: Vec<PathBuf>, protected: Vec<Protected>, allow_root: bool) -> Self {
         let roots = roots
             .into_iter()
             .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
             .collect();
         Self {
             roots,
-            protected,
+            protected: with_physical_aliases(protected),
             euid: nix::unistd::geteuid().as_raw(),
             allow_root,
         }
@@ -74,8 +76,8 @@ impl Policy {
     }
 
     /// Test seam: pretend the daemon runs as `euid`.
-    #[doc(hidden)]
-    pub fn with_euid(mut self, euid: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_euid(mut self, euid: u32) -> Self {
         self.euid = euid;
         self
     }
@@ -108,6 +110,12 @@ impl Policy {
             return Err(FileError::new(
                 ErrorCode::SpecialFile,
                 "this tree holds special files and is not accessible",
+            ));
+        }
+        if access != Access::Read && super::redact::is_secret_scope(full) {
+            return Err(FileError::new(
+                ErrorCode::SecretFile,
+                "secret files and their directories are read-only through the file tools",
             ));
         }
         if !self.roots.is_empty() && !self.roots.iter().any(|root| full.starts_with(root)) {
@@ -143,10 +151,20 @@ impl Policy {
             if !blocked {
                 continue;
             }
-            if let Ok(meta) = std::fs::metadata(&entry.path) {
-                let protected = Stat::from_metadata(&meta);
-                if protected.dev == stat.dev && protected.ino == stat.ino {
-                    return Err(FileError::denied("path is protected by wsmp"));
+            match std::fs::metadata(&entry.path) {
+                Ok(meta) => {
+                    let protected = Stat::from_metadata(&meta);
+                    if protected.dev == stat.dev && protected.ino == stat.ino {
+                        return Err(FileError::denied("path is protected by wsmp"));
+                    }
+                }
+                // An absent protected file has no identity to match; any other
+                // failure means the identity cannot be checked, so refuse.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(FileError::denied(
+                        "path is protected by wsmp (identity check failed)",
+                    ));
                 }
             }
         }
@@ -158,6 +176,46 @@ impl Policy {
     pub fn hidden_from_walk(&self, full: &Path) -> bool {
         self.check_path(Access::Read, full).is_err()
     }
+}
+
+/// `path` with its deepest existing ancestor resolved to the physical path
+/// (`WSMP_STATE_DIR` may be reached through a symlink, and the leaf may not
+/// exist yet). Resolution compares physical paths, so a protected entry must be
+/// expressed as one too.
+fn physical(path: &Path) -> PathBuf {
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let mut out = real;
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                base = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Every protected entry under both its configured and its physical name.
+fn with_physical_aliases(protected: Vec<Protected>) -> Vec<Protected> {
+    let mut out = Vec::with_capacity(protected.len() * 2);
+    for entry in protected {
+        let real = physical(&entry.path);
+        if real != entry.path {
+            out.push(Protected {
+                path: real,
+                subtree: entry.subtree,
+                deny: entry.deny,
+            });
+        }
+        out.push(entry);
+    }
+    out
 }
 
 fn default_protected() -> Vec<Protected> {

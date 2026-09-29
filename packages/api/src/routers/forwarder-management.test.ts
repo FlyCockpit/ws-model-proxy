@@ -5392,7 +5392,7 @@ describe("setCliDeviceFeatureGrants", () => {
       {
         ...row,
         id: "cli-newer",
-        rejectedRelayProtocolVersion: "2.8",
+        rejectedRelayProtocolVersion: "2.9",
         rejectedCliVersion: "0.9.0",
         relayRejectedAt: rejectedAt,
       },
@@ -5408,7 +5408,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
     expect(devices[2]?.upgradeRequired).toMatchObject({
-      protocolVersion: "2.8",
+      protocolVersion: "2.9",
       reason: "cli_too_new",
     });
   });

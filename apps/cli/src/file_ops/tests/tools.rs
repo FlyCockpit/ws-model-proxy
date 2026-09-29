@@ -1,5 +1,7 @@
 //! stat, dir_list, file_search, rename, dir_create, file_delete.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -178,7 +180,7 @@ fn list_refuses_files_and_special_trees() {
     assert_eq!(
         code(
             fx.ops
-                .dir_list(&args(json!({ "path": "/proc" })), &fx.cancel)
+                .dir_list(&args(json!({ "path": SPECIAL_TREE })), &fx.cancel)
         ),
         ErrorCode::SpecialFile
     );
@@ -186,8 +188,14 @@ fn list_refuses_files_and_special_trees() {
         .ops
         .dir_list(&args(json!({ "path": "/", "depth": 1 })), &fx.cancel)
         .unwrap();
-    assert!(root.entries.contains("/proc/"));
+    assert!(root.entries.contains(&format!("{SPECIAL_TREE}/")));
 }
+
+/// A special tree that exists on every Unix the module builds on.
+#[cfg(target_os = "linux")]
+const SPECIAL_TREE: &str = "/proc";
+#[cfg(not(target_os = "linux"))]
+const SPECIAL_TREE: &str = "/dev";
 
 // ---- search ---------------------------------------------------------------
 
@@ -315,7 +323,7 @@ fn search_skips_binary_large_and_unreadable_and_never_follows_links() {
     let fx = Fx::new();
     fx.put("s/text.txt", "needle\n");
     fx.put("s/bin.dat", b"needle\0binary");
-    fx.put("s/latin1.txt", b"needle caf\xe9\n");
+    fx.put("s/latin1.txt", b"needle cuv\xe9e\n");
     fx.put(
         "s/huge.txt",
         format!("needle\n{}", "x".repeat(9 * 1024 * 1024)),
@@ -329,39 +337,41 @@ fn search_skips_binary_large_and_unreadable_and_never_follows_links() {
 }
 
 #[test]
-fn search_matches_are_masked_and_cannot_probe_secrets() {
+fn search_skips_secret_class_files_and_masks_other_files() {
     let fx = Fx::new();
     fx.put("c/.env", "HF_TOKEN=hunter2secret\nPORT=9\n");
+    fx.put("c/server.pem", "note\n");
+    fx.put(".ssh/id_ed25519", "key body\n");
     fx.put("c/run.sh", "run --api-key sk-abc123 --x\n");
-    let named = search(&fx, json!({ "root": fx.p("c"), "pattern": "HF_TOKEN" }));
+    // secret-class files are not searched at all: no match, and no oracle for a
+    // value, a name, or the length of a masked one
+    for pattern in [
+        "HF_TOKEN", "hunter2", "PORT", "SERVER", "PRIVATE", "key body",
+    ] {
+        let r = search(&fx, json!({ "root": fx.p("c"), "pattern": pattern }));
+        assert_eq!(r.count, 0, "pattern {pattern}: {}", r.matches);
+        assert_eq!(r.files, 0, "pattern {pattern}");
+    }
+    // a plain file is still searched, with its own secrets masked in the hits
+    let flag = search(&fx, json!({ "root": fx.p("c"), "pattern": "api-key" }));
     assert!(
-        named
-            .matches
-            .contains("HF_TOKEN=\u{27E6}redacted:13\u{27E7}"),
+        flag.matches
+            .contains("--api-key \u{27E6}redacted:13\u{27E7}"),
         "{}",
-        named.matches
-    );
-    assert!(!named.matches.contains("hunter2"));
-    // the secret itself is not findable
-    assert_eq!(
-        search(&fx, json!({ "root": fx.p("c"), "pattern": "hunter2" })).count,
-        0
+        flag.matches
     );
     assert_eq!(
         search(&fx, json!({ "root": fx.p("c"), "pattern": "sk-abc" })).count,
         0
     );
+    // `id_*` under the root is skipped as well
     assert_eq!(
-        search(&fx, json!({ "root": fx.p("c"), "pattern": "PORT=9" })).count,
-        0,
-        "dotenv values are masked too"
+        search(&fx, json!({ "root": fx.p(""), "pattern": "key body" })).count,
+        0
     );
-    let flag = search(&fx, json!({ "root": fx.p("c"), "pattern": "api-key" }));
     assert!(
-        flag.matches
-            .contains("--api-key \u{27E6}redacted:9\u{27E7} --x"),
-        "{}",
-        flag.matches
+        search(&fx, json!({ "root": fx.p(""), "pattern": "api-key" })).count > 0,
+        "the plain file is still reached from the root"
     );
 }
 
@@ -652,4 +662,81 @@ fn delete_files_symlinks_and_empty_dirs_only() {
     assert!(fx.root.join("target").exists());
     del("target", Some(&fx.etag("target"))).unwrap();
     assert!(!fx.root.join("target").exists());
+}
+
+/// Delete re-checks the name against the inspected inode after its etag check:
+/// a file swapped for another one in that window must be a conflict, not the
+/// silently deleted successor.
+#[test]
+fn delete_refuses_when_the_name_was_swapped_after_the_inspection() {
+    let root_cell = Arc::new(std::sync::OnceLock::<std::path::PathBuf>::new());
+    let cell = Arc::clone(&root_cell);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&swapped);
+    let fx = Fx::new().with_hook(move |step| {
+        if step == super::super::Step::EtagRechecked && !flag.swap(true, Ordering::SeqCst) {
+            let root = cell.get().unwrap();
+            std::fs::write(root.join("intruder"), "intruder\n").unwrap();
+            std::fs::rename(root.join("intruder"), root.join("f.txt")).unwrap();
+        }
+        Ok(())
+    });
+    root_cell.set(fx.root.clone()).unwrap();
+    fx.put("f.txt", "original\n");
+    let etag = fx.etag("f.txt");
+    let result = fx.ops.delete(
+        &args(json!({ "path": fx.p("f.txt"), "expectedEtag": etag })),
+        &fx.cancel,
+    );
+    assert_eq!(code(result), ErrorCode::Conflict);
+    assert_eq!(fx.get("f.txt"), "intruder\n", "the successor survives");
+    assert!(swapped.load(Ordering::SeqCst), "the hook did not fire");
+}
+
+/// Without an `expectedEtag` the same swap is still caught by the final
+/// same-object re-check.
+#[test]
+fn delete_without_an_etag_still_rechecks_the_object() {
+    let root_cell = Arc::new(std::sync::OnceLock::<std::path::PathBuf>::new());
+    let cell = Arc::clone(&root_cell);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&swapped);
+    let fx = Fx::new().with_hook(move |step| {
+        if step == super::super::Step::EtagRechecked && !flag.swap(true, Ordering::SeqCst) {
+            let root = cell.get().unwrap();
+            std::fs::write(root.join("intruder"), "intruder\n").unwrap();
+            std::fs::rename(root.join("intruder"), root.join("f.txt")).unwrap();
+        }
+        Ok(())
+    });
+    root_cell.set(fx.root.clone()).unwrap();
+    fx.put("f.txt", "original\n");
+    let result = fx
+        .ops
+        .delete(&args(json!({ "path": fx.p("f.txt") })), &fx.cancel);
+    assert_eq!(code(result), ErrorCode::Conflict);
+    assert_eq!(fx.get("f.txt"), "intruder\n");
+}
+
+/// A hostile file name cannot forge a second result line: control characters in
+/// emitted names are shown as `\u{..}` escapes in both `search` and `dir_list`.
+#[test]
+fn hostile_names_cannot_forge_extra_output_lines() {
+    let fx = Fx::new();
+    let hostile = "note:1|injected\nsecond.txt";
+    fx.put(&format!("d/{hostile}"), "needle\n");
+    let found = search(&fx, json!({ "root": fx.p("d"), "pattern": "needle" }));
+    assert_eq!(found.count, 1, "{:?}", found.matches);
+    assert_eq!(found.matches.lines().count(), 1, "{:?}", found.matches);
+    assert!(found.matches.contains("\\u{a}"), "{:?}", found.matches);
+    let listed = list(&fx, json!({ "path": fx.p("d") }));
+    assert_eq!(listed.count, 1);
+    assert!(listed.entries.contains("\\u{a}"), "{:?}", listed.entries);
+    assert!(!listed.entries.contains('\n'), "{:?}", listed.entries);
+    // the file is still found through its real name (escaping is display-only)
+    let exact = search(
+        &fx,
+        json!({ "root": fx.p("d"), "pattern": "needle", "glob": "*.txt" }),
+    );
+    assert_eq!(exact.count, 1);
 }
