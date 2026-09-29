@@ -2912,9 +2912,17 @@ describe("OpenRouter owner-paid settlement", () => {
   it.each(["openai", "openai-compatible"] as const)(
     "completes an event-less Responses terminal for the %s provider type",
     async (providerType) => {
+      // Strip the trailing `data: [DONE]` sentinel: it is a terminal on other
+      // surfaces and would mask a missing Responses recognition.
+      const raw = readFileSync(
+        new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+        "utf8",
+      );
+      const withoutDone = raw.replace(/data: \[DONE\]\s*$/, "");
+      expect(withoutDone).not.toBe(raw);
       const settled = await settleOwnerStream(
         providerType,
-        [readFileSync(new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url))],
+        [Buffer.from(withoutDone)],
         "owner",
         "openai-responses",
       );
