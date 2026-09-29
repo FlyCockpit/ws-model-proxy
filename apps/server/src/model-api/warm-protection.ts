@@ -19,9 +19,12 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 /** Token mode keeps this fraction of the KV budget as headroom. */
 export const PROTECTION_KV_HEADROOM = 0.1;
 /**
- * Upper bound on warm sessions read per request (newest first). The window
- * (default 5 min) and the size floor (default 8k tokens) keep the real count
- * far below it; the bound only caps a pathological table.
+ * Upper bound on warm sessions read per member KV pool per request (newest
+ * first). The window (default 5 min) and the size floor (default 8k tokens)
+ * keep the real count far below it; the bound only caps a pathological table.
+ * It applies per capacity so one busy pool can never crowd another pool's
+ * sessions out of the read (a silently truncated protection set would leave
+ * that pool looking unprotected).
  */
 export const WARM_SESSION_QUERY_LIMIT = 2_000;
 
@@ -152,7 +155,13 @@ export function protectedWarmSessions(
   const protectedSessions: WarmSession[] = [];
   for (const own of byUser.values()) {
     own.sort((left, right) => left.ageMs - right.ageMs || right.tokens - left.tokens);
-    const override = own[0]!.overridePercent;
+    // One override per user: the most generous explicit one across the user's
+    // eligible sessions (a user may hold grants in several pools of the same
+    // KV pool), so it never depends on which pool served the newest request.
+    const overrides = own.flatMap(({ overridePercent }) =>
+      overridePercent === null ? [] : [overridePercent],
+    );
+    const override = overrides.length > 0 ? Math.max(...overrides) : null;
     const fraction =
       override !== null
         ? override / 100
@@ -351,23 +360,31 @@ export async function loadWarmSessions({
   capacityIds,
   policy,
   now = new Date(),
+  limitPerCapacity = WARM_SESSION_QUERY_LIMIT,
 }: {
   ownerId: string;
   capacityIds: readonly string[];
   policy: Pick<WarmProtectionPolicy, "windowSeconds" | "minTokens">;
   now?: Date;
+  limitPerCapacity?: number;
 }): Promise<Map<string, WarmSession[]>> {
   const sessions = new Map<string, WarmSession[]>();
   if (capacityIds.length === 0) return sessions;
   const since = new Date(now.getTime() - policy.windowSeconds * 1000);
   const rows = await prisma.$queryRaw<WarmSessionRow[]>(Prisma.sql`
+    SELECT "capacityId", "userId", "lastUsedAt", "tokens", "overridePercent"
+      FROM (
     SELECT t."inferenceCapacityId" AS "capacityId",
            r."tenantUserId" AS "userId",
            r."lastUsedAt" AS "lastUsedAt",
            MAX(r."estimatedTokens")::int AS "tokens",
            CASE WHEN r."tenantUserId" = r."userId"
                 THEN p."ownerProtectionPercent"
-                ELSE g."protectionOverridePercent" END AS "overridePercent"
+                ELSE g."protectionOverridePercent" END AS "overridePercent",
+           ROW_NUMBER() OVER (
+             PARTITION BY t."inferenceCapacityId"
+             ORDER BY r."lastUsedAt" DESC, MAX(r."estimatedTokens") DESC
+           ) AS "rank"
       FROM cache_affinity_record r
       JOIN execution_target t ON t.id = r."executionTargetId"
       JOIN model_pool p ON p.id = r."poolId"
@@ -382,8 +399,9 @@ export async function loadWarmSessions({
               r."executionTargetId", r."bindingDigest", r."lastUsedAt",
               p."ownerProtectionPercent", g."protectionOverridePercent"
     HAVING MAX(r."estimatedTokens") >= ${policy.minTokens}
-     ORDER BY r."lastUsedAt" DESC
-     LIMIT ${WARM_SESSION_QUERY_LIMIT}
+      ) ranked
+     WHERE "rank" <= ${limitPerCapacity}
+     ORDER BY "lastUsedAt" DESC
   `);
   for (const row of rows) {
     const list = sessions.get(row.capacityId) ?? [];

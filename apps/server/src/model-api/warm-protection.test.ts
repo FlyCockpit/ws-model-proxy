@@ -108,6 +108,22 @@ describe("S-C warm-session equity", () => {
     expect(ages(protectedSessions)).toEqual(["alice@10", "alice@20"]);
   });
 
+  it("a user's override does not depend on which pool served the newest session", () => {
+    // Same user, two pools of one KV pool: the newest session inherits, an older one
+    // carries 100%. The explicit override applies whatever the order.
+    const sessions = [
+      session("alice", 10, 10_000, null),
+      session("alice", 20, 10_000, 100),
+      session("alice", 30, 10_000, null),
+      session("bob", 5),
+    ];
+    const protectedSessions = protectedWarmSessions(sessions, slots(4), policy());
+    expect(ages(protectedSessions)).toEqual(["alice@10", "alice@20", "alice@30", "bob@5"]);
+    expect(ages(protectedWarmSessions([...sessions].reverse(), slots(4), policy()))).toEqual(
+      ages(protectedSessions),
+    );
+  });
+
   it("a percent override replaces the pool share for that user", () => {
     const protectedSessions = protectedWarmSessions(
       [

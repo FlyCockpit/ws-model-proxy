@@ -255,6 +255,21 @@ integration("warm-session protection with real PostgreSQL", () => {
       });
       expect(stranger.size).toBe(0);
 
+      // The bound is per capacity: a busy pool never crowds out another
+      // pool's sessions (a global limit of 2 would return B(5s) and A(10s)).
+      const bounded = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: [capacityA.id, capacityB.id],
+        policy,
+        now,
+        limitPerCapacity: 2,
+      });
+      expect(bounded.get(capacityA.id)?.map(({ userId }) => userId)).toEqual([
+        owner.id,
+        unprotected.id,
+      ]);
+      expect(bounded.get(capacityB.id)?.map(({ userId }) => userId)).toEqual([owner.id]);
+
       // The planner can use the (executionTargetId, lastUsedAt) index.
       const indexes = await db.$queryRaw<Array<{ indexdef: string }>>`
         SELECT indexdef FROM pg_indexes WHERE tablename = 'cache_affinity_record'`;
