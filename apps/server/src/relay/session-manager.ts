@@ -3025,7 +3025,7 @@ export class RelaySessionManager {
     return false;
   }
 
-  private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean> {
+  private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean | "superseded"> {
     const surface = suggestedConnectionSurface({
       capabilities: member.capabilities as OpenAiCompatibleCapabilities | null,
     });
@@ -3063,6 +3063,12 @@ export class RelaySessionManager {
             };
     const headers = new Headers({ "content-type": "application/json" });
     if (surface === "ANTHROPIC_MESSAGES") headers.set("anthropic-version", "2023-06-01");
+    // The probe is only evidence about the connection it was dispatched on. If
+    // that session is replaced (a reconnect took over the device id) or lost
+    // while it runs, its `disconnected` failure belongs to the old connection,
+    // not the member, and must not be recorded against the successor.
+    const dispatchedOn = this.sessionsByCliDeviceId.get(member.cliDeviceId);
+    const superseded = () => this.sessionsByCliDeviceId.get(member.cliDeviceId) !== dispatchedOn;
     const attempt = startRelayAttempt({
       manager: this,
       cliDeviceId: member.cliDeviceId,
@@ -3080,9 +3086,10 @@ export class RelaySessionManager {
       // semantics are transport health, not a provider-specific text contract.
       await started.body.pipeTo(new WritableStream<Uint8Array>({ write() {} }));
       const terminal = await attempt.terminal;
+      if (superseded()) return "superseded";
       return started.status >= 200 && started.status < 300 && terminal.ok;
     } catch {
-      return false;
+      return superseded() ? "superseded" : false;
     }
   }
 }

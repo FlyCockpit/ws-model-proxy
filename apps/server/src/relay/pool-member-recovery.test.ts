@@ -164,4 +164,36 @@ describe("PoolMemberRecoveryScheduler", () => {
     scheduler.stop();
     vi.useRealTimers();
   });
+
+  it("hands back a superseded probe's trial instead of recording a failure, and re-scans", async () => {
+    vi.useFakeTimers();
+    const results: (boolean | "superseded")[] = ["superseded", true];
+    const probe = vi.fn().mockImplementation(async () => results.shift() ?? true);
+    const abandon = vi.fn().mockResolvedValue(true);
+    const settle = vi.fn().mockResolvedValue(true);
+    const claimedAt = new Date("2026-01-01T00:00:00Z");
+    const scheduler = new PoolMemberRecoveryScheduler({
+      getOwnedCliDeviceIds: () => ["local-cli"],
+      listDueMembers: vi.fn().mockResolvedValue([member]),
+      probe,
+      claim: vi.fn().mockResolvedValue(claimedAt),
+      abandon,
+      settle,
+      now: () => claimedAt,
+    });
+    scheduler.wake();
+    for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(50);
+    // The old connection's result is never a member failure; the trial goes
+    // back due and the scheduler probes again on the current session.
+    expect(abandon).toHaveBeenCalledWith({
+      memberId: "member-a",
+      trialStartedAt: claimedAt,
+      now: claimedAt,
+    });
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle).toHaveBeenCalledWith(expect.objectContaining({ healthy: true }));
+    scheduler.stop();
+    vi.useRealTimers();
+  });
 });

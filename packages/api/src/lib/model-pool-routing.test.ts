@@ -13,6 +13,8 @@ const {
   markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
   markPoolMembersDueAfterCliReconnect,
+  abandonPoolMemberRecoveryTrial,
+  disconnectCliDeviceAtGeneration,
   markPoolMembersForCliUnavailable,
   poolMemberFailureClassForRelayFailure,
   poolMemberTrialLive,
@@ -554,6 +556,7 @@ describe("modelPoolRouting", () => {
       failureClass: "WEBSOCKET_DISCONNECTED",
       generation: 7,
       now,
+      db: prisma,
     });
 
     expect(result).toMatchObject({
@@ -578,7 +581,7 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
           {
             executionTargetId: { not: null },
@@ -640,13 +643,70 @@ describe("modelPoolRouting", () => {
       failureClass: "STALE_SESSION",
       generation: 2,
       now,
+      db: prisma,
     });
     const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
     expect(where?.NOT).toEqual({
-      healthStatus: "UNHEALTHY",
+      healthStatus: { in: ["UNHEALTHY", "DEGRADED"] },
       nextRetryAt: { gt: now },
       lastFailureClass: { not: null, notIn: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
     });
+  });
+
+  it("abandons a recovery trial fenced on its own timestamp, keeping counters and class", async () => {
+    db.poolMember.updateMany.mockReset();
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    const claimed = new Date(now.getTime() - 500);
+    await expect(
+      abandonPoolMemberRecoveryTrial({ poolMemberId: "m", trialStartedAt: claimed, now }),
+    ).resolves.toBe(true);
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "m", healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: claimed },
+      data: { healthStatus: "UNHEALTHY", nextRetryAt: now, halfOpenTrialStartedAt: null },
+    });
+  });
+
+  it("retries a disconnect transaction that expired, and gives up after three attempts", async () => {
+    const expired = Object.assign(new Error("expired"), { code: "P2028" });
+    const tx = db as unknown as { $transaction: MockInstance };
+    tx.$transaction.mockReset();
+    tx.$transaction.mockRejectedValueOnce(expired).mockResolvedValueOnce(true);
+    await expect(
+      disconnectCliDeviceAtGeneration({
+        cliDeviceId: "cli-1",
+        generation: 1,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      }),
+    ).resolves.toBe(true);
+    expect(tx.$transaction).toHaveBeenCalledTimes(2);
+    expect(tx.$transaction.mock.calls[0]?.[1]).toEqual({ timeout: 10_000, maxWait: 5_000 });
+
+    tx.$transaction.mockReset();
+    tx.$transaction.mockRejectedValue(expired);
+    await expect(
+      disconnectCliDeviceAtGeneration({
+        cliDeviceId: "cli-1",
+        generation: 1,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      }),
+    ).rejects.toBe(expired);
+    expect(tx.$transaction).toHaveBeenCalledTimes(3);
+
+    // A non-transient error is not retried.
+    tx.$transaction.mockReset();
+    const fatal = new Error("boom");
+    tx.$transaction.mockRejectedValue(fatal);
+    await expect(
+      disconnectCliDeviceAtGeneration({
+        cliDeviceId: "cli-1",
+        generation: 1,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      }),
+    ).rejects.toBe(fatal);
+    expect(tx.$transaction).toHaveBeenCalledTimes(1);
   });
 
   it("fences the member scope with the device generation", async () => {
@@ -664,6 +724,7 @@ describe("modelPoolRouting", () => {
         cliDeviceId: "cli-1",
         failureClass: "WEBSOCKET_DISCONNECTED",
         generation: 4,
+        db: prisma,
       });
       const where = db.poolMember.updateMany.mock.calls[0]?.[0]?.where;
       // Both relation arms must carry the fence: dropping it from either arm

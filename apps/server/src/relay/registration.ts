@@ -231,7 +231,7 @@ export async function persistRelayRegistration({
                     // Owns the device for this connection: a disconnect write
                     // from the connection this one replaces carries the older
                     // generation and is refused below it (see
-                    // `markPoolMembersForCliUnavailable`).
+                    // `disconnectCliDeviceAtGeneration`).
                     connectionGeneration: { increment: 1 },
                   }
                 : {}),

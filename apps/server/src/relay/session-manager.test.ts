@@ -721,6 +721,42 @@ describe("revoked credentials", () => {
     manager.dispose();
   });
 
+  it("does not attribute a recovery probe's disconnect to the member when a reconnect replaced its session", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    const member = {
+      id: "member-1",
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      upstreamModelId: "model-a",
+      userId: "user-id",
+      capabilities: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: true },
+      },
+    };
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+
+    const probing = probe(member);
+    // The CLI reconnects before the server saw the old close: the replacement
+    // fails the probe's request with `disconnected` and maps the device to the
+    // new session.
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+    expect(first.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+
+    await expect(probing).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
   it("refuses a heartbeat write whose session generation was superseded", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
@@ -1050,7 +1086,7 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
-        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
           {
             executionTargetId: { not: null },
@@ -1350,7 +1386,7 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
-        NOT: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
           {
             executionTargetId: { not: null },

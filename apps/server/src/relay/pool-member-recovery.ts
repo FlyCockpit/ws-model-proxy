@@ -1,5 +1,6 @@
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
+  abandonPoolMemberRecoveryTrial,
   claimPoolMemberRecoveryTrial,
   settlePoolMemberRecoveryTrial,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
@@ -31,12 +32,17 @@ type Timer = ReturnType<typeof setTimeout>;
 export type PoolMemberRecoverySchedulerDependencies = {
   getOwnedCliDeviceIds(): Iterable<string>;
   listDueMembers(cliDeviceIds: string[], now: Date): Promise<OwnedRecoveryMember[]>;
-  probe(member: OwnedRecoveryMember): Promise<boolean>;
+  /**
+   * `"superseded"`: the connection the probe ran on was replaced or lost, so
+   * the result says nothing about the member (never recorded as a failure).
+   */
+  probe(member: OwnedRecoveryMember): Promise<boolean | "superseded">;
   now?(): Date;
   setTimer?(callback: () => void, ms: number): Timer;
   clearTimer?(timer: Timer): void;
   idlePollMs?: number;
   claim?(memberId: string, now: Date): Promise<Date | null>;
+  abandon?(input: { memberId: string; trialStartedAt: Date; now: Date }): Promise<boolean>;
   settle?(input: {
     memberId: string;
     trialStartedAt: Date;
@@ -112,6 +118,21 @@ export class PoolMemberRecoveryScheduler {
           )(member.id, this.now());
           if (!trialStartedAt) continue;
           const healthy = await this.dependencies.probe(member).catch(() => false);
+          if (healthy === "superseded") {
+            // Not attributable to the member: hand the trial back due now and
+            // re-scan so the current owner probes it immediately.
+            await (
+              this.dependencies.abandon ??
+              ((input) =>
+                abandonPoolMemberRecoveryTrial({
+                  poolMemberId: input.memberId,
+                  trialStartedAt: input.trialStartedAt,
+                  now: input.now,
+                }))
+            )({ memberId: member.id, trialStartedAt, now: this.now() });
+            this.wakeRequested = true;
+            continue;
+          }
           if (!new Set(this.dependencies.getOwnedCliDeviceIds()).has(member.cliDeviceId)) continue;
           await (
             this.dependencies.settle ??

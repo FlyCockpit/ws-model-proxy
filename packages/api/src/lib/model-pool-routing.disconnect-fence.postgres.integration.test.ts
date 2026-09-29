@@ -195,18 +195,20 @@ integration("disconnect fence with real PostgreSQL", () => {
   });
 
   it("preserves a running real-failure cooldown across disconnect and reconnect, and opens the rest", async () => {
-    const { prisma, routing, rows } = await seed("provenance", 5);
+    const { prisma, routing, rows } = await seed("provenance", 6);
     const now = new Date();
     const later = new Date(now.getTime() + 120_000);
     const past = new Date(now.getTime() - 5_000);
     // 0: real failure, cooldown running. 1: real failure, cooldown over.
     // 2: disconnect-class already. 3: healthy. 4: UNHEALTHY with no class recorded.
+    // 5: DEGRADED by a real failure, cooldown running.
     const states = [
       { healthStatus: "UNHEALTHY", lastFailureClass: "RELAY_TIMEOUT", nextRetryAt: later },
       { healthStatus: "UNHEALTHY", lastFailureClass: "UPSTREAM_5XX", nextRetryAt: past },
       { healthStatus: "UNHEALTHY", lastFailureClass: "STALE_SESSION", nextRetryAt: later },
       { healthStatus: "HEALTHY", lastFailureClass: null, nextRetryAt: null },
       { healthStatus: "UNHEALTHY", lastFailureClass: null, nextRetryAt: later },
+      { healthStatus: "DEGRADED", lastFailureClass: "UPSTREAM_5XX", nextRetryAt: later },
     ] as const;
     for (const [i, state] of states.entries())
       await prisma.poolMember.update({
@@ -230,11 +232,52 @@ integration("disconnect fence with real PostgreSQL", () => {
     // Real failure with a running cooldown: class and cooldown untouched.
     expect(after[0]?.lastFailureClass).toBe("RELAY_TIMEOUT");
     expect(after[0]?.nextRetryAt?.getTime()).toBe(later.getTime());
+    // The same for a DEGRADED member: class, health and cooldown untouched.
+    expect(after[5]?.healthStatus).toBe("DEGRADED");
+    expect(after[5]?.lastFailureClass).toBe("UPSTREAM_5XX");
+    expect(after[5]?.nextRetryAt?.getTime()).toBe(later.getTime());
     // Every other shape was opened by the disconnect and is due at reconnect.
     for (const i of [1, 2, 3, 4]) {
       expect(after[i]?.healthStatus, `member ${i}`).toBe("UNHEALTHY");
       expect(after[i]?.lastFailureClass, `member ${i}`).toBe("WEBSOCKET_DISCONNECTED");
       expect(after[i]?.nextRetryAt?.getTime(), `member ${i}`).toBeLessThanOrEqual(now.getTime());
     }
+  });
+
+  it("abandons a superseded recovery trial to a due UNHEALTHY member, only for its own claim", async () => {
+    const { prisma, routing, rows } = await seed("abandon");
+    const row = rows[0];
+    const memberId = row?.member.id;
+    const claimed = new Date();
+    await prisma.poolMember.update({
+      where: { id: memberId },
+      data: {
+        healthStatus: "HALF_OPEN",
+        halfOpenTrialStartedAt: claimed,
+        lastFailureClass: "WEBSOCKET_DISCONNECTED",
+        consecutiveRetryableFailures: 3,
+      },
+    });
+    // A newer claim owns the row: the old holder's abandon must match nothing.
+    await expect(
+      routing.abandonPoolMemberRecoveryTrial({
+        poolMemberId: memberId ?? "",
+        trialStartedAt: new Date(claimed.getTime() - 1_000),
+      }),
+    ).resolves.toBe(false);
+    const now = new Date();
+    await expect(
+      routing.abandonPoolMemberRecoveryTrial({
+        poolMemberId: memberId ?? "",
+        trialStartedAt: claimed,
+        now,
+      }),
+    ).resolves.toBe(true);
+    const after = await prisma.poolMember.findUniqueOrThrow({ where: { id: memberId } });
+    expect(after.healthStatus).toBe("UNHEALTHY");
+    expect(after.halfOpenTrialStartedAt).toBeNull();
+    expect(after.lastFailureClass).toBe("WEBSOCKET_DISCONNECTED");
+    expect(after.consecutiveRetryableFailures).toBe(3);
+    expect(after.nextRetryAt?.getTime()).toBe(now.getTime());
   });
 });
