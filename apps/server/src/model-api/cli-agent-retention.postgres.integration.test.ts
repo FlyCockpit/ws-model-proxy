@@ -1,4 +1,5 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
@@ -65,6 +66,40 @@ integration("agent audit retention with real PostgreSQL", () => {
     });
     expect(left.map((event) => event.path)).toEqual(["recent-1", "recent-2"]);
     await expect(retention.deleteExpiredCliAgentActions({ prisma: db, now })).resolves.toBe(0);
+  });
+
+  it("deletes audit events whose user no longer exists and keeps a live owner's", async () => {
+    const fixture = createFixturePrismaClient(databaseUrl as string);
+    const owner = await fixture.user.create({
+      data: {
+        name: "Audit retention owner",
+        email: `${tag}@example.test`,
+        slug: tag,
+      },
+    });
+    try {
+      await db.cliAgentActionEvent.createMany({
+        data: [
+          { ...row(1, "live-owner"), userId: owner.id },
+          { ...row(1, "orphan-1"), userId: `${tag}-gone` },
+          { ...row(1, "orphan-2"), userId: `${tag}-gone` },
+          { ...row(1, "orphan-3"), userId: `${tag}-gone-too` },
+        ],
+      });
+      // Other tests of this file leave rows of a made-up user id, also orphans.
+      expect(
+        await retention.deleteOrphanCliAgentActions({ prisma: db, batch: 2 }),
+      ).toBeGreaterThanOrEqual(3);
+      const left = await db.cliAgentActionEvent.findMany({
+        where: { path: { in: ["live-owner", "orphan-1", "orphan-2", "orphan-3"] } },
+        select: { path: true },
+      });
+      expect(left.map((event) => event.path)).toEqual(["live-owner"]);
+    } finally {
+      await db.cliAgentActionEvent.deleteMany({ where: { userId: owner.id } });
+      await fixture.user.deleteMany({ where: { id: owner.id } });
+      await fixture.$disconnect();
+    }
   });
 
   it("runUsageRetention includes the step and reports its count", async () => {

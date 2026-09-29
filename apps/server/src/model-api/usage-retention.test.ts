@@ -24,6 +24,7 @@ const {
   ABANDONED_PENDING_AFTER_MS,
   compactMinuteRollups,
   deleteExpiredCliAgentActions,
+  deleteOrphanCliAgentActions,
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
   deleteExpiredRoutingVerdicts,
@@ -134,7 +135,30 @@ describe("usage retention", () => {
     tx.$queryRaw.mockResolvedValue([]);
     await expect(
       runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
-    ).resolves.toMatchObject({ agentActionsDeleted: 4 });
+    ).resolves.toMatchObject({ agentActionsDeleted: 8 }); // 4 expired + 4 orphaned
+  });
+
+  it("deletes orphaned audit events (no such user) in SKIP LOCKED batches, fence-checked", async () => {
+    const { prisma } = fakePrisma();
+    const statements: string[] = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      statements.push(strings.join("?"));
+      round += 1;
+      return round === 1 ? 2 : 1;
+    });
+    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      3,
+    );
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain('NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")');
+    expect(statements[0]).toContain("FOR UPDATE OF e SKIP LOCKED");
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      0,
+    );
+    expect(statements).toEqual([]);
   });
 
   it("runs the hot-path history sweeps after the rollup retention and reports their counts", async () => {

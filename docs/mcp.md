@@ -564,7 +564,8 @@ and counted when the database cannot keep up). Rows are deleted after **90
 days** by the hourly retention sweep, and with the user on account deletion
 (the deletion drain removes them; a row recorded or skipped after that drain,
 such as the cancellation of a command still running when the account is
-deleted, is removed by the deleted-user purge within its grace period).
+deleted, is removed by the deleted-user purge within its grace period, and the
+hourly retention sweep deletes any event whose user no longer exists).
 The owner reads them under `Dashboard → CLIs → Agent activity` and through
 `forwarder_cli_activity_list` (read scope; visible only to a personal token
 minted with CLI commands, like the other CLI tools).

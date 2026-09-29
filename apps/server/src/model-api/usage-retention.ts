@@ -18,7 +18,9 @@
  *  4. Delete hourly rollups older than 13 months.
  *  5. Delete agent audit events (cli_agent_action_event, plain ids, no FKs)
  *     older than CLI_AGENT_ACTION_RETENTION_DAYS, in `FOR UPDATE SKIP LOCKED`
- *     batches ordered by the (createdAt) index.
+ *     batches ordered by the (createdAt) index, and audit events whose user
+ *     no longer exists (an independent bound for a row that outlived the
+ *     deletion drain and the deleted-user purge).
  *  6. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
  *     terminal admission history older than RELAY_REQUEST_RETENTION_DAYS (it
  *     no longer blocks a parent delete, so it needs its own bound), the rest
@@ -349,6 +351,37 @@ export async function deleteExpiredCliAgentActions({
   }
 }
 
+/**
+ * Deletes audit events whose user no longer exists. The audit table has no
+ * foreign key (plain ids), so the user delete's drain and the deleted-user
+ * purge queue (@ws-model-proxy/db/hot-path-sweeps) are the prompt paths; this
+ * recurring anti-join is the independent bound for a row that outlived both (a
+ * writer suspended between its owner check and its insert past the purge
+ * grace, or a purge backlog). `FOR UPDATE SKIP LOCKED` batches, fence between
+ * batches, like the expiry step; `user` is read only.
+ */
+export async function deleteOrphanCliAgentActions({
+  prisma = defaultPrisma as RetentionPrisma,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  batch?: number;
+} = {}): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM cli_agent_action_event
+       WHERE ctid IN (
+         SELECT e.ctid FROM cli_agent_action_event e
+          WHERE NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")
+          LIMIT ${batch}
+          FOR UPDATE OF e SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function deleteExpiredRoutingVerdicts({
   prisma = defaultPrisma as RetentionPrisma,
   now,
@@ -401,7 +434,9 @@ export async function runUsageRetention({
   });
   const minuteRowsCompacted = await compactMinuteRollups({ prisma, now, batch });
   const hourRowsDeleted = await deleteExpiredHourRollups({ prisma, now, batch });
-  const agentActionsDeleted = await deleteExpiredCliAgentActions({ prisma, now, batch });
+  const agentActionsDeleted =
+    (await deleteExpiredCliAgentActions({ prisma, now, batch })) +
+    (await deleteOrphanCliAgentActions({ prisma, batch }));
   const routingVerdictsDeleted = await deleteExpiredRoutingVerdicts({ prisma, now, batch });
   const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
     before: new Date(now.getTime() - retentionDays * DAY_MS),
