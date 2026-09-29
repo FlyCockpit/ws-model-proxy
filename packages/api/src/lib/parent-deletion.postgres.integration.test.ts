@@ -1099,8 +1099,8 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       .prisma.$transaction(
         async (tx) => {
           await tx.$executeRawUnsafe("SET LOCAL deadlock_timeout = '150ms'");
-          // What admission holds (target, L2) before it inserts rows that
-          // take FOR KEY SHARE on the user (L7).
+          // What admission holds (the execution_target row) before it inserts
+          // rows that take FOR KEY SHARE on the user (the L7 user lock).
           await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${g.target.id} FOR UPDATE`;
           deleting = order.deleteUserUnderOwnerFences(prisma, g.user.id, mark!.generation);
           // Wait until the delete is blocked on the target lock.

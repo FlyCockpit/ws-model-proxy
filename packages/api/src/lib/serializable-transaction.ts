@@ -89,12 +89,13 @@ export async function runCapacityDeleteTransaction<T>(
 
 /**
  * Maps the failures of a capacity-ordered delete transaction that mean
- * "nothing was deleted, retry" to their CONFLICT reasons: a residual above
- * the final-phase bound is `delete_pending`; exhausted deadlock /
- * serialization / lock-set-change retries and the transaction's own
- * server-side timeouts (a lock wait or statement past its bound, live
- * traffic holding the capacity locks) are `delete_contended`. Other errors
- * pass.
+ * "nothing was deleted, retry" to their CONFLICT reasons: a user-deletion
+ * drain that could not finish now (`ParentDeletionDrainPendingError`, a busy
+ * row past its lock bound or the drain's work bound) is `delete_pending`;
+ * exhausted deadlock / serialization / lock-set-change retries and the
+ * transaction's own server-side timeouts (a lock wait or statement past its
+ * bound, live traffic holding the capacity locks) are `delete_contended`.
+ * Other errors pass.
  */
 export function throwCapacityDeleteConflict(error: unknown): void {
   throwParentDeletionPendingConflict(error);

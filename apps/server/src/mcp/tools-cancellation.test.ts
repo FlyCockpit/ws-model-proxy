@@ -912,7 +912,7 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     // The armed fence stops the fill BEFORE it starts: no sweep writes on other
     // requests' waiters (expiry / member_unroutable) and no snapshot read.
     expect(tx.capacityWaiter.updateMany).not.toHaveBeenCalled();
-    // (The L3 scope-lock lookup is a distinct-select findMany; the snapshot read has `include`.)
+    // (The concurrency-scope fence lookup is a distinct-select findMany; the snapshot read has `include`.)
     expect(
       (tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>).filter(
         (call) => call[0].include,

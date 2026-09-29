@@ -680,8 +680,9 @@ export async function persistRelayRegistration({
 
           if (engineFactsByCapacityId.size > 0) {
             // Same fence as the context seed: every target on the capacity
-            // must be one this inventory holds the L2 lock for, and every
-            // capacity row already holds its L5 policy lock (above).
+            // must be one this inventory holds the `06:capacity-policy:<target>`
+            // fence for, and every capacity row already holds its
+            // `08:capacity:<capacity>` fence (above).
             const capacities = await tx.inferenceCapacity.findMany({
               where: { userId: identity.userId, id: { in: [...engineFactsByCapacityId.keys()] } },
               select: {

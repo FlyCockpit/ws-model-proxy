@@ -260,7 +260,7 @@ A deletion-related `CONFLICT` also carries a stable `reason`
 | --- | --- | --- |
 | `retained_history` | Provider accounting history must be kept, so the user can never be deleted. | Archive the user instead. |
 | `delete_pending` | The user's request history could not be drained yet; nothing was deleted. | Retry once requests finish. |
-| `delete_contended` | The set of affected owners kept changing under the delete; nothing was deleted. | Retry. |
+| `delete_contended` | The set of affected owners kept changing under the delete, or it kept deadlocking (including a server-side lock or statement timeout); nothing was deleted. | Retry. |
 | `still_attached` | A capacity is still attached to a pool member. | Detach it first. |
 | `not_stale` | A stale-only delete found the item reporting recently. | Nothing; it is live. |
 | `deletion_in_progress` | The user is being deleted and cannot be restored. | Nothing. |

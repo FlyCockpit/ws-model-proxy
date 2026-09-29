@@ -777,7 +777,8 @@ integration("PostgreSQL capacity admission primitives", () => {
       if (live.state !== "ADMITTED") throw new Error("Expected live database-clock lease.");
       const beforeHeartbeat = await databaseNow();
       // F2-CAP-1: renewal must not wait for an unrelated admission/reclaim
-      // transaction's L4/L5 locks. This file is already registered in test:postgres.
+      // transaction's capacity fences and capacity row lock. This file is
+      // already registered in test:postgres.
       await first.$transaction(async (tx) => {
         await acquireFences(tx, [fences.capacity(capacity.id)]);
         await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;

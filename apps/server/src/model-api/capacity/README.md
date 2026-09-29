@@ -37,7 +37,8 @@ and release/reclaim (fill mode: grant until nothing more fits).
 1. **Read** (`#readAdmissionSnapshot`): the deadline sweep (deferred waiters are left to their
    owner's poll), the grant-time routability re-check, then ONE snapshot of the capacity (limit, DRR
    cursor/deficits/version), ACTIVE leases, WAITING waiters, reservation members, direct
-   reservations and per-scope lease counts, all under the L4/L6 locks the caller already holds.
+   reservations and per-scope lease counts, all under the capacity and
+   concurrency-scope fences the caller already holds.
 2. **Plan** (`planGrants`, pure, no database): applies the decision repeatedly in memory. Each step
    is the single-grant decision (eligibility: `notBefore <= now`, candidate/request deadlines with
    the creating-request and last-chance exceptions, member/scope and physical limits, reservation
@@ -59,6 +60,16 @@ independent of how many waiters are granted (256 grants: about 0.5 s release, 1.
 loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged. The planner is O(k·W) per
 transaction (k grants over W waiters) and is suited to at most a few thousand simultaneously
 grantable waiters per capacity.
+
+### Known limitation: scope fence derived before the capacity fence
+
+`fenceCapacityAdmission` reads the durable concurrency-scope set of the target capacities
+BEFORE it takes the capacity fences. A waiter committed while an admission pass waits for a
+capacity fence introduces a scope fence that can no longer be taken (WMPF2 forbids a fence below
+one already held), so two fill-mode passes on different capacities that share such a scope can
+transiently over-admit one lease. This window is pre-existing (master's
+`lockCapacityAdmissionResources` derived the scope set the same way) and is bounded by one lease
+lifetime.
 
 ## Spill-over `notBefore` and grant-time routability (saturation S-A)
 

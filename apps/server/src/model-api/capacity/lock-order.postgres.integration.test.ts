@@ -257,9 +257,10 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("stores engine facts and refreshes only an AUTO limit from engine slots, with a live lease", async () => {
-    // S-B (relay 2.7): registration writes engine facts under the L5 policy
-    // lock it already holds, refreshes an AUTO hard limit from reported slots
-    // on every update, and never touches a USER limit.
+    // S-B (relay 2.7): registration writes engine facts under the
+    // capacity-policy / capacity fences it already holds, refreshes an AUTO
+    // hard limit from reported slots on every update, and never touches a USER
+    // limit.
     if (!databaseUrl) return;
     registrationRetryErrors.length = 0;
     process.env.DATABASE_URL = databaseUrl;
@@ -375,8 +376,9 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("expires terminal relay requests while an admitter updates one of them (no 40P01)", async () => {
-    // L6/L7. An admitter locks its admission_request row, then updates the
-    // relay_request row it references. Retention deletes that terminal relay
+    // Cross-capacity request and relay row locks. An admitter locks its
+    // admission_request row, then updates the relay_request row it references.
+    // Retention deletes that terminal relay
     // row, whose ON DELETE SET NULL rewrites the admission row. The delete
     // must never hold the relay row while it waits on the admission row.
     if (!databaseUrl) return;
@@ -477,7 +479,8 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
   }, 60_000);
 
   it("admits two overlapping multi-capacity requests from disjoint capacity sets (no 40P01)", async () => {
-    // L6. Two admitters hold disjoint capacity sets ({c1,c2} and {c3,c4}).
+    // Cross-capacity request locks. Two admitters hold disjoint capacity sets
+    // ({c1,c2} and {c3,c4}).
     // Request A waits on c1 and c4, request B on c2 and c3, so each admitter
     // wins one of them on its first capacity and the other on its second.
     // Admission-request row locks must be taken in one global order.
@@ -503,7 +506,7 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
     };
     const clients = [countingClient(0), countingClient(1)];
     const user = await fixtures.user.create({
-      data: { name: "L6 order", email: `dl1-l6-${suffix}@example.test` },
+      data: { name: "cross-capacity order", email: `dl1-cross-${suffix}@example.test` },
     });
     let releaseGate!: () => void;
     const gateMayCommit = new Promise<void>((resolve) => {

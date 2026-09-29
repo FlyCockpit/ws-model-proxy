@@ -381,11 +381,6 @@ export class FenceProtocolError extends Error {
   }
 }
 
-/** A graph write ran without a fence it needs (`WMPF4`, schema-hardening.sql). */
-export function isMissingFenceError(error: unknown): boolean {
-  return findErrorCode(error, (code) => code === "WMPF4") !== undefined;
-}
-
 /**
  * Takes `requested` fences in the global order: sorted by level, then name.
  * Must run before the transaction's first row lock or write, and each call
@@ -434,6 +429,16 @@ export async function fenceOwners(tx: Tx, userIds: Iterable<string>): Promise<vo
  * The first read after this call runs as a new READ COMMITTED statement, so
  * it sees every capacity policy and admission write committed by the previous
  * holder of these fences.
+ *
+ * KNOWN LIMITATION (pre-existing, carried in from master's
+ * `lockCapacityAdmissionResources`): the durable scope set is derived from a
+ * plain read BEFORE the capacity fences are taken. A waiter committed while
+ * this transaction waits for a capacity fence brings a new scope fence that
+ * can no longer be taken (WMPF2 forbids a fence below one already held). Two
+ * fill-mode passes on different capacities that share such a scope can
+ * therefore briefly over-admit one lease, transiently and bounded by one lease
+ * lifetime. Closing it means re-deriving the scope set after the capacity
+ * fences and restarting on change; that is deliberately not done here.
  */
 export async function fenceCapacityAdmission(
   tx: Tx,

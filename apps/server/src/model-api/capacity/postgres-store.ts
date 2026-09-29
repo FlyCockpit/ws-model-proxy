@@ -215,9 +215,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               ? []
               : [fences.concurrencyScope(candidate.concurrencyScope, candidate.concurrencyScopeId)],
           );
-      // Every shared scope fence sorts before every physical-capacity fence.
-      // Release/reclaim use the same order, preventing both cross-capacity
-      // write skew and fence inversion.
+      // Every shared scope fence sorts before every physical-capacity fence,
+      // so release/reclaim and acquire take them in the same order (no fence
+      // inversion). KNOWN LIMITATION (pre-existing, carried in from master's
+      // lockCapacityAdmissionResources): `fenceCapacityAdmission` derives the
+      // durable scope set BEFORE it waits on the capacity fence. A scope
+      // fence for a waiter committed while this transaction waits for the
+      // capacity fence therefore cannot be taken afterwards (WMPF2 monotonic
+      // order), so two fill-mode passes on different capacities that share
+      // such a scope can briefly over-admit one lease, bounded by one lease
+      // lifetime. See fenceCapacityAdmission's doc comment.
       const capacityIds = [...orderedCapacityIds].sort();
       await fenceCapacityAdmission(tx, capacityIds, candidateScopeFences);
       // The initial graph read only discovers locks for an idempotent retry.
@@ -226,9 +233,10 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      // L6: this request plus every queued request that another admitter
-      // (one holding a capacity outside this set) can also lock, in one
-      // sorted statement, before #persistGrants locks any winner.
+      // Cross-capacity request locks: this request plus every queued request
+      // that another admitter (one holding a capacity outside this set) can
+      // also lock, in one sorted statement, before #persistGrants locks any
+      // winner.
       await lockCrossCapacityAdmissionRequests(tx, capacityIds, existing ? [existing.id] : []);
       if (existing)
         await tx.$queryRaw`SELECT id FROM capacity_waiter WHERE "admissionRequestId" = ${existing.id} FOR UPDATE`;
@@ -742,8 +750,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
    * READ phase of an admission pass on one capacity: the deadline and
    * routability sweeps, then ONE snapshot of everything the planner needs
    * (capacity, ACTIVE leases, WAITING waiters, reservation members and direct
-   * targets, per-scope lease counts). Every read happens under the L4/L6 locks
-   * the caller already holds; this adds no lock.
+   * targets, per-scope lease counts). Every read happens under the capacity
+   * and concurrency-scope fences the caller already holds; this adds no lock.
    */
   async #readAdmissionSnapshot(
     tx: Prisma.TransactionClient,
@@ -783,7 +791,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     // expires on its own next poll when no live candidate remains (the other
     // candidates keep waiting). The pool_member read is a plain subquery (no
     // row lock), so it adds no lock-order edge; waiter rows are written under
-    // this capacity's L4 lock, like the deadline sweep above. CLI connection
+    // this capacity's fence, like the deadline sweep above. CLI connection
     // state is per process and stays a candidate-build / dispatch check.
     // The waiter has no relation to the graph (DL-1 design (d)): the member
     // filter is a plain read of pool_member (no row lock, no lock-order edge).
@@ -1107,7 +1115,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
    * DRR order (older eligible waiters first, as a release-fill would) until
    * the request holds a lease, nothing more is grantable, or the capacity is
    * full; the loop is bounded by the queue size, never by a constant.
-   * Same locks as before (L4 plus the L6 pre-lock): no new lock-order edge.
+   * Same fences as before (the capacity fence plus the cross-capacity request
+   * pre-lock): no new lock-order edge.
    */
   async #admitCapacity(
     tx: Prisma.TransactionClient,

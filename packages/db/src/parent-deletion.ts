@@ -37,9 +37,9 @@
  *     relay requests, WAITING/ADMITTED admission requests).
  *  3. The delete under owner fences, which also queues the user in
  *     `deleted_user_purge`: the history sweeper
- *     (apps/server/src/model-api/hot-path-sweeper.ts) purges what the drain
- *     could not take (requests still in flight at the delete) once it is
- *     terminal.
+ *     (apps/server/src/model-api/usage-retention.ts, `startUsageRetention` ->
+ *     `purgeDeletedUsersHistory`) purges what the drain could not take
+ *     (requests still in flight at the delete) once it is terminal.
  *
  * Durable intent. A user delete marks the user first
  * ({@link requestUserDeletion}: `deletionRequestedAt`, a ban and the removal

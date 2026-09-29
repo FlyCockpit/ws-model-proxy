@@ -196,8 +196,9 @@ describe("capacity lease release", () => {
       $executeRaw: vi.fn().mockResolvedValue(0),
       $queryRaw: vi.fn().mockResolvedValue([{ now: new Date() }]),
       capacityWaiter: {
-        // The L3 scope query (distinct) sees no limited scopes; the fill's
-        // waiter query sees the one WAITING waiter until it is admitted.
+        // The concurrency-scope fence query (distinct) sees no limited scopes;
+        // the fill's waiter query sees the one WAITING waiter until it is
+        // admitted.
         findMany: vi.fn(async (args: { distinct?: unknown }) =>
           args.distinct || admitted ? [] : [waiter],
         ),
