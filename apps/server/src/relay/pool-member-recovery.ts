@@ -1,5 +1,6 @@
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
+  abandonPoolMemberRecoveryTrial,
   claimPoolMemberRecoveryTrial,
   settlePoolMemberRecoveryTrial,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
@@ -31,12 +32,17 @@ type Timer = ReturnType<typeof setTimeout>;
 export type PoolMemberRecoverySchedulerDependencies = {
   getOwnedCliDeviceIds(): Iterable<string>;
   listDueMembers(cliDeviceIds: string[], now: Date): Promise<OwnedRecoveryMember[]>;
-  probe(member: OwnedRecoveryMember): Promise<boolean>;
+  /**
+   * `"superseded"`: the connection the probe ran on was replaced or lost, so
+   * the result says nothing about the member (never recorded as a failure).
+   */
+  probe(member: OwnedRecoveryMember): Promise<boolean | "superseded">;
   now?(): Date;
   setTimer?(callback: () => void, ms: number): Timer;
   clearTimer?(timer: Timer): void;
   idlePollMs?: number;
   claim?(memberId: string, now: Date): Promise<Date | null>;
+  abandon?(input: { memberId: string; trialStartedAt: Date; now: Date }): Promise<boolean>;
   settle?(input: {
     memberId: string;
     trialStartedAt: Date;
@@ -111,18 +117,46 @@ export class PoolMemberRecoveryScheduler {
             ((id, now) => claimPoolMemberRecoveryTrial({ poolMemberId: id, now }))
           )(member.id, this.now());
           if (!trialStartedAt) continue;
-          const healthy = await this.dependencies.probe(member).catch(() => false);
-          if (!new Set(this.dependencies.getOwnedCliDeviceIds()).has(member.cliDeviceId)) continue;
-          await (
-            this.dependencies.settle ??
-            ((input) =>
-              settlePoolMemberRecoveryTrial({
-                poolMemberId: input.memberId,
-                trialStartedAt: input.trialStartedAt,
-                healthy: input.healthy,
-                now: input.now,
-              }))
-          )({ memberId: member.id, trialStartedAt, healthy, now: this.now() });
+          // Every claimed trial ends in settle or abandon: a probe that says
+          // nothing about the member (superseded, or its session is gone by
+          // now) and any error after the claim hand the trial back due now,
+          // fenced on its own timestamp, instead of leaving a live half-open
+          // lease that nothing else would clear.
+          const abandon = () =>
+            (
+              this.dependencies.abandon ??
+              ((input) =>
+                abandonPoolMemberRecoveryTrial({
+                  poolMemberId: input.memberId,
+                  trialStartedAt: input.trialStartedAt,
+                  now: input.now,
+                }))
+            )({ memberId: member.id, trialStartedAt, now: this.now() });
+          try {
+            const healthy = await this.dependencies.probe(member).catch(() => false);
+            const stillOwned = new Set(this.dependencies.getOwnedCliDeviceIds()).has(
+              member.cliDeviceId,
+            );
+            if (healthy === "superseded" || !stillOwned) {
+              await abandon();
+              // A successor session may now own the device: probe it at once.
+              if (healthy === "superseded") this.wakeRequested = true;
+              continue;
+            }
+            await (
+              this.dependencies.settle ??
+              ((input) =>
+                settlePoolMemberRecoveryTrial({
+                  poolMemberId: input.memberId,
+                  trialStartedAt: input.trialStartedAt,
+                  healthy: input.healthy,
+                  now: input.now,
+                }))
+            )({ memberId: member.id, trialStartedAt, healthy, now: this.now() });
+          } catch (error) {
+            await abandon().catch(() => false);
+            throw error;
+          }
         }
       }
     } catch {

@@ -38,7 +38,7 @@ overrides:
   "mysql2@<3.22.0": 3.24.4
   "prisma@7.10.0>mysql2": 3.24.4
   "better-auth@1.7.4>mysql2": 3.24.4
-  "undici@>=7 <7.29.0": 7.29.0 # CVE-2026-13697
+  "undici@>=7 <7.29.1": 7.29.1 # CVE-2026-13697; GHSA-rfgv-xxqx-mfg5 (DoS) / GHSA-w293-vg96-wgc3 (TLS validation bypass)
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe to a single installed copy: better-auth
   # 1.7.3 declares kysely as a DEPENDENCY (`^0.28.17 || ^0.29.0`, no kysely
