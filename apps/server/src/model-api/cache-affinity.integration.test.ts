@@ -206,6 +206,104 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     expect(runtimeIsolated.conversationMatches[changedRuntime.executionTargetId]).toBe(false);
   });
 
+  it("keeps one warm-session id across edited and shortened history and changed parameters", async () => {
+    if (!db) return;
+    const row = await fixture();
+    const base = {
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "token-a",
+      policy: { ...policy, maxRecords: 100 },
+      surface: "OPENAI_CHAT_COMPLETIONS",
+    };
+    // Real-clock based (the row's createdAt is the database's now), one second per step.
+    const start = Date.now();
+    const at = (seconds: number) => new Date(start + seconds * 1000);
+    const user = (content: string) => ({ role: "user", content });
+    const assistant = (content: string) => ({ role: "assistant", content });
+    const chat = (messages: unknown[], extra: Record<string, unknown> = {}) => ({
+      messages: [{ role: "system", content: "rules" }, ...messages],
+      ...extra,
+    });
+    const remember = (
+      payload: Record<string, unknown>,
+      seconds: number,
+      targetIndex = 0,
+      overrides: Record<string, unknown> = {},
+    ) =>
+      service.rememberAffinity({
+        ...base,
+        ...overrides,
+        payload,
+        target: row.target(targetIndex),
+        estimatedTokens: 10_000 + seconds,
+        now: at(seconds),
+      });
+    const sessions = async () =>
+      new Set(
+        (
+          await db.cacheAffinityRecord.findMany({
+            where: { tenantUserId: row.tenant.id, poolId: row.pool.id },
+            select: { sessionId: true },
+          })
+        ).map((record) => record.sessionId),
+      );
+
+    // Turn 1, turn 2 (continuation), then an edited earlier turn and a
+    // shortened history: one session throughout.
+    await remember(chat([user("a")]), 1);
+    const [first] = [...(await sessions())];
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    await remember(chat([user("a"), assistant("b"), user("c")]), 2);
+    await remember(chat([user("a"), assistant("b"), user("c"), assistant("d"), user("e")]), 3);
+    await remember(chat([user("a"), assistant("b"), user("EDITED"), assistant("x"), user("y")]), 4);
+    await remember(chat([user("a"), assistant("b"), user("c")]), 5);
+    expect(await sessions()).toEqual(new Set([first]));
+
+    // A different conversation (fresh first message) is its own session; so is
+    // the same history on another target (its KV lives elsewhere).
+    await remember(chat([user("unrelated")]), 6);
+    expect((await sessions()).size).toBe(2);
+    await remember(chat([user("a"), assistant("b"), user("c")]), 7, 1);
+    expect((await sessions()).size).toBe(3);
+
+    // An explicit conversation keeps its session when the parameters change;
+    // a tenant's records never join another tenant's.
+    const explicit = (temperature: number, text: string) => ({
+      conversation: "conv-1",
+      input: text,
+      temperature,
+    });
+    const responses = { surface: "OPENAI_RESPONSES" };
+    await remember(explicit(0.1, "one"), 8, 0, responses);
+    const afterFirst = await sessions();
+    await remember(explicit(0.9, "one and two"), 9, 0, responses);
+    expect((await sessions()).size).toBe(afterFirst.size);
+    const conversationRecords = await db.cacheAffinityRecord.findMany({
+      where: { tenantUserId: row.tenant.id, poolId: row.pool.id, prefixDigest: null },
+      select: { sessionId: true },
+    });
+    expect(new Set(conversationRecords.map((record) => record.sessionId)).size).toBe(1);
+    await service.rememberAffinity({
+      ...base,
+      ownerId: row.otherTenant.id,
+      payload: chat([user("a"), assistant("b"), user("c")]),
+      target: row.target(0),
+      now: at(10),
+    });
+    const otherTenantSessions = await db.cacheAffinityRecord.findMany({
+      where: { tenantUserId: row.otherTenant.id, poolId: row.pool.id },
+      select: { sessionId: true },
+    });
+    expect(otherTenantSessions.every(({ sessionId }) => sessionId !== null)).toBe(true);
+    expect(
+      otherTenantSessions.some(({ sessionId }) =>
+        (afterFirst as Set<string | null>).has(sessionId),
+      ),
+    ).toBe(false);
+  });
+
   it("persists one bounded conversation-only record under concurrent refreshes", async () => {
     if (!db) return;
     const row = await fixture();

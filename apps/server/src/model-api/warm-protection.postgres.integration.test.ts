@@ -3,9 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
  * Real-PostgreSQL proof of the warm-session query (saturation S-C): one
- * bounded, non-locking read per request, grouped into sessions by the shared
- * `lastUsedAt` of one request's records, with the owner/grant overrides, and
- * cheap at the default retention bound (10 000 records per pool).
+ * bounded, non-locking read per request, grouped into sessions by the
+ * `sessionId` the records of a conversation share across turns (newest turn
+ * wins), with the owner/grant overrides and the active-lease link, and cheap
+ * at the default retention bound (10 000 records per pool).
  */
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -47,7 +48,7 @@ integration("warm-session protection with real PostgreSQL", () => {
     });
   }
 
-  it("groups one request's records into a session and reads overrides, in bounded time", async () => {
+  it("groups a session's records by session id and reads overrides, in bounded time", async () => {
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
     const owner = await user("owner");
@@ -124,8 +125,11 @@ integration("warm-session protection with real PostgreSQL", () => {
         lastUsedAt: Date;
         tokens: number[];
         expiresAt?: Date;
-      }) =>
-        input.tokens.map((estimatedTokens, index) => ({
+      }) => {
+        // One request's records: one session.
+        const sessionId = crypto.randomUUID();
+        return input.tokens.map((estimatedTokens, index) => ({
+          sessionId,
           userId: owner.id,
           tenantUserId: input.tenantUserId,
           poolId: input.poolId,
@@ -139,6 +143,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           createdAt: ago(3_700 + 1_000),
           expiresAt: input.expiresAt ?? future,
         }));
+      };
       await db.cacheAffinityRecord.createMany({
         data: [
           // Owner session on A: three records of one request; size = the max.
@@ -305,7 +310,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         await db.user.deleteMany({ where: { id } });
     }
   }, 60_000);
-  it("keeps every user's sessions under the read bound and one session per explicit conversation", async () => {
+  it("keeps every user's sessions under the read bound and one session per session id", async () => {
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();
     const owner = await user("owner2");
@@ -368,7 +373,9 @@ integration("warm-session protection with real PostgreSQL", () => {
         bindingDigest?: string;
         conversationDigest?: string;
         poolId?: string;
+        sessionId?: string;
       }) => ({
+        sessionId: input.sessionId ?? crypto.randomUUID(),
         userId: owner.id,
         tenantUserId: input.tenantUserId,
         poolId: input.poolId ?? pool.id,
@@ -413,8 +420,8 @@ integration("warm-session protection with real PostgreSQL", () => {
             tokens: 11_000,
             poolId: bucketPool.id,
           }),
-          // One tenant, one binding: an explicit conversation and prefix-only
-          // requests at DIFFERENT instants are separate sessions (both orders).
+          // One tenant: an explicit conversation and prefix-only requests at
+          // different instants, each its own session.
           row({
             tenantUserId: mixed.id,
             lastUsedAt: ago(100),
@@ -423,51 +430,24 @@ integration("warm-session protection with real PostgreSQL", () => {
           }),
           row({ tenantUserId: mixed.id, lastUsedAt: ago(50), tokens: 13_000 }),
           row({ tenantUserId: mixed.id, lastUsedAt: ago(150), tokens: 14_000 }),
-          // A small explicit conversation still covers its instant's prefix group,
-          // even when the group carries another request's larger (stale) estimate.
-          row({
-            tenantUserId: mixed.id,
-            lastUsedAt: ago(20),
-            tokens: 2_000,
-            bindingDigest: "f".repeat(64),
-            conversationDigest: "g".repeat(40),
-          }),
-          row({
-            tenantUserId: mixed.id,
-            lastUsedAt: ago(20),
-            tokens: 20_000,
-            bindingDigest: "f".repeat(64),
-          }),
-          // An estimate-less explicit conversation record covers its group too.
-          row({
-            tenantUserId: mixed.id,
-            lastUsedAt: ago(30),
-            tokens: null,
-            bindingDigest: "h".repeat(64),
-            conversationDigest: "i".repeat(40),
-          }),
-          row({
-            tenantUserId: mixed.id,
-            lastUsedAt: ago(30),
-            tokens: 20_000,
-            bindingDigest: "h".repeat(64),
-          }),
           // Two explicit conversations finishing in the same instant, each with
-          // its conversation record and the shared prefix records of the request.
+          // its conversation record and the prefix records of its own request.
           row({
             tenantUserId: owner.id,
             lastUsedAt: same,
             tokens: 15_000,
             conversationDigest: "c".repeat(40),
+            sessionId: "session-c",
           }),
           row({
             tenantUserId: owner.id,
             lastUsedAt: same,
             tokens: 16_000,
             conversationDigest: "d".repeat(40),
+            sessionId: "session-d",
           }),
-          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 16_000 }),
-          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 15_000 }),
+          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 16_000, sessionId: "session-d" }),
+          row({ tenantUserId: owner.id, lastUsedAt: same, tokens: 15_000, sessionId: "session-c" }),
         ],
       });
       const policy = { windowSeconds: 300, minTokens: 8192 };
@@ -497,7 +477,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       expect(
         list.filter((session) => session.userId === owner.id && session.overridePercent === 100),
       ).toHaveLength(1);
-      // A conversation record only covers prefix records of ITS instant.
+      // Unbounded read: the mixed tenant's three requests are three sessions.
       const all = await warm.loadWarmSessions({
         ownerId: owner.id,
         capacityIds: [capacity.id],
@@ -513,6 +493,211 @@ integration("warm-session protection with real PostgreSQL", () => {
     } finally {
       for (const id of [owner.id, heavy.id, light.id, batch.id, mixed.id])
         await db.user.deleteMany({ where: { id } });
+    }
+  }, 60_000);
+
+  it("keeps one identity across turns and marks sessions an active lease is serving", async () => {
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const owner = await user("owner3");
+    try {
+      const device = await db.cliDevice.create({
+        data: { userId: owner.id, slug: `device-${suffix}` },
+      });
+      const endpoint = await db.endpoint.create({
+        data: { userId: owner.id, cliDeviceId: device.id, slug: `endpoint-${suffix}`, label: "W" },
+      });
+      const pool = await db.modelPool.create({
+        data: { userId: owner.id, slug: `pool-${suffix}`, name: "Warm pool" },
+      });
+      const capacity = async (label: string) =>
+        db.inferenceCapacity.create({
+          data: {
+            userId: owner.id,
+            label: `${label}-${suffix}`,
+            runtimeIdentityKey: `${label}-${suffix}`,
+            runtimeModel: "warm-proof",
+            hardConcurrencyLimit: 4,
+          },
+        });
+      const target = async (label: string, capacityId: string) => {
+        const model = await db.discoveredModel.create({
+          data: {
+            userId: owner.id,
+            endpointId: endpoint.id,
+            upstreamModelId: label,
+            encodedModelId: `${label}-${suffix}`,
+          },
+        });
+        return db.executionTarget.update({
+          where: { discoveredModelId: model.id },
+          data: { inferenceCapacityId: capacityId },
+        });
+      };
+      const capacityA = await capacity("a");
+      const capacityB = await capacity("b");
+      const targetA = await target("a", capacityA.id);
+      const targetB = await target("b", capacityB.id);
+      const now = new Date("2026-09-29T12:00:00.000Z");
+      const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+      let sequence = 0;
+      const record = (input: {
+        sessionId: string | null;
+        lastUsedAt: Date;
+        tokens: number;
+        targetId?: string;
+        conversationDigest?: string;
+      }) => ({
+        sessionId: input.sessionId,
+        userId: owner.id,
+        tenantUserId: owner.id,
+        poolId: pool.id,
+        executionTargetId: input.targetId ?? targetA.id,
+        targetIdentity: "identity",
+        bindingDigest: "b".repeat(64),
+        prefixDigest: input.conversationDigest
+          ? null
+          : `prefix-${String(sequence++).padStart(40, "0")}`,
+        conversationDigest: input.conversationDigest ?? null,
+        prefixDepth: input.conversationDigest ? 0 : 1,
+        estimatedTokens: input.tokens,
+        lastUsedAt: input.lastUsedAt,
+        createdAt: ago(1_000),
+        expiresAt: new Date(now.getTime() + 3_600_000),
+      });
+      await db.cacheAffinityRecord.createMany({
+        data: [
+          // "long": turn 1 at 200 s wrote deep prefixes (30k); turn 2 (edited
+          // and shortened history) at 20 s wrote a shorter one (12k). One
+          // session, dated and sized by its newest turn.
+          record({ sessionId: "long", lastUsedAt: ago(200), tokens: 30_000 }),
+          record({ sessionId: "long", lastUsedAt: ago(200), tokens: 30_000 }),
+          record({ sessionId: "long", lastUsedAt: ago(20), tokens: 12_000 }),
+          record({
+            sessionId: "long",
+            lastUsedAt: ago(20),
+            tokens: 12_000,
+            conversationDigest: "c".repeat(40),
+          }),
+          // "shrunk": the newest turn fell below the floor; the older turn's
+          // larger prefix is still what the engine holds.
+          record({ sessionId: "shrunk", lastUsedAt: ago(90), tokens: 20_000 }),
+          record({ sessionId: "shrunk", lastUsedAt: ago(10), tokens: 3_000 }),
+          // Rows from before session ids existed are one session each.
+          record({ sessionId: null, lastUsedAt: ago(40), tokens: 9_000 }),
+          record({ sessionId: null, lastUsedAt: ago(40), tokens: 9_500 }),
+          // Served by an active lease, by an ended one, by an expired one, by
+          // a lease of ANOTHER member, and not served at all.
+          record({ sessionId: "busy", lastUsedAt: ago(30), tokens: 15_000 }),
+          record({ sessionId: "released", lastUsedAt: ago(31), tokens: 16_000 }),
+          record({ sessionId: "expired", lastUsedAt: ago(32), tokens: 17_000 }),
+          record({ sessionId: "on-other-member", lastUsedAt: ago(33), tokens: 18_000 }),
+          record({ sessionId: "idle", lastUsedAt: ago(34), tokens: 19_000 }),
+          record({
+            sessionId: "b-only",
+            lastUsedAt: ago(35),
+            tokens: 14_000,
+            targetId: targetB.id,
+          }),
+        ],
+      });
+      let fencing = 0n;
+      const lease = async (input: {
+        capacityId: string;
+        targetId: string;
+        warmSessionIds: string[];
+        state?: "ACTIVE" | "RELEASED";
+        expiresInSeconds?: number;
+      }) => {
+        fencing += 1n;
+        const id = crypto.randomUUID();
+        const request = await db.admissionRequest.create({
+          data: {
+            userId: owner.id,
+            requestId: id,
+            attemptId: id,
+            sourceKind: "DIRECT",
+            directExecutionTargetId: input.targetId,
+            basePriority: 16,
+            enqueueSequence: fencing,
+            connectionOwner: "test",
+            heartbeatAt: now,
+            state: "ADMITTED",
+            warmSessionIds: input.warmSessionIds,
+          },
+        });
+        const released = input.state === "RELEASED";
+        await db.capacityLease.create({
+          data: {
+            userId: owner.id,
+            admissionRequestId: request.id,
+            requestId: id,
+            attemptId: id,
+            capacityId: input.capacityId,
+            executionTargetId: input.targetId,
+            priority: 16,
+            reservationClass: 0,
+            fencingToken: fencing,
+            state: input.state ?? "ACTIVE",
+            ownerServerInstance: "test",
+            acquiredAt: ago(60),
+            heartbeatAt: now,
+            expiresAt: new Date(now.getTime() + (input.expiresInSeconds ?? 30) * 1000),
+            releasedAt: released ? ago(1) : null,
+            releaseReason: released ? "test" : null,
+          },
+        });
+      };
+      await lease({ capacityId: capacityA.id, targetId: targetA.id, warmSessionIds: ["busy"] });
+      await lease({
+        capacityId: capacityA.id,
+        targetId: targetA.id,
+        warmSessionIds: ["released"],
+        state: "RELEASED",
+      });
+      await lease({
+        capacityId: capacityA.id,
+        targetId: targetA.id,
+        warmSessionIds: ["expired"],
+        expiresInSeconds: -10,
+      });
+      // Active on B, but naming a session that lives on A: A's copy is idle.
+      await lease({
+        capacityId: capacityB.id,
+        targetId: targetB.id,
+        warmSessionIds: ["on-other-member"],
+      });
+
+      const sessions = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: [capacityA.id, capacityB.id],
+        policy: { windowSeconds: 300, minTokens: 8192 },
+        now,
+      });
+      const summary = (capacityId: string) =>
+        (sessions.get(capacityId) ?? [])
+          .map(({ ageMs, tokens, inFlight }) => ({ age: ageMs / 1000, tokens, inFlight }))
+          .sort((left, right) => left.age - right.age || left.tokens - right.tokens);
+      expect(summary(capacityA.id)).toEqual([
+        // "long": one session at its newest turn (not two, not 30k).
+        { age: 20, tokens: 12_000, inFlight: false },
+        // Only the active lease of the same member marks a session in flight.
+        { age: 30, tokens: 15_000, inFlight: true },
+        { age: 31, tokens: 16_000, inFlight: false },
+        { age: 32, tokens: 17_000, inFlight: false },
+        { age: 33, tokens: 18_000, inFlight: false },
+        { age: 34, tokens: 19_000, inFlight: false },
+        // Rows from before session ids existed: one session each.
+        { age: 40, tokens: 9_000, inFlight: false },
+        { age: 40, tokens: 9_500, inFlight: false },
+        // "shrunk": the older, larger turn stays its size.
+        { age: 90, tokens: 20_000, inFlight: false },
+      ]);
+      expect(summary(capacityB.id)).toEqual([{ age: 35, tokens: 14_000, inFlight: false }]);
+    } finally {
+      // Leases restrict their target's and capacity's deletion.
+      await db.capacityLease.deleteMany({ where: { userId: owner.id } });
+      await db.user.deleteMany({ where: { id: owner.id } });
     }
   }, 60_000);
 });

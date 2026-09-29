@@ -5619,6 +5619,9 @@ async function relayPool({
           // S-C: the grant's queue priority (if set) replaces the pool/member
           // priority for this grantee's waiters; the store reads it.
           accessGrantId: target.accessGrantId,
+          // S-C: the warm sessions this request continues, so its lease can
+          // be told apart from an idle slot holding a protected session.
+          warmSessionIds: Object.values(affinityDecision?.matchedSessionIds ?? {}),
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
@@ -5715,10 +5718,11 @@ async function relayPool({
     }
   }
   // Saturation S-C: warm-session protection (redirect-only). A new session
-  // avoids members whose idle capacity holds other conversations' protected warm
-  // sessions: they route last, and with an external plan they are left out
-  // of the first local admission (or, when nothing else can serve, the
-  // request goes external first). It needs the affinity decision to tell a
+  // avoids members whose idle capacity holds protected warm sessions (including
+  // the requester's own; a session an active lease is serving holds a busy
+  // slot, not an idle one): such members route last, and with an external plan
+  // they are left out of the first local admission (or, when nothing else can
+  // serve, the request goes external first). It needs the affinity decision to tell a
   // continuation (never redirected) from a new session, so without one
   // nothing changes. Like affinity, it is an optimization only.
   let protectionInitialCandidates: typeof routeCandidates | null = null;

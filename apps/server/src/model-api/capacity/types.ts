@@ -46,6 +46,13 @@ export type AdmissionAttempt = {
    * priority for every candidate of this attempt; null inherits it.
    */
   accessGrantId?: string | null;
+  /**
+   * Warm sessions (S-C) this request continues, across its candidate targets
+   * (`AffinityDecision.matchedSessionIds`). Recorded on the admission request
+   * only; the lease of a granted candidate is joined to it to tell which warm
+   * session an active lease is serving. Never read by admission.
+   */
+  warmSessionIds?: readonly string[];
   connectionOwner: string;
   deadlineAt: Date;
   candidates: readonly AdmissionCandidate[];

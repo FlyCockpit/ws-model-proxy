@@ -24,6 +24,7 @@ import {
   type AffinityTarget,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
+  continuedSessionKey,
   rankAffinityTargets,
   rememberAffinity,
   sweepExpiredAffinity,
@@ -86,6 +87,8 @@ const affinityRow = ({
   conversationDigest = null as string | null,
   digestVersion = 4,
   engineCacheConfirmed = false,
+  sessionId = null as string | null,
+  lastUsedAt = new Date("2026-08-25T11:59:00.000Z"),
 }: {
   target: ReturnType<typeof target>;
   material: ReturnType<typeof affinityPrefixDigests>;
@@ -94,7 +97,12 @@ const affinityRow = ({
   conversationDigest?: string | null;
   digestVersion?: number;
   engineCacheConfirmed?: boolean;
+  sessionId?: string | null;
+  lastUsedAt?: Date;
 }) => ({
+  id: `record-${prefixDigest ?? conversationDigest}`,
+  sessionId,
+  lastUsedAt,
   executionTargetId: affinityTarget.executionTargetId,
   targetIdentity: affinityTarget.targetIdentity,
   bindingDigest: material.bindingDigest,
@@ -592,6 +600,256 @@ describe("cache affinity", () => {
     expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
       new Set([now.getTime()]),
     );
+  });
+
+  describe("warm-session identity (S-C)", () => {
+    const at = (seconds: number) => new Date(Date.UTC(2026, 7, 25, 12, 0, 0) - seconds * 1000);
+    const record = (
+      id: string,
+      sessionId: string | null,
+      shape: { prefixDigest?: string; conversationDigest?: string },
+      lastUsedAt = at(10),
+    ) => ({
+      id,
+      sessionId,
+      prefixDigest: shape.prefixDigest ?? null,
+      conversationDigest: shape.conversationDigest ?? null,
+      lastUsedAt,
+    });
+    const request = (overrides: Partial<Parameters<typeof continuedSessionKey>[1]> = {}) => ({
+      conversationDigest: null,
+      isContinuation: true,
+      digests: ["d1", "d2", "d3"],
+      ...overrides,
+    });
+    // Each row names which session a request joins (null = starts a new one).
+    const cases: {
+      name: string;
+      records: ReturnType<typeof record>[];
+      request: ReturnType<typeof request>;
+      expected: string | null;
+    }[] = [
+      { name: "no records: a new session", records: [], request: request(), expected: null },
+      {
+        name: "the deepest prefix the history still contains",
+        records: [
+          record("r1", "S1", { prefixDigest: "d1" }),
+          record("r2", "S2", { prefixDigest: "d2" }),
+        ],
+        request: request(),
+        expected: "S2",
+      },
+      {
+        name: "an edited history keeps its shared earlier prefix",
+        records: [
+          record("r1", "S1", { prefixDigest: "d1" }),
+          record("old", "S1", { prefixDigest: "old-tail" }),
+        ],
+        request: request({ digests: ["d1", "edited2"] }),
+        expected: "S1",
+      },
+      {
+        name: "a shortened history matches the prefix it still holds",
+        records: [
+          record("r1", "S1", { prefixDigest: "d1" }),
+          record("r3", "S1", { prefixDigest: "d3" }),
+          record("r5", "S1", { prefixDigest: "d5" }),
+        ],
+        request: request({ digests: ["d1", "d2", "d3"] }),
+        expected: "S1",
+      },
+      {
+        name: "equal depth: the most recently used session",
+        records: [
+          record("a", "S-old", { prefixDigest: "d2" }, at(100)),
+          record("b", "S-new", { prefixDigest: "d2" }, at(5)),
+        ],
+        request: request(),
+        expected: "S-new",
+      },
+      {
+        name: "the explicit conversation's record beats a deeper prefix",
+        records: [
+          record("c", "S-conv", { conversationDigest: "conv" }),
+          record("p", "S-prefix", { prefixDigest: "d3" }),
+        ],
+        request: request({ conversationDigest: "conv" }),
+        expected: "S-conv",
+      },
+      {
+        name: "an explicit conversation is the session even for a non-continuation",
+        records: [record("c", "S-conv", { conversationDigest: "conv" })],
+        request: request({ conversationDigest: "conv", isContinuation: false }),
+        expected: "S-conv",
+      },
+      {
+        name: "another conversation's record never links",
+        records: [record("c", "S-other", { conversationDigest: "other" })],
+        request: request({ conversationDigest: "conv", isContinuation: false }),
+        expected: null,
+      },
+      {
+        name: "a fresh (non-continuation) request never links by prefix",
+        records: [record("r1", "S1", { prefixDigest: "d1" })],
+        request: request({ isContinuation: false }),
+        expected: null,
+      },
+      {
+        name: "instruction-only overlap is not conversation evidence",
+        records: [record("i", "S-instr", { prefixDigest: "instruction-1" })],
+        request: request(),
+        expected: null,
+      },
+      {
+        name: "a row from before session ids stands for itself by its own id",
+        records: [record("legacy-row", null, { prefixDigest: "d2" })],
+        request: request(),
+        expected: "legacy-row",
+      },
+    ];
+    it.each(cases)("$name", ({ records, request: input, expected }) => {
+      expect(continuedSessionKey(records, input)).toBe(expected);
+    });
+
+    const writeInputs = {
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+    };
+    const turn = (messages: unknown[]) => ({
+      messages: [{ role: "system", content: "rules" }, ...messages],
+    });
+    const stampedSessions = () => [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.sessionId,
+        input.update.sessionId,
+      ]),
+      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.sessionId),
+      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.sessionId),
+    ];
+
+    it("a new conversation gets one fresh session id on every record it writes", async () => {
+      await rememberAffinity({
+        ...writeInputs,
+        payload: turn([{ role: "user", content: "hello" }]),
+      });
+      const stamped = new Set(stampedSessions());
+      expect(stamped.size).toBe(1);
+      expect([...stamped][0]).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it("a continuation stamps the session of the prefix an edited history still shares", async () => {
+      const first = [{ role: "user", content: "hello" }];
+      const second = [
+        ...first,
+        { role: "assistant", content: "hi" },
+        { role: "user", content: "and now" },
+      ];
+      const material = (messages: unknown[]) =>
+        affinityPrefixDigests({
+          ownerId: "tenant",
+          resourceOwnerId: "pool-owner",
+          poolId: "pool",
+          securityScope: "token",
+          surface: "OPENAI_CHAT_COMPLETIONS",
+          payload: turn(messages),
+          runtimeIdentity: "runtime",
+        });
+      const previous = material(first);
+      db.cacheAffinityRecord.findMany.mockResolvedValue([
+        {
+          id: "r1",
+          sessionId: "S-prev",
+          prefixDigest: previous.digests[0],
+          conversationDigest: null,
+          lastUsedAt: new Date("2026-08-25T11:59:00.000Z"),
+        },
+      ]);
+      await rememberAffinity({ ...writeInputs, payload: turn(second) });
+      expect(new Set(stampedSessions())).toEqual(new Set(["S-prev"]));
+      // The lookup is bound to this owner, tenant, pool, target and binding.
+      expect(db.cacheAffinityRecord.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: "pool-owner",
+            tenantUserId: "tenant",
+            poolId: "pool",
+            executionTargetId: "target",
+            targetIdentity: "runtime",
+            bindingDigest: material(second).bindingDigest,
+          }),
+        }),
+      );
+    });
+
+    it("an explicit conversation keeps its session when the parameters change", async () => {
+      const explicit = (temperature: number) => ({
+        conversation: "conv-1",
+        input: "hello",
+        temperature,
+      });
+      const before = affinityPrefixDigests({
+        ownerId: "tenant",
+        resourceOwnerId: "pool-owner",
+        poolId: "pool",
+        securityScope: "token",
+        surface: "OPENAI_RESPONSES",
+        payload: explicit(0.1),
+        runtimeIdentity: "runtime",
+      });
+      db.cacheAffinityRecord.findMany.mockResolvedValue([
+        {
+          id: "c1",
+          sessionId: "S-conv",
+          prefixDigest: null,
+          conversationDigest: before.conversationDigest,
+          lastUsedAt: new Date("2026-08-25T11:59:00.000Z"),
+        },
+      ]);
+      await rememberAffinity({
+        ...writeInputs,
+        surface: "OPENAI_RESPONSES",
+        payload: explicit(0.9),
+      });
+      expect(new Set(stampedSessions())).toEqual(new Set(["S-conv"]));
+    });
+
+    it("ranking reports the session a request continues, per target", async () => {
+      const selected = target("target-a", "runtime-a");
+      const prior = affinityPrefixDigests({
+        ownerId: "tenant",
+        resourceOwnerId: "pool-owner",
+        poolId: "pool",
+        securityScope: "token",
+        surface: "OPENAI_RESPONSES",
+        payload: { conversation: "conversation", input: "first" },
+        runtimeIdentity: selected.targetIdentity,
+      });
+      db.cacheAffinityRecord.findMany.mockResolvedValue([
+        affinityRow({
+          target: selected,
+          material: prior,
+          conversationDigest: prior.conversationDigest,
+          sessionId: "S-conv",
+        }),
+      ]);
+      const decision = await rankAffinityTargets({
+        ownerId: "tenant",
+        resourceOwnerId: "pool-owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "OPENAI_RESPONSES",
+        payload: { conversation: "conversation", input: "second" },
+        targets: [target("target-b", "runtime-b"), selected],
+      });
+      expect(decision.matchedSessionIds).toEqual({ "target-a": "S-conv" });
+    });
   });
 
   it("scores a single target so protection can tell a continuation from a new session", async () => {

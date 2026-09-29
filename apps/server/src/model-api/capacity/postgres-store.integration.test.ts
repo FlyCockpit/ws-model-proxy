@@ -3411,6 +3411,8 @@ integration("PostgreSQL per-grant queue priority", () => {
         poolId: pool.id,
         basePriority: 16,
         accessGrantId,
+        // Only recorded on the request (S-C lease-to-session link), deduplicated.
+        ...(name === "high-1" ? { warmSessionIds: ["session-1", "session-1", "session-2"] } : {}),
         connectionOwner: "grant-priority-proof",
         deadlineAt: new Date(Date.now() + 10 * 60_000),
         candidates: [
@@ -3447,6 +3449,11 @@ integration("PostgreSQL per-grant queue priority", () => {
         (await db.admissionRequest.findFirstOrThrow({ where: { attemptId: `high-1-${suffix}` } }))
           .basePriority,
       ).toBe(31);
+      const warmIds = async (name: string) =>
+        (await db.admissionRequest.findFirstOrThrow({ where: { attemptId: `${name}-${suffix}` } }))
+          .warmSessionIds;
+      expect((await warmIds("high-1")).sort()).toEqual(["session-1", "session-2"]);
+      expect(await warmIds("low-1")).toEqual([]);
 
       // Inherit (null) and a foreign-pool grant both keep the pool priority.
       for (const [name, grantId] of [

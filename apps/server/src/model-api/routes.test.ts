@@ -1368,6 +1368,7 @@ describe("model API routes", () => {
                     ageMs: (ages[member] ?? 30) * 1000,
                     tokens: 20_000,
                     overridePercent: null,
+                    inFlight: false,
                   },
                 ]
               : [],
@@ -1645,6 +1646,62 @@ describe("model API routes", () => {
         ["member-b"],
         ["member-b", "member-a"],
       ]);
+    });
+
+    it("C1b-1: warm conversations mid-turn do not send a new :external session external", async () => {
+      // C=4 with two active leases, both serving warm conversations of other
+      // users: both idle slots are empty, so the new session is admitted
+      // locally instead of going external with local_saturated_protected.
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members(1));
+      const session = (userId: string, inFlight: boolean) => ({
+        userId,
+        ageMs: 30_000,
+        tokens: 20_000,
+        overridePercent: null,
+        inFlight,
+      });
+      const load = (sessions: ReturnType<typeof session>[]) =>
+        warmProtection.load.mockResolvedValue({
+          activeByCapacity: new Map([["member-a-capacity", 2]]),
+          sessionsByCapacity: new Map([["member-a-capacity", sessions]]),
+        });
+      load([session("alice", true), session("bob", true)]);
+      const busy = scripted(["member-a"]);
+
+      const served = await serveLocal(busy.runtime, EXTERNAL_MODEL_ID);
+
+      expect(served.response.status).toBe(200);
+      expect(requireSent(served.manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(served.response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+
+      // The same load with those two conversations idle (their turns ended and
+      // other leases hold the busy slots): both idle slots hold protected
+      // sessions, so the external attempt is made first (the provider tier
+      // finds no slot here, so it then admits locally).
+      load([session("alice", false), session("bob", false)]);
+      publicOverflow.dispatch.mockClear();
+      const idle = scripted([null, "member-a"]);
+      const second = await serveLocal(idle.runtime, EXTERNAL_MODEL_ID);
+      expect(second.response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    });
+
+    it("records the warm sessions the request continues on its admission attempt", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "FREE", b: "FREE" });
+      affinity.rank.mockResolvedValue({
+        ...decision(true),
+        matchedSessionIds: { "member-a-target": "session-a" },
+      });
+      const continued = scripted(["member-a"]);
+      await serveLocal(continued.runtime, poolTarget.modelId);
+      expect(continued.acquire.mock.calls[0]?.[0].warmSessionIds).toEqual(["session-a"]);
+
+      affinity.rank.mockResolvedValue(decision());
+      const fresh = scripted(["member-a"]);
+      await serveLocal(fresh.runtime, poolTarget.modelId);
+      expect(fresh.acquire.mock.calls[0]?.[0].warmSessionIds).toEqual([]);
     });
 
     it("a continuation (affinity hit) is never blocked by protection", async () => {
