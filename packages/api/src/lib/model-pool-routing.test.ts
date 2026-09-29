@@ -26,7 +26,6 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   poolMember: {
     findUnique: MockInstance;
-    update: MockInstance;
     updateMany: MockInstance;
   };
 };
@@ -411,16 +410,26 @@ describe("modelPoolRouting", () => {
   });
 
   it("resets health on success and fresh inventory without changing routing status", async () => {
-    db.poolMember.update.mockResolvedValue({ id: "member-id" });
     db.poolMember.updateMany.mockResolvedValue({ count: 2 });
 
-    await markPoolMemberRelaySuccess("member-id");
+    await markPoolMemberRelaySuccess("member-id", { now });
     await resetPoolMemberHealthForDiscoveredModels(["model-a", "model-b"]);
 
-    expect(db.poolMember.update).toHaveBeenCalledWith({
-      where: { id: "member-id" },
+    // A non-claimant success never clears a live trial (owner fence).
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "member-id",
+        OR: [
+          { healthStatus: { not: "HALF_OPEN" } },
+          { halfOpenTrialStartedAt: null },
+          {
+            halfOpenTrialStartedAt: {
+              lte: new Date(now.getTime() - POOL_MEMBER_HALF_OPEN_LEASE_MS),
+            },
+          },
+        ],
+      },
       data: resetPoolMemberHealth(),
-      select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
@@ -446,8 +455,7 @@ describe("modelPoolRouting", () => {
       nextRetryAt: null,
       halfOpenTrialStartedAt: null,
     });
-    db.poolMember.update.mockResolvedValue({ id: "member-id" });
-    db.poolMember.updateMany.mockResolvedValue({ count: 3 });
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await recordPoolMemberRelayFailure({
       poolMemberId: "member-id",
@@ -468,13 +476,17 @@ describe("modelPoolRouting", () => {
         consecutiveRetryableFailures: 3,
       },
     });
-    expect(db.poolMember.update).toHaveBeenCalledWith({
-      where: { id: "member-id" },
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        id: "member-id",
+        healthStatus: "HEALTHY",
+        halfOpenTrialStartedAt: null,
+        consecutiveRetryableFailures: 2,
+      }),
       data: expect.objectContaining({
         healthStatus: "UNHEALTHY",
         lastFailureClass: "RELAY_TIMEOUT",
       }),
-      select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
@@ -490,6 +502,61 @@ describe("modelPoolRouting", () => {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
       }),
+    });
+  });
+
+  // Owner fence (#120 design pass): an outcome the attempt does not own is dropped
+  // before any write; the row read decides, the versioned write repeats it.
+  it.each([
+    ["stale claimant", { trialStartedAt: new Date(now.getTime() - 1) }],
+    ["non-claimant against a live trial", {}],
+  ])("drops a relay failure from a %s", async (_name, options) => {
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HALF_OPEN",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 1,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: now,
+    });
+    const result = await recordPoolMemberRelayFailure({
+      poolMemberId: "member-id",
+      failure: "timeout",
+      now,
+      ...options,
+    });
+    expect(result).toEqual({ retryable: true, update: null });
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("re-reads and retries a failure write when a concurrent writer changed the row", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    db.poolMember.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+    const result = await recordPoolMemberRelayFailure({
+      poolMemberId: "member-id",
+      failure: "timeout",
+      now,
+    });
+    expect(result.update).not.toBeNull();
+    expect(db.poolMember.findUnique).toHaveBeenCalledTimes(2);
+    expect(db.poolMember.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it("scopes a claimant's success to exactly its claim", async () => {
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    await markPoolMemberRelaySuccess("member-id", { trialStartedAt: now, now });
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "member-id", healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: now },
+      data: resetPoolMemberHealth(),
     });
   });
 

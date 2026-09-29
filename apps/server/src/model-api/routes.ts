@@ -6065,6 +6065,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6178,6 +6179,7 @@ async function relayPool({
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
+        trialStartedAt: claimedTrialAt,
         failure: "unknown",
       }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
@@ -6202,6 +6204,7 @@ async function relayPool({
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure: "upstream_5xx",
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
@@ -6231,6 +6234,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
@@ -6279,6 +6283,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6334,6 +6339,7 @@ async function relayPool({
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
+            trialStartedAt: claimedTrialAt,
             failure: "protocol_error",
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
@@ -6559,11 +6565,14 @@ async function relayPool({
             : "identity_unavailable";
           const terminalWrites = await Promise.allSettled([
             terminal.ok
-              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
+                  trialStartedAt: claimedTrialAt,
+                })
               : adaptationOutcome === "protocol_error" &&
                   upstreamTerminal.failure !== "capacity_lease_lost"
                 ? recordPoolMemberRelayFailure({
                     poolMemberId: candidate.poolMemberId,
+                    trialStartedAt: claimedTrialAt,
                     failure: "protocol_error",
                   })
                 : // A served attempt that settled neither way (client abort
@@ -6673,6 +6682,7 @@ async function relayPool({
       if (memberRetryable && isPoolRelayFailureClass(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
+          trialStartedAt: claimedTrialAt,
           failure,
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();

@@ -59,7 +59,7 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
     });
     // One pool and member per case: cases never share a row. Provider targets
     // are external fallback members, which is enough for the claim under test.
-    for (let index = 0; index < 8; index += 1) {
+    for (let index = 0; index < 20; index += 1) {
       const pool = await prisma.modelPool.create({
         data: {
           userId: user.id,
@@ -227,5 +227,166 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
         now: new Date(T0.getTime() + 1),
       }),
     ).toBe(1);
+  });
+
+  // #120 design pass (stale-owner outcome writes): every relay outcome write
+  // carries the attempt's claim and only applies to the epoch it owns. Rows:
+  // [name, seed row, writer, expected row afterwards]. `B` is the successor
+  // that took over A's expired claim; `now` is inside B's live lease.
+  describe("relay outcome writers are fenced on the trial epoch", () => {
+    const A = T0;
+    const B = () => new Date(T0.getTime() + lease());
+    const at = () => new Date(B().getTime() + 1_000);
+    type Row = { healthStatus: string; halfOpenTrialStartedAt: Date | null };
+    type Case = {
+      name: string;
+      seed: Row & { consecutiveRetryableFailures?: number };
+      write: (id: string) => Promise<unknown>;
+      expected: Partial<Row> & { consecutiveRetryableFailures?: number };
+    };
+    const unchangedB = () => ({ healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: B() });
+    const cases = (): Case[] => [
+      {
+        name: "claimant success on its own claim resets health",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: A },
+        write: (id) =>
+          routing.markPoolMemberRelaySuccess(id, {
+            trialStartedAt: A,
+            now: new Date(A.getTime() + 1),
+          }),
+        expected: { healthStatus: "HEALTHY", halfOpenTrialStartedAt: null },
+      },
+      {
+        name: "claimant failure on its own claim marks UNHEALTHY",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: A },
+        write: (id) =>
+          routing.recordPoolMemberRelayFailure({
+            poolMemberId: id,
+            failure: "protocol_error",
+            trialStartedAt: A,
+            now: new Date(A.getTime() + 1),
+          }),
+        expected: { healthStatus: "UNHEALTHY", halfOpenTrialStartedAt: null },
+      },
+      {
+        name: "stale claimant success after take-over is dropped",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: B() },
+        write: (id) => routing.markPoolMemberRelaySuccess(id, { trialStartedAt: A, now: at() }),
+        expected: unchangedB(),
+      },
+      {
+        name: "stale claimant failure after take-over is dropped",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: B() },
+        write: (id) =>
+          routing.recordPoolMemberRelayFailure({
+            poolMemberId: id,
+            failure: "protocol_error",
+            trialStartedAt: A,
+            now: at(),
+          }),
+        expected: unchangedB(),
+      },
+      {
+        name: "claimant success after the row was reset by a newer writer is dropped",
+        seed: { healthStatus: "UNHEALTHY", halfOpenTrialStartedAt: null },
+        write: (id) => routing.markPoolMemberRelaySuccess(id, { trialStartedAt: A, now: at() }),
+        expected: { healthStatus: "UNHEALTHY", halfOpenTrialStartedAt: null },
+      },
+      {
+        name: "non-claimant success never clears a live trial",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: B() },
+        write: (id) => routing.markPoolMemberRelaySuccess(id, { now: at() }),
+        expected: unchangedB(),
+      },
+      {
+        name: "non-claimant failure never clears a live trial",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: B() },
+        write: (id) =>
+          routing.recordPoolMemberRelayFailure({
+            poolMemberId: id,
+            failure: "upstream_5xx",
+            now: at(),
+          }),
+        expected: unchangedB(),
+      },
+      {
+        name: "non-claimant success on an expired trial applies",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: A },
+        write: (id) => routing.markPoolMemberRelaySuccess(id, { now: B() }),
+        expected: { healthStatus: "HEALTHY", halfOpenTrialStartedAt: null },
+      },
+      {
+        name: "non-claimant success on an unclaimed half-open row applies",
+        seed: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+        write: (id) => routing.markPoolMemberRelaySuccess(id, { now: at() }),
+        expected: { healthStatus: "HEALTHY", halfOpenTrialStartedAt: null },
+      },
+      {
+        name: "non-claimant failure on a healthy row still records health",
+        seed: { healthStatus: "HEALTHY", halfOpenTrialStartedAt: null },
+        write: (id) =>
+          routing.recordPoolMemberRelayFailure({
+            poolMemberId: id,
+            failure: "upstream_5xx",
+            now: at(),
+          }),
+        expected: {
+          healthStatus: "DEGRADED",
+          halfOpenTrialStartedAt: null,
+          consecutiveRetryableFailures: 1,
+        },
+      },
+    ];
+
+    it.each(Array.from({ length: 10 }, (_, index) => index))("case %i", async (index) => {
+      const testCase = cases()[index]!;
+      const slot = 8 + index;
+      await prisma.poolMember.update({
+        where: { id: memberFor(slot) },
+        data: {
+          healthStatus: testCase.seed.healthStatus as "HALF_OPEN",
+          halfOpenTrialStartedAt: testCase.seed.halfOpenTrialStartedAt,
+          consecutiveRetryableFailures: testCase.seed.consecutiveRetryableFailures ?? 0,
+          nextRetryAt: null,
+        },
+      });
+      await testCase.write(memberFor(slot));
+      const after = await prisma.poolMember.findUniqueOrThrow({
+        where: { id: memberFor(slot) },
+        select: {
+          healthStatus: true,
+          halfOpenTrialStartedAt: true,
+          consecutiveRetryableFailures: true,
+        },
+      });
+      expect(after, testCase.name).toMatchObject(testCase.expected);
+    });
+
+    it("concurrent failures on one row lose no increment", async () => {
+      const slot = 18;
+      await prisma.poolMember.update({
+        where: { id: memberFor(slot) },
+        data: {
+          healthStatus: "HEALTHY",
+          halfOpenTrialStartedAt: null,
+          consecutiveRetryableFailures: 0,
+          nextRetryAt: null,
+        },
+      });
+      await Promise.all(
+        [0, 1].map(() =>
+          routing.recordPoolMemberRelayFailure({
+            poolMemberId: memberFor(slot),
+            failure: "upstream_5xx",
+            now: at(),
+          }),
+        ),
+      );
+      const after = await prisma.poolMember.findUniqueOrThrow({
+        where: { id: memberFor(slot) },
+        select: { consecutiveRetryableFailures: true },
+      });
+      expect(after.consecutiveRetryableFailures).toBe(2);
+    });
   });
 });

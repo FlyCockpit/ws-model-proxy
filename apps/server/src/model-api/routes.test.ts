@@ -2413,7 +2413,9 @@ describe("model API routes", () => {
       ),
     );
     expect(
-      db.poolMember.update.mock.calls.filter(([call]) => call?.where?.id === "responses-member"),
+      db.poolMember.updateMany.mock.calls.filter(
+        ([call]) => call?.where?.id === "responses-member",
+      ),
     ).toHaveLength(1);
   });
 
@@ -2501,7 +2503,9 @@ describe("model API routes", () => {
       ),
     );
     expect(
-      db.poolMember.update.mock.calls.filter(([call]) => call?.where?.id === "responses-member"),
+      db.poolMember.updateMany.mock.calls.filter(
+        ([call]) => call?.where?.id === "responses-member",
+      ),
     ).toHaveLength(0);
   });
 
@@ -2782,7 +2786,7 @@ describe("model API routes", () => {
     await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
     // Not a protocol failure of the member: no health write for it.
     expect(
-      db.poolMember.update.mock.calls.filter(
+      db.poolMember.updateMany.mock.calls.filter(
         ([call]) => call?.where?.id === "first-responses-member",
       ),
     ).toHaveLength(0);
@@ -3120,7 +3124,7 @@ describe("model API routes", () => {
         ([call]) => call?.data?.attemptCount === 1 && call?.data?.status === "CANCELED",
       ),
     ).toHaveLength(1);
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   it("filters adapted pool candidates against both tool and image requirements", async () => {
@@ -8283,6 +8287,64 @@ describe("model API routes", () => {
       );
     });
 
+    // #120 design pass: the attempt's failure write is owner-fenced. It must
+    // apply to the claim this attempt holds and be dropped after a take-over.
+    it.each([
+      ["applies to its own claim", true],
+      ["is dropped after another request took the claim over", false],
+    ])("a member failure %s", async (_name, ownsClaim) => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          healthStatus: "HALF_OPEN",
+        }),
+      ]);
+      const updateMany = (db.poolMember as unknown as { updateMany: MockInstance }).updateMany;
+      updateMany.mockResolvedValue({ count: 1 });
+      const claimDate = () =>
+        updateMany.mock.calls
+          .map(([arg]) => arg as { data: Record<string, unknown> })
+          .find((write) => write.data.halfOpenTrialStartedAt instanceof Date)?.data
+          .halfOpenTrialStartedAt as Date;
+      db.poolMember.findUnique.mockImplementation(async () => ({
+        healthStatus: "HALF_OPEN",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: ownsClaim ? claimDate() : new Date(claimDate().getTime() + 1),
+      }));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.error(requireSent(manager).requestId, "transport");
+      await Promise.resolve(responsePromise).catch(() => undefined);
+      const failureWrites = () =>
+        updateMany.mock.calls
+          .map(([arg]) => arg as { where: Record<string, unknown>; data: Record<string, unknown> })
+          .filter((write) => write.data.healthStatus === "UNHEALTHY");
+      if (ownsClaim) {
+        await vi.waitFor(() => expect(failureWrites()).toHaveLength(1));
+        expect(failureWrites()[0]?.where).toMatchObject({
+          id: "member-a",
+          healthStatus: "HALF_OPEN",
+          halfOpenTrialStartedAt: claimDate(),
+        });
+      } else {
+        await vi.waitFor(() => expect(db.poolMember.findUnique).toHaveBeenCalled());
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(failureWrites()).toHaveLength(0);
+      }
+    });
+
     // #120: an expired trial lease is routable again and the claim itself
     // carries the expiry clause (deterministic clock: Date only is faked).
     it("re-claims a half-open trial whose lease expired", async () => {
@@ -9481,8 +9543,8 @@ describe("model API routes", () => {
       requestId: failed.requestId,
       reason: "upstream_5xx",
     });
-    expect(db.poolMember.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "member-a" } }),
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
     );
 
     manager.headers(retried.requestId, 200, { "content-type": "application/json" });
@@ -9595,8 +9657,8 @@ describe("model API routes", () => {
       reason: "cancelled",
     });
     // A DB-side event is never the member's fault.
-    expect(db.poolMember.update).not.toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "member-a" } }),
+    expect(db.poolMember.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
     );
 
     manager.headers(retried.requestId, 200, { "content-type": "application/json" });
@@ -10059,8 +10121,8 @@ describe("model API routes", () => {
         expect(response.status).toBe(200);
         await response.text();
         // A DB-side event is never the member's fault.
-        expect(db.poolMember.update).not.toHaveBeenCalledWith(
-          expect.objectContaining({ where: { id: "member-a" } }),
+        expect(db.poolMember.updateMany).not.toHaveBeenCalledWith(
+          expect.objectContaining({ where: expect.objectContaining({ id: "member-a" }) }),
         );
         return;
       }
