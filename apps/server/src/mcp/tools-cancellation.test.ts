@@ -886,6 +886,15 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     expect(tx.capacityWaiter.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ state: "ADMITTED" }) }),
     );
+    // The armed fence stops the fill BEFORE it starts: no sweep writes on other
+    // requests' waiters (expiry / member_unroutable) and no snapshot read.
+    expect(tx.capacityWaiter.updateMany).not.toHaveBeenCalled();
+    // (The L3 scope-lock lookup is a distinct-select findMany; the snapshot read has `include`.)
+    expect(
+      (tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>).filter(
+        (call) => call[0].include,
+      ),
+    ).toHaveLength(0);
   });
 });
 
@@ -1090,6 +1099,31 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     )[0]?.[0];
     // Only the prefix before the stale winner is persisted...
     expect(first?.data.map((row) => row.admissionRequestId)).toEqual(["next-request-0"]);
+    // ...and the pass re-read the snapshot to re-plan (bounded by the queue size).
+    const snapshotReads = (
+      tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>
+    ).filter((call) => call[0].include);
+    expect(snapshotReads.length).toBeGreaterThan(1);
+    expect(snapshotReads.length).toBeLessThanOrEqual(4);
+  });
+
+  it("a winner that is no longer WAITING at the write phase at INDEX 0 persists nothing and the pass re-plans", async () => {
+    const { PostgresCapacityAdmissionStore } = await import("../model-api/capacity/postgres-store");
+    // Grants are planned for requests 0, 1, 2 (same priority, DRR order); the
+    // write-phase re-read finds request 0 (the first winner) already ADMITTED by someone else.
+    const tx = fillTx({ arm: "never", waiters: 3, staleFrom: 0 });
+    raw.$transaction.mockImplementation(async (callback: (txClient: unknown) => Promise<unknown>) =>
+      callback(tx),
+    );
+    const store = new PostgresCapacityAdmissionStore();
+    await expect(releaseLease(store)).resolves.toBe(true);
+    const first = (
+      tx.capacityLease.createMany.mock.calls as unknown as Array<
+        [{ data: Array<{ admissionRequestId: string }> }]
+      >
+    )[0]?.[0];
+    // Nothing is persisted when the FIRST winner is stale...
+    expect(first).toBeUndefined();
     // ...and the pass re-read the snapshot to re-plan (bounded by the queue size).
     const snapshotReads = (
       tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>

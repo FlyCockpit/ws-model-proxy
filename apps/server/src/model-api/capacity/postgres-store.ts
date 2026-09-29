@@ -843,7 +843,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     const firstStale = plan.grants.findIndex((grant) => !writable.has(grant.admissionRequestId));
     const persisted = firstStale === -1 ? plan.grants : plan.grants.slice(0, firstStale);
     const stale = firstStale !== -1;
-    if (!persisted.length || isDbShutdownFenceArmed()) return { persisted: [], stale: false };
+    if (isDbShutdownFenceArmed()) return { persisted: [], stale: false };
+    // Also true when the FIRST winner is stale (nothing persisted): re-plan.
+    if (!persisted.length) return { persisted: [], stale };
     const last = persisted[persisted.length - 1]!;
     const updatedCapacity = await tx.inferenceCapacity.update({
       where: { id: capacityId },
@@ -923,6 +925,10 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       lastChanceWaiterIds?: readonly string[];
     } = {},
   ): Promise<boolean> {
+    // G2n: fill mode (release/reclaim) is NEW admission work; with the fence
+    // armed it starts nothing (no sweeps, no snapshot, no row locks). Offer
+    // mode belongs to acquire, which the fence rejects on its own.
+    if (options.requestId === undefined && isDbShutdownFenceArmed()) return false;
     // A re-planned pass happens only when a winner turned out to be no longer
     // grantable at the write phase (unreachable under the held locks); every
     // such round consumes at least one waiter, so the queue size bounds it.

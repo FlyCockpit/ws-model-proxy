@@ -42,7 +42,9 @@ The transaction can be retried (`runCapacitySerializable`): nothing is carried a
 each attempt re-reads, re-plans and takes fencing tokens from the capacity row's counter. Cost per
 transaction is one snapshot plus O(waiters) work per grant in memory and a handful of statements,
 independent of how many waiters are granted (256 grants: about 0.5 s release, 1.5 s poll on a
-loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged.
+loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged. The planner is O(k·W) per
+transaction (k grants over W waiters) and is suited to at most a few thousand simultaneously
+grantable waiters per capacity.
 
 ## Spill-over `notBefore` and grant-time routability (saturation S-A)
 

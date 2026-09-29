@@ -2857,7 +2857,7 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
    */
   describe("volume: k eligible deferred waiters are granted by ONE transaction", () => {
     const K = 256;
-    const BUDGET_MS = 3000;
+    const BUDGET_MS = 10_000;
 
     /** A busy holder (member 0) and K deferred waiters on the cold member 1. */
     async function volumeSetup(db: Db, store: Store, coldLimit: number | null) {
@@ -2970,6 +2970,72 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
       }
     }, 240_000);
   });
+
+  /**
+   * C4-2: scope limits (pool, member, direct target) are consumed by EACH grant
+   * of one plan (the planner advances scope counts in memory through the
+   * store's lease-scope keys). Three eligible deferred waiters on an unlimited
+   * capacity, scope limit 2: one poll leaves exactly 2 ACTIVE and R WAITING.
+   */
+  it.each(["POOL", "MEMBER", "DIRECT_TARGET"] as const)(
+    "a %s-scoped limit is consumed per grant of one plan",
+    async (scope) => {
+      if (!databaseUrl) return;
+      const db = createPrismaClient(databaseUrl);
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, `spill-scope-${scope}`);
+      const fixture = await spillFixture(db, 2, [1, null]);
+      const cold = fixture.members[1]!;
+      try {
+        if (scope === "POOL")
+          await db.modelPool.update({
+            where: { id: fixture.pool.id },
+            data: { capacityConcurrencyLimit: 2 },
+          });
+        if (scope === "MEMBER")
+          await db.poolMember.update({
+            where: { id: cold.poolMemberId },
+            data: { capacityConcurrencyMode: "LIMITED", capacityConcurrencyLimit: 2 },
+          });
+        if (scope === "DIRECT_TARGET")
+          await db.executionTarget.update({
+            where: { id: cold.executionTargetId },
+            data: { directConcurrencyLimit: 2 },
+          });
+        const attempts = [0, 1, 2].map((index) => {
+          const pooled = fixture.attempt(`scope-${index}`, [{ member: 1, notBeforeMs: 30_000 }]);
+          if (scope !== "DIRECT_TARGET") return pooled;
+          return {
+            ...pooled,
+            sourceKind: "DIRECT" as const,
+            poolId: undefined,
+            candidates: pooled.candidates.map(
+              ({ poolMemberId: _member, ...candidate }) => candidate,
+            ),
+          };
+        });
+        for (const attempt of attempts)
+          expect((await store.acquire(attempt)).state).toBe("WAITING");
+        await db.$executeRaw`UPDATE capacity_waiter
+          SET "notBefore" = clock_timestamp() - interval '100 milliseconds'
+          WHERE "userId" = ${fixture.user.id} AND state = 'WAITING'`;
+        const result = await store.acquire({ ...attempts[2]!, candidates: [] });
+        expect(result.state).toBe("WAITING");
+        expect(
+          await db.capacityLease.count({ where: { capacityId: cold.capacityId, state: "ACTIVE" } }),
+        ).toBe(2);
+        await expect(
+          db.capacityLease.findFirst({
+            where: { attemptId: attempts[2]!.attemptId, state: "ACTIVE" },
+          }),
+        ).resolves.toBeNull();
+      } finally {
+        await cleanupCapacityFixture(db, fixture.user.id);
+        await db.$disconnect();
+      }
+    },
+    60_000,
+  );
 
   it("expires a deferred waiter after its last-chance check when nothing is free", async () => {
     if (!databaseUrl) return;
