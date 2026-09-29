@@ -498,7 +498,19 @@ export type EndpointLoadMessage = z.infer<typeof endpointLoadSchema>;
 export const remoteMetricSourceSchema = z
   .object({
     name: metricNameSchema,
-    command: z.string().min(1).max(4096),
+    // One definition of a runnable command on every side (the CLI's
+    // `validate_command`): non-blank, at most 4096 BYTES, no NUL.
+    command: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine(
+        (command) =>
+          command.trim().length > 0 &&
+          !command.includes("\u0000") &&
+          new TextEncoder().encode(command).length <= 4096,
+        { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },
+      ),
     intervalSecs: z.number().int().min(5).max(86_400),
     timeoutSecs: z.number().int().min(1).max(300),
     format: z.enum(["number", "json", "prometheus"]),

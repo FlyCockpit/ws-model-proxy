@@ -419,8 +419,21 @@ struct SourceState {
     eligibility: Eligibility,
     next_due: Instant,
     in_flight: bool,
+    /// Ends the run in flight for THIS definition (set when the source is
+    /// replaced, withdrawn, un-approved, or the runner goes away). Each
+    /// attempt owns its own flag, so cancelling one never touches another.
+    attempt_cancel: Option<Arc<AtomicBool>>,
     last: Option<LastValues>,
     error: Option<MetricSourceError>,
+}
+
+impl SourceState {
+    /// The one way a run in flight is ended early. Idempotent.
+    fn cancel_attempt(&self) {
+        if let Some(cancel) = &self.attempt_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 type SourceKey = (bool, String);
@@ -471,9 +484,6 @@ pub struct Runner {
     results_tx: Sender<RunResult>,
     results_rx: Receiver<RunResult>,
     changed: bool,
-    /// Set when the runner is dropped (the session ended): runs in flight
-    /// kill their process group at the next poll instead of running out.
-    cancel: Arc<AtomicBool>,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -483,8 +493,12 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 impl Drop for Runner {
+    /// The session ended: every run in flight kills its process group at the
+    /// next poll instead of running out.
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        for state in self.states.values() {
+            state.cancel_attempt();
+        }
     }
 }
 
@@ -511,7 +525,6 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
-            cancel: Arc::new(AtomicBool::new(false)),
         };
         runner.reload_config(true);
         runner.rebuild(Instant::now());
@@ -535,7 +548,6 @@ impl Runner {
             results_tx,
             results_rx,
             changed: false,
-            cancel: Arc::new(AtomicBool::new(false)),
         };
         runner.rebuild(Instant::now());
         runner
@@ -587,6 +599,12 @@ impl Runner {
                 Some(state) if state.spec == spec && state.eligibility == eligibility => state,
                 previous => {
                     self.changed = true;
+                    // The definition or its authority changed (command,
+                    // withdrawal is handled below, approval revoked, opt-in):
+                    // the run of the old one must not keep executing.
+                    if let Some(previous) = &previous {
+                        previous.cancel_attempt();
+                    }
                     SourceState {
                         spec,
                         eligibility,
@@ -596,6 +614,7 @@ impl Runner {
                         // overlap a run of the new one for long: timeouts
                         // bound it.
                         in_flight: previous.is_some_and(|previous| previous.in_flight),
+                        attempt_cancel: None,
                         last: None,
                         error: None,
                     }
@@ -603,7 +622,12 @@ impl Runner {
             };
             next.insert(source_key, state);
         }
-        if next.len() != self.states.len() {
+        // What is left in the old map was withdrawn (or is no longer
+        // reportable): end its run too.
+        for withdrawn in self.states.values() {
+            withdrawn.cancel_attempt();
+        }
+        if !self.states.is_empty() {
             self.changed = true;
         }
         self.states = next;
@@ -620,6 +644,7 @@ impl Runner {
                 continue;
             };
             state.in_flight = false;
+            state.attempt_cancel = None;
             if state.spec.command_sha256 != result.command_sha256
                 || state.eligibility != Eligibility::Run
             {
@@ -652,7 +677,8 @@ impl Runner {
             state.next_due = now + Duration::from_secs(u64::from(state.spec.interval_secs));
             let spec = state.spec.clone();
             let tx = self.results_tx.clone();
-            let cancel = Arc::clone(&self.cancel);
+            let cancel = Arc::new(AtomicBool::new(false));
+            state.attempt_cancel = Some(Arc::clone(&cancel));
             let source_key = source_key.clone();
             let spawned = thread::Builder::new()
                 .name("wsmp-metric-source".to_string())
@@ -668,6 +694,7 @@ impl Runner {
                 });
             if spawned.is_err() {
                 state.in_flight = false;
+                state.attempt_cancel = None;
                 state.error = Some(MetricSourceError::Spawn);
             }
         }
@@ -1061,6 +1088,103 @@ escaped{v="a\"b"} 1
         // Stale after 3 intervals.
         let (custom, _) = runner.report(Instant::now() + Duration::from_secs(31));
         assert!(custom.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn approved_remote(command: &str) -> (MetricsConfig, RemoteMetricSource) {
+        let mut metrics = MetricsConfig::default();
+        metrics
+            .approved_remote_sources
+            .insert("slow".to_string(), sha256_hex(command.as_bytes()));
+        (metrics, remote("slow", command))
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid(pid_file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the command never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| stat.contains(") Z "))
+                .unwrap_or(false)
+    }
+
+    /// Any change that removes a run's authority ends the run in flight at
+    /// once: a changed command, a withdrawal, a revoked approval. An
+    /// unchanged rebuild leaves it alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_in_flight_ends_when_its_authority_changes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            Command,
+            Withdraw,
+            Revoke,
+            Unchanged,
+        }
+        for change in [
+            Change::Command,
+            Change::Withdraw,
+            Change::Revoke,
+            Change::Unchanged,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("run.pid");
+            let command = format!("echo $$ > '{}'; sleep 60 & wait", pid_file.display());
+            let (metrics, definition) = approved_remote(&command);
+            let mut runner = Runner::with_inputs(settings(true), metrics.clone(), vec![definition]);
+            runner.tick(Instant::now());
+            let pid = wait_for_pid(&pid_file);
+            match change {
+                Change::Command => {
+                    runner.set_remote(vec![remote("slow", &format!("{command}; echo 2"))]);
+                }
+                Change::Withdraw => runner.set_remote(Vec::new()),
+                Change::Revoke => runner.set_metrics_config(MetricsConfig::default()),
+                Change::Unchanged => {
+                    runner.set_remote(vec![remote("slow", &command)]);
+                    runner.set_metrics_config(metrics);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let survived = loop {
+                if !is_alive(pid) {
+                    break false;
+                }
+                if Instant::now() >= deadline {
+                    break true;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            match change {
+                Change::Unchanged => {
+                    assert!(survived, "{change:?}: an unchanged source was killed")
+                }
+                _ => assert!(!survived, "{change:?}: the old command kept running"),
+            }
+            drop(runner);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while is_alive(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                !is_alive(pid),
+                "{change:?}: dropping the runner left it running"
+            );
+        }
     }
 
     /// The session ended (the runner is dropped): a run in flight is killed

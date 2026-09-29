@@ -293,25 +293,26 @@ fn a_program_that_cannot_start_is_a_spawn_error() {
 }
 
 /// The direct child leaves its process group (the deadline's `killpg` cannot
-/// reach it) and sleeps past the deadline. The call must still settle by the
-/// deadline plus the reap grace, not when the child chooses to exit.
+/// reach it) and sleeps past the deadline. The call must settle by the
+/// deadline plus the reap grace, and the child itself must be killed (it is
+/// still ours), not left to run on.
 #[test]
-fn a_child_outside_its_group_settles_at_the_deadline_plus_the_reap_grace() {
+fn a_child_outside_its_group_is_killed_and_settles_by_the_deadline() {
     // The escaping child is a python3 one-liner (every CI runner has it).
     std::process::Command::new("python3")
         .arg("--version")
         .output()
         .expect("python3 is required for this test");
     let anchor = Anchor::start();
+    let path = marker("escaped-direct");
+    let script = format!(
+        "{ESCAPE}\nopen({:?}, 'w').close()",
+        path.display().to_string()
+    );
     let started = Instant::now();
     let result = run(
         "python3",
-        &[
-            "-c".to_string(),
-            ESCAPE.to_string(),
-            anchor.pgid(),
-            "4".to_string(),
-        ],
+        &["-c".to_string(), script, anchor.pgid(), "2".to_string()],
         Duration::from_millis(300),
         1024,
         None,
@@ -321,6 +322,41 @@ fn a_child_outside_its_group_settles_at_the_deadline_plus_the_reap_grace() {
     assert!(
         elapsed < Duration::from_millis(300) + REAP_GRACE + Duration::from_millis(1_200),
         "settled in {elapsed:?}"
+    );
+    std::thread::sleep(Duration::from_millis(2_500));
+    let survived = path.exists();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !survived,
+        "the child outside its group outlived the deadline"
+    );
+}
+
+/// stdout closed but the program keeps running (the table's "E, but the
+/// program still runs"): a cancel must still end the run at the next poll,
+/// not at the deadline.
+#[test]
+fn cancel_after_stdout_closed_kills_at_once() {
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let result = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            sh(
+                "exec 1>&-; sleep 30",
+                Duration::from_secs(30),
+                1024,
+                Some(&cancel),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        cancel.store(true, Ordering::SeqCst);
+        handle.join().expect("run thread")
+    });
+    assert_eq!(result, Err(RunError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
     );
 }
 

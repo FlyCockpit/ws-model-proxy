@@ -2405,6 +2405,80 @@ describe("relay 2.7 telemetry", () => {
     supervised.manager.dispose();
   });
 
+  it("orders remote source sends: a withdrawal is never overtaken by an older read", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The first read is slow and sees the old (unsupervised) state; the
+    // mode is then lowered and a second send is requested.
+    const readsBefore = findUnique.mock.calls.length;
+    let release: (value: unknown) => void = () => undefined;
+    findUnique.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    // The first send's read is in flight before the mode changes.
+    await vi.waitFor(() => expect(findUnique).toHaveBeenCalledTimes(1 + readsBefore));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const second = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    release({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    await Promise.all([first, second]);
+    const frames = sourceFrames(socket).map((frame) => frame.sources);
+    expect(frames.at(-1)).toEqual([]);
+    manager.dispose();
+  });
+
+  it("fails closed: a failed device read withdraws the sources and reports no delivery", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const failure of [
+      () => findUnique.mockRejectedValueOnce(new Error("db down")),
+      () => findUnique.mockResolvedValueOnce(null),
+      () =>
+        findUnique.mockResolvedValueOnce({
+          userId: "someone-else",
+          mcpCommandMode: "UNSUPERVISED",
+          remoteMetricSources: [fansSource],
+        }),
+    ]) {
+      socket.sends.length = 0;
+      failure();
+      await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(false);
+      expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    }
+    consoleError.mockRestore();
+    // A healthy read afterwards delivers again.
+    socket.sends.length = 0;
+    await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(true);
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    manager.dispose();
+  });
+
   it("never sends an oversized remote source list: the CLI gets an empty one", async () => {
     const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
       .findUnique;
@@ -2451,35 +2525,37 @@ describe("relay 2.7 telemetry", () => {
     try {
       const deep = prisma as unknown as {
         poolMember: { findMany: MockInstance };
-        poolMemberRoutingVerdict: { upsert: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
       };
+      const routingRules = [
+        { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
+      ];
+      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", routingRules }]);
       deep.poolMember.findMany.mockResolvedValue([
         {
           id: "member-1",
           poolId: "pool-1",
           ModelPool: {
-            routingRules: [
-              { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
-            ],
+            routingRules,
           },
           DiscoveredModel: null,
           ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
         },
       ]);
-      deep.poolMemberRoutingVerdict.upsert.mockResolvedValue({});
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
       const { manager, socket } = await registered();
       await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
       await vi.advanceTimersByTimeAsync(0);
-      expect(deep.poolMemberRoutingVerdict.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { poolMemberId: "member-1" },
-          create: expect.objectContaining({
-            verdict: "FULL",
-            cliDeviceId: "cli-device-id",
-            userId: "user-id",
-          }),
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
         }),
-      );
+      });
       manager.dispose();
     } finally {
       vi.useRealTimers();

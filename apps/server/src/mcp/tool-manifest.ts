@@ -844,7 +844,7 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     classification: "external",
     inputSchema: confirmedArgs("RUN"),
     descriptionNote:
-      "Only for devices whose MCP command mode is unsupervised. The CLI runs a source only with its local opt-in and after the person approves the exact command (wsmp metrics approve); a changed command needs approval again.",
+      "Only for devices whose MCP command mode is unsupervised, and only for a personal token minted with the CLI commands option (like forwarder_cli_command_run). The CLI runs a source only with its local opt-in and after the person approves the exact command (wsmp metrics approve <name> --sha256 <hash>); a changed command needs approval again.",
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.setCliDeviceMetricSources,
     ),

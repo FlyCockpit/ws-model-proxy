@@ -114,6 +114,19 @@ describe("remote metric source definitions", () => {
       remoteMetricSourceDefinitionsSchema.safeParse([{ ...source, format: "yaml" }]).success,
     ).toBe(false);
     expect(parseStoredRemoteMetricSources([source])).toEqual([source]);
+  });
+
+  it("uses the CLI's definition of a runnable command: non-blank, at most 4096 bytes, no NUL", () => {
+    const ok = (command: string) =>
+      remoteMetricSourceDefinitionsSchema.safeParse([{ ...source, command }]).success;
+    expect(ok("echo 1")).toBe(true);
+    expect(ok("a".repeat(4096))).toBe(true);
+    expect(ok("é".repeat(2048))).toBe(true);
+    // 1 509 UTF-16 units but 4 509 bytes: the CLI would call it refused.
+    expect(ok("€".repeat(1509))).toBe(false);
+    expect(ok("a".repeat(4097))).toBe(false);
+    expect(ok("echo\u0000 1")).toBe(false);
+    expect(ok("   ")).toBe(false);
     expect(parseStoredRemoteMetricSources("garbage")).toEqual([]);
   });
 });
@@ -257,6 +270,21 @@ describe("series flattening", () => {
       staleAfterMs: 30_000,
       origin: "custom",
     });
+    // A shadowed or refused remote source of the same name does not set the
+    // local source's interval.
+    const shadowed = nodeMetricSeries(
+      {
+        ts: "2026-09-28T11:59:50.000Z",
+        custom: [{ source: "fans", name: "fan_rpm", value: 1, ts: "2026-09-28T11:59:50.000Z" }],
+        sources: [
+          { name: "fans", origin: "local", state: "active", intervalSecs: 10 },
+          { name: "fans", origin: "remote", state: "refused", intervalSecs: 86_400 },
+        ],
+      },
+      receivedAt,
+      NOW,
+    );
+    expect(shadowed.find((entry) => entry.name === "fan_rpm")?.staleAfterMs).toBe(30_000);
     // Reserved prefixes and invalid names from custom sources are ignored.
     expect(flattened.filter((entry) => entry.name === "node.cpu.usage_percent")).toHaveLength(1);
     expect(byName.has("not ok")).toBe(false);

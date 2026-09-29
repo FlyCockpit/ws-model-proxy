@@ -88,7 +88,19 @@ export function parseStoredRoutingRules(value: unknown): RoutingRule[] {
 export const remoteMetricSourceDefinitionSchema = z
   .object({
     name: metricNameSchema,
-    command: z.string().min(1).max(4096),
+    // One definition of a runnable command on every side (the CLI's
+    // `validate_command`): non-blank, at most 4096 BYTES, no NUL.
+    command: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine(
+        (command) =>
+          command.trim().length > 0 &&
+          !command.includes("\u0000") &&
+          new TextEncoder().encode(command).length <= 4096,
+        { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },
+      ),
     intervalSecs: z.number().int().min(5).max(86_400),
     timeoutSecs: z.number().int().min(1).max(300),
     format: z.enum(["number", "json", "prometheus"]),
@@ -272,6 +284,9 @@ export function nodeMetricSeries(
   }
   const intervals = new Map<string, number>();
   for (const source of sample.sources ?? []) {
+    // Only a source that is running reports a series, so only its interval
+    // counts: a shadowed or refused same-named remote must not set it.
+    if (source.state !== "active" && source.state !== "failing") continue;
     if (finite(source.intervalSecs)) intervals.set(source.name, source.intervalSecs);
   }
   const frameTs = parseTime(sample.ts);

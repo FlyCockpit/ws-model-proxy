@@ -63,12 +63,27 @@ export function createRoutingEvaluationState(
   };
 }
 
-type Db = Pick<typeof prisma, "poolMember" | "poolMemberRoutingVerdict">;
+type Db = Pick<typeof prisma, "poolMember" | "poolMemberRoutingVerdict" | "modelPool">;
 
 const VERDICT_TO_DB = { none: "NONE", avoid: "AVOID", full: "FULL" } as const satisfies Record<
   RoutingVerdict,
   "NONE" | "AVOID" | "FULL"
 >;
+
+/** The rules an evaluation used, in a form that compares by value. */
+function rulesKey(rules: unknown): string {
+  return JSON.stringify(rules);
+}
+
+type VerdictData = {
+  userId: string;
+  poolId: string;
+  cliDeviceId: string;
+  verdict: "NONE" | "AVOID" | "FULL";
+  ruleStates: string[];
+  evaluatedAt: Date;
+  expiresAt: Date;
+};
 
 export class MetricRoutingEvaluator {
   constructor(
@@ -124,6 +139,11 @@ export class MetricRoutingEvaluator {
   }
 
   async evaluate(state: RoutingEvaluationState, inputs: RoutingEvaluationInputs): Promise<void> {
+    // The evaluation's own time, taken BEFORE anything is read: it orders
+    // this evaluation against every other one for the same member (see
+    // `publish`), so a run that stalls in a query cannot later overwrite a
+    // verdict a newer run already wrote.
+    const now = this.clock();
     const members = await this.db.poolMember.findMany({
       where: {
         tier: "PRIMARY",
@@ -150,12 +170,13 @@ export class MetricRoutingEvaluator {
         },
       },
     });
-    const now = this.clock();
+    if (state.closed) return;
     const nowMs = now.getTime();
     const nodeSeries = inputs.nodeMetrics
       ? nodeMetricSeries(inputs.nodeMetrics.sample, inputs.nodeMetrics.receivedAt, now)
       : [];
     const seen = new Set<string>();
+    const published: Array<{ memberId: string; poolId: string; rulesKey: string }> = [];
     for (const member of members) {
       const rules = parseStoredRoutingRules(member.ModelPool.routingRules);
       if (rules.length === 0) continue;
@@ -171,7 +192,8 @@ export class MetricRoutingEvaluator {
         ),
       ];
       const evaluation = evaluateRoutingRules(rules, series, now);
-      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}`;
+      // The rules are part of the key: an edited rule set is always re-written.
+      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${rulesKey(rules)}`;
       const previous = state.written.get(member.id);
       if (previous && previous.key === key && nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS) {
         continue;
@@ -185,15 +207,72 @@ export class MetricRoutingEvaluator {
         evaluatedAt: now,
         expiresAt: evaluation.expiresAt,
       };
-      await this.db.poolMemberRoutingVerdict.upsert({
-        where: { poolMemberId: member.id },
-        create: { poolMemberId: member.id, ...data },
-        update: data,
-      });
-      state.written.set(member.id, { key, writtenAtMs: nowMs });
+      // The session ended while an earlier write was in flight: publish nothing more.
+      if (state.closed) break;
+      if (await this.publish(member.id, data)) {
+        state.written.set(member.id, { key, writtenAtMs: nowMs });
+        published.push({
+          memberId: member.id,
+          poolId: member.poolId,
+          rulesKey: rulesKey(rules),
+        });
+      }
     }
+    await this.retractIfRulesChanged(state, published, now);
     for (const memberId of state.written.keys()) {
       if (!seen.has(memberId)) state.written.delete(memberId);
     }
+  }
+  /**
+   * The ONE write of a verdict: never older than what is stored. The row is
+   * updated only while its `evaluatedAt` is not newer than this
+   * evaluation's; a missing row is created, and losing that creation race
+   * (unique violation) means a newer evaluation already wrote. True when
+   * this evaluation's verdict is now the stored one.
+   */
+  private async publish(memberId: string, data: VerdictData): Promise<boolean> {
+    const updated = await this.db.poolMemberRoutingVerdict.updateMany({
+      where: { poolMemberId: memberId, evaluatedAt: { lte: data.evaluatedAt } },
+      data,
+    });
+    if (updated.count > 0) return true;
+    try {
+      await this.db.poolMemberRoutingVerdict.create({ data: { poolMemberId: memberId, ...data } });
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === "P2002") return false;
+      throw error;
+    }
+  }
+
+  /**
+   * A rule edit can commit between the rules this evaluation read and its
+   * write. After the write is committed, re-read the pools: any whose rules
+   * differ had their rows cleared before or will not see ours, so delete
+   * exactly the rows this evaluation wrote (a newer evaluation's row has a
+   * different `evaluatedAt` and is kept). A row committed before the
+   * re-read is either seen here or deleted by the edit's own clearing,
+   * because the edit clears after its rules commit.
+   */
+  private async retractIfRulesChanged(
+    state: RoutingEvaluationState,
+    published: readonly { memberId: string; poolId: string; rulesKey: string }[],
+    evaluatedAt: Date,
+  ): Promise<void> {
+    if (published.length === 0) return;
+    const poolIds = [...new Set(published.map((entry) => entry.poolId))];
+    const pools = await this.db.modelPool.findMany({
+      where: { id: { in: poolIds } },
+      select: { id: true, routingRules: true },
+    });
+    const current = new Map(
+      pools.map((pool) => [pool.id, rulesKey(parseStoredRoutingRules(pool.routingRules))]),
+    );
+    const stale = published.filter((entry) => current.get(entry.poolId) !== entry.rulesKey);
+    if (stale.length === 0) return;
+    await this.db.poolMemberRoutingVerdict.deleteMany({
+      where: { poolMemberId: { in: stale.map((entry) => entry.memberId) }, evaluatedAt },
+    });
+    for (const entry of stale) state.written.delete(entry.memberId);
   }
 }

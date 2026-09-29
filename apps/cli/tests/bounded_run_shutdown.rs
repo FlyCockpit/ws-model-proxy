@@ -59,4 +59,38 @@ fn exiting_kills_the_running_group_and_refuses_later_runs() {
         ),
         Err(RunError::Cancelled)
     );
+    // ...not even by runs already queued behind the exit: none of them
+    // may execute (a check after the spawn would run the command first).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let results = std::thread::scope(|scope| {
+        let handles = (0..100)
+            .map(|index| {
+                let path = dir.path().join(format!("late-{index}"));
+                scope.spawn(move || {
+                    run(
+                        "touch",
+                        &[path.display().to_string()],
+                        Duration::from_secs(5),
+                        1024,
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("run thread"))
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        results
+            .iter()
+            .all(|result| *result == Err(RunError::Cancelled)),
+        "{results:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("dir").count(),
+        0,
+        "a command ran after the daemon began exiting"
+    );
 }

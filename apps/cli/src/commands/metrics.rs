@@ -37,10 +37,11 @@ enum Sub {
     /// new approval.
     Approve {
         name: String,
-        /// Only approve if the command's SHA-256 is exactly this (as shown by
-        /// `wsmp metrics list`).
+        /// The SHA-256 of the command you reviewed (shown by `wsmp metrics
+        /// list`). Required: the approval is bound to the text you read, so a
+        /// definition the server swapped in since is refused.
         #[arg(long)]
-        sha256: Option<String>,
+        sha256: String,
     },
     /// Remove the approval of a remote source; it stops running.
     Revoke { name: String },
@@ -50,7 +51,7 @@ pub fn run(args: &Args) -> Result<()> {
     match &args.command {
         Sub::List => list(args.json),
         Sub::Test { name } => test(args.json, name),
-        Sub::Approve { name, sha256 } => approve(args.json, name, sha256.as_deref()),
+        Sub::Approve { name, sha256 } => approve(args.json, name, sha256),
         Sub::Revoke { name } => revoke(args.json, name),
     }
 }
@@ -251,7 +252,7 @@ fn test(json: bool, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn approve(json: bool, name: &str, expected: Option<&str>) -> Result<()> {
+fn approve(json: bool, name: &str, expected: &str) -> Result<()> {
     let remote = load_remote_sources()?;
     let Some(source) = remote.iter().find(|source| source.name == name) else {
         bail!(
@@ -260,9 +261,10 @@ fn approve(json: bool, name: &str, expected: Option<&str>) -> Result<()> {
         );
     };
     let hash = sha256_hex(source.command.as_bytes());
-    if let Some(expected) = expected
-        && !expected.trim().eq_ignore_ascii_case(&hash)
-    {
+    // The only path that pins a hash: the caller must name the hash of the
+    // text they reviewed, so approval can never bind to a command that was
+    // swapped in between `list` and `approve`.
+    if !expected.trim().eq_ignore_ascii_case(&hash) {
         bail!(
             "the command of `{}` changed: its SHA-256 is {hash}, not {}",
             source.name,

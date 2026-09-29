@@ -56,6 +56,7 @@ import {
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  type RemoteMetricSource,
   rejectedHelloFacts,
   relayProtocolAtLeast,
   remoteMetricSourcesSchema,
@@ -341,6 +342,8 @@ type SessionState = {
   cliDeviceId: string | null;
   cli: { slug: string } | null;
   registered: boolean;
+  /** Serialises `metrics.sources.set` sends: each re-reads the device after the previous one was sent. */
+  remoteSourcesQueue: Promise<void>;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
@@ -611,6 +614,7 @@ export class RelaySessionManager {
       cliDeviceId: null,
       cli: null,
       registered: false,
+      remoteSourcesQueue: Promise.resolve(),
       inventoryConfirmed: false,
       endpointTargeting: false,
       protocolVersion: null,
@@ -1423,30 +1427,61 @@ export class RelaySessionManager {
    * definitions; any other mode gets an empty list, which stops them. The CLI
    * still needs its local opt-in and a hash approval of each command.
    */
-  private async sendRemoteMetricSources(session: SessionState) {
+  private sendRemoteMetricSources(session: SessionState): Promise<boolean> {
+    // One send at a time per session, each reading the device only when its
+    // turn comes: the last send always reflects the newest committed mode
+    // and definitions, so an older read can never overtake a withdrawal.
+    const turn = session.remoteSourcesQueue.then(() => this.sendRemoteMetricSourcesNow(session));
+    session.remoteSourcesQueue = turn.then(() => undefined);
+    return turn;
+  }
+
+  /**
+   * Never rejects (it logs and returns), so the queue never stalls. Fails
+   * closed: whatever goes wrong before the device's grant and definitions
+   * are known (read error, missing or foreign device, invalid stored list),
+   * the CLI is sent an EMPTY list, which stops every remote source; only a
+   * successful read of an `unsupervised` device sends definitions. Returns
+   * true only when the intended list was sent.
+   */
+  private async sendRemoteMetricSourcesNow(session: SessionState): Promise<boolean> {
     const cliDeviceId = session.cliDeviceId;
-    if (!cliDeviceId) return;
+    if (!cliDeviceId) return false;
+    let sources: RemoteMetricSource[] = [];
+    let intended = false;
     try {
       const device = await prisma.cliDevice.findUnique({
         where: { id: cliDeviceId },
         select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
       });
-      if (!device || device.userId !== session.identity.userId) return;
-      if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return;
-      if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
-      // The outbound list is validated against the relay 2.7 wire schema
-      // (strict entries, at most NODE_METRIC_SOURCES_MAX). Anything that
-      // fails is withheld: the CLI gets an empty list, which stops every
-      // remote source, never a malformed or oversized frame.
-      const wire = remoteMetricSourcesSchema.safeParse(
-        device.mcpCommandMode === "UNSUPERVISED"
-          ? parseStoredRemoteMetricSources(device.remoteMetricSources)
-          : [],
-      );
-      if (!wire.success) {
-        console.error("[relay] stored remote metric sources failed the wire schema; sending none");
+      if (device && device.userId === session.identity.userId) {
+        // The outbound list is validated against the relay 2.7 wire schema
+        // (strict entries, at most NODE_METRIC_SOURCES_MAX). Anything that
+        // fails is withheld: the CLI gets an empty list, never a malformed
+        // or oversized frame.
+        const wire = remoteMetricSourcesSchema.safeParse(
+          device.mcpCommandMode === "UNSUPERVISED"
+            ? parseStoredRemoteMetricSources(device.remoteMetricSources)
+            : [],
+        );
+        if (wire.success) {
+          sources = wire.data;
+          intended = true;
+        } else {
+          console.error(
+            "[relay] stored remote metric sources failed the wire schema; sending none",
+          );
+        }
       }
-      const sources = wire.success ? wire.data : [];
+    } catch (error) {
+      console.error(
+        "[relay] reading remote metric sources failed; withdrawing them",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+    if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    try {
       session.socket.send(
         encodeRelayServerControlMessage({
           type: "metrics.sources.set",
@@ -1454,11 +1489,13 @@ export class RelaySessionManager {
           sources,
         }),
       );
+      return intended;
     } catch (error) {
       console.error(
         "[relay] sending remote metric sources failed",
         error instanceof Error ? error.name : typeof error,
       );
+      return false;
     }
   }
 
@@ -1466,8 +1503,7 @@ export class RelaySessionManager {
   async onRemoteMetricSourcesChanged(cliDeviceId: string) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session?.registered) return false;
-    await this.sendRemoteMetricSources(session);
-    return true;
+    return await this.sendRemoteMetricSources(session);
   }
 
   private async writeTelemetry(

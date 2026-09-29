@@ -1,37 +1,23 @@
-//! A child that survives the deadline kill (here: it left its process group,
-//! as a command stuck in the kernel or one that calls `setpgid` would) must
-//! not pile up: it is handed to a reaper, and at `LINGERING_MAX` stuck
-//! children new runs are refused until they finish. It owns a process-wide
-//! counter, so it is the only test in its binary.
+//! Escaped children and the run budget. A direct child that left its process
+//! group is killed by `finish` (it is still ours), so real processes cannot
+//! occupy the stuck-child cap any more (only a child in uninterruptible sleep
+//! can; the admission arithmetic is unit-tested in `bounded_run.rs`). Many
+//! concurrent escapers must all settle by the deadline, leave nothing
+//! running, and leave the primitive able to run the next command at once.
 
 #![cfg(unix)]
 
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{LINGERING_MAX, RunError, run};
+use wsmp::bounded_run::{RunError, run};
 
-/// The child joins the anchor's group, so `killpg(child pid)` finds nothing.
-const ESCAPE: &str = "import os,sys,time\nos.setpgid(0, int(sys.argv[1]))\nassert os.getpgid(0) == int(sys.argv[1])\nsys.stdout.write('x')\nsys.stdout.flush()\ntime.sleep(int(sys.argv[2]))";
-
-fn stuck(pgid: &str) -> Result<Vec<u8>, RunError> {
-    run(
-        "python3",
-        &[
-            "-c".to_string(),
-            ESCAPE.to_string(),
-            pgid.to_string(),
-            "5".to_string(),
-        ],
-        Duration::from_millis(200),
-        1024,
-        None,
-    )
-}
+/// The child joins the anchor's group (so `killpg(child pid)` finds nothing),
+/// writes a byte, sleeps, then touches the marker if it was left alive.
+const ESCAPE: &str = "import os,sys,time\nos.setpgid(0, int(sys.argv[1]))\nassert os.getpgid(0) == int(sys.argv[1])\nsys.stdout.write('x')\nsys.stdout.flush()\ntime.sleep(2)\nopen(sys.argv[2], 'w').close()";
 
 #[test]
-fn stuck_children_are_capped_and_the_cap_recovers() {
-    // The escaping child is a python3 one-liner (every CI runner has it).
+fn sixteen_concurrent_escaped_children_are_killed_and_nothing_is_refused() {
     std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -42,10 +28,31 @@ fn stuck_children_are_capped_and_the_cap_recovers() {
         .spawn()
         .expect("anchor");
     let pgid = anchor.id().to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let barrier = std::sync::Barrier::new(16);
     let started = Instant::now();
     let results = std::thread::scope(|scope| {
-        let handles = (0..LINGERING_MAX)
-            .map(|_| scope.spawn(|| stuck(&pgid)))
+        let handles = (0..16)
+            .map(|index| {
+                let marker = dir.path().join(format!("alive-{index}"));
+                let pgid = &pgid;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    run(
+                        "python3",
+                        &[
+                            "-c".to_string(),
+                            ESCAPE.to_string(),
+                            pgid.clone(),
+                            marker.display().to_string(),
+                        ],
+                        Duration::from_millis(300),
+                        1024,
+                        None,
+                    )
+                })
+            })
             .collect::<Vec<_>>();
         handles
             .into_iter()
@@ -63,7 +70,7 @@ fn stuck_children_are_capped_and_the_cap_recovers() {
         "{:?}",
         started.elapsed()
     );
-    // Every slot is held by a child still asleep: refused, not started.
+    // No run was refused: nothing is stuck.
     assert_eq!(
         run(
             "echo",
@@ -72,28 +79,11 @@ fn stuck_children_are_capped_and_the_cap_recovers() {
             1024,
             None
         ),
-        Err(RunError::Resources)
+        Ok(b"hi\n".to_vec())
     );
-    // They exit on their own; the reapers free the slots.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match run(
-            "echo",
-            &["hi".to_string()],
-            Duration::from_secs(5),
-            1024,
-            None,
-        ) {
-            Ok(bytes) => {
-                assert_eq!(bytes, b"hi\n");
-                break;
-            }
-            Err(RunError::Resources) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            other => panic!("did not recover: {other:?}"),
-        }
-    }
+    std::thread::sleep(Duration::from_millis(2_500));
+    let survivors = std::fs::read_dir(dir.path()).expect("dir").count();
     let _ = anchor.kill();
     let _ = anchor.wait();
+    assert_eq!(survivors, 0, "escaped children outlived the deadline");
 }

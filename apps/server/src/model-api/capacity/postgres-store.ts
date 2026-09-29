@@ -10,6 +10,7 @@ import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy
 import {
   type AdmissionSnapshot,
   type GrantPlan,
+  inWindow,
   type PlannedGrant,
   type PlannerWaiter,
   planGrants,
@@ -603,6 +604,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     now: Date,
     /** The attempt created in this transaction: its zero-budget waiters are still eligible. */
     creatingRequestId: string | undefined,
+    /** Deferred waiters owed a last-chance check in this pass (planner exception). */
+    lastChanceWaiterIds: readonly string[] = [],
   ): Promise<{ snapshot: AdmissionSnapshot; rows: Map<string, AdmissionWaiterRow> }> {
     await tx.capacityWaiter.updateMany({
       where: {
@@ -678,7 +681,10 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     });
     // Metric routing (S-B part 2): a waiter whose member is metric-FULL is not
     // planned, unless its whole request fails open (see #metricFullWaiterIds).
-    const metricFull = await this.#metricFullWaiterIds(tx, allWaiters, now);
+    const metricFull = await this.#metricFullWaiterIds(tx, allWaiters, now, {
+      creatingRequestId,
+      lastChance: new Set(lastChanceWaiterIds),
+    });
     const waiters = allWaiters.filter((waiter) => !metricFull.has(waiter.id));
     const configuredReservationMembers = await tx.poolMember.findMany({
       // Every PRIMARY (always local) execution target sharing this physical
@@ -838,6 +844,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       AdmissionRequest: { metricFailOpen: boolean };
     }>,
     now: Date,
+    /** The planner's eligibility exceptions for this pass; siblings are judged by the same rule. */
+    window: { creatingRequestId: string | undefined; lastChance: ReadonlySet<string> },
   ): Promise<Set<string>> {
     const memberIds = [
       ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
@@ -857,14 +865,36 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     ];
     const failOpen = new Set<string>();
     if (failOpenCandidates.length > 0) {
-      const siblings = await tx.capacityWaiter.findMany({
+      // Every live sibling, by the PLANNER's own window rule (creating and
+      // last-chance exceptions, request deadline): a sibling the planner would
+      // still grant is a real alternative and blocks the fail-open.
+      const siblingRows = await tx.capacityWaiter.findMany({
         where: {
           admissionRequestId: { in: failOpenCandidates },
           state: "WAITING",
-          OR: [{ deadlineAt: null }, { deadlineAt: { gte: now } }],
+          AdmissionRequest: { state: "WAITING" },
         },
-        select: { admissionRequestId: true, poolMemberId: true },
+        select: {
+          id: true,
+          admissionRequestId: true,
+          poolMemberId: true,
+          deadlineAt: true,
+          AdmissionRequest: { select: { deadlineAt: true } },
+        },
       });
+      const siblings = siblingRows.filter((sibling) =>
+        inWindow(
+          {
+            waiterId: sibling.id,
+            admissionRequestId: sibling.admissionRequestId,
+            deadlineAt: sibling.deadlineAt,
+            requestDeadlineAt: sibling.AdmissionRequest.deadlineAt,
+          },
+          now,
+          window.creatingRequestId,
+          window.lastChance,
+        ),
+      );
       const unknownMembers = [
         ...new Set(
           siblings.flatMap((sibling) =>
@@ -1031,6 +1061,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         capacityId,
         now,
         options.creatingRequestId,
+        options.lastChanceWaiterIds,
       );
       const plan = planGrants(snapshot, now, options);
       const { persisted, stale } = await this.#persistGrants(tx, capacityId, now, rows, plan);

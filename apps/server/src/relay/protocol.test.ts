@@ -998,6 +998,10 @@ describe("metrics.sources.set encoding (G2a-3) and reserved label keys (CFc-5)",
       [{ ...source, intervalSecs: 4 }],
       [{ ...source, name: "bad name" }],
       [{ ...source, command: "" }],
+      // The CLI's own definition of a runnable command (bytes, NUL, blank).
+      [{ ...source, command: "€".repeat(1509) }],
+      [{ ...source, command: "echo\u0000 1" }],
+      [{ ...source, command: "   " }],
     ]) {
       expect(() => encodeRelayServerControlMessage(frame(sources))).toThrow(/wire schema/);
     }

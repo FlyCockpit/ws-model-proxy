@@ -198,6 +198,7 @@ const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  "forwarder_device_metric_sources_set",
 ]);
 
 function catalogNames(includeCliCommands: boolean): string[] {
@@ -1207,6 +1208,13 @@ describe("CLI command tools", () => {
     expect(flagged).toContain("forwarder_cli_command_run");
     expect(flagged).toContain("forwarder_cli_supervised_command_start");
     expect(flagged).toContain("forwarder_cli_command_result");
+    expect(flagged).toContain("forwarder_device_metric_sources_set");
+    for (const hidden of [
+      await listedNames(OAUTH_CREDENTIAL, ["mcp:write"]),
+      await listedNames(PAT_WITHOUT_CLI, ["mcp:write"]),
+    ]) {
+      expect(hidden).not.toContain("forwarder_device_metric_sources_set");
+    }
   });
 
   it("tells the model that other secrets in command output are NOT redacted", async () => {
@@ -1245,6 +1253,22 @@ describe("CLI command tools", () => {
       expect(resultText(result).toLowerCase()).not.toContain("disabled");
       expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
     }
+  });
+
+  it("defining a device's metric sources needs the command credential, like the CLI command tools", async () => {
+    const setSources = requireDescriptor("forwarder_device_metric_sources_set");
+    const client = { forwarderManagement: { setCliDeviceMetricSources: vi.fn() } };
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      const result = await runManifestTool(setSources, {
+        dispatch: cliDispatch(credential),
+        scopes: ["mcp:write"],
+        client: client as never,
+        args: { cliDeviceId: "cli-1", sources: [], confirm: "RUN" },
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Tool forwarder_device_metric_sources_set not found");
+    }
+    expect(client.forwarderManagement.setCliDeviceMetricSources).not.toHaveBeenCalled();
   });
 
   it("an unregistered call on the transport is the SDK not-found error", async () => {

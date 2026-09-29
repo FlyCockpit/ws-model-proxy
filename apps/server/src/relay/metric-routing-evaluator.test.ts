@@ -34,16 +34,80 @@ function member(
 const hotRule = [{ metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect: "full" }];
 const busyRule = [{ metric: "endpoint.waiting", op: ">=", threshold: 2, effect: "avoid" }];
 
+type Row = {
+  poolMemberId: string;
+  verdict: string;
+  ruleStates: string[];
+  evaluatedAt: Date;
+  expiresAt: Date;
+  poolId: string;
+};
+
+/**
+ * An in-memory stand-in for the verdict table with the two operations the
+ * evaluator uses: a conditional `updateMany` (by `evaluatedAt`) and a
+ * `create` that fails like a unique violation (P2002) when the row exists.
+ */
 function harness(members: ReturnType<typeof member>[]) {
   let now = T0;
+  const rows = new Map<string, Row>();
+  const pools = new Map<string, unknown>(
+    members.map((entry) => [entry.poolId, entry.ModelPool.routingRules]),
+  );
   const db = {
     poolMember: { findMany: vi.fn(async () => members) },
-    poolMemberRoutingVerdict: { upsert: vi.fn(async () => ({})) },
+    modelPool: {
+      findMany: vi.fn(async () =>
+        [...pools.entries()].map(([id, routingRules]) => ({ id, routingRules })),
+      ),
+    },
+    poolMemberRoutingVerdict: {
+      updateMany: vi.fn(
+        async (args: {
+          where: { poolMemberId: string; evaluatedAt: { lte: Date } };
+          data: Omit<Row, "poolMemberId">;
+        }) => {
+          const row = rows.get(args.where.poolMemberId);
+          if (!row || row.evaluatedAt > args.where.evaluatedAt.lte) return { count: 0 };
+          rows.set(row.poolMemberId, { ...row, ...args.data });
+          return { count: 1 };
+        },
+      ),
+      create: vi.fn(async (args: { data: Row }) => {
+        if (rows.has(args.data.poolMemberId)) {
+          throw Object.assign(new Error("unique"), { code: "P2002" });
+        }
+        rows.set(args.data.poolMemberId, { ...args.data });
+        return {};
+      }),
+      deleteMany: vi.fn(
+        async (args: { where: { poolMemberId: { in: string[] }; evaluatedAt: Date } }) => {
+          let count = 0;
+          for (const id of args.where.poolMemberId.in) {
+            const row = rows.get(id);
+            if (row && row.evaluatedAt.getTime() === args.where.evaluatedAt.getTime()) {
+              rows.delete(id);
+              count += 1;
+            }
+          }
+          return { count };
+        },
+      ),
+    },
   };
   const evaluator = new MetricRoutingEvaluator(db as never, () => now);
   return {
     db,
+    rows,
     evaluator,
+    /** Replace a pool's rules, as `setPoolRoutingRules` does (rules, then clear its verdicts). */
+    editRules: (poolId: string, rules: unknown) => {
+      pools.set(poolId, rules);
+      for (const [id, row] of rows) if (row.poolId === poolId) rows.delete(id);
+    },
+    setRulesWithoutClearing: (poolId: string, rules: unknown) => {
+      pools.set(poolId, rules);
+    },
     advance: (ms: number) => {
       now = new Date(now.getTime() + ms);
     },
@@ -80,20 +144,19 @@ describe("MetricRoutingEvaluator", () => {
       }),
     );
     // Members of pools without rules get no verdict row.
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(1);
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledWith({
-      where: { poolMemberId: "m1" },
-      create: expect.objectContaining({
+    expect([...h.rows.keys()]).toEqual(["m1"]);
+    expect(h.db.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
         poolMemberId: "m1",
         userId: "user-1",
         poolId: "pool-of-m1",
         cliDeviceId: "device-1",
         verdict: "FULL",
         ruleStates: ["triggered"],
+        evaluatedAt: T0,
         // Built-ins are stale 90 s after receipt.
         expiresAt: new Date(T0.getTime() + 90_000),
       }),
-      update: expect.objectContaining({ verdict: "FULL" }),
     });
   });
 
@@ -107,11 +170,7 @@ describe("MetricRoutingEvaluator", () => {
         { endpointSlug: "b", modelSlug: null, running: 1, waiting: 0, receivedAt: T0 },
       ],
     });
-    const verdicts = h.db.poolMemberRoutingVerdict.upsert.mock.calls.map(
-      (call) =>
-        (call as unknown as [{ create: { poolMemberId: string; verdict: string } }])[0].create,
-    );
-    expect(verdicts.map((row) => [row.poolMemberId, row.verdict])).toEqual([
+    expect([...h.rows.values()].map((row) => [row.poolMemberId, row.verdict])).toEqual([
       ["m1", "AVOID"],
       ["m2", "NONE"],
     ]);
@@ -121,11 +180,7 @@ describe("MetricRoutingEvaluator", () => {
     const h = harness([member("m1", hotRule)]);
     const state = createRoutingEvaluationState("user-1", "device-1");
     await h.evaluator.evaluate(state, { nodeMetrics: null, endpointLoad: [] });
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        create: expect.objectContaining({ verdict: "NONE", ruleStates: ["stale"] }),
-      }),
-    );
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", ruleStates: ["stale"] });
   });
 
   it("rewrites an unchanged verdict only after the refresh interval, a changed one at once", async () => {
@@ -134,16 +189,105 @@ describe("MetricRoutingEvaluator", () => {
     await h.evaluator.evaluate(state, metrics(90, h.now()));
     h.advance(1_000);
     await h.evaluator.evaluate(state, metrics(90, h.now()));
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(1);
+    const writes = () =>
+      h.db.poolMemberRoutingVerdict.create.mock.calls.length +
+      h.db.poolMemberRoutingVerdict.updateMany.mock.calls.length;
+    // First evaluation: a miss on updateMany, then the create.
+    expect(h.db.poolMemberRoutingVerdict.create).toHaveBeenCalledTimes(1);
+    const afterFirst = writes();
     h.advance(VERDICT_REFRESH_MS);
     await h.evaluator.evaluate(state, metrics(90, h.now()));
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(2);
+    expect(writes()).toBeGreaterThan(afterFirst);
+    const afterRefresh = writes();
     h.advance(1_000);
     await h.evaluator.evaluate(state, metrics(40, h.now()));
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenCalledTimes(3);
-    expect(h.db.poolMemberRoutingVerdict.upsert).toHaveBeenLastCalledWith(
-      expect.objectContaining({ update: expect.objectContaining({ verdict: "NONE" }) }),
-    );
+    expect(writes()).toBeGreaterThan(afterRefresh);
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
+  });
+
+  it("never overwrites a newer evaluation's verdict with an older one (stalled run, reconnect)", async () => {
+    // Session A starts (t0) and stalls in its member read; session B starts
+    // later (t0+50ms), writes NONE and finishes; A then resumes and tries to
+    // publish its stale FULL. It must lose.
+    const h = harness([member("m1", hotRule)]);
+    const a = createRoutingEvaluationState("user-1", "device-1");
+    const b = createRoutingEvaluationState("user-1", "device-1");
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const realFind = h.db.poolMember.findMany.getMockImplementation();
+    h.db.poolMember.findMany.mockImplementationOnce(async () => {
+      await gate;
+      return realFind ? realFind() : [];
+    });
+    const first = h.evaluator.evaluate(a, metrics(90, T0));
+    h.advance(50);
+    await h.evaluator.evaluate(b, metrics(40, h.now()));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
+    release();
+    await first;
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE" });
+  });
+
+  it("publishes nothing once its session was cancelled mid-evaluation", async () => {
+    const h = harness([member("m1", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const realFind = h.db.poolMember.findMany.getMockImplementation();
+    h.db.poolMember.findMany.mockImplementationOnce(async () => {
+      await gate;
+      return realFind ? realFind() : [];
+    });
+    const pending = h.evaluator.evaluate(state, metrics(90, T0));
+    h.evaluator.cancel(state);
+    release();
+    await pending;
+    expect(h.rows.size).toBe(0);
+  });
+
+  it("retracts a verdict written under rules that were edited during the evaluation", async () => {
+    // The evaluation read the old rules; the edit (rules committed, then its
+    // rows cleared) happens before the evaluation's write commits, so the
+    // clearing missed it. The evaluation's re-check must remove it, and only
+    // its own row.
+    const h = harness([member("m1", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    const publish = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
+    h.db.poolMemberRoutingVerdict.create.mockImplementationOnce(async (args) => {
+      const result = await (publish ? publish(args) : Promise.resolve({}));
+      h.setRulesWithoutClearing("pool-of-m1", []);
+      return result;
+    });
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    expect(h.rows.size).toBe(0);
+    // With no rules left nothing writes it back, and the next run is quiet.
+    h.advance(1_000);
+    await h.evaluator.evaluate(state, metrics(90, h.now()));
+    expect(h.rows.size).toBe(0);
+  });
+
+  it("keeps a verdict whose rules did not change while it was written", async () => {
+    const h = harness([member("m1", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "FULL" });
+    expect(h.db.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("re-writes at once after a rule edit even when the verdict is unchanged", async () => {
+    const h = harness([member("m1", hotRule)]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, metrics(90, T0));
+    const other = [{ metric: "node.gpu.temperature_c", op: ">", threshold: 70, effect: "full" }];
+    h.editRules("pool-of-m1", other);
+    h.db.poolMember.findMany.mockResolvedValue([member("m1", other)]);
+    h.advance(1_000);
+    await h.evaluator.evaluate(state, metrics(90, h.now()));
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "FULL" });
   });
 
   it("coalesces frames to one evaluation per device per second and stops when cancelled", async () => {

@@ -2274,7 +2274,20 @@ fn metrics_approve_pins_the_exact_remote_command() {
         .assert()
         .failure();
 
-    // A hash that does not match the current command is refused.
+    // Approval by name alone (no reviewed hash) is refused and pins nothing:
+    // it would bind to whatever command the server stored last.
+    cli(&config, &state)
+        .args(["metrics", "approve", "fans"])
+        .assert()
+        .failure();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(
+        cfg.pointer("/metrics/approvedRemoteSources/fans").is_none(),
+        "nothing is pinned without a reviewed hash"
+    );
+
+    // The server swaps the command after the person read `echo 4`: the
+    // approval of the reviewed hash is refused and pins nothing.
     cli(&config, &state)
         .args([
             "metrics",
@@ -2285,6 +2298,8 @@ fn metrics_approve_pins_the_exact_remote_command() {
         ])
         .assert()
         .failure();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.pointer("/metrics/approvedRemoteSources/fans").is_none());
     let approved = json_stdout({
         let mut cmd = cli(&config, &state);
         cmd.args([

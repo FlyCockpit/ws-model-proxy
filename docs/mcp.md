@@ -57,11 +57,14 @@ Metric routing rules (S-B part 2):
   "RUN" }`) replaces a device's remotely defined metric sources
   (`{ name, command, intervalSecs >= 5, timeoutSecs, format: "number" | "json"
   | "prometheus" }`). The server accepts it only while the device's MCP command
-  mode is `unsupervised`, and sends an empty list to the CLI whenever the mode
+  mode is `unsupervised`, only for a personal token minted with the CLI
+  commands option (`allowCliCommands`; OAuth clients and other tokens neither
+  see nor can call it), and sends an empty list to the CLI whenever the mode
   is anything else. The CLI refuses remote sources unless its local
   `allowRemoteMetricSources` opt-in is on, and runs a command only after the
   person approves that exact command string on the machine
-  (`wsmp metrics approve <name>`); a changed command stops until it is approved
+  (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
+  read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
 
 ## Setup

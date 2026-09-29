@@ -205,6 +205,45 @@ integration("PostgreSQL metric routing at grant time", () => {
     }
   });
 
+  it("counts a last-chance sibling as a live candidate: no fail-open past a non-FULL member", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const f = await fixture(db);
+    try {
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(db, "metric-proof");
+      const holdA = admitted(await store.acquire(f.attempt([f.a])));
+      const holdB = admitted(await store.acquire(f.attempt([f.b])));
+      // Two deferred, zero-budget candidates: each is eligible only at its
+      // notBefore and its deadline is that same instant, so the poll that
+      // first sees them may run after the deadline and owes them one
+      // "last chance" pass (planner exception).
+      const deferred = f.attempt([f.a, f.b]);
+      deferred.candidates = deferred.candidates.map((candidate) => ({
+        ...candidate,
+        notBeforeMs: 400,
+        waitBudgetMs: 0,
+      }));
+      expect((await store.acquire(deferred)).state).toBe("WAITING");
+      await store.release(holdA);
+      await store.release(holdB);
+      expect(await requestState(db, deferred.attemptId)).toEqual({
+        state: "WAITING",
+        poolMemberId: null,
+      });
+      // The owner's first poll comes late: past both deadlines.
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await f.setVerdict(f.a, "FULL");
+      const polled = await store.acquire({ ...deferred, candidates: [] });
+      // B is not FULL and is still a last-chance candidate, so the request
+      // must not fail open onto the FULL member A.
+      expect(admitted(polled).poolMemberId).toBe(f.b.id);
+    } finally {
+      await f.cleanup();
+      await db.$disconnect();
+    }
+  });
+
   it("keeps an :external shortened-phase request waiting instead of failing open", async () => {
     if (!databaseUrl) return;
     const db = createPrismaClient(databaseUrl);
