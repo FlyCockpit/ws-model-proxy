@@ -1483,6 +1483,28 @@ describe("relay terminal and exec sessions", () => {
         return JSON.stringify(frame);
       })(),
     ],
+    [
+      "a 2.8 hello (a CLI newer than this server)",
+      (() => {
+        const frame = JSON.parse(hello24()) as {
+          protocolVersion: string;
+          cli: { capabilities: Record<string, unknown> };
+        };
+        frame.protocolVersion = "2.8";
+        frame.cli.capabilities.protocolVersion = "2.8";
+        return JSON.stringify(frame);
+      })(),
+    ],
+    [
+      // The top-level version alone must trip the gate: the capability echo is
+      // still 2.7, so the capability comparison would not refuse this frame.
+      "a 2.8 hello whose capability echo still says 2.7",
+      (() => {
+        const frame = JSON.parse(hello24()) as { protocolVersion: string };
+        frame.protocolVersion = "2.8";
+        return JSON.stringify(frame);
+      })(),
+    ],
   ])("refuses %s with the upgrade message before schema parsing", async (_, frame) => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const manager = new RelaySessionManager();
@@ -1574,6 +1596,45 @@ describe("relay terminal and exec sessions", () => {
       "[relay] refused a hello older than the minimum relay protocol",
       { protocolVersion: null, cliVersion: null },
     );
+    consoleError.mockRestore();
+  });
+
+  it("records a refused newer hello as the claimed protocol version", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(hello24()) as {
+      protocolVersion: string;
+      cli: { version?: string; capabilities: Record<string, unknown> };
+    };
+    frame.protocolVersion = "2.8";
+    frame.cli.version = "0.9.0-rc.1+build.5";
+    frame.cli.capabilities.protocolVersion = "2.8";
+    manager.acceptAuthenticatedSocket({
+      socket,
+      identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
+      now,
+    });
+    await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    expect(socket.sends.map((send) => JSON.parse(String(send)))).toEqual([
+      {
+        type: "protocol.error",
+        failure: "protocol_error",
+        message: RELAY_UPGRADE_REQUIRED_MESSAGE,
+      },
+    ]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "bound-device", userId: "user-id" },
+      data: {
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0-rc.1+build.5",
+        relayRejectedAt: now,
+      },
+    });
+    // Nothing was registered, so no device became routable.
+    expect(db.cliDevice.upsert).not.toHaveBeenCalled();
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
     consoleError.mockRestore();
   });
 

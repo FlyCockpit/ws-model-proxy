@@ -931,10 +931,11 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello from a CLI older than protocol 2.7: another protocol
- * version, or the pre-naming `cli.label` field. Checked before the strict
- * schema so such a CLI gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an
- * opaque "malformed message".
+ * True for a hello that is not the minimum protocol 2.7: a different protocol
+ * version (older than 2.7, or newer than this server speaks), or the
+ * pre-naming `cli.label` field. Checked before the strict schema so such a CLI
+ * gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed
+ * message".
  */
 export function helloNeedsUpgrade(frame: string): boolean {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
@@ -971,8 +972,9 @@ function rejectedVersionField(value: unknown, pattern: RegExp): string | null {
 
 /**
  * The protocol and CLI versions a refused hello claimed, for the device card
- * ("CLI upgrade required") and the relay log. Anything that is not a short
- * version-shaped string is dropped.
+ * ("CLI upgrade required", or "Server upgrade required" when the claimed
+ * protocol is newer than this server speaks) and the relay log. Anything that
+ * is not a short version-shaped string is dropped.
  */
 export function rejectedHelloFacts(frame: string): {
   protocolVersion: string | null;

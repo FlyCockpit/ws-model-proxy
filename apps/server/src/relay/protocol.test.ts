@@ -317,7 +317,7 @@ describe("relay protocol 2.7 minimum", () => {
     expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("Upgrade wsmp");
   });
 
-  it("flags every older hello, and the pre-naming label field, before schema parsing", () => {
+  it("flags every hello that is not the minimum protocol, and the pre-naming label field", () => {
     for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6"]) {
       expect(helloNeedsUpgrade(hello(version, { protocolVersion: version }))).toBe(true);
     }
@@ -346,6 +346,19 @@ describe("relay protocol 2.7 minimum", () => {
     expect(helloNeedsUpgrade("not json")).toBe(false);
   });
 
+  it("flags a hello newer than the minimum too: the server must be upgraded", () => {
+    for (const version of ["2.8", "2.10", "3.0"]) {
+      expect(
+        helloNeedsUpgrade(hello(version, { ...CAPABILITIES_27, protocolVersion: version })),
+      ).toBe(true);
+    }
+    // The capability echo is not consulted for a non-minimum hello, so a
+    // self-consistent 2.8 frame cannot slip through as "malformed".
+    expect(helloNeedsUpgrade(hello("2.8", { ...CAPABILITIES_27, protocolVersion: "2.7" }))).toBe(
+      true,
+    );
+  });
+
   describe("rejectedHelloFacts sanitising", () => {
     const facts = (protocolVersion: unknown, version: unknown) =>
       rejectedHelloFacts(
@@ -372,6 +385,10 @@ describe("relay protocol 2.7 minimum", () => {
       ["non-semver word", "latest"],
       ["two-part", "1.2"],
       ["four-part", "1.2.3.4"],
+      // A >9-digit numeric identifier that still fits in the 32-character cap
+      // (an IP-shaped string here; phone-shaped elsewhere) is not a semver, and
+      // the per-component digit bound rejects it.
+      ["overlong numeric identifier", `${"9".repeat(10)}.1.1`],
       ["v prefix", "v1.2.3"],
       ["empty", ""],
       ["padded with spaces", " 1.2.3 "],
