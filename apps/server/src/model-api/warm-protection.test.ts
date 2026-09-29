@@ -173,6 +173,40 @@ describe("S-C warm-session equity", () => {
     ]);
   });
 
+  it("token mode: over the share the user's OLDER sessions lose protection first (closure is sticky)", () => {
+    const load = { slots: null, active: 0, kvBudgetTokens: 100_000 };
+    // Two active users: alice's share is 50k. 30k fits, the second 30k overflows,
+    // so the older 10k (which would fit on its own) must not be protected.
+    const user = [
+      session("alice", 10, 30_000),
+      session("alice", 20, 30_000),
+      session("alice", 30, 10_000),
+      session("bob", 5, 10_000),
+    ];
+    expect(ages(protectedWarmSessions(user, load, policy()))).toEqual(["alice@10", "bob@5"]);
+    // The same per override bucket: bucket 25% (25k) keeps the 20k, not the older 4k.
+    const buckets = [
+      session("alice", 5, 10_000, 100),
+      session("alice", 10, 20_000, 25),
+      session("alice", 20, 20_000, 25),
+      session("alice", 30, 4_000, 25),
+    ];
+    expect(ages(protectedWarmSessions(buckets, load, policy({ minTokens: 0 })))).toEqual([
+      "alice@10",
+      "alice@5",
+    ]);
+  });
+
+  it("a bucket that only fits its first session does not stop the user's other buckets", () => {
+    const load = { slots: 4, active: 0, kvBudgetTokens: null };
+    const sessions = [
+      session("alice", 10, 10_000, 25),
+      session("alice", 20, 10_000, 25),
+      session("alice", 30, 10_000, 100),
+    ];
+    expect(ages(protectedWarmSessions(sessions, load, policy()))).toEqual(["alice@10", "alice@30"]);
+  });
+
   it("a percent override replaces the pool share for that user", () => {
     const protectedSessions = protectedWarmSessions(
       [

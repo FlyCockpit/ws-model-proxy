@@ -654,6 +654,23 @@ describe("PoolForm affinity defaults", () => {
     });
   });
 
+  it("does not validate hidden percent fields (a stale invalid value never blocks save)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const share = screen.getByLabelText("dashboard:pools.protection.share");
+    fireEvent.change(share, { target: { value: "FIXED_PERCENT" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
+      target: { value: "0" },
+    });
+    // Back to a mode without the field: the invalid hidden value is not sent or checked.
+    fireEvent.change(share, { target: { value: "EQUAL_SHARE" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protectionShare: "EQUAL_SHARE",
+      protectionFixedPercent: null,
+    });
+  });
+
   it("loads a stored owner protection percent", () => {
     mount(true, {
       mode: "edit",

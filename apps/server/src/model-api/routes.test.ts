@@ -1718,6 +1718,23 @@ describe("model API routes", () => {
       );
     });
 
+    it("does not score a single-member pool when protection is off (no extra reads)", async () => {
+      db.poolMember.findMany.mockResolvedValue(
+        members(1).map((member) => ({
+          ...member,
+          ModelPool: { ...member.ModelPool, protectionEnabled: false },
+        })),
+      );
+      const { runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: false }),
+      );
+    });
+
     it("changes nothing when the warm-set read fails", async () => {
       db.poolMember.findMany.mockResolvedValue(members());
       warmProtection.load.mockRejectedValue(new Error("database unavailable"));

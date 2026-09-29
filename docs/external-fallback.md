@@ -123,7 +123,8 @@ The request goes external only after local routing could not serve it:
   while a cold local member is free. Pre-commit retry rounds keep the original
   external deadline instead of waiting another `externalAfterWaitMs` each;
 - no local member is free for a new conversation because the members with an
-  idle slot hold protected warm sessions (other conversations, including the caller's own) (see
+  idle slot hold protected warm sessions of other conversations, including the
+  caller's own (see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
   free: a new `:external` conversation may go external at once while a local
@@ -231,13 +232,14 @@ capacity is shared between the people whose sessions are warm
 
 A session is one explicit conversation (its refreshed conversation record) or,
 for traffic without a conversation id, the prefix records one request wrote.
-An edited or shortened history can leave its older branch counted as a second
-session until the window ends (the engine may still hold it). The records of
+An edited or shortened history, or a change of tools, instructions or request
+parameters between turns, can leave the earlier turn counted as a second session
+until the window ends (the engine may still hold it). The records of
 every pool of the owner on the member count; each session's override comes from
 its own pool (grant, or the owner's percent), each distinct override is its own
-budget, and one user's total never exceeds their largest share. `UNPROTECTED`
+budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`
 sessions are never shielded and never count. Reads are bounded per user per
-member (2000 newest sessions), so one busy user or pool cannot hide another's
+member and override value (2000 newest sessions), so one busy user or pool cannot hide another's
 sessions.
 
 Over the share, a user's oldest sessions lose protection first. The owner has

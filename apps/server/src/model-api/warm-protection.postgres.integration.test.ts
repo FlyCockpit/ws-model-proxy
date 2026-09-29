@@ -312,6 +312,7 @@ integration("warm-session protection with real PostgreSQL", () => {
     const heavy = await user("heavy");
     const light = await user("light");
     const batch = await user("batch");
+    const mixed = await user("mixed");
     try {
       const device = await db.cliDevice.create({
         data: { userId: owner.id, slug: `device-${suffix}` },
@@ -326,6 +327,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         [heavy, null],
         [light, null],
         [batch, 0],
+        [mixed, null],
       ] as const)
         await db.poolGrant.create({
           data: {
@@ -365,10 +367,11 @@ integration("warm-session protection with real PostgreSQL", () => {
         tokens: number;
         bindingDigest?: string;
         conversationDigest?: string;
+        poolId?: string;
       }) => ({
         userId: owner.id,
         tenantUserId: input.tenantUserId,
-        poolId: pool.id,
+        poolId: input.poolId ?? pool.id,
         executionTargetId: target.id,
         targetIdentity: "identity",
         bindingDigest: input.bindingDigest ?? "b".repeat(64),
@@ -382,6 +385,14 @@ integration("warm-session protection with real PostgreSQL", () => {
         createdAt: ago(1_000),
         expiresAt: new Date(now.getTime() + 3_600_000),
       });
+      const bucketPool = await db.modelPool.create({
+        data: {
+          userId: owner.id,
+          slug: `bucket-${suffix}`,
+          name: "Bucket pool",
+          ownerProtectionPercent: 100,
+        },
+      });
       const same = ago(3);
       await db.cacheAffinityRecord.createMany({
         data: [
@@ -394,6 +405,24 @@ integration("warm-session protection with real PostgreSQL", () => {
             row({ tenantUserId: heavy.id, lastUsedAt: ago(2 + index), tokens: 20_000 }),
           ),
           row({ tenantUserId: light.id, lastUsedAt: ago(60), tokens: 12_000 }),
+          // The owner's older session under another pool's override (its own
+          // budget bucket): it survives the newer sessions of the default bucket.
+          row({
+            tenantUserId: owner.id,
+            lastUsedAt: ago(200),
+            tokens: 11_000,
+            poolId: bucketPool.id,
+          }),
+          // One tenant, one binding: an explicit conversation and prefix-only
+          // requests at DIFFERENT instants are separate sessions (both orders).
+          row({
+            tenantUserId: mixed.id,
+            lastUsedAt: ago(100),
+            tokens: 10_000,
+            conversationDigest: "e".repeat(40),
+          }),
+          row({ tenantUserId: mixed.id, lastUsedAt: ago(50), tokens: 13_000 }),
+          row({ tenantUserId: mixed.id, lastUsedAt: ago(150), tokens: 14_000 }),
           // Two explicit conversations finishing in the same instant, each with
           // its conversation record and the shared prefix records of the request.
           row({
@@ -431,12 +460,29 @@ integration("warm-session protection with real PostgreSQL", () => {
       // the prefix records of the same instant are not a third session.
       expect(
         list
-          .filter((session) => session.userId === owner.id)
+          .filter((session) => session.userId === owner.id && session.overridePercent === null)
           .map((s) => s.tokens)
           .sort(),
       ).toEqual([15_000, 16_000]);
+      // The bound is per override bucket: the 100% bucket's only session is kept.
+      expect(
+        list.filter((session) => session.userId === owner.id && session.overridePercent === 100),
+      ).toHaveLength(1);
+      // A conversation record only covers prefix records of ITS instant.
+      const all = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: [capacity.id],
+        policy,
+        now,
+      });
+      expect(
+        (all.get(capacity.id) ?? [])
+          .filter((session) => session.userId === mixed.id)
+          .map((s) => s.tokens)
+          .sort(),
+      ).toEqual([10_000, 13_000, 14_000]);
     } finally {
-      for (const id of [owner.id, heavy.id, light.id, batch.id])
+      for (const id of [owner.id, heavy.id, light.id, batch.id, mixed.id])
         await db.user.deleteMany({ where: { id } });
     }
   }, 60_000);

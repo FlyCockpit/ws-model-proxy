@@ -22,10 +22,11 @@ export const PROTECTION_KV_HEADROOM = 0.1;
  * Upper bound on warm sessions read per user per member KV pool per request
  * (newest first). The window (default 5 min) and the size floor (default 8k
  * tokens) keep the real count far below it; the bound only caps a pathological
- * table. It is per (capacity, user) because a user's protected sessions are a
- * newest-first prefix of their own list: keeping each user's newest N leaves
- * every user's prefix (up to N) and the active-user count exact, and one busy
- * user or pool can never crowd another's sessions out of the read (a silently
+ * table. It is per (capacity, user, override value) because the sessions
+ * protected within one budget bucket are a newest-first prefix of that bucket:
+ * keeping each bucket's newest N leaves every bucket's prefix (up to N), the
+ * user's largest share and the active-user count exact, and one busy user or
+ * pool can never crowd another's sessions out of the read (a silently
  * truncated protection set would leave the pool looking unprotected).
  */
 export const WARM_SESSION_QUERY_LIMIT = 2_000;
@@ -401,7 +402,9 @@ export async function loadWarmSessions({
          AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
-         AND r."estimatedTokens" IS NOT NULL
+         -- Every record of one request carries the request's whole estimate, so a
+         -- record below the floor never changes a session's size or eligibility.
+         AND r."estimatedTokens" >= ${policy.minTokens}
     ),
     session AS (
       -- An explicit conversation is one session: its (single, refreshed)
@@ -442,7 +445,7 @@ export async function loadWarmSessions({
     ranked AS (
       SELECT scoped.*,
              ROW_NUMBER() OVER (
-               PARTITION BY "capacityId", "userId"
+               PARTITION BY "capacityId", "userId", "overridePercent"
                ORDER BY "lastUsedAt" DESC, tokens DESC
              ) AS "rank"
         FROM scoped
