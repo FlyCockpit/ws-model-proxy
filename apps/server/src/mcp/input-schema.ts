@@ -121,7 +121,7 @@ function resolveProcedureInput(target: string): z.ZodType | undefined {
   return input as z.ZodType;
 }
 
-/** The generator call, shared by the manifest and the drift tests. */
+/** Stage 1 of the generator: the procedure input as JSON Schema. */
 export function toInputJsonSchema(schema: z.ZodType): JsonObject {
   return z.toJSONSchema(schema, { io: "input", unrepresentable: "any" }) as JsonObject;
 }

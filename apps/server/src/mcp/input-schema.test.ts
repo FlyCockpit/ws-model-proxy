@@ -149,23 +149,43 @@ describe("advertised schema equals the procedure schema plus declared overlays",
       // Independent of the generator: straight zod -> JSON Schema, then only
       // the overlay tables above are applied. Every root keyword (`oneOf`,
       // `additionalProperties`, `$schema`, ...) stays in the comparison.
-      const base: Json = toInputJsonSchema(input ?? z.looseObject({}));
+      const base = z.toJSONSchema(input ?? z.looseObject({}), {
+        io: "input",
+        unrepresentable: "any",
+      }) as Json;
       const { properties: baseProperties, required: baseRequiredRaw, ...root } = base;
       const json = advertised(tool);
-      const props = json.properties as Record<string, unknown>;
       const forbidden = FORBIDDEN[tool.name]?.fields ?? [];
-      const owned = new Set<string>([
-        ...forbidden,
-        ...(EMPTY_ARRAY[tool.name] ?? []),
-        ...(DATE_FIELDS[tool.name] ?? []),
-        ...(tool.confirmation === null ? [] : ["confirm"]),
-      ]);
-      // Overlay property SHAPES are pinned by the overlay tests below; here
-      // only their presence is taken from the advertised schema.
+      // Overlay property shapes are written out literally here (descriptions
+      // that name a replacement tool are matched by the tool name).
       const expectedProps: Record<string, unknown> = { ...(baseProperties as Json) };
-      for (const key of owned) {
-        expect(props).toHaveProperty(key);
-        expectedProps[key] = props[key];
+      for (const key of FORBIDDEN[tool.name]?.fields ?? []) {
+        expectedProps[key] = {
+          not: {},
+          description: expect.stringContaining(FORBIDDEN[tool.name]!.names),
+        };
+      }
+      for (const key of EMPTY_ARRAY[tool.name] ?? []) {
+        expectedProps[key] = {
+          type: "array",
+          maxItems: 0,
+          description: expect.stringContaining("forwarder_provider_member_add"),
+        };
+      }
+      for (const key of DATE_FIELDS[tool.name] ?? []) {
+        expectedProps[key] = {
+          type: "string",
+          format: "date-time",
+          description:
+            "RFC 3339 UTC timestamp in the exact form YYYY-MM-DDTHH:MM:SS[.fff]Z (no offsets).",
+        };
+      }
+      if (tool.confirmation !== null) {
+        expectedProps.confirm = {
+          type: "string",
+          const: tool.confirmation,
+          description: `Must be exactly "${tool.confirmation}" to confirm this call.`,
+        };
       }
       const expectedRequired = [
         ...new Set([
