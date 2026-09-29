@@ -80,8 +80,12 @@ fails with `timeout` or `offline` carries `error.outcome: "unknown"`: call
 Operations are never queued and time out after 30 seconds (search and hashing have shorter
 CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
 windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
-request), write content is at most 1 MiB, and an edit request must fit one 64 KiB relay
-frame. Errors are in-band `isError` results with a stable `error.code`: the command codes
+request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
+DECODED, and the whole request of any file tool must fit one 64 KiB relay frame (the
+first-stage input bound). The 1 MB `/mcp` request-body cap that every call shares is the
+real ceiling on the encoded form, so a base64 write arrives at roughly 786 KiB decoded or
+less (it encodes to 4/3 of that); larger bodies need chunking by the client. Errors are
+in-band `isError` results with a stable `error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,

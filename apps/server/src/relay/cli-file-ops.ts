@@ -353,8 +353,13 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
       dispatched = false;
     }
     if (!dispatched) {
+      // Nothing was sent, so the CLI will never answer: drop the record from
+      // both maps the dispatch could have filled (a send throw leaves the
+      // session entry behind) and resolve the mode refusal without an unknown
+      // outcome.
       pendingById.delete(opId);
       record.settled = true;
+      relaySessionManager.forgetFileOp(record.cliDeviceId, opId);
       const refusal = relaySessionManager.fileOpModeRefusal(input.cliDeviceId, opClass);
       resolve({ ok: false, code: refusal ?? "offline" });
       return;

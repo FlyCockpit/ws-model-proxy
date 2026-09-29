@@ -291,11 +291,22 @@ function withInputSizeBound<T extends z.ZodType>(schema: T, maxBytes?: number) {
 }
 
 /**
- * `forwarder_cli_file_write` carries up to 1 MiB of content (base64 grows it
- * by a third), so its first-stage bound is the content cap plus headroom for
- * the other fields; the raw wire stays bounded by the 1 MiB body cap.
+ * `forwarder_cli_file_write` advertises `content` at most
+ * {@link FILE_BODY_MAX_BYTES} DECODED. Base64 encodes 3 bytes into 4
+ * characters, so a 1 MiB body arrives as ~1.4 MiB of JSON text: this
+ * first-stage bound sizes the guard for the ENCODED form (4/3 of the cap
+ * plus headroom for the other fields), and the decoded body stays capped at
+ * {@link FILE_BODY_MAX_BYTES} in `adaptFileToolInput`. It is only the
+ * first-stage zod guard — the raw HTTP body is capped at 1 MiB by
+ * `mcpBodyCap` (`apps/server/src/mcp-rate-limit.ts`), which is the
+ * advertised limit for every /mcp call, so this bound is budget, not
+ * framing.
  */
-const FILE_WRITE_INPUT_MAX_BYTES = FILE_BODY_MAX_BYTES + 16 * 1024;
+/** Headroom for the write tool's other fields: path, etag, mode, reason, cliDeviceId. */
+const FILE_WRITE_INPUT_FIELD_HEADROOM_BYTES = 64 * 1024;
+/** Base64 expansion of the DECODED body cap, plus the field headroom. */
+const FILE_WRITE_INPUT_MAX_BYTES =
+  Math.ceil((FILE_BODY_MAX_BYTES * 4) / 3) + FILE_WRITE_INPUT_FIELD_HEADROOM_BYTES;
 
 /** Loose passthrough object — the procedure's zod input stays the authority. */
 function anyArgs(): StandardSchemaWithJSON {

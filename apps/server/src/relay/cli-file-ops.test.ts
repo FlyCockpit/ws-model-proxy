@@ -610,6 +610,36 @@ describe("cli file ops", () => {
       });
     });
 
+    it("maps the wire-level bad_frame refusal to io_error for a read and for a mutation (no raw code leaks)", async () => {
+      // `bad_frame` is a CLI-side framing refusal: the request never reached
+      // the filesystem, so the caller must see the documented io_error and a
+      // mutation must NOT carry an unknown outcome.
+      const socket = await connect();
+      const read = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "bad_frame",
+        }),
+      );
+      await expect(read).resolves.toEqual({ ok: false, code: "io_error" });
+
+      const edit = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "bad_frame",
+        }),
+      );
+      await expect(edit).resolves.toEqual({ ok: false, code: "io_error" });
+    });
+
     it("drops answers for unknown ops and answers from another session, without closing", async () => {
       const socket = await connect("desktop");
       const other = await connect("laptop");
@@ -944,6 +974,75 @@ describe("cli file ops", () => {
       await relaySessionManager.removeSession(socket);
       await expect(read).resolves.toEqual({ ok: false, code: "offline" });
       await expect(write).resolves.toEqual({ ok: false, code: "offline", outcome: "unknown" });
+    });
+
+    it("leaves no dead record behind when the send itself throws (G5)", async () => {
+      const socket = await connect();
+      // Registered before the send (session-manager dispatchFileOp stores then
+      // sends), so a throwing send must be forgotten by the refusal path or the
+      // record would sit in filesById until teardown and hold the per-CLI slot.
+      vi.spyOn(socket, "send").mockImplementation(() => {
+        throw new Error("socket send failed");
+      });
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+      ).resolves.toEqual({ ok: false, code: "offline" });
+      const session = (
+        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
+          string,
+          { filesById: Map<string, { markLost(cause: string): void }> }
+        >
+      ).get("desktop");
+      const abandoned = [...(session?.filesById.values() ?? [])];
+      expect(abandoned).toEqual([]);
+      // No dead entry counts against the per-CLI limit or leaks into a
+      // follow-up op once the socket works again.
+      vi.mocked(socket.send).mockRestore();
+      const next = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(next).resolves.toMatchObject({ ok: true });
+    });
+
+    it("runs settle EXACTLY once per record (no double-fire after a terminal outcome)", async () => {
+      // `record.resolve` and the map deletes are idempotent, so the once-only
+      // guard is observed by COUNTERS: the #132 audit hook (the TODO in
+      // settle) is the next thing that depends on it, and a re-delivered
+      // frame or a session sweep can reach the same record again. Drive two
+      // terminal answers at one tracked record and count settle's effects.
+      const socket = await connect();
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      const opId = lastOpId(socket);
+      const session = (
+        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
+          string,
+          { filesById: Map<string, { markLost(cause: string): void }> }
+        >
+      ).get("desktop");
+      // Captured BEFORE the answer, because settle forgets it on success.
+      const tracked = session?.filesById.get(opId);
+      expect(tracked).toBeDefined();
+      const forget = vi.spyOn(relaySessionManager, "forgetFileOp");
+      const cancel = vi.spyOn(relaySessionManager, "dispatchFileCancel");
+      await answer(socket, resultFor(opId, "read", readResult));
+      await expect(outcome).resolves.toMatchObject({ ok: true });
+      expect(forget).toHaveBeenCalledTimes(1);
+      // A duplicate terminal answer (re-delivered frame or a later sweep)
+      // must not settle it again. Reading the maps also holds the record
+      // shape itself: a second settle would delete a DIFFERENT opId.
+      await answer(socket, resultFor(opId, "read", readResult));
+      await answer(socket, JSON.stringify({ type: "file.rejected", opId, reason: "cancelled" }));
+      tracked?.markLost("offline");
+      expect(forget).toHaveBeenCalledTimes(1);
+      expect(forget).toHaveBeenLastCalledWith("desktop", opId);
+      expect(session?.filesById.size).toBe(0);
+      expect(cancel.mock.calls.length).toBe(0);
     });
 
     it("ends in-flight ops with the refusal the mode now gives when the grant drops", async () => {

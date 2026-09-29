@@ -126,12 +126,17 @@ function toolCallRequest(id: number, tool: string, args: unknown = {}) {
       "mcp-method": "tools/call",
       "mcp-name": tool,
     },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: { name: tool, arguments: args, _meta: ENVELOPE },
-    }),
+    body: toolCallBody(tool, args, id),
+  });
+}
+
+/** The exact JSON-RPC body a `tools/call` sends (byte length is what the /mcp body cap measures). */
+function toolCallBody(tool: string, args: unknown, id = 1) {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: tool, arguments: args, _meta: ENVELOPE },
   });
 }
 
@@ -1975,6 +1980,16 @@ describe("CLI file tools", () => {
     expect(edit?.description).toContain("expectedEtag");
     expect(edit?.description).toContain("forwarder_cli_file_stat");
     expect(edit?.description).toContain('confirm: "RUN"');
+    // G3: the 64 KiB request-fit rule is stated on the tools whose advertised
+    // maxima can exceed it (stat's 50 paths, list/search patterns), and the
+    // read note names the escape-dense too_large case.
+    const stat = tools.find((tool) => tool.name === "forwarder_cli_file_stat");
+    const list = tools.find((tool) => tool.name === "forwarder_cli_dir_list");
+    const search = tools.find((tool) => tool.name === "forwarder_cli_file_search");
+    for (const tool of [stat, list, search, edit]) {
+      expect(tool?.description).toContain("64 KiB relay frame");
+    }
+    expect(read?.description).toContain("escape-dense");
     expect(read?.annotations?.readOnlyHint).toBe(true);
     expect(edit?.annotations?.readOnlyHint).toBe(false);
     const listing = await (async () => {
@@ -2291,5 +2306,85 @@ describe("CLI file tools", () => {
     );
     expect(result.isError).toBe(true);
     expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+  });
+
+  it("accepts a base64 write at the 1 MiB decoded cap through the advertised schema (G2)", async () => {
+    // The base64 text of a 1 MiB body is ~1.4 MiB, so the schema's
+    // first-stage input bound must be sized for the ENCODED form. The row
+    // below is exactly what the old `FILE_BODY_MAX_BYTES + 16 KiB` bound
+    // refused before `adaptFileToolInput` ever decoded it. (The matching
+    // JSON-RPC request then exceeds the 1 MB /mcp body cap, so on the real
+    // wire this size is refused in transport, not by this guard; the guard
+    // must not be the thing that refuses a body the tool advertises.)
+    const schema = requireDescriptor("forwarder_cli_file_write").inputSchema;
+    const argsFor = (content: string) => ({
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content,
+    });
+    const full = Buffer.alloc(1024 * 1024, 0x41).toString("base64");
+    expect(Buffer.from(full, "base64").length).toBe(1024 * 1024);
+    const fullValidated = (await schema["~standard"].validate(argsFor(full))) as {
+      issues?: unknown[];
+    };
+    expect(fullValidated.issues).toBeUndefined();
+
+    // The largest request that can actually arrive under the 1 MB /mcp body
+    // cap still round-trips end to end: decode → body → relay op.
+    const overhead = new TextEncoder().encode(
+      toolCallBody("forwarder_cli_file_write", argsFor("")),
+    ).length;
+    const contentLength = Math.floor((1024 * 1024 - overhead) / 4) * 4;
+    const content = "A".repeat(contentLength);
+    const args = argsFor(content);
+    expect(
+      new TextEncoder().encode(toolCallBody("forwarder_cli_file_write", args)).length,
+    ).toBeLessThanOrEqual(1024 * 1024);
+    const decoded = (contentLength / 4) * 3;
+    expect(decoded).toBeGreaterThan(700 * 1024);
+    expect(decoded).toBeLessThanOrEqual(1024 * 1024);
+
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "write",
+      result: { etag: "h:AAAAAAAAAAAAAAAAAAAAAA", size: decoded, created: true },
+    });
+    const result = await call("forwarder_cli_file_write", args);
+    expect(result.isError).toBeUndefined();
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0].body?.byteLength).toBe(decoded);
+  });
+
+  it("refuses a base64 write whose body would decode past the decoded cap (G2 inverse)", async () => {
+    const schema = requireDescriptor("forwarder_cli_file_write").inputSchema;
+    // A JSON input far above the first-stage bound is refused there (one size issue).
+    const oversized = {
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content: "A".repeat(1500 * 1024),
+    };
+    const guarded = (await schema["~standard"].validate(oversized)) as {
+      issues?: { message: string }[];
+    };
+    expect(guarded.issues).toHaveLength(1);
+    expect(guarded.issues?.[0]?.message).toContain("input exceeds the maximum size");
+
+    // And an input UNDER the guard whose decoded body exceeds 1 MiB is refused
+    // as invalid_input by the decoded-body cap, before any op runs.
+    fileRuntime.runFileOp.mockClear();
+    const decoded = Buffer.alloc(1024 * 1024 + 1, 1).toString("base64");
+    const result = await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content: decoded,
+    });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("invalid_input");
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 });
