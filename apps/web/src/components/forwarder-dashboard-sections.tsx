@@ -755,7 +755,7 @@ export function CliEndpointsModelsSection() {
       ) : (
         <div className="space-y-4">
           {matchingDevices.map((device) => (
-            <div key={device.id} className="rounded-md border">
+            <div key={device.id} id={`cli-${device.id}`} className="scroll-mt-20 rounded-md border">
               <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -766,23 +766,33 @@ export function CliEndpointsModelsSection() {
                     ) : null}
                     {device.upgradeRequired ? (
                       <StatusPill status="OFFLINE">
-                        {t("dashboard:clis.upgradeRequired", {
-                          protocol:
-                            device.upgradeRequired.protocolVersion ??
-                            t("dashboard:clis.upgradeUnknownProtocol"),
-                        })}
+                        {t(
+                          device.upgradeRequired.reason === "cli_too_new"
+                            ? "dashboard:clis.serverUpgradeRequired"
+                            : "dashboard:clis.upgradeRequired",
+                          {
+                            protocol:
+                              device.upgradeRequired.protocolVersion ??
+                              t("dashboard:clis.upgradeUnknownProtocol"),
+                          },
+                        )}
                       </StatusPill>
                     ) : null}
                   </div>
                   <p className="mt-1 font-mono text-xs text-muted-foreground">{device.slug}</p>
                   {device.upgradeRequired ? (
                     <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
-                      {t("dashboard:clis.upgradeRequiredDetail", {
-                        version:
-                          device.upgradeRequired.cliVersion ??
-                          t("dashboard:clis.upgradeUnknownVersion"),
-                        value: formatDate(device.upgradeRequired.rejectedAt),
-                      })}
+                      {t(
+                        device.upgradeRequired.reason === "cli_too_new"
+                          ? "dashboard:clis.serverUpgradeRequiredDetail"
+                          : "dashboard:clis.upgradeRequiredDetail",
+                        {
+                          version:
+                            device.upgradeRequired.cliVersion ??
+                            t("dashboard:clis.upgradeUnknownVersion"),
+                          value: formatDate(device.upgradeRequired.rejectedAt),
+                        },
+                      )}
                     </p>
                   ) : null}
                   <p className="mt-2 text-xs text-muted-foreground">
@@ -1684,6 +1694,8 @@ export function PoolForm({
     affinityPrefixWeight: z.number().int().min(0).max(10_000),
     affinityConversationWeight: z.number().int().min(0).max(10_000),
     affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
+    cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
+    cacheHolderWaitMs: z.number().int().min(0).max(30_000),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1767,6 +1779,9 @@ export function PoolForm({
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
       affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
       affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
+      // S-A cache-holder wait: null = automatic; 0 = off; N = fixed ms.
+      cacheHolderWaitMode: (pool?.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
+      cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1858,6 +1873,8 @@ export function PoolForm({
             affinityPrefixWeight: value.affinityPrefixWeight,
             affinityConversationWeight: value.affinityConversationWeight,
             affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+            cacheHolderWaitMs:
+              value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
           }
         : {};
       if (mode === "create") {
@@ -1881,6 +1898,7 @@ export function PoolForm({
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+          cacheHolderWaitMs: value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
         });
         toast.success(t("dashboard:pools.created"));
         onSuccess();
@@ -2082,6 +2100,47 @@ export function PoolForm({
               </form.Field>
             ))}
           </div>
+          <form.Field name="cacheHolderWaitMode">
+            {(modeField) => (
+              <div className="mt-4 min-w-0 space-y-2">
+                <Label htmlFor="cacheHolderWaitMode">
+                  {t("dashboard:pools.affinity.fields.cacheHolderWaitMs")}
+                </Label>
+                <select
+                  id="cacheHolderWaitMode"
+                  className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                  value={modeField.state.value}
+                  onChange={(event) =>
+                    modeField.handleChange(event.target.value as "AUTO" | "FIXED")
+                  }
+                >
+                  <option value="AUTO">{t("dashboard:pools.affinity.cacheHolderWait.auto")}</option>
+                  <option value="FIXED">
+                    {t("dashboard:pools.affinity.cacheHolderWait.fixed")}
+                  </option>
+                </select>
+                {modeField.state.value === "FIXED" ? (
+                  <form.Field name="cacheHolderWaitMs">
+                    {(field) => (
+                      <Input
+                        id="cacheHolderWaitMs"
+                        className="min-h-11"
+                        type="number"
+                        min={0}
+                        max={30000}
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(Number(event.target.value))}
+                        aria-label={t("dashboard:pools.affinity.cacheHolderWait.valueLabel")}
+                      />
+                    )}
+                  </form.Field>
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pools.affinity.cacheHolderWait.hint")}
+                </p>
+              </div>
+            )}
+          </form.Field>
           <p className="mt-3 text-xs text-muted-foreground">
             {t("dashboard:pools.affinity.privacy")}
           </p>
@@ -4056,7 +4115,7 @@ export function RelayMetadataSection() {
                   <td className="p-3 align-top tabular-nums">{numberOrDash(row.attemptCount)}</td>
                   <td className="p-3 align-top" title={row.affinityReason ?? undefined}>
                     {row.affinityOutcome
-                      ? `${row.affinityOutcome} · ${row.affinityScore ?? 0} · ${row.affinityPrefixDepth ?? 0}`
+                      ? `${row.affinityOutcome} · ${row.affinityScore ?? 0} · ${row.affinityPrefixDepth ?? 0}${row.affinityWaitMs != null ? ` · ${t("dashboard:relay.affinityWait", { ms: row.affinityWaitMs })}` : ""}`
                       : "—"}
                   </td>
                   <td className="p-3 align-top font-mono">

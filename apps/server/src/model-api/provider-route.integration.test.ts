@@ -1219,6 +1219,696 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     },
   );
 
+  /** The grantee's token and a send claim for the owner's first provider member. */
+  async function granteeClaimFixture() {
+    if (!modules) throw new Error("modules unavailable");
+    const publicOverflow = await import("./public-overflow.js");
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      grantee: true,
+    });
+    if (!result.grant) throw new Error("grant unavailable");
+    const token = await modules.prisma.modelApiToken.findFirstOrThrow({
+      where: { userId: result.requester.id, name: "Provider route token" },
+    });
+    const [target] = (
+      await publicOverflow.listPublicOverflowTargets(result.user.id, result.pool.id)
+    ).targets;
+    if (!target) throw new Error("provider target unavailable");
+    const claim = () =>
+      publicOverflow.claimPublicProviderCredentialForSend({
+        userId: result.user.id,
+        target,
+        keyring: modules!.credentials.parseProviderCredentialKeyring(
+          process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS!,
+        ),
+        consent: {
+          requesterUserId: result.requester.id,
+          modelApiTokenId: token.id,
+          poolId: result.pool.id,
+          ownerUserId: result.user.id,
+          accessGrantId: result.grant!.id,
+        },
+      });
+    const credentialLastUsed = async () =>
+      (
+        await modules!.prisma.providerCredential.findUniqueOrThrow({
+          where: { id: result.credentialId },
+          select: { lastUsedAt: true },
+        })
+      ).lastUsedAt;
+    return { result, token, claim, credentialLastUsed, publicOverflow };
+  }
+
+  async function databaseNow(): Promise<Date> {
+    if (!modules) throw new Error("modules unavailable");
+    const [row] = await modules.prisma.$queryRaw<
+      Array<{ now: Date }>
+    >`SELECT clock_timestamp() AS now`;
+    if (!row) throw new Error("database clock unavailable");
+    return row.now;
+  }
+
+  // C-3 and #76 on real PostgreSQL: the claim's account-state read
+  // (readRequesterValidity) for the requester and the pool owner, evaluated
+  // by the database against its statement clock.
+  it.each([
+    [
+      "requester banned indefinitely (banExpires NULL)",
+      "requester",
+      { banned: true, banExpires: null },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+    [
+      "requester deletion-marked",
+      "requester",
+      { deletionRequestedAt: new Date(), deletionGeneration: "g" },
+      "REQUESTER_ACCESS_BLOCKED",
+    ],
+    [
+      "owner banned indefinitely",
+      "owner",
+      { banned: true, banExpires: null },
+      "POOL_OWNER_INACTIVE",
+    ],
+    [
+      "owner temporarily banned",
+      "owner",
+      { banned: true, banExpires: new Date(Date.now() + 3_600_000) },
+      "POOL_OWNER_INACTIVE",
+    ],
+    [
+      "owner with an expired temporary ban",
+      "owner",
+      { banned: true, banExpires: new Date(Date.now() - 60_000) },
+      null,
+    ],
+    [
+      "owner deletion-marked",
+      "owner",
+      { deletionRequestedAt: new Date(), deletionGeneration: "g" },
+      "POOL_OWNER_INACTIVE",
+    ],
+  ] as const)("send claim with %s", async (_label, who, state, reason) => {
+    if (!modules) throw new Error("modules unavailable");
+    const { result, claim, credentialLastUsed } = await granteeClaimFixture();
+    await modules.prisma.user.update({
+      where: { id: who === "owner" ? result.user.id : result.requester.id },
+      data: state,
+    });
+    const before = await credentialLastUsed();
+    if (reason === null) {
+      await expect(claim()).resolves.toMatchObject({ claimed: true });
+      return;
+    }
+    await expect(claim()).resolves.toEqual({ claimed: false, reason });
+    expect(await credentialLastUsed()).toEqual(before);
+  });
+
+  // C-3: a ban that expires between two claims, both judged on the database
+  // statement clock. The expiry is taken from the database clock, so the
+  // refusal and the later admission do not depend on the test process clock.
+  // (An expiry exactly equal to the claim statement's timestamp is still an
+  // active ban: `banExpires < statement_timestamp()`; pinned in the unit
+  // tests of the SQL text, as no client can aim a write at a future
+  // statement's timestamp.)
+  it.each(["requester", "owner"] as const)(
+    "refuses while the %s's temporary ban is in force and admits once it expired",
+    async (who) => {
+      if (!modules) throw new Error("modules unavailable");
+      const { result, claim } = await granteeClaimFixture();
+      const expires = new Date((await databaseNow()).getTime() + 1_500);
+      await modules.prisma.user.update({
+        where: { id: who === "owner" ? result.user.id : result.requester.id },
+        data: { banned: true, banExpires: expires },
+      });
+      await expect(claim()).resolves.toEqual({
+        claimed: false,
+        reason: who === "owner" ? "POOL_OWNER_INACTIVE" : "REQUESTER_ACCESS_BLOCKED",
+      });
+      while ((await databaseNow()).getTime() <= expires.getTime())
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      await expect(claim()).resolves.toMatchObject({ claimed: true });
+    },
+    10_000,
+  );
+
+  // CF-b4: the exact-timestamp boundary of the ban expiry, on real PostgreSQL
+  // with a deterministic clock. No client can aim a write at a future
+  // statement's timestamp, so the recheck runs in a transaction whose search
+  // path puts a fixed `statement_timestamp()` ahead of pg_catalog (the schema
+  // and function exist only inside the rolled-back transaction). A ban that
+  // expires exactly at the statement's timestamp is still active
+  // (`banExpires < statement_timestamp()` is false); one millisecond earlier
+  // it is over.
+  it.each(["requester", "owner"] as const)(
+    "judges the %s's ban expiry exactly at the statement timestamp (deterministic clock)",
+    async (who) => {
+      if (!modules) throw new Error("modules unavailable");
+      const { recheckExternalSendRequesterValidity } = await import(
+        "@ws-model-proxy/api/lib/model-api-token-access"
+      );
+      const { result, token } = await granteeClaimFixture();
+      const fixed = new Date("2030-01-02T03:04:05.678Z");
+      const userId = who === "owner" ? result.user.id : result.requester.id;
+      const consent = {
+        requesterUserId: result.requester.id,
+        modelApiTokenId: token.id,
+        poolId: result.pool.id,
+        ownerUserId: result.user.id,
+        accessGrantId: result.grant!.id,
+      };
+      const denied = who === "owner" ? "POOL_OWNER_INACTIVE" : "REQUESTER_ACCESS_BLOCKED";
+      const recheckAt = async (expires: Date) => {
+        await modules!.prisma.user.update({
+          where: { id: userId },
+          data: { banned: true, banExpires: expires },
+        });
+        class Rollback extends Error {}
+        let outcome: unknown;
+        await modules!.prisma
+          .$transaction(async (tx) => {
+            await tx.$executeRawUnsafe("CREATE SCHEMA wsmp_fake_clock");
+            await tx.$executeRawUnsafe(
+              `CREATE FUNCTION wsmp_fake_clock.statement_timestamp() RETURNS timestamptz
+                 LANGUAGE sql STABLE AS $$ SELECT '${fixed.toISOString()}'::timestamptz $$`,
+            );
+            await tx.$executeRawUnsafe(
+              "SET LOCAL search_path = wsmp_fake_clock, pg_catalog, public",
+            );
+            const [clock] = await tx.$queryRawUnsafe<Array<{ now: Date }>>(
+              "SELECT statement_timestamp() AS now",
+            );
+            // The shadow function really is the clock the recheck will read.
+            expect(clock?.now.getTime()).toBe(fixed.getTime());
+            outcome = await recheckExternalSendRequesterValidity(tx, consent);
+            throw new Rollback();
+          })
+          .catch((error) => {
+            if (!(error instanceof Rollback)) throw error;
+          });
+        return outcome;
+      };
+      expect(await recheckAt(fixed)).toBe(denied);
+      expect(await recheckAt(new Date(fixed.getTime() + 1))).toBe(denied);
+      expect(await recheckAt(new Date(fixed.getTime() - 1))).toBeNull();
+    },
+    20_000,
+  );
+
+  // C-3: the token's scope mode switches from ALL_VISIBLE (listing) to
+  // ALLOWLIST before the claim; the claim applies the allowlist it sees.
+  it("applies an ALLOWLIST scope switch made between listing and the claim", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const { result, token, claim } = await granteeClaimFixture();
+    await modules.prisma.modelApiToken.update({
+      where: { id: token.id },
+      data: { scopeMode: "ALLOWLIST" },
+    });
+    await expect(claim()).resolves.toEqual({
+      claimed: false,
+      reason: "CALLER_CONSENT_WITHDRAWN",
+    });
+    const entry = await modules.prisma.modelApiTokenAllowlistEntry.create({
+      data: {
+        modelApiTokenId: token.id,
+        target: "MODEL_POOL",
+        modelPoolId: result.pool.id,
+        includeExternal: false,
+      },
+    });
+    await expect(claim()).resolves.toEqual({
+      claimed: false,
+      reason: "CALLER_CONSENT_WITHDRAWN",
+    });
+    await modules.prisma.modelApiTokenAllowlistEntry.update({
+      where: { id: entry.id },
+      data: { includeExternal: true },
+    });
+    await expect(claim()).resolves.toMatchObject({ claimed: true });
+    await modules.prisma.modelApiToken.update({
+      where: { id: token.id },
+      data: { scopeMode: "ALL_VISIBLE" },
+    });
+    await expect(claim()).resolves.toMatchObject({ claimed: true });
+  });
+
+  // #76: a banned (active ban) or deletion-marked owner's pool is hidden from
+  // grantees and refused on use; it returns when a temporary ban expires.
+  it("hides a banned or deletion-marked owner's pool from grantees and refuses its use", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const { listVisibleModelTargetsForUser } = await import(
+      "@ws-model-proxy/api/lib/model-api-token-access"
+    );
+    const { result, publicOverflow } = await granteeClaimFixture();
+    const visible = async () =>
+      (await listVisibleModelTargetsForUser(result.requester.id)).modelPools.map((pool) => pool.id);
+    const request = () =>
+      result.app.request("/chat/completions", {
+        method: "POST",
+        headers: bearerHeaders(result.rawToken, true),
+        body: JSON.stringify({
+          model: result.modelId,
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+    const listed = async () => {
+      const response = await result.app.request("/models", {
+        headers: bearerHeaders(result.rawToken),
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { data: Array<{ id: string }> };
+      return body.data.map((model) => model.id);
+    };
+    const plainModelId = result.modelId.replace(/:external$/, "");
+    const listsPool = async () => (await listed()).some((id) => id.startsWith(plainModelId));
+    expect(await visible()).toEqual([result.pool.id]);
+    expect(await listsPool()).toBe(true);
+    const observations = upstreamObservations.length;
+
+    // C1b-4: the provider listing itself reports the owner's state, so the
+    // pre-admission gate does not rest on the consent SQL alone.
+    const ownerActiveInListing = async () =>
+      (await publicOverflow.listPublicOverflowTargets(result.user.id, result.pool.id)).ownerActive;
+    expect(await ownerActiveInListing()).toBe(true);
+    const expectHiddenAndRefused = async () => {
+      expect(await visible()).toEqual([]);
+      expect(await ownerActiveInListing()).toBe(false);
+      expect(await listsPool()).toBe(false);
+      const refused = await request();
+      expect(refused.status).toBe(404);
+      await refused.text();
+    };
+    for (const state of [
+      { banned: true, banExpires: null },
+      { banned: true, banExpires: new Date(Date.now() + 3_600_000) },
+    ]) {
+      await modules.prisma.user.update({ where: { id: result.user.id }, data: state });
+      await expectHiddenAndRefused();
+      await modules.prisma.user.update({
+        where: { id: result.user.id },
+        data: { banned: null, banExpires: null },
+      });
+    }
+
+    // An expired temporary ban no longer hides or refuses the pool.
+    await modules.prisma.user.update({
+      where: { id: result.user.id },
+      data: { banned: true, banExpires: new Date(Date.now() - 60_000) },
+    });
+    expect(await visible()).toEqual([result.pool.id]);
+    expect(await ownerActiveInListing()).toBe(true);
+    const served = await request();
+    expect(served.status).toBe(200);
+    await served.text();
+    const observationsBeforeMark = upstreamObservations.length;
+
+    // A deletion mark last: only the deletion subsystem may clear it
+    // (user_deletion_marker_guard), so it is never reset here.
+    await modules.prisma.user.update({
+      where: { id: result.user.id },
+      data: {
+        banned: null,
+        banExpires: null,
+        deletionRequestedAt: new Date(),
+        deletionGeneration: crypto.randomUUID(),
+      },
+    });
+    await expectHiddenAndRefused();
+    // Nothing reached the provider while the owner was inactive.
+    expect(upstreamObservations.length - observationsBeforeMark).toBe(0);
+    expect(observationsBeforeMark - observations).toBe(1);
+  }, 15_000);
+
+  // L1b on real PostgreSQL: while the claim waits on a provider_account row
+  // held by another transaction (as budget accounting holds it), it holds the
+  // token FOR SHARE. The token's per-request lastUsedAt write must not queue
+  // behind it, and the claim's own wait is bounded by its lock_timeout.
+  it("bounds the claim's provider-account wait and never blocks token use behind it", async () => {
+    if (!modules || !db) throw new Error("modules unavailable");
+    const { authenticateModelApiTokenSecret } = await import(
+      "@ws-model-proxy/api/lib/model-api-token-access"
+    );
+    const { result, token, claim, credentialLastUsed, publicOverflow } =
+      await granteeClaimFixture();
+    const stale = new Date(Date.now() - 5 * 60_000);
+    await modules.prisma.modelApiToken.update({
+      where: { id: token.id },
+      data: { lastUsedAt: stale },
+    });
+    const credentialBefore = await credentialLastUsed();
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    let holderLocked!: () => void;
+    const holderHoldsRow = new Promise<void>((resolve) => {
+      holderLocked = resolve;
+    });
+    const holder = db.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${result.account.id} FOR UPDATE`;
+        holderLocked();
+        await holderGate;
+      },
+      { maxWait: 10_000, timeout: 30_000 },
+    );
+    try {
+      await holderHoldsRow;
+      const startedAt = Date.now();
+      const pending = claim().then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      // Wait until the claim holds the token FOR SHARE and waits on the account.
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        const [row] = await db.$queryRaw<Array<{ waiting: bigint }>>`
+          SELECT count(*) AS waiting FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock'
+             AND query LIKE '%FROM provider_account WHERE id = %FOR UPDATE%'
+             AND pid <> pg_backend_pid()`;
+        if (row && row.waiting > 0n) break;
+        if (Date.now() > deadline) throw new Error("claim never waited on the account row");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // Control: a plain token write would queue behind the claim's share lock.
+      await expect(
+        db.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT set_config('lock_timeout', '200ms', true)`;
+          await tx.$executeRaw`UPDATE model_api_token SET "lastUsedAt" = now() WHERE id = ${token.id}`;
+        }),
+      ).rejects.toThrow(/lock timeout|55P03/i);
+      // Token use (authentication) completes at once and skips the write.
+      const authStartedAt = Date.now();
+      const identity = await authenticateModelApiTokenSecret(result.rawToken);
+      expect(Date.now() - authStartedAt).toBeLessThan(1_000);
+      expect(identity).toMatchObject({ id: token.id, lastUsedAt: stale });
+      // The claim gives up after its lock_timeout: nothing claimed or sent.
+      const outcome = await pending;
+      const elapsed = Date.now() - startedAt;
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(String(outcome.error)).toMatch(/lock timeout|55P03/i);
+      expect(elapsed).toBeGreaterThanOrEqual(
+        publicOverflow.EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS - 100,
+      );
+      expect(elapsed).toBeLessThan(publicOverflow.EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS + 3_000);
+      // G1b-2: the documented bound itself (2 s), not only the constant.
+      expect(publicOverflow.EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS).toBe(2_000);
+      expect(elapsed).toBeLessThan(5_000);
+      expect(await credentialLastUsed()).toEqual(credentialBefore);
+    } finally {
+      releaseHolder();
+      await holder;
+    }
+    // Once the account is free the claim succeeds, and token use records again.
+    await expect(claim()).resolves.toMatchObject({ claimed: true });
+    const recorded = await authenticateModelApiTokenSecret(result.rawToken);
+    expect(recorded?.lastUsedAt?.getTime()).toBeGreaterThan(stale.getTime());
+  }, 20_000);
+
+  /**
+   * Holds the provider account FOR NO KEY UPDATE (the claim's account FOR
+   * UPDATE waits on it; budget admission's FK KEY SHARE does not), runs
+   * `during` once a backend waits on that lock, then `beforeCommit` inside the
+   * holder, and commits. The poll matches the account lock statement; call
+   * the claim directly (fence allocation runs the same statement earlier in
+   * a request, so an end-to-end request would be caught before its claim).
+   */
+  async function whileClaimWaitsOnAccount(
+    accountId: string,
+    during: () => Promise<void>,
+    beforeCommit: (
+      tx: import("@ws-model-proxy/db").Prisma.TransactionClient,
+    ) => Promise<void> = async () => undefined,
+  ) {
+    return whileClaimWaits(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${accountId} FOR NO KEY UPDATE`;
+      },
+      "%FROM provider_account WHERE id = %FOR UPDATE%",
+      during,
+      beforeCommit,
+    );
+  }
+
+  /**
+   * Holds the grantee's `pool_grant` row FOR NO KEY UPDATE. Only the send
+   * claim's C2 share lock waits on it, so an end-to-end request is caught
+   * inside its claim. Apply the change within the claim's 2 s lock_timeout.
+   */
+  async function whileClaimWaitsOnGrant(grantId: string, during: () => Promise<void>) {
+    return whileClaimWaits(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM pool_grant WHERE id = ${grantId} FOR NO KEY UPDATE`;
+      },
+      "%FROM pool_grant WHERE%FOR SHARE%",
+      during,
+      async () => undefined,
+    );
+  }
+
+  async function whileClaimWaits(
+    lock: (tx: import("@ws-model-proxy/db").Prisma.TransactionClient) => Promise<void>,
+    waiterQuery: string,
+    during: () => Promise<void>,
+    beforeCommit: (tx: import("@ws-model-proxy/db").Prisma.TransactionClient) => Promise<void>,
+  ) {
+    if (!db) throw new Error("database unavailable");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let locked!: () => void;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const holder = db.$transaction(
+      async (tx) => {
+        await lock(tx);
+        locked();
+        await gate;
+        await beforeCommit(tx);
+      },
+      { maxWait: 10_000, timeout: 60_000 },
+    );
+    await holding;
+    return {
+      holder,
+      async waitThenApply() {
+        const deadline = Date.now() + 10_000;
+        for (;;) {
+          const [row] = await db!.$queryRaw<Array<{ waiting: bigint }>>`
+            SELECT count(*) AS waiting FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock'
+               AND query LIKE ${waiterQuery}
+               AND pid <> pg_backend_pid()`;
+          if (row && row.waiting > 0n) break;
+          if (Date.now() > deadline) throw new Error("the claim never waited on the held row");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await during();
+        release();
+        await holder;
+      },
+    };
+  }
+
+  // #64 decision on real PostgreSQL: the target listed for the attempt is
+  // re-read by the send claim after its last lock wait. A change committed
+  // while the claim waits on the provider account is seen: nothing is claimed.
+  it.each([
+    // C1b-1 (#76): the owner's or requester's account, re-read after the wait.
+    ["owner banned", false, "POOL_OWNER_INACTIVE"],
+    ["owner deletion-marked", false, "POOL_OWNER_INACTIVE"],
+    ["requester banned", false, "REQUESTER_ACCESS_BLOCKED"],
+    ["member routing disabled", false, "PROVIDER_UNAVAILABLE"],
+    ["member removed", false, "PROVIDER_UNAVAILABLE"],
+    ["member removed", true, "BOUND_TARGET_INVALID"],
+    ["provider model disabled", false, "PROVIDER_UNAVAILABLE"],
+    ["endpoint version changed", false, "PROVIDER_UNAVAILABLE"],
+    ["endpoint version changed", true, "BOUND_TARGET_INVALID"],
+    // C6-3: a deleted account is target availability, not a claim failure.
+    ["provider account deleted", false, "PROVIDER_UNAVAILABLE"],
+    ["provider account deleted", true, "BOUND_TARGET_INVALID"],
+  ] as const)(
+    "refuses the send claim when the %s while it waits (binding %s)",
+    async (change, exactBinding, reason) => {
+      if (!modules) throw new Error("modules unavailable");
+      const { result, token, credentialLastUsed, publicOverflow } = await granteeClaimFixture();
+      const [target] = (
+        await publicOverflow.listPublicOverflowTargets(result.user.id, result.pool.id)
+      ).targets;
+      if (!target || !result.primaryMember) throw new Error("provider target unavailable");
+      const before = await credentialLastUsed();
+      const race = await whileClaimWaitsOnAccount(
+        result.account.id,
+        async () => {
+          if (change === "owner banned" || change === "requester banned")
+            await modules!.prisma.user.update({
+              where: { id: change === "owner banned" ? result.user.id : result.requester.id },
+              data: { banned: true, banExpires: null },
+            });
+          else if (change === "owner deletion-marked")
+            await modules!.prisma.user.update({
+              where: { id: result.user.id },
+              data: { deletionRequestedAt: new Date(), deletionGeneration: crypto.randomUUID() },
+            });
+          else if (change === "member routing disabled")
+            await modules!.prisma.poolMember.update({
+              where: { id: result.primaryMember.id },
+              data: { routingStatus: "DISABLED" },
+            });
+          else if (change === "member removed") {
+            await modules!.prisma.capacityLease.deleteMany({
+              where: { poolMemberId: result.primaryMember.id },
+            });
+            await modules!.prisma.poolMember.delete({ where: { id: result.primaryMember.id } });
+          } else if (change === "provider model disabled")
+            await modules!.prisma.providerModel.update({
+              where: { id: result.model.id },
+              data: { enabled: false },
+            });
+        },
+        async (tx) => {
+          // The account row is held by this transaction: change it here.
+          if (change === "provider account deleted")
+            await tx.providerAccount.update({
+              where: { id: result.account.id },
+              data: { deletedAt: new Date() },
+            });
+          if (change === "endpoint version changed")
+            await tx.providerAccount.update({
+              where: { id: result.account.id },
+              data: {
+                baseUrl: `${origin}/replacement`,
+                endpointIdentity: `${origin}/replacement`,
+                endpointVersion: { increment: 1 },
+              },
+            });
+        },
+      );
+      const pending = publicOverflow.claimPublicProviderCredentialForSend({
+        userId: result.user.id,
+        target,
+        keyring: modules.credentials.parseProviderCredentialKeyring(
+          process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS!,
+        ),
+        consent: {
+          requesterUserId: result.requester.id,
+          modelApiTokenId: token.id,
+          poolId: result.pool.id,
+          ownerUserId: result.user.id,
+          accessGrantId: result.grant!.id,
+        },
+        exactBinding,
+      });
+      await race.waitThenApply();
+      await expect(pending).resolves.toEqual({ claimed: false, reason });
+      expect(await credentialLastUsed()).toEqual(before);
+    },
+    20_000,
+  );
+
+  // End to end: the first external member is disabled while its send claim
+  // waits (C2, on the held grant row); the retry-safe chat request is served
+  // by the next member and nothing reaches the first member's provider.
+  it("serves a retry-safe request from the next member when the first changed before its claim", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      secondBehavior: "json",
+      grantee: true,
+    });
+    if (!result.primaryMember || !result.secondModel) throw new Error("members unavailable");
+    const observations = upstreamObservations.length;
+    if (!result.grant) throw new Error("grant unavailable");
+    const race = await whileClaimWaitsOnGrant(result.grant.id, async () => {
+      await modules!.prisma.poolMember.update({
+        where: { id: result.primaryMember.id },
+        data: { routingStatus: "DISABLED" },
+      });
+    });
+    const pending = result.app.request("/chat/completions", {
+      method: "POST",
+      headers: bearerHeaders(result.rawToken, true),
+      body: JSON.stringify({
+        model: result.modelId,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    await race.waitThenApply();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-served-model")).toBe("upstream-model-second");
+    await response.text();
+    const sent = upstreamObservations.slice(observations);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.authorization).toBe("Bearer route-provider-secret-second");
+    // The first member's attempt ended at the claim, never sent.
+    const deadline = Date.now() + 5_000;
+    let refused = 0;
+    while (Date.now() < deadline) {
+      refused = await modules.prisma.publicProviderAttemptEvent.count({
+        where: {
+          providerModelId: result.model.id,
+          eventType: "TERMINAL",
+          reason: "PROVIDER_UNAVAILABLE",
+        },
+      });
+      if (refused > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(refused).toBe(1);
+  }, 30_000);
+
+  // L1b: concurrent sends on one provider account race each send claim
+  // against the other requests' budget admission and settlement on the same
+  // account row. No deadlock, and every request is served.
+  it("races send claims against budget admission and settlement on one account", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const { result } = await granteeClaimFixture();
+    const responses = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        result.app.request("/chat/completions", {
+          method: "POST",
+          headers: bearerHeaders(result.rawToken, true),
+          body: JSON.stringify({
+            model: result.modelId,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        }),
+      ),
+    );
+    const statuses = await Promise.all(
+      responses.map(async (response) => {
+        await response.text();
+        return response.status;
+      }),
+    );
+    expect(statuses).toEqual(Array.from({ length: 6 }, () => 200));
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const settled = await modules.prisma.providerUsageLedger.count({
+        where: { providerModelId: result.model.id },
+      });
+      if (settled >= 7) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(
+      await modules.prisma.providerUsageLedger.count({
+        where: { providerModelId: result.model.id },
+      }),
+    ).toBe(7);
+  }, 30_000);
+
   it.each([
     "expiry",
     "endpoint",
@@ -1226,6 +1916,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     "target",
     "model",
     "account",
+    "account disable",
     "credential",
     "token",
     "external consent",
@@ -1278,6 +1969,12 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         where: { id: result.account.id },
         data: { deletedAt: new Date(), enabled: false },
       });
+    // C-3: a plain disable (not deleted) is restorable: 503, never 404.
+    else if (invalidation === "account disable")
+      await modules.prisma.providerAccount.update({
+        where: { id: result.account.id },
+        data: { enabled: false },
+      });
     else if (invalidation === "credential")
       await modules.prisma.$transaction(async (tx) => {
         await tx.providerAccount.update({
@@ -1315,7 +2012,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           ? 403
           : // A revoked credential on a disabled, undeleted account is restorable
             // (a new credential serves the same binding): transient, not gone.
-            invalidation === "credential"
+            invalidation === "credential" || invalidation === "account disable"
             ? 503
             : 404,
     );

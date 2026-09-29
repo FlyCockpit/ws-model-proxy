@@ -107,10 +107,12 @@ it("owner aggregate returns only a count after checking ownership", async () => 
     code: "NOT_FOUND",
   });
 });
+const ACTIVE_OWNER = { banned: null, banExpires: null, deletionRequestedAt: null };
 it("sets the exact live grant and checks requester-owned enabled resources", async () => {
-  db.poolGrant.findFirst.mockResolvedValue({ id: "grant" } as Awaited<
-    ReturnType<typeof prisma.poolGrant.findFirst>
-  >);
+  db.poolGrant.findFirst.mockResolvedValue({
+    id: "grant",
+    ModelPool: { User: ACTIVE_OWNER },
+  } as unknown as Awaited<ReturnType<typeof prisma.poolGrant.findFirst>>);
   db.providerModel.findFirst.mockResolvedValue({
     id: "model",
     providerAccountId: "account",
@@ -147,4 +149,48 @@ it("sets the exact live grant and checks requester-owned enabled resources", asy
       }),
     }),
   );
+});
+
+// K1a-1 (#76): an inactive owner's pool is hidden from the editor and cannot
+// be chosen; its saved preference row is kept (not deleted).
+it.each([
+  ["banned", { banned: true, banExpires: null, deletionRequestedAt: null }],
+  ["deletion-marked", { banned: false, banExpires: null, deletionRequestedAt: new Date() }],
+] as const)("hides and refuses a pool whose owner is %s", async (_label, owner) => {
+  const grant = (id: string, user: typeof owner | typeof ACTIVE_OWNER) => ({
+    id: `grant-${id}`,
+    ModelPool: {
+      id,
+      name: id,
+      slug: id,
+      externalEquivalentModel: "gpt",
+      User: { slug: "alice", ...user },
+    },
+    FallbackPreferences: [],
+  });
+  db.poolGrant.findMany.mockResolvedValue([
+    grant("inactive", owner),
+    grant("active", ACTIVE_OWNER),
+  ] as unknown as Awaited<ReturnType<typeof prisma.poolGrant.findMany>>);
+  db.modelApiToken.findMany.mockResolvedValue([]);
+  const listed = await client.list();
+  expect(listed.pools.map((pool) => pool.id)).toEqual(["active"]);
+
+  db.poolGrant.findFirst.mockResolvedValue({
+    id: "grant-inactive",
+    ModelPool: { User: owner },
+  } as unknown as Awaited<ReturnType<typeof prisma.poolGrant.findFirst>>);
+  // C2-4: every other precondition holds, so only the owner check can refuse.
+  db.providerModel.findFirst.mockResolvedValue({
+    id: "model",
+    providerAccountId: "account",
+  } as Awaited<ReturnType<typeof prisma.providerModel.findFirst>>);
+  db.poolFallbackPreference.upsert.mockResolvedValue({ providerModelId: "model" } as Awaited<
+    ReturnType<typeof prisma.poolFallbackPreference.upsert>
+  >);
+  await expect(client.set({ poolId: "inactive", providerModelId: "model" })).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+  expect(db.poolFallbackPreference.upsert).not.toHaveBeenCalled();
+  expect(db.poolFallbackPreference.deleteMany).not.toHaveBeenCalled();
 });

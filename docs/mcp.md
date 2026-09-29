@@ -218,8 +218,9 @@ dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
 `provider_audit_events_list` (`poolId` filters one pool's history) and shown
 as the fallback change history on the pool's Fallback tab in the dashboard.
 The tool description also lists the preconditions an agent otherwise sees only
-as "Invalid input". The general pool tools reject the two switches and point to
-this tool; they still accept `externalAfterWaitMs`, and their descriptions
+as a plain "Invalid input". The general pool tools reject the two switches (the
+advertised schema describes each as forbidden and names this tool); they still
+accept `externalAfterWaitMs`, and their descriptions
 state its cost.
 
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
@@ -237,6 +238,26 @@ searches the output for every seeded secret value in every encoding. The CLI
 command tools return what a command printed on your own CLI device (behind the
 separate `allowCliCommands` consent); WMP credentials in that text are
 scrubbed, but other device content is returned as printed.
+Three independent switches gate each command (the token, the device's dashboard
+grant and the CLI's own config); see [CLI command switches](cli-command-switches.md).
+
+## Tool input schemas
+
+Each procedure-backed tool advertises the JSON Schema of its real oRPC input
+(generated from the procedure's zod schema, so required fields such as
+`poolId` show up in `tools/list`), plus the few fields MCP itself owns:
+
+- `confirm`: the exact literal (`DELETE` or `RUN`), required on gated tools;
+- fields an agent must not use, advertised as `{ "not": {} }` with a
+  `description` that names the tool to use instead (the pool fallback switches
+  point to `forwarder_pool_fallback_update`; `allowDataCollection` is
+  dashboard-only);
+- timestamp filters, advertised as RFC 3339 UTC strings.
+
+The generator lives in `apps/server/src/mcp/input-schema.ts`, and a test
+compares every tool's advertised schema with its procedure schema. The schema
+is advisory: the oRPC procedure still validates every call, so a client that
+ignores the schema gets the same checks.
 
 ## Tool errors
 
@@ -266,6 +287,28 @@ A deletion-related `CONFLICT` also carries a stable `reason`
 | `deletion_in_progress` | The user is being deleted and cannot be restored. | Nothing. |
 
 Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
+
+A `BAD_REQUEST` caused by invalid arguments also lists what was wrong, in the
+text (`Invalid input: poolId: Invalid input: expected string, received
+undefined`) and in `structuredContent`:
+
+```json
+{
+  "error": {
+    "code": "BAD_REQUEST",
+    "issues": [{ "path": ["poolId"], "code": "invalid_type", "message": "Invalid input: expected string, received undefined" }]
+  }
+}
+```
+
+`path` names the failing field (array indexes are numbers; a segment that is
+not a field the tool declares is `"?"`), `code` is the validator's issue code (anything outside a short allowlist
+of standard codes is reported as `invalid`),
+and `message` is the validator's own text. Input values are never echoed:
+messages that could quote a value (`custom`, `unrecognized_keys`, unknown
+codes) are replaced by fixed text, and at most 20 issues are returned. A
+`BAD_REQUEST` the procedure raises for a reason other than argument shape
+(for example a failed precondition) stays the plain "Invalid input".
 
 ## Login, consent, and scope step-up
 

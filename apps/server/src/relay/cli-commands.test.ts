@@ -141,6 +141,12 @@ async function connect(
   return socket;
 }
 
+/** Closes every session and clears the drain flag, which production never clears. */
+async function resetRelaySessions() {
+  await relaySessionManager.closeRelaySessions();
+  Reflect.set(relaySessionManager, "relayDrain", false);
+}
+
 describe("cli commands", () => {
   beforeEach(() => {
     resetCliCommandsForTests();
@@ -186,7 +192,7 @@ describe("cli commands", () => {
   });
 
   afterEach(async () => {
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     sweepExpiredTokenCommands(Date.now() + 16 * 60 * 1000);
   });
 
@@ -398,7 +404,7 @@ describe("cli commands", () => {
       userId: "user-id",
       mcpCommandMode: "UNSUPERVISED",
     });
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     await expect(
       startCliCommand({
         userId: "user-id",
@@ -450,7 +456,7 @@ describe("cli commands", () => {
       false,
     );
 
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     const disabled = await connect("desktop", { mcpCommandMode: "off" });
     disabled.sends.length = 0;
     await expect(
@@ -464,7 +470,7 @@ describe("cli commands", () => {
     ).resolves.toEqual({ ok: false, error: "feature_disabled" });
     expect(disabled.sends).toEqual([]);
 
-    await relaySessionManager.closeRelaySessions();
+    await resetRelaySessions();
     const live = await connect();
     const first = await startCliCommand({
       userId: "user-id",

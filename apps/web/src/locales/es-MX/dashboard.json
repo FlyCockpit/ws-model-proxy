@@ -204,7 +204,22 @@
         "cancel": "Mantener el modo actual",
         "confirm": "Permitir sin supervisión"
       },
-      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:"
+      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:",
+      "effective": "Lo que los agentes pueden ejecutar ahora",
+      "commandSwitches": "Un comando se ejecuta solo cuando el token MCP, este permiso y la configuración propia del CLI lo permiten. El modo efectivo es el más estricto de los dos últimos.",
+      "commandKind": {
+        "headless": "Comandos sin cabecera (headless)",
+        "supervised": "Comandos supervisados"
+      },
+      "commandAllowed": "permitido ahora",
+      "commandRefusal": {
+        "grant_disabled": "rechazado: el permiso del panel de arriba no lo permite. Sube el permiso para permitirlo.",
+        "offline": "rechazado: este CLI está desconectado o es demasiado antiguo. Funciona de nuevo cuando el CLI se reconecte con un wsmp actual.",
+        "feature_disabled": "rechazado: la configuración propia de este CLI no lo permite. En esa máquina ejecuta wsmp config set-mcp-commands y reinicia wsmp.",
+        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
+        "grant_supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel de arriba es Supervisado. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
+        "cli_supervised_only": "rechazado: requiere Sin supervisión, y la configuración propia de este CLI es Supervisado. En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
+      }
     },
     "rename": {
       "action": "Renombrar",
@@ -222,6 +237,8 @@
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     },
+    "serverUpgradeRequired": "Actualización del servidor necesaria: el protocolo {{protocol}} de la CLI es más nuevo de lo que admite este servidor",
+    "serverUpgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}} porque es más nuevo que este servidor. Pide al administrador que actualice el servidor, o instala una versión anterior de wsmp en esta máquina.",
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",
@@ -358,19 +375,15 @@
       "checking": "Verificando identidad…",
       "offline": "Sin conexión",
       "unpinned": "Este navegador no pudo guardar la clave. Compara la huella antes de escribir algo sensible.",
-      "unverified": "Sin verificar. Actualiza la CLI para verificar su identidad.",
       "invalid": "Esta CLI no demostró su identidad. Sus terminales están bloqueadas.",
       "changed": "La clave de identidad de esta CLI cambió. Sus terminales están bloqueadas hasta que confíes en la nueva clave.",
-      "downgraded": "Esta CLI ya no demuestra su identidad. Sus terminales están bloqueadas hasta que la permitas.",
       "pinned": "Fijada",
       "new": "Nueva",
       "trustNew": "Confiar en la nueva clave",
-      "allowUnverified": "Permitir sin verificar",
       "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
       "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
       "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
       "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
-      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla.",
       "attention": "La clave de identidad de una CLI necesita revisión. Sus terminales están bloqueadas hasta que la verifiques.",
       "review": "Revisar"
     },
@@ -429,7 +442,14 @@
         "affinityMaxRecords": "Máximo de registros por destino",
         "affinityPrefixWeight": "Peso por profundidad del prefijo de conversación",
         "affinityConversationWeight": "Peso de conversación",
-        "affinityLoadPenaltyWeight": "Penalización por carga activa"
+        "affinityLoadPenaltyWeight": "Penalización por carga activa",
+        "cacheHolderWaitMs": "Esperar al miembro con la caché"
+      },
+      "cacheHolderWait": {
+        "auto": "Automático (tiempo de reprocesamiento ahorrado, hasta 30 s)",
+        "fixed": "Fijo (milisegundos; 0 lo desactiva)",
+        "valueLabel": "Espera por el miembro con la caché en milisegundos",
+        "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
     },
     "capacity": {
@@ -561,7 +581,7 @@
       "enabled": "Permitir respaldo externo",
       "forGrantees": "También para usuarios con acceso compartido",
       "externalAfterWaitMs": "Esperar capacidad local antes de usar un proveedor externo (ms)",
-      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre. Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
+      "externalAfterWaitHint": "0 usa un proveedor externo de inmediato cuando ningún miembro local está libre (después de cualquier espera por el miembro con la caché). Si el presupuesto de espera local es más corto, se aplica la espera más corta.",
       "waitInvalid": "Ingresa un número entero de milisegundos entre 0 y 600000.",
       "save": "Guardar ajustes de respaldo",
       "saved": "Ajustes de respaldo guardados",
@@ -1118,6 +1138,7 @@
     "responseBytes": "Bytes de respuesta",
     "attempts": "Intentos",
     "affinity": "Afinidad / puntuación / profundidad",
+    "affinityWait": "esperó {{ms}} ms al miembro con la caché",
     "status": "Estado",
     "title": "Metadatos de relay",
     "tokenPrefix": "Prefijo del token",

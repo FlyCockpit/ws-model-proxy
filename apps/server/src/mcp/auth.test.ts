@@ -1365,6 +1365,14 @@ describe("createMcpRequestHandler — shadow-awaited abort release (F8 pass 5)",
   });
 });
 
+// The fake-transport sweep runs 150 microtask depths. The real-SDK sweep runs the
+// full transport per depth (~25-60 ms each under load), so it sweeps the first 40
+// depths: the scheduling window that decides which continuation wins is a
+// handful of microtask ticks wide. Both carry an explicit timeout so a loaded
+// machine cannot trip vitest's 5 s default.
+const REAL_SDK_SWEEP_DEPTHS = 40;
+const SWEEP_TIMEOUT_MS = 30_000;
+
 describe("createMcpRequestHandler — F10 pass 5: losing continuation cannot mis-frame the winning response", () => {
   it("abort DURING the augmentation body-read → 499 with framing that matches ITS OWN body (no 500 leakage)", async () => {
     const gate = createMcpAdmissionGate();
@@ -1422,72 +1430,93 @@ describe("createMcpRequestHandler — F10 pass 5: losing continuation cannot mis
     expect(text).not.toContain("-32603");
   });
 
-  it("scheduling sweep (R60 reproducer, fake transport): no depth lets a losing 500 mis-frame the winning 499", async () => {
-    const failures: object[] = [];
-    for (let depth = 0; depth < 150; depth += 1) {
-      const gate = createMcpAdmissionGate();
-      const transport: McpTransport = {
-        fetch: vi.fn(async () => {
-          let remaining = depth;
-          const tick = () => {
-            if (remaining-- > 0) queueMicrotask(tick);
-            else void gate.close();
-          };
-          queueMicrotask(tick);
-          return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              error: { code: -32603, message: "Internal server error" },
-            }),
-            { status: 500, headers: { "content-type": "application/json" } },
-          );
-        }),
-      };
-      const { handler } = buildHandler({ admissionGate: gate, transport });
-      const response = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
-      const body = await response.text();
-      const length = response.headers.get("content-length");
-      if (length !== null && Number(length) !== Buffer.byteLength(body)) {
-        failures.push({ depth, status: response.status, length, actual: Buffer.byteLength(body) });
+  it(
+    "scheduling sweep (R60 reproducer, fake transport): no depth lets a losing 500 mis-frame the winning 499",
+    async () => {
+      const failures: object[] = [];
+      for (let depth = 0; depth < 150; depth += 1) {
+        const gate = createMcpAdmissionGate();
+        const transport: McpTransport = {
+          fetch: vi.fn(async () => {
+            let remaining = depth;
+            const tick = () => {
+              if (remaining-- > 0) queueMicrotask(tick);
+              else void gate.close();
+            };
+            queueMicrotask(tick);
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: { code: -32603, message: "Internal server error" },
+              }),
+              { status: 500, headers: { "content-type": "application/json" } },
+            );
+          }),
+        };
+        const { handler } = buildHandler({ admissionGate: gate, transport });
+        const response = await callHandler(
+          handler,
+          mcpRequest({ authorization: `Bearer ${TOKEN}` }),
+        );
+        const body = await response.text();
+        const length = response.headers.get("content-length");
+        if (length !== null && Number(length) !== Buffer.byteLength(body)) {
+          failures.push({
+            depth,
+            status: response.status,
+            length,
+            actual: Buffer.byteLength(body),
+          });
+        }
+        await gate.close();
       }
-      await gate.close();
-    }
-    expect(failures).toEqual([]);
-  });
+      expect(failures).toEqual([]);
+    },
+    SWEEP_TIMEOUT_MS,
+  );
 
-  it("scheduling sweep (R60 reproducer, REAL SDK transport): no depth mis-frames the final response", async () => {
-    const failures: object[] = [];
-    for (let depth = 0; depth < 150; depth += 1) {
-      const gate = createMcpAdmissionGate();
-      const transport = createMcpTransport({
-        isShuttingDown: () => gate.closed,
-        registerTools: () => {
-          let remaining = depth;
-          const tick = () => {
-            if (remaining-- > 0) queueMicrotask(tick);
-            else void gate.close();
-          };
-          queueMicrotask(tick);
-          throw new Error("f10-synthetic-factory-failure");
-        },
-      });
-      const { handler } = buildHandler({ admissionGate: gate, transport });
-      const response = await callHandler(handler, modernMcpRequest());
-      const body = await response.text();
-      const length = response.headers.get("content-length");
-      if (length !== null && Number(length) !== Buffer.byteLength(body)) {
-        failures.push({ depth, status: response.status, length, actual: Buffer.byteLength(body) });
+  it(
+    "scheduling sweep (R60 reproducer, REAL SDK transport): no depth mis-frames the final response",
+    async () => {
+      const failures: object[] = [];
+      for (let depth = 0; depth < REAL_SDK_SWEEP_DEPTHS; depth += 1) {
+        const gate = createMcpAdmissionGate();
+        const transport = createMcpTransport({
+          isShuttingDown: () => gate.closed,
+          registerTools: () => {
+            let remaining = depth;
+            const tick = () => {
+              if (remaining-- > 0) queueMicrotask(tick);
+              else void gate.close();
+            };
+            queueMicrotask(tick);
+            throw new Error("f10-synthetic-factory-failure");
+          },
+        });
+        const { handler } = buildHandler({ admissionGate: gate, transport });
+        const response = await callHandler(handler, modernMcpRequest());
+        const body = await response.text();
+        const length = response.headers.get("content-length");
+        if (length !== null && Number(length) !== Buffer.byteLength(body)) {
+          failures.push({
+            depth,
+            status: response.status,
+            length,
+            actual: Buffer.byteLength(body),
+          });
+        }
+        await Promise.all([gate.close(), transport.close()]);
       }
-      await Promise.all([gate.close(), transport.close()]);
-    }
-    expect(failures).toEqual([]);
-    expect(
-      errorSpy.mock.calls
-        .flat()
-        .some((l: string) => String(l).includes("f10-synthetic-factory-failure")),
-    ).toBe(false);
-  });
+      expect(failures).toEqual([]);
+      expect(
+        errorSpy.mock.calls
+          .flat()
+          .some((l: string) => String(l).includes("f10-synthetic-factory-failure")),
+      ).toBe(false);
+    },
+    SWEEP_TIMEOUT_MS,
+  );
 
   it("a prior Content-Length set on the context can NEVER mis-frame a later early-exit response (all exits)", async () => {
     // Middleware on the chain sets a bogus length BEFORE the handler runs —

@@ -226,6 +226,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     protocolAdaptationEnabled: false,
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
+    cacheHolderWaitMs: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -2156,6 +2157,28 @@ describe("forwarderManagementRouter", () => {
     // Disabling never inspects or removes the external members.
     expect(db.poolMember.findMany).not.toHaveBeenCalled();
     expect(db.poolMember.delete).not.toHaveBeenCalled();
+  });
+
+  it("stores the cache-holder wait override (auto, off, fixed) and caps it at 30 s", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    for (const value of [750, 0, null]) {
+      db.modelPool.update.mockResolvedValueOnce(poolRow({ cacheHolderWaitMs: value }));
+      await expect(
+        client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: value }),
+      ).resolves.toMatchObject({ cacheHolderWaitMs: value });
+      const update = db.modelPool.update.mock.calls.at(-1)?.[0] as {
+        data: Record<string, unknown>;
+      };
+      expect(update.data).toMatchObject({ cacheHolderWaitMs: value });
+    }
+    await expect(
+      client().updateModelPool({ id: "pool-id", cacheHolderWaitMs: 30_001 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // Unrelated saves leave the stored override untouched.
+    db.modelPool.update.mockResolvedValueOnce(poolRow({ name: "Renamed" }));
+    await client().updateModelPool({ id: "pool-id", name: "Renamed" });
+    const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {
@@ -5190,13 +5213,17 @@ describe("setCliDeviceFeatureGrants", () => {
         supported: true,
         live: false,
         effectiveMode: "off",
+        refusals: { headless: "offline", supervised: "offline" },
         available: false,
       },
     });
     expect(offline[0]?.displayName).toBe("Desk");
     expect(offline[0]?.cliVersion).toBe("0.4.0");
 
-    const liveClient = (mcpCommandMode: "off" | "supervised" | "unsupervised") =>
+    const liveClient = (
+      mcpCommandMode: "off" | "supervised" | "unsupervised",
+      terminalSupported = true,
+    ) =>
       createRouterClient(forwarderManagementRouter, {
         context: {
           ...buildContext(),
@@ -5211,7 +5238,7 @@ describe("setCliDeviceFeatureGrants", () => {
                     humanTerminal: true,
                     mcpCommandMode,
                     supervisedCommands: true,
-                    terminalSupported: true,
+                    terminalSupported,
                     terminalApproval: false,
                     terminalPublicKey: "key",
                   },
@@ -5222,21 +5249,85 @@ describe("setCliDeviceFeatureGrants", () => {
       });
     const live = await liveClient("supervised").listCliDevices();
     expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
-    // Grant unsupervised, live CLI supervised: the lower one applies.
+    // Grant unsupervised, live CLI supervised: the lower one applies, and only
+    // headless is refused (the relay's supervised_only, attributed to the CLI config).
     expect(live[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "supervised",
+      refusals: { headless: "cli_supervised_only", supervised: null },
       available: true,
     });
     const liveOff = await liveClient("off").listCliDevices();
     expect(liveOff[0]?.features.commands).toMatchObject({
       live: true,
       effectiveMode: "off",
+      refusals: { headless: "feature_disabled", supervised: "feature_disabled" },
       available: false,
+    });
+    const liveFull = await liveClient("unsupervised").listCliDevices();
+    expect(liveFull[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: null },
+      available: true,
+    });
+    // No PTY (Windows): supervised is refused although the mode allows it, and
+    // headless still works on an unsupervised device.
+    const noPty = await liveClient("unsupervised", false).listCliDevices();
+    expect(noPty[0]?.features.commands).toMatchObject({
+      effectiveMode: "unsupervised",
+      refusals: { headless: null, supervised: "unsupported" },
+      available: true,
+    });
+    // A connected CLI older than protocol 2.6 has no command support: offline.
+    const oldClient = createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.5",
+                  cliVersion: "0.3.0",
+                  humanTerminal: true,
+                  mcpCommandMode: "unsupervised" as const,
+                  supervisedCommands: true,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  terminalPublicKey: "key",
+                },
+              ],
+            ]),
+        },
+      },
+    });
+    const preCommands = await oldClient.listCliDevices();
+    expect(preCommands[0]?.features.commands).toMatchObject({
+      live: false,
+      effectiveMode: "off",
+      refusals: { headless: "offline", supervised: "offline" },
+      available: false,
+    });
+    const [row] = await db.cliDevice.findMany();
+    db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "SUPERVISED" }]);
+    // A supervised-only device without a PTY cannot run anything: not available.
+    const nothing = await liveClient("supervised", false).listCliDevices();
+    expect(nothing[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: "unsupported" },
+      available: false,
+    });
+    // The relay checks the grant first: a supervised grant refuses headless as
+    // supervised_only whatever the CLI reports (attributed to the grant).
+    const grantLimited = await liveClient("unsupervised").listCliDevices();
+    expect(grantLimited[0]?.features.commands).toMatchObject({
+      effectiveMode: "supervised",
+      refusals: { headless: "grant_supervised_only", supervised: null },
     });
   });
 
-  it("flags a device whose last hello was refused for an old relay protocol", async () => {
+  it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {
     const rejectedAt = new Date("2026-09-28T10:00:00.000Z");
     const row = {
       id: "cli-id",
@@ -5265,6 +5356,13 @@ describe("setCliDeviceFeatureGrants", () => {
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
+      {
+        ...row,
+        id: "cli-newer",
+        rejectedRelayProtocolVersion: "2.8",
+        rejectedCliVersion: "0.9.0",
+        relayRejectedAt: rejectedAt,
+      },
     ]);
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: buildContext(),
@@ -5273,8 +5371,13 @@ describe("setCliDeviceFeatureGrants", () => {
       protocolVersion: "2.6",
       cliVersion: "0.4.0",
       rejectedAt,
+      reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
+    expect(devices[2]?.upgradeRequired).toMatchObject({
+      protocolVersion: "2.8",
+      reason: "cli_too_new",
+    });
   });
 });
 

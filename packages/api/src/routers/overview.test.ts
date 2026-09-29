@@ -388,6 +388,7 @@ describe("overviewRouter.metrics", () => {
           fallbackEnabled: true,
           fallbackForGrantees: true,
           externalEquivalentModel: "qwen/qwen3-coder",
+          User: { banned: null, banExpires: null, deletionRequestedAt: null },
           PoolMembers: [
             {
               tier: "PUBLIC_OVERFLOW",
@@ -466,6 +467,7 @@ describe("overviewRouter.metrics", () => {
           fallbackEnabled: false,
           fallbackForGrantees: false,
           externalEquivalentModel: "qwen/qwen3-coder",
+          User: { banned: null, banExpires: null, deletionRequestedAt: null },
           PoolMembers: [],
         },
         Owner: { slug: "bob" },
@@ -512,6 +514,7 @@ describe("overviewRouter.metrics", () => {
           fallbackEnabled: false,
           fallbackForGrantees: false,
           externalEquivalentModel: "qwen/qwen3-coder",
+          User: { banned: null, banExpires: null, deletionRequestedAt: null },
           PoolMembers: [],
         },
         Owner: { slug: "bob" },
@@ -555,6 +558,7 @@ describe("overviewRouter.metrics", () => {
           fallbackEnabled: false,
           fallbackForGrantees: false,
           externalEquivalentModel: null,
+          User: { banned: null, banExpires: null, deletionRequestedAt: null },
           PoolMembers: [],
         },
         Owner: { slug: "bob" },
@@ -573,14 +577,16 @@ describe("overviewRouter.metrics", () => {
   });
 
   it.each([
-    [true, true, true, true],
-    [false, true, true, true],
-    [true, false, true, true],
-    [true, true, false, true],
-    [true, true, true, false],
+    [true, true, true, true, true],
+    [false, true, true, true, true],
+    [true, false, true, true, true],
+    [true, true, false, true, true],
+    [true, true, true, false, true],
+    // K1a-1 (#76): an inactive owner's pool is labelled like one no longer shared.
+    [true, true, true, true, false],
   ])(
-    "shared disclosure: switch %s fallback %s coverage %s grant %s",
-    async (enabled, fallbackEnabled, fallbackForGrantees, liveGrant) => {
+    "shared disclosure: switch %s fallback %s coverage %s grant %s owner active %s",
+    async (enabled, fallbackEnabled, fallbackForGrantees, liveGrant, ownerActive) => {
       const { env } = await import("@ws-model-proxy/env/server");
       env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = enabled;
       db.$queryRaw
@@ -607,6 +613,11 @@ describe("overviewRouter.metrics", () => {
                   slug: "shared",
                   fallbackEnabled,
                   fallbackForGrantees,
+                  User: {
+                    banned: !ownerActive,
+                    banExpires: null,
+                    deletionRequestedAt: null,
+                  },
                   _count: { PoolMembers: 1 },
                   PoolMembers: [
                     {
@@ -631,7 +642,12 @@ describe("overviewRouter.metrics", () => {
       );
       try {
         const result = await client().metrics({ range: "1h" });
-        const eligible = enabled && fallbackEnabled && fallbackForGrantees && liveGrant;
+        const eligible =
+          enabled && fallbackEnabled && fallbackForGrantees && liveGrant && ownerActive;
+        expect(result.sharedPools[0]).toMatchObject({
+          available: liveGrant && ownerActive,
+          name: liveGrant && ownerActive ? "Shared" : null,
+        });
         expect(result.sharedPools[0]).toHaveProperty(
           "providerTypes",
           eligible ? ["openrouter"] : [],

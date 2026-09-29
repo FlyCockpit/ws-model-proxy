@@ -70,12 +70,6 @@ function IdentityStatus({
           </p>
         </>
       );
-    case "unverified":
-      return (
-        <p className="text-xs text-muted-foreground">
-          {t("dashboard:terminals.identity.unverified")}
-        </p>
-      );
     case "invalid":
       return (
         <p className="text-xs text-destructive">{t("dashboard:terminals.identity.invalid")}</p>
@@ -87,18 +81,12 @@ function IdentityStatus({
     case "changed":
       return (
         <div className="flex min-w-0 flex-col gap-1">
-          <p className="text-xs text-destructive">
-            {trust.fingerprint
-              ? t("dashboard:terminals.identity.changed")
-              : t("dashboard:terminals.identity.downgraded")}
-          </p>
+          <p className="text-xs text-destructive">{t("dashboard:terminals.identity.changed")}</p>
           <Fingerprint
             label={t("dashboard:terminals.identity.pinned")}
             value={trust.pinnedFingerprint}
           />
-          {trust.fingerprint ? (
-            <Fingerprint label={t("dashboard:terminals.identity.new")} value={trust.fingerprint} />
-          ) : null}
+          <Fingerprint label={t("dashboard:terminals.identity.new")} value={trust.fingerprint} />
           <Button
             type="button"
             size="touch"
@@ -106,9 +94,7 @@ function IdentityStatus({
             className="mt-1 self-start"
             onClick={() => onTrust(trust)}
           >
-            {trust.fingerprint
-              ? t("dashboard:terminals.identity.trustNew")
-              : t("dashboard:terminals.identity.allowUnverified")}
+            {t("dashboard:terminals.identity.trustNew")}
           </Button>
         </div>
       );
@@ -153,7 +139,6 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
   const shown = cliIdentitiesToShow(clis, trust);
   if (shown.length === 0) return null;
   const confirmTrust = confirm?.trust;
-  const downgrade = confirmTrust !== undefined && confirmTrust.fingerprint === null;
 
   return (
     <div className="min-w-0">
@@ -198,16 +183,10 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
                 label={t("dashboard:terminals.identity.pinned")}
                 value={confirmTrust.pinnedFingerprint}
               />
-              {confirmTrust.fingerprint ? (
-                <Fingerprint
-                  label={t("dashboard:terminals.identity.new")}
-                  value={confirmTrust.fingerprint}
-                />
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  {t("dashboard:terminals.identity.downgraded")}
-                </p>
-              )}
+              <Fingerprint
+                label={t("dashboard:terminals.identity.new")}
+                value={confirmTrust.fingerprint}
+              />
             </div>
           ) : null}
           <AlertDialogFooter>
@@ -229,9 +208,7 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
                 );
               }}
             >
-              {downgrade
-                ? t("dashboard:terminals.identity.allowUnverified")
-                : t("dashboard:terminals.identity.trustNew")}
+              {t("dashboard:terminals.identity.trustNew")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

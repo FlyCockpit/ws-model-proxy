@@ -1,5 +1,13 @@
 import type { RelayFailure } from "../relay/protocol.js";
 
+/**
+ * Every failure a model API request can end with: the relay wire failures
+ * plus server-only reasons that never cross the CLI protocol.
+ * `capacity_lease_lost`: the request's capacity lease was lost (heartbeat
+ * refused or timed out). A server-side 503, never a client cancellation.
+ */
+export type ModelApiFailure = RelayFailure | "capacity_lease_lost";
+
 export type OpenAiErrorBody = {
   error: {
     message: string;
@@ -23,7 +31,8 @@ export function openAiErrorBody({
   return { error: { message, type, param, code } };
 }
 
-export function relayFailureHttpStatus(failure: RelayFailure): number {
+export function relayFailureHttpStatus(failure: ModelApiFailure): number {
+  if (failure === "capacity_lease_lost") return 503;
   if (failure === "access_denied") return 401;
   if (failure === "cancelled") return 499;
   if (failure === "disconnected") return 503;
@@ -39,7 +48,9 @@ export function relayFailureHttpStatus(failure: RelayFailure): number {
   return 500;
 }
 
-export function relayFailureMessage(failure: RelayFailure): string {
+export function relayFailureMessage(failure: ModelApiFailure): string {
+  if (failure === "capacity_lease_lost")
+    return "The request lost its execution capacity before completing. Retry the request.";
   if (failure === "access_denied") return "Access denied.";
   if (failure === "cancelled") return "Request was cancelled.";
   if (failure === "disconnected") return "The selected model endpoint is disconnected.";
@@ -56,7 +67,7 @@ export function relayFailureMessage(failure: RelayFailure): string {
   return "Model relay failed.";
 }
 
-function openAiFailureResponse(failure: RelayFailure, message = relayFailureMessage(failure)) {
+function openAiFailureResponse(failure: ModelApiFailure, message = relayFailureMessage(failure)) {
   return new Response(
     JSON.stringify(
       openAiErrorBody({
@@ -79,6 +90,6 @@ function openAiFailureResponse(failure: RelayFailure, message = relayFailureMess
   );
 }
 
-export function openAiFailureJsonResponse(failure: RelayFailure, message?: string) {
+export function openAiFailureJsonResponse(failure: ModelApiFailure, message?: string) {
   return openAiFailureResponse(failure, message);
 }

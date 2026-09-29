@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
+import {
+  CAPACITY_LEASE_MAX_LIFETIME_MS,
+  CapacityLeaseLostError,
+  isCapacityLeaseLost,
+} from "./lease-owner.js";
 import { StoreCapacityAdmissionRuntime } from "./runtime.js";
 import type { CapacityAdmissionStore, CapacityLeaseHandle } from "./types.js";
 
@@ -450,36 +455,152 @@ describe("admitted lease ownership", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["false", "reject"])(
-    "aborts pending dispatch when heartbeat returns %s",
-    async (mode) => {
-      vi.useFakeTimers();
-      const { runtime, store, admit } = fixture();
-      const handle = await admit();
-      const cancelled = vi.fn();
-      const dispatch = new Promise<void>((_resolve, reject) => {
-        handle.signal!.addEventListener("abort", () => {
-          cancelled();
-          reject(handle.signal!.reason);
-        });
+  it("aborts pending dispatch with a typed lease-loss reason when heartbeat returns false", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    const cancelled = vi.fn();
+    const dispatch = new Promise<void>((_resolve, reject) => {
+      handle.signal!.addEventListener("abort", () => {
+        cancelled();
+        reject(handle.signal!.reason);
       });
-      const outcome = expect(dispatch).rejects.toThrow();
-      if (mode === "false") store.heartbeat.mockResolvedValueOnce(false);
-      else store.heartbeat.mockRejectedValueOnce(new Error("db unavailable"));
-      await vi.advanceTimersByTimeAsync(10_000);
-      await outcome;
-      expect(cancelled).toHaveBeenCalledOnce();
-      expect(store.release).toHaveBeenCalledOnce();
-      // Late headers cannot revive a lost owner or expose upstream bytes.
-      const late = runtime.hold(new Response("late data"), handle);
-      await expect(late.text()).rejects.toThrow();
-      await runtime.release(handle);
-      await vi.advanceTimersByTimeAsync(31_000);
-      expect(store.heartbeat).toHaveBeenCalledTimes(2);
-      expect(store.release).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
-    },
-  );
+    });
+    const outcome = expect(dispatch).rejects.toMatchObject({
+      name: "CapacityLeaseLostError",
+      kind: "ownership_lost",
+    });
+    store.heartbeat.mockResolvedValueOnce(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await outcome;
+    expect(isCapacityLeaseLost(handle.signal!.reason)).toBe(true);
+    expect(cancelled).toHaveBeenCalledOnce();
+    expect(store.release).toHaveBeenCalledOnce();
+    // Late headers cannot revive a lost owner or expose upstream bytes: the
+    // hand-off is refused so the route classifies it as a precommit failure.
+    const lateBody = new ReadableStream<Uint8Array>({ cancel: vi.fn() });
+    expect(() => runtime.hold(new Response(lateBody), handle)).toThrow(CapacityLeaseLostError);
+    await runtime.release(handle);
+    await vi.advanceTimersByTimeAsync(31_000);
+    // A false result is never retried.
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the dispatch alive across one transient heartbeat error (F2-CAP-5)", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    store.heartbeat.mockRejectedValueOnce(new Error("db unavailable"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+    expect(handle.signal?.aborted).toBe(false);
+    // Retried after the first backoff step and acknowledged.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(3);
+    expect(handle.signal?.aborted).toBe(false);
+    // The successful retry re-armed the watchdog from ITS query start, so
+    // the dispatch outlives the TTL of the heartbeat before the error.
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(handle.signal?.aborted).toBe(false);
+    expect(store.release).not.toHaveBeenCalled();
+    await runtime.release(handle);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases before the acknowledged TTL ends when heartbeat errors persist", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    // Admission confirmed ownership at t=0: the acknowledged TTL ends at 30 s.
+    store.heartbeat.mockRejectedValue(new Error("db unavailable"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(handle.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(17_500);
+    // Retries at 11, 13, 17, 21, 25 s; the next 4 s step would not fit.
+    expect(handle.signal?.aborted).toBe(true);
+    expect(handle.signal?.reason).toMatchObject({ kind: "heartbeat_failed" });
+    expect(store.heartbeat).toHaveBeenCalledTimes(7);
+    expect(store.release).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(7);
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await runtime.close();
+  });
+
+  it("measures retry room from the LAST acknowledged renewal", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    // t=10 s renews successfully (acknowledged until 40 s); errors from t=20 s.
+    await vi.advanceTimersByTimeAsync(10_000);
+    store.heartbeat.mockRejectedValue(new Error("db unavailable"));
+    await vi.advanceTimersByTimeAsync(20_500);
+    // Past the TTL of the admission-time renewal, still inside the new one.
+    expect(handle.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(handle.signal?.reason).toMatchObject({ kind: "heartbeat_failed" });
+    expect(store.release).toHaveBeenCalledOnce();
+    await runtime.close();
+  });
+
+  it("stops a pending heartbeat retry backoff on shutdown", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    store.heartbeat.mockRejectedValueOnce(new Error("db unavailable"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(handle.signal?.aborted).toBe(false);
+    await runtime.close();
+    expect(isCapacityLeaseLost(handle.signal?.reason)).toBe(false);
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(store.heartbeat).toHaveBeenCalledTimes(2);
+  });
+
+  it("never lets an error extend the watchdog: a hung retry still ends at the TTL", async () => {
+    vi.useFakeTimers();
+    const { store, admit } = fixture();
+    const handle = await admit();
+    store.heartbeat
+      .mockRejectedValueOnce(new Error("db unavailable"))
+      .mockImplementationOnce(() => new Promise<boolean>(() => undefined));
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(handle.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(handle.signal?.reason).toMatchObject({ kind: "heartbeat_timeout" });
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("caps an owner's lifetime as a backstop and stops every timer", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { store, admit } = fixture();
+    const handle = await admit();
+    await vi.advanceTimersByTimeAsync(CAPACITY_LEASE_MAX_LIFETIME_MS - 1);
+    expect(handle.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(handle.signal?.reason).toMatchObject({ kind: "max_lifetime" });
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    warn.mockRestore();
+  });
+
+  it("releases with a shutdown reason, not a lease loss, exactly once", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, admit } = fixture();
+    const handle = await admit();
+    await runtime.close();
+    expect(handle.signal?.aborted).toBe(true);
+    expect(isCapacityLeaseLost(handle.signal?.reason)).toBe(false);
+    await runtime.close();
+    expect(store.release).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it("aborts dispatch if a heartbeat stalls beyond the last acknowledged TTL", async () => {
     vi.useFakeTimers();
@@ -506,9 +627,40 @@ describe("admitted lease ownership", () => {
     vi.useFakeTimers();
     const { runtime, store, attempt } = fixture();
     store.heartbeat.mockResolvedValueOnce(false);
-    expect(await runtime.acquire(attempt)).toEqual({ state: "CANCELLED" });
+    // A server-side lease loss names the lost member (callers exclude it and
+    // fail over, or answer 503); it is never reported as a cancellation.
+    expect(await runtime.acquire(attempt)).toMatchObject({
+      state: "LEASE_LOST",
+      executionTargetId: "target",
+      reason: { kind: "ownership_lost" },
+    });
     expect(store.release).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("reports persistent initial heartbeat errors as lease loss, not cancellation", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, attempt } = fixture();
+    store.heartbeat.mockRejectedValue(new Error("db unavailable"));
+    const admission = runtime.acquire(attempt);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(await admission).toMatchObject({
+      state: "LEASE_LOST",
+      reason: { kind: "heartbeat_failed" },
+    });
+    expect(store.release).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a client abort during initial confirmation a cancellation", async () => {
+    vi.useFakeTimers();
+    const { runtime, store, attempt } = fixture();
+    const controller = new AbortController();
+    store.heartbeat.mockImplementationOnce(async () => {
+      controller.abort(new Error("client gone"));
+      return true;
+    });
+    expect(await runtime.acquire(attempt, controller.signal)).toEqual({ state: "CANCELLED" });
+    expect(store.release).toHaveBeenCalledOnce();
   });
 
   it("deduplicates idempotent admission and overlapping heartbeat calls", async () => {

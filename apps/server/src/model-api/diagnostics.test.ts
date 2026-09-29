@@ -6,6 +6,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 
 /**
@@ -76,7 +77,7 @@ const tokenAccess = await import("@ws-model-proxy/api/lib/model-api-token-access
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
-  poolMember: { findUnique: MockInstance; update: MockInstance };
+  poolMember: { findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: { findUnique: MockInstance };
   executionTarget: { findUnique: MockInstance };
   modelPool: { findFirst: MockInstance };
@@ -320,7 +321,7 @@ beforeEach(() => {
   });
   db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
   db.poolMember.findUnique.mockResolvedValue(memberRow());
-  db.poolMember.update.mockResolvedValue({ id: "member-id" });
+  db.poolMember.updateMany.mockResolvedValue({ count: 1 });
   mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
     directModels: [directTarget],
     modelPools: [poolTarget],
@@ -410,9 +411,9 @@ describe("runPoolMemberTest — typed core outcomes", () => {
     manager.body(sent.requestId, JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
     manager.complete(sent.requestId);
     await expect(corePromise).resolves.toMatchObject({ outcome: "ok", status: 200 });
-    expect(db.poolMember.update).toHaveBeenCalledWith(
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "member-id" },
+        where: expect.objectContaining({ id: "member-id" }),
         data: expect.objectContaining({ healthStatus: "HEALTHY" }),
       }),
     );
@@ -444,7 +445,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       outcome: "probe-failed",
       status: 200,
     });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 
   function reasoningInventory(reasoningConfig?: Record<string, unknown>, reasoning = true) {
@@ -556,7 +557,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       detail: REASONING_ONLY_PROBE_DETAIL,
     });
     expect(REASONING_ONLY_PROBE_DETAIL).not.toMatch(/pong/);
-    expect(db.poolMember.update).toHaveBeenCalled();
+    expect(db.poolMember.updateMany).toHaveBeenCalled();
   });
 
   it("does not attach a detail when visible pong content is present", async () => {
@@ -594,7 +595,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       outcome: "probe-failed",
       reason: expect.stringContaining("timeout"),
     });
-    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
 });
 
@@ -677,6 +678,47 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
     // completion, not an SSE request.
     const relayedBody = await readSentBody(sent);
     expect(JSON.parse(relayedBody)).toMatchObject({ stream: false, model: "gpt-4o-mini" });
+  });
+
+  it("F2-CAP-6: releases a capacity owner the diagnostic run leaked when it returns", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = {
+      heartbeat: vi.fn().mockResolvedValue(true),
+      release: vi.fn().mockResolvedValue(true),
+    };
+    const owners: CapacityLeaseOwner[] = [];
+    const runtime = admittingCapacityRuntime();
+    vi.mocked(runtime.acquire).mockImplementation(async (attempt) => {
+      const selected = attempt.candidates[0]!;
+      const lease = {
+        leaseId: "lease-leaked",
+        attemptId: attempt.attemptId,
+        capacityId: selected.capacityId,
+        executionTargetId: selected.executionTargetId,
+        fencingToken: 1n,
+        expiresAt: new Date(Date.now() + 30_000),
+      };
+      const owner = new CapacityLeaseOwner(leaseStore, lease, undefined, 0);
+      owners.push(owner);
+      return { state: "ADMITTED" as const, lease: { ...lease, signal: owner.signal } };
+    });
+    const manager = new FakeRelayManager();
+    const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: runtime,
+      userId: "user-id",
+      body: { model: directTarget.modelId, messages: [{ role: "user", content: "ping" }] },
+      manager,
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, JSON.stringify({ choices: [] }));
+    manager.complete(sent.requestId);
+    await diagnosticPromise;
+    expect(owners[0]?.signal.reason).toMatchObject({ kind: "request_scope_closed" });
+    await owners[0]?.release();
+    expect(leaseStore.release).toHaveBeenCalledOnce();
+    warn.mockRestore();
   });
 
   it("bounds the assistant excerpt length", async () => {
@@ -789,7 +831,7 @@ describe("diagnosticsCapacityRuntime — module-lifetime singleton", () => {
 describe("G2 — stable outcomes only (failure data never crosses the core)", () => {
   it("a health-write DB failure becomes the stable probe-error reason — the hostile message never crosses", async () => {
     const manager = new FakeRelayManager();
-    db.poolMember.update.mockRejectedValue(
+    db.poolMember.updateMany.mockRejectedValue(
       new Error("R63_DB_SENTINEL PrismaClientKnownRequestError P2025 SECRET_SQL"),
     );
     const corePromise = runPoolMemberTest({

@@ -333,6 +333,8 @@ ALTER TABLE capacity_waiter ADD CONSTRAINT capacity_waiter_shape_check CHECK (
   AND "effectiveConcurrencyScope" IN ('DIRECT_TARGET', 'POOL', 'MEMBER')
   AND "effectiveConcurrencyScopeId" <> ''
   AND "effectiveReservedSlots" >= 0
+  -- Saturation S-A: a deferred waiter's deadline never precedes its notBefore.
+  AND ("notBefore" IS NULL OR "deadlineAt" IS NULL OR "deadlineAt" >= "notBefore")
   AND (("poolId" IS NULL AND "poolMemberId" IS NULL)
     OR ("poolId" IS NOT NULL AND "poolMemberId" IS NOT NULL))
 );
@@ -1288,6 +1290,17 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_fallback_route_check CHEC
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_external_after_wait_check;
 ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK (
   "externalAfterWaitMs" BETWEEN 0 AND 600000
+);
+
+-- Saturation S-A: null = automatic, 0 = off, otherwise fixed (capped at 30 s).
+ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_cache_holder_wait_check;
+ALTER TABLE model_pool ADD CONSTRAINT model_pool_cache_holder_wait_check CHECK (
+  "cacheHolderWaitMs" IS NULL OR "cacheHolderWaitMs" BETWEEN 0 AND 30000
+);
+
+ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_affinity_wait_check;
+ALTER TABLE relay_request ADD CONSTRAINT relay_request_affinity_wait_check CHECK (
+  "affinityWaitMs" IS NULL OR "affinityWaitMs" >= 0
 );
 
 -- Canonicalize compatibility writes before uniqueness and consistency checks.

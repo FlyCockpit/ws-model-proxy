@@ -397,9 +397,12 @@ async function deleteBatched<TWhere>(
 export async function sweepExpiredOAuthArtifacts({
   prisma: client = prisma,
   now = new Date(),
+  verificationScanCap = OAUTH_CLEANUP_VERIFICATION_SCAN_CAP,
 }: {
   prisma?: OAuthCleanupPrisma;
   now?: Date;
+  /** Test seam: rows-examined bound for the authorization-code scan. */
+  verificationScanCap?: number;
 } = {}): Promise<OAuthCleanupCounts> {
   // Audit-grace cutoff for token rows + assertions: a row expiring exactly
   // AT the cutoff is deletable (lte — inclusive boundary, pinned by test);
@@ -519,7 +522,7 @@ export async function sweepExpiredOAuthArtifacts({
   let scanned = 0;
   while (
     authorizationCodes < OAUTH_CLEANUP_VERIFICATION_TOTAL_CAP &&
-    scanned < OAUTH_CLEANUP_VERIFICATION_SCAN_CAP
+    scanned < verificationScanCap
   ) {
     if (isDbShutdownFenceArmed()) break;
     const candidates = await client.verification.findMany({
@@ -550,7 +553,7 @@ export async function sweepExpiredOAuthArtifacts({
     // loop (or a replica) deleted it — no dependence on row existence.
     lastSeenId = candidates[candidates.length - 1]!.id;
     if (candidates.length < OAUTH_CLEANUP_VERIFICATION_BATCH) break;
-    if (scanned >= OAUTH_CLEANUP_VERIFICATION_SCAN_CAP) scanCapReached = true;
+    if (scanned >= verificationScanCap) scanCapReached = true;
   }
 
   return {

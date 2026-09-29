@@ -4,7 +4,7 @@ import {
   type CliWebsocketIdentity,
 } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { Context, MiddlewareHandler } from "hono";
-import type { WSContext } from "hono/ws";
+import type { WSContext, WSEvents } from "hono/ws";
 import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
 import { parseRelaySubprotocolHeader, RELAY_SUBPROTOCOL } from "./protocol.js";
 import { type RelaySocket, relaySessionManager } from "./session-manager.js";
@@ -96,44 +96,53 @@ function relaySocketFor(ws: RelayWsContext): RelaySocket {
   return socket;
 }
 
+/**
+ * The socket events of one upgraded CLI relay connection, for the identity the
+ * middleware authenticated. Exported for the wiring tests. `onOpen` runs after
+ * the awaited authentication, so it is where a socket that authenticated
+ * during shutdown is refused ({@link RelaySessionManager.acceptAuthenticatedSocket}).
+ */
+export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebSocketLike> {
+  return {
+    onOpen(_event, ws) {
+      const socket = relaySocketFor(ws);
+      if (!relaySessionManager.acceptAuthenticatedSocket({ socket, identity })) {
+        relaySockets.delete(ws);
+      }
+    },
+    onMessage(event, ws) {
+      const socket = relaySocketFor(ws);
+      if (typeof event.data === "string") {
+        settleSocketHandler("cli text", relaySessionManager.handleTextFrame(socket, event.data));
+        return;
+      }
+      if (event.data instanceof ArrayBuffer) {
+        relaySessionManager.handleBinaryFrame(socket, event.data);
+      }
+    },
+    onClose(_event, ws) {
+      const socket = relaySocketFor(ws);
+      settleSocketHandler(
+        "cli close",
+        relaySessionManager.removeSession(socket).finally(() => {
+          relaySockets.delete(ws);
+        }),
+      );
+    },
+    onError(_event, ws) {
+      const socket = relaySocketFor(ws);
+      settleSocketHandler(
+        "cli error",
+        relaySessionManager.removeSession(socket).finally(() => {
+          relaySockets.delete(ws);
+        }),
+      );
+    },
+  };
+}
+
 export function relayUpgradeHandler() {
-  return upgradeWebSocket((c: Context<{ Variables: RelayVariables }>) => {
-    const identity = c.get("relayIdentity");
-    return {
-      onOpen(_event, ws) {
-        relaySessionManager.acceptAuthenticatedSocket({
-          socket: relaySocketFor(ws),
-          identity,
-        });
-      },
-      onMessage(event, ws) {
-        const socket = relaySocketFor(ws);
-        if (typeof event.data === "string") {
-          settleSocketHandler("cli text", relaySessionManager.handleTextFrame(socket, event.data));
-          return;
-        }
-        if (event.data instanceof ArrayBuffer) {
-          relaySessionManager.handleBinaryFrame(socket, event.data);
-        }
-      },
-      onClose(_event, ws) {
-        const socket = relaySocketFor(ws);
-        settleSocketHandler(
-          "cli close",
-          relaySessionManager.removeSession(socket).finally(() => {
-            relaySockets.delete(ws);
-          }),
-        );
-      },
-      onError(_event, ws) {
-        const socket = relaySocketFor(ws);
-        settleSocketHandler(
-          "cli error",
-          relaySessionManager.removeSession(socket).finally(() => {
-            relaySockets.delete(ws);
-          }),
-        );
-      },
-    };
-  });
+  return upgradeWebSocket((c: Context<{ Variables: RelayVariables }>) =>
+    relaySocketEvents(c.get("relayIdentity")),
+  );
 }

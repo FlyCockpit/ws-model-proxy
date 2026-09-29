@@ -25,6 +25,7 @@ import {
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
   type CapacityPolicyFailureReasons,
+  cacheHolderWaitMsSchema,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
@@ -62,6 +63,7 @@ import {
   mcpCommandModeAtLeast,
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
+  mcpCommandRefusals,
 } from "../lib/mcp-command-mode";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -102,7 +104,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
-import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
+import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
   drainBeforeParentDelete,
   runCapacityDeleteTransaction,
@@ -653,6 +655,17 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
   const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
+  const refusals = mcpCommandRefusals({
+    grant: commandsGrant,
+    live:
+      live && commandsLive
+        ? {
+            mode: live.mcpCommandMode,
+            supervisedCommands: live.supervisedCommands,
+            terminalSupported: live.terminalSupported,
+          }
+        : null,
+  });
   const staleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
     id: row.id,
@@ -678,13 +691,15 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     relayProtocolVersion: row.relayProtocolVersion ?? null,
     /**
      * Set when this device's last hello was refused for an old relay
-     * protocol; the next accepted hello clears it.
+     * protocol, or one newer than this server speaks (`reason`); the next
+     * accepted hello clears it.
      */
     upgradeRequired: row.relayRejectedAt
       ? {
           protocolVersion: row.rejectedRelayProtocolVersion ?? null,
           cliVersion: row.rejectedCliVersion ?? null,
           rejectedAt: row.relayRejectedAt,
+          reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
         }
       : null,
     nodeInfoAt: row.nodeInfoAt ?? null,
@@ -713,7 +728,13 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         live: commandsLive,
         /** What an MCP agent can do right now: the lowest of grant and live CLI mode. */
         effectiveMode: commandsEffective,
-        available: commandsEffective !== "off",
+        /**
+         * Why the relay would refuse each command kind right now (its refusal
+         * order), or null when it would admit it.
+         */
+        refusals,
+        /** Some command kind would be admitted (headless or supervised). */
+        available: refusals.headless === null || refusals.supervised === null,
       },
     },
     endpoints: row.Endpoints.map((endpoint) => ({
@@ -906,6 +927,7 @@ function serializePool(row: ModelPoolRow) {
       confirmedCacheWeight: row.affinityConfirmedCacheWeight,
       loadPenaltyWeight: row.affinityLoadPenaltyWeight,
     },
+    cacheHolderWaitMs: row.cacheHolderWaitMs,
     compatibility: {
       recommendedSurface,
       suggestedConnectionType: suggestedSurface,
@@ -1336,6 +1358,7 @@ const poolSelect = {
   affinityConversationWeight: true,
   affinityConfirmedCacheWeight: true,
   affinityLoadPenaltyWeight: true,
+  cacheHolderWaitMs: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -2554,6 +2577,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2634,6 +2658,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: input.affinityConversationWeight ?? 150,
         affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
         affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
+        cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
       } as const;
       const capacityPolicy = {
         capacityPriority: data.capacityPriority,
@@ -2705,6 +2730,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        cacheHolderWaitMs: cacheHolderWaitMsSchema,
         ...modelPoolCapacityPolicyFields,
       }),
     )
@@ -2895,6 +2921,9 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.affinityLoadPenaltyWeight !== undefined
               ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.cacheHolderWaitMs !== undefined
+              ? { cacheHolderWaitMs: input.cacheHolderWaitMs }
               : {}),
             ...(input.capacityPriority !== undefined
               ? { capacityPriority: input.capacityPriority }

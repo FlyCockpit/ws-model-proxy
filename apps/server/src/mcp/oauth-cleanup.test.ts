@@ -592,12 +592,15 @@ describe("sweepExpiredOAuthArtifacts", () => {
     counts = await sweepExpiredOAuthArtifacts({ now: NOW });
     expect(counts.authorizationCodes).toBe(OAUTH_CLEANUP_VERIFICATION_TOTAL_CAP);
     expect(state.rows).toHaveLength(200);
-    expect(OAUTH_CLEANUP_VERIFICATION_SCAN_CAP).toBeGreaterThan(5200); // work bound not hit
+    // The default scan bound is not hit by 5,200 rows (pins the default).
+    expect(counts.scanCapReached).toBe(false);
+    expect(OAUTH_CLEANUP_VERIFICATION_SCAN_CAP).toBeGreaterThan(5200);
   });
 
   it("R107/R108 finding 1: wrong-type scan-cap saturation is COUNTED and the log fires with zero deletions", async () => {
     seedEmpty();
-    // The reviewers' probe: 50,000 marker-matching WRONG-TYPE rows (a
+    // The reviewers' probe: a scan-cap-sized run (50,000 by default; the
+    // injected cap below keeps the fixture small) of marker-matching WRONG-TYPE rows (a
     // nested field carries the marker) ahead of ONE valid expired code.
     // Pass 2 excluded wrong-type rows from every counter, so this state
     // produced zero deletions, zero retainedUnvalidated, and NO log line —
@@ -609,18 +612,19 @@ describe("sweepExpiredOAuthArtifacts", () => {
       value: JSON.stringify({ type: "other", nested: { type: "authorization_code" } }),
     });
     const validTail = { id: "z9999", value: codeValue() };
+    const scanCap = OAUTH_CLEANUP_VERIFICATION_BATCH * 3;
     const state = statefulVerificationMock([
-      ...Array.from({ length: OAUTH_CLEANUP_VERIFICATION_SCAN_CAP }, (_, i) => wrongType(i)),
+      ...Array.from({ length: scanCap }, (_, i) => wrongType(i)),
       validTail,
     ]);
 
-    const counts = await sweepExpiredOAuthArtifacts({ now: NOW });
+    const counts = await sweepExpiredOAuthArtifacts({ now: NOW, verificationScanCap: scanCap });
 
     expect(counts.authorizationCodes).toBe(0); // valid tail behind the cap
     expect(counts.retainedUnvalidated).toBe(0);
-    expect(counts.retainedWrongType).toBe(OAUTH_CLEANUP_VERIFICATION_SCAN_CAP);
+    expect(counts.retainedWrongType).toBe(scanCap);
     expect(counts.scanCapReached).toBe(true);
-    expect(state.rows).toHaveLength(OAUTH_CLEANUP_VERIFICATION_SCAN_CAP + 1); // nothing deleted
+    expect(state.rows).toHaveLength(scanCap + 1); // nothing deleted
     // Valid rows BELOW the cap still drain: a small wrong-type prefix
     // never starves a following valid code.
     seedEmpty();

@@ -1,17 +1,17 @@
-import { QueryCache, QueryClient } from "@tanstack/react-query";
+import { QueryClient } from "@tanstack/react-query";
 import { createRouter } from "@tanstack/react-router";
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query";
 import { createIsomorphicFn } from "@tanstack/react-start";
 import { getRequestHeader } from "@tanstack/react-start/server";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 
 import ErrorState from "./components/error-state";
 import Loader from "./components/loader";
 import i18n from "./i18n";
 import { routeTree } from "./routeTree.gen";
-import { type DeletionEntity, friendly } from "./utils/friendly-error";
+import { type DeletionEntity } from "./utils/friendly-error";
 import { createAppMutationCache } from "./utils/mutation-error-toast";
 import { orpc } from "./utils/orpc";
+import { createAppQueryCache, retryQueryWith } from "./utils/query-error-toast";
 import { shouldRetryQuery } from "./utils/query-retry";
 
 // Read the per-request CSP nonce forwarded by the API server on the
@@ -23,20 +23,20 @@ const getCspNonce = createIsomorphicFn()
   .client(() => undefined);
 
 export function getRouter() {
+  // Retry needs the client, which owns this cache; resolved on click.
+  const retryQuery: Parameters<typeof createAppQueryCache>[1] = (query) =>
+    retryQueryWith(queryClient)(query);
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: shouldRetryQuery, staleTime: 1000 * 60 * 5 },
     },
-    queryCache: new QueryCache({
-      onError: (error, query) => {
-        toast.error(friendly(error), {
-          action: {
-            label: i18n.t("common:actions.retry"),
-            onClick: query.invalidate,
-          },
-        });
-      },
-    }),
+    // Surface query failures by default so no read fails silently. A query
+    // that renders its own error UI opts out with
+    // `meta: { skipGlobalErrorToast: true }` (utils/query-error-toast).
+    queryCache: createAppQueryCache(
+      (key) => i18n.t(key),
+      (query) => retryQuery(query),
+    ),
     // Surface mutation failures by default so no action ever fails silently.
     // Mutations that handle their own errors (e.g. inline form errors) can
     // opt out with `useMutation({ meta: { skipGlobalErrorToast: true } })`.
@@ -82,6 +82,10 @@ declare module "@tanstack/react-router" {
 
 declare module "@tanstack/react-query" {
   interface Register {
+    queryMeta: {
+      /** Suppress the global error toast for this query. */
+      skipGlobalErrorToast?: boolean;
+    };
     mutationMeta: {
       /** Suppress the global error toast for this mutation. */
       skipGlobalErrorToast?: boolean;

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
@@ -14,6 +15,14 @@ const consentState = vi.hoisted(() => ({
   allowlistEntry: null as null | Record<string, unknown>,
   grant: null as null | Record<string, unknown>,
   account: null as null | Record<string, unknown>,
+  /** The pool owner's account when the requester is someone else (#76). */
+  ownerAccount: null as null | Record<string, unknown>,
+  /** The send claim's target re-read: listed member and provider model rows. */
+  member: { id: "member" } as null | Record<string, unknown>,
+  providerModel: { enabled: true, ProviderAccount: { enabled: true } } as null | Record<
+    string,
+    unknown
+  >,
 }));
 function resetConsentState() {
   consentState.token = {
@@ -26,6 +35,9 @@ function resetConsentState() {
   consentState.allowlistEntry = null;
   consentState.grant = null;
   consentState.account = { banned: false, banExpires: null, deletionRequestedAt: null };
+  consentState.ownerAccount = { banned: false, banExpires: null, deletionRequestedAt: null };
+  consentState.member = { id: "member" };
+  consentState.providerModel = { enabled: true, ProviderAccount: { enabled: true } };
 }
 const db = vi.hoisted(() => ({
   modelApiToken: { findUnique: vi.fn(async () => consentState.token) },
@@ -112,7 +124,10 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
 import openRouterUsageFixture from "./fixtures/openrouter-usage.json";
-import { claimProviderHealthTrial } from "./provider-attempt-runtime.js";
+import {
+  claimProviderHealthTrial,
+  recordProviderAttemptEvent,
+} from "./provider-attempt-runtime.js";
 import { admitProviderBudget } from "./provider-budget.js";
 import { providerBillableTokens } from "./provider-budget-accounting.js";
 import {
@@ -143,6 +158,11 @@ function consentDelegates() {
     modelApiToken: db.modelApiToken,
     modelApiTokenAllowlistEntry: db.modelApiTokenAllowlistEntry,
     user: db.user,
+    poolOwner: { findUnique: async () => consentState.ownerAccount },
+    poolMember: { findFirst: vi.fn(async () => consentState.member) },
+    providerModel: { findFirst: vi.fn(async () => consentState.providerModel) },
+    // The claim's transaction-local lock_timeout (L1b).
+    $executeRaw: vi.fn(async () => 0),
   };
 }
 
@@ -274,6 +294,11 @@ function dispatchPoolFixture(
   return {
     fallbackEnabled: true,
     fallbackForGrantees: false,
+    User: {
+      banned: false,
+      banExpires: null as Date | null,
+      deletionRequestedAt: null as Date | null,
+    },
     PoolMembers: [
       {
         id: "member-heartbeat",
@@ -1006,6 +1031,242 @@ describe("requester validity lapsing during the send claim's provider-lock wait"
       vi.useRealTimers();
     }
   });
+});
+
+// #76 (owner lifecycle) and N6-1 (claim denial vs abort classification): the
+// pool owner's account is re-checked at dispatch entry and after the send
+// claim's last lock wait; a denial the claim returns is returned as such even
+// when the request or its capacity lease was aborted meanwhile, and no other
+// member is tried after it.
+describe("pool owner lifecycle and claim-denial classification at the send boundary", () => {
+  const start = new Date("2026-09-26T12:00:00.000Z");
+
+  function twoMemberFixture() {
+    const fixture = dispatchPoolFixture();
+    const first = fixture.PoolMembers[0]!;
+    const second = structuredClone(first);
+    second.id = "member-second";
+    second.publicOrder = 1;
+    second.ExecutionTarget.id = "target-second";
+    second.ExecutionTarget.ProviderModel.id = "model-second";
+    second.ExecutionTarget.ProviderModel.ProviderAccount.id = "account-second";
+    second.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential.id = "credential-second";
+    fixture.PoolMembers.push(second);
+    fixture.fallbackForGrantees = true;
+    return fixture;
+  }
+
+  function arrange(onAccountLock: () => void, fixture = twoMemberFixture()) {
+    providerHttpsRequest.mockReset();
+    reconcileProviderBudget.mockClear();
+    releaseProviderHealthTrial.mockClear();
+    recordProviderOutcome.mockClear();
+    db.$transaction.mockClear();
+    consentState.token = { ...consentState.token, userId: "grantee" };
+    consentState.grant = currentGrant();
+    db.modelPool.findFirst.mockImplementation(async () => structuredClone(fixture));
+    const accountLocks: string[] = [];
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        if (strings.join("").includes('AS "requesterValid"'))
+          return mockRequesterValidityQuery(strings, values, consentDelegates());
+        if (strings.join("?").includes("FROM provider_account")) {
+          accountLocks.push(String(values[0]));
+          onAccountLock();
+        }
+        return [];
+      }),
+      // D9: the account's privacy policy, read under the account lock.
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn(
+          async () =>
+            fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential,
+        ),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (value: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from('{"choices":[],"usage":{}}')]);
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+    return { tx, accountLocks };
+  }
+
+  const granteeRequest = (signal: AbortSignal = new AbortController().signal) => ({
+    userId: "owner",
+    poolId: "pool",
+    requestId: "owner-lifecycle",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+    ...ownerConsentFields("grantee"),
+    requestedProtocol: "openai" as const,
+    requestedSurface: "openai-chat" as const,
+    stream: false,
+    requiredFeatures: [],
+    path: "/v1/chat/completions",
+    headers: new Headers(),
+    body: new TextEncoder().encode('{"model":"pool","messages":[]}'),
+    signal,
+    liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+    requestedOutputTokens: 1n,
+    releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+    adaptationEnabled: false,
+    // Retry-safe with two members: a non-denial failure would move on.
+    retrySafe: true,
+  });
+
+  const banned = { banned: true, banExpires: null, deletionRequestedAt: null };
+
+  it.each([
+    ["is banned indefinitely", () => banned, "POOL_OWNER_INACTIVE"],
+    [
+      "gets a temporary ban",
+      () => ({
+        banned: true,
+        banExpires: new Date(Date.now() + 60_000),
+        deletionRequestedAt: null,
+      }),
+      "POOL_OWNER_INACTIVE",
+    ],
+    [
+      "is marked for deletion",
+      () => ({ banned: false, banExpires: null, deletionRequestedAt: new Date() }),
+      "POOL_OWNER_INACTIVE",
+    ],
+    ["stays active (control)", () => consentState.ownerAccount, null],
+  ] as const)(
+    "refuses a grantee's send when the owner %s while the claim waits on provider locks",
+    async (_label, ownerState, reason) => {
+      const { tx, accountLocks } = arrange(() => {
+        consentState.ownerAccount = ownerState();
+      });
+      const result = await dispatchPublicOverflow(granteeRequest());
+      if (reason === null) {
+        expect(result.dispatched).toBe(true);
+        if (result.dispatched) {
+          await result.response.text();
+          await result.terminal;
+        }
+        return;
+      }
+      expect(result).toEqual({ dispatched: false, reason });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      // Request-wide: the second member is never claimed.
+      expect(accountLocks).toEqual(["account-heartbeat"]);
+    },
+  );
+
+  it("serves again once the owner's temporary ban has expired", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    try {
+      const expiring = {
+        banned: true,
+        banExpires: new Date(start.getTime() + 1_000),
+        deletionRequestedAt: null,
+      };
+      const fixture = twoMemberFixture();
+      fixture.User = { ...expiring };
+      consentState.ownerAccount = { ...expiring };
+      arrange(() => undefined, fixture);
+      await expect(dispatchPublicOverflow(granteeRequest())).resolves.toEqual({
+        dispatched: false,
+        reason: "POOL_OWNER_INACTIVE",
+      });
+      // No claim transaction: refused at dispatch entry.
+      expect(db.$transaction).not.toHaveBeenCalled();
+      vi.setSystemTime(new Date(start.getTime() + 1_001));
+      arrange(() => undefined, fixture);
+      const result = await dispatchPublicOverflow(granteeRequest());
+      expect(result.dispatched).toBe(true);
+      if (result.dispatched) {
+        await result.response.text();
+        await result.terminal;
+      }
+      expect(providerHttpsRequest).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // #64 decision: a member removed or a provider model disabled between
+  // listing and the claim is not sent to; it is availability, so the next
+  // member is tried only for a retry-safe operation.
+  it.each([
+    ["member removed", "member", true],
+    ["member removed", "member", false],
+    ["provider model disabled", "model", true],
+    ["provider model disabled", "model", false],
+  ] as const)(
+    "on %s at the claim (retry-safe %s) tries the next member only when retry-safe",
+    async (_label, change, retrySafe) => {
+      let claims = 0;
+      const { tx, accountLocks } = arrange(() => {
+        claims += 1;
+        if (claims === 1) {
+          if (change === "member") consentState.member = null;
+          else consentState.providerModel = { enabled: false, ProviderAccount: { enabled: true } };
+        } else {
+          consentState.member = { id: "member" };
+          consentState.providerModel = { enabled: true, ProviderAccount: { enabled: true } };
+        }
+      });
+      const result = await dispatchPublicOverflow({ ...granteeRequest(), retrySafe });
+      if (retrySafe) {
+        expect(result.dispatched).toBe(true);
+        if (result.dispatched) {
+          await result.response.text();
+          await result.terminal;
+        }
+        expect(accountLocks).toEqual(["account-heartbeat", "account-second"]);
+        expect(providerHttpsRequest).toHaveBeenCalledTimes(1);
+        expect(tx.providerCredential.update).toHaveBeenCalledTimes(1);
+      } else {
+        expect(result).toEqual({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
+        expect(accountLocks).toEqual(["account-heartbeat"]);
+        expect(providerHttpsRequest).not.toHaveBeenCalled();
+        expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      }
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: expect.any(String), dispatchOutcome: "NOT_SENT" }),
+      );
+    },
+  );
+
+  it.each([
+    ["the client disconnected", "client"],
+    ["the capacity lease ownership was lost", "lease"],
+  ] as const)(
+    "returns a claim denial, not SEND_CLAIM_FAILED, when %s during the claim",
+    async (_label, abortKind) => {
+      const controller = new AbortController();
+      const { tx, accountLocks } = arrange(() => {
+        // The requester's account is marked for deletion and, in the same
+        // window, the request (client) or its lease signal (the dispatcher's
+        // request signal is the lease signal) is aborted.
+        consentState.account = { banned: false, banExpires: null, deletionRequestedAt: new Date() };
+        controller.abort(
+          new Error(abortKind === "client" ? "client disconnected" : "capacity lease lost"),
+        );
+      });
+      const result = await dispatchPublicOverflow(granteeRequest(controller.signal));
+      expect(result).toEqual({ dispatched: false, reason: "REQUESTER_ACCESS_BLOCKED" });
+      expect(accountLocks).toEqual(["account-heartbeat"]);
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "CANCELLED", dispatchOutcome: "NOT_SENT" }),
+      );
+    },
+  );
 });
 
 // L1a: a send claim that throws before any provider I/O is no evidence about
@@ -1783,6 +2044,7 @@ describe("public overflow terminal response dispatch", () => {
   it("keeps unavailable targets with cooldown metadata eligible for half-open recovery", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       fallbackEnabled: true,
+      User: { banned: false, banExpires: null, deletionRequestedAt: null },
       fallbackForGrantees: false,
       PoolMembers: [
         {
@@ -1844,6 +2106,7 @@ describe("public overflow terminal response dispatch", () => {
   it("returns a non-retry-safe 429 with Retry-After and records its cooldown", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       fallbackEnabled: true,
+      User: { banned: false, banExpires: null, deletionRequestedAt: null },
       fallbackForGrantees: false,
       PoolMembers: [
         {
@@ -2153,117 +2416,141 @@ describe("public overflow terminal response dispatch", () => {
     rememberAffinity.mockResolvedValue(undefined);
   });
 
-  it("settles cancellation before provider I/O as not sent with no health verdict", async () => {
-    recordProviderOutcome.mockClear();
-    db.modelPool.findFirst.mockResolvedValue({
-      fallbackEnabled: true,
-      fallbackForGrantees: false,
-      PoolMembers: [
-        {
-          id: "member-cancel",
-          publicOrder: 0,
-          ExecutionTarget: {
-            id: "target-cancel",
-            ProviderModel: {
-              id: "model-cancel",
-              userId: "owner",
-              upstreamModelId: "upstream-model",
-              contextWindow: 10_000,
-              maxOutputTokens: 1_000,
-              nativeCapabilities: {
-                protocols: ["openai"],
-                surfaces: ["openai-chat"],
-                streaming: true,
-                features: [],
-              },
-              healthStatus: "HEALTHY",
-              healthNextRetryAt: null,
-              enabled: true,
-              deletedAt: null,
-              ProviderAccount: {
-                id: "account-cancel",
+  it.each([
+    [
+      "a client cancellation",
+      () => new Error("client disconnected"),
+      "CANCELLED",
+      "CANCELLED",
+      "CANCELLED",
+    ],
+    // F2-CAP-3: a lost capacity lease is a server-side failure, never a cancel.
+    [
+      "a capacity lease loss",
+      () => new CapacityLeaseLostError("ownership_lost"),
+      "FAILED",
+      "CAPACITY_LEASE_LOST",
+      "FAILED",
+    ],
+  ] as const)(
+    "settles %s before provider I/O as not sent with no health verdict",
+    async (_label, abortReason, budgetReason, eventReason, terminalState) => {
+      recordProviderOutcome.mockClear();
+      db.modelPool.findFirst.mockResolvedValue({
+        fallbackEnabled: true,
+        User: { banned: false, banExpires: null, deletionRequestedAt: null },
+        fallbackForGrantees: false,
+        PoolMembers: [
+          {
+            id: "member-cancel",
+            publicOrder: 0,
+            ExecutionTarget: {
+              id: "target-cancel",
+              ProviderModel: {
+                id: "model-cancel",
                 userId: "owner",
-                providerType: "openai",
-                providerVersion: null,
-                baseUrl: "https://provider.example",
-                authType: "BEARER",
+                upstreamModelId: "upstream-model",
+                contextWindow: 10_000,
+                maxOutputTokens: 1_000,
+                nativeCapabilities: {
+                  protocols: ["openai"],
+                  surfaces: ["openai-chat"],
+                  streaming: true,
+                  features: [],
+                },
                 healthStatus: "HEALTHY",
                 healthNextRetryAt: null,
                 enabled: true,
                 deletedAt: null,
-                CurrentCredential: {
-                  id: "credential-cancel",
-                  credentialType: "BEARER",
-                  aadVersion: 1,
-                  algorithm: "AES-256-GCM",
-                  keyVersion: "v1",
-                  ciphertext: new Uint8Array(),
-                  nonce: new Uint8Array(),
-                  authTag: new Uint8Array(),
-                  status: "ACTIVE",
+                ProviderAccount: {
+                  id: "account-cancel",
+                  userId: "owner",
+                  providerType: "openai",
+                  providerVersion: null,
+                  baseUrl: "https://provider.example",
+                  authType: "BEARER",
+                  healthStatus: "HEALTHY",
+                  healthNextRetryAt: null,
+                  enabled: true,
+                  deletedAt: null,
+                  CurrentCredential: {
+                    id: "credential-cancel",
+                    credentialType: "BEARER",
+                    aadVersion: 1,
+                    algorithm: "AES-256-GCM",
+                    keyVersion: "v1",
+                    ciphertext: new Uint8Array(),
+                    nonce: new Uint8Array(),
+                    authTag: new Uint8Array(),
+                    status: "ACTIVE",
+                  },
                 },
               },
             },
           },
+        ],
+      });
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-cancel",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-cancel" }),
         },
-      ],
-    });
-    const tx = {
-      ...consentDelegates(),
-      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
-        mockRequesterValidityQuery(strings, values, consentDelegates()),
-      ),
-      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-      providerCredential: {
-        findFirst: vi.fn().mockResolvedValue({
-          id: "credential-cancel",
-          credentialType: "BEARER",
-          aadVersion: 1,
-          algorithm: "AES-256-GCM",
-          keyVersion: "v1",
-          ciphertext: new Uint8Array(),
-          nonce: new Uint8Array(),
-          authTag: new Uint8Array(),
-        }),
-        update: vi.fn().mockResolvedValue({ id: "credential-cancel" }),
-      },
-    };
-    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
-      callback(tx),
-    );
-    const controller = new AbortController();
-    controller.abort(new Error("client disconnected"));
-    providerHttpsRequest.mockReset();
-    reconcileProviderBudget.mockClear();
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const controller = new AbortController();
+      controller.abort(abortReason());
+      providerHttpsRequest.mockReset();
+      reconcileProviderBudget.mockClear();
+      vi.mocked(recordProviderAttemptEvent).mockClear();
 
-    const result = await dispatchPublicOverflow({
-      userId: "owner",
-      poolId: "pool",
-      requestId: "request-cancel",
-      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-      ...ownerConsentFields(),
-      requestedProtocol: "openai",
-      requestedSurface: "openai-chat",
-      stream: false,
-      requiredFeatures: [],
-      path: "/v1/chat/completions",
-      headers: new Headers({ "content-type": "application/json" }),
-      body: new TextEncoder().encode('{"model":"pool"}'),
-      signal: controller.signal,
-      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
-      requestedOutputTokens: 1n,
-      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
-      adaptationEnabled: false,
-      retrySafe: false,
-    });
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-cancel",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: controller.signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
 
-    expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
-    expect(recordProviderOutcome).not.toHaveBeenCalled();
-    expect(providerHttpsRequest).not.toHaveBeenCalled();
-    expect(reconcileProviderBudget).toHaveBeenCalledWith(
-      expect.objectContaining({ reason: "CANCELLED", dispatchOutcome: "NOT_SENT" }),
-    );
-  });
+      expect(result).toEqual({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: budgetReason, dispatchOutcome: "NOT_SENT" }),
+      );
+      expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: "TERMINAL", reason: eventReason, terminalState }),
+      );
+    },
+  );
 
   it("aborts a pending provider request when heartbeat ownership is lost", async () => {
     vi.useFakeTimers();
@@ -2437,6 +2724,176 @@ describe("public overflow terminal response dispatch", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // F2-CAP-3 (C1a-4/C1b-2/C1b-1): the capacity wrapper cancels the provider
+  // body when its lease is lost (mid-stream or at the hand-off refusal). That
+  // cancel must settle the attempt (heartbeat stopped, budget reconciled,
+  // terminal resolved) as a server-side FAILED, never as a client CANCELLED;
+  // a genuine client cancel keeps CANCELLED.
+  it.each([
+    [
+      "lease loss",
+      () => new CapacityLeaseLostError("ownership_lost"),
+      "FAILED",
+      "CAPACITY_LEASE_LOST",
+      "FAILED",
+    ],
+    [
+      "client cancel",
+      () => new Error("client disconnected"),
+      "CANCELLED",
+      "CANCELLED",
+      "CANCELLED",
+    ],
+  ] as const)(
+    "settles a cancelled provider body on %s with the right outcome",
+    async (_label, abortReason, budgetReason, eventReason, terminalState) => {
+      recordProviderOutcome.mockClear();
+      reconcileProviderBudget.mockClear();
+      vi.mocked(recordProviderAttemptEvent).mockClear();
+      db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const upstream = new Readable({ read() {} });
+      Object.assign(upstream, {
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+      providerHttpsRequest.mockImplementationOnce(async () => upstream);
+      const controller = new AbortController();
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-cancel-settle",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: true,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+        signal: controller.signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      if (!result.dispatched) throw new Error("expected a committed provider response");
+      // Nothing ever reads the body: only the cancel can settle the attempt.
+      const reason = abortReason();
+      controller.abort(reason);
+      await result.response.body?.cancel(reason);
+      await result.terminal;
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: budgetReason }),
+      );
+      expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: "TERMINAL", reason: eventReason, terminalState }),
+      );
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+    },
+  );
+
+  it("records one outcome when a lease loss lands during the settle of a client-cancelled attempt", async () => {
+    recordProviderOutcome.mockClear();
+    reconcileProviderBudget.mockClear();
+    vi.mocked(recordProviderAttemptEvent).mockClear();
+    db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = new Readable({ read() {} });
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    providerHttpsRequest.mockImplementationOnce(async () => upstream);
+    const controller = new AbortController();
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-cancel-race",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      ...ownerConsentFields(),
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: true,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+      signal: controller.signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    if (!result.dispatched) throw new Error("expected a committed provider response");
+    // Nothing ever reads the body: only the cancel can settle the attempt.
+    // The client cancels the body; the lease is then lost DURING the budget
+    // write. One attempt must not be split into different outcomes.
+    reconcileProviderBudget.mockImplementationOnce(async () => {
+      controller.abort(new CapacityLeaseLostError("ownership_lost"));
+    });
+    await result.response.body?.cancel(new Error("client disconnected"));
+    await result.terminal;
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "CANCELLED" }),
+    );
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "FAILED",
+        terminalState: "CANCELLED",
+      }),
+    );
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
   });
 });
 
@@ -2878,11 +3335,80 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines, so the native
-    // Responses terminal is not recognised and the observation stays
-    // incomplete (liability). OpenRouter accounts claim only Chat Completions,
-    // so Responses clients reach OpenRouter adapted to Chat.
+    // OpenRouter's Responses stream sends no `event:` lines and its terminal is
+    // deliberately not recognised (read to EOF, full hold): the observation
+    // completes only where the terminal is named (Messages `message_stop`,
+    // Chat `[DONE]`).
     expect(settled.observationComplete).toBe(surface !== "openai-responses");
+  });
+
+  it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    // A `response.completed` event line on a record of another type is no terminal.
+    const text = raw.replace(
+      /data: (\{"type":"response\.created")/,
+      "event: response.completed\ndata: $1",
+    );
+    expect(text).not.toBe(raw);
+    // The real terminal record is removed, leaving only the mismatching one.
+    const withoutTerminal = text.replace(/data: \{"type":"response\.completed".*\n\n/, "");
+    expect(withoutTerminal).not.toBe(text);
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutTerminal)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled.observationComplete).toBe(false);
+  });
+
+  // AC 13: an event-less (data-only) Responses record is never a terminal, for
+  // any provider type: recognising one would cut the read off at the first
+  // such record and make billing depend on transport chunking.
+  it.each(["openrouter", "openai", "openai-compatible"] as const)(
+    "does not complete an event-less Responses terminal for the %s provider type",
+    async (providerType) => {
+      // Strip the trailing `data: [DONE]` sentinel so nothing else ends the stream.
+      const raw = readFileSync(
+        new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+        "utf8",
+      );
+      const withoutDone = raw.replace(/data: \[DONE\]\s*$/, "");
+      expect(withoutDone).not.toBe(raw);
+      const settled = await settleOwnerStream(
+        providerType,
+        [Buffer.from(withoutDone)],
+        "owner",
+        "openai-responses",
+      );
+      expect(settled.observationComplete).toBe(false);
+    },
+  );
+
+  // AC 14 / M5: Messages stays strict. A data-only `message_stop` with no
+  // `event:` line must never be taken as a terminal, even though the record's
+  // `type` names it; otherwise a truncated/forged Messages stream would settle.
+  it("does not complete a Messages stream whose terminal has no event line", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/messages-stream-write.raw", import.meta.url),
+      "utf8",
+    );
+    const withoutEvents = raw
+      .split("\n")
+      .filter((line) => !line.startsWith("event:"))
+      .join("\n");
+    expect(withoutEvents).not.toBe(raw);
+    expect(withoutEvents).toContain('data: {"type":"message_stop"}');
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutEvents)],
+      "owner",
+      "anthropic-messages",
+    );
+    expect(settled.observationComplete).toBe(false);
   });
 
   it.each([
