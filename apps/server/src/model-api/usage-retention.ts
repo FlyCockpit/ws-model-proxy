@@ -16,6 +16,12 @@
  *     drop them (move = DELETE ... RETURNING + additive hourly upsert in ONE
  *     transaction, so a crash rolls both back and nothing is lost or doubled).
  *  4. Delete hourly rollups older than 13 months.
+ *  5. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
+ *     terminal admission history older than RELAY_REQUEST_RETENTION_DAYS (it
+ *     no longer blocks a parent delete, so it needs its own bound), the rest
+ *     of deleted users' history (the `deleted_user_purge` queue), and the
+ *     scheduler state of deleted capacities, and expired Responses stickiness
+ *     bindings (no foreign key removes them with their token or grant).
  *
  * Multi-replica safety: every batch selects its rows with
  * `FOR UPDATE SKIP LOCKED`, so concurrent sweepers work on disjoint rows; the
@@ -36,6 +42,13 @@ import {
 } from "@ws-model-proxy/config/usage-metrics";
 import defaultPrisma from "@ws-model-proxy/db";
 import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  HOT_PATH_SWEEP_BATCH,
+  pruneExpiredStickiness,
+  pruneOrphanCapacityRuntime,
+  pruneTerminalCapacityHistory,
+  purgeDeletedUsersHistory,
+} from "@ws-model-proxy/db/hot-path-sweeps";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
 import {
@@ -66,6 +79,10 @@ export type UsageRetentionResult = {
   relayRequestsDeleted: number;
   minuteRowsCompacted: number;
   hourRowsDeleted: number;
+  admissionHistoryPruned: number;
+  deletedUserRowsPurged: number;
+  orphanCapacityRuntimeDeleted: number;
+  expiredStickinessDeleted: number;
 };
 
 async function databaseNow(prisma: Pick<typeof defaultPrisma, "$queryRaw">): Promise<Date> {
@@ -142,12 +159,12 @@ export async function deleteExpiredRelayRequests({
     // createRelayMetadata writes PENDING), so a selected row is terminal and
     // already counted.
     //
-    // Capacity lock order (@ws-model-proxy/db/capacity-lock-order): the
-    // DELETE's ON DELETE SET NULL rewrites admission_request rows, which an
-    // admitter locks before it updates their relay rows. The shared helper
-    // takes the admission rows and then the relay rows with SKIP LOCKED, so
-    // this delete never waits on a row an admitter holds; skipped rows are
-    // deleted by a later run.
+    // Writer class S (@ws-model-proxy/db/capacity-lock-order): the DELETE's
+    // ON DELETE SET NULL rewrites admission_request rows (an H-internal
+    // foreign key), which an admitter locks. The shared helper takes the
+    // admission rows and then the relay rows with SKIP LOCKED, so this delete
+    // never waits on a row an admitter holds; skipped rows are deleted by a
+    // later run.
     const count = await prisma.$transaction(async (tx) => {
       const picked = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id FROM relay_request
@@ -295,10 +312,14 @@ export async function runUsageRetention({
   prisma = defaultPrisma as RetentionPrisma,
   retentionDays,
   batch = USAGE_RETENTION_BATCH,
+  sweepBatch = HOT_PATH_SWEEP_BATCH,
 }: {
   prisma?: RetentionPrisma;
   retentionDays: number;
+  /** Batch of the relay-request and rollup steps. */
   batch?: number;
+  /** Batch of the hot-path history sweeps (their own bound). */
+  sweepBatch?: number;
 }): Promise<UsageRetentionResult> {
   const now = await databaseNow(prisma);
   // Reap (drained) before deleting so abandoned requests are counted in the
@@ -314,7 +335,28 @@ export async function runUsageRetention({
   });
   const minuteRowsCompacted = await compactMinuteRollups({ prisma, now, batch });
   const hourRowsDeleted = await deleteExpiredHourRollups({ prisma, now, batch });
-  return { abandonedReaped, relayRequestsDeleted, minuteRowsCompacted, hourRowsDeleted };
+  const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
+    before: new Date(now.getTime() - retentionDays * DAY_MS),
+    batch: sweepBatch,
+  });
+  const purged = await purgeDeletedUsersHistory(prisma, { now, batch: sweepBatch });
+  const orphanCapacityRuntimeDeleted = await pruneOrphanCapacityRuntime(prisma, {
+    batch: sweepBatch,
+  });
+  const expiredStickinessDeleted = await pruneExpiredStickiness(prisma, {
+    now,
+    batch: sweepBatch,
+  });
+  return {
+    abandonedReaped,
+    relayRequestsDeleted,
+    minuteRowsCompacted,
+    hourRowsDeleted,
+    admissionHistoryPruned,
+    deletedUserRowsPurged: purged.rows,
+    orphanCapacityRuntimeDeleted,
+    expiredStickinessDeleted,
+  };
 }
 
 let activeUsageRetentionStop: (() => void) | null = null;
@@ -339,10 +381,14 @@ export function startUsageRetention({
         result.abandonedReaped +
         result.relayRequestsDeleted +
         result.minuteRowsCompacted +
-        result.hourRowsDeleted;
+        result.hourRowsDeleted +
+        result.admissionHistoryPruned +
+        result.deletedUserRowsPurged +
+        result.orphanCapacityRuntimeDeleted +
+        result.expiredStickinessDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

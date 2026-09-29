@@ -265,7 +265,7 @@ it("keeps external consent keys in sync and removes obsolete pool notices", () =
   }
   const keys = keyTree(enDashboard).join("\n");
   expect(keys).not.toMatch(
-    /publicEgressAcknowledged|granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
+    /granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
   );
 });
 

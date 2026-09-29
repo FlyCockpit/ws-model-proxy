@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import {
   budgetWindow,
@@ -342,8 +343,15 @@ export async function admitProviderBudget(
   const liabilitySpend =
     attempt.liability.spend === undefined ? undefined : decimal(attempt.liability.spend);
   return serializedByAdvisoryLocks(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${attempt.attemptId}`}, 0))`;
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${attempt.userId}:${attempt.providerAccountId}`}, 0))`;
+    // Writer class H (@ws-model-proxy/db/capacity-lock-order): fences only,
+    // attempt then account then (below) policy, before any row lock or
+    // write. The provider account and model are read without a lock, and the
+    // attempt, reservation and ledger rows it writes have no foreign key into
+    // the provider graph, so no insert takes an implicit account/model lock.
+    await acquireFences(tx, [
+      fences.budgetAttempt(attempt.attemptId),
+      fences.budgetAccount(attempt.userId, attempt.providerAccountId),
+    ]);
     // This statement runs after possibly waiting for the account lock. Use the
     // actual post-wait database clock, not this transaction's start time, when
     // evaluating newly committed activation/effective/expiry boundaries.
@@ -484,9 +492,10 @@ export async function admitProviderBudget(
     ) {
       return { admitted: false, reason: "PROTECTION_POLICY_MISSING" };
     }
-    for (const policy of policies) {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${policy.id}`}, 0))`;
-    }
+    await acquireFences(
+      tx,
+      policies.map((policy) => fences.budgetPolicy(policy.id)),
+    );
     if (attempt.expiresAt.getTime() <= now.getTime())
       throw new ProviderBudgetConfigurationError(
         "Provider reservation expiry is not in the future",
@@ -745,7 +754,23 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
   // surrounding new work stays fenced.
   await runWithDbShutdownPermit(() =>
     serializedByAdvisoryLocks(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
+      // Fences first (writer class H): the attempt fence, then the budget
+      // policy fences of the attempt's reservations. Reservations are written
+      // only under the attempt fence, so the set read between the two calls
+      // is final. Then the attempt row.
+      await acquireFences(tx, [fences.budgetAttempt(terminal.attemptId)]);
+      const reservedPolicies = await tx.providerBudgetReservation.findMany({
+        where: {
+          userId: terminal.userId,
+          attemptId: terminal.attemptId,
+          fencingToken: terminal.fencingToken,
+        },
+        select: { policyId: true },
+      });
+      await acquireFences(
+        tx,
+        reservedPolicies.map((reservation) => fences.budgetPolicy(reservation.policyId)),
+      );
       await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${terminal.attemptId} AND "fencingToken" = ${terminal.fencingToken} FOR UPDATE`;
       const anchor = await tx.providerAttempt.findUnique({
         where: {
@@ -863,8 +888,6 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         },
         orderBy: { id: "asc" },
       });
-      for (const reservation of reservations)
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${reservation.policyId}`}, 0))`;
 
       const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
       const reportedPricingVersion =
@@ -1078,7 +1101,7 @@ export async function repairExpiredProviderBudgets(
   for (const row of expired) {
     if (row.ledgerTerminalReason) {
       await prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${row.attemptId}`}, 0))`;
+        await acquireFences(tx, [fences.budgetAttempt(row.attemptId)]);
         const latest = await tx.providerUsageLedger.findFirst({
           where: { attemptId: row.attemptId, fencingToken: row.fencingToken },
           orderBy: [{ revisionSequence: "desc" }, { createdAt: "desc" }],

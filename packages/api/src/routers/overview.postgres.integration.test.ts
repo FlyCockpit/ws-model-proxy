@@ -1,5 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
@@ -25,12 +26,12 @@ integration("overview metrics with real PostgreSQL", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, router, metrics] = await Promise.all([
+    const [, router, metrics] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./overview"),
       import("@ws-model-proxy/config/usage-metrics"),
     ]);
-    prisma = db.default;
+    prisma = createFixturePrismaClient(databaseUrl!);
     overviewRouter = router.overviewRouter;
     latencyBucketIndex = metrics.latencyBucketIndex;
     emptyLatencyHistogram = metrics.emptyLatencyHistogram;

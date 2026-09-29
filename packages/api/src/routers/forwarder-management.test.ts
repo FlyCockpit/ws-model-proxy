@@ -7,10 +7,7 @@ import {
   parseDirectModelId,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
-import {
-  ParentDeletionDrainPendingError,
-  RetainedHistoryError,
-} from "@ws-model-proxy/db/parent-deletion";
+import { FenceSetChangedError } from "@ws-model-proxy/db/capacity-lock-order";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
@@ -20,28 +17,14 @@ const testEnv = vi.hoisted(() => ({
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
 }));
 
-const mailerState = vi.hoisted(() => ({
-  configured: false,
-  sendEmail: vi.fn(async () => undefined),
-}));
-
-// The ordered-delete locking runs against real PostgreSQL
+// The parent-delete fence prelude runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
-const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
-  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+const { fenceParentDelete } = vi.hoisted(() => ({
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
-  lockCapacityGraphForDelete,
-}));
-// The history drain before an ordered delete runs against real PostgreSQL
-// (parent-deletion.postgres.integration.test.ts); here it is observed.
-const { prepareParentDeletion } = vi.hoisted(() => ({
-  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
-}));
-vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
-  prepareParentDeletion,
+  fenceParentDelete,
 }));
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -62,6 +45,7 @@ vi.mock("@ws-model-proxy/db", async () => {
     Prisma: {
       DbNull: { kind: "DbNull" },
       Decimal: TestDecimal,
+      join: (values: readonly unknown[]) => values,
       TransactionIsolationLevel: { Serializable: "Serializable" },
     },
   };
@@ -72,15 +56,11 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   ADMIN_EMAIL: undefined,
 }));
 
-vi.mock("@ws-model-proxy/mailer", () => ({
-  isEmailConfigured: () => mailerState.configured,
-  sendEmail: mailerState.sendEmail,
-}));
-
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
   user: {
     findUnique: MockInstance;
     findFirst: MockInstance;
@@ -124,11 +104,6 @@ const db = prisma as unknown as {
     update: MockInstance;
     delete: MockInstance;
   };
-  dashboardNotice: {
-    createMany: MockInstance;
-    findMany: MockInstance;
-    updateMany: MockInstance;
-  };
   executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance; upsert: MockInstance };
   providerModel: { findFirst: MockInstance; findMany: MockInstance };
@@ -149,6 +124,29 @@ const db = prisma as unknown as {
     deleteMany: MockInstance;
   };
 };
+
+const sqlOf = (call: unknown[]) => (call[0] as readonly string[]).join("?");
+const isFenceCall = (call: unknown[]) => sqlOf(call).includes("wsmp_acquire_fences");
+
+/** The fence arrays passed to `wsmp_acquire_fences`, one per call, in call order. */
+function fenceCalls(): unknown[] {
+  return (db.$queryRaw.mock.calls as unknown[][]).filter(isFenceCall).map((call) => call[1]);
+}
+
+/** Call order of the last fence call (NaN when none was taken). */
+function lastFenceOrder(): number {
+  const calls = db.$queryRaw.mock.calls as unknown[][];
+  return db.$queryRaw.mock.invocationCallOrder[calls.findLastIndex(isFenceCall)] ?? Number.NaN;
+}
+
+/** Call order of the first `$queryRaw` that is not a fence (a row lock). */
+function firstRowLockOrder(): number {
+  const calls = db.$queryRaw.mock.calls as unknown[][];
+  return (
+    db.$queryRaw.mock.invocationCallOrder[calls.findIndex((call) => !isFenceCall(call))] ??
+    Number.NaN
+  );
+}
 
 function buildContext(
   sessionOverride?: Partial<{
@@ -284,10 +282,9 @@ describe("forwarderManagementRouter", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
-    mailerState.configured = false;
     db.poolMember.count.mockResolvedValue(0);
     db.poolGrant.findMany.mockResolvedValue([]);
-    db.dashboardNotice.createMany.mockResolvedValue({ count: 0 });
+    db.$queryRaw.mockResolvedValue([]);
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.executionTarget.findUnique.mockResolvedValue(null);
     db.executionTarget.findMany.mockResolvedValue([]);
@@ -494,7 +491,6 @@ describe("forwarderManagementRouter", () => {
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
 
     await httpClient().createGuardedModelPool({
-      ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
       slug: "default-context",
       name: "Default context",
       localModelIds: ["local-id"],
@@ -519,9 +515,6 @@ describe("forwarderManagementRouter", () => {
         }),
       }),
     );
-    expect(
-      JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
-    ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
   });
 
   it("defaults cache-affinity routing on for new guarded pools while honoring an explicit opt-out", async () => {
@@ -921,6 +914,31 @@ describe("forwarderManagementRouter", () => {
       where: { id: expect.stringMatching(/^provider-target-/) },
       data: { inferenceCapacityId: "provider-capacity-id" },
     });
+    // Writer class M: the owner fence, then the provider identity fences and
+    // the capacity-policy fences of every existing target it changes (one
+    // ascending call), then the provider account -> model rows (sorted, FOR
+    // KEY SHARE), and only then the graph writes.
+    expect(fenceCalls()).toEqual([
+      ["00:owner:user-id"],
+      [
+        "02:execution-target:provider-model:provider-a",
+        "02:execution-target:provider-model:provider-b",
+        "06:capacity-policy:existing-target",
+      ],
+    ]);
+    const rowLocks = (db.$queryRaw.mock.calls as unknown[][]).filter((call) => !isFenceCall(call));
+    expect(rowLocks.map((call) => [sqlOf(call).match(/FROM (\w+)/)?.[1], call[1]])).toEqual([
+      ["provider_account", ["account-a", "account-b"]],
+      ["provider_model", ["provider-a", "provider-b"]],
+    ]);
+    for (const call of rowLocks) expect(sqlOf(call)).toContain("FOR KEY SHARE");
+    expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
+    expect(lastFenceOrder()).toBeLessThan(
+      db.modelPool.create.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    expect(firstRowLockOrder()).toBeLessThan(
+      db.executionTarget.upsert.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
   });
 
   it("creates a provider-only pool as external fallback with fallback enabled", async () => {
@@ -1899,9 +1917,9 @@ describe("forwarderManagementRouter", () => {
 
   it("removes metadata only when the row belongs to the current user", async () => {
     // The owner-scoped precheck finds nothing for another user's device, so
-    // nothing is drained and no lock is taken.
+    // no fence or lock is taken.
     db.cliDevice.findFirst.mockResolvedValue(null);
-    prepareParentDeletion.mockClear();
+    fenceParentDelete.mockClear();
 
     await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toSatisfy(
       (error: ORPCError) => {
@@ -1913,14 +1931,14 @@ describe("forwarderManagementRouter", () => {
       where: { id: "cli-id", userId: "user-id" },
       select: { lastHeartbeatAt: true },
     });
-    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(fenceParentDelete).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
   });
 
   it("deletes a device with its credentials and closes their live relay sessions", async () => {
     db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
-    prepareParentDeletion.mockClear();
+    fenceParentDelete.mockClear();
     db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
     db.cliDevice.delete.mockResolvedValue({ id: "cli-id" });
     db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "device-credential-1" }]);
@@ -1947,12 +1965,16 @@ describe("forwarderManagementRouter", () => {
       [{ kind: "deviceCredential", ids: ["device-credential-1"] }],
       [{ kind: "cliToken", ids: ["cli-token-1"] }],
     ]);
-    // The request history is drained before the ordered delete.
-    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+    // The parent-delete fences come first in the delete transaction (no
+    // history drain).
+    expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
       userId: "user-id",
       cliDeviceIds: ["cli-id"],
     });
-    expect(prepareParentDeletion.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(fenceParentDelete.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
+      db.cliDevice.updateMany.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    expect(db.cliDevice.updateMany.mock.invocationCallOrder[0] ?? Number.NaN).toBeLessThan(
       db.cliDevice.delete.mock.invocationCallOrder[0] ?? Number.NaN,
     );
     // Sessions are closed only after the delete transaction committed.
@@ -2117,7 +2139,6 @@ describe("forwarderManagementRouter", () => {
       fallbackForGrantees: true,
       externalAfterWaitMs: 500,
     });
-    expect(update.data).not.toHaveProperty("publicEgressAcknowledged");
     // Issue #67: every fallback change is audited, with its source.
     expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
       data: {
@@ -2288,6 +2309,9 @@ describe("forwarderManagementRouter", () => {
       where: { id: "grant-id", poolId: "pool-id", ownerUserId: "user-id" },
       data: { protectionOverridePercent: 0, queuePriority: 24 },
     });
+    // Writer class M: the owner fence is the first lock operation, before the pool row lock.
+    expect(fenceCalls()).toEqual([["00:owner:user-id"]]);
+    expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
     // Omitted fields stay; null means "inherit".
     await client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: null });
     expect(db.poolGrant.updateMany).toHaveBeenLastCalledWith({
@@ -2515,32 +2539,12 @@ describe("forwarderManagementRouter", () => {
       );
     }
 
-    it("enables shared fallback without notices or email, including with SMTP configured", async () => {
+    it("enables shared fallback without consulting grantees", async () => {
       privateSharedPool();
-      mailerState.configured = true;
       await expect(
         client().updateModelPool({ id: "pool-id", fallbackEnabled: true }),
       ).resolves.toMatchObject({ fallbackEnabled: true });
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
-      expect(mailerState.sendEmail).not.toHaveBeenCalled();
       expect(db.poolGrant.findMany).not.toHaveBeenCalled();
-    });
-
-    it("ignores obsolete confirmation inputs from old clients", async () => {
-      privateSharedPool();
-      const oldInput = {
-        id: "pool-id",
-        fallbackEnabled: true,
-        publicEgressAcknowledged: false,
-        confirmGranteePrivacyChange: false,
-      };
-      await expect(client().updateModelPool(oldInput)).resolves.toMatchObject({
-        fallbackEnabled: true,
-      });
-      const write = db.modelPool.update.mock.calls[0]?.[0] as { data: Record<string, unknown> };
-      expect(write.data).not.toHaveProperty("publicEgressAcknowledged");
-      expect(write.data).not.toHaveProperty("confirmGranteePrivacyChange");
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
     it("does not require confirmation when the shared pool has no grantees", async () => {
@@ -2553,7 +2557,6 @@ describe("forwarderManagementRouter", () => {
           fallbackEnabled: true,
         }),
       ).resolves.toMatchObject({ fallbackEnabled: true });
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
     it("does not require confirmation when the pool is already non-private", async () => {
@@ -2573,10 +2576,9 @@ describe("forwarderManagementRouter", () => {
           fallbackEnabled: true,
         }),
       ).resolves.toMatchObject({ fallbackEnabled: true });
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
 
-    it("attaches the first external member of an enabled shared pool without notices", async () => {
+    it("attaches the first external member of an enabled shared pool", async () => {
       db.modelPool.findFirst.mockResolvedValue({
         id: "pool-id",
         name: "Shared",
@@ -2601,7 +2603,6 @@ describe("forwarderManagementRouter", () => {
 
       await expect(
         httpClient().addProviderPoolMember({
-          ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
           poolId: "pool-id",
           providerModelId: "provider-model",
           tier: "PUBLIC_OVERFLOW",
@@ -2611,11 +2612,29 @@ describe("forwarderManagementRouter", () => {
         id: "external-provider-member",
         executionTargetId: "provider-target",
       });
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
-      expect(mailerState.sendEmail).not.toHaveBeenCalled();
-      expect(
-        JSON.stringify([db.modelPool.create.mock.calls, db.poolMember.create.mock.calls]),
-      ).not.toMatch(/publicEgressAcknowledged|confirmGranteePrivacyChange/);
+      // Writer class M: the owner fence, then (no target or capacity yet) the
+      // provider-model identity fence, then the pool row and the provider
+      // account -> model rows (FOR KEY SHARE), then the writes.
+      expect(fenceCalls()).toEqual([
+        ["00:owner:user-id"],
+        ["02:execution-target:provider-model:provider-model"],
+      ]);
+      const rowLocks = (db.$queryRaw.mock.calls as unknown[][])
+        .filter((call) => !isFenceCall(call))
+        .map((call) =>
+          sqlOf(call)
+            .match(/FROM (\w+)[\s\S]*FOR ((NO )?KEY \w+|UPDATE)/)
+            ?.slice(1, 3),
+        );
+      expect(rowLocks).toEqual([
+        ["model_pool", "NO KEY UPDATE"],
+        ["provider_account", "KEY SHARE"],
+        ["provider_model", "KEY SHARE"],
+      ]);
+      expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
+      expect(firstRowLockOrder()).toBeLessThan(
+        db.executionTarget.upsert.mock.invocationCallOrder[0] ?? Number.NaN,
+      );
     });
 
     it("never promotes a provider member to PRIMARY", async () => {
@@ -2664,7 +2683,6 @@ describe("forwarderManagementRouter", () => {
         }),
       ).rejects.toMatchObject({ code: "BAD_REQUEST" });
       expect(db.poolMember.update).not.toHaveBeenCalled();
-      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
     });
   });
 
@@ -3392,10 +3410,12 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("locks the target (L2) and the adopted capacity row (L5) before filling or linking it", async () => {
-    // DL-1 L5-before-L2: a target without a capacity adopts its auto capacity
-    // and fills a null AUTO limit. Both writes follow the target's policy
-    // lock and the sorted capacity-row lock.
+  it("fences the owner, then the target policy and adopted capacity, before the pool row and any write", async () => {
+    // Writer class M: a target without a capacity adopts its auto capacity
+    // and fills a null AUTO limit. The owner fence comes first; the planned
+    // target's capacity-policy fence and the candidate capacity's fence are
+    // taken (one ascending call) before the pool row lock, the fill and the
+    // link. No execution_target or inference_capacity row lock remains.
     const raw = prisma as unknown as { $queryRaw: MockInstance; $executeRaw: MockInstance };
     const extra = prisma as unknown as {
       inferenceCapacity: { findUnique: MockInstance };
@@ -3413,6 +3433,11 @@ describe("forwarderManagementRouter", () => {
       userId: "user-id",
       upstreamModelId: "model",
     });
+    // The planning read (before any row lock) finds the existing target.
+    db.executionTarget.findUnique.mockResolvedValueOnce({
+      id: "target-id",
+      inferenceCapacityId: null,
+    });
     db.executionTarget.upsert.mockResolvedValue({
       id: "target-id",
       inferenceCapacityId: null,
@@ -3426,19 +3451,33 @@ describe("forwarderManagementRouter", () => {
 
     await client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" });
 
-    const rawOrder = (fragment: string) => {
-      const index = raw.$queryRaw.mock.calls.findIndex(([strings]) =>
-        (strings as TemplateStringsArray).join("?").includes(fragment),
-      );
-      return raw.$queryRaw.mock.invocationCallOrder[index] ?? Number.NaN;
-    };
-    const targetLock = rawOrder("FROM execution_target WHERE id = ? FOR NO KEY UPDATE");
-    const capacityLock = rawOrder("FROM inference_capacity WHERE id IN (");
+    const calls = raw.$queryRaw.mock.calls as unknown[][];
+    const sqlOf = (call: unknown[]) => (call[0] as readonly string[]).join("?");
+    const fenceIndexes = calls.flatMap((call, index) =>
+      sqlOf(call).includes("wsmp_acquire_fences") ? [index] : [],
+    );
+    expect(fenceIndexes.map((index) => calls[index]?.[1])).toEqual([
+      ["00:owner:user-id"],
+      ["06:capacity-policy:target-id", "08:capacity:auto-capacity"],
+    ]);
+    const poolLockIndex = calls.findIndex((call) =>
+      /FROM model_pool[\s\S]*FOR NO KEY UPDATE/.test(sqlOf(call)),
+    );
+    expect(poolLockIndex).toBeGreaterThan(-1);
+    expect(
+      calls.some((call) => /FROM (execution_target|inference_capacity)/.test(sqlOf(call))),
+    ).toBe(false);
+    const order = raw.$queryRaw.mock.invocationCallOrder;
+    const policyFence = order[fenceIndexes[1] ?? -1] ?? Number.NaN;
+    const poolLock = order[poolLockIndex] ?? Number.NaN;
+    const upsert = db.executionTarget.upsert.mock.invocationCallOrder[0] ?? Number.NaN;
     const fill = db.inferenceCapacity.updateMany.mock.invocationCallOrder[0] ?? Number.NaN;
     const link = extra.executionTarget.updateMany.mock.invocationCallOrder[0] ?? Number.NaN;
-    expect(targetLock).toBeLessThan(capacityLock);
-    expect(capacityLock).toBeLessThan(fill);
-    expect(capacityLock).toBeLessThan(link);
+    expect(order[fenceIndexes[0] ?? -1] ?? Number.NaN).toBeLessThan(policyFence);
+    expect(policyFence).toBeLessThan(poolLock);
+    expect(poolLock).toBeLessThan(upsert);
+    expect(upsert).toBeLessThan(fill);
+    expect(upsert).toBeLessThan(link);
   });
 
   it("maps duplicate local pool members to CONFLICT without swallowing other errors", async () => {
@@ -3549,7 +3588,6 @@ describe("forwarderManagementRouter", () => {
 
     await expect(
       httpClient().updatePoolMember({
-        ...{ publicEgressAcknowledged: false, confirmGranteePrivacyChange: false },
         id: "provider-primary-member",
         capacityPriority: 24,
         capacityConcurrencyMode: "LIMITED",
@@ -3563,9 +3601,6 @@ describe("forwarderManagementRouter", () => {
         capacityContextMargin: 1_024,
       }),
     ).resolves.toMatchObject({ id: "provider-primary-member", tier: "PUBLIC_OVERFLOW" });
-    expect(JSON.stringify(db.poolMember.update.mock.calls)).not.toMatch(
-      /publicEgressAcknowledged|confirmGranteePrivacyChange/,
-    );
 
     expect(db.poolMember.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -3904,6 +3939,25 @@ describe("forwarderManagementRouter", () => {
       select: { id: true },
     });
     expect(JSON.stringify(db.user.findFirst.mock.calls)).not.toContain("contains");
+    // A grant links two owners' graphs: both owner fences (sorted, one call)
+    // before the pool row lock and the upsert; the revoke takes the same
+    // fences before its single delete statement.
+    expect(fenceCalls()).toEqual([
+      ["00:owner:grantee-id", "00:owner:user-id"],
+      ["00:owner:grantee-id", "00:owner:user-id"],
+    ]);
+    const calls = db.$queryRaw.mock.calls as unknown[][];
+    const order = db.$queryRaw.mock.invocationCallOrder;
+    const poolLock = calls.findIndex((call) =>
+      /FROM model_pool[\s\S]*FOR NO KEY UPDATE/.test(sqlOf(call)),
+    );
+    expect(order[0] ?? Number.NaN).toBeLessThan(order[poolLock] ?? Number.NaN);
+    expect(order[poolLock] ?? Number.NaN).toBeLessThan(
+      db.poolGrant.upsert.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    expect(lastFenceOrder()).toBeLessThan(
+      db.poolGrant.deleteMany.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
   });
 
   it("grants access to a pool with external fallback without any egress acknowledgement", async () => {
@@ -4611,13 +4665,21 @@ describe("forwarderManagementRouter", () => {
       expect(db.poolMember.delete).toHaveBeenCalledWith({
         where: { id: "member-a" },
       });
-      // Capacity lock order: the member's delete locks precede the DELETE.
-      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+      // Writer class M: the parent-delete fences come first in the delete
+      // transaction, before the pool row lock and the DELETE.
+      expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
         userId: "user-id",
         poolMemberIds: ["member-a"],
       });
-      expect(lockCapacityGraphForDelete.mock.invocationCallOrder.at(-1)).toBeLessThan(
-        db.poolMember.delete.mock.invocationCallOrder.at(-1) ?? 0,
+      const fenceOrder = fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN;
+      const poolLockIndex = db.$queryRaw.mock.calls.findIndex((call) =>
+        (call[0] as readonly string[]).join("?").includes("FROM model_pool"),
+      );
+      expect(fenceOrder).toBeLessThan(
+        db.$queryRaw.mock.invocationCallOrder[poolLockIndex] ?? Number.NaN,
+      );
+      expect(fenceOrder).toBeLessThan(
+        db.poolMember.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN,
       );
       expect(db.poolMember.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { poolId: "pool-id", id: { not: "member-a" } } }),
@@ -4805,25 +4867,33 @@ describe("forwarderManagementRouter", () => {
       expect(result.impactedPools).toEqual([]);
     });
 
-    it("removeEndpointMetadata passes endpointIds in the capacity lock scope", async () => {
+    it("removeEndpointMetadata passes endpointIds in the parent-delete fence scope", async () => {
       db.endpoint.findUnique.mockResolvedValue({
         id: "endpoint-id",
         userId: "user-id",
         cliDeviceId: "cli-device-id",
         lastSeenAt: null,
       });
-      db.executionTarget.findMany.mockResolvedValue([{ id: "target-id" }]);
       db.endpoint.delete.mockResolvedValue({ id: "endpoint-id" });
 
       await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).resolves.toEqual({
         deleted: true,
       });
-      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+      // The fences (owner fences of every user the cascade writes) are the
+      // first statement of the delete transaction; the cascade is resolved
+      // under them, so no target plan is passed in.
+      expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
         userId: "user-id",
-        lockedCliDeviceIds: ["cli-device-id"],
-        executionTargetIds: ["target-id"],
         endpointIds: ["endpoint-id"],
       });
+      const fenceOrder = fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN;
+      // Precheck read, then (under the fences) the owner re-read and the delete.
+      expect(fenceOrder).toBeLessThan(
+        db.endpoint.findUnique.mock.invocationCallOrder[1] ?? Number.NaN,
+      );
+      expect(fenceOrder).toBeLessThan(
+        db.endpoint.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN,
+      );
     });
 
     it("removeDiscoveredModelMetadata computes the post-deletion surface after capturing affected pools", async () => {
@@ -4834,7 +4904,6 @@ describe("forwarderManagementRouter", () => {
         Endpoint: { cliDeviceId: "cli-device-id" },
       });
       db.discoveredModel.delete.mockResolvedValue({ id: "model-id" });
-      db.executionTarget.findMany.mockResolvedValueOnce([{ id: "target-id" }]);
       // The responses-native member cascades away with the deleted model, so
       // the post-deletion primary set of pool-a is chat-only under a stored
       // responses override: unservable.
@@ -4849,15 +4918,14 @@ describe("forwarderManagementRouter", () => {
         impactedPools: [{ id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" }],
       });
       expect(db.discoveredModel.delete).toHaveBeenCalledWith({ where: { id: "model-id" } });
-      // Capacity lock order: the owning device (L0) and the model's target
-      // cascade are locked before the DELETE.
-      // The model is named for the in-transaction residual recount.
-      expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+      // The parent-delete fences precede the DELETE.
+      expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
         userId: "user-id",
-        lockedCliDeviceIds: ["cli-device-id"],
-        executionTargetIds: ["target-id"],
         discoveredModelIds: ["model-id"],
       });
+      expect(fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN).toBeLessThan(
+        db.discoveredModel.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN,
+      );
     });
 
     describe("deletion CONFLICT reasons", () => {
@@ -4873,7 +4941,7 @@ describe("forwarderManagementRouter", () => {
           message: "Endpoint is not stale.",
           data: { reason: "not_stale" },
         });
-        expect(prepareParentDeletion).not.toHaveBeenCalled();
+        expect(fenceParentDelete).not.toHaveBeenCalled();
       });
 
       it("endpoint: a heartbeat under the locks is not_stale", async () => {
@@ -4915,66 +4983,44 @@ describe("forwarderManagementRouter", () => {
         expect(db.discoveredModel.delete).not.toHaveBeenCalled();
       });
 
-      it("endpoint: retained history and an undrained residual carry their reasons", async () => {
-        db.endpoint.findUnique.mockResolvedValue({ userId: "user-id", lastSeenAt: null });
-        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
-        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "retained_history" },
-        });
-        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
-        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "delete_pending" },
-        });
-        expect(db.endpoint.delete).not.toHaveBeenCalled();
-      });
-
-      it("pool: retained history and an undrained residual carry their reasons", async () => {
+      it("pool: a plain delete after the parent-delete fences (no history drain)", async () => {
         db.modelPool.findUnique.mockResolvedValue({
           id: "pool-id",
           userId: "user-id",
           fallbackEnabled: false,
         });
-        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
-        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "retained_history" },
+        db.modelPool.delete.mockResolvedValue({ id: "pool-id" });
+        await expect(client().deleteModelPool({ id: "pool-id" })).resolves.toEqual({
+          deleted: true,
         });
-        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
-        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "delete_pending" },
+        expect(fenceParentDelete).toHaveBeenCalledWith(expect.anything(), {
+          userId: "user-id",
+          poolIds: ["pool-id"],
         });
+        expect(fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN).toBeLessThan(
+          db.modelPool.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN,
+        );
+      });
+
+      it("pool: an owner set that keeps changing under the fences is delete_contended", async () => {
+        db.modelPool.findUnique.mockResolvedValue({
+          id: "pool-id",
+          userId: "user-id",
+          fallbackEnabled: false,
+        });
+        fenceParentDelete.mockRejectedValue(new FenceSetChangedError());
+        try {
+          await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+            code: "CONFLICT",
+            data: { reason: "delete_contended" },
+          });
+        } finally {
+          fenceParentDelete.mockReset();
+          fenceParentDelete.mockImplementation(async () => undefined);
+        }
+        // Retried with a fresh plan each time, never deleting.
+        expect(db.$transaction).toHaveBeenCalledTimes(5);
         expect(db.modelPool.delete).not.toHaveBeenCalled();
-      });
-
-      it("pool member: retained history carries its reason", async () => {
-        db.poolMember.findUnique.mockResolvedValue({
-          id: "member-a",
-          poolId: "pool-id",
-          tier: "PUBLIC_OVERFLOW",
-          ModelPool: {
-            userId: "user-id",
-            recommendedSurfaceOverride: null,
-            protocolAdaptationEnabled: false,
-          },
-        });
-        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
-        await expect(client().removePoolMember({ id: "member-a" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "retained_history" },
-        });
-        expect(db.poolMember.delete).not.toHaveBeenCalled();
-      });
-
-      it("CLI device: retained history carries its reason", async () => {
-        db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
-        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
-        await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toMatchObject({
-          code: "CONFLICT",
-          data: { reason: "retained_history" },
-        });
       });
     });
   });

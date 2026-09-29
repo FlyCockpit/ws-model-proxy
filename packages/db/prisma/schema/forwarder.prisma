@@ -474,10 +474,6 @@ model DiscoveredModel {
   PoolMembers                   PoolMember[]
   TransformerForPools           ModelPool[]                    @relation("ModelPoolTransformer")
   ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
-  ResponseStickinessTargets     ResponseStickinessRecord[]     @relation("ResponseStickinessTargetModel")
-  ResponseStickinessSelections  ResponseStickinessRecord[]     @relation("ResponseStickinessSelectedModel")
-  RequestedRelayRequests        RelayRequest[]                 @relation("RelayRequestRequestedModel")
-  SelectedRelayRequests         RelayRequest[]                 @relation("RelayRequestSelectedModel")
   ExecutionTarget               ExecutionTarget?
 
   @@unique([endpointId, upstreamModelId])
@@ -494,9 +490,9 @@ model DiscoveredModel {
 /// reaches a provider only through a pool's external fallback tier when the
 /// caller explicitly requests `owner/pool:external`.
 model ProviderAccount {
-  id                         String                       @id @default(cuid(2))
-  createdAt                  DateTime                     @default(now())
-  updatedAt                  DateTime                     @default(now()) @updatedAt
+  id                         String                   @id @default(cuid(2))
+  createdAt                  DateTime                 @default(now())
+  updatedAt                  DateTime                 @default(now()) @updatedAt
   deletedAt                  DateTime?
   userId                     String
   providerType               String
@@ -504,40 +500,36 @@ model ProviderAccount {
   label                      String
   baseUrl                    String
   /// Canonical endpoint identity used by affinity keys; changes only with baseUrl.
-  endpointIdentity           String                       @default("")
-  endpointVersion            Int                          @default(1)
+  endpointIdentity           String                   @default("")
+  endpointVersion            Int                      @default(1)
   authType                   ProviderAuthType
-  status                     ProviderAccountStatus        @default(DISABLED)
-  enabled                    Boolean                      @default(false)
+  status                     ProviderAccountStatus    @default(DISABLED)
+  enabled                    Boolean                  @default(false)
   safeConfiguration          Json?
   /// OpenRouter only: when false (the default), every request carries
   /// `provider.data_collection: "deny"` so OpenRouter routes only to upstream
   /// providers that do not store or train on prompts. Human-only setting
   /// (dashboard), never writable through MCP.
-  allowDataCollection        Boolean                      @default(false)
-  currentCredentialId        String?                      @unique
-  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  allowDataCollection        Boolean                  @default(false)
+  currentCredentialId        String?                  @unique
+  healthStatus               ProviderHealthStatus     @default(UNKNOWN)
   healthCheckedAt            DateTime?
-  healthFailureCount         Int                          @default(0)
+  healthFailureCount         Int                      @default(0)
   healthNextRetryAt          DateTime?
   healthHalfOpenAt           DateTime?
   /// Fenced owner of the live half-open probe. Both fields are null together.
   healthHalfOpenAttemptId    String?
   healthHalfOpenFencingToken BigInt?
   /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
-  healthFencingWatermark     BigInt                       @default(0)
-  nextFencingToken           BigInt                       @default(0)
-  User                       User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  healthFencingWatermark     BigInt                   @default(0)
+  nextFencingToken           BigInt                   @default(0)
+  User                       User                     @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderModels             ProviderModel[]
-  Credentials                ProviderCredential[]         @relation("ProviderAccountCredentials")
-  CurrentCredential          ProviderCredential?          @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Credentials                ProviderCredential[]     @relation("ProviderAccountCredentials")
+  CurrentCredential          ProviderCredential?      @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   BudgetPolicies             ProviderBudgetPolicy[]
-  UsageLedger                ProviderUsageLedger[]
-  Attempts                   ProviderAttempt[]
   PricingVersions            ProviderPricingVersion[]
   AuditEvents                ProviderAuditEvent[]
-  AttemptEvents              PublicProviderAttemptEvent[]
-  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderAccount")
 
   @@unique([userId, label])
   @@unique([id, userId])
@@ -547,9 +539,9 @@ model ProviderAccount {
 }
 
 model ProviderModel {
-  id                         String                       @id @default(cuid(2))
-  createdAt                  DateTime                     @default(now())
-  updatedAt                  DateTime                     @default(now()) @updatedAt
+  id                         String                   @id @default(cuid(2))
+  createdAt                  DateTime                 @default(now())
+  updatedAt                  DateTime                 @default(now()) @updatedAt
   deletedAt                  DateTime?
   userId                     String
   providerAccountId          String
@@ -562,26 +554,22 @@ model ProviderModel {
   concurrencyLimit           Int?
   pricingMetadata            Json?
   pricingVersion             String?
-  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  healthStatus               ProviderHealthStatus     @default(UNKNOWN)
   healthCheckedAt            DateTime?
-  healthFailureCount         Int                          @default(0)
+  healthFailureCount         Int                      @default(0)
   healthNextRetryAt          DateTime?
   healthHalfOpenAt           DateTime?
   /// Fenced owner of the live half-open probe. Both fields are null together.
   healthHalfOpenAttemptId    String?
   healthHalfOpenFencingToken BigInt?
   /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
-  healthFencingWatermark     BigInt                       @default(0)
-  enabled                    Boolean                      @default(false)
-  User                       User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount            ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  healthFencingWatermark     BigInt                   @default(0)
+  enabled                    Boolean                  @default(false)
+  User                       User                     @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount            ProviderAccount          @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget            ExecutionTarget?
   BudgetPolicies             ProviderBudgetPolicy[]
-  UsageLedger                ProviderUsageLedger[]
-  Attempts                   ProviderAttempt[]
   PricingVersions            ProviderPricingVersion[]
-  AttemptEvents              PublicProviderAttemptEvent[]
-  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderModel")
   PoolFallbackPreferences    PoolFallbackPreference[]
 
   @@unique([providerAccountId, upstreamModelId])
@@ -594,31 +582,28 @@ model ProviderModel {
 /// Recoverable provider secret encrypted with application-layer AES-256-GCM.
 /// Identity fields are immutable because they form the authenticated AAD.
 model ProviderCredential {
-  id                 String                      @id @default(cuid(2))
-  createdAt          DateTime                    @default(now())
-  userId             String
-  providerAccountId  String
-  credentialType     ProviderAuthType
-  aadVersion         Int                         @default(1)
-  algorithm          String                      @default("AES-256-GCM")
-  keyVersion         String
-  ciphertext         Bytes
-  nonce              Bytes
-  authTag            Bytes
-  displaySuffix      String
-  status             ProviderCredentialStatus    @default(ACTIVE)
-  replacedAt         DateTime?
-  replacedById       String?                     @unique
-  lastUsedAt         DateTime?
-  revokedAt          DateTime?
-  User               User                        @relation("ProviderCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount    ProviderAccount             @relation("ProviderAccountCredentials", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  CurrentForAccount  ProviderAccount?            @relation("ProviderAccountCurrentCredential")
-  ReplacedBy         ProviderCredential?         @relation("ProviderCredentialReplacement", fields: [replacedById, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Replaces           ProviderCredential?         @relation("ProviderCredentialReplacement")
-  BudgetReservations ProviderBudgetReservation[]
-  UsageLedger        ProviderUsageLedger[]
-  Attempts           ProviderAttempt[]
+  id                String                   @id @default(cuid(2))
+  createdAt         DateTime                 @default(now())
+  userId            String
+  providerAccountId String
+  credentialType    ProviderAuthType
+  aadVersion        Int                      @default(1)
+  algorithm         String                   @default("AES-256-GCM")
+  keyVersion        String
+  ciphertext        Bytes
+  nonce             Bytes
+  authTag           Bytes
+  displaySuffix     String
+  status            ProviderCredentialStatus @default(ACTIVE)
+  replacedAt        DateTime?
+  replacedById      String?                  @unique
+  lastUsedAt        DateTime?
+  revokedAt         DateTime?
+  User              User                     @relation("ProviderCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount          @relation("ProviderAccountCredentials", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  CurrentForAccount ProviderAccount?         @relation("ProviderAccountCurrentCredential")
+  ReplacedBy        ProviderCredential?      @relation("ProviderCredentialReplacement", fields: [replacedById, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Replaces          ProviderCredential?      @relation("ProviderCredentialReplacement")
 
   @@unique([id, userId])
   @@unique([replacedById, userId])
@@ -629,24 +614,23 @@ model ProviderCredential {
 }
 
 model ProviderBudgetPolicy {
-  id                String                      @id @default(cuid(2))
-  createdAt         DateTime                    @default(now())
-  updatedAt         DateTime                    @default(now()) @updatedAt
+  id                String               @id @default(cuid(2))
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @default(now()) @updatedAt
   userId            String
   scopeType         BudgetScopeType
   providerAccountId String
   poolId            String?
   providerModelId   String?
-  version           Int                         @default(1)
-  active            Boolean                     @default(false)
+  version           Int                  @default(1)
+  active            Boolean              @default(false)
   activatedAt       DateTime?
   deactivatedAt     DateTime?
-  User              User                        @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount             @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  Pool              ModelPool?                  @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel     ProviderModel?              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  User              User                 @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount      @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Pool              ModelPool?           @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel     ProviderModel?       @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   Rules             ProviderBudgetRule[]
-  Reservations      ProviderBudgetReservation[]
 
   @@unique([id, userId])
   @@unique([userId, scopeType, providerAccountId, poolId, providerModelId, version])
@@ -655,16 +639,15 @@ model ProviderBudgetPolicy {
 }
 
 model ProviderBudgetRule {
-  id           String                      @id @default(cuid(2))
-  createdAt    DateTime                    @default(now())
-  policyId     String
-  metric       BudgetMetric
-  period       BudgetPeriod
-  mode         BudgetLimitMode
-  limitValue   Decimal?                    @db.Decimal(30, 9)
-  currency     String?
-  Policy       ProviderBudgetPolicy        @relation(fields: [policyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Reservations ProviderBudgetReservation[]
+  id         String               @id @default(cuid(2))
+  createdAt  DateTime             @default(now())
+  policyId   String
+  metric     BudgetMetric
+  period     BudgetPeriod
+  mode       BudgetLimitMode
+  limitValue Decimal?             @db.Decimal(30, 9)
+  currency   String?
+  Policy     ProviderBudgetPolicy @relation(fields: [policyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([policyId, metric, period])
   @@map("provider_budget_rule")
@@ -700,9 +683,6 @@ model ProviderBudgetReservation {
   pricingVersion    String?
   accountingVersion String
   state             BudgetReservationState     @default(RESERVED)
-  Policy            ProviderBudgetPolicy       @relation(fields: [policyId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Rule              ProviderBudgetRule         @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  Credential        ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   UsageLedger       ProviderUsageLedger[]
   Settlements       ProviderBudgetSettlement[]
 
@@ -737,10 +717,6 @@ model ProviderAttempt {
   liabilityCurrency String?
   pricingVersion    String?
   accountingVersion String
-  User              User                         @relation("ProviderAttemptOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel     ProviderModel                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Credential        ProviderCredential?          @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   Events            PublicProviderAttemptEvent[]
 
   @@unique([attemptId, fencingToken])
@@ -786,9 +762,6 @@ model PublicProviderAttemptEvent {
   terminalState          String?
   usage                  Json?
   metadata               Json?
-  User                   User             @relation("PublicProviderAttemptEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount        ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel          ProviderModel    @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   ProviderAttempt        ProviderAttempt? @relation(fields: [providerAttemptId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([userId, createdAt])
@@ -848,10 +821,6 @@ model ProviderUsageLedger {
   costKnown                    Boolean
   terminalReason               String
   confidence                   UsageCostConfidence
-  User                         User                           @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount              ProviderAccount                @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel                ProviderModel                  @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Credential                   ProviderCredential?            @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   Reservation                  ProviderBudgetReservation?     @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([attemptId, fencingToken, sourceVersion])
@@ -943,36 +912,28 @@ model ProviderAuditEvent {
 /// The named database CHECK installed by prisma/schema-hardening.sql enforces the
 /// kind/FK XOR that Prisma cannot express.
 model ExecutionTarget {
-  id                      String                        @id @default(cuid(2))
-  createdAt               DateTime                      @default(now())
-  updatedAt               DateTime                      @default(now()) @updatedAt
-  userId                  String
-  kind                    ExecutionTargetKind
-  discoveredModelId       String?                       @unique
-  providerModelId         String?                       @unique
-  inferenceCapacityId     String?
+  id                     String                        @id @default(cuid(2))
+  createdAt              DateTime                      @default(now())
+  updatedAt              DateTime                      @default(now()) @updatedAt
+  userId                 String
+  kind                   ExecutionTargetKind
+  discoveredModelId      String?                       @unique
+  providerModelId        String?                       @unique
+  inferenceCapacityId    String?
   /// Direct requests participate in the same 0..31 scheduler as pool traffic.
-  directPriority          Int                           @default(16)
-  directConcurrencyLimit  Int?
-  directReservedSlots     Int                           @default(0)
-  directBorrowPolicy      CapacityBorrowPolicy          @default(WHEN_IDLE)
-  directWaitBudgetMs      Int?
-  directContextCeiling    Int?
-  directContextMargin     Int                           @default(0)
-  User                    User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DiscoveredModel         DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel           ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity       InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  PoolMembers             PoolMember[]
-  TokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
-  StickinessTargets       ResponseStickinessRecord[]    @relation("ResponseStickinessTargetExecutionTarget")
-  StickinessSelections    ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedExecutionTarget")
-  RequestedRelayRequests  RelayRequest[]                @relation("RelayRequestRequestedExecutionTarget")
-  SelectedRelayRequests   RelayRequest[]                @relation("RelayRequestSelectedExecutionTarget")
-  DirectAdmissionRequests AdmissionRequest[]            @relation("AdmissionRequestDirectTarget")
-  CapacityWaiters         CapacityWaiter[]
-  CapacityLeases          CapacityLease[]
-  CacheAffinityRecords    CacheAffinityRecord[]
+  directPriority         Int                           @default(16)
+  directConcurrencyLimit Int?
+  directReservedSlots    Int                           @default(0)
+  directBorrowPolicy     CapacityBorrowPolicy          @default(WHEN_IDLE)
+  directWaitBudgetMs     Int?
+  directContextCeiling   Int?
+  directContextMargin    Int                           @default(0)
+  User                   User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel        DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel          ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity      InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  PoolMembers            PoolMember[]
+  TokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
 
   @@unique([discoveredModelId, userId])
   @@unique([providerModelId, userId])
@@ -1029,10 +990,6 @@ model ModelPool {
   /// external. 0 means go external at once when no local member is free now.
   /// Bounded by the local wait budget (it never makes a caller wait longer).
   externalAfterWaitMs             Int                           @default(2000)
-  /// Deprecated. No longer read or required anywhere; dropped by the final
-  /// cleanup release (APPLY_SCHEMA=dangerous).
-  /// Dead legacy column: no longer read or written; retained until PR5 schema cleanup.
-  publicEgressAcknowledged        Boolean                       @default(false)
   /// Permit developer instructions to collapse into the target protocol's system role.
   allowLossyDeveloperRoleCollapse Boolean                       @default(false)
   /// Optional validated preferred API surface; null lets WSMP recommend one.
@@ -1090,13 +1047,6 @@ model ModelPool {
   ProviderBudgetPolicies          ProviderBudgetPolicy[]
   PoolGrants                      PoolGrant[]
   ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
-  ResponseStickinessRecords       ResponseStickinessRecord[]
-  RelayRequests                   RelayRequest[]                @relation("RelayRequestRequestedPool")
-  AdmissionRequests               AdmissionRequest[]
-  CapacityWaiters                 CapacityWaiter[]
-  CapacityLeases                  CapacityLease[]
-  CacheAffinityRecords            CacheAffinityRecord[]
-  DashboardNotices                DashboardNotice[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -1109,9 +1059,9 @@ model ModelPool {
 /// `conversationDigest` are tenant-scoped, purpose-separated HMACs over
 /// canonical material. The source material is never persisted.
 model CacheAffinityRecord {
-  id                   String          @id @default(cuid(2))
-  createdAt            DateTime        @default(now())
-  lastUsedAt           DateTime        @default(now())
+  id                   String   @id @default(cuid(2))
+  createdAt            DateTime @default(now())
+  lastUsedAt           DateTime @default(now())
   expiresAt            DateTime
   userId               String
   /// Requester tenant; may differ from userId for an explicitly granted pool.
@@ -1121,18 +1071,14 @@ model CacheAffinityRecord {
   poolId               String
   executionTargetId    String
   targetIdentity       String
-  digestVersion        Int             @default(4)
+  digestVersion        Int      @default(4)
   /// Stable execution/security binding, separate from request content and conversation identity.
   bindingDigest        String
   prefixDigest         String?
   conversationDigest   String?
   prefixDepth          Int
   estimatedTokens      Int?
-  engineCacheConfirmed Boolean         @default(false)
-  User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TenantUser           User            @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  engineCacheConfirmed Boolean  @default(false)
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])
@@ -1178,9 +1124,6 @@ model PoolMember {
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CapacityWaiters              CapacityWaiter[]
-  CapacityLeases               CapacityLease[]
-  RelayRequests                RelayRequest[]          @relation("RelayRequestSelectedPoolMember")
 
   @@unique([poolId, discoveredModelId])
   @@unique([poolId, executionTargetId])
@@ -1192,8 +1135,9 @@ model PoolMember {
 }
 
 /// Owner-scoped physical inference capacity shared by every execution target
-/// that points at the same runtime/cache identity. Scheduler state is durable
-/// so a restart cannot reset fairness credit.
+/// that points at the same runtime/cache identity. Graph (configuration) row:
+/// admission reads it without a lock and never writes it. Its durable
+/// scheduler state lives in CapacityRuntime.
 model InferenceCapacity {
   id                         String                @id @default(cuid(2))
   createdAt                  DateTime              @default(now())
@@ -1226,20 +1170,48 @@ model InferenceCapacity {
   maxModelLen                Int?
   engineFactsSource          EngineFactsSource?
   engineFactsAt              DateTime?
-  schedulerCursor            Int                   @default(31)
-  schedulerDeficits          Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
-  schedulerVersion           Int                   @default(1)
-  nextFencingToken           BigInt                @default(1)
   User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTargets           ExecutionTarget[]
-  CapacityWaiters            CapacityWaiter[]
-  CapacityLeases             CapacityLease[]
 
   @@unique([userId, label])
   @@unique([userId, runtimeIdentityKey])
   @@unique([id, userId])
   @@index([userId])
   @@map("inference_capacity")
+}
+
+/// Hot-path (writer class H) scheduler state of one inference capacity, split
+/// out of InferenceCapacity so admission never writes a graph row. Durable so
+/// a restart cannot reset fairness credit or reuse a fencing token. Written
+/// only by the admission store while it holds the capacity's fence; created
+/// lazily on first admission. Deliberately no foreign key to the capacity
+/// graph (packages/db/src/capacity-lock-order.ts): a deleted capacity leaves
+/// an orphan row the capacity sweeper removes.
+model CapacityRuntime {
+  capacityId        String   @id
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+  userId            String
+  schedulerCursor   Int      @default(31)
+  schedulerDeficits Json     @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
+  schedulerVersion  Int      @default(1)
+  nextFencingToken  BigInt   @default(1)
+
+  @@index([userId])
+  @@map("capacity_runtime")
+}
+
+/// A deleted user whose hot-path history (writer class H tables, which have no
+/// foreign key to the user) may still hold rows: requests that were in flight
+/// when the user row was deleted. Written in the same transaction as the user
+/// delete; the history purge sweeper deletes the user's remaining H rows and
+/// then this row. A plain id: the user row no longer exists.
+model DeletedUserPurge {
+  userId    String   @id
+  deletedAt DateTime @default(now())
+
+  @@index([deletedAt])
+  @@map("deleted_user_purge")
 }
 
 model AdmissionRequest {
@@ -1267,9 +1239,6 @@ model AdmissionRequest {
   state                   AdmissionRequestState @default(WAITING)
   terminalAt              DateTime?
   terminalReason          String?
-  User                    User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool               ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DirectExecutionTarget   ExecutionTarget?      @relation("AdmissionRequestDirectTarget", fields: [directExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Waiters                 CapacityWaiter[]
   Lease                   CapacityLease?
   RelayRequest            RelayRequest?         @relation(fields: [relayRequestId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -1277,10 +1246,10 @@ model AdmissionRequest {
   @@unique([userId, requestId, attemptId])
   @@index([userId, state, deadlineAt])
   @@index([state, heartbeatAt])
+  // Terminal-history retention (packages/db/src/hot-path-sweeps.ts).
+  @@index([state, updatedAt])
   @@index([basePriority, enqueueSequence, id])
   @@index([relayRequestId])
-  // Parent-deletion history drains (packages/db/src/parent-deletion.ts) and
-  // the ON DELETE CASCADE from model_pool / execution_target.
   @@index([poolId])
   @@index([directExecutionTargetId])
   @@map("admission_request")
@@ -1315,10 +1284,6 @@ model CapacityWaiter {
   stateChangedAt              DateTime             @default(now())
   terminalReason              String?
   AdmissionRequest            AdmissionRequest     @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity           InferenceCapacity    @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTarget             ExecutionTarget      @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool                   ModelPool?           @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  PoolMember                  PoolMember?          @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([admissionRequestId, candidateOrder])
   @@unique([attemptId, candidateOrder])
@@ -1326,8 +1291,7 @@ model CapacityWaiter {
   @@index([capacityId, state, deadlineAt, candidateOrder])
   @@index([admissionRequestId, state])
   @@index([poolMemberId, state])
-  // Parent-deletion history drains and the ON DELETE CASCADE from
-  // execution_target / model_pool.
+  // Orphan sweep (a deleted target) and scope counts.
   @@index([executionTargetId])
   @@index([poolId])
   @@map("capacity_waiter")
@@ -1357,26 +1321,21 @@ model CapacityLease {
   releasedAt          DateTime?
   releaseReason       String?
   AdmissionRequest    AdmissionRequest   @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity   InferenceCapacity  @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ExecutionTarget     ExecutionTarget    @relation(fields: [executionTargetId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ModelPool           ModelPool?         @relation(fields: [poolId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  PoolMember          PoolMember?        @relation(fields: [poolMemberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([capacityId, fencingToken])
   @@index([capacityId, state, expiresAt])
   @@index([ownerServerInstance, state, heartbeatAt])
   @@index([poolMemberId, state])
-  // Retained-history preflight of parent deletes (RESTRICT from
-  // execution_target / model_pool).
+  // Concurrency-scope counts by target and pool (admission).
   @@index([executionTargetId])
   @@index([poolId])
   @@map("capacity_lease")
 }
 
 model PoolGrant {
-  id                        String                     @id @default(cuid(2))
-  createdAt                 DateTime                   @default(now())
-  updatedAt                 DateTime                   @default(now()) @updatedAt
+  id                        String                   @id @default(cuid(2))
+  createdAt                 DateTime                 @default(now())
+  updatedAt                 DateTime                 @default(now()) @updatedAt
   poolId                    String
   ownerUserId               String
   granteeUserId             String
@@ -1387,10 +1346,9 @@ model PoolGrant {
   /// Queue priority (0..31) of this grantee's pool admissions. Replaces the
   /// pool/member capacity priority for them; null inherits it.
   queuePriority             Int?
-  ModelPool                 ModelPool                  @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Owner                     User                       @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Grantee                   User                       @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ResponseStickinessRecords ResponseStickinessRecord[]
+  ModelPool                 ModelPool                @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Owner                     User                     @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee                   User                     @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   FallbackPreferences       PoolFallbackPreference[]
 
   @@unique([poolId, granteeUserId])
@@ -1400,49 +1358,24 @@ model PoolGrant {
   @@map("pool_grant")
 }
 
-// Dead legacy notice enum/table: no producers or consumers; retained until PR5.
-enum DashboardNoticeKind {
-  POOL_EXTERNAL_PROVIDER
-}
-
-/// Dead legacy notices retained for the final PR5 schema cleanup.
-model DashboardNotice {
-  id        String              @id @default(cuid(2))
-  createdAt DateTime            @default(now())
-  userId    String
-  kind      DashboardNoticeKind
-  poolId    String?
-  /// Pool display name at notice time. Not a credential.
-  poolName  String
-  readAt    DateTime?
-  User      User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool ModelPool?          @relation(fields: [poolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-
-  @@index([userId, readAt, createdAt])
-  @@index([poolId])
-  @@map("dashboard_notice")
-}
-
 model ModelApiToken {
-  id                        String                        @id @default(cuid(2))
-  createdAt                 DateTime                      @default(now())
-  updatedAt                 DateTime                      @default(now()) @updatedAt
-  userId                    String
-  name                      String
-  scopeMode                 ModelApiTokenScopeMode        @default(ALL_VISIBLE)
+  id               String                        @id @default(cuid(2))
+  createdAt        DateTime                      @default(now())
+  updatedAt        DateTime                      @default(now()) @updatedAt
+  userId           String
+  name             String
+  scopeMode        ModelApiTokenScopeMode        @default(ALL_VISIBLE)
   /// Human-only consent for `owner/pool:external` requests. False (private
   /// only) by default. ALLOWLIST tokens additionally need the pool entry's
   /// includeExternal; ALL_VISIBLE tokens are all-or-nothing.
-  allowExternal             Boolean                       @default(false)
-  lookupPrefix              String
-  secretDigest              String
-  lastUsedAt                DateTime?
-  revokedAt                 DateTime?
-  expiresAt                 DateTime?
-  User                      User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  AllowlistEntries          ModelApiTokenAllowlistEntry[]
-  RelayRequests             RelayRequest[]
-  ResponseStickinessRecords ResponseStickinessRecord[]
+  allowExternal    Boolean                       @default(false)
+  lookupPrefix     String
+  secretDigest     String
+  lastUsedAt       DateTime?
+  revokedAt        DateTime?
+  expiresAt        DateTime?
+  User             User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  AllowlistEntries ModelApiTokenAllowlistEntry[]
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -1480,15 +1413,15 @@ model ModelApiTokenAllowlistEntry {
 }
 
 model ResponseStickinessRecord {
-  id                        String           @id @default(cuid(2))
-  createdAt                 DateTime         @default(now())
-  updatedAt                 DateTime         @default(now()) @updatedAt
+  id                        String    @id @default(cuid(2))
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @default(now()) @updatedAt
   userId                    String
   modelApiTokenId           String?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.
-  routingVersion            Int              @default(1)
+  routingVersion            Int       @default(1)
   targetDiscoveredModelId   String?
   targetModelPoolId         String?
   selectedDiscoveredModelId String?
@@ -1509,16 +1442,6 @@ model ResponseStickinessRecord {
   /// and are never honored.
   fallbackRoute             String?
   expiresAt                 DateTime?
-  User                      User             @relation("ResponseStickinessOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TargetDiscoveredModel     DiscoveredModel? @relation("ResponseStickinessTargetModel", fields: [targetDiscoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TargetModelPool           ModelPool?       @relation(fields: [targetModelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  SelectedDiscoveredModel   DiscoveredModel? @relation("ResponseStickinessSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  TargetExecutionTarget     ExecutionTarget? @relation("ResponseStickinessTargetExecutionTarget", fields: [targetExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  PoolGrant                 PoolGrant?       @relation(fields: [poolGrantId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([userId, routingKeyDigest])
   @@index([modelApiTokenId])
@@ -1633,19 +1556,14 @@ model RelayRequest {
   /// immutable afterwards, so it survives the pool's deletion. Deliberately a
   /// plain id, not a foreign key: readers tolerate a deleted owner.
   resourceOwnerUserId        String?
-  User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedModelPool         ModelPool?              @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  SelectedDiscoveredModel    DiscoveredModel?        @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedExecutionTarget   ExecutionTarget?        @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  SelectedExecutionTarget    ExecutionTarget?        @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   AdmissionRequests          AdmissionRequest[]
-  SelectedPoolMember         PoolMember?             @relation("RelayRequestSelectedPoolMember", fields: [selectedPoolMemberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   ExecutionEvents            RelayExecutionEvent[]
   ExecutionAttempts          RelayExecutionAttempt[]
 
-  @@index([userId, createdAt])
+  // The user-deletion drain's keyset scan (packages/db/src/parent-deletion.ts:
+  // WHERE "userId" = $1 AND ("createdAt", id) > ... ORDER BY "createdAt", id)
+  // and the owner's history reads.
+  @@index([userId, createdAt, id])
   @@index([modelApiTokenId, createdAt])
   @@index([requestedDiscoveredModelId, createdAt])
   @@index([requestedModelPoolId, createdAt])
@@ -1668,19 +1586,20 @@ model RelayRequest {
 /// Users: own-key rows use the requester as `ownerUserId`, with empty pool/member
 /// keys. Otherwise `ownerUserId` is the RESOURCE owner (requested pool's owner, else
 /// the execution target's owner, else the requester when nothing resolved);
-/// owners see all traffic on what they own and deleting the owner cascades.
-/// `requesterUserId` is the RelayRequest owner and is deliberately NOT a
-/// foreign key: deleting a requester must not erase the owner's history, so
-/// the `usage_rollup_detach_requester` trigger (schema-hardening.sql) merges
-/// the deleted requester's rows into the '' sentinel requester. Grantees read
-/// only rows where they are the requester and not the owner.
+/// owners see all traffic on what they own. Rollups are hot-path history
+/// (DL-1 writer class H): neither user column is a foreign key. Deleting the
+/// owner erases their rows (user drain, then the deleted-user purge,
+/// @ws-model-proxy/db/hot-path-sweeps); deleting a requester must not erase
+/// the owner's history, so the drain and the purge merge the deleted
+/// requester's rows into the '' sentinel requester. Grantees read only rows
+/// where they are the requester and not the owner.
 /// Latency histograms use the fixed log-scale bounds in
 /// `@ws-model-proxy/config/usage-metrics`. Kept 30 days, then compacted into
 /// UsageRollupHour.
 model UsageRollupMinute {
   bucketStart           DateTime
   ownerUserId           String
-  /// '' once the requester was deleted (merged by trigger); never NULL.
+  /// '' once the requester was deleted (merged by the drain/purge); never NULL.
   requesterUserId       String
   poolId                String             @default("")
   poolMemberId          String             @default("")
@@ -1707,7 +1626,6 @@ model UsageRollupMinute {
   ttftCount             Int                @default(0)
   ttftSumMs             BigInt             @default(0)
   ttftHistogram         Int[]              @default([])
-  Owner                 User               @relation("UsageRollupMinuteOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])
@@ -1720,7 +1638,7 @@ model UsageRollupMinute {
 model UsageRollupHour {
   bucketStart           DateTime
   ownerUserId           String
-  /// '' once the requester was deleted (merged by trigger); never NULL.
+  /// '' once the requester was deleted (merged by the drain/purge); never NULL.
   requesterUserId       String
   poolId                String             @default("")
   poolMemberId          String             @default("")
@@ -1745,7 +1663,6 @@ model UsageRollupHour {
   ttftCount             Int                @default(0)
   ttftSumMs             BigInt             @default(0)
   ttftHistogram         Int[]              @default([])
-  Owner                 User               @relation("UsageRollupHourOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])
@@ -1787,7 +1704,6 @@ model RelayExecutionEvent {
   completionTokens       Int?
   totalTokens            Int?
   usageSource            String?
-  User                   User         @relation("RelayExecutionEventOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   RelayRequest           RelayRequest @relation(fields: [relayRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([attemptId, eventType])
@@ -1821,15 +1737,12 @@ model RelayExecutionAttempt {
   memberTier        String?
   requestBytes      BigInt?
   responseBytes     BigInt?
-  User              User         @relation("RelayExecutionAttemptOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   RelayRequest      RelayRequest @relation(fields: [relayRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@index([state, expiresAt])
   @@index([ownerEpoch, state])
   @@index([relayRequestId, createdAt])
-  // The user-delete cascade (ON DELETE CASCADE on userId) and the final-phase
-  // residual recount under the capacity locks look attempts up by owner
-  // (DL1-TXBOUND); without this index both scanned the whole table.
+  // Owner lookups (deleted-user purge checks).
   @@index([userId])
   @@map("relay_execution_attempt")
 }

@@ -1,6 +1,11 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { lockCapacityGraphForDelete } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  acquireFences,
+  fenceOwners,
+  fenceParentDelete,
+  fences,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
@@ -8,8 +13,8 @@ import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   cacheHolderWaitMsSchema,
-  lockAndValidateModelPoolCapacityPolicy,
-  lockExecutionTargetPolicies,
+  fenceAndValidateModelPoolCapacityPolicy,
+  fenceExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import { deletionConflict } from "../lib/deletion-conflict";
@@ -18,7 +23,6 @@ import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import {
-  drainBeforeParentDelete,
   runCapacityDeleteTransaction,
   runSerializableTransaction,
 } from "../lib/serializable-transaction";
@@ -57,11 +61,20 @@ function assertLossyDeveloperRoleCollapseRequiresAdaptation({
   }
 }
 
+/**
+ * A capacity policy write (writer class M, @ws-model-proxy/db/capacity-lock-order):
+ * the owner's fence first, then `work`, which takes the policy/capacity fences
+ * it needs before its first row lock or write.
+ */
 async function capacityTransaction<T>(
+  userId: string,
   work: (tx: Prisma.TransactionClient) => Promise<T>,
   _options?: { isolationLevel: "Serializable" },
 ): Promise<T> {
-  return runSerializableTransaction(work);
+  return runSerializableTransaction(async (tx) => {
+    await fenceOwners(tx, [userId]);
+    return work(tx);
+  });
 }
 
 function auditJson(value: unknown): Prisma.InputJsonValue {
@@ -165,22 +178,41 @@ const memberPolicy = z
 export const capacityManagementRouter = {
   list: protectedProcedure.handler(async ({ context }) => {
     const userId = context.session.user.id;
-    const rows = await prisma.inferenceCapacity.findMany({
+    const capacities = await prisma.inferenceCapacity.findMany({
       where: { userId },
       orderBy: [{ label: "asc" }, { id: "asc" }],
-      include: {
-        _count: {
-          select: {
-            ExecutionTargets: true,
-            CapacityLeases: { where: { state: "ACTIVE" } },
-            CapacityWaiters: { where: { state: "WAITING" } },
-          },
-        },
-      },
+      include: { _count: { select: { ExecutionTargets: true } } },
     });
+    // Live admission state is hot-path history that names its capacity by
+    // plain id (no relation): counted by capacity id.
+    const ids = capacities.map((capacity) => capacity.id);
+    const [leases, waiters] = ids.length
+      ? await Promise.all([
+          prisma.capacityLease.groupBy({
+            by: ["capacityId"],
+            where: { capacityId: { in: ids }, state: "ACTIVE" },
+            _count: { _all: true },
+          }),
+          prisma.capacityWaiter.groupBy({
+            by: ["capacityId"],
+            where: { capacityId: { in: ids }, state: "WAITING" },
+            _count: { _all: true },
+          }),
+        ])
+      : [[], []];
+    const activeLeases = new Map(leases.map((row) => [row.capacityId, row._count._all]));
+    const waitingWaiters = new Map(waiters.map((row) => [row.capacityId, row._count._all]));
     // The engine preset is derived from the stored engine kind (relay 2.7
     // engine facts); S-C and S-D read it, this list only shows it.
-    return rows.map((row) => ({ ...row, enginePreset: enginePreset(row.engineKind) }));
+    return capacities.map((capacity) => ({
+      ...capacity,
+      enginePreset: enginePreset(capacity.engineKind),
+      _count: {
+        ExecutionTargets: capacity._count.ExecutionTargets,
+        CapacityLeases: activeLeases.get(capacity.id) ?? 0,
+        CapacityWaiters: waitingWaiters.get(capacity.id) ?? 0,
+      },
+    }));
   }),
 
   listAudit: protectedProcedure
@@ -202,6 +234,7 @@ export const capacityManagementRouter = {
       throw new ORPCError("BAD_REQUEST");
     const userId = context.session.user.id;
     return capacityTransaction(
+      userId,
       async (tx) => {
         // A user-created capacity's limit (null = unlimited) is user-authored;
         // discovery and startup backfill must never fill it.
@@ -234,17 +267,20 @@ export const capacityManagementRouter = {
       const { id: capacityId, ...data } = input;
       const userId = context.session.user.id;
       return capacityTransaction(
+        userId,
         async (tx) => {
           const candidate = await tx.inferenceCapacity.findUnique({
             where: { id: capacityId },
             select: { userId: true, ExecutionTargets: { select: { id: true } } },
           });
           if (!candidate || candidate.userId !== userId) return notFound();
-          await lockExecutionTargetPolicies(
-            tx,
-            candidate.ExecutionTargets.map((target) => target.id),
-          );
-          await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacityId} AND "userId" = ${userId} FOR UPDATE`;
+          // The capacity-policy fences of every attached target, then the
+          // capacity fence (admission's view of this capacity). The owner
+          // fence keeps the attached set stable.
+          await acquireFences(tx, [
+            ...candidate.ExecutionTargets.map((target) => fences.capacityPolicy(target.id)),
+            fences.capacity(capacityId),
+          ]);
           const current = await tx.inferenceCapacity.findUnique({
             where: { id: capacityId },
             include: {
@@ -366,20 +402,16 @@ export const capacityManagementRouter = {
     if (precheck._count.ExecutionTargets > 0) {
       throw deletionConflict("still_attached", "Capacity is still attached.");
     }
-    // Terminal waiter history on the capacity is drained in short batches
-    // first (DL1-TXBOUND), so the ordered transaction holds the capacity
-    // locks only for the capacity row and its live rows.
-    await drainBeforeParentDelete({ userId, capacityIds: [input.id] });
-    // Parent delete in capacity lock order: the capacity's L3-L5 locks and
-    // the L6 rows of every live request waiting on it are taken before the
-    // DELETE cascades into its waiters (see lockCapacityGraphForDelete).
+    // A plain delete under the owner fence (fenceParentDelete). Waiter and
+    // lease history keeps the capacity's id; the capacity sweeper
+    // terminalizes live orphans and removes its scheduler state.
     return runCapacityDeleteTransaction(async (tx) => {
       const owner = await tx.inferenceCapacity.findUnique({
         where: { id: input.id },
         select: { userId: true },
       });
       if (!owner || owner.userId !== userId) return notFound();
-      await lockCapacityGraphForDelete(tx, { userId, capacityIds: [input.id] });
+      await fenceParentDelete(tx, { userId, capacityIds: [input.id] });
       const current = await tx.inferenceCapacity.findUnique({
         where: { id: input.id },
         select: { userId: true, _count: { select: { ExecutionTargets: true } } },
@@ -403,13 +435,14 @@ export const capacityManagementRouter = {
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
     const userId = context.session.user.id;
     return capacityTransaction(
+      userId,
       async (tx) => {
         const candidate = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
           select: { id: true, userId: true },
         });
         if (!candidate || candidate.userId !== userId) return notFound();
-        await lockExecutionTargetPolicies(tx, [candidate.id]);
+        await fenceExecutionTargetPolicies(tx, [candidate.id]);
         const target = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
           select: {
@@ -529,8 +562,9 @@ export const capacityManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       return capacityTransaction(
+        userId,
         async (tx) => {
-          await lockAndValidateModelPoolCapacityPolicy(tx, {
+          await fenceAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.modelPoolId,
             userId,
             policy: input,
@@ -651,6 +685,7 @@ export const capacityManagementRouter = {
           : input.capacityContextCeiling,
     };
     return capacityTransaction(
+      userId,
       async (tx) => {
         const candidate = await tx.poolMember.findUnique({
           where: { id: input.poolMemberId },
@@ -661,9 +696,9 @@ export const capacityManagementRouter = {
           },
         });
         if (!candidate || candidate.ModelPool.userId !== userId) return notFound();
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (candidate.executionTargetId)
-          await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
+          await fenceExecutionTargetPolicies(tx, [candidate.executionTargetId]);
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const member = await tx.poolMember.findUnique({
           where: { id: input.poolMemberId },
           select: {
