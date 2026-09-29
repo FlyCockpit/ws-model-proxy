@@ -9,6 +9,16 @@ vi.mock("@ws-model-proxy/db", async () => {
 vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://usage-retention-test", NODE_ENV: "test" },
 }));
+// The hot-path history sweeps have their own PostgreSQL suites; here only
+// their wiring into the retention run is under test.
+const sweeps = vi.hoisted(() => ({
+  HOT_PATH_SWEEP_BATCH: 1_000,
+  pruneTerminalCapacityHistory: vi.fn(),
+  purgeDeletedUsersHistory: vi.fn(),
+  pruneOrphanCapacityRuntime: vi.fn(),
+  pruneExpiredStickiness: vi.fn(),
+}));
+vi.mock("@ws-model-proxy/db/hot-path-sweeps", () => sweeps);
 
 const {
   ABANDONED_PENDING_AFTER_MS,
@@ -76,7 +86,15 @@ function minuteRow(overrides: Record<string, unknown> = {}) {
 }
 
 describe("usage retention", () => {
-  beforeEach(() => disarmDbShutdownFence());
+  beforeEach(() => {
+    disarmDbShutdownFence();
+    sweeps.pruneTerminalCapacityHistory.mockReset().mockResolvedValue(0);
+    sweeps.purgeDeletedUsersHistory
+      .mockReset()
+      .mockResolvedValue({ users: 0, rows: 0, completed: 0 });
+    sweeps.pruneOrphanCapacityRuntime.mockReset().mockResolvedValue(0);
+    sweeps.pruneExpiredStickiness.mockReset().mockResolvedValue(0);
+  });
   afterEach(() => disarmDbShutdownFence());
 
   it("is a no-op on an empty database", async () => {
@@ -94,6 +112,10 @@ describe("usage retention", () => {
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
       agentActionsDeleted: 0,
+      admissionHistoryPruned: 0,
+      deletedUserRowsPurged: 0,
+      orphanCapacityRuntimeDeleted: 0,
+      expiredStickinessDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -110,6 +132,62 @@ describe("usage retention", () => {
     await expect(
       runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
     ).resolves.toMatchObject({ agentActionsDeleted: 4 });
+  });
+
+  it("runs the hot-path history sweeps after the rollup retention and reports their counts", async () => {
+    const { prisma, tx } = fakePrisma();
+    const order: string[] = [];
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
+    );
+    prisma.$executeRaw.mockImplementation(async () => {
+      order.push("rollup-retention");
+      return 0;
+    });
+    tx.$queryRaw.mockResolvedValue([]);
+    sweeps.pruneTerminalCapacityHistory.mockImplementation(async () => {
+      order.push("admission-history");
+      return 4;
+    });
+    sweeps.purgeDeletedUsersHistory.mockImplementation(async () => {
+      order.push("deleted-users");
+      return { users: 2, rows: 7, completed: 1 };
+    });
+    sweeps.pruneOrphanCapacityRuntime.mockImplementation(async () => {
+      order.push("orphan-runtime");
+      return 3;
+    });
+    sweeps.pruneExpiredStickiness.mockImplementation(async () => {
+      order.push("expired-stickiness");
+      return 5;
+    });
+    await expect(
+      runUsageRetention({
+        prisma: prisma as never,
+        retentionDays: 14,
+        batch: 50,
+        sweepBatch: 50,
+      }),
+    ).resolves.toMatchObject({
+      admissionHistoryPruned: 4,
+      deletedUserRowsPurged: 7,
+      orphanCapacityRuntimeDeleted: 3,
+      expiredStickinessDeleted: 5,
+    });
+    // Terminal admission history uses the relay-request retention window.
+    expect(sweeps.pruneTerminalCapacityHistory).toHaveBeenCalledWith(prisma, {
+      before: new Date(NOW.getTime() - 14 * DAY_MS),
+      batch: 50,
+    });
+    expect(sweeps.purgeDeletedUsersHistory).toHaveBeenCalledWith(prisma, { now: NOW, batch: 50 });
+    expect(sweeps.pruneOrphanCapacityRuntime).toHaveBeenCalledWith(prisma, { batch: 50 });
+    expect(sweeps.pruneExpiredStickiness).toHaveBeenCalledWith(prisma, { now: NOW, batch: 50 });
+    expect(order.slice(-4)).toEqual([
+      "admission-history",
+      "deleted-users",
+      "orphan-runtime",
+      "expired-stickiness",
+    ]);
   });
 
   it("deletes raw relay requests past the retention cutoff in SKIP LOCKED batches", async () => {
@@ -233,11 +311,8 @@ describe("usage retention", () => {
           cacheReadTokens: null,
           cacheWriteTokens: null,
           usageKnown: false,
-          RequestedModelPool: { userId: "owner" },
-          SelectedExecutionTarget: target
-            ? { userId: route === "own-key" ? "requester" : "owner" }
-            : null,
-          RequestedExecutionTarget: null,
+          // Derived by the database at insert: the requested pool's owner.
+          resourceOwnerUserId: "owner",
         },
       ]);
       expect(await reapAbandonedPendingRequests({ prisma: prisma as never, now: NOW })).toBe(1);

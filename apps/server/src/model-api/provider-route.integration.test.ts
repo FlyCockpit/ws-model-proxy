@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { Hono } from "hono";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -80,7 +82,7 @@ async function readBody(request: IncomingMessage) {
 }
 
 integration("provider dispatch routes with real PostgreSQL", () => {
-  const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+  const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let upstream: ReturnType<typeof createServer> | undefined;
   let origin = "";
   const upstreamObservations: Array<{
@@ -109,18 +111,17 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
     process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `route-v1:${Buffer.alloc(32, 19).toString("base64")}`;
-    const [prismaModule, security, routes, chatTest, identifiers, credentials, protocols] =
-      await Promise.all([
-        import("@ws-model-proxy/db"),
-        import("@ws-model-proxy/db/forwarder-security"),
-        import("./routes.js"),
-        import("./chat-test.js"),
-        import("@ws-model-proxy/config/forwarder-identifiers"),
-        import("@ws-model-proxy/api/lib/provider-credential-crypto"),
-        import("./protocols/index.js"),
-      ]);
+    const [, security, routes, chatTest, identifiers, credentials, protocols] = await Promise.all([
+      import("@ws-model-proxy/db"),
+      import("@ws-model-proxy/db/forwarder-security"),
+      import("./routes.js"),
+      import("./chat-test.js"),
+      import("@ws-model-proxy/config/forwarder-identifiers"),
+      import("@ws-model-proxy/api/lib/provider-credential-crypto"),
+      import("./protocols/index.js"),
+    ]);
     modules = {
-      prisma: prismaModule.default,
+      prisma: db!,
       security,
       routes,
       chatTest,
@@ -789,10 +790,10 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const ledger = await waitForLedger(model.id);
     const attempt = await waitForTerminalAttempt(model.id);
     await waitForTerminalEvent(model.id);
-    const [reservations, settlements, attemptEvents] = await Promise.all([
+    // Hot-path rows carry no relation to the graph (DL-1): join the rule by id.
+    const [reservationRows, settlements, attemptEvents] = await Promise.all([
       modules.prisma.providerBudgetReservation.findMany({
         where: { providerModelId: model.id },
-        include: { Rule: true },
       }),
       modules.prisma.providerBudgetSettlement.findMany({ where: { providerModelId: model.id } }),
       modules.prisma.publicProviderAttemptEvent.findMany({
@@ -800,6 +801,13 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         orderBy: { createdAt: "asc" },
       }),
     ]);
+    const rules = await modules.prisma.providerBudgetRule.findMany({
+      where: { id: { in: reservationRows.map((row) => row.ruleId) } },
+    });
+    const reservations = reservationRows.map((row) => ({
+      ...row,
+      Rule: rules.find((rule) => rule.id === row.ruleId)!,
+    }));
     return {
       response,
       ledger,
@@ -1060,9 +1068,13 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expect(guessed.status).toBe(404);
 
     await modules.prisma.poolGrant.delete({ where: { id: result.grant.id } });
-    expect(await modules.prisma.responseStickinessRecord.count({ where: { id: binding.id } })).toBe(
-      0,
-    );
+    // DL-1 (d): the binding is hot-path history and outlives its grant (no
+    // foreign key); it names the revoked grant, which the route re-checks.
+    expect(
+      await modules.prisma.responseStickinessRecord.findUniqueOrThrow({
+        where: { id: binding.id },
+      }),
+    ).toMatchObject({ poolGrantId: result.grant.id });
     await modules.prisma.poolGrant.create({
       data: {
         poolId: result.pool.id,

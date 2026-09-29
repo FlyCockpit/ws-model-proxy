@@ -47,10 +47,8 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     cacheReadTokens: 60,
     cacheWriteTokens: null,
     usageKnown: true,
-    resourceOwnerUserId: null,
-    RequestedModelPool: { userId: "owner-1" },
-    SelectedExecutionTarget: { userId: "owner-1" },
-    RequestedExecutionTarget: null,
+    // Derived by the database at insert (schema-hardening.sql): the pool owner.
+    resourceOwnerUserId: "owner-1",
     ...overrides,
   };
 }
@@ -115,50 +113,34 @@ describe("rollupIncrementForRequest", () => {
     expect(increment.executionTargetId).toBe("requested");
   });
 
-  it("keys the resource owner (pool, else target, else requester) and the requester", () => {
+  it("keys the stored resource owner (else the requester) and the requester", () => {
+    // The database derives resourceOwnerUserId at insert (pool owner, else
+    // target owner); the rollup reads it by value and never joins the graph.
     const pooled = rollupIncrementForRequest(row())!;
     expect([pooled.ownerUserId, pooled.requesterUserId]).toEqual(["owner-1", "user-1"]);
     const direct = rollupIncrementForRequest(
-      row({
-        requestedModelPoolId: null,
-        RequestedModelPool: null,
-        SelectedExecutionTarget: { userId: "target-owner" },
-      }),
+      row({ requestedModelPoolId: null, resourceOwnerUserId: "target-owner" }),
     )!;
     expect(direct.ownerUserId).toBe("target-owner");
-    const requestedOnly = rollupIncrementForRequest(
-      row({
-        requestedModelPoolId: null,
-        RequestedModelPool: null,
-        selectedExecutionTargetId: null,
-        SelectedExecutionTarget: null,
-        requestedExecutionTargetId: "requested",
-        RequestedExecutionTarget: { userId: "requested-owner" },
-      }),
-    )!;
-    expect(requestedOnly.ownerUserId).toBe("requested-owner");
     const unresolved = rollupIncrementForRequest(
       row({
         requestedModelPoolId: null,
-        RequestedModelPool: null,
         selectedExecutionTargetId: null,
-        SelectedExecutionTarget: null,
+        resourceOwnerUserId: null,
       }),
     )!;
     expect(unresolved.ownerUserId).toBe("user-1");
   });
 
   it("prefers the durable resource owner, which survives the pool's deletion", () => {
-    // The pool was deleted in flight: its FK and the selection are gone, so the
-    // legacy derivation would fall back to the requester.
+    // The pool was deleted in flight and the selection is gone; the owner
+    // stored at insert still attributes the traffic to the pool owner.
     const orphaned = rollupIncrementForRequest(
       row({
         resourceOwnerUserId: "owner-1",
         requestedModelPoolId: null,
-        RequestedModelPool: null,
         selectedPoolMemberId: null,
         selectedExecutionTargetId: null,
-        SelectedExecutionTarget: null,
       }),
     )!;
     expect(orphaned).toMatchObject({
@@ -168,11 +150,6 @@ describe("rollupIncrementForRequest", () => {
       poolMemberId: "",
       executionTargetId: "",
     });
-    expect(
-      rollupIncrementForRequest(
-        row({ resourceOwnerUserId: "owner-1", RequestedModelPool: { userId: "other" } }),
-      )!.ownerUserId,
-    ).toBe("owner-1");
     // Own-key traffic stays with the requester even though the stored owner
     // is the pool owner.
     expect(
@@ -180,7 +157,6 @@ describe("rollupIncrementForRequest", () => {
         row({
           resourceOwnerUserId: "owner-1",
           fallbackRoute: "own-key",
-          SelectedExecutionTarget: { userId: "user-1" },
         }),
       )!.ownerUserId,
     ).toBe("user-1");
@@ -363,9 +339,7 @@ describe("transitionRelayRequestTerminal (exactly-once claim)", () => {
 });
 
 it("own-key rollups belong to requester and omit owner pool/member identities", () => {
-  const increment = rollupIncrementForRequest(
-    row({ fallbackRoute: "own-key", SelectedExecutionTarget: { userId: "user-1" } }),
-  );
+  const increment = rollupIncrementForRequest(row({ fallbackRoute: "own-key" }));
   expect(increment).toMatchObject({
     ownerUserId: "user-1",
     requesterUserId: "user-1",

@@ -144,11 +144,11 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
   executionTarget: { findUnique: MockInstance };
+  poolGrant: { findUnique: MockInstance; findFirst: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
   };
-  poolGrant: { findFirst: MockInstance };
   poolMember: {
     findMany: MockInstance;
     findUnique: MockInstance;
@@ -185,6 +185,48 @@ const db = prisma as unknown as {
     findMany: MockInstance;
   };
 };
+
+type StickyFixture = Record<string, unknown> & {
+  poolGrantId?: string | null;
+  targetExecutionTargetId?: string | null;
+  selectedExecutionTargetId?: string | null;
+  PoolGrant?: ({ id: string } & Record<string, unknown>) | null;
+  TargetExecutionTarget?: unknown;
+  SelectedExecutionTarget?: unknown;
+};
+
+/**
+ * Stickiness records name their grant and targets by plain id (no Prisma
+ * relations, @ws-model-proxy/db/capacity-lock-order). A fixture carries the
+ * related rows as they exist in the database (`PoolGrant`,
+ * `TargetExecutionTarget`, `SelectedExecutionTarget`; null = deleted): the
+ * stored record is served without them, and the by-id lookups return a
+ * related row only for the id the record names.
+ */
+function mockStickyRecord(fixture: StickyFixture | null) {
+  if (!fixture) {
+    db.responseStickinessRecord.findUnique.mockResolvedValue(null);
+    return;
+  }
+  const { PoolGrant, TargetExecutionTarget, SelectedExecutionTarget, ...stored } = fixture;
+  if (TargetExecutionTarget && !stored.targetExecutionTargetId) {
+    throw new Error("a sticky fixture with a TargetExecutionTarget must name its id");
+  }
+  db.responseStickinessRecord.findUnique.mockResolvedValue(stored);
+  db.poolGrant.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+    PoolGrant && PoolGrant.id === where.id ? PoolGrant : null,
+  );
+  const otherTargets = db.executionTarget.findUnique.getMockImplementation();
+  db.executionTarget.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+    const sticky: Array<[unknown, unknown]> = [
+      [stored.targetExecutionTargetId, TargetExecutionTarget],
+      [stored.selectedExecutionTargetId, SelectedExecutionTarget],
+    ];
+    const match = sticky.find(([id]) => id && id === args.where.id);
+    if (match) return match[1] ?? null;
+    return otherTargets ? otherTargets(args) : undefined;
+  });
+}
 
 const ACTIVE_POOL_OWNER = { banned: false, banExpires: null, deletionRequestedAt: null };
 
@@ -805,7 +847,8 @@ describe("model API routes", () => {
     db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
     db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
     db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
-    db.responseStickinessRecord.findUnique.mockResolvedValue(null);
+    mockStickyRecord(null);
+    db.poolGrant.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
     // The local pool send boundary re-reads the exact grant: it still exists.
     db.poolGrant.findFirst.mockImplementation(async ({ where }: { where: { id: string } }) => ({
@@ -7554,7 +7597,7 @@ describe("model API routes", () => {
         ]);
       }
       if (route === "local sticky") {
-        db.responseStickinessRecord.findUnique.mockResolvedValue({
+        mockStickyRecord({
           routingVersion: 2,
           userId: "user-id",
           modelApiTokenId: "token-id",
@@ -7562,6 +7605,7 @@ describe("model API routes", () => {
           targetModelPoolId: "pool-id",
           selectedDiscoveredModelId: "local-model",
           TargetExecutionTarget: null,
+          selectedExecutionTargetId: "selected-target-id",
           SelectedExecutionTarget: { discoveredModelId: "local-model" },
           expiresAt: new Date(Date.now() + 60_000),
         });
@@ -7589,8 +7633,7 @@ describe("model API routes", () => {
               }
             : externalProviderTarget();
         publicOverflow.list.mockResolvedValue(listedExternalTargets([providerTarget]));
-        if (route === "external sticky")
-          db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+        if (route === "external sticky") mockStickyRecord(consentedProviderBinding());
         publicOverflow.dispatch.mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
           providerSignal = signal;
           return new Promise((resolve) => {
@@ -10428,14 +10471,14 @@ describe("model API routes", () => {
       ),
     );
     if (route === "local sticky") {
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         routingVersion: 2,
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
         targetModelPoolId: "pool-id",
         selectedDiscoveredModelId: "model-a",
-        TargetExecutionTarget: null,
+        selectedExecutionTargetId: "target-a",
         SelectedExecutionTarget: { discoveredModelId: "model-a" },
         expiresAt: new Date(Date.now() + 60_000),
       });
@@ -11525,7 +11568,7 @@ describe("model API routes", () => {
       adaptationEnabled: false,
     });
 
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       ...binding,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -11658,14 +11701,16 @@ describe("model API routes", () => {
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
       targetModelPoolId: null,
       selectedDiscoveredModelId: null,
+      targetExecutionTargetId: "bound-target-id",
       TargetExecutionTarget: { discoveredModelId: "model-id" },
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-id" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -11809,7 +11854,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
@@ -11879,7 +11924,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
@@ -11915,7 +11960,7 @@ describe("model API routes", () => {
   );
 
   it("routes Responses retrieve through the sticky selected model with no request body", async () => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 1,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -11950,7 +11995,7 @@ describe("model API routes", () => {
     });
     externalConsent.poolIds = [externalPoolTarget.id];
     publicOverflow.list.mockResolvedValue(listedExternalTargets([]));
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       fallbackRoute: "pool-external",
       routingVersion: 3,
       userId: "user-id",
@@ -12041,7 +12086,7 @@ describe("model API routes", () => {
         modelPools: [ownPool],
       });
       externalConsent.poolIds = [ownPool.id];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           fallbackRoute: "own-key",
           poolGrantId: "grant",
@@ -12095,7 +12140,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+    mockStickyRecord(consentedProviderBinding());
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/responses",
       {
@@ -12129,7 +12174,7 @@ describe("model API routes", () => {
         modelPools: [externalPoolTarget],
       });
       externalConsent.poolIds = [];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      mockStickyRecord(consentedProviderBinding());
       const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
         path,
         { method, headers: { authorization: "Bearer wsmp_model_test" } },
@@ -12203,7 +12248,7 @@ describe("model API routes", () => {
         modelPools: [externalPoolTarget],
       });
       externalConsent.poolIds = [externalPoolTarget.id];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      mockStickyRecord(consentedProviderBinding());
       publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()]));
     });
 
@@ -12612,7 +12657,7 @@ describe("model API routes", () => {
                 ]
               : [],
           });
-          db.responseStickinessRecord.findUnique.mockResolvedValue(
+          mockStickyRecord(
             consentedProviderBinding({
               poolGrantId: "original-grant",
               PoolGrant: replacement
@@ -12653,7 +12698,7 @@ describe("model API routes", () => {
       publicOverflow.list.mockResolvedValue(
         listedExternalTargets([boundProvider()], { fallbackForGrantees: true }),
       );
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
           PoolGrant: {
@@ -12698,7 +12743,7 @@ describe("model API routes", () => {
       publicOverflow.list.mockResolvedValue(
         listedExternalTargets([boundProvider()], { fallbackForGrantees: false }),
       );
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
           PoolGrant: {
@@ -12878,9 +12923,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue(
-      consentedProviderBinding({ fallbackRoute: null }),
-    );
+    mockStickyRecord(consentedProviderBinding({ fallbackRoute: null }));
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/responses/resp_provider",
       { headers: { authorization: "Bearer wsmp_model_test" } },
@@ -12896,7 +12939,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
@@ -12948,7 +12991,7 @@ describe("model API routes", () => {
         },
       ],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 3,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -12992,7 +13035,9 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: null,
         expiresAt: new Date(Date.now() + 60_000),
       },
@@ -13007,7 +13052,9 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: { discoveredModelId: "model-id" },
         expiresAt: new Date(Date.now() + 60_000),
       },
@@ -13022,14 +13069,16 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: { discoveredModelId: "model-id" },
         expiresAt: new Date(Date.now() - 1),
       },
       404,
     ],
   ] as const)("fails closed for v2 Responses lifecycle with %s", async (_label, record, status) => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue(record);
+    mockStickyRecord(record);
     const manager = new FakeRelayManager();
     const response = await appWith(manager).request("/responses/resp_123", {
       headers: { authorization: "Bearer wsmp_model_test" },
@@ -13043,14 +13092,16 @@ describe("model API routes", () => {
       directModels: [{ ...directTarget, id: "other-model-id", modelId: "owner/other" }],
       modelPools: [],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: "model-id",
       targetModelPoolId: null,
       selectedDiscoveredModelId: "model-id",
+      targetExecutionTargetId: "bound-target-id",
       TargetExecutionTarget: { discoveredModelId: "model-id" },
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-id" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -13067,7 +13118,7 @@ describe("model API routes", () => {
       directModels: [],
       modelPools: [poolTarget],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -13075,6 +13126,7 @@ describe("model API routes", () => {
       targetModelPoolId: "pool-id",
       selectedDiscoveredModelId: "model-a",
       TargetExecutionTarget: null,
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -13159,6 +13211,7 @@ describe("model API routes", () => {
         granteeUserId: "user-id",
       },
       TargetExecutionTarget: null,
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
       ...overrides,
@@ -13227,7 +13280,7 @@ describe("model API routes", () => {
     });
 
     it("sticks a grantee follow-up to its member and re-binds it to the same grant", async () => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       db.poolMember.findMany.mockResolvedValue([memberA({ routingStatus: "DRAINING" })]);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -13260,7 +13313,7 @@ describe("model API routes", () => {
       ],
       ["an owner-style binding without a grant", { poolGrantId: null, PoolGrant: null }],
     ])("does not honor a grantee binding through %s", async (_name, overrides) => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding(overrides));
+      mockStickyRecord(granteeBinding(overrides));
       db.poolMember.findMany.mockResolvedValue([memberA()]);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -13274,7 +13327,7 @@ describe("model API routes", () => {
       ["removed from the pool", []],
       ["disabled", [memberA({ routingStatus: "DISABLED" })]],
     ])("does not route a follow-up to a member %s", async (_name, members) => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       db.poolMember.findMany.mockResolvedValue(members);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -13374,7 +13427,7 @@ describe("model API routes", () => {
     ])(
       "refuses a follow-up at the send boundary when %s after resolution",
       async (_name, arrange) => {
-        db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        mockStickyRecord(granteeBinding());
         db.poolMember.findMany.mockResolvedValue([memberA()]);
         arrange();
         const manager = new FakeRelayManager();
@@ -13417,7 +13470,7 @@ describe("model API routes", () => {
         db.poolMember.findMany.mockResolvedValue([
           memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
         ]);
-        if (isFollowUp) db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        if (isFollowUp) mockStickyRecord(granteeBinding());
         // The early gate (before the native count fan-out) passes on an admitted
         // create; the read fails at the send gate after admission.
         if (withRuntime && !isFollowUp)
@@ -13628,7 +13681,7 @@ describe("model API routes", () => {
 
     it("holds a follow-up's EOF until its binding is durable", async () => {
       db.poolMember.findMany.mockResolvedValue([memberA()]);
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       await holdsEofUntilDurable(
         { model: granteePool.modelId, previous_response_id: "resp_local", input: "next" },
         replyJson,
@@ -13638,7 +13691,7 @@ describe("model API routes", () => {
 
     it("holds a streaming follow-up's EOF until its binding is durable", async () => {
       db.poolMember.findMany.mockResolvedValue([memberA()]);
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       await holdsEofUntilDurable(
         {
           model: granteePool.modelId,
@@ -13683,14 +13736,14 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         routingVersion: 2,
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
         targetModelPoolId: "pool-id",
         selectedDiscoveredModelId: "model-a",
-        TargetExecutionTarget: null,
+        selectedExecutionTargetId: "target-a",
         SelectedExecutionTarget: { discoveredModelId: "model-a" },
         expiresAt: new Date(Date.now() + 60_000),
       });
@@ -13771,14 +13824,14 @@ describe("model API routes", () => {
       directModels: [],
       modelPools: [],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
       targetModelPoolId: "pool-id",
       selectedDiscoveredModelId: "model-a",
-      TargetExecutionTarget: null,
+      selectedExecutionTargetId: "target-a",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
     });

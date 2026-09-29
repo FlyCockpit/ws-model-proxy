@@ -1,4 +1,4 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
@@ -19,7 +19,7 @@ if (!databaseUrl)
     "[warm-protection-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured",
   );
 
-type Db = ReturnType<typeof createPrismaClient>;
+type Db = ReturnType<typeof createFixturePrismaClient>;
 
 integration("warm-session protection with real PostgreSQL", () => {
   let db: Db;
@@ -28,7 +28,7 @@ integration("warm-session protection with real PostgreSQL", () => {
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    db = createPrismaClient(databaseUrl);
+    db = createFixturePrismaClient(databaseUrl);
     warm = await import("./warm-protection.js");
   });
 

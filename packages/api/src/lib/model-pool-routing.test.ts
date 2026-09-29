@@ -25,6 +25,7 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
   poolMember: {
+    findMany: MockInstance;
     findUnique: MockInstance;
     updateMany: MockInstance;
   };
@@ -410,7 +411,8 @@ describe("modelPoolRouting", () => {
   });
 
   it("resets health on success and fresh inventory without changing routing status", async () => {
-    db.poolMember.updateMany.mockResolvedValue({ count: 2 });
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }, { id: "member-b" }]);
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     await markPoolMemberRelaySuccess("member-id", { trialStartedAt: null, now });
     await resetPoolMemberHealthForDiscoveredModels(["model-a", "model-b"]);
@@ -431,7 +433,7 @@ describe("modelPoolRouting", () => {
       },
       data: resetPoolMemberHealth(),
     });
-    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenCalledWith({
       where: {
         OR: [
           {
@@ -442,8 +444,25 @@ describe("modelPoolRouting", () => {
         ],
         routingStatus: { not: "DISABLED" },
       },
-      data: resetPoolMemberHealth(),
+      orderBy: { id: "asc" },
+      select: { id: true },
     });
+    // After the fenced success write: one single-row statement per member
+    // (hot-path writer class H).
+    expect(db.poolMember.updateMany.mock.calls.slice(1)).toEqual([
+      [
+        {
+          where: { id: "member-a", routingStatus: { not: "DISABLED" } },
+          data: resetPoolMemberHealth(),
+        },
+      ],
+      [
+        {
+          where: { id: "member-b", routingStatus: { not: "DISABLED" } },
+          data: resetPoolMemberHealth(),
+        },
+      ],
+    ]);
   });
 
   it("persists relay failure and websocket disconnect health updates", async () => {
@@ -455,6 +474,7 @@ describe("modelPoolRouting", () => {
       nextRetryAt: null,
       halfOpenTrialStartedAt: null,
     });
+    db.poolMember.findMany.mockResolvedValue([{ id: "member-a" }, { id: "member-b" }]);
     db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await recordPoolMemberRelayFailure({
@@ -489,7 +509,7 @@ describe("modelPoolRouting", () => {
         lastFailureClass: "RELAY_TIMEOUT",
       }),
     });
-    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+    expect(db.poolMember.findMany).toHaveBeenCalledWith({
       where: {
         OR: [
           {
@@ -499,11 +519,18 @@ describe("modelPoolRouting", () => {
           { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
         ],
       },
-      data: expect.objectContaining({
-        healthStatus: "UNHEALTHY",
-        lastFailureClass: "WEBSOCKET_DISCONNECTED",
-      }),
+      orderBy: { id: "asc" },
+      select: { id: true },
     });
+    const disconnected = expect.objectContaining({
+      healthStatus: "UNHEALTHY",
+      lastFailureClass: "WEBSOCKET_DISCONNECTED",
+    });
+    // After the versioned failure write: one single-row statement per member.
+    expect(db.poolMember.updateMany.mock.calls.slice(1)).toEqual([
+      [{ where: { id: "member-a" }, data: disconnected }],
+      [{ where: { id: "member-b" }, data: disconnected }],
+    ]);
   });
 
   // Owner fence (#120 design pass): an outcome the attempt does not own is dropped

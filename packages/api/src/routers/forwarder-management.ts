@@ -13,9 +13,12 @@ import {
 import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-policy";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
-  lockCapacityGraphForDelete,
-  lockCapacityRowsForPolicyWrite,
+  acquireFences,
+  fenceOwners,
+  fenceParentDelete,
+  fences,
 } from "@ws-model-proxy/db/capacity-lock-order";
+import { clearCacheAffinityRecords } from "@ws-model-proxy/db/hot-path-sweeps";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import type { LiveCliFeatureSnapshot } from "../context";
@@ -26,9 +29,8 @@ import {
   assertModelPoolCapacityPolicy,
   type CapacityPolicyFailureReasons,
   cacheHolderWaitMsSchema,
-  lockAndValidateModelPoolCapacityPolicy,
-  lockExecutionTargetIdentities,
-  lockExecutionTargetPolicies,
+  fenceAndValidateModelPoolCapacityPolicy,
+  fenceExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import {
@@ -101,7 +103,6 @@ import {
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
-  drainBeforeParentDelete,
   runCapacityDeleteTransaction,
   runSerializableTransaction,
 } from "../lib/serializable-transaction";
@@ -1293,8 +1294,7 @@ async function removeOwnedRow({
   userId: string;
   staleBefore?: Date;
 }) {
-  // Read-only checks first, so a refused delete drains nothing; the ordered
-  // transaction repeats them under its locks.
+  // Read-only checks first; the transaction repeats them under its fences.
   const precheck =
     kind === "endpoint"
       ? await prisma.endpoint.findUnique({
@@ -1312,17 +1312,16 @@ async function removeOwnedRow({
   if (staleBefore && precheck.lastSeenAt && precheck.lastSeenAt >= staleBefore) {
     throw deletionConflict("not_stale", `${label} is not stale.`);
   }
-  // The request history the cascade deletes or detaches is drained in short
-  // batches first (DL1-TXBOUND), so the ordered transaction below holds the
-  // capacity locks only for the graph itself.
-  await drainBeforeParentDelete(
-    kind === "endpoint" ? { userId, endpointIds: [id] } : { userId, discoveredModelIds: [id] },
-  );
-  // Parent delete in capacity lock order: the owning device (L0, serializes
-  // with its relay registration), then every capacity lock the cascade into
-  // discovered models, execution targets, pool members and admission rows can
-  // reach, then the DELETE (see lockCapacityGraphForDelete).
+  // A plain delete under the owner fences of every user its cascade writes
+  // (fenceParentDelete): the owner fence also serializes it with the device's
+  // relay registration, and the rows the cascade reaches are resolved under
+  // it (no stale target plan). Request and admission history keeps the
+  // deleted ids; the capacity sweeper terminalizes live orphans.
   return runCapacityDeleteTransaction(async (tx) => {
+    await fenceParentDelete(
+      tx,
+      kind === "endpoint" ? { userId, endpointIds: [id] } : { userId, discoveredModelIds: [id] },
+    );
     if (kind === "endpoint") {
       const row = await tx.endpoint.findUnique({
         where: { id },
@@ -1331,16 +1330,6 @@ async function removeOwnedRow({
       if (!row || row.userId !== userId) {
         throw new ORPCError("NOT_FOUND", { message: "Endpoint not found." });
       }
-      const targets = await tx.executionTarget.findMany({
-        where: { userId, DiscoveredModel: { is: { endpointId: id } } },
-        select: { id: true },
-      });
-      await lockCapacityGraphForDelete(tx, {
-        userId,
-        lockedCliDeviceIds: [row.cliDeviceId],
-        executionTargetIds: targets.map((target) => target.id),
-        endpointIds: [id],
-      });
       const current = await tx.endpoint.findUnique({
         where: { id },
         select: { lastSeenAt: true },
@@ -1355,21 +1344,11 @@ async function removeOwnedRow({
 
     const row = await tx.discoveredModel.findUnique({
       where: { id },
-      select: { id: true, userId: true, Endpoint: { select: { cliDeviceId: true } } },
+      select: { id: true, userId: true },
     });
     if (!row || row.userId !== userId) {
       throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
     }
-    const targets = await tx.executionTarget.findMany({
-      where: { userId, discoveredModelId: id },
-      select: { id: true },
-    });
-    await lockCapacityGraphForDelete(tx, {
-      userId,
-      lockedCliDeviceIds: [row.Endpoint.cliDeviceId],
-      executionTargetIds: targets.map((target) => target.id),
-      discoveredModelIds: [id],
-    });
     const current = await tx.discoveredModel.findUnique({
       where: { id },
       select: { lastSeenAt: true },
@@ -1790,6 +1769,8 @@ export const forwarderManagementRouter = {
       });
       const now = new Date();
       return runSerializableTransaction(async (tx) => {
+        // Writer class M: the owner fence first (@ws-model-proxy/db/capacity-lock-order).
+        await fenceOwners(tx, [userId]);
         const localModels = await tx.discoveredModel.findMany({
           where: {
             id: { in: input.localModelIds },
@@ -1962,15 +1943,61 @@ export const forwarderManagementRouter = {
             });
           }
         }
-        // Stable mutation order for mixed local/provider setup:
-        // identity fences -> target rows (sorted policy locks) -> capacities.
-        await lockExecutionTargetIdentities(
-          tx,
-          providers.map((provider) => `provider-model:${provider.id}`),
-        );
+        // Stable mutation order for mixed local/provider setup: identity
+        // fences -> capacity-policy fences, all before the first row lock or
+        // write; then provider account rows -> provider model rows (F-LO1:
+        // the account before the model, the order every provider writer and
+        // the provider health runtime use) -> target, capacity, member and
+        // budget writes, whose foreign-key checks re-enter those rows.
         const orderedProviders = [...providers].sort((left, right) =>
           left.id.localeCompare(right.id),
         );
+        const existingProviderTargets = orderedProviders.length
+          ? await tx.executionTarget.findMany({
+              where: { providerModelId: { in: orderedProviders.map((provider) => provider.id) } },
+              select: { id: true },
+            })
+          : [];
+        const seedCapacityIds = [
+          ...new Set(
+            localTargets.flatMap((target) =>
+              target.inferenceCapacityId &&
+              target.discoveredModelId &&
+              declaredContextByModelId.get(target.discoveredModelId) != null
+                ? [target.inferenceCapacityId]
+                : [],
+            ),
+          ),
+        ];
+        const targetsSharingCandidateCapacity =
+          seedCapacityIds.length > 0
+            ? await tx.executionTarget.findMany({
+                where: { userId, inferenceCapacityId: { in: seedCapacityIds } },
+                select: { id: true },
+              })
+            : [];
+        // A provider target this transaction creates is new, so it needs no
+        // policy fence; every existing target it changes or attaches has one.
+        const policyLockTargetIds = new Set([
+          ...localTargets.map((target) => target.id),
+          ...existingProviderTargets.map((target) => target.id),
+          ...targetsSharingCandidateCapacity.map((target) => target.id),
+        ]);
+        await acquireFences(tx, [
+          ...providers.map((provider) => fences.targetIdentity(`provider-model:${provider.id}`)),
+          ...[...policyLockTargetIds].map((targetId) => fences.capacityPolicy(targetId)),
+        ]);
+        const providerAccountIds = [
+          ...new Set(providers.map((provider) => provider.providerAccountId)),
+        ].sort();
+        if (providerAccountIds.length > 0) {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id IN (${Prisma.join(
+            providerAccountIds,
+          )}) AND "userId" = ${userId} ORDER BY id FOR KEY SHARE`;
+          await tx.$queryRaw`SELECT id FROM provider_model WHERE id IN (${Prisma.join(
+            orderedProviders.map((provider) => provider.id),
+          )}) AND "userId" = ${userId} ORDER BY id FOR KEY SHARE`;
+        }
         const providerTargets = await Promise.all(
           orderedProviders.map((provider) =>
             tx.executionTarget.upsert({
@@ -2000,24 +2027,7 @@ export const forwarderManagementRouter = {
             );
           }
         }
-        const targetsSharingCandidateCapacity =
-          seedCandidates.size > 0
-            ? await tx.executionTarget.findMany({
-                where: {
-                  userId,
-                  inferenceCapacityId: { in: [...seedCandidates.keys()] },
-                },
-                select: { id: true },
-              })
-            : [];
-        // Pool row locks (where applicable) precede this one sorted policy-lock
-        // union: operated targets plus every target sharing a seed candidate.
-        const policyLockTargetIds = new Set([
-          ...localTargets.map((target) => target.id),
-          ...providerTargets.map((target) => target.id),
-          ...targetsSharingCandidateCapacity.map((target) => target.id),
-        ]);
-        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
+        for (const target of providerTargets) policyLockTargetIds.add(target.id);
         const additionalDependentsByCapacityId = new Map<string, ContextWindowSeedDependent[]>();
         for (const target of localTargets) {
           if (!target.inferenceCapacityId) continue;
@@ -2612,10 +2622,12 @@ export const forwarderManagementRouter = {
     .input(z.object({ poolId: idSchema }))
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
-      const result = await prisma.cacheAffinityRecord.deleteMany({
-        where: { userId: context.session.user.id, poolId: input.poolId },
-      });
-      return { deleted: result.count };
+      return {
+        deleted: await clearCacheAffinityRecords(prisma, {
+          ownerUserId: context.session.user.id,
+          poolId: input.poolId,
+        }),
+      };
     }),
 
   createModelPool: protectedProcedure
@@ -2743,6 +2755,8 @@ export const forwarderManagementRouter = {
         capacityBorrowPolicy: data.capacityBorrowPolicy,
       } as const;
       const row = await prisma.$transaction(async (tx) => {
+        // Writer class M: the owner fence before the graph insert.
+        await fenceOwners(tx, [userId]);
         const created = await tx.modelPool.create({
           data,
           select: poolSelect,
@@ -2856,9 +2870,12 @@ export const forwarderManagementRouter = {
 
       const updated = await runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        // Writer class M: the owner fence, then (for a capacity policy edit)
+        // the capacity-policy fences of every member target, then the pool
+        // row (the E0 send claim's C1 order) before any other write.
+        await fenceOwners(tx, [userId]);
         if (hasCapacityPolicy)
-          await lockAndValidateModelPoolCapacityPolicy(tx, {
+          await fenceAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.id,
             userId,
             policy: input,
@@ -2866,6 +2883,7 @@ export const forwarderManagementRouter = {
               throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
             },
           });
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const current = await tx.modelPool.findUnique({
           where: { id: input.id },
           select: {
@@ -3065,15 +3083,13 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       await ownedPool(input.id, userId);
-      // History first, in short batches (relay requests detach from the
-      // pool, terminal admission history goes), so the ordered transaction
-      // holds the capacity locks only for the graph (DL1-TXBOUND).
-      await drainBeforeParentDelete({ userId, poolIds: [input.id] });
-      // Parent delete in capacity lock order: the pool (L1), its members'
-      // targets (L2) and every capacity lock its cascade into members and
-      // admission rows can reach, then the DELETE.
+      // A plain delete under the owner fences of every user its cascade
+      // writes (the owner, the pool's grantees, the owners of allowlist
+      // entries naming it): fenceParentDelete. Request, admission and lease
+      // history keeps the pool's id; the capacity sweeper terminalizes its
+      // live orphans.
       await runCapacityDeleteTransaction(async (tx) => {
-        await lockCapacityGraphForDelete(tx, { userId, poolIds: [input.id] });
+        await fenceParentDelete(tx, { userId, poolIds: [input.id] });
         await tx.modelPool.delete({ where: { id: input.id } });
       });
       return { deleted: true };
@@ -3100,6 +3116,42 @@ export const forwarderManagementRouter = {
       );
       return runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
+        // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
+        // fence; then, planned with reads only, the capacity-policy fences of
+        // the operated target and every target sharing a capacity it may seed
+        // and the capacity fences of the capacity rows it may write; then the
+        // pool row, and only then adopt, fill or link a capacity.
+        await fenceOwners(tx, [userId]);
+        const plannedTarget = await tx.executionTarget.findUnique({
+          where: { discoveredModelId: input.discoveredModelId },
+          select: { id: true, inferenceCapacityId: true },
+        });
+        const candidateCapacityIds =
+          plannedTarget?.inferenceCapacityId != null
+            ? [plannedTarget.inferenceCapacityId]
+            : await existingDiscoveredCapacityCandidates(tx, {
+                userId,
+                discoveredModelId: input.discoveredModelId,
+                executionTargetId: plannedTarget?.id,
+              });
+        const targetsSharingCandidateCapacity =
+          declaredContext != null && candidateCapacityIds.length > 0
+            ? await tx.executionTarget.findMany({
+                where: {
+                  userId,
+                  inferenceCapacityId: { in: candidateCapacityIds },
+                },
+                select: { id: true },
+              })
+            : [];
+        const policyLockTargetIds = new Set([
+          ...(plannedTarget ? [plannedTarget.id] : []),
+          ...targetsSharingCandidateCapacity.map((sharedTarget) => sharedTarget.id),
+        ]);
+        await acquireFences(tx, [
+          ...[...policyLockTargetIds].map((targetId) => fences.capacityPolicy(targetId)),
+          ...candidateCapacityIds.map((capacityId) => fences.capacity(capacityId)),
+        ]);
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         // Local members always join at PRIMARY tier, so every attach changes
         // the primary member set and must keep the effective recommended
@@ -3139,35 +3191,8 @@ export const forwarderManagementRouter = {
             },
           },
         });
-        // Capacity lock order (@ws-model-proxy/db/capacity-lock-order): the
-        // pool row (L1) is locked above. Plan with reads only, then take one
-        // sorted L2 union (the operated target and every target sharing a
-        // capacity it may seed), then the capacity rows it may write (L5),
-        // and only then adopt, fill or link a capacity.
-        const candidateCapacityIds =
-          target.inferenceCapacityId !== null
-            ? [target.inferenceCapacityId]
-            : await existingDiscoveredCapacityCandidates(tx, {
-                userId,
-                discoveredModelId: input.discoveredModelId,
-                executionTargetId: target.id,
-              });
-        const targetsSharingCandidateCapacity =
-          declaredContext != null && candidateCapacityIds.length > 0
-            ? await tx.executionTarget.findMany({
-                where: {
-                  userId,
-                  inferenceCapacityId: { in: candidateCapacityIds },
-                },
-                select: { id: true },
-              })
-            : [];
-        const policyLockTargetIds = new Set([
-          target.id,
-          ...targetsSharingCandidateCapacity.map((sharedTarget) => sharedTarget.id),
-        ]);
-        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
-        await lockCapacityRowsForPolicyWrite(tx, userId, candidateCapacityIds);
+        // A target the upsert created is new: it needs no policy fence.
+        policyLockTargetIds.add(target.id);
         let inferenceCapacityId = target.inferenceCapacityId;
         if (inferenceCapacityId === null) {
           inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
@@ -3285,11 +3310,35 @@ export const forwarderManagementRouter = {
         });
       const userId = context.session.user.id;
       const attached = await runSerializableTransaction(async (tx) => {
+        // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
+        // fence; then, planned with reads only, the target identity fence and
+        // the policy/capacity fences of the rows it may change; then the pool
+        // row and the provider account -> model rows (F-LO1) before the first
+        // write, whose foreign-key checks re-enter them.
+        await fenceOwners(tx, [userId]);
         const candidatePool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
           select: { id: true },
         });
         if (!candidatePool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const plannedTarget = await tx.executionTarget.findUnique({
+          where: { providerModelId: input.providerModelId },
+          select: { id: true, inferenceCapacityId: true },
+        });
+        const plannedCapacity = await tx.inferenceCapacity.findUnique({
+          where: {
+            userId_runtimeIdentityKey: {
+              userId,
+              runtimeIdentityKey: `provider-model:${input.providerModelId}`,
+            },
+          },
+          select: { id: true },
+        });
+        await acquireFences(tx, [
+          fences.targetIdentity(`provider-model:${input.providerModelId}`),
+          ...(plannedTarget ? [fences.capacityPolicy(plannedTarget.id)] : []),
+          ...(plannedCapacity ? [fences.capacity(plannedCapacity.id)] : []),
+        ]);
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidatePool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const pool = await tx.modelPool.findFirst({
           where: { id: candidatePool.id, userId },
@@ -3329,7 +3378,8 @@ export const forwarderManagementRouter = {
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
         }
-        await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${providerModel.providerAccountId} AND "userId" = ${userId} FOR KEY SHARE`;
+        await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${providerModel.id} AND "userId" = ${userId} FOR KEY SHARE`;
         // Fast rejection; the same invariant is checked again after the target
         // policy fence below, which is the authoritative race-safe check.
         assertConcurrencyPolicyWithinHardLimit({
@@ -3403,7 +3453,6 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
-        await lockExecutionTargetPolicies(tx, [target.id]);
         const capacity = await tx.inferenceCapacity.upsert({
           where: {
             userId_runtimeIdentityKey: {
@@ -3430,7 +3479,6 @@ export const forwarderManagementRouter = {
             where: { id: target.id },
             data: { inferenceCapacityId: capacity.id },
           });
-        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} AND "userId" = ${userId} FOR UPDATE`;
         const [reloadedProviderModel, reloadedPool, reloadedCapacity] = await Promise.all([
           tx.providerModel.findFirst({
             where: { id: input.providerModelId, userId, deletedAt: null },
@@ -3567,6 +3615,9 @@ export const forwarderManagementRouter = {
       const userId = context.session.user.id;
       const updatedMember = await prisma.$transaction(
         async (tx) => {
+          // Writer class M: the owner fence first; it serializes every
+          // tier/order transition with pool attachment and reorder.
+          await fenceOwners(tx, [userId]);
           const candidate = await tx.poolMember.findUnique({
             where: { id: input.id },
             select: {
@@ -3578,12 +3629,12 @@ export const forwarderManagementRouter = {
           if (!candidate || candidate.ModelPool.userId !== userId)
             throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
 
-          // Serialize every tier/order transition with pool attachment and
-          // reorder operations. Re-read all policy inputs after taking the lock
-          // so pool settings and protection cannot be revoked concurrently.
-          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+          // The member's capacity-policy fence, then the pool row. Re-read
+          // all policy inputs after them so pool settings and protection
+          // cannot be revoked concurrently.
           if (candidate.executionTargetId)
-            await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
+            await fenceExecutionTargetPolicies(tx, [candidate.executionTargetId]);
+          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
           const member = await tx.poolMember.findUnique({
             where: { id: input.id },
             select: {
@@ -3863,6 +3914,8 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
+        // Writer class M: the owner fence before the multi-row reorder.
+        await fenceOwners(tx, [userId]);
         const candidate = await tx.poolMember.findUnique({
           where: { id: input.id },
           select: { id: true, poolId: true, tier: true, ModelPool: { select: { userId: true } } },
@@ -3899,11 +3952,14 @@ export const forwarderManagementRouter = {
     .input(z.object({ id: idSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // Read-only checks first, so a refused detach drains nothing; the
-      // ordered transaction repeats them under the pool lock.
+      // Read-only checks first; the transaction repeats them under its fence.
       await assertPoolMemberRemovable(prisma, input.id, userId);
-      await drainBeforeParentDelete({ userId, poolMemberIds: [input.id] });
       return runCapacityDeleteTransaction(async (tx) => {
+        // A plain delete under the owner fence (fenceParentDelete), which
+        // also keeps the member set this decision is made against stable;
+        // then the pool row, matching addPoolMember. Waiters and leases keep
+        // the member's id; the capacity sweeper terminalizes live orphans.
+        await fenceParentDelete(tx, { userId, poolMemberIds: [input.id] });
         const candidate = await tx.poolMember.findUnique({
           where: { id: input.id },
           select: { id: true, poolId: true, ModelPool: { select: { userId: true } } },
@@ -3911,14 +3967,8 @@ export const forwarderManagementRouter = {
         if (!candidate || candidate.ModelPool.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
         }
-        // Lock the pool row first (matching addPoolMember) so the member set
-        // this decision is made against cannot change concurrently.
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         await assertPoolMemberRemovable(tx, input.id, userId);
-        // Parent delete in capacity lock order: the pool row is L1 (above);
-        // then the member's target (L2) and every capacity lock its cascade
-        // into waiters and admission rows can reach, then the DELETE.
-        await lockCapacityGraphForDelete(tx, { userId, poolMemberIds: [input.id] });
         await tx.poolMember.delete({ where: { id: input.id } });
         return { deleted: true };
       });
@@ -4183,17 +4233,11 @@ export const forwarderManagementRouter = {
       // No grant-time egress acknowledgement: a grantee's data leaves the
       // deployment only when the grantee asks for `owner/pool:external` with
       // a consenting credential AND the owner enabled fallbackForGrantees.
-      // The pool row lock keeps grants serialized with pool settings changes
-      // (lock order: model_pool first).
+      // Writer class M: a grant links two owners' graphs, so it takes both
+      // owner fences (the fence trigger on pool_grant requires them). The
+      // pool row lock then keeps grants serialized with pool settings
+      // changes and the E0 send claim (lock order: model_pool first).
       return runSerializableTransaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
-        const locked = await tx.modelPool.findUnique({
-          where: { id: pool.id },
-          select: { id: true, userId: true },
-        });
-        if (!locked || locked.userId !== userId) {
-          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        }
         const grantee = await tx.user.findFirst({
           where: { email: { equals: input.email, mode: "insensitive" } },
           select: { id: true },
@@ -4205,6 +4249,15 @@ export const forwarderManagementRouter = {
           throw new ORPCError("BAD_REQUEST", {
             message: grantPoolAccessServerMessages.cannotGrantToSelf,
           });
+        }
+        await fenceOwners(tx, [userId, grantee.id]);
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        const locked = await tx.modelPool.findUnique({
+          where: { id: pool.id },
+          select: { id: true, userId: true },
+        });
+        if (!locked || locked.userId !== userId) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         }
         return tx.poolGrant.upsert({
           where: {
@@ -4235,12 +4288,17 @@ export const forwarderManagementRouter = {
       if (!grantee) {
         throw new ORPCError("NOT_FOUND", { message: "User not found." });
       }
-      const result = await prisma.poolGrant.deleteMany({
-        where: {
-          poolId: input.poolId,
-          ownerUserId: context.session.user.id,
-          granteeUserId: grantee.id,
-        },
+      // Writer class M: both parties' owner fences (the grant's delete
+      // cascades into the grantee's fallback preference), then one statement.
+      const result = await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [context.session.user.id, grantee.id]);
+        return tx.poolGrant.deleteMany({
+          where: {
+            poolId: input.poolId,
+            ownerUserId: context.session.user.id,
+            granteeUserId: grantee.id,
+          },
+        });
       });
       return { revokedCount: result.count };
     }),
@@ -4264,8 +4322,10 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       await ownedPool(input.poolId, userId);
-      // Same lock order as grant creation: the pool row (L1 / C1), then the grant.
+      // Same lock order as grant creation: the owner fence first (writer
+      // class M), then the pool row, then the grant.
       return runSerializableTransaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
         const locked = await tx.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (locked.length !== 1)

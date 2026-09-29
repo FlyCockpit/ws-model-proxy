@@ -1,5 +1,7 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import { catalogEntry } from "../lib/fixtures/openrouter-catalog";
@@ -35,14 +37,20 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
-    const [db, router, model, management, locks] = await Promise.all([
+    const [, router, model, management, locks] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./provider-catalog"),
       import("../lib/provider-catalog-model"),
       import("./provider-management"),
       import("../lib/capacity-policy-safety"),
     ]);
-    modules = { prisma: db.default, router, parseCatalog: model.parseCatalog, management, locks };
+    modules = {
+      prisma: createFixturePrismaClient(databaseUrl!),
+      router,
+      parseCatalog: model.parseCatalog,
+      management,
+      locks,
+    };
   });
 
   afterAll(() => {
@@ -279,9 +287,8 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
     expect(model).toEqual({ deletedAt: null, enabled: false });
   });
 
-  it("activation cannot invert an import's account -> pricing -> model locks", async () => {
+  it("activation cannot invert an import's owner -> identity -> pricing fences and rows", async () => {
     if (!modules) throw new Error("modules unavailable");
-    const { locks } = modules;
     const { prisma, user, account, client, management } = await fixture();
     useCatalog([catalogEntry()]);
     const imported = await client.importModel({
@@ -320,13 +327,18 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
             Array<{ pid: number }>
           >`SELECT pg_backend_pid() AS pid`;
           if (!backend) throw new Error("Backend pid unavailable");
-          // Deterministic import-side lock driver: precisely importModel's
-          // existing-model prefix, paused after account. The real activation
-          // must queue there WITHOUT holding the pricing advisory/rows/model.
-          // Before PR2-C10 it holds those and waits on the audit FK to account;
-          // the next advisory below then deadlocks (the short detector is here,
-          // outside import's retry wrapper, so retry cannot hide the regression).
-          await locks.lockExecutionTargetIdentities(tx, [`provider-model:${imported.model.id}`]);
+          // Deterministic import-side driver in the writer-class M order:
+          // owner, identity and pricing fences, then rows. The real activation
+          // must queue at its owner fence WITHOUT holding any pricing row or
+          // the model. Before DL-1 it held those and waited on the audit FK to
+          // the account; the row locks below then deadlocked (the short
+          // detector is here, outside import's retry wrapper, so retry cannot
+          // hide the regression).
+          await acquireFences(tx, [
+            fences.owner(user.id),
+            fences.targetIdentity(`provider-model:${imported.model.id}`),
+            fences.pricing(user.id, imported.model.id),
+          ]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${account.id} AND "userId" = ${user.id} FOR UPDATE`;
           activation = management.activatePricingVersion({ id: draft.id });
           // Observe rejection immediately; assert it after the driver releases.
@@ -345,7 +357,6 @@ integration("providerCatalog.importModel with real PostgreSQL", () => {
             await tick();
           }
           expect(blocked).toBe(true);
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${user.id}:${imported.model.id}`}, 0))`;
           await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${imported.model.id} AND "userId" = ${user.id} FOR NO KEY UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_pricing_version WHERE "providerModelId" = ${imported.model.id} AND "userId" = ${user.id} FOR UPDATE`;
         },
