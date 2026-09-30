@@ -551,10 +551,11 @@ the command text itself), when, and how it ended (`completed`, `refused`, `faile
 stored as `rejected`, so CLI-supplied text never reaches the column. File
 content, diffs and command output are never stored, and the command's arguments
 are never stored: the server reduces the command text to its program (the
-basename of the first word that is not a leading plain `NAME=value` assignment (that word must itself be a plain name or absolute path, read the same by `sh` and by `cmd /C`, which the CLI uses on Windows without `sh`: a quoted word, a redirection, a flag with an attached path, a relative path, a `+` or a built-in followed by `.` is `?`; a command cut for length stores `?`);
-an assignment whose value has a quote, escape, expansion or any character
-outside a plain set makes the program `?`, so no piece of a secret value can
-be stored) and hashes the whole text. The digest is
+first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
+`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
+command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
+flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
+for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
 HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
 (fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
 used to check a guessed command; when the key cannot be derived the hash is

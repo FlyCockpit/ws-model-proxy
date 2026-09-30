@@ -79,10 +79,10 @@ describe("commandProgram", () => {
   // Adversarial table: every row must yield exactly the program, never any
   // argument text, a secret, a quote or an unparsable fragment.
   const rows: ReadonlyArray<readonly [string, string, string]> = [
-    ["a leading secret assignment is skipped", "FOO=secret curl https://x", "curl"],
-    ["an underscore-leading assignment is skipped", "_TOKEN=abc tool arg", "tool"],
+    ["a leading assignment fails closed (cmd has none)", "FOO=secret curl https://x", UNKNOWN],
+    ["an underscore-leading assignment fails closed", "_TOKEN=abc tool arg", UNKNOWN],
     ["a one-character program is accepted", "x arg", "x"],
-    ["an absolute path is reduced to its basename", "/usr/bin/git push", "git"],
+    ["an absolute path fails closed (cmd reads / as a switch)", "/usr/bin/git push", UNKNOWN],
     ["a wrapper is stored by its own name", "sudo rm -rf x", "sudo"],
     ["env is not unwrapped", "env A=1 ls", "env"],
     ["a plain command", "echo hf_abc", "echo"],
@@ -94,14 +94,14 @@ describe("commandProgram", () => {
     ["nothing at all", "", UNKNOWN],
     ["whitespace only", "   \t\n  ", UNKNOWN],
     ["only assignments", "A=b", UNKNOWN],
-    ["two assignments then a program", "A=b C=d prog", "prog"],
+    ["two assignments then a program fail closed", "A=b C=d prog", UNKNOWN],
     ["a NUL in the program", "bad\0cmd", UNKNOWN],
     ["a control char in the program", "bad\u0007cmd", UNKNOWN],
     ["unicode in the program", "\u00e9cho hi", UNKNOWN],
     ["an overlong name (65)", `${"a".repeat(65)} x`, UNKNOWN],
     ["a name of exactly 64", `${"a".repeat(64)} x`, "a".repeat(64)],
-    ["leading whitespace and tabs", "\t  /bin/ls", "ls"],
-    ["a newline before the program", "\n\npython -c x", "python"],
+    ["leading spaces and tabs are skipped", "\t  ls", "ls"],
+    ["a newline before the program fails closed (cmd ends the line)", "\n\npython -c x", UNKNOWN],
     [
       "single quotes around the program fail closed (cmd does not quote with ')",
       "'/bin/ls' x",
@@ -116,8 +116,8 @@ describe("commandProgram", () => {
     ["a plus in the name fails closed", "g++ x", UNKNOWN],
     ["a path with a trailing slash", "/usr/bin/", UNKNOWN],
     ["a quoted assignment value with a space fails closed", 'FOO="a b" curl', UNKNOWN],
-    ["a plain assignment with path-ish value is skipped", "A=/x/y:z@1.2,3+4=5 prog", "prog"],
-    ["an empty assignment value is skipped", "A= prog", "prog"],
+    ["a plain assignment with path-ish value fails closed", "A=/x/y:z@1.2,3+4=5 prog", UNKNOWN],
+    ["an empty assignment value fails closed", "A= prog", UNKNOWN],
     ["an assignment-looking invalid name is a candidate", "1A=b", UNKNOWN],
     ["a dashed assignment-looking name is a candidate", "a-b=c", UNKNOWN],
     ["a leading long flag is not a program", "--api-key x", UNKNOWN],
@@ -207,8 +207,10 @@ describe("commandProgram", () => {
     expect(commandProgram(`${character}/home/u/hunter2Secret`)).toBe(UNKNOWN);
   });
 
-  it("trims leading blanks and newlines like sh", () => {
-    expect(commandProgram(" \t\n\n /usr/bin/git push")).toBe("git");
+  it("skips only leading spaces and tabs", () => {
+    expect(commandProgram(" \t  git push")).toBe("git");
+    expect(commandProgram("\n git push")).toBe(UNKNOWN);
+    expect(commandProgram(" \n git push")).toBe(UNKNOWN);
   });
 
   // C4b-1: the CLI may run the command through `cmd /C` (Windows without sh),
@@ -231,9 +233,24 @@ describe("commandProgram", () => {
   it("keeps plain names, absolute paths and dotted non-built-in names", () => {
     expect(commandProgram("git status")).toBe("git");
     expect(commandProgram("echo hi")).toBe("echo");
-    expect(commandProgram("/usr/bin/git status")).toBe("git");
+    expect(commandProgram("/usr/bin/git status")).toBe(UNKNOWN);
     expect(commandProgram("python3.12 x")).toBe("python3.12");
     expect(commandProgram("node.exe x")).toBe("node.exe");
+  });
+
+  // C5b-1: cmd /C has no inline assignment, so `NAME=value word` must not
+  // yield `word`; and no `=`, DPATH/KEYS dotted names.
+  it.each([
+    "FOO=bar hunter2Secret",
+    "echo=hello hunter2Secret",
+    "PATH=/usr/bin:/bin hunter2Secret --x",
+    "set=x hunter2Secret",
+    "dpath.hunter2Secret",
+    "keys.hunter2Secret",
+    "/hunter2Secret",
+    "/echo/hunter2Secret",
+  ])("stores ? for a first word the two shells could read differently: %s", (input) => {
+    expect(commandProgram(input)).toBe(UNKNOWN);
   });
 
   it("returns the unknown program for non-string and non-well-formed input", () => {
@@ -272,10 +289,8 @@ describe("commandAuditPath", () => {
   });
 
   it("stores ? as the program of a truncated command", () => {
-    expect(commandAuditPath("/usr/bin/git status", hex, { truncated: true })).toBe(
-      "hmac-sha256:H<19> ?",
-    );
-    expect(commandAuditPath("/usr/bin/git status", hex)).toBe("hmac-sha256:H<19> git");
+    expect(commandAuditPath("git status", hex, { truncated: true })).toBe("hmac-sha256:H<10> ?");
+    expect(commandAuditPath("git status", hex)).toBe("hmac-sha256:H<10> git");
   });
 
   it("stores no argument text for any adversarial command", () => {

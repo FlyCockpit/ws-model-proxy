@@ -1026,13 +1026,14 @@ describe("cli commands", () => {
       const path = String(events()[0]?.path ?? "");
       // The first word is a secret-bearing assignment: it is skipped, never stored.
       expect(path).not.toContain("abcdefghij");
-      expect(path.split(" ").slice(1).join(" ")).toBe("tool");
+      // A leading assignment is not skipped (cmd has none): the program is `?`.
+      expect(path.split(" ").slice(1).join(" ")).toBe("?");
       expect(path.slice(0, path.indexOf(" "))).toBe(`hmac-sha256:${commandAuditDigest(command)}`);
     });
 
     it("never stores raw argument text for a secret-bearing command", async () => {
       const socket = await connect();
-      const command = "FOO=secret curl --api-key sk-secret-9 https://x";
+      const command = "curl --api-key sk-secret-9 https://x";
       const result = await startCliCommand({ ...base, command });
       if (!result.ok) throw new Error("expected start");
       await relaySessionManager.handleTextFrame(
@@ -1045,7 +1046,7 @@ describe("cli commands", () => {
         }),
       );
       const serialized = JSON.stringify(events());
-      for (const leak of ["secret", "sk-secret-9", "https://x", "--api-key", "FOO="])
+      for (const leak of ["sk-secret-9", "https://x", "--api-key"])
         expect(serialized, `row leaks ${leak}`).not.toContain(leak);
       expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
     });

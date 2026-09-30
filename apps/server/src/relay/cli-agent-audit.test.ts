@@ -129,7 +129,7 @@ describe("recordCliAgentAction", () => {
 
   it("never writes raw command text: the row carries only the hash and the program", async () => {
     const { commandAuditPath } = await import("@ws-model-proxy/config/cli-agent-audit");
-    const command = "FOO=secret curl --api-key sk-secret-9 https://x";
+    const command = "curl --api-key sk-secret-9 https://x";
     // The keyed digest is injected: this module never sees the key.
     const digest = (text: string) => createHash("sha256").update(`key:${text}`).digest("hex");
     recordCliAgentAction(event({ kind: "command", path: commandAuditPath(command, digest) }));
@@ -137,7 +137,7 @@ describe("recordCliAgentAction", () => {
     const serialized = JSON.stringify(written(), (_k, v) =>
       typeof v === "bigint" ? String(v) : v,
     );
-    for (const leak of ["secret", "sk-secret-9", "https://x", "--api-key", "FOO=", command])
+    for (const leak of ["sk-secret-9", "https://x", "--api-key", command])
       expect(serialized, `write leaks ${leak}`).not.toContain(leak);
     expect(written()[0]?.path).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
   });

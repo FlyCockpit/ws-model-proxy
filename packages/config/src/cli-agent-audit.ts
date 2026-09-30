@@ -170,20 +170,16 @@ export const CLI_AGENT_ACTION_UNKNOWN_DEVICE = "unknown";
  */
 export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 
-/** The only names a stored program may have: no spaces, quotes, `+`, NUL or non-ASCII. */
+/** The only names a stored program may have: a bare name, no `/`, `+`, quotes, NUL or non-ASCII. */
 const PROGRAM_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
-/** The whole program word: a plain path (program charset plus `/`). */
-const PROGRAM_WORD_PATTERN = /^[A-Za-z0-9._/-]+$/;
-
 /**
- * The CLI runs a headless command through `sh -c`, or through `cmd /C` on a
- * Windows device without `sh` (apps/cli/src/child_env.rs `exec_shell`), and
- * the relay does not know which. `cmd` ends a command token at `/`, `+` and,
- * after a built-in such as `echo`, at `.`, so a word only counts as the
- * program when both shells read it the same way: no `+`, `/` only in an
- * absolute path (a leading `/`), and no built-in name followed by `.`. Anything
- * else stores `?`.
+ * cmd.exe internal commands (Microsoft's `cmd` command list and SS64's
+ * internal-command list). The CLI runs a headless command through `sh -c`, or
+ * through `cmd /C` on a Windows device without `sh` (apps/cli/src/child_env.rs
+ * `exec_shell`), and the relay does not know which. `cmd` ends a built-in's
+ * name at `.`, so `echo.x` runs `echo` with an argument: a built-in name
+ * followed by `.` is not a program word.
  */
 const CMD_BUILTINS: ReadonlySet<string> = new Set([
   "assoc",
@@ -197,6 +193,7 @@ const CMD_BUILTINS: ReadonlySet<string> = new Set([
   "date",
   "del",
   "dir",
+  "dpath",
   "echo",
   "endlocal",
   "erase",
@@ -205,6 +202,7 @@ const CMD_BUILTINS: ReadonlySet<string> = new Set([
   "ftype",
   "goto",
   "if",
+  "keys",
   "md",
   "mkdir",
   "mklink",
@@ -232,80 +230,36 @@ const CMD_BUILTINS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A leading `NAME=value` assignment that is safe to skip: a valid shell env
- * NAME and a value made only of plain characters. Anything else in the value
- * (quotes, backslash, `$`, backtick, parentheses, braces, redirection, glob
- * or history characters, whitespace other than space and tab) can keep a
- * space inside ONE shell word, so the next space-separated piece would be a
- * fragment of the value, not a program. Such a command fails closed.
- */
-const SAFE_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,=-]*$/;
-
-/** A word that starts like an assignment (valid NAME then `=`), safe or not. */
-const ASSIGNMENT_START_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
-
-/**
- * Splits a command into tokens at spaces and tabs ONLY. There is no quote or
- * escape handling on purpose: a word is never re-assembled, so no piece of an
- * argument or assignment value can be mistaken for the program. Any other
- * whitespace (CR, VT, FF, Unicode spaces, BOM) stays inside its token, which
- * then fails the program charset. Only what sh itself skips before the first
- * word is trimmed first (blanks and newlines): a wider trim would drop an
- * invisible first word that sh runs as the program and store the next word.
- */
-function tokenizeCommand(command: string): string[] {
-  return command
-    .replace(/^[ \t\n]+/, "")
-    .split(/[ \t]+/)
-    .filter((token) => token.length > 0);
-}
-
-/** The basename of a word: `"/usr/bin/git"` -> `git`; empty for a trailing slash. */
-function basename(word: string): string {
-  if (word.endsWith("/")) return "";
-  const index = word.lastIndexOf("/");
-  return index === -1 ? word : word.slice(index + 1);
-}
-
-/**
- * The program of a command for the audit `path`: the basename of the first
- * word that is not a leading plain `NAME=value` assignment (an assignment with
- * a quote, escape, expansion or other non-plain value fails closed) (`env`, `sudo` and the
- * other wrappers are stored by their own name, never unwrapped). Returns
- * {@link CLI_AGENT_ACTION_UNKNOWN_PROGRAM} for anything outside the accepted
- * shape: a word that starts with `-` is a flag, not a program, so it fails
- * closed too. The rule is proven against both `sh` and `cmd /C` word
- * boundaries (see CMD_BUILTINS). Never returns any argument text.
+ * The program of a command for the audit `path`: the FIRST word, and only when
+ * it is a bare name that `sh` and `cmd /C` both read as the command word. That
+ * is the whole grammar (design-c1b1.md):
+ *
+ * - Leading spaces and tabs are skipped; the word ends at the next space or
+ *   tab. Nothing else is trimmed or split on: newline, CR, VT, FF, Unicode
+ *   spaces, quotes, `/`, `+`, `=`, redirections and expansions all stay in the
+ *   word and fail the name charset.
+ * - A word that starts like an assignment (`NAME=`) or with `-` is not
+ *   skipped, unwrapped or interpreted: `cmd` has no inline assignments and the
+ *   value can hide a shell word, so it fails closed. `env`, `sudo` and other
+ *   wrappers are stored by their own name.
+ * - A built-in name followed by `.` fails closed (see {@link CMD_BUILTINS}).
+ *
+ * Anything else returns {@link CLI_AGENT_ACTION_UNKNOWN_PROGRAM}. It never
+ * returns argument text: the result is the whole first word or `?`.
  */
 export function commandProgram(command: unknown): string {
   if (typeof command !== "string" || command.length === 0) {
     return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
-  for (const token of tokenizeCommand(command)) {
-    if (ASSIGNMENT_START_PATTERN.test(token)) {
-      // Skip only a plain assignment; any other shape may hide a value that
-      // spans several tokens, so the program cannot be told and fails closed.
-      if (SAFE_ASSIGNMENT_PATTERN.test(token)) continue;
-      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
-    }
-    // The WHOLE word is checked before its basename is taken: a leading
-    // redirection (`2>/x/y`), a slash-bearing flag (`--opt=/x/y`, `-p/x/y`) or
-    // any word with a character outside the path charset would otherwise leak
-    // its last path segment as the "program".
-    const word = token;
-    if (!PROGRAM_WORD_PATTERN.test(word) || word.startsWith("-")) {
-      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
-    }
-    // Only the shells' common reading: `/` only in an absolute path, and a
-    // built-in name is not followed by `.` (see CMD_BUILTINS).
-    if (word.includes("/") && !word.startsWith("/")) return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
-    const base = basename(word);
-    const stem = base.split(".")[0] ?? "";
-    if (stem !== base && CMD_BUILTINS.has(stem.toLowerCase()))
-      return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
-    return PROGRAM_PATTERN.test(base) ? base : CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+  const word = command.replace(/^[ \t]+/, "").split(/[ \t]/, 1)[0] ?? "";
+  if (!PROGRAM_PATTERN.test(word) || word.startsWith("-") || word.includes("=")) {
+    return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
-  return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+  const stem = word.split(".")[0] ?? "";
+  if (stem !== word && CMD_BUILTINS.has(stem.toLowerCase())) {
+    return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+  }
+  return word;
 }
 
 /**
