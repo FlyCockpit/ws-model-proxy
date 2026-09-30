@@ -435,13 +435,13 @@ EOF/completion, with at most
 in bounded pieces with retained private-key labels and overlap across piece boundaries,
 and masked whole, never emitting a prefix or unbroken token tail. When the overlong line begins inside a live multi-line
 secret run — an open private-key PEM block, an open quote or backslash
-continuation, an indentation run — that run's remaining output is opaque through
+continuation, an indentation run from the output itself — that run's remaining output is opaque through
 EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
 masks the lines that follow. Otherwise, at its terminating LF a fresh scanner is
 primed with every unclosed private-key BEGIN label from that line and an
 unconditional until-blank opener. Every non-blank output line stays masked until
 the next blank line, including output after an overlong public line or closed
-quote. A matching END closes the corresponding carried PEM block.
+quote. (The recovery's own synthetic guard is exempt: a second overlong line right after it recovers again, masking at least as much.) A matching END closes the corresponding carried PEM block.
 Recovery also treats that line as a column-0 secret-name token line: the next
 non-blank line is masked whole, and subsequent lines indented deeper than column
 0 stay masked. Blank lines do not consume the next-line protection; PEM and other
