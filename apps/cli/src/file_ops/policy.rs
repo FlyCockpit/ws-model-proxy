@@ -218,17 +218,31 @@ fn physical(path: &Path) -> PathBuf {
     } else {
         path
     };
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut rest: Vec<std::path::Component> = Vec::new();
     let mut base = path;
     loop {
         if let Ok(real) = std::fs::canonicalize(base) {
             let mut out = real;
-            out.extend(rest.iter().rev());
+            // the unresolved suffix is applied lexically: a `..` removes the missing
+            // name before it (or, with none left, the real directory's parent)
+            let mut pending: Vec<std::path::Component> = Vec::new();
+            for component in rest.iter().rev() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        if pending.pop().is_none() {
+                            out.pop();
+                        }
+                    }
+                    std::path::Component::CurDir => {}
+                    other => pending.push(*other),
+                }
+            }
+            out.extend(pending.iter().map(|c| c.as_os_str()));
             return out;
         }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
+        match (base.parent(), base.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
                 base = parent;
             }
             _ => return path.to_path_buf(),
@@ -314,6 +328,18 @@ mod tests {
             aliases.iter().any(|p| p.path == want),
             "{aliases:?} lacks {want:?}"
         );
+    }
+
+    #[test]
+    fn dotdot_after_a_missing_ancestor_is_collapsed_in_the_alias() {
+        let cwd = physical(&std::env::current_dir().unwrap());
+        let rel = PathBuf::from("wsmp-missing-a/spare/../state/device-auth.json");
+        assert_eq!(
+            physical(&rel),
+            cwd.join("wsmp-missing-a/state/device-auth.json")
+        );
+        let up = PathBuf::from("wsmp-missing-a/../../wsmp-x.json");
+        assert_eq!(physical(&up), cwd.parent().unwrap().join("wsmp-x.json"));
     }
 
     #[test]

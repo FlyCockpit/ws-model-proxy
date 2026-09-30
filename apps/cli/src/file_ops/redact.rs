@@ -17,10 +17,13 @@
 //! an END closes only the innermost opener of its own label. Public keys and
 //! certificates stay visible. There is no vendor-prefix credential scanner.
 //!
-//! A token line can open a quote, trailing backslash or YAML-like block. These
-//! constructs end only at a structural boundary: a blank line, or a dedent for
-//! a YAML block, never at a closing quote. Openers are scanned even inside masked
-//! runs, and all open constructs contribute masks (restartable union semantics).
+//! A token line also masks every following line indented deeper than itself
+//! (blank lines inside the run included; a tab against a space is fail-closed
+//! deeper) and ends at the first non-blank line at or below its indentation. No
+//! block header, key syntax or comment is inspected. An open quote or a trailing
+//! backslash on a token line also runs to the next blank line. Openers are
+//! scanned even inside masked runs, and all open constructs contribute masks
+//! (restartable union semantics).
 //! Reads feed the bounded [`LOOKBACK_BYTES`] context plus its preceding line;
 //! constructs beyond that lookback are a documented residual. [`mask`]
 //! records every replacement as a span without changing line counts. Edits
@@ -470,57 +473,6 @@ fn first_secret_name(line: &str) -> Option<Range<usize>> {
     None
 }
 
-/// The constructs after a token, without parsing assignments or file formats.
-/// A quoted YAML key may end just before its colon. Quote parity is always
-/// computed over the entire line, including text before the token.
-fn construct_after_name(line: &str, end: usize) -> Construct {
-    let tail = line[end..].trim_start_matches([' ', '\t', '\'', '"']);
-    let (tail, colon) = match tail.strip_prefix(':') {
-        Some(tail) => (tail, true),
-        None => (tail, false),
-    };
-    construct_for_tail(tail, colon, indent_of(line), quote_left_open(line))
-}
-
-/// The multi-line value the line after a token line opens (`value: |`, `value: >-`,
-/// an open quote, a trailing backslash): a `key:` whose key is identifier-like
-/// opens a YAML block; any other colon (`for x in y:`) is code, not a header.
-fn value_line_construct(line: &str) -> Construct {
-    match line.find(':') {
-        Some(colon) if key_like(&line[..colon]) => construct_for_tail(
-            &line[colon + 1..],
-            true,
-            indent_of(line),
-            quote_left_open(line),
-        ),
-        _ => construct_for_tail(line, false, indent_of(line), quote_left_open(line)),
-    }
-}
-
-/// A block-scalar header (`key: |`, `key: >- # note`) whose secret-name token sits
-/// in its trailing comment: the header itself opens the block, whatever the line
-/// above held. Narrow on purpose: a `- name: Use API_KEY` step header opens nothing.
-fn header_block_before(line: &str, name_start: usize) -> Option<Construct> {
-    let colon = line.find(':').filter(|c| *c < name_start)?;
-    (key_like(&line[..colon]) && BLOCK_SCALAR.is_match(line[colon + 1..].trim())).then(|| {
-        Construct::Block {
-            line_indent: indent_of(line),
-        }
-    })
-}
-
-/// Whether `before` (the text before a colon) is a YAML/JSON-style key: an optional
-/// list dash, then an identifier-like word, possibly quoted.
-fn key_like(before: &str) -> bool {
-    let word = before.trim();
-    let word = word.strip_prefix("- ").unwrap_or(word).trim();
-    let word = word.trim_matches(['"', '\'']);
-    !word.is_empty()
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-}
-
 /// One secret flag candidate: where its masked tail starts and what it opens.
 type Candidate = (usize, Construct);
 
@@ -669,11 +621,26 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// Which whitespace kinds (1 space, 2 tab) a line is indented with.
+fn indent_kinds(line: &str) -> u8 {
+    line.bytes()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .fold(0, |kinds, b| kinds | if b == b' ' { 1 } else { 2 })
+}
+
+/// Tabs and spaces compared against each other cannot be ordered: the run stays
+/// open (fail closed).
+fn mixed_indent(a: u8, b: u8) -> bool {
+    a | b == 3
+}
+
 /// One open YAML-like block: it masks lines indented deeper than `indent` until
 /// a non-blank line at or below it.
 #[derive(Debug, Clone, Copy)]
 struct OpenBlock {
     indent: usize,
+    /// Which whitespace kinds (1 space, 2 tab) its line was indented with.
+    ws: u8,
     opener: usize,
 }
 
@@ -782,7 +749,9 @@ impl LineMasker {
             self.until_blank = None;
         } else {
             let indent = indent_of(line);
-            self.blocks.retain(|block| block.indent < indent);
+            let kinds = indent_kinds(line);
+            self.blocks
+                .retain(|block| block.indent < indent || mixed_indent(block.ws, kinds));
             masked_by = self
                 .blocks
                 .iter()
@@ -833,6 +802,7 @@ impl LineMasker {
                     self.blocks.retain(|block| block.indent != line_indent);
                     self.blocks.push(OpenBlock {
                         indent: line_indent,
+                        ws: indent_kinds(line),
                         opener: at,
                     });
                 }
@@ -915,13 +885,15 @@ impl LineMasker {
                 masks.extend(tail_mask(line, range.start));
                 constructs.push(opened);
             }
-            if let Some(name) = first_secret_name(line) {
-                constructs.push(construct_after_name(line, name.end));
-                constructs.extend(header_block_before(line, name.start));
-                if self.pending_token_line {
-                    // this is also the value's line after a token line (`value: | # API_KEY
-                    // is injected`): its own multi-line opener is kept next to the token's
-                    constructs.push(value_line_construct(line));
+            if first_secret_name(line).is_some() {
+                // purely structural: every following line indented deeper than this one
+                // (blank lines included) is masked, whatever the line looks like
+                constructs.push(Construct::Block {
+                    line_indent: indent_of(line),
+                });
+                // an open quote or a trailing backslash also runs to the next blank line
+                if line.trim_end().ends_with('\\') || quote_left_open(line) {
+                    constructs.push(Construct::UntilBlank);
                 }
                 // the marker never copies text of the line (a word that looks like a
                 // secret name can itself be the secret value: `--password admin_password`)
@@ -934,10 +906,6 @@ impl LineMasker {
                 }
                 if self.pending_token_line && !line.trim().is_empty() {
                     masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
-                    // the line after a token line is the value's line (`value: |` after
-                    // `name: API_KEY`): a multi-line value that it opens goes on to a
-                    // structural end (blank line, dedent), like a value on the token line
-                    constructs.push(value_line_construct(line));
                 }
                 self.pending_token_line = false;
             }
@@ -1279,6 +1247,63 @@ mod tests {
             assert!(!view.contains(hidden), "{sample}: {view:?}");
             assert!(view.contains("next: 1"), "{sample}: {view:?}");
         }
+    }
+
+    /// A token line also masks every following line indented deeper than itself
+    /// (blank lines inside included) and ends at the first line at or below its
+    /// indentation, whatever the line looks like: no header syntax is inspected.
+    #[test]
+    fn token_line_masks_deeper_indented_lines_structurally() {
+        for (sample, input, hidden) in [
+            (
+                "dotted key block",
+                "data:\n  db_password.txt: |\n    a\n    probe-b\n\n    probe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                "bare item with comment",
+                "args:\n  - | # needs the API_KEY\n    a\n    probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "slash key",
+                "annotations:\n  example.com/pgpass: | # holds the DB_PASSWORD\n    a\n    probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "spaced key",
+                "db pass file: | # DB_PASSWORD\n  a\n  probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "nested map under a secret key",
+                "api_key:\n  id: one\n  nested:\n    probe-deep: two\nnext: 1\n",
+                "probe-deep",
+            ),
+            (
+                "folded with keep",
+                "signing_key: >+2\n  a\n  probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            ("tabs", "x_key:\n\ta\n\tprobe-b\nnext: 1\n", "probe-b"),
+            (
+                "mixed tab and space stays open",
+                "    x_key:\n        a\n\tprobe-b\nnext: 1\n",
+                "probe-b",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(!view.contains(hidden), "{sample}: {view:?}");
+            assert!(view.contains("next: 1"), "{sample}: {view:?}");
+        }
+        // the run ends at the first non-blank line at or below the token line's indent
+        let view = mask(
+            FileClass::Plain,
+            "  x_key: |\n    a\n    b\n  public: 1\n    c\n",
+        )
+        .text;
+        assert!(view.contains("public: 1"), "{view:?}");
+        assert!(view.contains("    c"), "{view:?}");
     }
 
     #[test]
@@ -1962,6 +1987,8 @@ mod tests {
             "K_TOKEN=\"open",
             "close\"",
             "K_KEY: |",
+            "- | # API_KEY",
+            "\tdb_password.txt:",
             "  body-secret",
             "    deeper",
             "x: 1",
