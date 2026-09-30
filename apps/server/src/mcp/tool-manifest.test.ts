@@ -304,6 +304,44 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
+  it("all command catalog entries disclose CLI masking and its limits", () => {
+    for (const name of [
+      "forwarder_cli_command_run",
+      "forwarder_cli_supervised_command_start",
+      "forwarder_cli_command_result",
+    ]) {
+      const description = MCP_TOOL_MANIFEST.find((entry) => entry.name === name)?.descriptionNote;
+      for (const phrase of [
+        "secret-name tokens",
+        "scans the terminal-cleaned view",
+        "retain private-key labels across piece boundaries",
+        "recovery unconditionally masks non-blank output until the next blank line",
+        "Normal scanning resumes after the blank unless these protections extend masking",
+        "unmasked lines keep their raw bytes",
+        "Terminal parser state carries across lines",
+        "The server cleanText still runs afterwards",
+        "following non-blank line",
+        "private key blocks",
+        "--api-key/--hf-token",
+        ".huggingface/token",
+        "NOT masked",
+        "not a security boundary",
+        "A line over 64 KiB is masked whole",
+        "inside a live multi-line secret run",
+        "the next non-blank line and subsequent lines indented deeper than column 0 are also protected",
+        "Opaque fallbacks stay closed through EOF",
+        "a PEM marker exceeding the 1 KiB recovery overlap",
+        "more than 1 MiB of live masking-state input",
+        "an over-long line inside such a run",
+        "a cleaned LF inside an overlong terminal group",
+        "including LF executed inside unfinished CSI",
+      ]) {
+        expect(description).toContain(phrase);
+      }
+      expect(description).not.toContain("A line over 64 KiB or more than 1 MiB");
+    }
+  });
+
   it("contains exactly 33 read + 60 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);

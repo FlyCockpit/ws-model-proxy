@@ -1432,7 +1432,7 @@ describe("CLI command tools", () => {
     }
   });
 
-  it("tells the model that other secrets in command output are NOT redacted", async () => {
+  it("discloses the masked output classes and the unsupervised limitation", async () => {
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo, "req-list", PAT_WITH_CLI);
     const handler = createMcpTransport();
@@ -1444,12 +1444,45 @@ describe("CLI command tools", () => {
     const resultTool = body.result?.tools?.find(
       (tool) => tool.name === "forwarder_cli_command_result",
     );
-    expect(run?.description).toContain("NOT redacted");
+    const supervised = body.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_supervised_command_start",
+    );
+    for (const tool of [run, resultTool, supervised]) {
+      for (const phrase of [
+        "private key blocks",
+        "secret-name tokens",
+        "scans the terminal-cleaned view",
+        "retain private-key labels across piece boundaries",
+        "recovery unconditionally masks non-blank output until the next blank line",
+        "Normal scanning resumes after the blank unless these protections extend masking",
+        "unmasked lines keep their raw bytes",
+        "Terminal parser state carries across lines",
+        "The server cleanText still runs afterwards",
+        "following non-blank line",
+        "continuation",
+        "--api-key/--hf-token",
+        ".cache/huggingface/token",
+        "dotenv view",
+        "NOT masked",
+        "not a security boundary",
+        "A line over 64 KiB is masked whole",
+        "inside a live multi-line secret run",
+        "the next non-blank line and subsequent lines indented deeper than column 0 are also protected",
+        "Opaque fallbacks stay closed through EOF",
+        "a PEM marker exceeding the 1 KiB recovery overlap",
+        "more than 1 MiB of live masking-state input",
+        "an over-long line inside such a run",
+        "a cleaned LF inside an overlong terminal group",
+        "including LF executed inside unfinished CSI",
+      ]) {
+        expect(tool?.description).toContain(phrase);
+      }
+      expect(tool?.description).not.toContain("A line over 64 KiB or more than 1 MiB");
+    }
     expect(
       (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
         ?.destructiveHint,
     ).toBe(true);
-    expect(resultTool?.description).toContain("NOT redacted");
     expect(run?.description).toContain('confirm: "RUN"');
     expect(resultTool?.description).not.toContain('confirm: "RUN"');
   });

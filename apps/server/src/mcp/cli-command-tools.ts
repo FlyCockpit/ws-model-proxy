@@ -19,12 +19,8 @@ type CliCommandDeps = {
   credential: McpRequestCredential;
 };
 
-/**
- * Shown on both CLI command tools. Only the wsmp_ credential substrings
- * are removed; other secrets in command output are NOT redacted.
- */
-export const CLI_COMMAND_OUTPUT_NOTICE =
-  "Other secrets in command output are NOT redacted. Only substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed.";
+// All command-tool descriptions share the CLI's masking and server scrubbing notice.
+export { CLI_COMMAND_OUTPUT_NOTICE } from "@ws-model-proxy/config/cli-command-output";
 
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the

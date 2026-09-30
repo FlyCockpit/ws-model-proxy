@@ -403,9 +403,66 @@ backup codes). Projections pick safe fields, a recursive redactor removes
 secret-bearing keys and product credentials under any key, and the serializer
 elides byte values. A test drives every tool with secret-laden results and
 searches the output for every seeded secret value in every encoding. The CLI
-command tools return what a command printed on your own CLI device (behind the
-separate `allowCliCommands` consent); WMP credentials in that text are
-scrubbed, but other device content is returned as printed.
+command tools return a masked copy of what a command printed on your own CLI
+device (behind the separate `allowCliCommands` consent). The CLI masks headless
+stdout/stderr and the shared/review capture of supervised output before it
+leaves the node; the person's encrypted terminal viewer is unchanged.
+
+Masking scans the terminal-cleaned view, including indentation. Terminal parser
+state carries across lines and chunks, including control strings containing LF.
+A line with any mask emits masked cleaned text with CR/LF terminators preserved;
+an unmasked line keeps its raw bytes. Control strings hiding LF are held through
+the next terminal ground-state LF so names cannot be joined after scanning.
+Masked groups spanning hidden LFs emit opaque physical-line markers with their
+CR/LF bytes preserved. The server's `cleanText` still runs afterwards.
+The person's encrypted terminal viewer keeps the original bytes.
+
+The file tools' restartable scanner masks private-key PEM blocks through the
+matching END label (missing or mismatched END stays masked); whole lines with
+secret-name tokens as `⟦redacted line⟧`, the following non-blank line and deeper
+indentation continuation (including blanks within the run); secret flag value
+tails such as `--api-key` / `--hf-token` and their continuation; and every
+non-blank output line when the command text names `.cache/huggingface/token`
+or `.huggingface/token`. Token words are case-insensitive and end in `_TOKEN`,
+`_KEY`, `_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `api_key`, `hf-token` or
+`hf_token`, or equal `PASSWORD`. Open quotes/backslashes on token/value lines
+continue until a blank line. Printed dotenv-style token lines are masked whole;
+`KEY=⟦redacted:N⟧` applies only to the file tools' dotenv view.
+
+Each normal line is scanned once, held until a terminal ground-state LF or
+EOF/completion, with at most
+64 KiB held per stream and no filesystem access. An overlong line is scanned
+in bounded pieces with retained private-key labels and overlap across piece boundaries,
+and masked whole, never emitting a prefix or unbroken token tail. When the overlong line begins inside a live multi-line
+secret run — an open private-key PEM block, an open quote or backslash
+continuation, an indentation run from the output itself — that run's remaining output is opaque through
+EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
+masks the lines that follow. Otherwise, at its terminating LF a fresh scanner is
+primed with every unclosed private-key BEGIN label from that line and an
+unconditional until-blank opener. Every non-blank output line stays masked until
+the next blank line, including output after an overlong public line or closed
+quote. (The recovery's own synthetic guard is exempt: a second overlong line right after it recovers again, masking at least as much.) A matching END closes the corresponding carried PEM block.
+Recovery also treats that line as a column-0 secret-name token line: the next
+non-blank line is masked whole, and subsequent lines indented deeper than column
+0 stay masked. Blank lines do not consume the next-line protection; PEM and other
+opener detection still run on protected lines. Normal scanning resumes after
+the blank unless PEM, indentation, or next-value protection extends masking. CR/LF
+bytes are preserved. Opaque fallbacks stay closed through EOF: more than
+1 MiB of input contributing live masking state bounds PEM/indentation state, and
+an over-long line inside a live run fails closed instead of dropping the opener.
+A PEM marker exceeding the 1 KiB recovery overlap on an overlong line stays
+opaque through EOF, since its exact label cannot safely be reconstructed.
+A cleaned LF inside an overlong terminal group, including LF executed inside
+unfinished CSI, also makes the remaining stream opaque through EOF.
+The latency bound is in bytes; a silent
+process has no wall-clock flush deadline. Invalid UTF-8 passes through when its
+cleaned lossy scan finds no mask. EOF flushes partial output; teardown flushes exec tails or
+discards unshared capture. Masking precedes the 8 KiB head / 40 KiB tail cuts,
+and `output_bytes`/stream totals count masked bytes. WMP credentials are still
+scrubbed by the server. Other secrets (vendor tokens, JWTs, cloud credentials)
+are returned as printed, and on an `unsupervised` node this masking is not a
+security boundary. The threat model is accidental disclosure, not crafted evasion.
+
 Three independent switches gate each command (the token, the device's dashboard
 grant and the CLI's own config); see [CLI command switches](cli-command-switches.md).
 

@@ -8,9 +8,12 @@
  */
 
 /**
- * Per-stream view the model sees. `totalBytes` is the full stream count.
+ * Per-stream view the model sees. `totalBytes` counts CLI-masked bytes before
+ * head/tail retention (not the original command's raw byte count).
  * `text` is lossy UTF-8 of the retained head and tail, with credential
- * substrings removed. Other secrets are not redacted.
+ * substrings removed. The CLI masks private-key blocks, secret-name token lines
+ * and their continuation, secret flag values and HF token file output first.
+ * Other secrets are not masked; the terminal viewer still sees raw output.
  */
 export type CliStreamText = {
   text: string;
@@ -24,6 +27,10 @@ export type BoundedByteView = {
   tail: Uint8Array;
   totalBytes: number;
 };
+
+/** Shared command-tool notice; CLI masking is accidental-disclosure protection. */
+export const CLI_COMMAND_OUTPUT_NOTICE =
+  "Before command output leaves the node, the CLI scans the terminal-cleaned view and masks private key blocks (through the matching END label), whole lines containing secret-name tokens and the following non-blank line plus indentation/quote/backslash continuation, secret flag value tails (--api-key/--hf-token-style flags), and output from commands naming .cache/huggingface/token or .huggingface/token. Token lines use ⟦redacted line⟧; KEY=⟦redacted:N⟧ is only the file tools' dotenv view. A line over 64 KiB is masked whole and scanned in bounded pieces that retain private-key labels across piece boundaries; when it sits inside a live multi-line secret run (an open private-key block, quote or indentation continuation) that run's remaining output fails closed through EOF like the 1 MiB case. Otherwise, at its terminating LF recovery unconditionally masks non-blank output until the next blank line. Private key blocks still close at their matching END label; the next non-blank line and subsequent lines indented deeper than column 0 are also protected, and blank lines do not consume the next-line protection. Normal scanning resumes after the blank unless these protections extend masking. Opaque fallbacks stay closed through EOF: more than 1 MiB of live masking-state input, an over-long line inside such a run, a PEM marker exceeding the 1 KiB recovery overlap on an overlong line, or a cleaned LF inside an overlong terminal group (including LF executed inside unfinished CSI). Masked lines emit masked cleaned text with CR/LF terminators preserved; unmasked lines keep their raw bytes. Terminal parser state carries across lines; control strings hiding LF are held through a terminal ground-state LF, and masked groups spanning hidden LFs use opaque physical-line markers with CR/LF preserved. The server cleanText still runs afterwards. The person's terminal viewer is unchanged; shared/review output and byte totals are masked. Other secrets (vendor tokens such as ghp_ or sk-, JWTs, cloud credentials) are NOT masked. The server also removes substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters. On an unsupervised node masking is not a security boundary: a command can print a secret in an unrecognized form.";
 
 /** First bytes retained per stream (the runtime cap). */
 export const CLI_STREAM_HEAD_MAX_BYTES = 8192;

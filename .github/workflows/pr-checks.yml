@@ -582,7 +582,7 @@ jobs:
               git grep -nE 'DATABASE_URL[[:space:]]*=[[:space:]]*postgres(ql)?://[^[:space:]]+:[^[:space:]@]+@' -- \
                 ':!*.example' ':!.env.docker.defaults' ':!docker-compose.agent.yml' ':!*.md' ':!CLAUDE.md' ':!.cursorrules' || true
               git grep -nE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' -- \
-                ':!*.example' ':!.env.docker.defaults' || true
+                ':!*.example' ':!.env.docker.defaults' ':!apps/cli/tests/fixtures/masking/**' || true
             } | grep -v 'generateValue: true' || true
           )"
           if [ -n "$matches" ]; then
