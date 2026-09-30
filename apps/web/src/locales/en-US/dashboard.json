@@ -1009,6 +1009,33 @@
       "summary": "Protected share: {{protection}} · Queue priority: {{priority}}",
       "saved": "Routing settings saved.",
       "failed": "Could not save the routing settings."
+    },
+    "engineLoad": {
+      "title": "Live engine load",
+      "description": "Engines that report load (llama.cpp, vLLM, SGLang) can mark a member FULL from what they see right now, including traffic that bypasses the proxy. It only adds to FULL: capacity counts stay authoritative, a stale reading is ignored, and when every member is FULL requests are still served.",
+      "use": "Use engine load",
+      "saved": "Engine load setting saved",
+      "saveFailed": "Could not save the engine load setting.",
+      "badges": {
+        "off": "Engine load ignored",
+        "noSignal": "No engine signal",
+        "stale": "Load stale",
+        "clear": "Engine has room"
+      },
+      "states": {
+        "full_waiting": "Engine FULL: requests waiting",
+        "full_kv": "Engine FULL: KV cache nearly full",
+        "full_slots": "Engine FULL: all slots busy",
+        "full_deferred": "Engine FULL: requests deferred"
+      },
+      "running_one": "{{count}} running",
+      "running_other": "{{count}} running",
+      "waiting_one": "{{count}} waiting",
+      "waiting_other": "{{count}} waiting",
+      "kv": "KV {{value}}",
+      "slots": "{{busy}}/{{total}} slots",
+      "prefixHit": "prefix hits {{value}}",
+      "noReading": "No reading from the engine yet."
     }
   },
   "relay": {

@@ -754,6 +754,19 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.setPoolRoutingRules),
   },
   {
+    name: "forwarder_pool_member_engine_load_set",
+    target: "forwarderManagement.setPoolMemberEngineLoad",
+    scope: "write",
+    confirmation: "RUN",
+    // Engine-load FULL can send `:external` callers to paid external providers.
+    classification: "cost",
+    descriptionNote:
+      "{poolMemberId, mode: 'auto'|'off', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. Read the live load with forwarder_pool_routing_rules_get.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setPoolMemberEngineLoad,
+    ),
+  },
+  {
     name: "forwarder_device_metric_sources_set",
     target: "forwarderManagement.setCliDeviceMetricSources",
     scope: "write",
@@ -1224,8 +1237,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 29 read tools and 54 write tools
- * (78 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 29 read tools and 55 write tools
+ * (79 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
   buildDescriptor,
