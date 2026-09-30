@@ -298,7 +298,9 @@ export function judgeCliAgentAdmission(
         live.fileOps === true,
       roots: live?.fileRootsConfigured === true,
     };
-    const grantAccess = fileToolAccess(grant, opClass, readGrant);
+    // The dashboard stage judges only the server-side part of the read grant, so an
+    // offline, old-protocol or CLI-side refusal is not misreported as the dashboard's.
+    const grantAccess = fileToolAccess(grant, opClass, { ...readGrant, live: true, roots: true });
     if (grantAccess !== "headless") {
       return { ok: false, error: fileAccessRefusal(grantAccess, "grant") };
     }

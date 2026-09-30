@@ -3471,15 +3471,19 @@ mod relay_28_vectors {
         }
         // The wire refusal reasons `FileRelay::refuse` emits must be inside this
         // set; `file-rejected-grant-disabled` covers `admit`'s third branch.
-        for reason in crate::file_relay::WIRE_REFUSAL_REASONS {
-            let message = ClientControlMessage::FileRejected {
-                op_id: str_field(&vector("file-rejected-bad-frame"), "opId"),
-                reason: reason.to_string(),
-                detail: None,
-            };
-            let as_value: Value =
-                serde_json::from_str(&encode_control(&message).expect("encode")).expect("json");
-            assert_eq!(as_value["reason"], reason);
+        // `file_relay` exists on unix only.
+        #[cfg(unix)]
+        {
+            for reason in crate::file_relay::WIRE_REFUSAL_REASONS {
+                let message = ClientControlMessage::FileRejected {
+                    op_id: str_field(&vector("file-rejected-bad-frame"), "opId"),
+                    reason: reason.to_string(),
+                    detail: None,
+                };
+                let as_value: Value =
+                    serde_json::from_str(&encode_control(&message).expect("encode")).expect("json");
+                assert_eq!(as_value["reason"], reason);
+            }
         }
     }
 

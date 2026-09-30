@@ -60,6 +60,7 @@ describe("settings locale key parity (en-US / es-MX)", () => {
       "tokens.allowCliFileReadHelp",
       "tokens.allowCliCommandsHelp",
       "tokens.allowCliCommandsBadge",
+      "tokens.allowCliFileReadBadge",
       "tokens.allowCliCommandsNoExpiryWarning",
       "tokens.cliDevicesTitle",
       "tokens.cliDevicesHelp",

@@ -352,6 +352,7 @@ const REFUSED_BY_CLI_CODES: ReadonlySet<string> = new Set([
   "unsupported",
   "limit",
   "supervised_only",
+  "grant_disabled",
   "feature_disabled",
 ]);
 

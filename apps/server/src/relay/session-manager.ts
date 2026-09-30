@@ -2293,7 +2293,13 @@ export class RelaySessionManager {
         relayProtocolAtLeast(session.protocolVersion, "2.8"),
       roots: session.features?.fileRootsConfigured === true,
     };
-    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass, readGrant);
+    // Dashboard stage: only the server-side part of the read grant (the live and
+    // roots parts belong to the CLI stage below and map to `feature_disabled`).
+    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass, {
+      ...readGrant,
+      live: true,
+      roots: true,
+    });
     if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
     const liveAccess = fileToolAccess(
       session.features?.mcpCommandMode ?? "off",

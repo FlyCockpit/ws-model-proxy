@@ -314,6 +314,7 @@ describe("McpTokensPanel CLI commands", () => {
     const user = userEvent.setup();
     renderPanel();
     expect(await screen.findByText("settings:mcp.tokens.allowCliCommandsBadge")).toBeTruthy();
+    expect(screen.queryByText("settings:mcp.tokens.allowCliFileReadBadge")).toBeNull();
     await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(within(dialog).getByLabelText("settings:mcp.tokens.name"), "Grok laptop");
@@ -1113,6 +1114,7 @@ describe("read-only file token consent", () => {
     ];
     const user = userEvent.setup();
     renderPanel(false);
+    expect(await screen.findByText("settings:mcp.tokens.allowCliFileReadBadge")).toBeTruthy();
     await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
     const dialog = screen.getByRole("dialog");
     const checkbox = within(dialog).getByRole("checkbox", {

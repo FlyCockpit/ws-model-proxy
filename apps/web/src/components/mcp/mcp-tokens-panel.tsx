@@ -518,6 +518,11 @@ export function McpTokensPanel({
                             {t("settings:mcp.tokens.allowCliCommandsBadge")}
                           </span>
                         ) : null}
+                        {token.allowCliFileRead === true ? (
+                          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            {t("settings:mcp.tokens.allowCliFileReadBadge")}
+                          </span>
+                        ) : null}
                       </div>
                       <code className="mt-1 block font-mono text-xs break-all text-muted-foreground">
                         {token.lookupPrefix}…

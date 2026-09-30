@@ -41,6 +41,7 @@
       "allowCliCommands": "Allow CLI commands",
       "allowCliCommandsHelp": "Lets this token run shell commands on your CLIs through MCP. Requires write access.",
       "allowCliCommandsBadge": "CLI commands",
+      "allowCliFileReadBadge": "CLI file read",
       "allowCliCommandsNoExpiryWarning": "This token never expires and can run commands on your CLIs. Prefer an expiry, or revoke it when you no longer need it.",
       "expiryLabel": "Expiry",
       "expiryHelp": "Expiry can be at most 365 days from now. Tokens without expiry stay valid until you revoke them.",

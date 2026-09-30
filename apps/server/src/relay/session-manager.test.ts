@@ -2040,6 +2040,58 @@ describe("relay terminal and exec sessions", () => {
     });
   });
 
+  it("persists the read switch and the roots report separately", async () => {
+    const manager = new RelaySessionManager();
+    const frame = JSON.parse(helloCli()) as {
+      cli: { capabilities: { features: Record<string, unknown> } };
+    };
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = false;
+    await register(manager, new FakeSocket(), JSON.stringify(frame));
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          reportedMcpFileRead: true,
+          reportedFileRoots: false,
+        }),
+      }),
+    );
+  });
+
+  it("takes the dashboard read grant from the hello registration and from a grant change", async () => {
+    db.cliDevice.upsert.mockResolvedValue({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: true,
+      connectionGeneration: 1,
+    });
+    const manager = new RelaySessionManager();
+    const frame = JSON.parse(helloCli()) as {
+      cli: { capabilities: { features: Record<string, unknown> } };
+    };
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = true;
+    const socket = await register(manager, new FakeSocket(), JSON.stringify(frame));
+    // Straight after the hello, with no applyFeatureGrants call: reads pass, writes do not.
+    expect(manager.fileOpModeRefusal("cli-device-id", "read")).toBeNull();
+    expect(manager.fileOpModeRefusal("cli-device-id", "write")).toBe("grant_disabled");
+    // The dashboard revokes: the refreshed row reaches the live session.
+    (
+      prisma as unknown as { cliDevice: { findUnique: MockInstance } }
+    ).cliDevice.findUnique.mockResolvedValue({
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: false,
+      remoteMetricSources: [],
+    });
+    await manager.onCliFeatureGrantsChanged("cli-device-id");
+    expect(manager.fileOpModeRefusal("cli-device-id", "read")).toBe("grant_disabled");
+    expect(socket.closes).toEqual([]);
+  });
+
   it("reports fileOps live only when the 2.8 hello's own capability says so", async () => {
     // The live snapshot ANDs `protocolVersion >= 2.8` with the hello's own
     // `capabilities.fileOps`. A real 2.8 hello pins fileOps true (the strict

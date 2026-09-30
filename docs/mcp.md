@@ -128,7 +128,7 @@ The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
 and live `fileRootsConfigured`; missing or stale features never authorize it.
 
 | Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
-| --- | --- | --- | --- | --- |
+| --- | --- | --- | --- |
 | `unsupervised` | either | headless | headless |
 | `supervised` | on | headless | refused `supervised_only` |
 | `supervised` | off | refused `supervised_only` | refused `supervised_only` |

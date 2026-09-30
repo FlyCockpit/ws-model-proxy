@@ -313,7 +313,11 @@ describe("cli file ops", () => {
                 ? null
                 : mode === "supervised"
                   ? "supervised_only"
-                  : "grant_disabled";
+                  : // Off: the dashboard grant is what refuses without it; with it, the missing
+                    // CLI switch or roots is the CLI's own config.
+                    server && op === "read"
+                    ? "feature_disabled"
+                    : "grant_disabled";
             readGrantMatrix.push({ mode, server, live, roots, op, code });
           }
   it.each(readGrantMatrix)(
@@ -395,10 +399,29 @@ describe("cli file ops", () => {
       );
       await expect(start(socket, "read", readArgs)).resolves.toEqual({
         ok: false,
-        code: "grant_disabled",
+        code: "feature_disabled",
       });
       expect(socket.frames("file.op")).toEqual([]);
     });
+
+    it.each(["OFF", "SUPERVISED"] as const)(
+      "a granted read on a %s device blames the CLI's absence, not the dashboard",
+      async (grant) => {
+        db.cliDevice.findUnique.mockImplementation(deviceRow(grant, { mcpFileRead: true }));
+        await expect(
+          runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+        ).resolves.toEqual({ ok: false, code: "offline" });
+        db.cliDevice.findUnique.mockImplementation(
+          deviceRow(grant, { mcpFileRead: true, rejectedRelayProtocolVersion: "2.7" }),
+        );
+        await expect(
+          runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+        ).resolves.toMatchObject({
+          ok: false,
+          code: "upgrade_required",
+        });
+      },
+    );
 
     it("the dispatch gate re-checks roots on the session even when admission passed", async () => {
       db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: true }));
@@ -948,7 +971,7 @@ describe("cli file ops", () => {
 
     it("records the CLI's own supervised_only refusal as refused and its cancelled as cancelled", async () => {
       const socket = await connect();
-      for (const reason of ["supervised_only", "cancelled"]) {
+      for (const reason of ["supervised_only", "grant_disabled", "cancelled"]) {
         const outcome = start(socket, "read", readArgs);
         await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
         await answer(
@@ -959,7 +982,8 @@ describe("cli file ops", () => {
         socket.sends.length = 0;
       }
       expect(events()[0]).toMatchObject({ outcome: "refused", reason: "supervised_only" });
-      expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
+      expect(events()[1]).toMatchObject({ outcome: "refused", reason: "grant_disabled" });
+      expect(events()[2]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {
