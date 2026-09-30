@@ -29,7 +29,10 @@ type Db = typeof prisma;
 
 // Bound Prisma relation assembly and multi-row insert parameter construction.
 // All batches belong to the same fenced transaction and admission snapshot.
-const ADMISSION_ROW_BATCH_SIZE = 500;
+// The lease INSERT binds 13 array parameters plus 3 scalars per statement
+// (arrays travel as one parameter each), so the batch size bounds array length
+// and statement duration, not the bind-parameter count.
+export const ADMISSION_ROW_BATCH_SIZE = 500;
 
 export { isRetryableCapacityTransactionError };
 

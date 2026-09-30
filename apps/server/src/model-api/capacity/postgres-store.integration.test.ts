@@ -3062,10 +3062,25 @@ integration("PostgreSQL cache-holder spill-over and grant-time routability", () 
       expect(elapsed).toBeLessThan(10_000);
       const leases = await db.capacityLease.findMany({
         where: { capacityId: member.capacityId, state: "ACTIVE" },
-        select: { fencingToken: true },
+        select: { fencingToken: true, acquiredAt: true, heartbeatAt: true, expiresAt: true },
       });
       expect(leases).toHaveLength(count);
       expect(new Set(leases.map((lease) => lease.fencingToken)).size).toBe(count);
+      // M-1: a swapped heartbeatAt/expiresAt would make every new lease
+      // instantly stale (expiresAt = now), so heartbeat's
+      // `expiresAt > clock_timestamp()` guard rejects renewals and the lease
+      // dies at 30 s. Pin the column relationship on every row: heartbeatAt is
+      // the acquisition instant, expiresAt is one 30 s TTL later, and
+      // acquiredAt defaults to the insert's now.
+      for (const lease of leases) {
+        expect(lease.expiresAt.getTime() - lease.heartbeatAt.getTime()).toBe(30_000);
+        expect(lease.expiresAt.getTime()).toBeGreaterThan(lease.acquiredAt.getTime());
+        // heartbeatAt is the statement clock, acquiredAt the transaction
+        // start; they land in the same window, not necessarily equal.
+        expect(Math.abs(lease.heartbeatAt.getTime() - lease.acquiredAt.getTime())).toBeLessThan(
+          5_000,
+        );
+      }
       expect(
         await db.admissionRequest.count({ where: { userId: fixture.user.id, state: "ADMITTED" } }),
       ).toBe(count);
