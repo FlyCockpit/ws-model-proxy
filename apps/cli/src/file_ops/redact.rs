@@ -482,6 +482,18 @@ fn construct_after_name(line: &str, end: usize) -> Construct {
     construct_for_tail(tail, colon, indent_of(line), quote_left_open(line))
 }
 
+/// Whether `before` (the text before a colon) is a YAML/JSON-style key: an optional
+/// list dash, then an identifier-like word, possibly quoted.
+fn key_like(before: &str) -> bool {
+    let word = before.trim();
+    let word = word.strip_prefix("- ").unwrap_or(word).trim();
+    let word = word.trim_matches(['"', '\'']);
+    !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 /// One secret flag candidate: where its masked tail starts and what it opens.
 type Candidate = (usize, Construct);
 
@@ -575,12 +587,18 @@ fn continuation_value(line: &str) -> Option<(Range<usize>, Construct)> {
     if value_is_public(without_continuation(value)) {
         return None;
     }
+    // a list item that is a block-scalar header (`- >-`) continues on the next lines
+    let block_item = BLOCK_SCALAR.is_match(value);
     Some((
         start..end.max(start),
         construct_for_tail(
             &line[start..],
-            false,
-            indent_of(line),
+            block_item,
+            if block_item {
+                trimmed_start
+            } else {
+                indent_of(line)
+            },
             quote_left_open(line),
         ),
     ))
@@ -880,14 +898,16 @@ impl LineMasker {
                     // the line after a token line is the value's line (`value: |` after
                     // `name: API_KEY`): a multi-line value that it opens goes on to a
                     // structural end (blank line, dedent), like a value on the token line
+                    // a `key:` whose key is identifier-like opens a YAML block; any other
+                    // colon (`for x in y:`, `def main():`) is code, not a value header
                     construct = match line.find(':') {
-                        Some(colon) => construct_for_tail(
+                        Some(colon) if key_like(&line[..colon]) => construct_for_tail(
                             &line[colon + 1..],
                             true,
                             indent_of(line),
                             quote_left_open(line),
                         ),
-                        None => {
+                        _ => {
                             construct_for_tail(line, false, indent_of(line), quote_left_open(line))
                         }
                     };
@@ -1124,6 +1144,32 @@ mod tests {
             }
             assert!(view.contains(visible), "{sample}: {view:?}");
         }
+    }
+
+    /// A colon that is not a `key:` header on the line after a token line (Python
+    /// `for`/`def`, prose `Usage:`) does not open a block: only the next line is masked.
+    #[test]
+    fn code_after_a_token_line_is_not_swallowed_by_a_value_block() {
+        for input in [
+            "headers = {\"Authorization\": f\"Bearer {API_KEY}\"}\nfor attempt in range(3):\n    time.sleep(2 ** attempt)\n",
+            "OPENAI_API_KEY = os.environ[\"OPENAI_API_KEY\"]\ndef main():\n    run_public_code()\n",
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(
+                view.contains("time.sleep") || view.contains("run_public_code"),
+                "{view:?}"
+            );
+        }
+        // a secret flag whose value is a block-scalar list item keeps the value masked
+        let view = mask(
+            FileClass::Plain,
+            "args:\n  - --api-key\n  - >-\n    flag-value-one\nnext: 1\n",
+        )
+        .text;
+        assert!(
+            !view.contains("flag-value-one") && view.contains("next: 1"),
+            "{view:?}"
+        );
     }
 
     #[test]
@@ -1730,6 +1776,13 @@ mod tests {
             "_key".repeat(200_000),
             "password".repeat(100_000),
             "a_tokenb".repeat(100_000),
+            // thousands of distinct private-key labels on one line, then many short lines
+            {
+                let markers: String = (0..18_000)
+                    .map(|i| format!("-----BEGIN {i}PRIVATE KEY-----"))
+                    .collect();
+                format!("{markers}\n{}", "x\n".repeat(250_000))
+            },
         ];
         for text in &corpora {
             for class in [FileClass::Plain, FileClass::Dotenv] {
