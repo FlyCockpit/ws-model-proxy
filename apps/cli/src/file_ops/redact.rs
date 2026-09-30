@@ -674,6 +674,9 @@ pub struct LineMasker {
     blocks: Vec<OpenBlock>,
     /// The previous line contained a secret-name token (one line of scope).
     pending_token_line: bool,
+    /// Offset of the previous line when it was a token line: the run it opened
+    /// survives the always-masked next line, even at the same indentation.
+    token_at: Option<usize>,
     /// Offset of the next line when the caller does not supply one.
     next_at: usize,
     long_run: bool,
@@ -694,6 +697,7 @@ impl LineMasker {
             until_blank: None,
             blocks: Vec::new(),
             pending_token_line: false,
+            token_at: None,
             next_at: 0,
             long_run: false,
         }
@@ -750,8 +754,11 @@ impl LineMasker {
         } else {
             let indent = indent_of(line);
             let kinds = indent_kinds(line);
-            self.blocks
-                .retain(|block| block.indent < indent || mixed_indent(block.ws, kinds));
+            self.blocks.retain(|block| {
+                block.indent < indent
+                    || mixed_indent(block.ws, kinds)
+                    || Some(block.opener) == self.token_at
+            });
             masked_by = self
                 .blocks
                 .iter()
@@ -788,6 +795,7 @@ impl LineMasker {
         masked_by = masked_by.max(pem_opener);
         // 2. the line's own rules and openers, always (union semantics)
         let (masks, opened) = self.scan_body(line);
+        self.token_at = self.pending_token_line.then_some(at);
         if let Some(opener) = masked_by
             && at.saturating_sub(opener) > self.lookback
         {
@@ -799,7 +807,9 @@ impl LineMasker {
                 Construct::None => {}
                 Construct::UntilBlank => self.until_blank = Some(at),
                 Construct::Block { line_indent } => {
-                    self.blocks.retain(|block| block.indent != line_indent);
+                    let kinds = indent_kinds(line);
+                    self.blocks
+                        .retain(|block| block.indent != line_indent || block.ws != kinds);
                     self.blocks.push(OpenBlock {
                         indent: line_indent,
                         ws: indent_kinds(line),
@@ -906,6 +916,11 @@ impl LineMasker {
                 }
                 if self.pending_token_line && !line.trim().is_empty() {
                     masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
+                    // a value that opens a quote or ends in a backslash runs on to the
+                    // next blank line (`value = """`, `VALUE="a` )
+                    if line.trim_end().ends_with('\\') || quote_left_open(line) {
+                        constructs.push(Construct::UntilBlank);
+                    }
                 }
                 self.pending_token_line = false;
             }
@@ -1141,19 +1156,41 @@ mod tests {
         }
     }
 
-    /// A colon that is not a `key:` header on the line after a token line (Python
-    /// `for`/`def`, prose `Usage:`) does not open a block: only the next line is masked.
+    /// The structural rule masks code indented under the line after a token line
+    /// (accepted over-masking) and ends at the next line at the token line's
+    /// indentation; a name/value pair with a same-indent block value stays masked.
     #[test]
-    fn code_after_a_token_line_is_not_swallowed_by_a_value_block() {
-        for input in [
-            "headers = {\"Authorization\": f\"Bearer {API_KEY}\"}\nfor attempt in range(3):\n    time.sleep(2 ** attempt)\n",
-            "OPENAI_API_KEY = os.environ[\"OPENAI_API_KEY\"]\ndef main():\n    run_public_code()\n",
+    fn value_runs_after_a_token_line_follow_indentation_and_quotes() {
+        for (sample, input, hidden) in [
+            (
+                "python loop body",
+                "headers = {\"A\": f\"Bearer {API_KEY}\"}\nfor attempt in range(3):\n    probe-body\nvisible()\n",
+                "probe-body",
+            ),
+            (
+                "same-indent block value",
+                "name: API_KEY\nvalue: |\n  probe-b1\n  probe-b2\nvisible: 1\n",
+                "probe-b2",
+            ),
+            (
+                "list item with other first key",
+                "parameters:\n  - description: db\n    name: DB_PASSWORD\n    value: |\n      probe-c1\n      probe-c2\nvisible: 1\n",
+                "probe-c2",
+            ),
+            (
+                "triple-quoted value line",
+                "cfg = dict(\n    name=\"API_KEY\",\n    value=\"\"\"\nprobe-d1\nprobe-d2\n\"\"\",\n)\n\nvisible = 1\n",
+                "probe-d2",
+            ),
+            (
+                "open quote on the value line",
+                "NAME=DB_PASSWORD\nVALUE=\"probe-f1\nprobe-f2\nprobe-f3\"\n\nvisible = 1\n",
+                "probe-f3",
+            ),
         ] {
             let view = mask(FileClass::Plain, input).text;
-            assert!(
-                view.contains("time.sleep") || view.contains("run_public_code"),
-                "{view:?}"
-            );
+            assert!(!view.contains(hidden), "{sample}: {view:?}");
+            assert!(view.contains("visible"), "{sample}: {view:?}");
         }
         // a secret flag whose value is a block-scalar list item keeps the value masked
         let view = mask(

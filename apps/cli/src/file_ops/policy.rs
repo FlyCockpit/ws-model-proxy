@@ -226,9 +226,11 @@ fn physical(path: &Path) -> PathBuf {
             // the unresolved suffix is applied lexically: a `..` removes the missing
             // name before it (or, with none left, the real directory's parent)
             let mut pending: Vec<std::path::Component> = Vec::new();
+            let mut collapsed = false;
             for component in rest.iter().rev() {
                 match component {
                     std::path::Component::ParentDir => {
+                        collapsed = true;
                         if pending.pop().is_none() {
                             out.pop();
                         }
@@ -238,7 +240,9 @@ fn physical(path: &Path) -> PathBuf {
                 }
             }
             out.extend(pending.iter().map(|c| c.as_os_str()));
-            return out;
+            // the collapsed path can now run through a symlink: resolve it again (it
+            // holds no `..`, so this ends)
+            return if collapsed { physical(&out) } else { out };
         }
         match (base.parent(), base.components().next_back()) {
             (Some(parent), Some(last)) => {
@@ -328,6 +332,17 @@ mod tests {
             aliases.iter().any(|p| p.path == want),
             "{aliases:?} lacks {want:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_after_a_collapsed_dotdot_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
+        let configured = root.join("missing/../link/f");
+        assert_eq!(physical(&configured), root.join("real/sub/f"));
     }
 
     #[test]
