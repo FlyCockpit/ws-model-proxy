@@ -111,7 +111,10 @@ function buildValidator(spec: McpInputSchemaSpec): z.ZodType {
   for (const [field, message] of Object.entries(spec.forbiddenInputs ?? {})) {
     shape[field] = z.never(message).optional();
   }
-  if (spec.confirmation !== null) shape.confirm = z.literal(spec.confirmation);
+  // An advisory-shape tool checks its confirmation in the wrapper (which audits the refusal).
+  if (spec.confirmation !== null && spec.shapeIsAdvisory !== true) {
+    shape.confirm = z.literal(spec.confirmation);
+  }
   return withInputSizeBound(z.looseObject(shape), spec.maxInputBytes);
 }
 

@@ -45,6 +45,7 @@ import {
   runForwarderCliSupervisedCommandStart,
 } from "./cli-command-tools.js";
 import {
+  auditFileInputRefusal,
   FILE_TOOL_NOTES,
   FILE_TOOLS,
   type FileToolName,
@@ -126,6 +127,16 @@ export interface McpToolDescriptor {
    * Extra sentence appended to the generated tool description.
    */
   descriptionNote?: string;
+  /**
+   * Called when a call to this tool is refused before its core runs (the SDK
+   * validator rejected the input, or the confirmation literal is missing), so
+   * the refusal can be audited. Metadata only: it receives the raw input and
+   * the verified user and credential, never a device it could trust.
+   */
+  auditInputRefusal?: (
+    input: unknown,
+    who: { userId: string; credential: McpRequestCredential },
+  ) => void;
   /**
    * Deliver the core's result even if the admission signal aborts. CLI
    * command run uses this: abort ends the wait, not the command, and the
@@ -435,6 +446,7 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
     coreShape: fileToolCoreShape(name),
     // The core enforces the strict shape: refusals are audited and name the field.
     shapeIsAdvisory: true,
+    auditInputRefusal: (input, who) => auditFileInputRefusal(op, input, who),
     ...(op === "write" ? { maxInputBytes: FILE_WRITE_INPUT_MAX_BYTES } : {}),
     invokeCore: (input, deps) => runForwarderCliFileTool(op, input, deps),
     outputProjector: projectFileToolOutput,

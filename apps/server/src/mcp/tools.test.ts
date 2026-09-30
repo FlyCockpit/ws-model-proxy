@@ -2297,6 +2297,24 @@ describe("CLI file tools", () => {
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 
+  it("audits missing confirmation and oversized input through the real SDK transport (#104)", async () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["forwarder_cli_file_delete", { cliDeviceId: "cli-1", path: "~/a" }],
+      ["forwarder_cli_file_delete", { cliDeviceId: "cli-1", path: "~/a", confirm: "NOPE" }],
+      ["forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", pad: "x".repeat(70_000) }],
+    ];
+    for (const [name, args] of cases) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk-c", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, name, args);
+      const failed = body.result?.isError === true || body.error !== undefined;
+      expect(failed).toBe(true);
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
   it("names the failing fields of an invalid input without echoing values (#117)", async () => {
     const cases: Array<[Record<string, unknown>, RegExp, string]> = [
       [{ path: "~/a", surprise: "SECRET-VALUE-XYZ" }, /Unrecognized field/, "(input)"],

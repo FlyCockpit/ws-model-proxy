@@ -368,7 +368,13 @@ function rejectionFailure(
   // was made, so the outcome is unknown and the agent must file_stat first.
   // Ops whose cleanup runs after the commit can also fail with `not_found`
   // (the source vanished): for rename and delete that code is ambiguous.
-  if (mutating && (reason === "io_error" || (ambiguousNotFound && reason === "not_found"))) {
+  // A `replaced` conflict on a mutation can also follow a committed exchange
+  // whose undo failed, so it is not definitive either.
+  const replacedConflict = reason === "conflict" && detail?.currentEtag === "replaced";
+  if (
+    mutating &&
+    (reason === "io_error" || replacedConflict || (ambiguousNotFound && reason === "not_found"))
+  ) {
     return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
   }
   if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });

@@ -213,7 +213,15 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
       {
         title: descriptor.name,
         description: toolDescription(descriptor),
-        inputSchema: descriptor.inputSchema,
+        inputSchema:
+          descriptor.auditInputRefusal !== undefined && dispatch !== undefined
+            ? auditRefusals(descriptor.inputSchema, (input) =>
+                descriptor.auditInputRefusal?.(input, {
+                  userId: dispatch.orpcContext.session.user.id,
+                  credential: dispatch.credential ?? { kind: "oauth" },
+                }),
+              )
+            : descriptor.inputSchema,
         annotations: {
           readOnlyHint: descriptor.scope === "read",
           destructiveHint:
@@ -229,6 +237,39 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
         runManifestTool(descriptor, { dispatch, scopes, client, args }),
     );
   }
+}
+
+/**
+ * The same input schema, reporting every refusal to `onRefused` with the raw
+ * input (SDK validation runs before any tool code, so this is the only place a
+ * refused file call can be audited). Validation itself is unchanged.
+ */
+function auditRefusals(
+  schema: StandardSchemaWithJSON,
+  onRefused: (input: unknown) => void,
+): StandardSchemaWithJSON {
+  const standard = schema["~standard"];
+  const report = (input: unknown, result: { issues?: unknown }) => {
+    if (result.issues !== undefined) {
+      try {
+        onRefused(input);
+      } catch {
+        // Auditing never changes the validation outcome.
+      }
+    }
+    return result;
+  };
+  return {
+    "~standard": {
+      ...standard,
+      validate: (input: unknown, options?: never) => {
+        const result = standard.validate(input, options);
+        return result instanceof Promise
+          ? result.then((resolved) => report(input, resolved))
+          : report(input, result);
+      },
+    },
+  } as StandardSchemaWithJSON;
 }
 
 function toolDescription(descriptor: McpToolDescriptor): string {
@@ -315,6 +356,10 @@ export async function runManifestTool(
     mcpSanitizedLog("tool call denied: missing confirmation", {
       toolName: descriptor.name,
       requestId,
+    });
+    descriptor.auditInputRefusal?.(argsRecord, {
+      userId: dispatch.orpcContext.session.user.id,
+      credential,
     });
     return confirmationRequiredError(descriptor);
   }

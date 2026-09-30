@@ -161,8 +161,9 @@ additionally removes `wsmp_` credential substrings from every returned string.
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
-and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`:
-re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
+and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`
+(an etag, or the word `replaced` or `gone` when the file was swapped or removed; on a
+write-class call `replaced` is reported as `outcome: "unknown"`): re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
 when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
 fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
 `token_inactive`, a mode change, `io_error`, or `not_found` on rename and delete): call
