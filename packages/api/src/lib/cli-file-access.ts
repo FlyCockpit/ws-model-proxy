@@ -1,4 +1,4 @@
-import type { McpCommandModeName } from "./mcp-command-mode";
+import { lowestMcpCommandMode, type McpCommandModeName } from "./mcp-command-mode";
 
 /** One file verdict for admission, dispatch, cancellation and summaries.
  * Read grants require both explicit opt-ins and live usable roots. The CLI
@@ -62,4 +62,34 @@ export function fileAccessRefusal(
 ): "grant_disabled" | "feature_disabled" | "supervised_only" {
   if (access === "supervised") return "supervised_only";
   return source === "grant" ? "grant_disabled" : "feature_disabled";
+}
+
+export type FileRefusalCode = ReturnType<typeof fileAccessRefusal>;
+
+/**
+ * The two server verdict stages, shared by admission, the dispatch gate and
+ * the narrowing sweep so they cannot drift (and matching `fileToolsSummary`).
+ *
+ * Stage 1 judges the dashboard alone: its mode and only the server-side part
+ * of the read grant, so a missing or old CLI is not blamed on the dashboard.
+ * Stage 2 judges the effective mode, the lowest of the dashboard mode and the
+ * CLI's own, with the full grant (server AND live switch AND roots).
+ */
+export function fileGrantStageRefusal(
+  dashboardMode: McpCommandModeName | null | undefined,
+  opClass: FileOpClass,
+  readGrant: FileReadGrant,
+): FileRefusalCode | null {
+  const access = fileToolAccess(dashboardMode, opClass, { ...readGrant, live: true, roots: true });
+  return access === "headless" ? null : fileAccessRefusal(access, "grant");
+}
+
+export function fileLiveStageRefusal(
+  dashboardMode: McpCommandModeName | null | undefined,
+  liveMode: McpCommandModeName | null | undefined,
+  opClass: FileOpClass,
+  readGrant: FileReadGrant,
+): FileRefusalCode | null {
+  const access = fileToolAccess(lowestMcpCommandMode(dashboardMode, liveMode), opClass, readGrant);
+  return access === "headless" ? null : fileAccessRefusal(access, "live");
 }

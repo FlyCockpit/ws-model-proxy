@@ -7,8 +7,8 @@ import type {
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   type FileOpClass,
-  fileAccessRefusal,
-  fileToolAccess,
+  fileGrantStageRefusal,
+  fileLiveStageRefusal,
 } from "@ws-model-proxy/api/lib/cli-file-access";
 import {
   allowsHeadlessCommands,
@@ -608,6 +608,10 @@ export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
+  private grantChangeSeq = 0;
+  // One integer per device changed since process start. There is no device-delete
+  // policy hook; retain the fence even while offline so delayed hellos stay fenced.
+  private lastGrantChangeSeq = new Map<string, number>();
   /**
    * Highest connection generation this process has installed or settled per
    * device. Hello results can complete out of order, so an older-committed
@@ -747,6 +751,7 @@ export class RelaySessionManager {
 
     if (message.type === "hello") {
       try {
+        const helloSeq = this.grantChangeSeq;
         const registration = await persistRelayRegistration({
           identity: session.identity,
           cli: message.cli,
@@ -795,9 +800,16 @@ export class RelaySessionManager {
         session.endpointTargeting = true;
         session.protocolVersion = message.protocolVersion;
         session.cliVersion = message.cli.version ?? null;
-        session.allowHumanTerminal = registration.allowHumanTerminal;
-        session.mcpCommandMode = registration.mcpCommandMode;
-        session.mcpFileRead = registration.mcpFileRead;
+        // Registration can commit before a policy change but return after its
+        // refresh. Check and install without yielding: an old hello gets no
+        // authority until the same device queue establishes current policy.
+        const stalePolicy = this.featureGrantChangeSeq(registration.cliDeviceId) > helloSeq;
+        this.installSessionFeatureGrants(
+          session,
+          stalePolicy
+            ? { allowHumanTerminal: false, mcpCommandMode: "off", mcpFileRead: false }
+            : registration,
+        );
         const interactive = interactiveCapabilities(message.cli.capabilities);
         session.features = interactive.features;
         session.terminalPublicKey = interactive.terminalPublicKey;
@@ -812,6 +824,14 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        if (stalePolicy) {
+          void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
+            console.error(
+              "[relay] stale hello policy refresh failed",
+              error instanceof Error ? error.name : typeof error,
+            );
+          });
+        }
         // Members opened only by this device's disconnect are probed now, not
         // after the disconnect cooldown. Best effort: on failure the normal
         // scheduled retry still recovers them.
@@ -1378,8 +1398,19 @@ export class RelaySessionManager {
     });
   }
 
-  async onCliFeatureGrantsChanged(cliDeviceId: string) {
-    // Called only after the device policy commits. Own the per-device queue
+  onCliFeatureGrantsChanged(cliDeviceId: string): Promise<void> {
+    this.lastGrantChangeSeq.set(cliDeviceId, ++this.grantChangeSeq);
+    return this.refreshFeatureGrants(cliDeviceId);
+  }
+
+  /** Fence an admission before its first read; compare again at its sync verdict. */
+  featureGrantChangeSeq(cliDeviceId: string): number {
+    return this.lastGrantChangeSeq.get(cliDeviceId) ?? 0;
+  }
+
+  private async refreshFeatureGrants(cliDeviceId: string) {
+    // Post-commit notifications and stale hello recovery share this queue.
+    // Own the per-device queue
     // through the read, apply and metric push; different devices stay independent.
     // A failed tail must not poison the next refresh or leave an idle entry.
     const previous = this.featureGrantsRefreshByCliDeviceId.get(cliDeviceId);
@@ -1528,10 +1559,22 @@ export class RelaySessionManager {
   ) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
+    this.installSessionFeatureGrants(session, grants);
+    this.reconcileInteractiveGrants(session);
+  }
+
+  /** The only installer for established session policy; callers never await here. */
+  private installSessionFeatureGrants(
+    session: SessionState,
+    grants: {
+      allowHumanTerminal: boolean;
+      mcpCommandMode: McpCommandModeName;
+      mcpFileRead: boolean;
+    },
+  ) {
     session.allowHumanTerminal = grants.allowHumanTerminal;
     session.mcpCommandMode = grants.mcpCommandMode;
     session.mcpFileRead = grants.mcpFileRead === true;
-    this.reconcileInteractiveGrants(session);
   }
 
   /**
@@ -2319,21 +2362,15 @@ export class RelaySessionManager {
         relayProtocolAtLeast(session.protocolVersion, "2.8"),
       roots: session.features?.fileRootsConfigured === true,
     };
-    // Dashboard stage: only the server-side part of the read grant (the live and
-    // roots parts belong to the CLI stage below and map to `feature_disabled`).
-    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass, {
-      ...readGrant,
-      live: true,
-      roots: true,
-    });
-    if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
-    const liveAccess = fileToolAccess(
-      session.features?.mcpCommandMode ?? "off",
-      opClass,
-      readGrant,
+    return (
+      fileGrantStageRefusal(session.mcpCommandMode, opClass, readGrant) ??
+      fileLiveStageRefusal(
+        session.mcpCommandMode,
+        session.features?.mcpCommandMode ?? "off",
+        opClass,
+        readGrant,
+      )
     );
-    if (liveAccess !== "headless") return fileAccessRefusal(liveAccess, "live");
-    return null;
   }
 
   sendRelayRequest({

@@ -1,4 +1,7 @@
-import { fileAccessRefusal, fileToolAccess } from "@ws-model-proxy/api/lib/cli-file-access";
+import {
+  fileGrantStageRefusal,
+  fileLiveStageRefusal,
+} from "@ws-model-proxy/api/lib/cli-file-access";
 import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import {
   allowsHeadlessCommands,
@@ -78,11 +81,15 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
  *   record is ended with the session.
  * In memory, single process: the relay sockets and the sweeps live here.
  */
-type Admission = { tokenId: string; revoked: boolean };
+type Admission = { tokenId: string; revoked: boolean; grantChangeSeq: number };
 const openAdmissions = new Set<Admission>();
 
-function openAdmission(tokenId: string): Admission {
-  const admission = { tokenId, revoked: false };
+function openAdmission(tokenId: string, cliDeviceId: string): Admission {
+  const admission = {
+    tokenId,
+    revoked: false,
+    grantChangeSeq: relaySessionManager.featureGrantChangeSeq(cliDeviceId),
+  };
   openAdmissions.add(admission);
   return admission;
 }
@@ -179,7 +186,7 @@ export type CliAgentAdmissionReads = {
 export async function readCliAgentAdmission(
   input: CliAgentAdmissionInput,
 ): Promise<CliAgentAdmissionReads> {
-  const admission = openAdmission(input.tokenId);
+  const admission = openAdmission(input.tokenId, input.cliDeviceId);
   let device: AdmissionDevice | null;
   let token: LiveCliToken | null;
   let owner: CliOwnerState | null;
@@ -270,6 +277,23 @@ export function judgeCliAgentAdmission(
     return { ok: false, error: "token_inactive" };
   if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
   if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };
+  // A committed policy change invalidates reads opened before its notification,
+  // even if a reconnect or a later enable has already restored live authority.
+  if (admission.grantChangeSeq !== relaySessionManager.featureGrantChangeSeq(input.cliDeviceId)) {
+    // Preserve the dispatch gate's specific refusal (e.g. a headless command
+    // narrowed to supervised). A newer enable still cannot revive this admission.
+    const refusal =
+      capability === "file_read" || capability === "file_write"
+        ? relaySessionManager.fileOpModeRefusal(
+            input.cliDeviceId,
+            capability === "file_read" ? "read" : "write",
+          )
+        : relaySessionManager.commandModeRefusal(
+            input.cliDeviceId,
+            capability === "headless_exec" ? "headless" : "supervised",
+          );
+    return { ok: false, error: refusal ?? "grant_disabled" };
+  }
   const grant = mcpCommandModeFromDb(device.mcpCommandMode);
 
   if (capability === "headless_exec") {
@@ -298,12 +322,8 @@ export function judgeCliAgentAdmission(
         live.fileOps === true,
       roots: live?.fileRootsConfigured === true,
     };
-    // The dashboard stage judges only the server-side part of the read grant, so an
-    // offline, old-protocol or CLI-side refusal is not misreported as the dashboard's.
-    const grantAccess = fileToolAccess(grant, opClass, { ...readGrant, live: true, roots: true });
-    if (grantAccess !== "headless") {
-      return { ok: false, error: fileAccessRefusal(grantAccess, "grant") };
-    }
+    const grantRefusal = fileGrantStageRefusal(grant, opClass, readGrant);
+    if (grantRefusal) return { ok: false, error: grantRefusal };
     if (!live) {
       // Not connected. A device whose last hello was refused for an old
       // protocol says so (#90) instead of a bare `offline`.
@@ -318,10 +338,8 @@ export function judgeCliAgentAdmission(
     if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
       return { ok: false, error: "offline" };
     }
-    const liveAccess = fileToolAccess(live.mcpCommandMode, opClass, readGrant);
-    if (liveAccess !== "headless") {
-      return { ok: false, error: fileAccessRefusal(liveAccess, "live") };
-    }
+    const liveRefusal = fileLiveStageRefusal(grant, live.mcpCommandMode, opClass, readGrant);
+    if (liveRefusal) return { ok: false, error: liveRefusal };
     return { ok: true, token, device, live };
   }
 

@@ -249,6 +249,8 @@ export function CliDeviceFeatureSwitches({
       },
       onError: () => {
         setOptimistic({});
+        // A grant can commit and the live refresh still fail: show the durable state.
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
       },
     }),
     meta: { errorFallbackKey: "dashboard:clis.features.saveFailed" },

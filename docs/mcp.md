@@ -127,6 +127,11 @@ and the CLI's own `wsmp config set-mcp-commands` mode in its live hello.
 The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
 and live `fileRootsConfigured`; missing or stale features never authorize it.
 If a post-commit device-grant refresh cannot read the current policy, live terminal, command, and file authority (including unsupervised access) is withdrawn and pending work is cancelled until a successful refresh or reconnect.
+A reconnect whose hello began before a device policy change installs no terminal,
+command, or file authority until a serialized refresh establishes the current
+policy. Admissions opened before the change are refused even if a later enable
+restores authority; a fresh request may use the restored grant. Changes to another
+device do not affect these admissions or require an extra hello policy read.
 
 | Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
 | --- | --- | --- | --- |

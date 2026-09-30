@@ -309,6 +309,7 @@ describe("CLI feature switches", () => {
   it("shows one error toast and rolls back optimistic mode when grants fail", async () => {
     const user = userEvent.setup();
     state.grantsShouldFail = true;
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     renderSwitches(
       {
         terminal: {
@@ -328,6 +329,9 @@ describe("CLI feature switches", () => {
     expect(toast.error).toHaveBeenCalledWith("dashboard:clis.features.saveFailed");
     expect((modeRadio("off") as HTMLInputElement).checked).toBe(true);
     expect((modeRadio("supervised") as HTMLInputElement).checked).toBe(false);
+    // The durable state is refetched: a grant can commit even when the save reports failure.
+    expect(invalidate).toHaveBeenCalled();
+    invalidate.mockRestore();
   });
 
   it("recommends browser approval while agents can request commands", () => {
