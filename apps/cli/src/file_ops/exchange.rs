@@ -5,8 +5,8 @@ use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 
-/// Test seam: make the next exchange on THIS thread fail with an errno, so the
-/// callers' handling of each errno class is exercised on any platform.
+// Test seam: make the next exchange on THIS thread fail with an errno, so the
+// callers' handling of each errno class is exercised on any platform.
 #[cfg(test)]
 thread_local! {
     pub(super) static INJECTED: std::cell::Cell<Option<Errno>> = const { std::cell::Cell::new(None) };
