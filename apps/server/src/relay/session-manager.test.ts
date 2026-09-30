@@ -3277,7 +3277,7 @@ describe("relay 2.7 telemetry", () => {
     const manager = new RelaySessionManager();
     await manager.onPoolRoutingRulesChanged("pool-1");
     expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
-      where: { poolId: "pool-1" },
+      where: { poolId: "pool-1", verdict: { not: "NONE" } },
     });
     manager.dispose();
   });

@@ -17,7 +17,8 @@
  * A member without rules gets a row while engine load holds it FULL, plus
  * one clearing write. Each session also publishes once per member to fence
  * inherited or in-flight predecessor verdicts, including on reconnect. Idle
- * frames then stay quiet until membership or the local clear epoch changes.
+ * frames then stay quiet until membership changes. Clears and retractions
+ * preserve NONE rows so their durable successor fences survive every process.
  *
  * The inputs are numbers, names and labels only; no prompt text reaches here.
  */
@@ -66,8 +67,6 @@ export type RoutingEvaluationState = {
   written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
   /** Members successfully published by this session, including idle successor fences. */
   probed: Set<string>;
-  /** A local clear invalidates the probes as well as the cached FULL verdicts. */
-  probedEpoch: number;
 };
 
 /** Rule verdict OR engine-load verdict: engine load only adds FULL. */
@@ -98,7 +97,6 @@ export function createRoutingEvaluationState(
     closed: false,
     written: new Map(),
     probed: new Set(),
-    probedEpoch: 0,
   };
 }
 
@@ -200,13 +198,10 @@ export class MetricRoutingEvaluator {
     // `publish`), so a run that stalls in a query cannot later overwrite a
     // verdict a newer run already wrote.
     const now = this.clock();
-    // Probes and cached writes belong to the epoch captured before reads:
-    // a clear during publication must invalidate them on the next run.
+    // Cached writes belong to the epoch captured before reads: a clear
+    // during publication must invalidate them on the next run. Idle probes
+    // remain valid because clears preserve their durable NONE fences.
     const epoch = this.clearEpoch;
-    if (state.probedEpoch !== epoch) {
-      state.probed.clear();
-      state.probedEpoch = epoch;
-    }
     const members = await this.db.poolMember.findMany({
       where: {
         tier: "PRIMARY",
@@ -298,8 +293,8 @@ export class MetricRoutingEvaluator {
       if (state.closed) break;
       if (await this.publish(member.id, data)) {
         state.probed.add(member.id);
-        // A rule-less member's row only exists to hold FULL; once cleared it
-        // is not tracked (a NONE row never gates and needs no refresh).
+        // A rule-less member's NONE fence never gates and needs no refresh,
+        // so only FULL verdicts remain in the cached writes.
         if (rules.length === 0 && evaluation.verdict === "none") state.written.delete(member.id);
         else state.written.set(member.id, { key, writtenAtMs: nowMs, epoch });
         published.push({
@@ -359,11 +354,13 @@ export class MetricRoutingEvaluator {
   /**
    * A rule edit or engine-load override change can commit between what this
    * evaluation read and its write. After the write is committed, re-read the
-   * pools and members: any whose rules or override
-   * differ had their rows cleared before or will not see ours, so delete
-   * exactly the rows this evaluation wrote (a newer evaluation's row has a
-   * different `evaluatedAt` and is kept). A row committed before the
-   * re-read is either seen here or deleted by the edit's own clearing,
+   * pools and members: if their rules or override differ, the edit's clear
+   * may have missed our publication, so delete
+   * exactly the gating rows this evaluation wrote (a newer evaluation's row
+   * has a different `evaluatedAt` or publisher and is kept). NONE rows stay
+   * as durable successor fences even when their snapshot is outdated.
+   * A gating row committed before the re-read is either seen here or
+   * deleted by the edit's own clearing,
    * because the edit clears after its rules commit.
    */
   private async retractIfRulesChanged(
@@ -401,6 +398,7 @@ export class MetricRoutingEvaluator {
         poolMemberId: { in: stale.map((entry) => entry.memberId) },
         evaluatedAt,
         publisherId: state.publisherId,
+        verdict: { not: "NONE" },
       },
     });
     for (const entry of stale) {
@@ -411,14 +409,17 @@ export class MetricRoutingEvaluator {
 
   /**
    * A pool's rules were replaced (the rule editor committed): its stored
-   * verdicts belong to the old rules. Cleared here, in the hot-path (H)
+   * gating verdicts belong to the old rules. Cleared here, in the hot-path (H)
    * module, because a management writer must not write H tables; an
    * evaluation still in flight is retracted by `retractIfRulesChanged`.
    */
   async clearPool(poolId: string): Promise<void> {
-    // Every state re-writes its verdicts at once afterwards (also for rules
-    // that were saved unchanged), not only after the refresh interval.
+    // Cached verdicts are re-written at once afterwards (also for rules
+    // saved unchanged). Idle rule-less members retain their NONE fences
+    // without re-probing; deleting those rows could admit a delayed older write.
     this.clearEpoch += 1;
-    await this.db.poolMemberRoutingVerdict.deleteMany({ where: { poolId } });
+    await this.db.poolMemberRoutingVerdict.deleteMany({
+      where: { poolId, verdict: { not: "NONE" } },
+    });
   }
 }

@@ -159,6 +159,189 @@ async function verdictOf(db: Db, poolMemberId: string) {
 }
 
 integration("PostgreSQL live engine load at candidate build and grant time", () => {
+  it.each(["P1 same process", "P3 another process"])(
+    "pool clear preserves the successor fence against a delayed cancelled FULL (%s)",
+    async (scenario) => {
+      if (!databaseUrl) return;
+      const db = createFixturePrismaClient(databaseUrl);
+      const f = await fixture(db);
+      let releaseCreate: () => void = () => undefined;
+      let enteredCreate: () => void = () => undefined;
+      const createGate = new Promise<void>((resolve) => {
+        releaseCreate = resolve;
+      });
+      const createStarted = new Promise<void>((resolve) => {
+        enteredCreate = resolve;
+      });
+      let releaseDelete: () => void = () => undefined;
+      let enteredDelete: () => void = () => undefined;
+      const deleteGate = new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+      const deleteStarted = new Promise<void>((resolve) => {
+        enteredDelete = resolve;
+      });
+      let pendingCreate: Promise<void> | undefined;
+      let pendingClear: Promise<void> | undefined;
+      try {
+        const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+          "../../relay/metric-routing-evaluator.js"
+        );
+        const { applyMetricRoutingVerdicts } = await import("../metric-routing-order.js");
+        let now = new Date();
+        const a = createRoutingEvaluationState(f.user.id, f.device.id);
+        const b = createRoutingEvaluationState(f.user.id, f.device.id);
+        const predecessorDb = db.$extends({
+          query: {
+            poolMemberRoutingVerdict: {
+              async create({ args, query }) {
+                if (args.data.poolMemberId === f.a.id && args.data.verdict === "FULL") {
+                  enteredCreate();
+                  await createGate;
+                }
+                return query(args);
+              },
+            },
+          },
+        });
+        const clearerDb = db.$extends({
+          query: {
+            poolMemberRoutingVerdict: {
+              async deleteMany({ args, query }) {
+                if (args.where?.poolId === f.pool.id) {
+                  enteredDelete();
+                  await deleteGate;
+                }
+                return query(args);
+              },
+            },
+          },
+        });
+        const predecessor = new MetricRoutingEvaluator(predecessorDb as never, () => now);
+        const clearer = new MetricRoutingEvaluator(clearerDb as never, () => now);
+        const successor =
+          scenario === "P1 same process"
+            ? clearer
+            : new MetricRoutingEvaluator(db as never, () => now);
+        const calm = () => ({
+          nodeMetrics: null,
+          endpointLoad: [f.reading(f.a, { kvUsage: 0.2, receivedAt: now })],
+        });
+        pendingCreate = predecessor.evaluate(a, {
+          nodeMetrics: null,
+          endpointLoad: [f.reading(f.a, { kvUsage: 0.99, receivedAt: now })],
+        });
+        await createStarted;
+        predecessor.cancel(a);
+        expect(await verdictOf(db, f.a.id)).toBeNull();
+        now = new Date(now.getTime() + 1_000);
+        if (scenario === "P1 same process") {
+          // The local epoch has bumped, but the DELETE has not committed.
+          pendingClear = clearer.clearPool(f.pool.id);
+          await deleteStarted;
+        }
+        await successor.evaluate(b, calm());
+        const fence = await verdictOf(db, f.a.id);
+        expect(fence).toMatchObject({ verdict: "NONE", publisherId: b.publisherId });
+        if (scenario === "P3 another process") {
+          // The other replica's clear cannot invalidate B's local state.
+          pendingClear = clearer.clearPool(f.pool.id);
+          await deleteStarted;
+        }
+        releaseDelete();
+        await pendingClear;
+        expect(await verdictOf(db, f.a.id)).toEqual(fence);
+        releaseCreate();
+        await pendingCreate;
+        for (let frame = 0; frame < 3; frame += 1) {
+          now = new Date(now.getTime() + 1_000);
+          await successor.evaluate(b, calm());
+        }
+        expect(await verdictOf(db, f.a.id)).toEqual(fence);
+        const candidates = [{ poolMemberId: f.a.id }, { poolMemberId: f.b.id }];
+        expect((await applyMetricRoutingVerdicts(candidates, { db, now })).candidates).toEqual(
+          candidates,
+        );
+        // A preserved fence must still allow a legitimate newer FULL and its clearing write.
+        now = new Date(now.getTime() + 1_000);
+        await successor.evaluate(b, {
+          nodeMetrics: null,
+          endpointLoad: [f.reading(f.a, { kvUsage: 0.99, receivedAt: now })],
+        });
+        expect(await verdictOf(db, f.a.id)).toMatchObject({
+          verdict: "FULL",
+          publisherId: b.publisherId,
+          evaluatedAt: now,
+        });
+        expect((await applyMetricRoutingVerdicts(candidates, { db, now })).candidates).toEqual([
+          candidates[1],
+        ]);
+        now = new Date(now.getTime() + 1_000);
+        await successor.evaluate(b, calm());
+        expect(await verdictOf(db, f.a.id)).toMatchObject({ verdict: "NONE", evaluatedAt: now });
+        expect((await applyMetricRoutingVerdicts(candidates, { db, now })).candidates).toEqual(
+          candidates,
+        );
+      } finally {
+        releaseCreate();
+        releaseDelete();
+        await Promise.allSettled([pendingCreate, pendingClear]);
+        await f.cleanup();
+        await db.$disconnect();
+      }
+    },
+  );
+
+  it("another tenant's five pool clears cause no idle rule-less verdict statements", async () => {
+    if (!databaseUrl) return;
+    const db = createFixturePrismaClient(databaseUrl);
+    const x = await fixture(db);
+    const y = await fixture(db);
+    const create = vi.spyOn(db.poolMemberRoutingVerdict, "create");
+    const update = vi.spyOn(db.poolMemberRoutingVerdict, "updateMany");
+    try {
+      const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+        "../../relay/metric-routing-evaluator.js"
+      );
+      let now = new Date();
+      const evaluator = new MetricRoutingEvaluator(db as never, () => now);
+      const state = createRoutingEvaluationState(y.user.id, y.device.id);
+      const inputs = () => ({
+        nodeMetrics: null,
+        endpointLoad: [y.a, y.b].map((member) =>
+          y.reading(member, { kvUsage: 0.2, receivedAt: now }),
+        ),
+      });
+      const statements = () =>
+        update.mock.calls.filter(([args]) =>
+          [y.a.id, y.b.id].some((id) => args.where?.poolMemberId === id),
+        ).length +
+        create.mock.calls.filter(([args]) => [y.a.id, y.b.id].includes(args.data.poolMemberId))
+          .length;
+      await evaluator.evaluate(state, inputs());
+      expect(statements()).toBe(4);
+      for (let frame = 0; frame < 3; frame += 1) {
+        now = new Date(now.getTime() + 1_000);
+        await evaluator.evaluate(state, inputs());
+        expect(statements()).toBe(4);
+      }
+      for (let clear = 0; clear < 5; clear += 1) {
+        await evaluator.clearPool(x.pool.id);
+        now = new Date(now.getTime() + 1_000);
+        await evaluator.evaluate(state, inputs());
+        expect(statements()).toBe(4);
+      }
+      expect(await verdictOf(db, y.a.id)).toMatchObject({ verdict: "NONE" });
+      expect(await verdictOf(db, y.b.id)).toMatchObject({ verdict: "NONE" });
+    } finally {
+      create.mockRestore();
+      update.mockRestore();
+      await x.cleanup();
+      await y.cleanup();
+      await db.$disconnect();
+    }
+  });
+
   it.each(["sequential", "delayed create", "rules control"])(
     "successor fence: %s restores candidate and queued admission",
     async (scenario) => {
@@ -352,11 +535,13 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
   });
 
   it.each(["member leaves", "local clear"])(
-    "successor fence: %s resets the probe",
+    "successor fence: %s obeys the membership and clear probe budgets",
     async (event) => {
       if (!databaseUrl) return;
       const db = createFixturePrismaClient(databaseUrl);
       const f = await fixture(db);
+      const create = vi.spyOn(db.poolMemberRoutingVerdict, "create");
+      const update = vi.spyOn(db.poolMemberRoutingVerdict, "updateMany");
       try {
         const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
           "../../relay/metric-routing-evaluator.js"
@@ -369,6 +554,7 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
           endpointLoad: [f.reading(f.a, { kvUsage: 0.2, receivedAt: now })],
         });
         await evaluator.evaluate(state, inputs());
+        const fenceAt = now;
         now = new Date(now.getTime() + 1_000);
         if (event === "member leaves") {
           const otherDevice = await db.cliDevice.create({
@@ -383,11 +569,23 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
           await evaluator.clearPool(f.pool.id);
         }
         await evaluator.evaluate(state, inputs());
-        expect(await verdictOf(db, f.a.id)).toMatchObject({ verdict: "NONE", evaluatedAt: now });
+        const expectedAt = event === "member leaves" ? now : fenceAt;
+        expect(await verdictOf(db, f.a.id)).toMatchObject({
+          verdict: "NONE",
+          evaluatedAt: expectedAt,
+        });
         now = new Date(now.getTime() + 1_000);
         await evaluator.evaluate(state, inputs());
-        expect((await verdictOf(db, f.a.id))?.evaluatedAt.getTime()).toBe(now.getTime() - 1_000);
+        expect((await verdictOf(db, f.a.id))?.evaluatedAt).toEqual(expectedAt);
+        expect(
+          create.mock.calls.filter(([args]) => args.data.poolMemberId === f.a.id),
+        ).toHaveLength(1);
+        expect(
+          update.mock.calls.filter(([args]) => args.where?.poolMemberId === f.a.id),
+        ).toHaveLength(event === "member leaves" ? 2 : 1);
       } finally {
+        create.mockRestore();
+        update.mockRestore();
         await f.cleanup();
         await db.$disconnect();
       }

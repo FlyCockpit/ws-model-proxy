@@ -159,6 +159,7 @@ function harness(members: ReturnType<typeof member>[]) {
             poolMemberId?: { in: string[] };
             evaluatedAt?: Date;
             publisherId?: string;
+            verdict?: { not: string };
           };
         }) => {
           let count = 0;
@@ -168,7 +169,9 @@ function harness(members: ReturnType<typeof member>[]) {
               (args.where.poolMemberId === undefined || args.where.poolMemberId.in.includes(id)) &&
               (args.where.evaluatedAt === undefined ||
                 row.evaluatedAt.getTime() === args.where.evaluatedAt.getTime()) &&
-              (args.where.publisherId === undefined || row.publisherId === args.where.publisherId);
+              (args.where.publisherId === undefined ||
+                row.publisherId === args.where.publisherId) &&
+              (args.where.verdict === undefined || row.verdict !== args.where.verdict.not);
             if (matches) {
               rows.delete(id);
               count += 1;
@@ -193,7 +196,8 @@ function harness(members: ReturnType<typeof member>[]) {
     /** Replace a pool's rules, as `setPoolRoutingRules` does (rules, then clear its verdicts). */
     editRules: (poolId: string, rules: unknown) => {
       pools.set(poolId, rules);
-      for (const [id, row] of rows) if (row.poolId === poolId) rows.delete(id);
+      for (const [id, row] of rows)
+        if (row.poolId === poolId && row.verdict !== "NONE") rows.delete(id);
     },
     setRulesWithoutClearing: (poolId: string, rules: unknown) => {
       pools.set(poolId, rules);
@@ -424,7 +428,6 @@ describe("MetricRoutingEvaluator successor fences", () => {
       const otherProcess = new MetricRoutingEvaluator(h.db as never, h.now);
       const b = createRoutingEvaluationState("user-1", "device-1");
       expect(b.probed.size).toBe(0);
-      expect(b.probedEpoch).toBe(0);
       await otherProcess.evaluate(b, {
         nodeMetrics: null,
         endpointLoad: [load({ kvUsage: 0.2, receivedAt: h.now() })],
@@ -573,33 +576,42 @@ describe("MetricRoutingEvaluator successor fences", () => {
     },
   );
 
-  it.each(["member leaves", "local clear"])("successor probe resets after %s", async (event) => {
-    const members = [engineMember("m1", "VLLM")];
-    const original = members[0]!;
-    const h = harness(members);
-    const state = createRoutingEvaluationState("user-1", "device-1");
-    const inputs = () => ({
-      nodeMetrics: null,
-      endpointLoad: [load({ kvUsage: 0.2, receivedAt: h.now() })],
-    });
-    await h.evaluator.evaluate(state, inputs());
-    expect(h.written).toHaveLength(1);
-    h.advance(1_000);
-    if (event === "member leaves") {
-      members.splice(0);
+  it.each(["member leaves", "local clear", "another pool clear"])(
+    "successor probe budget after %s",
+    async (event) => {
+      const members = [engineMember("m1", "VLLM")];
+      const original = members[0]!;
+      const h = harness(members);
+      const state = createRoutingEvaluationState("user-1", "device-1");
+      const inputs = () => ({
+        nodeMetrics: null,
+        endpointLoad: [load({ kvUsage: 0.2, receivedAt: h.now() })],
+      });
       await h.evaluator.evaluate(state, inputs());
-      expect(state.probed.size).toBe(0);
-      members.push(original);
-    } else {
-      await h.evaluator.clearPool("pool-of-m1");
-    }
-    await h.evaluator.evaluate(state, inputs());
-    expect(h.written).toHaveLength(2);
-    expect(state.probed.has("m1")).toBe(true);
-    h.advance(1_000);
-    await h.evaluator.evaluate(state, inputs());
-    expect(h.written).toHaveLength(2);
-  });
+      expect(h.written).toHaveLength(1);
+      const statements = () =>
+        h.db.poolMemberRoutingVerdict.updateMany.mock.calls.length +
+        h.db.poolMemberRoutingVerdict.create.mock.calls.length;
+      const initialStatements = statements();
+      h.advance(1_000);
+      if (event === "member leaves") {
+        members.splice(0);
+        await h.evaluator.evaluate(state, inputs());
+        expect(state.probed.size).toBe(0);
+        members.push(original);
+      } else {
+        await h.evaluator.clearPool(event === "local clear" ? "pool-of-m1" : "another-pool");
+      }
+      await h.evaluator.evaluate(state, inputs());
+      expect(h.written).toHaveLength(event === "member leaves" ? 2 : 1);
+      expect(statements()).toBe(initialStatements + (event === "member leaves" ? 1 : 0));
+      expect(state.probed.has("m1")).toBe(true);
+      h.advance(1_000);
+      await h.evaluator.evaluate(state, inputs());
+      expect(h.written).toHaveLength(event === "member leaves" ? 2 : 1);
+      expect(statements()).toBe(initialStatements + (event === "member leaves" ? 1 : 0));
+    },
+  );
 
   it("an older calm successor cannot clear a newer FULL owner", async () => {
     const h = harness([engineMember("m1", "VLLM")]);
@@ -619,7 +631,7 @@ describe("MetricRoutingEvaluator successor fences", () => {
     expect(older.probed.size).toBe(0);
   });
 
-  it("a clear during publication invalidates the in-flight successor probe", async () => {
+  it("a clear during publication preserves the in-flight successor fence and idle budget", async () => {
     const h = harness([engineMember("m1", "VLLM")]);
     const state = createRoutingEvaluationState("user-1", "device-1");
     const create = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
@@ -633,11 +645,13 @@ describe("MetricRoutingEvaluator successor fences", () => {
       endpointLoad: [load({ kvUsage: 0.2, receivedAt: h.now() })],
     });
     await h.evaluator.evaluate(state, inputs());
-    expect(h.rows.size).toBe(0);
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", evaluatedAt: T0 });
     h.advance(1_000);
     await h.evaluator.evaluate(state, inputs());
-    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", evaluatedAt: h.now() });
-    expect(h.written).toHaveLength(2);
+    expect(h.rows.get("m1")).toMatchObject({ verdict: "NONE", evaluatedAt: T0 });
+    expect(h.written).toHaveLength(1);
+    expect(h.db.poolMemberRoutingVerdict.updateMany).toHaveBeenCalledTimes(1);
+    expect(h.db.poolMemberRoutingVerdict.create).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -817,14 +831,44 @@ describe("MetricRoutingEvaluator", () => {
     expect(h.rows.get("m1")).toMatchObject({ verdict: "FULL", publisherId: b.publisherId });
   });
 
-  it("clears a pool's verdicts on request (the rule editor's hook)", async () => {
-    const h = harness([member("m1", hotRule), member("m2", hotRule)]);
-    const state = createRoutingEvaluationState("user-1", "device-1");
-    await h.evaluator.evaluate(state, metrics(90, T0));
-    expect(h.rows.size).toBe(2);
-    await h.evaluator.clearPool("pool-of-m1");
-    expect([...h.rows.keys()]).toEqual(["m2"]);
-  });
+  it.each([
+    { verdict: "FULL", effect: "full", waiting: 3 },
+    { verdict: "AVOID", effect: "avoid", waiting: 3 },
+    { verdict: "NONE", effect: "full", waiting: 0 },
+  ])(
+    "clearPool removes gating $verdict rows, keeps NONE fences and invalidates cached writes",
+    async ({ verdict, effect, waiting }) => {
+      const rules = [{ metric: "endpoint.waiting", op: ">=", threshold: 2, effect }];
+      const h = harness([
+        member("m1", rules, "a"),
+        { ...member("idle", rules, "b"), poolId: "pool-of-m1" },
+        member("other", rules, "c"),
+      ]);
+      const state = createRoutingEvaluationState("user-1", "device-1");
+      const inputs = () => ({
+        nodeMetrics: null,
+        endpointLoad: [
+          load({ endpointSlug: "a", waiting, receivedAt: h.now() }),
+          load({ endpointSlug: "b", waiting: 0, receivedAt: h.now() }),
+          load({ endpointSlug: "c", waiting, receivedAt: h.now() }),
+        ],
+      });
+      await h.evaluator.evaluate(state, inputs());
+      expect(h.rows.get("m1")).toMatchObject({ verdict });
+      const idleFence = h.rows.get("idle");
+      const otherRow = h.rows.get("other");
+      await h.evaluator.clearPool("pool-of-m1");
+      expect(h.rows.has("m1")).toBe(verdict === "NONE");
+      expect(h.rows.get("idle")).toEqual(idleFence);
+      expect(h.rows.get("other")).toEqual(otherRow);
+      // Rule-bearing rows, including retained NONE snapshots, still refresh
+      // immediately after a local clear inside the usual five-second budget.
+      h.advance(1_000);
+      await h.evaluator.evaluate(state, inputs());
+      expect(h.rows.get("m1")).toMatchObject({ verdict, evaluatedAt: h.now() });
+      expect(h.rows.get("idle")).toMatchObject({ verdict: "NONE", evaluatedAt: h.now() });
+    },
+  );
 
   it("re-writes at once after the pool's verdicts were cleared, even for an unchanged verdict", async () => {
     const h = harness([member("m1", hotRule)]);
@@ -898,6 +942,48 @@ describe("MetricRoutingEvaluator", () => {
     });
     expect(h.rows.size).toBe(0);
   });
+
+  it.each([
+    { edit: "rules", verdict: "NONE", effect: "full", temperature: 40 },
+    { edit: "rules", verdict: "FULL", effect: "full", temperature: 90 },
+    { edit: "rules", verdict: "AVOID", effect: "avoid", temperature: 90 },
+    { edit: "override", verdict: "NONE", effect: "full", temperature: 40 },
+    { edit: "override", verdict: "FULL", effect: "full", temperature: 90 },
+    { edit: "override", verdict: "AVOID", effect: "avoid", temperature: 90 },
+  ])(
+    "retraction after $edit edit preserves only NONE fences ($verdict)",
+    async ({ edit, verdict, effect, temperature }) => {
+      const rules = [{ metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect }];
+      const members = [engineMember("m1", "VLLM", { ModelPool: { routingRules: rules } })];
+      const h = harness(members);
+      const state = createRoutingEvaluationState("user-1", "device-1");
+      const create = h.db.poolMemberRoutingVerdict.create.getMockImplementation();
+      h.db.poolMemberRoutingVerdict.create.mockImplementationOnce(async (args) => {
+        const result = await (create?.(args) ?? {});
+        if (edit === "rules") h.setRulesWithoutClearing("pool-of-m1", []);
+        else members[0]!.engineLoadMode = "OFF";
+        return result;
+      });
+      await h.evaluator.evaluate(state, metrics(temperature, T0));
+      expect(h.written[0]).toMatchObject({ verdict });
+      expect(h.db.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
+        where: expect.objectContaining({
+          poolMemberId: { in: ["m1"] },
+          evaluatedAt: T0,
+          publisherId: state.publisherId,
+        }),
+      });
+      if (verdict === "NONE") {
+        expect(h.rows.get("m1")).toMatchObject({
+          verdict: "NONE",
+          publisherId: state.publisherId,
+          evaluatedAt: T0,
+        });
+      } else expect(h.rows.has("m1")).toBe(false);
+      expect(state.written.size).toBe(0);
+      expect(state.probed.size).toBe(0);
+    },
+  );
 
   it("stops publishing the remaining members once its session is cancelled between writes", async () => {
     const h = harness([member("m1", hotRule), member("m2", hotRule)]);

@@ -136,6 +136,9 @@ export const metricRoutingProcedures = {
             ]
           : [];
       });
+      // Clears retain NONE rows as successor fences. Their ruleStates and
+      // engineState remain historical snapshots until the member is rewritten;
+      // the expiry check below and live engine evaluation still apply.
       const verdicts = await prisma.poolMemberRoutingVerdict.findMany({
         where: { poolId: pool.id, poolMemberId: { in: members.map((member) => member.id) } },
       });
