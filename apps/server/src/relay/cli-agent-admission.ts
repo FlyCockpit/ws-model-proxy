@@ -155,8 +155,10 @@ export type CliAgentAdmissionReads = {
 
 /**
  * Open the admission and read the device, the live token and the owner in one
- * `Promise.all`. The admission is closed before this returns; the verdict
- * (`judgeCliAgentAdmission`) must be taken in the caller's next synchronous step.
+ * `Promise.all`. The admission stays OPEN when this returns (so a revoke landing
+ * in the microtask gap before the caller resumes still marks it); the verdict
+ * (`judgeCliAgentAdmission`) closes it synchronously, and a caller that never
+ * judges must call `closeCliAgentAdmission`.
  */
 export async function readCliAgentAdmission(
   input: CliAgentAdmissionInput,
@@ -183,10 +185,16 @@ export async function readCliAgentAdmission(
     // one synchronous step (a stale owner snapshot taken before the slower
     // device read would extend it).
     owner = await readCliOwner(input.userId);
-  } finally {
+  } catch (error) {
     openAdmissions.delete(admission);
+    throw error;
   }
   return { input, admission, device, token, owner };
+}
+
+/** Close an admission that will not be judged. */
+export function closeCliAgentAdmission(reads: CliAgentAdmissionReads): void {
+  openAdmissions.delete(reads.admission);
 }
 
 type AdmissionOk = {
@@ -233,6 +241,8 @@ export function judgeCliAgentAdmission(
   capability: CliAgentCapability,
 ): CliAgentAdmissionVerdict {
   const { input, admission, device, token, owner } = reads;
+  // Closing and judging are one synchronous step: no revoke can slip between them.
+  openAdmissions.delete(admission);
   if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
   if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
   if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };

@@ -7,6 +7,7 @@ import {
 } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   type CliAgentAdmissionRejection,
+  closeCliAgentAdmission,
   judgeCliAgentAdmission,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
@@ -519,7 +520,10 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   // The caller may have gone while the admission read: never start new work for
   // a request that is already aborted (a cancel after the dispatch could lose a
   // race with a fast mutation).
-  if (input.signal?.aborted) return { ok: false, code: "cancelled" };
+  if (input.signal?.aborted) {
+    closeCliAgentAdmission(reads);
+    return { ok: false, code: "cancelled" };
+  }
   const verdict = judgeCliAgentAdmission(reads, mutating ? "file_write" : "file_read");
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   // The verdict resolved the device to one of the caller's own unless it said

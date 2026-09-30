@@ -2,6 +2,11 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  judgeCliAgentAdmission,
+  readCliAgentAdmission,
+  revokeOpenCliAgentAdmissions,
+} from "./cli-agent-admission.js";
+import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
@@ -962,6 +967,20 @@ describe("cli file ops", () => {
       release({ banned: false, banExpires: null, deletionRequestedAt: null });
       await expect(started).resolves.toEqual({ ok: false, code: "token_inactive" });
       expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("keeps the admission open until the verdict, so a revoke between the read and the verdict refuses", async () => {
+      await connect();
+      const reads = await readCliAgentAdmission({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+      });
+      // The caller resumes in a later microtask: a revoke landing now must count.
+      revokeOpenCliAgentAdmissions("token");
+      expect(judgeCliAgentAdmission(reads, "file_write")).toEqual({
+        ok: false,
+        error: "token_inactive",
+      });
     });
 
     it("does not mark another token's open admission", async () => {
