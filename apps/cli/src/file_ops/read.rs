@@ -1,0 +1,788 @@
+//! `forwarder_cli_file_read`: bounded, line-numbered, masked windows.
+//!
+//! The file is masked line by line as it is returned. The masker is first fed the
+//! lines in the lookback (`redact::LOOKBACK_BYTES`, 1 MiB) before the window, for
+//! every class but the whole-line ones, so a value or key block opened there masks
+//! the window; reading a plain file costs one cheap trigger-word check per line.
+
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::FileExt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use super::error::{ErrorCode, FileError, FileResult};
+use super::etag::STRONG_ETAG_MAX_BYTES;
+use super::policy::Access;
+use super::redact::{self, FileClass, LineMasker};
+use super::resolve::{ResolveOpts, Stat, resolve};
+use super::text::{self, Eol, SNIFF_BYTES, floor_boundary, strip_eol};
+use super::{Cancel, FileOps, fmt};
+
+pub const DEFAULT_MAX_LINES: u32 = 400;
+pub const MAX_LINES: u32 = 2000;
+pub const DEFAULT_MAX_BYTES: u32 = 32 * 1024;
+pub const MAX_BYTES: u32 = 128 * 1024;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadArgs {
+    pub path: String,
+    /// 1-based; negative counts from the end (-200 = the last 200 lines).
+    pub start_line: Option<i64>,
+    pub max_lines: Option<u32>,
+    pub max_bytes: Option<u32>,
+    /// Continue inside one very long line (bytes of the masked line).
+    pub byte_offset: Option<u64>,
+    pub line_numbers: Option<bool>,
+    pub if_none_match: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct More {
+    pub start_line: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ReadOutcome {
+    Unchanged { unchanged: bool, etag: String },
+    Content(Box<ReadResult>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResult {
+    pub etag: String,
+    pub size: u64,
+    pub mtime: String,
+    pub mode: String,
+    /// `null` when the file is over 64 MiB (not scanned).
+    pub total_lines: Option<u64>,
+    /// `null` for a tail window of a file over 64 MiB (line numbers unknown).
+    pub start_line: Option<u64>,
+    pub end_line: Option<u64>,
+    pub eol: Eol,
+    pub text: String,
+    pub redactions: u64,
+    pub more: Option<More>,
+    pub secret_file: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+}
+
+/// Rows of a served window.
+pub(crate) struct Window {
+    pub text: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub more: Option<More>,
+    pub redactions: u64,
+}
+
+pub(crate) struct WindowOpts {
+    pub start_line: u64,
+    pub max_lines: usize,
+    pub max_bytes: usize,
+    pub byte_offset: Option<u64>,
+    pub numbers: bool,
+}
+
+pub(crate) fn binary_error(sniff: &str, size: u64, etag: &str) -> FileError {
+    FileError::new(ErrorCode::BinaryFile, "file is not text")
+        .with_detail(json!({ "size": size, "etag": etag, "sniff": sniff }))
+}
+
+pub(crate) fn clamp_window(args: &ReadArgs) -> FileResult<(usize, usize)> {
+    let lines = args.max_lines.unwrap_or(DEFAULT_MAX_LINES);
+    let bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    if lines == 0 || bytes == 0 {
+        return Err(FileError::invalid(
+            "maxLines and maxBytes must be at least 1",
+        ));
+    }
+    Ok((lines.min(MAX_LINES) as usize, bytes.min(MAX_BYTES) as usize))
+}
+
+/// `Read::read_to_end` in 1 MiB steps, observing cancellation between them.
+pub(crate) fn read_to_end_cancellable<R: Read>(
+    mut reader: R,
+    out: &mut Vec<u8>,
+    cancel: &Cancel,
+) -> FileResult<()> {
+    loop {
+        cancel.check()?;
+        let n = reader.by_ref().take(1 << 20).read_to_end(out)?;
+        if n == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Read the whole file (at most `max` bytes) from an open fd.
+pub(crate) fn load_all(
+    file: &mut std::fs::File,
+    stat: &Stat,
+    max: u64,
+    cancel: &Cancel,
+) -> FileResult<Vec<u8>> {
+    if stat.size > max {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            format!("file is larger than {max} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(stat.size as usize);
+    read_to_end_cancellable(file.take(max + 1), &mut bytes, cancel)?;
+    if bytes.len() as u64 > max {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            format!("file is larger than {max} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The current etag of an open regular file: strong up to 64 MiB, weak above.
+pub(crate) fn current_etag(
+    ops: &FileOps,
+    file: &mut std::fs::File,
+    stat: &Stat,
+    cancel: &Cancel,
+) -> FileResult<String> {
+    if stat.size > STRONG_ETAG_MAX_BYTES {
+        return Ok(ops.key.weak_stat(stat));
+    }
+    let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES, cancel)?;
+    Ok(ops.key.strong(stat, &bytes))
+}
+
+pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
+    let (max_lines, max_bytes) = clamp_window(args)?;
+    let start = args.start_line.unwrap_or(1);
+    if start == 0 {
+        return Err(FileError::invalid(
+            "startLine is 1-based; use a negative value to read from the end",
+        ));
+    }
+    let resolved = resolve(
+        &args.path,
+        &ResolveOpts {
+            follow_last: true,
+            make_parents: None,
+            policy: &ops.policy,
+            access: Access::Read,
+        },
+    )?;
+    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Read)?;
+    let full = resolved.full_path();
+    let class = redact::classify(&full);
+    let echo = resolved.echo(&args.path);
+    let numbers = args.line_numbers.unwrap_or(true);
+    let opts_for = |start_line: u64| WindowOpts {
+        start_line,
+        max_lines,
+        max_bytes,
+        byte_offset: args.byte_offset,
+        numbers,
+    };
+
+    if stat.size > STRONG_ETAG_MAX_BYTES {
+        return read_large(
+            ops, args, &mut file, &stat, class, echo, start, &opts_for, max_lines, max_bytes,
+            cancel,
+        );
+    }
+
+    let bytes = load_all(&mut file, &stat, STRONG_ETAG_MAX_BYTES, cancel)?;
+    cancel.check()?;
+    let etag = ops.key.strong(&stat, &bytes);
+    if args.if_none_match.as_deref() == Some(etag.as_str()) {
+        return Ok(ReadOutcome::Unchanged {
+            unchanged: true,
+            etag,
+        });
+    }
+    if let Some(kind) = text::sniff_binary(&bytes) {
+        return Err(binary_error(kind, stat.size, &etag));
+    }
+    let total = text::count_lines(&bytes) as u64;
+    let first = if start > 0 {
+        start as u64
+    } else {
+        total.saturating_sub(start.unsigned_abs() - 1).max(1)
+    };
+    let offset = line_offset(&bytes, first.saturating_sub(1) as usize);
+    // A `.pem` `PRIVATE KEY` block or a multi-line value opened before the window
+    // masks the following lines, so the masker is fed the lookback before the
+    // window (`redact::LOOKBACK_BYTES`, the straddling line kept whole). Only the
+    // whole-line classes get by with one line of context for the flag rule.
+    let context_from = if class.needs_prefix() {
+        lookback_start(&bytes, offset)
+    } else {
+        prev_line_start(&bytes, offset)
+    };
+    let mut masker = LineMasker::new(class);
+    if offset > 0 {
+        let context = &bytes[context_from..offset];
+        for raw in context.split_inclusive(|b| *b == b'\n') {
+            masker.advance_bytes(strip_eol(raw));
+        }
+    }
+    let mut lines = bytes[offset..]
+        .split_inclusive(|b| *b == b'\n')
+        .map(|raw| Ok(raw.to_vec()));
+    let window = assemble(&mut masker, &mut lines, &opts_for(first), &etag, stat.size)?;
+    Ok(ReadOutcome::Content(Box::new(ReadResult {
+        etag,
+        size: stat.size,
+        mtime: fmt::rfc3339(stat.mtime()),
+        mode: fmt::mode_string(stat.mode),
+        total_lines: Some(total),
+        start_line: Some(window.start_line),
+        end_line: Some(window.end_line),
+        eol: text::detect_eol(&bytes),
+        text: window.text,
+        redactions: window.redactions,
+        more: window.more,
+        secret_file: class.is_secret(),
+        resolved_path: echo,
+    })))
+}
+
+/// Byte offset of the start of 0-based line `n` (`bytes.len()` past the end).
+fn line_offset(bytes: &[u8], n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == n {
+                return idx + 1;
+            }
+        }
+    }
+    bytes.len()
+}
+
+/// Start of the line BEFORE the one that contains the byte
+/// [`redact::LOOKBACK_BYTES`] before `offset` (the window start). The straddling
+/// line is kept whole, and one more line before it: the previous line's flag or
+/// pairing state decides whether the next line opens a multi-line value, so the
+/// state a run needs is reproducible from any line at or after this one.
+fn lookback_start(bytes: &[u8], offset: usize) -> usize {
+    lookback_start_with(bytes, offset, redact::LOOKBACK_BYTES)
+}
+
+pub(crate) fn lookback_start_with(bytes: &[u8], offset: usize, lookback: usize) -> usize {
+    let from = offset.saturating_sub(lookback);
+    if from == 0 {
+        return 0;
+    }
+    let containing = bytes[..from]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |idx| idx + 1);
+    if containing == 0 {
+        return 0;
+    }
+    bytes[..containing - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |idx| idx + 1)
+}
+
+/// Start of the line before the one starting at `offset` (`0` when none).
+fn prev_line_start(bytes: &[u8], offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    bytes[..offset - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |idx| idx + 1)
+}
+
+/// Build a window from raw lines (with terminators), masking each line.
+pub(crate) fn assemble(
+    masker: &mut LineMasker,
+    lines: &mut dyn Iterator<Item = FileResult<Vec<u8>>>,
+    opts: &WindowOpts,
+    etag: &str,
+    size: u64,
+) -> FileResult<Window> {
+    let mut out = String::new();
+    let mut emitted = 0_usize;
+    let mut number = opts.start_line;
+    let mut end_line = opts.start_line.saturating_sub(1);
+    let mut more = None;
+    let mut redactions = 0_u64;
+    let mut pending = lines.next().transpose()?;
+    while let Some(raw) = pending.take() {
+        if emitted >= opts.max_lines {
+            more = Some(More {
+                start_line: number,
+                byte_offset: None,
+            });
+            break;
+        }
+        let stripped = strip_eol(&raw);
+        let (masked, count): (std::borrow::Cow<'_, str>, usize) =
+            match std::str::from_utf8(stripped) {
+                Ok(body) => masker.mask_line_counted(body),
+                Err(_) if masker.class().is_secret() => {
+                    let (token, count) = masker.mask_invalid(stripped);
+                    (std::borrow::Cow::Owned(token), count)
+                }
+                Err(_) => return Err(binary_error("unknown", size, etag)),
+            };
+        let mut slice: &str = &masked;
+        let mut consumed = 0_usize;
+        if emitted == 0
+            && let Some(offset) = opts.byte_offset
+        {
+            let offset = offset as usize;
+            if offset > masked.len() || !masked.is_char_boundary(offset) {
+                return Err(FileError::invalid(
+                    "byteOffset is not a character boundary inside the line",
+                ));
+            }
+            consumed = offset;
+            slice = &masked[offset..];
+        }
+        let prefix = if opts.numbers {
+            format!("{number}|")
+        } else {
+            String::new()
+        };
+        let separator = usize::from(emitted > 0);
+        if out.len() + separator + prefix.len() + slice.len() > opts.max_bytes {
+            if emitted == 0 {
+                let room = opts.max_bytes.saturating_sub(prefix.len());
+                let mut cut = floor_boundary(slice, room);
+                if cut == 0
+                    && let Some(first) = slice.chars().next()
+                {
+                    cut = first.len_utf8();
+                }
+                out.push_str(&prefix);
+                out.push_str(&slice[..cut]);
+                redactions += count as u64;
+                end_line = number;
+                more = Some(More {
+                    start_line: number,
+                    byte_offset: Some((consumed + cut) as u64),
+                });
+            } else {
+                more = Some(More {
+                    start_line: number,
+                    byte_offset: None,
+                });
+            }
+            break;
+        }
+        if separator == 1 {
+            out.push('\n');
+        }
+        out.push_str(&prefix);
+        out.push_str(slice);
+        redactions += count as u64;
+        emitted += 1;
+        end_line = number;
+        number += 1;
+        pending = lines.next().transpose()?;
+    }
+    if let Some(more) = &more {
+        out.push_str("\n…[truncated: call again with ");
+        out.push_str(&format!("startLine={}", more.start_line));
+        if let Some(offset) = more.byte_offset {
+            out.push_str(&format!(" byteOffset={offset}"));
+        }
+        out.push(']');
+    }
+    Ok(Window {
+        text: out,
+        start_line: opts.start_line,
+        end_line,
+        more,
+        redactions,
+    })
+}
+
+/// The most of a huge file's end that one tail read scans for its lines.
+const TAIL_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How many lines of a huge file are read between cancellation checks.
+const CANCEL_CHECK_LINES: u64 = 512;
+
+/// Longest single line served from a file over 64 MiB. Masking needs the whole
+/// line in memory, so an unbounded line (a sparse or minified file) would be an
+/// allocation the file's owner controls.
+const LARGE_LINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one line (terminator included) of at most [`LARGE_LINE_MAX_BYTES`].
+fn read_line_bounded(
+    reader: &mut BufReader<&mut std::fs::File>,
+    buf: &mut Vec<u8>,
+) -> FileResult<usize> {
+    let n = reader
+        .by_ref()
+        .take(LARGE_LINE_MAX_BYTES + 1)
+        .read_until(b'\n', buf)?;
+    if buf.len() as u64 > LARGE_LINE_MAX_BYTES {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "a line in this file over 64 MiB is longer than 16 MiB and cannot be read",
+        ));
+    }
+    Ok(n)
+}
+
+/// Files over 64 MiB: weak etag, no line count, no whole-file scan.
+#[allow(clippy::too_many_arguments)]
+fn read_large(
+    ops: &FileOps,
+    args: &ReadArgs,
+    file: &mut std::fs::File,
+    stat: &Stat,
+    class: FileClass,
+    echo: Option<String>,
+    start: i64,
+    opts_for: &dyn Fn(u64) -> WindowOpts,
+    max_lines: usize,
+    max_bytes: usize,
+    cancel: &Cancel,
+) -> FileResult<ReadOutcome> {
+    cancel.check()?;
+    let etag = ops.key.weak(&file.metadata()?);
+    if args.if_none_match.as_deref() == Some(etag.as_str()) {
+        return Ok(ReadOutcome::Unchanged {
+            unchanged: true,
+            etag,
+        });
+    }
+    if class.needs_full_scan() {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "secret-class files over 64 MiB cannot be read (masking needs a full scan)",
+        ));
+    }
+    let mut head = vec![0_u8; SNIFF_BYTES];
+    let got = file.read_at(&mut head, 0)?;
+    if let Some(kind) = text::sniff_binary(&head[..got]) {
+        return Err(binary_error(kind, stat.size, &etag));
+    }
+
+    let mut masker = LineMasker::new(class);
+    let (window, eol) = if start < 0 {
+        tail_window(
+            file,
+            stat,
+            cancel,
+            &mut masker,
+            start.unsigned_abs() as usize,
+            max_lines,
+            max_bytes,
+            &etag,
+        )?
+    } else {
+        let first = start as u64;
+        let mut reader = BufReader::with_capacity(1 << 20, &mut *file);
+        let mut scanned = 0_u64;
+        // Feed the masker the lines in the lookback before the window (state
+        // only): a value or key block opened there masks the window's first
+        // lines. Whole-line classes need only the one line before it.
+        let lookback = if class.needs_prefix() {
+            redact::LOOKBACK_BYTES as u64
+        } else {
+            1
+        };
+        let mut context: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+        let mut context_bytes = 0_u64;
+        for seen in 1..first {
+            // a 64 MiB prefix is millions of lines: observe cancellation as we go
+            if seen.is_multiple_of(CANCEL_CHECK_LINES) {
+                cancel.check()?;
+            }
+            let mut buf = Vec::new();
+            let n = read_line_bounded(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            scanned += n as u64;
+            if scanned > STRONG_ETAG_MAX_BYTES {
+                return Err(FileError::new(
+                    ErrorCode::TooLarge,
+                    "startLine is more than 64 MiB into the file; use a negative startLine to read the end",
+                ));
+            }
+            context_bytes += n as u64;
+            context.push_back(buf);
+            // drop the oldest line only while the lines after the NEXT one still cover
+            // the lookback (the oldest kept line stays before the straddling line)
+            while context.len() > 2
+                && context
+                    .front()
+                    .zip(context.get(1))
+                    .is_some_and(|(old, next)| {
+                        context_bytes - old.len() as u64 - next.len() as u64 >= lookback
+                    })
+            {
+                if let Some(old) = context.pop_front() {
+                    context_bytes -= old.len() as u64;
+                }
+            }
+        }
+        for buf in &context {
+            masker.advance_bytes(strip_eol(buf));
+        }
+        let mut served = 0_u64;
+        let mut lines = std::iter::from_fn(|| {
+            served += 1;
+            if served.is_multiple_of(CANCEL_CHECK_LINES)
+                && let Err(err) = cancel.check()
+            {
+                return Some(Err(err));
+            }
+            let mut buf = Vec::new();
+            match read_line_bounded(&mut reader, &mut buf) {
+                Ok(0) => None,
+                Ok(_) => Some(Ok(buf)),
+                Err(err) => Some(Err(err)),
+            }
+        });
+        let window = assemble(&mut masker, &mut lines, &opts_for(first), &etag, stat.size)?;
+        let eol = text::detect_eol(window.text.as_bytes());
+        (window, eol)
+    };
+    Ok(ReadOutcome::Content(Box::new(ReadResult {
+        etag,
+        size: stat.size,
+        mtime: fmt::rfc3339(stat.mtime()),
+        mode: fmt::mode_string(stat.mode),
+        total_lines: None,
+        start_line: (start > 0).then_some(window.start_line),
+        end_line: (start > 0).then_some(window.end_line),
+        eol,
+        text: window.text,
+        redactions: window.redactions,
+        more: window.more,
+        secret_file: class.is_secret(),
+        resolved_path: echo,
+    })))
+}
+
+/// Move `start` back to the start of the line that contains it, so the tail
+/// chunk begins with a whole line (its state matters to the masker). Bounded by
+/// [`LARGE_LINE_MAX_BYTES`]; returns whether the first line stays partial.
+fn aligned_chunk_start(file: &std::fs::File, start: u64) -> FileResult<(u64, bool)> {
+    let mut at = start;
+    let mut moved = 0_u64;
+    while at > 0 {
+        let block = at.min(64 * 1024);
+        let mut buf = vec![0_u8; block as usize];
+        file.read_exact_at(&mut buf, at - block)?;
+        if let Some(idx) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok((at - block + idx as u64 + 1, false));
+        }
+        at -= block;
+        moved += block;
+        if moved > LARGE_LINE_MAX_BYTES {
+            return Ok((start, true));
+        }
+    }
+    Ok((0, false))
+}
+
+fn too_large_tail() -> FileError {
+    FileError::new(
+        ErrorCode::TooLarge,
+        "a line longer than 16 MiB precedes the end of this file; read with a positive startLine",
+    )
+}
+
+/// The last `count` lines of a huge file, without line numbers.
+#[allow(clippy::too_many_arguments)]
+fn tail_window(
+    file: &std::fs::File,
+    stat: &Stat,
+    cancel: &Cancel,
+    masker: &mut LineMasker,
+    count: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    etag: &str,
+) -> FileResult<(Window, Eol)> {
+    cancel.check()?;
+    // Read enough of the end to hold the requested lines (lines that mask short
+    // can be very long raw): grow the chunk up to the scan bound, then refuse
+    // instead of returning fewer lines than asked without saying so.
+    let wanted = count.min(max_lines);
+    let mut chunk_len = ((max_bytes as u64) * 2 + 64 * 1024).min(stat.size);
+    let (chunk_start, chunk) = loop {
+        cancel.check()?;
+        let (chunk_start, partial_first) = aligned_chunk_start(file, stat.size - chunk_len)?;
+        if partial_first {
+            // A line longer than 16 MiB precedes the tail: its state cannot be known,
+            // and serving the lines after it unmasked could show a continued value.
+            return Err(too_large_tail());
+        }
+        let mut chunk = vec![0_u8; (stat.size - chunk_start) as usize];
+        file.read_exact_at(&mut chunk, chunk_start)?;
+        let lines = chunk.split_inclusive(|b| *b == b'\n').count();
+        if lines >= wanted || chunk_start == 0 {
+            break (chunk_start, chunk);
+        }
+        if chunk_len >= TAIL_SCAN_MAX_BYTES.min(stat.size) {
+            return Err(FileError::new(
+                ErrorCode::TooLarge,
+                "the requested last lines are longer than the tail scan bound (32 MiB); ask for fewer lines or use a positive startLine",
+            ));
+        }
+        chunk_len = (chunk_len * 4).min(TAIL_SCAN_MAX_BYTES).min(stat.size);
+    };
+    let raw_lines: Vec<&[u8]> = chunk.split_inclusive(|b| *b == b'\n').collect();
+    let want = count.min(max_lines).min(raw_lines.len());
+    if want == 0 {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "the last line is longer than the read window; read it with a positive startLine",
+        ));
+    }
+    let first_index = raw_lines.len() - want;
+    // The masker's state comes from the lookback before the WINDOW'S first line
+    // (measured in raw bytes from that line, not from the end of the file: a
+    // window of lines that mask short can hold many raw bytes): the line that
+    // contains the byte LOOKBACK before it, and the line before that one.
+    let window_abs = chunk_start
+        + raw_lines[..first_index]
+            .iter()
+            .map(|l| l.len() as u64)
+            .sum::<u64>();
+    let want_from = window_abs.saturating_sub(redact::LOOKBACK_BYTES as u64);
+    let containing = aligned_chunk_start(file, want_from)?;
+    if containing.1 {
+        return Err(too_large_tail());
+    }
+    let ctx_start = if containing.0 == 0 {
+        0
+    } else {
+        let previous = aligned_chunk_start(file, containing.0 - 1)?;
+        if previous.1 {
+            return Err(too_large_tail());
+        }
+        previous.0
+    };
+    if ctx_start < window_abs {
+        let mut context = vec![0_u8; (window_abs - ctx_start) as usize];
+        file.read_exact_at(&mut context, ctx_start)?;
+        for raw in context.split_inclusive(|b| *b == b'\n') {
+            masker.advance_bytes(strip_eol(raw));
+        }
+    }
+    cancel.check()?;
+    let mut masked: Vec<String> = Vec::with_capacity(want);
+    let mut redactions: Vec<u64> = Vec::with_capacity(want);
+    for raw in &raw_lines[first_index..] {
+        let stripped = strip_eol(raw);
+        let (line, count): (std::borrow::Cow<'_, str>, usize) = match std::str::from_utf8(stripped)
+        {
+            Ok(body) => masker.mask_line_counted(body),
+            Err(_) if masker.class().is_secret() => {
+                let (token, count) = masker.mask_invalid(stripped);
+                (std::borrow::Cow::Owned(token), count)
+            }
+            Err(_) => return Err(binary_error("unknown", stat.size, etag)),
+        };
+        masked.push(line.into_owned());
+        redactions.push(count as u64);
+    }
+    let mut total: usize = masked
+        .iter()
+        .map(|l| l.len() + 1)
+        .sum::<usize>()
+        .saturating_sub(1);
+    let mut drop = 0;
+    while total > max_bytes && drop + 1 < masked.len() {
+        total -= masked[drop].len() + 1;
+        drop += 1;
+    }
+    if total > max_bytes {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "the last line is longer than the read window; read it with a positive startLine",
+        ));
+    }
+    let eol = text::detect_eol(&chunk);
+    let mut text = masked[drop..].join("\n");
+    if drop > 0 {
+        // the output cap cut the OLDEST requested lines: say so (line numbers are
+        // unknown in a file this large, so there is no startLine to offer)
+        text = format!(
+            "…[truncated: {drop} earlier line(s) omitted; ask for fewer lines or a larger maxBytes]\n{text}"
+        );
+    }
+    Ok((
+        Window {
+            text,
+            start_line: 0,
+            end_line: 0,
+            more: None,
+            redactions: redactions[drop..].iter().sum(),
+        },
+        eol,
+    ))
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A reader that cancels after handing out its first chunk.
+    struct CancelAfterFirst<'a> {
+        cancel: &'a Cancel,
+        served: bool,
+    }
+
+    impl Read for CancelAfterFirst<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served {
+                return Ok(0);
+            }
+            self.served = true;
+            self.cancel.cancel();
+            let n = buf.len().min(1 << 20);
+            buf[..n].fill(b'a');
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_chunked_reader_observes_a_cancel_between_chunks() {
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        let r = read_to_end_cancellable(
+            CancelAfterFirst {
+                cancel: &cancel,
+                served: false,
+            },
+            &mut out,
+            &cancel,
+        );
+        assert_eq!(r.expect_err("cancelled").code, ErrorCode::Cancelled);
+        assert!(
+            !out.is_empty() && out.len() < 1 << 20,
+            "only the first chunk was read"
+        );
+        // an uncancelled reader reads to the end
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        read_to_end_cancellable(&[7_u8; 3 << 20][..], &mut out, &cancel).unwrap();
+        assert_eq!(out.len(), 3 << 20);
+    }
+}
