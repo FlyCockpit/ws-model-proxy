@@ -17,7 +17,7 @@ import {
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
 import { deletionConflict } from "./deletion-conflict";
-import { deleteOrphanAutoCapacities } from "./engine-process-capacity";
+import { deleteOrphanAutoCapacities, refreshSharedAutoCapacities } from "./engine-process-capacity";
 import { throwCapacityDeleteConflict } from "./serializable-transaction";
 
 export type CliCredentialKind = "cliToken" | "deviceCredential";
@@ -383,6 +383,7 @@ async function deleteCliDeviceInCapacityLockOrder({
       });
     }
     await tx.cliDevice.delete({ where: { id: cliDeviceId }, select: { id: true } });
+    await refreshSharedAutoCapacities(tx, userId, orphanCapacityIds);
     await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
 
     return {

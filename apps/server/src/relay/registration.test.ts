@@ -119,6 +119,13 @@ const identity: CliWebsocketIdentity = {
   lookupPrefix: "wsmp_cli_lookup",
 };
 
+function capacityAssignmentWrites() {
+  return db.executionTarget.updateMany.mock.calls.filter((call) => {
+    const args = call[0] as { data?: { inferenceCapacityId?: string } };
+    return args.data && Object.hasOwn(args.data, "inferenceCapacityId");
+  });
+}
+
 const now = new Date("2026-01-01T00:00:00.000Z");
 
 const cliOverride = {
@@ -793,7 +800,7 @@ describe("capability override origin", () => {
     // upserted with a SET of the key column "userId" (DL-1).
     expect(db.executionTarget.findUnique).toHaveBeenCalledWith({
       where: { discoveredModelId: "model-id" },
-      select: { id: true, inferenceCapacityId: true },
+      select: { id: true, inferenceCapacityId: true, capacityAssignmentSource: true },
     });
     expect(db.executionTarget.create).not.toHaveBeenCalled();
   });
@@ -965,7 +972,12 @@ describe("capability override origin", () => {
       select: { id: true },
     });
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
-      where: { id: "execution-target-id", userId: "user-id", inferenceCapacityId: null },
+      where: {
+        id: "execution-target-id",
+        userId: "user-id",
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
       data: { inferenceCapacityId: "new-capacity" },
     });
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
@@ -1034,7 +1046,7 @@ describe("capability override origin", () => {
     await persistRelayRegistration(registration);
 
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(1);
-    expect(db.executionTarget.updateMany).toHaveBeenCalledTimes(1);
+    expect(capacityAssignmentWrites()).toHaveLength(1);
   });
 
   it("keeps an execution target capacity that is already attached", async () => {
@@ -1088,7 +1100,7 @@ describe("capability override origin", () => {
     });
 
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: { id: "kept-capacity", userId: "user-id", physicalMaxContext: null },
       data: { physicalMaxContext: 4_096 },
@@ -1147,7 +1159,7 @@ describe("capability override origin", () => {
     expect(row.hardConcurrencyLimit).toBe(4);
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: {
         id: "trigger-capacity",
@@ -1155,11 +1167,7 @@ describe("capability override origin", () => {
         hardConcurrencyLimit: null,
         hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
-          in: [
-            "execution-target:execution-target-id",
-            "discovered-model:model-id",
-            "engine-process:endpoint-id",
-          ],
+          in: ["execution-target:execution-target-id", "discovered-model:model-id"],
         },
       },
       data: { hardConcurrencyLimit: 4, hardConcurrencyLimitSource: "AUTO" },
@@ -1184,7 +1192,7 @@ describe("capability override origin", () => {
     await persistRelayRegistration(preAttachedRegistration());
 
     expect(row.hardConcurrencyLimit).toBe(1);
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
   });
 
   it("does not rewrite a pre-attached capacity whose hard limit is already 4", async () => {
@@ -1207,7 +1215,7 @@ describe("capability override origin", () => {
     expect(row.hardConcurrencyLimit).toBe(4);
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     for (const call of db.inferenceCapacity.updateMany.mock.calls) {
       const args = call[0] as CapacityWriteArgs;
       if (args.data && "hardConcurrencyLimit" in args.data) {
@@ -1261,7 +1269,7 @@ describe("capability override origin", () => {
 
     expect(row.hardConcurrencyLimit).toBeNull();
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
   });
   function engineRegistration(engineFacts: Record<string, unknown>, concurrencyLimit?: number) {
     const registration = preAttachedRegistration(concurrencyLimit);

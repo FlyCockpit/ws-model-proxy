@@ -20,6 +20,7 @@ const auto = (key: string) => ({ runtimeIdentityKey: key, hardConcurrencyLimitSo
 const own = (id: string): EngineProcessTarget => ({
   id,
   upstreamModelId: id,
+  capacityAssignmentSource: "AUTO",
   capacity: auto(`discovered-model:${id}`),
 });
 function plan(
@@ -78,6 +79,17 @@ describe("process capacity proof table", () => {
   ])("requires two exact inventory ids: %j", (aliases) => {
     expect(plan("llama.cpp", aliases).sharedTargetIds).toEqual([]);
   });
+  it.each([null, auto("discovered-model:a"), auto("engine-process:ep")])(
+    "preserves durable owner assignments and detach: %j",
+    (capacity) => {
+      const target = { ...own("a"), capacity, capacityAssignmentSource: "OWNER" };
+      expect(plan("llama.cpp", ["a", "b"], [target, own("b")])).toEqual({
+        sharedTargetIds: [],
+        splitTargetIds: [],
+      });
+      expect(plan("llama.cpp", undefined, [target, own("b")]).splitTargetIds).toEqual([]);
+    },
+  );
   it("deduplicates proof, intersects inventory, and excludes user choices", () => {
     for (const capacity of [
       { ...auto("discovered-model:c"), hardConcurrencyLimitSource: "USER" },
@@ -123,31 +135,121 @@ describe("process capacity proof table", () => {
 
 describe("lifecycle transaction seams", () => {
   beforeEach(() => vi.resetAllMocks());
-  it("guards a re-point by owner and original FK, and treats an identical FK as a no-op", async () => {
-    vi.mocked(prisma.executionTarget.updateMany).mockResolvedValue({ count: 1 });
-    expect(
-      await repointTargetCapacity(prisma, {
+  it.each([
+    {
+      name: "idle auto",
+      source: "AUTO",
+      lease: null,
+      waiter: null,
+      context: null,
+      ceiling: 2048,
+      expected: 1,
+    },
+    {
+      name: "owner auto destination",
+      source: "OWNER",
+      lease: null,
+      waiter: null,
+      context: null,
+      ceiling: null,
+      expected: 0,
+    },
+    {
+      name: "live lease",
+      source: "AUTO",
+      lease: { id: "l" },
+      waiter: null,
+      context: null,
+      ceiling: null,
+      expected: 0,
+    },
+    {
+      name: "waiting waiter",
+      source: "AUTO",
+      lease: null,
+      waiter: { id: "w" },
+      context: null,
+      ceiling: null,
+      expected: 0,
+    },
+    {
+      name: "unconfigured AUTO hard limit",
+      source: "AUTO",
+      lease: null,
+      waiter: null,
+      context: null,
+      ceiling: null,
+      hardLimit: null,
+      expected: 0,
+    },
+    {
+      name: "known context too small",
+      source: "AUTO",
+      lease: null,
+      waiter: null,
+      context: 1024,
+      ceiling: 2048,
+      expected: 0,
+    },
+  ])(
+    "guards automatic repoint: $name",
+    async ({ source, lease, waiter, context, ceiling, expected, hardLimit = 1 }) => {
+      vi.mocked(prisma.executionTarget.findUnique).mockResolvedValue({
+        id: "t",
         userId: "u",
-        targetId: "t",
-        fromCapacityId: "old",
-        toCapacityId: "new",
-      }),
-    ).toBe(1);
-    expect(prisma.executionTarget.updateMany).toHaveBeenCalledWith({
-      where: { id: "t", userId: "u", inferenceCapacityId: "old" },
-      data: { inferenceCapacityId: "new" },
-    });
-    expect(
-      await repointTargetCapacity(prisma, {
+        inferenceCapacityId: "old",
+        capacityAssignmentSource: source,
+        InferenceCapacity: auto("discovered-model:t"),
+        directConcurrencyLimit: null,
+        directReservedSlots: 0,
+        directContextCeiling: ceiling,
+        directContextMargin: 0,
+        PoolMembers: [],
+      } as unknown as Awaited<ReturnType<typeof prisma.executionTarget.findUnique>>);
+      vi.mocked(prisma.inferenceCapacity.findUnique).mockResolvedValue({
+        id: "new",
         userId: "u",
-        targetId: "t",
-        fromCapacityId: "new",
-        toCapacityId: "new",
-      }),
-    ).toBe(0);
-    expect(prisma.executionTarget.updateMany).toHaveBeenCalledTimes(1);
-  });
-  it("seeds the shared limit from engine slots, else the summed member seeds, and guards null fills", async () => {
+        ...auto("engine-process:ep"),
+        hardConcurrencyLimit: hardLimit,
+        physicalMaxContext: context,
+      } as Awaited<ReturnType<typeof prisma.inferenceCapacity.findUnique>>);
+      vi.mocked(prisma.capacityLease.findFirst).mockResolvedValue(
+        lease as Awaited<ReturnType<typeof prisma.capacityLease.findFirst>>,
+      );
+      vi.mocked(prisma.capacityWaiter.findFirst).mockResolvedValue(
+        waiter as Awaited<ReturnType<typeof prisma.capacityWaiter.findFirst>>,
+      );
+      vi.mocked(prisma.executionTarget.updateMany).mockResolvedValue({ count: 1 });
+      expect(
+        await repointTargetCapacity(prisma, {
+          userId: "u",
+          targetId: "t",
+          fromCapacityId: "old",
+          toCapacityId: "new",
+        }),
+      ).toBe(expected);
+      expect(prisma.executionTarget.updateMany).toHaveBeenCalledTimes(expected);
+      if (expected)
+        expect(prisma.executionTarget.updateMany).toHaveBeenCalledWith({
+          where: {
+            id: "t",
+            userId: "u",
+            inferenceCapacityId: "old",
+            capacityAssignmentSource: "AUTO",
+          },
+          data: { inferenceCapacityId: "new" },
+        });
+      expect(
+        await repointTargetCapacity(prisma, {
+          userId: "u",
+          targetId: "t",
+          fromCapacityId: "new",
+          toCapacityId: "new",
+        }),
+      ).toBe(0);
+    },
+  );
+  it("seeds shared limits without mutating existing rows before preflight", async () => {
     vi.mocked(prisma.inferenceCapacity.upsert).mockResolvedValue({ id: "shared" } as Awaited<
       ReturnType<typeof prisma.inferenceCapacity.upsert>
     >);
@@ -169,15 +271,7 @@ describe("lifecycle transaction seams", () => {
         }),
       }),
     );
-    expect(prisma.inferenceCapacity.updateMany).toHaveBeenCalledWith({
-      where: {
-        id: "shared",
-        userId: "u",
-        hardConcurrencyLimit: null,
-        hardConcurrencyLimitSource: "AUTO",
-      },
-      data: { hardConcurrencyLimit: 13 },
-    });
+    expect(prisma.inferenceCapacity.updateMany).not.toHaveBeenCalled();
     for (const [slots, expected] of [
       [5, 5],
       [0, 3],
@@ -222,7 +316,7 @@ describe("lifecycle transaction seams", () => {
     const calls = vi.mocked(prisma.$queryRaw).mock.calls;
     expect(calls.map((call) => call[1])).toEqual([["00:owner:u"], ["08:capacity:c"]]);
     expect(vi.mocked(prisma.$queryRaw).mock.invocationCallOrder[1]).toBeLessThan(
-      vi.mocked(prisma.$executeRaw).mock.invocationCallOrder[0]!,
+      vi.mocked(prisma.$executeRaw).mock.invocationCallOrder.at(-1)!,
     );
     expect(prisma.inferenceCapacity.findMany).toHaveBeenLastCalledWith(
       expect.objectContaining({ where: expect.objectContaining({ id: { gt: "c" } }), take: 1 }),

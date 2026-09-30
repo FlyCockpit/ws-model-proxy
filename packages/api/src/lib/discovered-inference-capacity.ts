@@ -128,7 +128,8 @@ export async function fillNullAutoDiscoveredCapacityLimit(
         in: autoDiscoveredCapacityRuntimeKeys({
           discoveredModelId: input.discoveredModelId,
           executionTargetId: input.executionTargetId,
-          endpointId: input.endpointId,
+          // Shared limits require the complete membership aggregate, never
+          // this singleton seed. Inventory's coordinator owns that refresh.
         }),
       },
     },
@@ -157,6 +158,8 @@ export async function ensureDiscoveredInferenceCapacity(
     upstreamModelId: string;
     reportedConcurrency?: number | null;
     executionTargetId?: string | null;
+    /** Move preflight must not alter an existing destination before validation. */
+    fillExistingLimit?: boolean;
   },
 ): Promise<string> {
   if (input.executionTargetId) {
@@ -170,13 +173,14 @@ export async function ensureDiscoveredInferenceCapacity(
       select: { id: true },
     });
     if (legacy) {
-      await fillNullAutoDiscoveredCapacityLimit(tx, {
-        userId: input.userId,
-        capacityId: legacy.id,
-        discoveredModelId: input.discoveredModelId,
-        executionTargetId: input.executionTargetId,
-        reportedConcurrency: input.reportedConcurrency,
-      });
+      if (input.fillExistingLimit !== false)
+        await fillNullAutoDiscoveredCapacityLimit(tx, {
+          userId: input.userId,
+          capacityId: legacy.id,
+          discoveredModelId: input.discoveredModelId,
+          executionTargetId: input.executionTargetId,
+          reportedConcurrency: input.reportedConcurrency,
+        });
       return legacy.id;
     }
   }
@@ -200,13 +204,14 @@ export async function ensureDiscoveredInferenceCapacity(
     },
     select: { id: true },
   });
-  await fillNullAutoDiscoveredCapacityLimit(tx, {
-    userId: input.userId,
-    capacityId: capacity.id,
-    discoveredModelId: input.discoveredModelId,
-    executionTargetId: input.executionTargetId,
-    reportedConcurrency: input.reportedConcurrency,
-  });
+  if (input.fillExistingLimit !== false)
+    await fillNullAutoDiscoveredCapacityLimit(tx, {
+      userId: input.userId,
+      capacityId: capacity.id,
+      discoveredModelId: input.discoveredModelId,
+      executionTargetId: input.executionTargetId,
+      reportedConcurrency: input.reportedConcurrency,
+    });
   return capacity.id;
 }
 
@@ -240,6 +245,7 @@ export async function linkExecutionTargetCapacity(
       id: input.executionTargetId,
       userId: input.userId,
       inferenceCapacityId: null,
+      capacityAssignmentSource: "AUTO",
     },
     data: { inferenceCapacityId: input.inferenceCapacityId },
   });
@@ -275,6 +281,7 @@ async function attachBackfillTarget(input: {
         kind: true,
         discoveredModelId: true,
         inferenceCapacityId: true,
+        capacityAssignmentSource: true,
       },
     });
     if (
@@ -282,7 +289,8 @@ async function attachBackfillTarget(input: {
       current.userId !== input.userId ||
       current.kind !== "DISCOVERED_MODEL" ||
       current.discoveredModelId !== input.discoveredModelId ||
-      current.inferenceCapacityId
+      current.inferenceCapacityId ||
+      current.capacityAssignmentSource !== "AUTO"
     ) {
       return 0;
     }
@@ -361,9 +369,10 @@ async function withCapacityWriteRetries(work: () => Promise<number>): Promise<nu
 /**
  * Idempotent startup repair for discovered execution targets. Null foreign
  * keys are attached. An attached auto capacity (`execution-target:<id>` or
- * `discovered-model:<id>` or `engine-process:<endpointId>`) whose hard limit is still null and AUTO-sourced is
+ * `discovered-model:<id>`) whose hard limit is still null and AUTO-sourced is
  * set to the discovered default, because startup has no CLI report. Does not
- * delete rows, does not replace a foreign key that is already set, and does
+ * delete rows; shared engine-process limits wait for the next inventory aggregate.
+ * Does not replace a foreign key that is already set, and does
  * not change a non-null limit, a USER-sourced limit (a USER null is an
  * explicit "unlimited"), or a different runtime key.
  */
@@ -374,6 +383,7 @@ export async function backfillDiscoveredInferenceCapacities(): Promise<{
   const targets = await prisma.executionTarget.findMany({
     where: {
       inferenceCapacityId: null,
+      capacityAssignmentSource: "AUTO",
       kind: "DISCOVERED_MODEL",
       discoveredModelId: { not: null },
     },

@@ -910,9 +910,13 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
-    expect(db.executionTarget.update).toHaveBeenCalledWith({
-      where: { id: expect.stringMatching(/^provider-target-/) },
-      data: { inferenceCapacityId: "provider-capacity-id" },
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: expect.stringMatching(/^provider-target-/),
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
     });
     // Writer class M: the owner fence, then the provider identity fences and
     // the capacity-policy fences of every existing target it changes (one
@@ -3762,6 +3766,10 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolMember.update).toHaveBeenCalledWith({
       where: { id: "provider-member" },
       data: { publicOrder: 0 },
+    });
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: { id: "provider-target", capacityAssignmentSource: "AUTO" },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
     });
   });
 

@@ -26,12 +26,18 @@ Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
 when the CLI proves that at least two inventory model ids are aliases served
 by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
 capacities. Model-swapping front ends are excluded only through engine detection
-and router-role proof. User assignments and USER limits are preserved. An alias that is
-removed from the process splits back to its own capacity on the next inventory.
-Old capacity rows remain while their leases or waiters are live; runtime cleanup
-cancels moved-target waiters and releases leases using their original capacity.
+and router-role proof. Owner assignments (including selecting an existing AUTO
+capacity or explicitly detaching a target) are recorded on each target and preserved;
+USER limits remain owner controlled. Removed aliases split on a later inventory.
+Discovery skips the entire move batch while any involved capacity has ACTIVE leases
+or WAITING waiters, and retries once idle. Existing handles keep their original capacity.
+Every join and split must fit direct and effective pool concurrency and context policies.
+Shared AUTO limits follow engine slots, otherwise the sum of current automatic member
+limits; incompatible lowerings wait for a policy change and the next inventory.
+Startup leaves unknown shared AUTO limits for that complete inventory aggregate.
 Empty AUTO discovery capacities are removed with model, endpoint, and device
-deletes, and an idempotent startup sweep repairs existing idle orphans.
+deletes, and an idempotent startup sweep repairs existing idle orphans. The sweep skips
+contended owners and capacities for the next registration or startup.
 Owner-created empty capacities remain visible in `capacity_records_list`.
 Automatic capacity labels get a numeric suffix when an owner's existing label
 collides; repeated discovery preserves the capacity identity and its label.

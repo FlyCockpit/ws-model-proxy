@@ -891,11 +891,11 @@ BEGIN
     RETURN NEW;
   END IF;
   SELECT count(*) INTO label_count FROM inference_capacity WHERE "userId" = NEW."userId";
-  -- At most label_count labels are occupied: these label_count + 1 distinct
-  -- candidates (including preferred_label) contain a vacancy. Bounded even
-  -- when an owner has deliberately occupied every predictable suffix.
+  -- At most label_count labels are occupied. The label_count + 1 distinct
+  -- suffix candidates guarantee a vacancy even if one equals preferred_label.
+  -- Bounded even when an owner has occupied every predictable suffix.
   SELECT candidate.label INTO NEW.label
-    FROM generate_series(2::bigint, label_count + 1) AS suffix(n)
+    FROM generate_series(2::bigint, label_count + 2) AS suffix(n)
     CROSS JOIN LATERAL (
       SELECT left(preferred_label, 120 - length(' (' || n || ')')) || ' (' || n || ')' AS label
     ) candidate
@@ -955,6 +955,15 @@ SELECT
 FROM discovered_model
 ON CONFLICT ("discoveredModelId") DO NOTHING;
 
+-- Recover explicit target assignments (including detach) independently of limit source.
+-- D holds graph tables exclusively; reruns only promote AUTO to OWNER.
+UPDATE execution_target target SET "capacityAssignmentSource" = 'OWNER'
+ WHERE target."capacityAssignmentSource" = 'AUTO'
+   AND EXISTS (SELECT 1 FROM capacity_audit_event edit
+     WHERE edit."resourceType" = 'EXECUTION_TARGET' AND edit.action = 'UPDATE_POLICY'
+       AND edit."resourceId" = target.id AND edit."userId" = target."userId"
+       AND jsonb_typeof(edit.after) = 'object' AND edit.after ? 'inferenceCapacityId');
+
 -- Give every pre-capacity execution target a conservative private identity.
 -- We cannot safely infer that two independently published targets share a
 -- physical engine, so the backfill intentionally creates one capacity per
@@ -974,13 +983,13 @@ SELECT
 FROM execution_target target
 LEFT JOIN discovered_model model ON model.id = target."discoveredModelId"
 LEFT JOIN provider_model ON provider_model.id = target."providerModelId"
-WHERE target."inferenceCapacityId" IS NULL
+WHERE target."inferenceCapacityId" IS NULL AND target."capacityAssignmentSource" = 'AUTO'
 ON CONFLICT ("userId", "runtimeIdentityKey") DO NOTHING;
 
 UPDATE execution_target target
    SET "inferenceCapacityId" = capacity.id
   FROM inference_capacity capacity
- WHERE target."inferenceCapacityId" IS NULL
+ WHERE target."inferenceCapacityId" IS NULL AND target."capacityAssignmentSource" = 'AUTO'
    AND capacity."userId" = target."userId"
    AND capacity."runtimeIdentityKey" = 'execution-target:' || target.id;
 
@@ -990,7 +999,7 @@ DECLARE
   model_name TEXT;
   capacity_id TEXT;
 BEGIN
-  IF NEW."inferenceCapacityId" IS NOT NULL THEN
+  IF NEW."inferenceCapacityId" IS NOT NULL OR NEW."capacityAssignmentSource" <> 'AUTO' THEN
     RETURN NEW;
   END IF;
   IF NEW."discoveredModelId" IS NOT NULL THEN
@@ -3089,7 +3098,7 @@ BEGIN
     ('endpoint', 'id,userId,cliDeviceId,slug', ''),
     ('discovered_model', 'id,userId,endpointId,upstreamModelId,encodedModelId,slug', ''),
     ('execution_target', 'id,userId,kind,discoveredModelId,providerModelId',
-      'inferenceCapacityId,directPriority,directConcurrencyLimit,directReservedSlots,directBorrowPolicy,directWaitBudgetMs,directContextCeiling,directContextMargin'),
+      'inferenceCapacityId,capacityAssignmentSource,capacityAutoConcurrencyLimit,directPriority,directConcurrencyLimit,directReservedSlots,directBorrowPolicy,directWaitBudgetMs,directContextCeiling,directContextMargin'),
     ('inference_capacity', 'id,userId,runtimeIdentityKey', 'hardConcurrencyLimit'),
     ('model_pool', 'id,userId,slug,transformerDiscoveredModelId',
       'capacityPriority,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMs,capacityContextCeiling,capacityContextMargin'),

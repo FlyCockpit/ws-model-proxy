@@ -12,14 +12,19 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 ## Discovery capacity lifecycle (#91, #114)
 
 Slot-sharing llama.cpp, vLLM and SGLang processes now share a capacity when the
-CLI reports multiple served aliases. Removed aliases split on the next inventory;
-Ollama, LM Studio, router mode, and owner assignments stay independent. Discovery
-moves take both capacity fences; live leases retain their original capacity and
-moved-target waiters are cancelled by runtime cleanup. Parent deletes remove empty
-AUTO discovery rows in the same transaction. Startup repairs existing idle orphans
-with bounded batches; owner-created empty rows remain. Automatic labels are
-disambiguated by an additive database trigger when an existing label collides;
-apply schema hardening before starting the new server. No destructive schema change is needed.
+CLI reports multiple served aliases. Owner assignments and explicit detach choices
+are durable per target, including assignments to existing AUTO capacities. Removed
+aliases split once idle; a move batch with ACTIVE leases or WAITING waiters is skipped
+and retried on inventory. Direct and effective pool concurrency/context policies must
+fit every destination. Shared AUTO limits follow engine slots, otherwise the current
+automatic member sum; inadmissible lowerings retain the existing limit. Parent deletes
+refresh surviving shared aggregates and remove empty AUTO discovery rows atomically.
+Startup repairs idle orphans in bounded batches and skips contended owners for retry.
+Shared AUTO limits with unknown values wait for a complete inventory aggregate.
+Owner-created empty rows remain. Automatic labels choose the lowest free numeric
+suffix even when a 120-character preferred label already ends in that suffix.
+Apply the schema and hardening before starting the new server; this adds target
+assignment provenance and automatic concurrency seed columns.
 
 ## Before you deploy
 

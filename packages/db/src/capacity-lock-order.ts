@@ -777,10 +777,19 @@ export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Pro
       select: { id: true },
     });
     const ids = capacities.map((capacity) => capacity.id);
-    await acquireFences(
-      tx,
-      ids.map((id) => fences.capacity(id)),
-    );
+    // Surviving shared members need policy fences for aggregate refresh
+    // after the cascade, before any graph row is locked or written.
+    const attached =
+      ids.length > 0
+        ? await tx.executionTarget.findMany({
+            where: { userId: scope.userId, inferenceCapacityId: { in: ids } },
+            select: { id: true },
+          })
+        : [];
+    await acquireFences(tx, [
+      ...attached.map((target) => fences.capacityPolicy(target.id)),
+      ...ids.map((id) => fences.capacity(id)),
+    ]);
     return ids;
   }
   // The whole-user cascade removes capacities; it needs no separate cleanup.

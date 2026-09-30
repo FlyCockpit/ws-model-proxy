@@ -57,7 +57,10 @@ import {
   effectiveProviderEgress,
   grantPoolAccessServerMessages,
 } from "../lib/effective-provider-egress";
-import { deleteOrphanAutoCapacities } from "../lib/engine-process-capacity";
+import {
+  deleteOrphanAutoCapacities,
+  refreshSharedAutoCapacities,
+} from "../lib/engine-process-capacity";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   lowestMcpCommandMode,
@@ -1348,6 +1351,7 @@ async function removeOwnedRow({
         throw deletionConflict("not_stale", "Endpoint is not stale.");
       }
       await tx.endpoint.delete({ where: { id } });
+      await refreshSharedAutoCapacities(tx, userId, orphanCapacityIds);
       await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
       return { deleted: true };
     }
@@ -1368,6 +1372,7 @@ async function removeOwnedRow({
       throw deletionConflict("not_stale", "Discovered model is not stale.");
     }
     await tx.discoveredModel.delete({ where: { id } });
+    await refreshSharedAutoCapacities(tx, userId, orphanCapacityIds);
     await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
     return { deleted: true };
   });
@@ -2248,9 +2253,9 @@ export const forwarderManagementRouter = {
           const target = providerTargetByModelId.get(provider.id);
           if (!target) throw new ORPCError("PRECONDITION_FAILED");
           if (!target.inferenceCapacityId)
-            await tx.executionTarget.update({
-              where: { id: target.id },
-              data: { inferenceCapacityId: capacity.id },
+            await tx.executionTarget.updateMany({
+              where: { id: target.id, inferenceCapacityId: null, capacityAssignmentSource: "AUTO" },
+              data: { inferenceCapacityId: capacity.id, capacityAssignmentSource: "OWNER" },
             });
           await tx.poolMember.create({
             data: {
@@ -3235,12 +3240,13 @@ export const forwarderManagementRouter = {
             executionTargetId: target.id,
             reportedConcurrency: null,
           });
-          await linkExecutionTargetCapacity(tx, {
+          const linked = await linkExecutionTargetCapacity(tx, {
             executionTargetId: target.id,
             userId,
             inferenceCapacityId,
           });
-          target.inferenceCapacityId = inferenceCapacityId;
+          if (linked) target.inferenceCapacityId = inferenceCapacityId;
+          else inferenceCapacityId = null;
         }
         const seedCandidates = new Map(
           declaredContext != null && inferenceCapacityId
@@ -3508,9 +3514,9 @@ export const forwarderManagementRouter = {
           select: { id: true },
         });
         if (!existingTarget?.inferenceCapacityId)
-          await tx.executionTarget.update({
-            where: { id: target.id },
-            data: { inferenceCapacityId: capacity.id },
+          await tx.executionTarget.updateMany({
+            where: { id: target.id, capacityAssignmentSource: "AUTO" },
+            data: { inferenceCapacityId: capacity.id, capacityAssignmentSource: "OWNER" },
           });
         const [reloadedProviderModel, reloadedPool, reloadedCapacity] = await Promise.all([
           tx.providerModel.findFirst({

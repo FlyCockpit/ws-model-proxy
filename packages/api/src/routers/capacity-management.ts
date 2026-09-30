@@ -19,6 +19,7 @@ import {
 } from "../lib/capacity-policy-safety";
 import { deletionConflict } from "../lib/deletion-conflict";
 import { enginePreset } from "../lib/engine-facts";
+import { refreshSharedAutoCapacities } from "../lib/engine-process-capacity";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -255,14 +256,7 @@ export const capacityManagementRouter = {
   }),
 
   update: protectedProcedure
-    .input(
-      z.object({
-        id,
-        ...Object.fromEntries(
-          Object.entries(capacityFields).map(([key, value]) => [key, value.optional()]),
-        ),
-      }),
-    )
+    .input(z.object(capacityFields).partial().extend({ id }))
     .handler(async ({ input, context }) => {
       const { id: capacityId, ...data } = input;
       const userId = context.session.user.id;
@@ -439,10 +433,31 @@ export const capacityManagementRouter = {
       async (tx) => {
         const candidate = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
-          select: { id: true, userId: true },
+          select: { id: true, userId: true, inferenceCapacityId: true },
         });
         if (!candidate || candidate.userId !== userId) return notFound();
-        await fenceExecutionTargetPolicies(tx, [candidate.id]);
+        const changedCapacityIds =
+          input.inferenceCapacityId !== undefined
+            ? [
+                ...new Set(
+                  [candidate.inferenceCapacityId, input.inferenceCapacityId].filter(
+                    (id): id is string => typeof id === "string",
+                  ),
+                ),
+              ]
+            : [];
+        const dependents =
+          changedCapacityIds.length > 0
+            ? await tx.executionTarget.findMany({
+                where: { userId, inferenceCapacityId: { in: changedCapacityIds } },
+                select: { id: true },
+              })
+            : [];
+        await acquireFences(tx, [
+          fences.capacityPolicy(candidate.id),
+          ...dependents.map((target) => fences.capacityPolicy(target.id)),
+          ...changedCapacityIds.map((id) => fences.capacity(id)),
+        ]);
         const target = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
           select: {
@@ -534,7 +549,16 @@ export const capacityManagementRouter = {
           });
         }
         const { executionTargetId, ...data } = input;
-        const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
+        const updated = await tx.executionTarget.update({
+          where: { id: executionTargetId },
+          data: {
+            ...data,
+            ...(input.inferenceCapacityId !== undefined
+              ? { capacityAssignmentSource: "OWNER" }
+              : {}),
+          },
+        });
+        await refreshSharedAutoCapacities(tx, userId, changedCapacityIds);
         await audit(tx, {
           userId,
           action: "UPDATE_POLICY",
