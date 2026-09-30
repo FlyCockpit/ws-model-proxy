@@ -32,7 +32,7 @@ fn harness_with(runtime: Arc<FileRuntime>, mode: McpCommandMode) -> Harness {
         let _ = tx.lock().expect("sink").send((op_id, frames));
     });
     Harness {
-        relay: FileRelay::new(runtime, mode, sink),
+        relay: FileRelay::new(runtime, mode, false, sink),
         rx,
     }
 }
@@ -82,8 +82,244 @@ fn admit_is_a_pure_table_over_mode_and_root() {
         (McpCommandMode::Supervised, &root, Err("supervised_only")),
     ];
     for (mode, policy, expected) in rows {
-        assert_eq!(admit(mode, policy), expected, "{mode:?}");
+        assert_eq!(
+            admit(
+                mode,
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                },
+                true,
+                false,
+                policy.roots_configured(),
+                policy.euid(),
+                policy.allow_root()
+            ),
+            expected,
+            "{mode:?}"
+        );
     }
+}
+
+#[test]
+fn read_grant_admit_matrix() {
+    for mode in [
+        McpCommandMode::Off,
+        McpCommandMode::Supervised,
+        McpCommandMode::Unsupervised,
+    ] {
+        for server_mode in [
+            McpCommandMode::Off,
+            McpCommandMode::Supervised,
+            McpCommandMode::Unsupervised,
+        ] {
+            for read in [false, true] {
+                for grant in [false, true] {
+                    for switch in [false, true] {
+                        for roots in [false, true] {
+                            for euid in [0, 1000] {
+                                for allow_root in [false, true] {
+                                    let effective = mode.min(server_mode);
+                                    let expected = if effective != McpCommandMode::Unsupervised
+                                        && !(read && grant && switch && roots)
+                                    {
+                                        Err(if effective == McpCommandMode::Supervised {
+                                            "supervised_only"
+                                        } else if server_mode == McpCommandMode::Off {
+                                            "grant_disabled"
+                                        } else {
+                                            "feature_disabled"
+                                        })
+                                    } else if euid == 0 && !allow_root {
+                                        Err("unsupported")
+                                    } else {
+                                        Ok(())
+                                    };
+                                    assert_eq!(
+                                        admit(
+                                            mode,
+                                            FilePermission {
+                                                mode: server_mode,
+                                                read_grant: grant
+                                            },
+                                            read,
+                                            switch,
+                                            roots,
+                                            euid,
+                                            allow_root
+                                        ),
+                                        expected,
+                                        "local={mode:?} server={server_mode:?} read={read} grant={grant} switch={switch} roots={roots} euid={euid} allow_root={allow_root}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn only_the_four_read_ops_are_read_class() {
+    for op in ["read", "stat", "list", "search"] {
+        assert!(is_read_op(op), "{op}");
+    }
+    for op in [
+        "edit", "write", "rename", "mkdir", "delete", "", "READ", "read ", "unknown",
+    ] {
+        assert!(!is_read_op(op), "{op:?}");
+    }
+    assert_eq!(OPS.iter().filter(|op| is_read_op(op)).count(), 4);
+}
+
+#[test]
+fn read_grant_admit_literal_rows() {
+    use McpCommandMode::{Off, Supervised, Unsupervised};
+    // (local, server, read, grant, switch, roots) -> result, at euid 1000.
+    let rows = [
+        (Supervised, Unsupervised, true, true, true, true, Ok(())),
+        (Off, Unsupervised, true, true, true, true, Ok(())),
+        (
+            Supervised,
+            Unsupervised,
+            false,
+            true,
+            true,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Off,
+            Unsupervised,
+            false,
+            true,
+            true,
+            true,
+            Err("feature_disabled"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            false,
+            true,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            true,
+            false,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            true,
+            true,
+            false,
+            Err("supervised_only"),
+        ),
+        (Unsupervised, Off, true, true, true, true, Ok(())),
+        (
+            Unsupervised,
+            Off,
+            true,
+            false,
+            true,
+            true,
+            Err("grant_disabled"),
+        ),
+        (
+            Unsupervised,
+            Unsupervised,
+            false,
+            false,
+            false,
+            false,
+            Ok(()),
+        ),
+    ];
+    for (local, server, read, grant, switch, roots, expected) in rows {
+        let permission = FilePermission {
+            mode: server,
+            read_grant: grant,
+        };
+        assert_eq!(
+            admit(local, permission, read, switch, roots, 1000, false),
+            expected,
+            "{local:?} {server:?} read={read} grant={grant} switch={switch} roots={roots}"
+        );
+    }
+}
+
+#[test]
+fn local_read_consent_and_roots_are_rechecked_for_server_requests() {
+    let dir = tempfile::tempdir().expect("root");
+    let path = dir.path().join("plain.txt");
+    std::fs::write(&path, "plain").expect("file");
+    for mode in [McpCommandMode::Off, McpCommandMode::Supervised] {
+        for switch in [false, true] {
+            for roots in [false, true] {
+                let policy = Policy::from_environment(
+                    if roots {
+                        vec![dir.path().to_path_buf()]
+                    } else {
+                        vec![]
+                    },
+                    false,
+                )
+                .with_euid(1000);
+                let mut harness = harness_with(
+                    Arc::new(FileRuntime::new(FileOps::new(policy, EtagKey::random()))),
+                    mode,
+                );
+                harness.relay.read_switch = switch;
+                let frames = harness.relay.handle_op(
+                    &op_id(80),
+                    "read",
+                    json!({"path":path}),
+                    None,
+                    FilePermission {
+                        mode: McpCommandMode::Unsupervised,
+                        read_grant: true,
+                    },
+                );
+                if switch && roots {
+                    assert!(frames.is_empty());
+                    assert_eq!(only_control(&harness.settled().1)["type"], "file.result");
+                } else {
+                    assert_eq!(
+                        only_control(&frames)["reason"],
+                        if mode == McpCommandMode::Off {
+                            "feature_disabled"
+                        } else {
+                            "supervised_only"
+                        }
+                    );
+                }
+            }
+        }
+    }
+    // Server lowers an unsupervised CLI to off without read permission.
+    let mut harness = harness();
+    let frames = harness.relay.handle_op(
+        &op_id(81),
+        "read",
+        json!({"path":path}),
+        None,
+        FilePermission {
+            mode: McpCommandMode::Off,
+            read_grant: false,
+        },
+    );
+    assert_eq!(only_control(&frames)["reason"], "grant_disabled");
 }
 
 #[test]
@@ -100,6 +336,10 @@ fn a_supervised_or_off_config_refuses_a_server_op_and_touches_nothing() {
             "mkdir",
             json!({ "path": path_str(&target) }),
             None,
+            FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
         );
         assert_eq!(
             only_control(&frames),
@@ -121,6 +361,10 @@ fn euid_zero_is_refused_unless_allowed() {
         "mkdir",
         json!({ "path": path_str(&target) }),
         None,
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     assert_eq!(only_control(&frames)["reason"], "unsupported");
     assert!(!target.exists());
@@ -133,7 +377,11 @@ fn euid_zero_is_refused_unless_allowed() {
                 &op_id(2),
                 "mkdir",
                 json!({ "path": path_str(&target) }),
-                None
+                None,
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                }
             )
             .is_empty()
     );
@@ -180,7 +428,16 @@ fn malformed_ops_are_bad_frame_and_never_run() {
     let mut harness = harness();
     for (index, (name, op, args, body)) in rows.into_iter().enumerate() {
         let id = op_id(10 + index as u8);
-        let frames = harness.relay.handle_op(&id, op, args, body);
+        let frames = harness.relay.handle_op(
+            &id,
+            op,
+            args,
+            body,
+            FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
+        );
         assert_eq!(
             only_control(&frames),
             json!({ "type": "file.rejected", "opId": id, "reason": "bad_frame" }),
@@ -193,9 +450,138 @@ fn malformed_ops_are_bad_frame_and_never_run() {
     assert!(
         harness
             .relay
-            .handle_op("short", "read", json!({ "path": file }), None)
+            .handle_op(
+                "short",
+                "read",
+                json!({ "path": file }),
+                None,
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                }
+            )
             .is_empty()
     );
+}
+
+/// The wire refusal set, mirrored by `FILE_WIRE_REASONS` in
+/// `apps/server/src/relay/file-protocol.ts`: every one must parse there, and
+/// `admit` must only ever produce a member. Pinned so a new reason cannot be
+/// added on one side only.
+#[test]
+fn wire_refusal_reasons_are_pinned_and_admit_only_produces_members() {
+    assert_eq!(
+        WIRE_REFUSAL_REASONS,
+        [
+            "bad_frame",
+            "supervised_only",
+            "grant_disabled",
+            "feature_disabled"
+        ]
+    );
+    // Every refusal `handle_op`/`admit` can emit, over the full consent table.
+    // `unsupported` is a file error code (root without consent), accepted by
+    // the server's union but NOT a wire reason the server enumerates
+    // separately; the rest must be in WIRE_REFUSAL_REASONS.
+    let file_error_codes = [
+        crate::file_ops::ErrorCode::Unsupported.as_str(),
+        crate::file_ops::ErrorCode::Limit.as_str(),
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for mode in [
+        McpCommandMode::Off,
+        McpCommandMode::Supervised,
+        McpCommandMode::Unsupervised,
+    ] {
+        for (server_mode, read, grant, switch, roots, euid, allow_root) in [
+            (
+                McpCommandMode::Unsupervised,
+                true,
+                false,
+                false,
+                false,
+                1000,
+                false,
+            ),
+            (
+                McpCommandMode::Supervised,
+                true,
+                true,
+                true,
+                true,
+                1000,
+                false,
+            ),
+            (McpCommandMode::Off, false, true, true, true, 1000, false),
+            (
+                McpCommandMode::Unsupervised,
+                false,
+                false,
+                false,
+                false,
+                0,
+                false,
+            ),
+        ] {
+            if let Err(reason) = admit(
+                mode,
+                FilePermission {
+                    mode: server_mode,
+                    read_grant: grant,
+                },
+                read,
+                switch,
+                roots,
+                euid,
+                allow_root,
+            ) {
+                assert!(
+                    WIRE_REFUSAL_REASONS.contains(&reason) || file_error_codes.contains(&reason),
+                    "{reason} is neither a wire refusal nor a file error code"
+                );
+                seen.push(reason);
+            }
+        }
+    }
+    for expected in [
+        "supervised_only",
+        "grant_disabled",
+        "feature_disabled",
+        "unsupported",
+    ] {
+        assert!(seen.contains(&expected), "{expected} never produced");
+    }
+}
+
+#[test]
+fn every_refuse_reason_is_a_pinned_wire_reason_or_a_file_error_code() {
+    // The reasons `refuse` is called with, read out of the module source so a
+    // NEW call site cannot slip in without updating the pin. The server accepts
+    // the union of FILE_WIRE_REASONS and FILE_ERROR_CODES; a reason outside it
+    // makes the server fail the strict schema and settle the op as io_error.
+    assert_eq!(
+        REFUSE_REASONS,
+        [
+            "bad_frame",
+            "supervised_only",
+            "grant_disabled",
+            "feature_disabled",
+            "unsupported",
+            "limit",
+        ]
+    );
+    let file_error_codes = [
+        crate::file_ops::ErrorCode::Unsupported.as_str(),
+        crate::file_ops::ErrorCode::Limit.as_str(),
+    ];
+    for reason in REFUSE_REASONS {
+        assert!(
+            WIRE_REFUSAL_REASONS.contains(&reason) || file_error_codes.contains(&reason),
+            "{reason} is neither a wire refusal nor a file error code"
+        );
+    }
+    // `refuse` asserts this same set at runtime, so every exercised refusal path
+    // (malformed frame, the pending cap, each `admit` reason) is covered.
 }
 
 #[test]
@@ -221,7 +607,16 @@ fn a_read_returns_a_result_frame_with_the_etag() {
     assert!(
         harness
             .relay
-            .handle_op(&op_id(4), "read", json!({ "path": path_str(&file) }), None)
+            .handle_op(
+                &op_id(4),
+                "read",
+                json!({ "path": path_str(&file) }),
+                None,
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                }
+            )
             .is_empty()
     );
     let (id, frames, current) = harness.settled();
@@ -251,6 +646,10 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
         "delete",
         json!({ "path": path_str(&file), "expectedEtag": "h:AAAAAAAAAAAAAAAAAAAAAA" }),
         None,
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     let (_, frames, _) = harness.settled();
     let frame = only_control(&frames);
@@ -287,6 +686,39 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
 }
 
 #[test]
+fn uncertain_outcome_recovery_facts_survive_the_detail_filter_as_a_pair() {
+    let facts = json!({ "recovery": "/w/.wsmp-recover-AAAAAAAAAA", "kept": ["/w/.wsmp-recover-AAAAAAAAAA/slot-1"] });
+    assert_eq!(filter_detail(&facts), Some(facts.clone()));
+    // the whole wire path: the error's detail reaches the rejected frame
+    let error = ErrorCode::UncertainOutcome;
+    let (frames, code) = frames_for(
+        "op",
+        "edit",
+        Err(FileError::new(error, "uncertain").with_detail(facts.clone())),
+    );
+    assert_eq!(code, "uncertain_outcome");
+    let frame = only_control(&frames);
+    assert_eq!(frame["reason"], "uncertain_outcome");
+    assert_eq!(frame["detail"], facts);
+    // the server accepts the facts only together and only as bounded absolute paths
+    assert_eq!(filter_detail(&json!({ "recovery": "/w/r" })), None);
+    assert_eq!(filter_detail(&json!({ "kept": ["/w/r/slot-1"] })), None);
+    assert_eq!(
+        filter_detail(&json!({ "recovery": "relative", "kept": ["/w/r/slot-1"] })),
+        None
+    );
+    assert_eq!(
+        filter_detail(&json!({ "recovery": "/w/r", "kept": ["/a", "/b", "/c", "/d", "/e"] })),
+        None
+    );
+    let long = format!("/{}", "a".repeat(8192));
+    assert_eq!(
+        filter_detail(&json!({ "recovery": long, "kept": ["/w/r/slot-1"] })),
+        None
+    );
+}
+
+#[test]
 fn a_write_waits_for_its_body_then_runs_with_base64_content() {
     let dir = tempfile::tempdir().expect("dir");
     let file = dir.path().join("w.bin");
@@ -300,6 +732,10 @@ fn a_write_waits_for_its_body_then_runs_with_base64_content() {
                 "write",
                 json!({ "path": path_str(&file) }),
                 Some(content.len()),
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                }
             )
             .is_empty()
     );
@@ -337,6 +773,10 @@ fn a_body_of_the_wrong_size_is_bad_frame_and_writes_nothing() {
             "write",
             json!({ "path": path_str(&file) }),
             Some(5),
+            FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
         );
         let frames = harness.relay.handle_body(&op_id(7), body.to_vec());
         assert_eq!(
@@ -358,6 +798,10 @@ fn a_write_whose_body_never_arrives_expires() {
         "write",
         json!({ "path": path_str(&file) }),
         Some(2),
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     assert!(harness.relay.expire_stale(Instant::now()).is_empty());
     let frames = harness.relay.expire_stale(Instant::now() + BODY_WAIT);
@@ -384,6 +828,10 @@ fn a_marker_in_write_content_is_still_refused_after_injection() {
         "write",
         json!({ "path": path_str(&file) }),
         Some(body.len()),
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     harness.relay.handle_body(&op_id(9), body);
     let (_, frames, _) = harness.settled();
@@ -402,8 +850,7 @@ fn a_result_over_48_kib_spills_its_text_into_a_file_data_frame() {
         &op_id(20),
         "read",
         json!({ "path": path_str(&file), "maxLines": 2000, "maxBytes": 131072, "lineNumbers": false }),
-        None,
-    );
+        None, FilePermission { mode: McpCommandMode::Unsupervised, read_grant: false });
     let (_, frames, current) = harness.settled();
     assert!(current);
     assert_eq!(frames.len(), 2, "{frames:?}");
@@ -515,9 +962,16 @@ fn cancelling_before_the_commit_point_leaves_the_file_alone_and_drops_the_result
         McpCommandMode::Unsupervised,
     );
     // The etag key is per runtime: read through this one.
-    harness
-        .relay
-        .handle_op(&op_id(30), "read", json!({ "path": path_str(&file) }), None);
+    harness.relay.handle_op(
+        &op_id(30),
+        "read",
+        json!({ "path": path_str(&file) }),
+        None,
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
+    );
     let (_, frames, _) = harness.settled();
     let etag = only_control(&frames)["result"]["etag"]
         .as_str()
@@ -529,6 +983,10 @@ fn cancelling_before_the_commit_point_leaves_the_file_alone_and_drops_the_result
         "write",
         json!({ "path": path_str(&file), "ifExists": "replace", "expectedEtag": etag }),
         Some(3),
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     harness.relay.handle_body(&op_id(32), b"new".to_vec());
     {
@@ -567,6 +1025,10 @@ fn dropping_the_session_cancels_every_pending_op() {
         "write",
         json!({ "path": path_str(&file) }),
         Some(2),
+        FilePermission {
+            mode: McpCommandMode::Unsupervised,
+            read_grant: false,
+        },
     );
     let cancel = harness
         .relay
@@ -647,4 +1109,22 @@ fn summaries_show_paths_but_never_content() {
     let write = summarize("write", &json!({ "path": "/w", "reason": "r" }));
     assert_eq!((write.op.as_str(), write.target.as_str()), ("write", "/w"));
     assert_eq!(summarize("bogus", &json!({})).op, "unknown");
+}
+
+#[test]
+fn shared_runtime_keeps_configured_roots() {
+    let dir = tempfile::tempdir().expect("root");
+    let runtime = shared_runtime(true, &[dir.path().to_path_buf()]);
+    assert!(runtime.policy().roots_configured());
+    assert_eq!(
+        runtime
+            .policy()
+            .check_path(
+                crate::file_ops::policy::Access::Read,
+                std::path::Path::new("/outside/plain")
+            )
+            .expect_err("outside root")
+            .code,
+        ErrorCode::PathDenied
+    );
 }

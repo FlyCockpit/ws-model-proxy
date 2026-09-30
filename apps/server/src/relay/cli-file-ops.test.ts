@@ -1,4 +1,5 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -12,6 +13,7 @@ import {
   parseRelayBinaryFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
 } from "./protocol.js";
+import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -37,6 +39,7 @@ const { relaySessionManager } = await import("./session-manager.js");
 const {
   auditRefusedFileInput,
   cancelFileOpsForToken,
+  cancelFileOpsForUser,
   FILE_MUTATIONS_PER_MINUTE_PER_USER,
   FILE_OP_DEADLINE_MS,
   FILE_OPS_PER_CLI,
@@ -126,7 +129,7 @@ function uncompressedKey(): string {
 
 type Mode = "off" | "supervised" | "unsupervised";
 
-function hello(slug: string, mode: Mode) {
+function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
@@ -155,8 +158,8 @@ function hello(slug: string, mode: Mode) {
           terminalApproval: false,
           terminalSupported: false,
           remoteMetricSources: false,
-          mcpFileRead: false,
-          fileRootsConfigured: false,
+          mcpFileRead: readSwitch,
+          fileRootsConfigured: roots,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
@@ -170,10 +173,15 @@ function hello(slug: string, mode: Mode) {
   });
 }
 
-async function connect(slug = "desktop", mode: Mode = "unsupervised") {
+async function connect(
+  slug = "desktop",
+  mode: Mode = "unsupervised",
+  readSwitch = false,
+  roots = false,
+) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, mode), now);
+  await relaySessionManager.handleTextFrame(socket, hello(slug, mode, readSwitch, roots), now);
   socket.sends.length = 0;
   return socket;
 }
@@ -181,6 +189,7 @@ async function connect(slug = "desktop", mode: Mode = "unsupervised") {
 async function resetRelaySessions() {
   await relaySessionManager.closeRelaySessions();
   Reflect.set(relaySessionManager, "relayDrain", false);
+  Reflect.set(relaySessionManager, "latestGenerationByCliDeviceId", new Map<string, number>());
 }
 
 function deviceRow(mode: "OFF" | "SUPERVISED" | "UNSUPERVISED", extra: object = {}) {
@@ -242,6 +251,16 @@ function flush() {
   return new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function lastOpId(socket: FakeSocket): string {
   const frames = socket.frames("file.op");
   const opId = frames[frames.length - 1]?.opId;
@@ -251,6 +270,8 @@ function lastOpId(socket: FakeSocket): string {
 
 describe("cli file ops", () => {
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
     audit.record.mockClear();
     resetFileOpsForTests();
     resetCliAgentAdmissionsForTests();
@@ -293,6 +314,750 @@ describe("cli file ops", () => {
     db.poolMember.findMany.mockResolvedValue([]);
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
     db.inferenceCapacity.findMany.mockResolvedValue([]);
+  });
+
+  const readGrantMatrix = [];
+  for (const mode of ["off", "supervised", "unsupervised"] as const)
+    for (const server of [false, true])
+      for (const live of [false, true])
+        for (const roots of [false, true])
+          for (const op of ["read", "edit"] as const) {
+            const code =
+              mode === "unsupervised" || (op === "read" && server && live && roots)
+                ? null
+                : mode === "supervised"
+                  ? "supervised_only"
+                  : // Off: the dashboard grant is what refuses without it; with it, the missing
+                    // CLI switch or roots is the CLI's own config.
+                    server && op === "read"
+                    ? "feature_disabled"
+                    : "grant_disabled";
+            readGrantMatrix.push({ mode, server, live, roots, op, code });
+          }
+  it.each(readGrantMatrix)(
+    "read grant admission $mode $op server=$server live=$live roots=$roots",
+    async ({ mode, server, live, roots, op, code }) => {
+      const dbMode = mode === "off" ? "OFF" : mode === "supervised" ? "SUPERVISED" : "UNSUPERVISED";
+      db.cliDevice.findUnique.mockImplementation(deviceRow(dbMode, { mcpFileRead: server }));
+      const socket = await connect("desktop", mode, live, roots);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: mode,
+        mcpFileRead: server,
+      });
+      const outcome = start(socket, op, op === "read" ? readArgs : editArgs);
+      await flush();
+      if (code) {
+        await expect(outcome).resolves.toEqual({ ok: false, code });
+        expect(socket.frames("file.op")).toEqual([]);
+      } else {
+        expect(socket.frames("file.op").at(-1)).toMatchObject({
+          mode,
+          readGrant: server && live && roots,
+        });
+        await answer(
+          socket,
+          resultFor(
+            lastOpId(socket),
+            op,
+            op === "read"
+              ? readResult
+              : {
+                  etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+                  previousEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+                  added: 1,
+                  removed: 1,
+                  applied: true,
+                },
+          ),
+        );
+        await expect(outcome).resolves.toMatchObject({ ok: true, op });
+      }
+    },
+  );
+
+  describe("each read-grant site decides from its own source", () => {
+    const liveOf = () => {
+      const real = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
+      if (!real) throw new Error("no live snapshot");
+      return real;
+    };
+
+    it("admission reads the dashboard grant from the database, not the session copy", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: false }));
+      const socket = await connect("desktop", "off", true, true);
+      // The session still holds a stale `true` (a revoke has not been applied yet).
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      await expect(start(socket, "read", readArgs)).resolves.toEqual({
+        ok: false,
+        code: "grant_disabled",
+      });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("admission reads the live roots report from the connection", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: true }));
+      const socket = await connect("desktop", "off", true, true);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      const live = liveOf();
+      vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
+        new Map([["desktop", { ...live, fileRootsConfigured: false }]]),
+      );
+      await expect(start(socket, "read", readArgs)).resolves.toEqual({
+        ok: false,
+        code: "feature_disabled",
+      });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it.each(["OFF", "SUPERVISED"] as const)(
+      "a granted read on a %s device blames the CLI's absence, not the dashboard",
+      async (grant) => {
+        db.cliDevice.findUnique.mockImplementation(deviceRow(grant, { mcpFileRead: true }));
+        await expect(
+          runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+        ).resolves.toEqual({ ok: false, code: "offline" });
+        db.cliDevice.findUnique.mockImplementation(
+          deviceRow(grant, { mcpFileRead: true, rejectedRelayProtocolVersion: "2.7" }),
+        );
+        await expect(
+          runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+        ).resolves.toMatchObject({
+          ok: false,
+          code: "upgrade_required",
+        });
+      },
+    );
+
+    it("the dispatch gate re-checks roots on the session even when admission passed", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: true }));
+      const socket = await connect("desktop", "off", true, false);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      const live = liveOf();
+      vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
+        new Map([["desktop", { ...live, fileRootsConfigured: true }]]),
+      );
+      const outcome = await start(socket, "read", readArgs);
+      expect(outcome).toMatchObject({ ok: false });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+  });
+
+  it.each(["off", "supervised", "unsupervised"] as const)(
+    "grant-off sweep on %s cancels only reads that lose permission",
+    async (mode) => {
+      const dbMode = mode === "off" ? "OFF" : mode === "supervised" ? "SUPERVISED" : "UNSUPERVISED";
+      db.cliDevice.findUnique.mockImplementation(deviceRow(dbMode, { mcpFileRead: true }));
+      const socket = await connect("desktop", mode, true, true);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: mode,
+        mcpFileRead: true,
+      });
+      const outcome = start(socket, "read", readArgs);
+      await flush();
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: mode,
+        mcpFileRead: false,
+      });
+      if (mode === "unsupervised") {
+        expect(socket.frames("file.cancel")).toEqual([]);
+        await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(outcome).resolves.toMatchObject({ ok: true });
+      } else {
+        expect(socket.frames("file.cancel")).toHaveLength(1);
+        await expect(outcome).resolves.toEqual({
+          ok: false,
+          code: mode === "off" ? "grant_disabled" : "supervised_only",
+        });
+      }
+    },
+  );
+
+  describe("effective mode is the lowest of the dashboard and the CLI's own", () => {
+    const modes: Mode[] = ["off", "supervised", "unsupervised"];
+    const rank = { off: 0, supervised: 1, unsupervised: 2 } as const;
+    const cells: Array<{
+      dash: Mode;
+      cli: Mode;
+      server: boolean;
+      live: boolean;
+      roots: boolean;
+    }> = [];
+    for (const dash of modes)
+      for (const cli of modes)
+        for (const server of [false, true])
+          for (const live of [false, true])
+            for (const roots of [false, true]) cells.push({ dash, cli, server, live, roots });
+    it.each(cells)(
+      "read: dashboard $dash, CLI $cli, server=$server live=$live roots=$roots",
+      async ({ dash, cli, server, live, roots }) => {
+        const dbMode = dash.toUpperCase() as "OFF" | "SUPERVISED" | "UNSUPERVISED";
+        db.cliDevice.findUnique.mockImplementation(deviceRow(dbMode, { mcpFileRead: server }));
+        const socket = await connect("desktop", cli, live, roots);
+        relaySessionManager.applyFeatureGrants("desktop", {
+          allowHumanTerminal: false,
+          mcpCommandMode: dash,
+          mcpFileRead: server,
+        });
+        const effective = rank[dash] < rank[cli] ? dash : cli;
+        const runs = effective === "unsupervised" || (server && live && roots);
+        // Admission decides on its own, not only through the dispatch gate behind it.
+        const verdict = judgeCliAgentAdmission(
+          await readCliAgentAdmission({ ...OP_TOKEN, cliDeviceId: "desktop" }),
+          "file_read",
+        );
+        expect(verdict.ok).toBe(runs);
+        const outcome = start(socket, "read", readArgs);
+        await flush();
+        if (runs) {
+          expect(socket.frames("file.op").at(-1)).toMatchObject({
+            mode: effective,
+            readGrant: server && live && roots,
+          });
+          await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+          await expect(outcome).resolves.toMatchObject({ ok: true });
+        } else {
+          // Nothing reaches the CLI, whatever the CLI's own mode says.
+          expect(socket.frames("file.op")).toEqual([]);
+          const result = await outcome;
+          expect(result).toMatchObject({ ok: false });
+          if (!server && dash !== "unsupervised") {
+            expect(result).toMatchObject({
+              code: dash === "off" ? "grant_disabled" : "supervised_only",
+            });
+          }
+        }
+      },
+    );
+
+    it.each(["off", "supervised"] as const)(
+      "narrowing the dashboard to %s cancels a read that only the dashboard mode allowed",
+      async (narrowed) => {
+        // The CLI is unsupervised with its read switch off: the read runs on mode alone.
+        db.cliDevice.findUnique.mockImplementation(
+          deviceRow("UNSUPERVISED", { mcpFileRead: true }),
+        );
+        const socket = await connect("desktop", "unsupervised", false, false);
+        relaySessionManager.applyFeatureGrants("desktop", {
+          allowHumanTerminal: false,
+          mcpCommandMode: "unsupervised",
+          mcpFileRead: true,
+        });
+        const outcome = start(socket, "read", readArgs);
+        await flush();
+        expect(socket.frames("file.op")).toHaveLength(1);
+        relaySessionManager.applyFeatureGrants("desktop", {
+          allowHumanTerminal: false,
+          mcpCommandMode: narrowed,
+          mcpFileRead: true,
+        });
+        expect(socket.frames("file.cancel")).toHaveLength(1);
+        await expect(outcome).resolves.toMatchObject({ ok: false });
+      },
+    );
+  });
+
+  describe("post-commit device grant refresh", () => {
+    const policy = (mode: Mode, mcpFileRead: boolean) => ({
+      id: "desktop",
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: mode.toUpperCase(),
+      mcpFileRead,
+    });
+    const queue = () =>
+      Reflect.get(relaySessionManager, "featureGrantsRefreshByCliDeviceId") as Map<
+        string,
+        Promise<void>
+      >;
+
+    async function grantedRead(mode: Mode) {
+      db.cliDevice.findUnique.mockResolvedValue(policy(mode, true));
+      db.mcpPersonalToken.findFirst.mockResolvedValue({
+        ...liveToken(),
+        allowCliCommands: false,
+        allowCliFileRead: true,
+        scopes: ["mcp:read"],
+      });
+      const socket = await connect("desktop", mode, true, true);
+      await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await flush();
+      expect(socket.frames("file.op")).toHaveLength(1);
+      return { socket, outcome, opId: lastOpId(socket) };
+    }
+
+    // Missing rows already failed closed; pin that default alongside read errors.
+    it.each(
+      (["off", "supervised", "unsupervised"] as const).flatMap((mode) =>
+        (["throws", "missing"] as const).map((failure) => ({ mode, failure })),
+      ),
+    )(
+      "$failure refresh on $mode withdraws authority and recovers on retry",
+      async ({ mode, failure }) => {
+        const { socket, outcome, opId } = await grantedRead(mode);
+        const metrics = vi.spyOn(relaySessionManager, "onRemoteMetricSourcesChanged");
+        // Durable revocation precedes the hook, but its policy read is unavailable.
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+        if (failure === "throws")
+          db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+        else db.cliDevice.findUnique.mockResolvedValueOnce(null);
+        const refresh = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        if (failure === "throws") await expect(refresh).rejects.toThrow("db down");
+        else await refresh;
+        expect(metrics).toHaveBeenCalledTimes(1);
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe("grant_disabled");
+        expect(queue().size).toBe(0);
+        await answer(socket, resultFor(opId, "read", readResult));
+        expect(audit.record).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenLastCalledWith(
+          expect.objectContaining({ outcome: "cancelled", reason: "grant_disabled" }),
+        );
+
+        db.cliDevice.findUnique.mockResolvedValue(policy(mode, true));
+        await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        const retry = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        expect(socket.frames("file.op")).toHaveLength(2);
+        await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(retry).resolves.toMatchObject({ ok: true });
+        expect(metrics).toHaveBeenCalledTimes(2);
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    // These legitimate rows pin the existing verdict-based reconciliation
+    // through the refresh hook, including unchanged unsupervised permission.
+    it.each([
+      { mode: "off", readGrant: true, refusal: null },
+      { mode: "off", readGrant: false, refusal: "grant_disabled" },
+      { mode: "supervised", readGrant: false, refusal: "supervised_only" },
+      { mode: "unsupervised", readGrant: false, refusal: null },
+    ] as const)(
+      "successful $mode refresh readGrant=$readGrant cancels only lost permission",
+      async ({ mode, readGrant, refusal }) => {
+        const { socket, outcome, opId } = await grantedRead(mode);
+        db.cliDevice.findUnique.mockResolvedValue(policy(mode, readGrant));
+        await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        expect(socket.frames("file.cancel")).toHaveLength(refusal === null ? 0 : 1);
+        await answer(socket, resultFor(opId, "read", readResult));
+        await expect(outcome).resolves.toMatchObject(
+          refusal === null ? { ok: true } : { ok: false, code: refusal },
+        );
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    it.each(
+      ([false, true] as const).flatMap((latestGrant) =>
+        (["A-first", "B-first"] as const).map((completionOrder) => ({
+          latestGrant,
+          completionOrder,
+        })),
+      ),
+    )(
+      "serializes $completionOrder reads, retaining latestGrant=$latestGrant",
+      async ({ latestGrant, completionOrder }) => {
+        const { socket, outcome, opId } = await grantedRead("off");
+        const metrics = vi
+          .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+          .mockResolvedValue(false);
+        const firstRead = deferred<ReturnType<typeof policy>>();
+        const secondRead = deferred<ReturnType<typeof policy>>();
+        db.cliDevice.findUnique.mockClear();
+        db.cliDevice.findUnique
+          .mockImplementationOnce(() => firstRead.promise)
+          .mockImplementationOnce(() => secondRead.promise);
+        const first = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        await flush();
+        const second = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        await flush();
+        // B must not even start its DB read while A owns the device queue.
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(1);
+        if (completionOrder === "B-first") secondRead.resolve(policy("off", latestGrant));
+        firstRead.resolve(policy("off", !latestGrant));
+        await first;
+        if (completionOrder === "A-first") {
+          // A's cleanup must not delete B's still-pending tail.
+          await flush();
+          expect(queue().has("desktop")).toBe(true);
+          secondRead.resolve(policy("off", latestGrant));
+        }
+        await second;
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(2);
+        expect(metrics).toHaveBeenCalledTimes(2);
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(
+          latestGrant ? null : "grant_disabled",
+        );
+        // Either A or B withdrew the grant; an old pending result stays cancelled
+        // even when the latest commit legitimately re-enables new operations.
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+        await answer(socket, resultFor(opId, "read", readResult));
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", latestGrant));
+        const next = runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs });
+        await flush();
+        expect(socket.frames("file.op")).toHaveLength(latestGrant ? 2 : 1);
+        if (latestGrant) await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(next).resolves.toMatchObject(
+          latestGrant ? { ok: true } : { ok: false, code: "grant_disabled" },
+        );
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    it("a rejected tail releases the next refresh and keeps other devices independent", async () => {
+      const { socket, outcome, opId } = await grantedRead("off");
+      const metrics = vi
+        .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+        .mockResolvedValue(false);
+      const failedRead = deferred<ReturnType<typeof policy>>();
+      const retryRead = deferred<ReturnType<typeof policy>>();
+      db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) =>
+        args.where.id === "desktop" ? retryRead.promise : Promise.resolve(policy("off", false)),
+      );
+      db.cliDevice.findUnique.mockImplementationOnce(() => failedRead.promise);
+      const failed = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      const rejected = expect(failed).rejects.toThrow("db down");
+      await flush();
+      const retry = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      await relaySessionManager.onCliFeatureGrantsChanged("other-device");
+      expect(queue().has("desktop")).toBe(true);
+      expect(queue().has("other-device")).toBe(false);
+      failedRead.reject(new Error("db down"));
+      await rejected;
+      await flush();
+      expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+      await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+      expect(queue().has("desktop")).toBe(true);
+      retryRead.resolve(policy("off", true));
+      await retry;
+      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(null);
+      expect(metrics).toHaveBeenCalledTimes(3);
+      expect(queue().size).toBe(0);
+    });
+
+    // C2a-1: hold a COMMITTED registration result, not its transaction's read.
+    // Revocation finishes before the old hello installs; recovery must honor
+    // the latest durable row and never revive admissions opened before revoke.
+    it.each([
+      { initialMode: "off", recovery: "revoked" },
+      { initialMode: "unsupervised", recovery: "revoked" },
+      { initialMode: "off", recovery: "enabled" },
+      { initialMode: "unsupervised", recovery: "enabled" },
+      { initialMode: "off", recovery: "throws" },
+      { initialMode: "off", recovery: "missing" },
+    ] as const)(
+      "delayed hello $initialMode with $recovery recovery fences stale authority",
+      async ({ initialMode, recovery }) => {
+        const { socket, outcome, opId } = await grantedRead(initialMode);
+        const metrics = vi
+          .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+          .mockResolvedValue(false);
+        const logger = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        const ownerRead = deferred<{ slug: string }>();
+        db.user.findUnique.mockImplementationOnce(() => ownerRead.promise);
+        const paused = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        expect(openCliAgentAdmissionCountForTests()).toBe(1);
+
+        db.cliDevice.upsert.mockResolvedValue({
+          ...policy(initialMode, true),
+          slug: "desktop",
+          allowHumanTerminal: true,
+          connectionGeneration: 2,
+        });
+        const committed = deferred<void>();
+        const release = deferred<void>();
+        db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+          const snapshot = await callback(db);
+          committed.resolve();
+          await release.promise;
+          return snapshot;
+        });
+        const replacement = new FakeSocket();
+        relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
+        const reconnect = relaySessionManager.handleTextFrame(
+          replacement,
+          hello("desktop", initialMode, true, true),
+          now,
+        );
+        await committed.promise;
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+        await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+
+        const recoveryRead = deferred<ReturnType<typeof policy> | null>();
+        db.cliDevice.findUnique.mockImplementationOnce(() => recoveryRead.promise);
+        release.resolve();
+        await reconnect;
+        expect(replacement.frames("hello.ok")).toHaveLength(1);
+        expect(socket.closes).toContainEqual({ code: 1000, reason: "replaced" });
+        expect(queue().has("desktop")).toBe(true);
+        const session = Reflect.get(relaySessionManager, "sessionsByCliDeviceId").get("desktop");
+        expect(session).toMatchObject({
+          allowHumanTerminal: false,
+          mcpCommandMode: "off",
+          mcpFileRead: false,
+        });
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe("grant_disabled");
+        const recoveryTail = queue().get("desktop");
+        expect(recoveryTail).toBeDefined();
+        const observedTail = recoveryTail?.catch(() => undefined);
+        if (recovery === "throws") recoveryRead.reject(new Error("db down"));
+        else if (recovery === "missing") recoveryRead.resolve(null);
+        else
+          recoveryRead.resolve({
+            ...policy(recovery === "enabled" ? initialMode : "off", recovery === "enabled"),
+            allowHumanTerminal: recovery === "enabled",
+          });
+        await observedTail;
+        await flush();
+        expect(queue().size).toBe(0);
+        expect(metrics).toHaveBeenCalledTimes(2);
+        expect(logger).toHaveBeenCalledTimes(recovery === "throws" ? 1 : 0);
+        expect(session).toMatchObject({
+          allowHumanTerminal: recovery === "enabled",
+          mcpCommandMode: recovery === "enabled" ? initialMode : "off",
+          mcpFileRead: recovery === "enabled",
+        });
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(
+          recovery === "enabled" ? null : "grant_disabled",
+        );
+        // Resume AFTER recovery, including a newer enable: the old admission is
+        // invalid, while a freshly opened request may use the restored grant.
+        ownerRead.resolve({ slug: "owner" });
+        await flush();
+        expect(replacement.frames("file.op")).toHaveLength(0);
+        await expect(paused).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(openCliAgentAdmissionCountForTests()).toBe(0);
+        db.cliDevice.findUnique.mockResolvedValue(
+          policy(recovery === "enabled" ? initialMode : "off", recovery === "enabled"),
+        );
+        const fresh = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        if (recovery === "enabled") {
+          expect(replacement.frames("file.op")).toHaveLength(1);
+          await answer(replacement, resultFor(lastOpId(replacement), "read", readResult));
+        }
+        await expect(fresh).resolves.toMatchObject(
+          recovery === "enabled" ? { ok: true } : { ok: false, code: "grant_disabled" },
+        );
+      },
+    );
+
+    it("a hello installing after the refresh applied but before the change settles stays fenced", async () => {
+      const { outcome } = await grantedRead("off");
+      const metricsHeld = deferred<boolean>();
+      vi.spyOn(relaySessionManager, "onRemoteMetricSourcesChanged").mockImplementation(
+        () => metricsHeld.promise,
+      );
+      db.cliDevice.upsert.mockResolvedValue({
+        ...policy("off", true),
+        slug: "desktop",
+        allowHumanTerminal: true,
+        connectionGeneration: 2,
+      });
+      const committed = deferred<void>();
+      const release = deferred<void>();
+      db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+        const snapshot = await callback(db);
+        committed.resolve();
+        await release.promise;
+        return snapshot;
+      });
+      const replacement = new FakeSocket();
+      relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
+      const reconnect = relaySessionManager.handleTextFrame(
+        replacement,
+        hello("desktop", "off", true, true),
+        now,
+      );
+      await committed.promise;
+      db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+      const change = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      // The refresh has applied the revoke (the pending read is cancelled) while
+      // its tail still awaits the metric push.
+      await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+      release.resolve();
+      await reconnect;
+      const afterHello = relaySessionManager.fileOpModeRefusal("desktop", "read");
+      metricsHeld.resolve(false);
+      await change;
+      await flush();
+      await flush();
+      expect(afterHello).toBe("grant_disabled");
+      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe("grant_disabled");
+    });
+
+    // Inverse/default rows: only a change to THIS device after hello starts
+    // forces a refresh. A hello started after notification remains ordinary.
+    it.each(["none", "before-hello", "other-device"] as const)(
+      "normal hello with %s change needs no policy recovery read",
+      async (change) => {
+        const metrics = vi
+          .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+          .mockResolvedValue(false);
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", true));
+        db.mcpPersonalToken.findFirst.mockResolvedValue({
+          ...liveToken(),
+          allowCliCommands: false,
+          allowCliFileRead: true,
+          scopes: ["mcp:read"],
+        });
+        db.cliDevice.upsert.mockResolvedValue({
+          ...policy("off", true),
+          slug: "desktop",
+          allowHumanTerminal: true,
+          connectionGeneration: 1,
+        });
+        if (change === "before-hello")
+          await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        const committed = deferred<void>();
+        const release = deferred<void>();
+        db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+          const snapshot = await callback(db);
+          committed.resolve();
+          await release.promise;
+          return snapshot;
+        });
+        const socket = new FakeSocket();
+        relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
+        const registration = relaySessionManager.handleTextFrame(
+          socket,
+          hello("desktop", "off", true, true),
+          now,
+        );
+        await committed.promise;
+        const admission = await readCliAgentAdmission({ ...OP_TOKEN, cliDeviceId: "desktop" });
+        if (change === "other-device")
+          await relaySessionManager.onCliFeatureGrantsChanged("other-device");
+        db.cliDevice.findUnique.mockClear();
+        release.resolve();
+        await registration;
+        // Hello already reads remote metric sources; no additional policy read.
+        expect(db.cliDevice.findUnique).toHaveBeenCalledExactlyOnceWith({
+          where: { id: "desktop" },
+          select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
+        });
+        expect(queue().size).toBe(0);
+        expect(metrics).toHaveBeenCalledTimes(change === "none" ? 0 : 1);
+        expect(judgeCliAgentAdmission(admission, "file_read")).toMatchObject({ ok: true });
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBeNull();
+        const session = Reflect.get(relaySessionManager, "sessionsByCliDeviceId").get("desktop");
+        expect(session).toMatchObject({
+          allowHumanTerminal: true,
+          mcpCommandMode: "off",
+          mcpFileRead: true,
+        });
+        const fresh = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(fresh).resolves.toMatchObject({ ok: true });
+      },
+    );
+
+    // The admission's owner read is last; policy loss while it is paused
+    // must still deny dispatch despite the already-read, granted device row.
+    it.each(["revoke", "read-error"] as const)(
+      "%s during a paused owner read cannot dispatch",
+      async (change) => {
+        const { socket, outcome, opId } = await grantedRead("off");
+        const ownerRead = deferred<{ slug: string }>();
+        db.user.findUnique.mockImplementationOnce(() => ownerRead.promise);
+        const paused = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        expect(openCliAgentAdmissionCountForTests()).toBe(1);
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+        if (change === "read-error")
+          db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+        const refresh = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        if (change === "read-error") await expect(refresh).rejects.toThrow("db down");
+        else await refresh;
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        ownerRead.resolve({ slug: "owner" });
+        await expect(paused).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(openCliAgentAdmissionCountForTests()).toBe(0);
+        expect(socket.frames("file.op")).toHaveLength(1);
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+      },
+    );
+  });
+
+  it("read-only token consent is reread at admission, and its cancellation ends a pending read", async () => {
+    const token = {
+      ...liveToken(),
+      allowCliCommands: false,
+      allowCliFileRead: true,
+      scopes: ["mcp:read"],
+    };
+    const socket = await connect();
+    db.mcpPersonalToken.findFirst.mockResolvedValue(token);
+    const outcome = start(socket, "read", readArgs);
+    await flush();
+    expect(socket.frames("file.op")).toHaveLength(1);
+    db.mcpPersonalToken.findFirst.mockResolvedValue({ ...token, allowCliFileRead: false });
+    cancelFileOpsForToken("token");
+    await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+    await expect(
+      runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+    ).resolves.toEqual({ ok: false, code: "token_inactive" });
+    db.mcpPersonalToken.findFirst.mockResolvedValue({ ...token, scopes: [] });
+    await expect(
+      runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+    ).resolves.toEqual({ ok: false, code: "token_inactive" });
+    db.mcpPersonalToken.findFirst.mockResolvedValue(token);
+    await expect(
+      runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "edit", args: editArgs }),
+    ).resolves.toEqual({ ok: false, code: "token_inactive" });
+    expect(socket.frames("file.op")).toHaveLength(1);
   });
 
   afterEach(async () => {
@@ -338,6 +1103,34 @@ describe("cli file ops", () => {
       JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "no_match" }),
     );
     await expect(conflict).resolves.toEqual({ ok: false, code: "no_match" });
+  });
+
+  it("keeps uncertain_outcome recovery facts and marks mutations unknown", async () => {
+    const socket = await connect();
+    const detail = {
+      recovery: "/workspace/.wsmp-recover-a1b2c3d4e5",
+      kept: ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"],
+    };
+    for (const op of ["edit", "read"] as const) {
+      const outcome = start(socket, op, op === "edit" ? editArgs : readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "uncertain_outcome",
+          detail,
+        }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "uncertain_outcome",
+        detail,
+        ...(op === "edit" ? { outcome: "unknown" } : {}),
+      });
+      socket.sends.length = 0;
+    }
   });
 
   it("gives the rate slot back for an op that was never sent", async () => {
@@ -764,7 +1557,7 @@ describe("cli file ops", () => {
 
     it("records the CLI's own supervised_only refusal as refused and its cancelled as cancelled", async () => {
       const socket = await connect();
-      for (const reason of ["supervised_only", "cancelled"]) {
+      for (const reason of ["supervised_only", "grant_disabled", "cancelled"]) {
         const outcome = start(socket, "read", readArgs);
         await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
         await answer(
@@ -775,7 +1568,8 @@ describe("cli file ops", () => {
         socket.sends.length = 0;
       }
       expect(events()[0]).toMatchObject({ outcome: "refused", reason: "supervised_only" });
-      expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
+      expect(events()[1]).toMatchObject({ outcome: "refused", reason: "grant_disabled" });
+      expect(events()[2]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {
@@ -859,12 +1653,48 @@ describe("cli file ops", () => {
     it("takes the lowest of grant and CLI mode: a dashboard downgrade after hello refuses", async () => {
       const socket = await connect("desktop", "unsupervised");
       relaySessionManager.applyFeatureGrants("desktop", {
+        mcpFileRead: false,
         allowHumanTerminal: false,
         mcpCommandMode: "supervised",
       });
       await expect(
         runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
       ).resolves.toEqual({ ok: false, code: "supervised_only" });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("refuses every op offline when the live 2.8 session does not run file ops", async () => {
+      // A live 2.8 session whose features lack `fileOps` (the flag is ANDed into
+      // `getLiveCliFeatures().fileOps`, and the server's strict hello schema
+      // pins it true today) must dispatch nothing, even with the grant and the
+      // read switch on. Reached by dropping the recorded feature on the live
+      // session.
+      db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED", { mcpFileRead: true }));
+      const socket = await connect("desktop", "unsupervised", true, true);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "unsupervised",
+        mcpFileRead: true,
+      });
+      const session = (
+        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
+          string,
+          { features: Record<string, unknown> | null }
+        >
+      ).get("desktop");
+      expect(session?.features?.fileOps).toBe(true);
+      if (session) session.features = { ...session.features, fileOps: false };
+      expect(relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop")?.fileOps).toBe(
+        false,
+      );
+      for (const [op, args] of [
+        ["read", readArgs],
+        ["edit", editArgs],
+      ] as const) {
+        await expect(runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op, args })).resolves.toEqual(
+          { ok: false, code: "offline" },
+        );
+      }
       expect(socket.frames("file.op")).toEqual([]);
     });
 
@@ -1207,6 +2037,51 @@ describe("cli file ops", () => {
       await expect(edit).resolves.toEqual({ ok: false, code: "io_error" });
     });
 
+    // Every reason the CLI's own dispatcher can put in `file.rejected`:
+    // `grant_disabled`/`feature_disabled`/`supervised_only`/`bad_frame` from
+    // `admit`/`refuse` (apps/cli/src/file_relay.rs) and the file error codes
+    // (apps/cli/src/file_ops/error.rs). A reason outside the wire enum would
+    // fail the schema, settle as io_error and send a pointless file.cancel.
+    it.each([
+      ["grant_disabled", "grant_disabled"],
+      ["feature_disabled", "feature_disabled"],
+      ["supervised_only", "supervised_only"],
+      ["limit", "limit"],
+      ["unsupported", "unsupported"],
+      ["not_found", "not_found"],
+      ["bad_frame", "io_error"],
+    ])(
+      "passes the CLI's %s refusal through as %s without a malformed-frame cancel",
+      async (reason, code) => {
+        const socket = await connect();
+        const outcome = start(socket, "read", readArgs);
+        await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+        await answer(
+          socket,
+          JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+        );
+        await expect(outcome).resolves.toEqual({ ok: false, code });
+        expect(socket.frames("file.cancel")).toEqual([]);
+        expect(socket.closes).toEqual([]);
+      },
+    );
+
+    it.each([
+      ["grant_disabled", "grant_disabled"],
+      ["feature_disabled", "feature_disabled"],
+      ["supervised_only", "supervised_only"],
+    ])("settles a mutation refused with %s as %s, never as unknown", async (reason, code) => {
+      const socket = await connect();
+      const outcome = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(outcome).resolves.toEqual({ ok: false, code });
+      expect(socket.frames("file.cancel")).toEqual([]);
+    });
+
     it("drops answers for unknown ops and answers from another session, without closing", async () => {
       const socket = await connect("desktop");
       const other = await connect("laptop");
@@ -1335,6 +2210,11 @@ describe("cli file ops", () => {
       expect(retry).toBeLessThanOrEqual(60_000);
       expect(socket.frames("file.op")).toHaveLength(FILE_OPS_PER_MINUTE_PER_USER);
       clock += retry + 1;
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "heartbeat", id: "rate-window-heartbeat" }),
+        new Date(clock),
+      );
       const admitted = start(socket, "read", readArgs);
       await waitFor(() =>
         expect(socket.frames("file.op")).toHaveLength(FILE_OPS_PER_MINUTE_PER_USER + 1),
@@ -1381,7 +2261,7 @@ describe("cli file ops", () => {
 
   describe("deadline, cancel, and session loss", () => {
     it("times out a read after 30 s, sends file.cancel, and drops the late answer", async () => {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const socket = await connect();
       const outcome = runFileOp({
         ...OP_TOKEN,
@@ -1400,7 +2280,7 @@ describe("cli file ops", () => {
     });
 
     it("times out a mutating op with outcome unknown", async () => {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const socket = await connect();
       const outcome = runFileOp({
         ...OP_TOKEN,
@@ -1414,7 +2294,7 @@ describe("cli file ops", () => {
     });
 
     it("does not time out before the deadline", async () => {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const socket = await connect();
       const outcome = runFileOp({
         ...OP_TOKEN,
@@ -1506,7 +2386,7 @@ describe("cli file ops", () => {
     });
 
     it("releases the slot of an aborted op after a grace period when the CLI never answers", async () => {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const socket = await connect();
       const controller = new AbortController();
       const first = runFileOp({
@@ -1623,6 +2503,7 @@ describe("cli file ops", () => {
       });
       await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
       relaySessionManager.applyFeatureGrants("desktop", {
+        mcpFileRead: false,
         allowHumanTerminal: false,
         mcpCommandMode: "off",
       });
@@ -1669,6 +2550,240 @@ describe("cli file ops", () => {
       expect(sweepExpiredFileOps(Date.now())).toBe(0);
       expect(sweepExpiredFileOps(Date.now() + 6_000)).toBe(1);
       await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+  });
+  describe("ban fence (#159)", () => {
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      // The same subscription apps/server/src/app.ts makes.
+      unsubscribe = onUserBanned(cancelRelayWorkForBannedUser);
+    });
+    afterEach(async () => {
+      unsubscribe();
+      await resetRelaySessions();
+      resetFileOpsForTests();
+    });
+
+    /** A second owner with their own device, to prove the fence is per user. */
+    async function connectOtherUser() {
+      const other = new FakeSocket();
+      relaySessionManager.acceptAuthenticatedSocket({
+        socket: other,
+        identity: { ...identity, id: "token-id-other", userId: "other-user" },
+        now,
+      });
+      await relaySessionManager.handleTextFrame(other, hello("laptop", "unsupervised"), now);
+      other.sends.length = 0;
+      db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) => ({
+        id: args.where.id,
+        userId: args.where.id === "laptop" ? "other-user" : "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+      }));
+      return other;
+    }
+
+    /** A promise's state without awaiting it: true once it has settled. */
+    function tracked<T>(promise: Promise<T>) {
+      const state = { settled: false };
+      void promise.then(
+        () => {
+          state.settled = true;
+        },
+        () => {
+          state.settled = true;
+        },
+      );
+      return state;
+    }
+
+    it("a ban during a long read and a long mutating op cancels both, and only that user's", async () => {
+      const socket = await connect();
+      const other = await connectOtherUser();
+      // Three ops in flight, none answered by the CLI: they would run to their 30 s deadline.
+      const read = start(socket, "read", readArgs);
+      const edit = start(socket, "edit", editArgs, { tokenId: "second-token" });
+      const otherRead = start(other, "read", readArgs, {
+        userId: "other-user",
+        tokenId: "token-other",
+        cliDeviceId: "laptop",
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await waitFor(() => expect(other.frames("file.op")).toHaveLength(1));
+      const states = [tracked(read), tracked(edit), tracked(otherRead)];
+      await flush();
+      expect(states.map((state) => state.settled)).toEqual([false, false, false]);
+
+      // The ban commits; the post-commit notification runs the listener.
+      await notifyUserBanned("user-id");
+
+      // Every token of the banned user ends at once (not at the deadline). The mutation's outcome is unknown.
+      await expect(read).resolves.toEqual({ ok: false, code: "token_inactive" });
+      await expect(edit).resolves.toEqual({
+        ok: false,
+        code: "token_inactive",
+        outcome: "unknown",
+      });
+      expect(socket.frames("file.cancel").map((frame) => frame.opId)).toEqual(
+        socket.frames("file.op").map((frame) => frame.opId),
+      );
+      // Their socket is not closed by a ban.
+      expect(socket.closes).toEqual([]);
+      // The other user's op is untouched, still completes normally, and was never cancelled.
+      expect(states[2]?.settled).toBe(false);
+      expect(other.frames("file.cancel")).toEqual([]);
+      await answer(other, resultFor(lastOpId(other), "read", readResult));
+      await expect(otherRead).resolves.toMatchObject({ ok: true });
+      // A cancelled op leaves no record or slot behind (the mocked owner row is unbanned here).
+      const next = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(3));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(next).resolves.toMatchObject({ ok: true });
+    });
+
+    it("refuses an op whose admission is still reading when the ban lands", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      // The ban has committed but the owner read already returned the pre-ban row.
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const started = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      await notifyUserBanned("user-id");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(started).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+    });
+
+    it("cancelFileOpsForUser alone also refuses an op still in admission, and ends a registered one", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const reading = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      cancelFileOpsForUser("user-id");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(reading).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      const running = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      cancelFileOpsForUser("user-id");
+      await expect(running).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+
+    it("does not mark another user's open admission", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const started = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      await notifyUserBanned("someone-else");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(started).resolves.toMatchObject({ ok: true });
+    });
+
+    it("an op started after the ban is refused by the owner read, and the ban sweep leaves later ops of an unbanned user alone", async () => {
+      const socket = await connect();
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      await notifyUserBanned("user-id");
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+      ).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      // Unbanned again: the earlier sweep holds no state, so a new op runs.
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const again = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(again).resolves.toMatchObject({ ok: true });
+    });
+
+    it("revoking the CLI credential during a long read and a long mutating op ends both (the revoke half of #159)", async () => {
+      const socket = await connect();
+      const read = start(socket, "read", readArgs);
+      const edit = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      const ids = socket.frames("file.op").map((frame) => frame.opId);
+      // Another credential's revoke leaves them alone.
+      await relaySessionManager.closeSessionsForRevokedCredentials({
+        kind: "cliToken",
+        ids: ["some-other-token"],
+      });
+      expect(socket.closes).toEqual([]);
+      // What `onCliCredentialsRevoked` runs after the revoking write committed.
+      await relaySessionManager.closeSessionsForRevokedCredentials({
+        kind: "cliToken",
+        ids: [identity.id],
+      });
+      await expect(read).resolves.toEqual({ ok: false, code: "offline" });
+      await expect(edit).resolves.toEqual({ ok: false, code: "offline", outcome: "unknown" });
+      expect(socket.frames("file.cancel").map((frame) => frame.opId)).toEqual(ids);
+      expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    });
+
+    it("records the cancelled op in the audit as cancelled with token_inactive", async () => {
+      const socket = await connect();
+      const outcome = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await notifyUserBanned("user-id");
+      await outcome;
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: "cancelled", reason: "token_inactive" }),
+      );
     });
   });
 });

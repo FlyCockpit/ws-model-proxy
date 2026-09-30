@@ -1,6 +1,10 @@
 import { randomBytes } from "node:crypto";
 import type { FileOpClass } from "@ws-model-proxy/api/lib/cli-file-access";
 import {
+  lowestMcpCommandMode,
+  mcpCommandModeFromDb,
+} from "@ws-model-proxy/api/lib/mcp-command-mode";
+import {
   CLI_AGENT_ACTION_UNKNOWN_DEVICE,
   type CliAgentActionKind,
   type CliAgentActionOutcome,
@@ -11,6 +15,7 @@ import {
   judgeCliAgentAdmission,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
+  revokeOpenCliAgentAdmissionsForUser,
 } from "./cli-agent-admission.js";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
 import {
@@ -348,6 +353,7 @@ const REFUSED_BY_CLI_CODES: ReadonlySet<string> = new Set([
   "unsupported",
   "limit",
   "supervised_only",
+  "grant_disabled",
   "feature_disabled",
 ]);
 
@@ -369,14 +375,23 @@ function rejectionFailure(
   // was made, so the outcome is unknown and the agent must file_stat first.
   // Ops whose cleanup runs after the commit can also fail with `not_found`
   // (the source vanished): for rename and delete that code is ambiguous.
-  // A `replaced` conflict on a mutation can also follow a committed exchange
-  // whose undo failed, so it is not definitive either.
+  // Older CLIs can report a failed exchange undo as a `replaced` conflict.
+  // Keep that conservative mapping; new CLIs report uncertain_outcome and
+  // include the locations needed for manual recovery.
   const replacedConflict = reason === "conflict" && detail?.currentEtag === "replaced";
   if (
     mutating &&
-    (reason === "io_error" || replacedConflict || (ambiguousNotFound && reason === "not_found"))
+    (reason === "io_error" ||
+      reason === "uncertain_outcome" ||
+      replacedConflict ||
+      (ambiguousNotFound && reason === "not_found"))
   ) {
-    return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
+    return cliAnswered({
+      ok: false,
+      code: reason,
+      outcome: "unknown",
+      ...(reason === "uncertain_outcome" && detail ? { detail } : {}),
+    });
   }
   if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
   return cliAnswered({ ok: false, code: reason, ...(detail ? { detail } : {}) });
@@ -550,6 +565,14 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   }
   const parsed = fileOpFrameSchema.safeParse({
     type: "file.op",
+    mode: lowestMcpCommandMode(
+      mcpCommandModeFromDb(verdict.device.mcpCommandMode),
+      verdict.live.mcpCommandMode,
+    ),
+    readGrant:
+      verdict.device.mcpFileRead === true &&
+      verdict.live.mcpFileRead === true &&
+      verdict.live.fileRootsConfigured === true,
     opId,
     op: input.op,
     args: input.args,
@@ -650,14 +673,29 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   });
 }
 
-/** Cancel the in-flight file ops of a revoked or narrowed token, and refuse ops still in admission. */
-export function cancelFileOpsForToken(tokenId: string): void {
-  revokeOpenCliAgentAdmissions(tokenId);
+/** The ONE sweep behind the token and user cancels: every matching record ends `token_inactive`. */
+function cancelFileOpsWhere(matches: (record: FileOpRecord) => boolean): void {
   for (const record of [...pendingById.values()]) {
-    if (record.tokenId !== tokenId) continue;
+    if (!matches(record)) continue;
     relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
     settle(record, serverFailure(record, "token_inactive"));
   }
+}
+
+/** Cancel the in-flight file ops of a revoked or narrowed token, and refuse ops still in admission. */
+export function cancelFileOpsForToken(tokenId: string): void {
+  revokeOpenCliAgentAdmissions(tokenId);
+  cancelFileOpsWhere((record) => record.tokenId === tokenId);
+}
+
+/**
+ * A user was banned: cancel every in-flight file op they own (any token, any
+ * device) and refuse ops still in admission (#159). Mutating ops end with an
+ * unknown outcome like any other server-side cancel (`serverFailure`).
+ */
+export function cancelFileOpsForUser(userId: string): void {
+  revokeOpenCliAgentAdmissionsForUser(userId);
+  cancelFileOpsWhere((record) => record.userId === userId);
 }
 
 /** Expired tokens end their in-flight ops; also drops rate-limit windows that have emptied. */

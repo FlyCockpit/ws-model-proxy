@@ -9,5 +9,7 @@
     "includeHidden": false,
     "maxEntries": 200,
     "cursor": "~/models/a"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

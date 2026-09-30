@@ -26,6 +26,7 @@ pub(crate) mod diff;
 pub mod edit;
 pub mod error;
 pub mod etag;
+mod exchange;
 pub(crate) mod fmt;
 pub(crate) mod glob;
 pub mod list;
@@ -33,6 +34,7 @@ pub mod mutate;
 pub mod policy;
 pub mod pool;
 pub mod read;
+mod recovery;
 pub mod redact;
 pub(crate) mod resolve;
 pub mod search;
@@ -87,6 +89,14 @@ pub enum Step {
     Chowned,
     Chmodded,
     EtagRechecked,
+    Vacated,
+    Exchanged,
+    Captured,
+    Restored,
+    Disposing,
+    Created,
+    Linked,
+    Moved,
     Renamed,
     DirSynced,
 }

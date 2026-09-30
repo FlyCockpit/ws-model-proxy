@@ -8,14 +8,18 @@ import { z } from "zod";
  * `apps/cli/src/file_ops` (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
  *
  * Wire shape recap (control frames stay <= 64 KiB):
- * - S->C `file.op {opId, op, args, bodyBytes?}`; write content is NOT in
- *   `args`, it follows as one binary `file.body {opId}` frame (<= 1 MiB).
+ * - S->C `file.op {opId, op, args, bodyBytes?, mode, readGrant}`: `mode` and
+ *   `readGrant` are the admission verdict the CLI re-checks locally; write
+ *   content is NOT in `args`, it follows as one binary `file.body {opId}` frame
+ *   (<= 1 MiB).
  * - S->C `file.cancel {opId}`.
  * - C->S `file.result {opId, op, result, dataField?, bodyBytes?}`: when the
  *   large text field of the result is over 48 KiB the CLI sends it as a binary
  *   `file.data {opId}` frame and leaves that field empty in `result`;
  *   `dataField` names it (`text` | `matches` | `entries` | `diff`).
- * - C->S `file.rejected {opId, reason, detail?}`.
+ * - C->S `file.rejected {opId, reason, detail?}`: `reason` is a file error
+ *   code or one of {@link FILE_WIRE_REASONS} (`bad_frame`, `supervised_only`,
+ *   `grant_disabled`, `feature_disabled`) that the CLI's own admission emits.
  */
 
 export const FILE_INLINE_TEXT_MAX_BYTES = 48 * 1024;
@@ -58,6 +62,7 @@ export const FILE_ERROR_CODES = [
   "binary_file",
   "too_large",
   "conflict",
+  "uncertain_outcome",
   "match_count",
   "no_match",
   "redacted_span",
@@ -75,8 +80,18 @@ export const FILE_ERROR_CODES = [
 ] as const;
 export type FileErrorCode = (typeof FILE_ERROR_CODES)[number];
 
-/** Reasons only the CLI dispatcher produces (frame and mode re-checks). */
-export const FILE_WIRE_REASONS = ["bad_frame", "supervised_only", "feature_disabled"] as const;
+/**
+ * Reasons only the CLI dispatcher produces (frame and mode re-checks). `admit`
+ * in `apps/cli/src/file_relay.rs` chooses between `supervised_only`,
+ * `grant_disabled` (the server's grant is off) and `feature_disabled` (the
+ * CLI's own mode is off), so all three travel on the wire.
+ */
+export const FILE_WIRE_REASONS = [
+  "bad_frame",
+  "supervised_only",
+  "grant_disabled",
+  "feature_disabled",
+] as const;
 
 export const fileRejectReasonSchema = z.enum([...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]);
 export type FileRejectReason = z.infer<typeof fileRejectReasonSchema>;
@@ -218,7 +233,12 @@ const opId = z
   });
 
 /** The `file.op` frame body, strict per op. `bodyBytes` is present exactly for `write`. */
-const fileOpEnvelope = { type: z.literal("file.op"), opId } as const;
+const fileOpEnvelope = {
+  type: z.literal("file.op"),
+  opId,
+  mode: z.enum(["off", "supervised", "unsupervised"]),
+  readGrant: z.boolean(),
+} as const;
 export const fileOpFrameSchema = z.discriminatedUnion("op", [
   z.object({ ...fileOpEnvelope, op: z.literal("read"), args: readArgsSchema }).strict(),
   z.object({ ...fileOpEnvelope, op: z.literal("stat"), args: statArgsSchema }).strict(),
@@ -321,6 +341,15 @@ export const searchResultSchema = z
   })
   .strict();
 
+/** Absolute Unix recovery paths; bounded even when the parent is near PATH_MAX. */
+const recoveryPathSchema = z
+  .string()
+  .min(1)
+  .max(8192)
+  .startsWith("/")
+  .refine((s) => !s.includes("\0"));
+const recoveryPathsSchema = z.array(recoveryPathSchema).max(4);
+
 export const editResultSchema = z
   .object({
     etag: reportedEtagSchema,
@@ -334,6 +363,7 @@ export const editResultSchema = z
       .max(10_000)
       .optional(),
     resolvedPath: shortText.optional(),
+    recovered: recoveryPathsSchema.optional(),
   })
   .strict();
 
@@ -346,10 +376,13 @@ export const writeResultSchema = z
     removed: uintSchema.optional(),
     diff: boundedText().optional(),
     resolvedPath: shortText.optional(),
+    recovered: recoveryPathsSchema.optional(),
   })
   .strict();
 
-export const renameResultSchema = z.object({ etag: reportedEtagSchema.nullable() }).strict();
+export const renameResultSchema = z
+  .object({ etag: reportedEtagSchema.nullable(), recovered: recoveryPathsSchema.optional() })
+  .strict();
 export const mkdirResultSchema = z.object({ created: z.boolean() }).strict();
 export const deleteResultSchema = z
   .object({ deleted: z.boolean(), type: z.enum(["file", "dir", "symlink", "other"]) })
@@ -433,8 +466,24 @@ export const fileRejectDetailSchema = z
     found: uintSchema.optional(),
     lines: z.array(uintSchema).max(5).optional(),
     retryAfterMs: uintSchema.optional(),
+    recovery: recoveryPathSchema.optional(),
+    kept: recoveryPathsSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((detail, ctx) => {
+    if (detail.recovery !== undefined || detail.kept !== undefined) {
+      if (
+        detail.recovery === undefined ||
+        detail.kept === undefined ||
+        Object.keys(detail).some((key) => key !== "recovery" && key !== "kept")
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Recovery detail requires only recovery and kept.",
+        });
+      }
+    }
+  });
 export type FileRejectDetail = z.infer<typeof fileRejectDetailSchema>;
 
 export const fileRejectedFrameSchema = z
@@ -444,7 +493,19 @@ export const fileRejectedFrameSchema = z
     reason: fileRejectReasonSchema,
     detail: fileRejectDetailSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((frame, ctx) => {
+    if (
+      frame.reason === "uncertain_outcome" &&
+      (frame.detail?.recovery === undefined || frame.detail.kept === undefined)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "uncertain_outcome requires recovery detail.",
+        path: ["detail"],
+      });
+    }
+  });
 
 // Binary frame metadata.
 export const fileBodyMetadataSchema = z.object({ type: z.literal("file.body"), opId }).strict();

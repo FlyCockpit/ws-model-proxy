@@ -120,7 +120,7 @@ try {
     ),
   );
   waitForExit = async (child, label) => {
-    if (child.exitCode !== null) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
     const signal = (name) => {
       try {
         if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);

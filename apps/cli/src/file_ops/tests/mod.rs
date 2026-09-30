@@ -11,9 +11,12 @@ use super::policy::{Deny, Protected};
 use super::read::{ReadOutcome, ReadResult};
 use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod compensation;
 mod edit_write;
 mod hardening;
 mod misc;
+mod read_grant;
 mod read_tests;
 mod resolve_policy;
 mod tools;

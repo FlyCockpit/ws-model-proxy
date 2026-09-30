@@ -1,0 +1,114 @@
+[
+  {
+    "name": "pem",
+    "command": "show",
+    "input": "before\n-----BEGIN PRIVATE KEY-----\nprivate-body-one-107\n-----END PRIVATE KEY-----\nafter\n",
+    "expected": "before\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "hidden": ["private-body-one-107"]
+  },
+  {
+    "name": "token-next",
+    "command": "show",
+    "input": "public\nSVC_API_KEY: token-value-one-107\nnext-value-one-107\nvisible\n",
+    "expected": "public\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "hidden": ["token-value-one-107", "next-value-one-107"]
+  },
+  {
+    "name": "flag",
+    "command": "show",
+    "input": "serve --api-key flag-value-one-107 --port 80\n--max-tokens 4096\n",
+    "expected": "serve --api-key ⟦redacted:28⟧\n--max-tokens 4096\n",
+    "hidden": ["flag-value-one-107"]
+  },
+  {
+    "name": "hf",
+    "command": "cat ~/.cache/huggingface/token",
+    "input": "hf_fixturetoken107\n  \ntwo words\n",
+    "expected": "⟦redacted:18⟧\n  \n⟦redacted:9⟧\n",
+    "hidden": ["hf_fixturetoken107", "two words"]
+  },
+  {
+    "name": "dotenv-looking",
+    "command": "cat service.env",
+    "input": "export SVC_TOKEN=env-value-one-107\nPORT=8080\npublic\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\npublic\n",
+    "hidden": ["env-value-one-107"]
+  },
+  {
+    "name": "crlf",
+    "command": "show",
+    "input": "DB_PASSWORD=crlf-value-one-107\r\nnext-value-crlf-107\r\n\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\r\n\r\nvisible\r\n",
+    "hidden": ["crlf-value-one-107", "next-value-crlf-107"]
+  },
+  {
+    "name": "indent",
+    "command": "show",
+    "input": "APP_SECRET:\n  first-indent-value-107\n    second-indent-value-107\n \t\n\n  third-indent-value-107\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\n⟦redacted⟧\nvisible\n",
+    "hidden": ["first-indent-value-107", "second-indent-value-107", "third-indent-value-107"]
+  },
+  {
+    "name": "missing-pem-end",
+    "command": "show",
+    "input": "-----BEGIN OPENSSH PRIVATE KEY-----\nmissing-end-value-107\nlast-value-107",
+    "expected": "⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧",
+    "hidden": ["missing-end-value-107", "last-value-107"]
+  },
+  {
+    "name": "mismatched-pem-end",
+    "command": "show",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\n-----END EC PRIVATE KEY-----\nmismatch-value-107\n-----END RSA PRIVATE KEY-----\nvisible\n",
+    "expected": "⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nvisible\n",
+    "hidden": ["mismatch-value-107"]
+  },
+  {
+    "name": "next-flag",
+    "command": "show",
+    "input": "run --api-key\n  next-flag-value-107\n--max-tokens 4096\n",
+    "expected": "run --api-key\n  ⟦redacted:19⟧\n--max-tokens 4096\n",
+    "hidden": ["next-flag-value-107"]
+  },
+  {
+    "name": "flag-list-block",
+    "command": "show",
+    "input": "run --hf-token\n  - >-\n    flag-block-value-107\nvisible\n",
+    "expected": "run --hf-token\n  - ⟦redacted:2⟧\n⟦redacted⟧\nvisible\n",
+    "hidden": ["flag-block-value-107"]
+  },
+  {
+    "name": "eof",
+    "command": "show",
+    "input": "LAST_SECRET=eof-value-107",
+    "expected": "⟦redacted line⟧",
+    "hidden": ["eof-value-107"]
+  },
+  {
+    "name": "quote-run",
+    "command": "show",
+    "input": "APP_TOKEN\nvalue: \"quote-value-107\nquote-tail-107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["quote-value-107", "quote-tail-107"]
+  },
+  {
+    "name": "unicode",
+    "command": "show",
+    "input": "public café 🦀\r\nAPP_TOKEN=unicode-令牌-107\r\nnext-令牌-107",
+    "expected": "public café 🦀\r\n⟦redacted line⟧\r\n⟦redacted line⟧",
+    "hidden": ["unicode-令牌-107", "next-令牌-107"]
+  },
+  {
+    "name": "equals-flag",
+    "command": "show",
+    "input": "run --hf-token=equals-value-107\r\n--max-tokens=4096\r\n",
+    "expected": "run --hf-token=⟦redacted:16⟧\r\n--max-tokens=4096\r\n",
+    "hidden": ["equals-value-107"]
+  },
+  {
+    "name": "backslash-flag",
+    "command": "show",
+    "input": "run --api-key \\\n  backslash-flag-value-107\ncontinued-flag-value-107\n\nvisible\n",
+    "expected": "run --api-key \\\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["backslash-flag-value-107", "continued-flag-value-107"]
+  }
+]

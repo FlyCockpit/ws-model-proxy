@@ -1,0 +1,168 @@
+[
+  {
+    "name": "raw-sgr-public",
+    "input": "\u001b[31mMAX_TOKENS=42\u001b[0m\r\n",
+    "expected": "\u001b[31mMAX_TOKENS=42\u001b[0m\r\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-public-flags",
+    "input": "run --max-\u001b[1mtokens\u001b[0m 42 --api-key \"$PUBLIC\"\n",
+    "expected": "run --max-\u001b[1mtokens\u001b[0m 42 --api-key \"$PUBLIC\"\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-osc-lines",
+    "input": "public\u001b]hidden\r\nmore\u001b\\ visible\r\n",
+    "expected": "public\u001b]hidden\r\nmore\u001b\\ visible\r\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-apc-lines",
+    "input": "public\u001b_hidden\nmore\u001b\\ visible\n",
+    "expected": "public\u001b_hidden\nmore\u001b\\ visible\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-dcs-lines",
+    "input": "public\u001bPqhidden\nmore\u001b\\ visible\n",
+    "expected": "public\u001bPqhidden\nmore\u001b\\ visible\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-csi-lines",
+    "input": "public\u001b[31\nm visible\n",
+    "expected": "public\u001b[31\nm visible\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-c1-unicode",
+    "input": "héllohidden\n 🌻 public\n",
+    "expected": "héllohidden\n 🌻 public\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-malformed-cancel",
+    "input": "public\u001b[31\u0018 visible\n",
+    "expected": "public\u001b[31\u0018 visible\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-public-pem",
+    "input": "-----BEGIN PUBLIC \u001b[1mKEY\u001b[0m-----\npublic-body\n-----END PUBLIC KEY-----\n",
+    "expected": "-----BEGIN PUBLIC \u001b[1mKEY\u001b[0m-----\npublic-body\n-----END PUBLIC KEY-----\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-incomplete-eof",
+    "input": "public\u001b]hidden\nunfinished",
+    "expected": "public\u001b]hidden\nunfinished",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "long-closed-quote",
+    "input": " APP_TOKEN=\"closed\"\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "long-pem-close-same-line",
+    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "long-public-unmatched-quote",
+    "input": " public=\"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "long-malformed-pem",
+    "input": "-----BEGIN RSA PRIVATE KEY---\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "long-public-token-suffix",
+    "input": " --PUBLIC_TOKEN \"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "long-word-password-not-name",
+    "input": "PASSWORD \"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "productionCap": true
+  },
+  {
+    "name": "colored-flag-variable",
+    "input": "run --api-\u001b[31mkey\u001b[0m \"$PUBLIC\"\n",
+    "expected": "run --api-\u001b[31mkey\u001b[0m \"$PUBLIC\"\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "masked-osc-opener-end",
+    "input": "APP_TOKEN=value\u001b]hidden\n\u0007normal\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0
+  },
+  {
+    "name": "raw-leading-bom-public",
+    "input": "﻿\u001b[31mMAX_TOKENS=42\u001b[0m\r\n",
+    "expected": "﻿\u001b[31mMAX_TOKENS=42\u001b[0m\r\n"
+  },
+  {
+    "name": "masked-interior-bom-prefix",
+    "input": "public\nrun ﻿prefix --api-key flag-value-one-107 --port 80\n--max-tokens 4096\n",
+    "expected": "public\nrun ﻿prefix --api-key ⟦redacted:28⟧\n--max-tokens 4096\n"
+  },
+  {
+    "name": "plain-overlong-until-blank",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\nnext\nnormal-two\nnormal-three\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "productionCap": true
+  },
+  {
+    "name": "plain-overlong-crlf-whitespace-blank",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\r\nnext\r\nnormal-two\r\n \t\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\n \t\r\nvisible\r\n",
+    "productionCap": true
+  },
+  {
+    "name": "blank-keeps-next-value-and-deeper-indent",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\r\n\r\n \t\r\nnext\r\n  continuation\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n\r\n⟦redacted⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\nvisible\r\n",
+    "productionCap": true
+  }
+]

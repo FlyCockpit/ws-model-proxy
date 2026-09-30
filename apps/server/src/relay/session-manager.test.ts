@@ -2019,19 +2019,100 @@ describe("relay terminal and exec sessions", () => {
       cli: { capabilities: { features: Record<string, unknown> } };
     };
     frame.cli.capabilities.features.allowFileToolsAsRoot = true;
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = true;
     await register(manager, socket, JSON.stringify(frame));
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
-        update: expect.objectContaining({ reportedAllowFileToolsAsRoot: true }),
+        update: expect.objectContaining({
+          reportedAllowFileToolsAsRoot: true,
+          reportedMcpFileRead: true,
+          reportedFileRoots: true,
+        }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
       protocolVersion: "2.8",
       fileOps: true,
-      mcpFileRead: false,
-      fileRootsConfigured: false,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
       allowFileToolsAsRoot: true,
     });
+  });
+
+  it("persists the read switch and the roots report separately", async () => {
+    const manager = new RelaySessionManager();
+    const frame = JSON.parse(helloCli()) as {
+      cli: { capabilities: { features: Record<string, unknown> } };
+    };
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = false;
+    await register(manager, new FakeSocket(), JSON.stringify(frame));
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          reportedMcpFileRead: true,
+          reportedFileRoots: false,
+        }),
+      }),
+    );
+  });
+
+  it("takes the dashboard read grant from the hello registration and from a grant change", async () => {
+    db.cliDevice.upsert.mockResolvedValue({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: true,
+      connectionGeneration: 1,
+    });
+    const manager = new RelaySessionManager();
+    const frame = JSON.parse(helloCli()) as {
+      cli: { capabilities: { features: Record<string, unknown> } };
+    };
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = true;
+    const socket = await register(manager, new FakeSocket(), JSON.stringify(frame));
+    // Straight after the hello, with no applyFeatureGrants call: reads pass, writes do not.
+    expect(manager.fileOpModeRefusal("cli-device-id", "read")).toBeNull();
+    expect(manager.fileOpModeRefusal("cli-device-id", "write")).toBe("grant_disabled");
+    // The dashboard revokes: the refreshed row reaches the live session.
+    (
+      prisma as unknown as { cliDevice: { findUnique: MockInstance } }
+    ).cliDevice.findUnique.mockResolvedValue({
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: false,
+      remoteMetricSources: [],
+    });
+    await manager.onCliFeatureGrantsChanged("cli-device-id");
+    expect(manager.fileOpModeRefusal("cli-device-id", "read")).toBe("grant_disabled");
+    expect(socket.closes).toEqual([]);
+  });
+
+  it("reports fileOps live only when the 2.8 hello's own capability says so", async () => {
+    // The live snapshot ANDs `protocolVersion >= 2.8` with the hello's own
+    // `capabilities.fileOps`. A real 2.8 hello pins fileOps true (the strict
+    // schema requires `z.literal(true)`), so the false side is reached by
+    // clearing the recorded feature, exactly as a degraded/absent capability
+    // would leave it.
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    await register(manager, socket);
+    const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: true, mcpFileRead: false });
+
+    const session = (
+      Reflect.get(manager, "sessionsByCliDeviceId") as Map<
+        string,
+        { features: Record<string, unknown> | null }
+      >
+    ).get("cli-device-id");
+    if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
+    // The read switch reports true, yet the capability term withdraws fileOps.
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: false, mcpFileRead: true });
   });
 
   it("drops file frames for an unknown op and refuses them before registration", async () => {
@@ -2045,7 +2126,14 @@ describe("relay terminal and exec sessions", () => {
       { type: "file.rejected", opId: id16(9), reason: "conflict" },
       { type: "file.result", opId: id16(9), op: "mkdir", result: { created: true } },
       { type: "file.result", opId: id16(9), op: "mkdir", result: { leak: 1 } },
-      { type: "file.op", opId: id16(9), op: "read", args: { path: "~/a" } },
+      {
+        type: "file.op",
+        mode: "unsupervised",
+        readGrant: false,
+        opId: id16(9),
+        op: "read",
+        args: { path: "~/a" },
+      },
       { type: "file.cancel", opId: id16(9) },
     ]) {
       await manager.handleTextFrame(socket, JSON.stringify(frame), now);
@@ -2407,6 +2495,7 @@ describe("relay terminal and exec sessions", () => {
     });
 
     manager.applyFeatureGrants("cli-device-id", {
+      mcpFileRead: false,
       allowHumanTerminal: false,
       mcpCommandMode: "off",
     });

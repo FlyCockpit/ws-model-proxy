@@ -433,10 +433,13 @@ const listCliDevicesSelect = {
   endpointTargeting: true,
   allowHumanTerminal: true,
   mcpCommandMode: true,
+  mcpFileRead: true,
   cliVersion: true,
   relayProtocolVersion: true,
   reportedHumanTerminal: true,
   reportedMcpCommandMode: true,
+  reportedMcpFileRead: true,
+  reportedFileRoots: true,
   reportedTerminalApproval: true,
   reportedTerminalSupported: true,
   reportedAllowFileToolsAsRoot: true,
@@ -772,9 +775,16 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
      * (`headless`, `supervised` = needs a person, or `off`), from the effective
      * command mode; agents read it instead of trying calls.
      */
-    fileTools: fileToolsSummary(fileToolsLive ? commandsEffective : "off"),
+    fileTools: fileToolsSummary(fileToolsLive && live.fileOps ? commandsEffective : "off", {
+      server: row.mcpFileRead === true,
+      live: fileToolsLive && live.fileOps === true && live.mcpFileRead === true,
+      roots: fileToolsLive && live.fileRootsConfigured === true,
+    }),
     /** `allowFileToolsAsRoot` in the CLI's config: live when connected, else the last report. */
     allowFileToolsAsRoot: live?.allowFileToolsAsRoot ?? row.reportedAllowFileToolsAsRoot ?? null,
+    mcpFileRead: row.mcpFileRead === true,
+    reportedMcpFileRead: row.reportedMcpFileRead ?? null,
+    reportedFileRoots: row.reportedFileRoots ?? null,
     features: {
       terminal: {
         granted: row.allowHumanTerminal === true,
@@ -2491,9 +2501,13 @@ export const forwarderManagementRouter = {
           cliDeviceId: idSchema,
           humanTerminal: z.boolean().optional(),
           mcpCommandMode: z.enum(MCP_COMMAND_MODES).optional(),
+          fileRead: z.boolean().optional(),
         })
         .refine(
-          (value) => value.humanTerminal !== undefined || value.mcpCommandMode !== undefined,
+          (value) =>
+            value.humanTerminal !== undefined ||
+            value.mcpCommandMode !== undefined ||
+            value.fileRead !== undefined,
           { message: "At least one feature grant is required." },
         ),
     )
@@ -2505,6 +2519,8 @@ export const forwarderManagementRouter = {
           userId: true,
           reportedHumanTerminal: true,
           reportedMcpCommandMode: true,
+          reportedMcpFileRead: true,
+          reportedFileRoots: true,
           reportedTerminalSupported: true,
         },
       });
@@ -2531,20 +2547,30 @@ export const forwarderManagementRouter = {
           message: `MCP commands cannot be set to ${input.mcpCommandMode} until this CLI reports that mode (wsmp config set-mcp-commands).`,
         });
       }
+      if (
+        input.fileRead === true &&
+        (row.reportedMcpFileRead !== true || row.reportedFileRoots !== true)
+      ) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "File reading requires the CLI read switch and configured file roots.",
+        });
+      }
       const updated = await prisma.cliDevice.update({
         where: { id: row.id },
         data: {
+          ...(input.fileRead !== undefined ? { mcpFileRead: input.fileRead } : {}),
           ...(input.humanTerminal !== undefined ? { allowHumanTerminal: input.humanTerminal } : {}),
           ...(input.mcpCommandMode !== undefined
             ? { mcpCommandMode: mcpCommandModeToDb(input.mcpCommandMode) }
             : {}),
         },
-        select: { id: true, allowHumanTerminal: true, mcpCommandMode: true },
+        select: { id: true, allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
       });
       await context.services?.onCliFeatureGrantsChanged?.(updated.id);
       return {
         cliDeviceId: updated.id,
         humanTerminal: updated.allowHumanTerminal,
+        fileRead: updated.mcpFileRead,
         mcpCommandMode: mcpCommandModeFromDb(updated.mcpCommandMode),
       };
     }),

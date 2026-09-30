@@ -8,5 +8,7 @@
     "overwrite": true,
     "expectedEtag": "h:AAAAAAAAAAAAAAAAAAAAAA",
     "reason": "swap"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

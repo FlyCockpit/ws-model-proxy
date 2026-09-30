@@ -38,6 +38,9 @@
     "./user-deletion-listeners": {
       "default": "./src/user-deletion-listeners.ts"
     },
+    "./user-ban-listeners": {
+      "default": "./src/user-ban-listeners.ts"
+    },
     "./user-deletion-access-guard": {
       "default": "./src/user-deletion-access-guard.ts"
     }

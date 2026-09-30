@@ -1,9 +1,14 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  FILE_ERROR_CODES,
   FILE_OPS,
+  FILE_WIRE_REASONS,
   fileCancelFrameSchema,
   fileOpFrameSchema,
+  fileOpResultSchema,
+  fileRejectDetailSchema,
+  fileRejectedFrameSchema,
   fileSpawnSpecSchema,
 } from "./file-protocol.js";
 import {
@@ -131,7 +136,14 @@ describe("relay 2.8 file frames: server to CLI", () => {
       ["delete", { path: "~/a", expectedEtag: "" }],
     ];
     for (const [op, args] of bad) {
-      const frame: Record<string, unknown> = { type: "file.op", opId: OP_ID, op, args };
+      const frame: Record<string, unknown> = {
+        type: "file.op",
+        mode: "unsupervised",
+        readGrant: false,
+        opId: OP_ID,
+        op,
+        args,
+      };
       if (op === "write") frame.bodyBytes = 1;
       expect(
         () => fileOpFrameSchema.parse(frame),
@@ -179,9 +191,33 @@ describe("relay 2.8 file frames: CLI to server", () => {
       "file-rejected-conflict",
       "file-rejected-bad-frame",
       "file-rejected-match-count",
+      "file-rejected-grant-disabled",
     ]) {
       const frame = vector(name);
       expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+    }
+  });
+
+  it("accepts every reason the CLI dispatcher can emit, and nothing else", () => {
+    // Both sets are compared with the Rust source itself (parsed, not copied) in
+    // src/mcp/file-error-parity.test.ts.
+    for (const reason of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
+      // `uncertain_outcome` is only valid with its recovery facts (pinned below)
+      const detail =
+        reason === "uncertain_outcome"
+          ? {
+              recovery: "/w/.wsmp-recover-a1b2c3d4e5",
+              kept: ["/w/.wsmp-recover-a1b2c3d4e5/slot-1"],
+            }
+          : undefined;
+      const frame = { type: "file.rejected", opId: OP_ID, reason, ...(detail ? { detail } : {}) };
+      expect(parseRelayClientControlFrame(JSON.stringify(frame)), reason).toEqual(frame);
+    }
+    for (const reason of ["explode", "grantDisabled", "feature_disabled ", "GRANT_DISABLED"]) {
+      expect(
+        fileRejectedFrameSchema.safeParse({ type: "file.rejected", opId: OP_ID, reason }).success,
+        reason,
+      ).toBe(false);
     }
   });
 
@@ -334,5 +370,72 @@ describe("relay 2.8 supervised-file schema (answered unsupported until P5)", () 
     expect(names).toEqual(
       expect.arrayContaining(["file-cancel.json", "file-rejected-conflict.json"]),
     );
+  });
+});
+
+describe("file compensation recovery contract", () => {
+  const recovery = "/workspace/.wsmp-recover-a1b2c3d4e5";
+  const detail = { recovery, kept: [`${recovery}/slot-1`] };
+
+  it("accepts uncertain_outcome with bounded, absolute recovery facts", () => {
+    const frame = { type: "file.rejected", opId: OP_ID, reason: "uncertain_outcome", detail };
+    expect(fileRejectedFrameSchema.parse(frame)).toEqual(frame);
+    expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+    for (const bad of [
+      { ...detail, extra: true },
+      { ...detail, recovery: "relative" },
+      { ...detail, recovery: `/${"x".repeat(8192)}` },
+      { ...detail, kept: ["relative"] },
+      { ...detail, kept: ["/x\0y"] },
+      { ...detail, kept: Array(5).fill("/x") },
+      { recovery },
+      { kept: [] },
+    ])
+      expect(fileRejectDetailSchema.safeParse(bad).success).toBe(false);
+    expect(fileRejectedFrameSchema.safeParse({ ...frame, detail: undefined }).success).toBe(false);
+  });
+
+  it.each(["edit", "write", "rename"])(
+    "accepts recovered on %s and rejects unbounded/relative paths",
+    (op) => {
+      const frame = vector(`file-result-${op}`) as { result: Record<string, unknown> };
+      const result = { ...frame.result, recovered: detail.kept };
+      expect(fileOpResultSchema.parse({ op, result })).toEqual({ op, result });
+      for (const recovered of [
+        ["relative"],
+        ["/x\0y"],
+        Array(5).fill("/x"),
+        [`/${"x".repeat(8192)}`],
+      ]) {
+        expect(fileOpResultSchema.safeParse({ op, result: { ...result, recovered } }).success).toBe(
+          false,
+        );
+      }
+    },
+  );
+});
+
+describe("file permission frame inputs", () => {
+  it("requires explicit mode and grant intent and rejects malformed values", () => {
+    const valid = vector("file-op-read");
+    for (const field of ["mode", "readGrant"]) {
+      const absent = { ...valid };
+      delete absent[field];
+      expect(() => fileOpFrameSchema.parse(absent)).toThrow();
+    }
+    for (const patch of [
+      { mode: "on" },
+      { mode: null },
+      { mode: { mode: "unsupervised" } },
+      { readGrant: "true" },
+      { readGrant: null },
+      { readGrant: 1 },
+    ]) {
+      expect(() => fileOpFrameSchema.parse({ ...valid, ...patch })).toThrow();
+    }
+    expect(fileOpFrameSchema.parse({ ...valid, mode: "off", readGrant: true })).toMatchObject({
+      mode: "off",
+      readGrant: true,
+    });
   });
 });

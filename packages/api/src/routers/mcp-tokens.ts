@@ -84,6 +84,7 @@ function serializeToken(row: McpPersonalTokenRow) {
     revokedAt: row.revokedAt,
     expiresAt: row.expiresAt,
     allowCliCommands: row.allowCliCommands,
+    allowCliFileRead: row.allowCliFileRead,
   };
 }
 
@@ -140,6 +141,7 @@ export const mcpTokensRouter = {
           name: tokenNameSchema,
           allowWrite: z.boolean().default(false),
           allowCliCommands: z.boolean().default(false),
+          allowCliFileRead: z.boolean().default(false),
           expiresAt: tokenExpiresAtSchema,
         })
         .superRefine((value, ctx) => {
@@ -202,6 +204,7 @@ export const mcpTokensRouter = {
             // Any other value is the client timestamp already validated above.
             expiresAt,
             allowCliCommands: input.allowCliCommands,
+            allowCliFileRead: input.allowCliFileRead,
             grantId: grant.id,
           },
           select: mcpPersonalTokenSelection,
@@ -215,12 +218,12 @@ export const mcpTokensRouter = {
     }),
 
   /**
-   * Edits the capabilities of an ACTIVE token (scopes + allowCliCommands).
+   * Edits the capabilities of an ACTIVE token (scopes + CLI command/file-read consent).
    * The secret, name, and expiry are immutable. Narrowing is always allowed —
    * including during an emergency MCP shutdown — while widening (adding write
-   * or CLI commands) requires WMP_MCP_ENABLED like create. Admission reads the
+   * or CLI command/file-read consent) requires WMP_MCP_ENABLED like create. Admission reads the
    * row on every request, so edits apply from the next request; running CLI
-   * commands started under the old capabilities are cancelled after commit
+   * commands and file ops started under old capabilities are cancelled after commit
    * when the edit narrows.
    */
   updateMine: protectedProcedure
@@ -230,6 +233,7 @@ export const mcpTokensRouter = {
           id: z.string().min(1),
           allowWrite: z.boolean(),
           allowCliCommands: z.boolean(),
+          allowCliFileRead: z.boolean().default(false),
         })
         .superRefine(requireWriteForCliCommands),
     )
@@ -242,7 +246,7 @@ export const mcpTokensRouter = {
         // revoked, expired, and grant-revoked tokens are all NOT_FOUND.
         const existing = await tx.mcpPersonalToken.findFirst({
           where: { id: input.id, ...activeMcpPersonalTokenWhere(userId, new Date()) },
-          select: { id: true, scopes: true, allowCliCommands: true },
+          select: { id: true, scopes: true, allowCliCommands: true, allowCliFileRead: true },
         });
         if (!existing) {
           throw new ORPCError("NOT_FOUND", { message: "MCP token not found." });
@@ -250,7 +254,9 @@ export const mcpTokensRouter = {
 
         const hadWrite = existing.scopes.includes("mcp:write");
         const widened =
-          (input.allowWrite && !hadWrite) || (input.allowCliCommands && !existing.allowCliCommands);
+          (input.allowWrite && !hadWrite) ||
+          (input.allowCliCommands && !existing.allowCliCommands) ||
+          (input.allowCliFileRead && !existing.allowCliFileRead);
         if (widened && env.WMP_MCP_ENABLED !== true) {
           throw new ORPCError("FORBIDDEN", {
             message: "MCP token capabilities cannot be expanded while MCP is disabled.",
@@ -259,14 +265,19 @@ export const mcpTokensRouter = {
 
         const updated = await tx.mcpPersonalToken.update({
           where: { id: existing.id },
-          data: { scopes: nextScopes, allowCliCommands: input.allowCliCommands },
+          data: {
+            scopes: nextScopes,
+            allowCliCommands: input.allowCliCommands,
+            allowCliFileRead: input.allowCliFileRead,
+          },
           select: mcpPersonalTokenSelection,
         });
         return {
           row: updated,
           narrowed:
             (hadWrite && !input.allowWrite) ||
-            (existing.allowCliCommands && !input.allowCliCommands),
+            (existing.allowCliCommands && !input.allowCliCommands) ||
+            (existing.allowCliFileRead && !input.allowCliFileRead),
         };
       });
 

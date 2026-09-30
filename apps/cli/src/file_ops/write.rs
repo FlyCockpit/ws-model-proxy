@@ -55,6 +55,8 @@ pub struct WriteArgs {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteResult {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovered: Vec<String>,
     pub etag: String,
     pub size: u64,
     pub created: bool,
@@ -174,8 +176,10 @@ fn write_resolved(
             ));
         }
         cancel.check()?;
-        let created = atomic::create_new(
+        let (created, recovered) = atomic::create_new(
+            ops,
             &resolved.dir,
+            &resolved.dir_path,
             &resolved.name,
             content,
             mode.unwrap_or(DEFAULT_CREATE_MODE),
@@ -189,6 +193,7 @@ fn write_resolved(
             removed: None,
             diff: None,
             resolved_path: echo,
+            recovered,
         });
     };
 
@@ -230,11 +235,12 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    let new_stat = atomic::replace(
+    let (new_stat, recovered) = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
-        &mut file,
+        &resolved.dir_path,
+        file,
         &stat,
         &previous_etag,
         content,
@@ -249,6 +255,7 @@ fn write_resolved(
         removed: None,
         diff: None,
         resolved_path: echo,
+        recovered,
     };
     if args.return_diff.unwrap_or(false)
         && let (Some(before), Ok(after)) = (before_text, std::str::from_utf8(content))

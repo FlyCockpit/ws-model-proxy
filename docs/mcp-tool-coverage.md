@@ -82,7 +82,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.renameCliDevice` | `forwarder_cli_device_rename` | write | — | pure | — | — | — |
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
+| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
 | `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.setPoolMemberEngineLoad` | `forwarder_pool_member_engine_load_set` | write | RUN | cost | — | — | — |

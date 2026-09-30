@@ -617,6 +617,136 @@ fn pem_events(line: &str) -> Vec<(bool, &str)> {
     events
 }
 
+/// Bounded carry for one overlong terminal-cleaned line. Piece boundaries are
+/// never interpreted as line boundaries. Only exact private-key labels are
+/// carried; all general recovery is enforced by `StreamMasker::prime_recovery`.
+#[derive(Default)]
+pub(crate) struct SameLineCarry {
+    pem_tail: String,
+    pem_open: std::collections::BTreeMap<String, usize>,
+    state_cost: usize,
+    live_input: usize,
+    unrepresentable: bool,
+}
+
+impl SameLineCarry {
+    // Labels have no bound in files. Streaming output fails closed when a
+    // marker cannot fit this bounded overlap, rather than dropping its opener.
+    pub(crate) const OVERLAP: usize = 1024;
+
+    pub(crate) fn feed(&mut self, piece: &str, input_bytes: usize, state_limit: usize) {
+        if self.unrepresentable {
+            return;
+        }
+        // A visible LF inside a terminal group cannot be represented by this
+        // single-line carry. Fail closed rather than merge visual line state.
+        if piece.contains('\n') {
+            self.unrepresentable = true;
+            return;
+        }
+        self.pem_tail.push_str(piece);
+        loop {
+            let Some(start) = self.pem_tail.find("-----") else {
+                let mut cut = self.pem_tail.len().saturating_sub(4);
+                while !self.pem_tail.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                self.pem_tail.drain(..cut);
+                break;
+            };
+            self.pem_tail.drain(..start);
+            let rest = &self.pem_tail[5..];
+            let prefix = if rest.starts_with("BEGIN ") {
+                Some(11)
+            } else if rest.starts_with("END ") {
+                Some(9)
+            } else if "BEGIN ".starts_with(rest) || "END ".starts_with(rest) {
+                break;
+            } else {
+                None
+            };
+            let Some(label_at) = prefix else {
+                self.pem_tail.drain(..5);
+                continue;
+            };
+            let Some(end) = self.pem_tail[label_at..].find("-----") else {
+                if self.pem_tail.len() > Self::OVERLAP {
+                    self.unrepresentable = true;
+                    self.pem_tail.clear();
+                }
+                break;
+            };
+            let close_at = label_at + end;
+            // Keep the closing dashes: they may introduce the adjacent marker.
+            let marker_end = close_at + 5;
+            if marker_end > Self::OVERLAP {
+                self.unrepresentable = true;
+                self.pem_tail.clear();
+                break;
+            }
+            for (begin, label) in pem_events(&self.pem_tail[..marker_end]) {
+                if begin {
+                    let count = self.pem_open.entry(label.to_owned()).or_default();
+                    *count += 1;
+                    // Charge complete opener input, including its terminator.
+                    self.state_cost = self.state_cost.saturating_add(label.len() + 17);
+                } else if let Some(count) = self.pem_open.get_mut(label) {
+                    *count -= 1;
+                    self.state_cost = self.state_cost.saturating_sub(label.len() + 17);
+                    if *count == 0 {
+                        self.pem_open.remove(label);
+                    }
+                }
+            }
+            self.pem_tail.drain(..close_at);
+            if self.state_cost > state_limit {
+                self.unrepresentable = true;
+                self.pem_open.clear();
+                break;
+            }
+        }
+        if !self.pem_open.is_empty() {
+            self.live_input = self.live_input.saturating_add(input_bytes);
+        } else {
+            self.live_input = 0;
+        }
+        if self.live_input > state_limit {
+            self.unrepresentable = true;
+            self.pem_open.clear();
+        }
+    }
+
+    pub(crate) fn recover(mut self, masker: &mut LineMasker) -> Option<usize> {
+        if self.unrepresentable {
+            return None;
+        }
+        let cost = self.state_cost.max(self.live_input);
+        for (label, count) in std::mem::take(&mut self.pem_open) {
+            let opener = format!("-----BEGIN {label}-----");
+            for _ in 0..count {
+                let _ = masker.scan(&opener);
+            }
+        }
+        Some(cost)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pem_tail_len(&self) -> usize {
+        self.pem_tail.len()
+    }
+
+    pub(crate) fn unrepresentable(&self) -> bool {
+        self.unrepresentable
+    }
+}
+
+impl Drop for SameLineCarry {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.pem_tail).into_bytes();
+        bytes.fill(0);
+    }
+}
+
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -717,6 +847,12 @@ impl LineMasker {
     /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
         self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_open.is_empty()
+    }
+
+    /// Content constructs, including unconditional recovery UntilBlank, must
+    /// fail closed through EOF if another line crosses the hold cap.
+    pub(crate) fn has_content_continuation(&self) -> bool {
+        self.until_blank.is_some() || !self.pem_open.is_empty()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a
@@ -1356,6 +1492,65 @@ mod tests {
         .text;
         assert!(view.contains("public: 1"), "{view:?}");
         assert!(view.contains("    c"), "{view:?}");
+    }
+
+    /// Tabs and spaces cannot be ordered against each other, so a run opened with
+    /// one kind stays open across lines indented with the other kind (fail closed)
+    /// and ends only at column 0. Every row hides its probe line only because an
+    /// OLDER block is preserved (or a mixed-kind line keeps the block open): a
+    /// block replaced by a later token line of the same width but another kind,
+    /// or a mixed comparison that ordered by byte width, would show it.
+    #[test]
+    fn mixed_tab_space_indentation_keeps_every_older_block_open() {
+        for (sample, input, hidden) in [
+            (
+                // block B (2 tabs) shares its width with block A (2 spaces) but not its
+                // kind: A must survive B, and only A keeps the tab-only probe masked
+                "older space block survives an equal-width tab block",
+                "  a_key:\n    a1\n\t\tb_key: 1\n\t\t\tb1\n\tprobe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // the mirror image: only the older tab block keeps a space-only probe open
+                "older tab block survives an equal-width space block",
+                "\t\ta_key:\n\t\t\ta1\n  b_key: 1\n    b1\n probe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // the probe is shallower than both blocks by byte width
+                "shallower mixed probe stays open under both blocks",
+                "    a_key:\n        a1\n\t\t\t\tb_key: 1\n\t\t\t\t\tb1\n\tprobe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // C15b-5: the probe's indentation is a strict PREFIX of the block's mixed
+                // indentation, so it is really shallower; the ordering is not decided
+                // from prefixes and the run over-masks (documented fail-closed limit)
+                "strict-prefix probe of a mixed-indent block over-masks",
+                "\t    x_key: 1\n\t      a\n\tprobe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "strict-prefix probe of a mixed-indent block, spaces first",
+                "    \tx_key: 1\n    \t  a\n    probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(!view.contains(hidden), "{sample}: {view:?}");
+            assert!(view.contains("next: 1"), "{sample}: {view:?}");
+        }
+        // control: a same-kind probe at or below the block's indentation ends the run
+        for (sample, input) in [
+            ("tabs only", "\t\ta_key:\n\t\t\ta1\n\tpublic-c\nnext: 1\n"),
+            (
+                "spaces only",
+                "    a_key:\n        a1\n  public-c\nnext: 1\n",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(view.contains("public-c"), "{sample}: {view:?}");
+        }
     }
 
     #[test]
@@ -2037,6 +2232,7 @@ mod tests {
     /// masks, for every window start, whenever the file has no masked run longer
     /// than the lookback (`long_construct`, the case edits refuse to create).
     /// Random documents from a small hostile line pool, tiny lookback.
+    #[cfg(unix)] // The windowed reader is Unix-only; command masking also builds elsewhere.
     #[test]
     fn a_windowed_read_masks_at_least_what_the_full_view_masks() {
         use crate::file_ops::read::lookback_start_with;

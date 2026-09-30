@@ -11,5 +11,7 @@
     "contextLines": 1,
     "maxMatches": 100,
     "maxFiles": 20000
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }
