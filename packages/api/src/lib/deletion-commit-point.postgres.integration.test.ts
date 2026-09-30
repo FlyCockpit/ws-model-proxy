@@ -72,6 +72,13 @@ function gate(): { promise: Promise<void>; open: () => void } {
   return { promise, open };
 }
 
+/**
+ * The hook cold-imports the auth and router module graphs (Vite transforms
+ * them on first use); on a contended host that alone exceeded vitest's 10 s
+ * default hook timeout.
+ */
+const HOOK_TIMEOUT_MS = 120_000;
+
 integration("deletion commit points under concurrency", () => {
   let modules:
     | {
@@ -106,7 +113,7 @@ integration("deletion commit points under concurrency", () => {
       blocker: factory.createPrismaClient(databaseUrl),
       observer: factory.createPrismaClient(databaseUrl),
     };
-  });
+  }, HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     await Promise.all([modules?.blocker.$disconnect(), modules?.observer.$disconnect()]);
@@ -532,6 +539,16 @@ integration("deletion commit points under concurrency", () => {
     };
   }
 
+  /**
+   * Rows committed while the delete waits for the owner fence. The delete's own
+   * fence wait is bounded by CAPACITY_ORDERED_LOCK_TIMEOUT_MS (2 s, by design: it
+   * rolls back and answers CONFLICT), and that clock keeps running while the test
+   * inserts these rows. 5,000 rows made the insert alone outlast the bound on a
+   * starved host, so the delete was refused for the test's own slowness. This many
+   * rows still spans more than one 1,000-row sweep batch and commits in milliseconds.
+   */
+  const LATE_PRODUCER_ROWS = 1_200;
+
   // DL-1 (d): the final parent delete touches no hot-path row (no foreign key
   // crosses the boundary), so producers committing while it waits for its
   // owner fence no longer need a residual recount or refusal. Their rows stay
@@ -548,7 +565,7 @@ integration("deletion commit points under concurrency", () => {
       (error: unknown) => ({ error }),
     );
     await waitForLockWait("%wsmp_acquire_fences%", "advisory");
-    const late = 5_000;
+    const late = LATE_PRODUCER_ROWS;
     await observer.$executeRawUnsafe(
       `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
        SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
@@ -577,7 +594,7 @@ integration("deletion commit points under concurrency", () => {
       (error: unknown) => ({ error }),
     );
     await waitForLockWait("%wsmp_acquire_fences%", "advisory");
-    const late = 5_000;
+    const late = LATE_PRODUCER_ROWS;
     await observer.$executeRawUnsafe(
       `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
        SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
@@ -605,10 +622,17 @@ integration("deletion commit points under concurrency", () => {
     );
     await prisma.$executeRawUnsafe("ANALYZE relay_request");
     const plan = await prisma.$transaction(async (tx) => {
-      // Proves the index serves the keyset order; the planner may still pick
-      // a sequential scan for a tiny table, which is not what is under test.
+      // Proves the index serves the keyset order. Cost-based choice between
+      // this index and `relay_request_createdAt_idx` + an incremental sort
+      // depends on sampled statistics (ANALYZE samples randomly, and the table
+      // holds other files' rows), so it flaked. Disabling the sort node types
+      // leaves the composite index as the only plan that can deliver the order,
+      // whatever the statistics say; a missing or mis-ordered index would still
+      // fail here (no plan without a sort, or a different index).
       await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
       await tx.$executeRawUnsafe("SET LOCAL enable_bitmapscan = off");
+      await tx.$executeRawUnsafe("SET LOCAL enable_sort = off");
+      await tx.$executeRawUnsafe("SET LOCAL enable_incremental_sort = off");
       const rows = await tx.$queryRawUnsafe<Array<{ "QUERY PLAN": unknown }>>(
         `EXPLAIN (FORMAT JSON)
          SELECT id, "createdAt" FROM relay_request

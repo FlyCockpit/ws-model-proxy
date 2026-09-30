@@ -103,6 +103,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       }
     | undefined;
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
@@ -286,7 +287,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const address = upstream.address();
     if (!address || typeof address === "string") throw new Error("mock upstream did not listen");
     origin = `http://127.0.0.1:${address.port}`;
-  });
+  }, 120_000);
 
   afterAll(async () => {
     await new Promise<void>((resolve) => upstream?.close(() => resolve()) ?? resolve());
@@ -1212,9 +1213,22 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         select: { lastUsedAt: true },
       });
       const pending = claim();
+      // Wait until PostgreSQL reports the claim blocked on the withdrawal's row lock
+      // (deterministic: no fixed "long enough" sleep), then confirm it has not settled.
+      const lockDeadline = Date.now() + 10_000;
+      for (;;) {
+        const [row] = await modules.prisma.$queryRaw<Array<{ waiting: bigint }>>`
+          SELECT count(*) AS waiting FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock'
+             AND datname = current_database()
+             AND pid <> pg_backend_pid()`;
+        if (row && row.waiting > 0n) break;
+        if (Date.now() > lockDeadline) throw new Error("the claim never waited on the withdrawal");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       const early = await Promise.race([
         pending.then(() => "settled" as const),
-        new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 500)),
+        new Promise<"waiting">((resolve) => setImmediate(() => resolve("waiting"))),
       ]);
       // The claim is blocked on the withdrawal's row lock, not racing past it.
       expect(early).toBe("waiting");

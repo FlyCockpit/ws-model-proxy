@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
+  RELAY_MIN_PROTOCOL_VERSION,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
 } from "./protocol.js";
 
@@ -145,17 +146,24 @@ type CliFeatures = {
   terminalApproval?: boolean;
 };
 
-function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeatures) {
-  if (protocol === "2.1") {
+/**
+ * "current" speaks the relay's minimum (and only accepted) protocol; "identified"
+ * adds the CLI identity proof; "below-minimum" is a CLI the relay refuses.
+ */
+type CliKind = "current" | "identified" | "below-minimum";
+const BELOW_MINIMUM_PROTOCOL = "2.1";
+
+function hello(slug: string, kind: CliKind, features?: CliFeatures) {
+  if (kind === "below-minimum") {
     return JSON.stringify({
       type: "hello",
       id: `hello-${slug}`,
-      protocolVersion: "2.1",
+      protocolVersion: BELOW_MINIMUM_PROTOCOL,
       cli: {
         slug,
         hostname: `${slug}.local`,
         capabilities: {
-          protocolVersion: "2.1",
+          protocolVersion: BELOW_MINIMUM_PROTOCOL,
           inventoryAck: true,
           inventoryReplace: true,
           endpointTargeting: true,
@@ -169,18 +177,18 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
       endpoints: [],
     });
   }
-  // Every accepted CLI speaks 2.6; the 2.4 / 2.5 labels only pick whether it
+  // Every accepted CLI speaks the minimum protocol; `kind` only picks whether it
   // carries an identity proof.
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.7",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.7",
+        protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -204,7 +212,7 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
         terminalViewers: true,
         supervisedCommands: true,
         nodeTelemetry: true,
-        ...(protocol === "2.5" ? { terminalIdentity: cliIdentity() } : {}),
+        ...(kind === "identified" ? { terminalIdentity: cliIdentity() } : {}),
       },
     },
     endpoints: [],
@@ -229,7 +237,7 @@ function device(id: string, overrides: Record<string, unknown> = {}) {
     allowHumanTerminal: true,
     reportedHumanTerminal: true,
     reportedTerminalSupported: true,
-    relayProtocolVersion: "2.7",
+    relayProtocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     ...overrides,
   };
 }
@@ -252,14 +260,10 @@ function middlewareApp() {
   return app;
 }
 
-async function connectCli(
-  slug: string,
-  protocol: "2.5" | "2.4" | "2.1" = "2.4",
-  features?: CliFeatures,
-) {
+async function connectCli(slug: string, kind: CliKind = "current", features?: CliFeatures) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, protocol, features), now);
+  await relaySessionManager.handleTextFrame(socket, hello(slug, kind, features), now);
   return socket;
 }
 
@@ -518,14 +522,14 @@ describe("terminal browser hub", () => {
     expect(JSON.stringify(errors)).not.toContain("Foreign");
   });
 
-  it("refuses a CLI below 2.4, a missing grant, and a disabled feature without sending frames", async () => {
-    const old = await connectCli("old", "2.1");
+  it("refuses a CLI below the minimum protocol, a missing grant, and a disabled feature without sending frames", async () => {
+    const old = await connectCli("old", "below-minimum");
     const ungranted = await connectCli("ungranted");
-    const disabled = await connectCli("disabled", "2.4", { humanTerminal: false });
+    const disabled = await connectCli("disabled", "current", { humanTerminal: false });
     db.cliDevice.findFirst.mockImplementation(async (args: { where: { id?: string } }) => {
       if (args.where.id === "old")
         return device("old", {
-          relayProtocolVersion: "2.1",
+          relayProtocolVersion: BELOW_MINIMUM_PROTOCOL,
           reportedHumanTerminal: null,
           reportedTerminalSupported: null,
         });
@@ -1754,7 +1758,7 @@ describe("terminal browser hub", () => {
     expect(browser.jsonSends().filter((message) => message.type === "terminals")).toHaveLength(16);
   });
 
-  describe("protocol 2.5 viewers", () => {
+  describe("CLI viewers", () => {
     type Json = Record<string, unknown>;
 
     function binaryFrames(socket: FakeSocket) {
@@ -1773,7 +1777,7 @@ describe("terminal browser hub", () => {
 
     /** Browser A opens on a 2.5 CLI; the CLI spawns. */
     async function openShared(features?: CliFeatures) {
-      const cli = await connectCli("one", "2.5", features);
+      const cli = await connectCli("one", "identified", features);
       const a = attachBrowser();
       await open(a, "one");
       const opening = a.jsonSends().find((message) => message.type === "opening");

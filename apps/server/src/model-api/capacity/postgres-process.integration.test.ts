@@ -344,7 +344,11 @@ integration("capacity admission across operating-system processes", () => {
     });
 
     await quiesceCapacityFixture(db, owner.id);
-  }, 30_000);
+    // Timeout: 15 sequential worker boots (2 phases x holder, contender, 2 sweepers,
+    // recovered, releaser; then 3 scheduler rounds) x a 6 s per-boot budget = 90 s.
+    // A boot is `node --import tsx` transforming the capacity graph: ~1.1 s on an idle
+    // host, several times that when contended, so the old 30 s left <2x headroom idle.
+  }, 90_000);
 
   it("drains a deterministic high-contention process queue without retry exhaustion", async () => {
     if (!db) return;
