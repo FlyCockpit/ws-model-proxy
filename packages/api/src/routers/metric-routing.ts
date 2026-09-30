@@ -261,14 +261,14 @@ export const metricRoutingProcedures = {
    * Replace a pool's routing rules. `full` makes a member FULL (the request
    * queues, goes to another member, or goes external for `:external`
    * callers); `avoid` ranks it last. Stale or missing metrics are ignored.
-   * The pool's stored verdicts are cleared so the new rules apply at the
+   * The pool's stored gating (FULL and AVOID) verdicts are cleared so the new rules apply at the
    * device's next metrics frame.
    */
   setPoolRoutingRules: protectedProcedure
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // One graph statement (a non-key JSON column). The stored verdicts are
+      // One graph statement (a non-key JSON column). The stored gating verdicts are
       // H-class rows: they are cleared afterwards by the relay (H module),
       // never by this M writer.
       const updated = await prisma.modelPool.updateMany({
@@ -286,7 +286,7 @@ export const metricRoutingProcedures = {
    * Per-member live engine load override (S-D). `auto` lets the engine's live
    * load (`endpoint.load`) mark the member FULL; `off` ignores it. The optional
    * `kvFullThreshold` (0-1) overrides the 0.95 default for vLLM/SGLang; null
-   * clears it. The relay (H) clears the pool's stored verdicts. A changed
+   * clears it. The relay (H) clears the pool's stored gating verdicts (NONE fences stay). A changed
    * override invalidates this member's cache in every process, so it is
    * re-published at the device's next evaluation. Unchanged siblings follow
    * the regular refresh budget when their session is on another process.
@@ -302,7 +302,7 @@ export const metricRoutingProcedures = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       // One graph statement (non-key columns): no capacity lock is held or
-      // taken. The stored verdicts are H-class rows: the relay clears them
+      // taken. The stored gating verdicts are H-class rows: the relay clears them
       // afterwards (`onPoolRoutingRulesChanged`), never this M writer.
       const updated = await prisma.poolMember.updateMany({
         where: { id: input.poolMemberId, ModelPool: { userId } },

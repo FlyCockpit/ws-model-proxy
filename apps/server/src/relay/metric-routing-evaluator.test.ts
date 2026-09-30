@@ -836,7 +836,7 @@ describe("MetricRoutingEvaluator", () => {
     { verdict: "AVOID", effect: "avoid", waiting: 3 },
     { verdict: "NONE", effect: "full", waiting: 0 },
   ])(
-    "clearPool removes gating $verdict rows, keeps NONE fences and invalidates cached writes",
+    "clearPool keeps NONE fences, removes gating rows and invalidates cached writes",
     async ({ verdict, effect, waiting }) => {
       const rules = [{ metric: "endpoint.waiting", op: ">=", threshold: 2, effect }];
       const h = harness([
