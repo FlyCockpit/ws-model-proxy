@@ -81,6 +81,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       }
     | undefined;
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
@@ -115,7 +116,7 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       deadline,
       timeouts,
     };
-  });
+  }, 120_000);
 
   afterAll(async () => {
     // Fixtures use unique identities in a disposable database.
@@ -1872,7 +1873,9 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
     const row = await prisma.user.findUniqueOrThrow({ where: { id: victim.g.user.id } });
     expect(row.deletionGeneration).toBe(mark!.generation);
     expect(await prisma.session.count({ where: { userId: victim.g.user.id } })).toBe(0);
-  });
+    // CPU-bound, not time-dependent: two scrypt hashes plus several sign-ins on the
+    // production auth instance, which outlast the 5 s default when the host is busy.
+  }, 60_000);
 
   it("merges requester rollups onto other owners without changing their totals", async () => {
     const { prisma, deletion } = required();
@@ -2658,11 +2661,30 @@ integration("DL1-TXBOUND parent deletes with large request history", () => {
       await expect(tick()).resolves.toEqual({ deleted: 0, abandoned: 0, failed: 0 });
       const held = await backendPid();
       expect(await sweepBackends(before)).toEqual([held]);
-      // Several times the (shortened) idle timeout, which the production
-      // 5-minute interval exceeds by far: the connection is still open, and
-      // the next tick runs on it without connecting.
-      await sleep(TEST_POOL_IDLE_MS * 4);
-      expect(await sweepBackends(before)).toEqual([held]);
+      // Positive control for the idle-timeout seam: the same options with
+      // `minIdleConnections: 0` must LOSE its idle connection within the same
+      // window. Without this, a dropped seam (default 10 s timeout) would let the
+      // check below pass even with `min` removed from the production options.
+      const control = required().clientFactory.createStatementBoundedPrismaClient(databaseUrl!, {
+        ...sweep.USER_DELETION_SWEEP_CLIENT_OPTIONS,
+        minIdleConnections: 0,
+        idleTimeoutMsForTest: TEST_POOL_IDLE_MS,
+      }).prisma;
+      try {
+        const [row] = await control.$queryRaw<Array<{ pid: number }>>`
+          SELECT pg_backend_pid() AS pid`;
+        const controlPid = Number(row!.pid);
+        expect(await sweepBackends(before)).toContain(controlPid);
+        // Several times the (shortened) idle timeout, which the production
+        // 5-minute interval exceeds by far: the connection is still open, and
+        // the next tick runs on it without connecting.
+        await sleep(TEST_POOL_IDLE_MS * 4);
+        const alive = await sweepBackends(before);
+        expect(alive).not.toContain(controlPid);
+        expect(alive).toEqual([held]);
+      } finally {
+        await control.$disconnect();
+      }
       await expect(tick()).resolves.toEqual({ deleted: 0, abandoned: 0, failed: 0 });
       expect(await backendPid()).toBe(held);
       report(`sweep tick after ${TEST_POOL_IDLE_MS * 4} ms idle reused backend ${held}`);

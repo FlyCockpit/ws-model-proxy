@@ -344,7 +344,13 @@ integration("capacity admission across operating-system processes", () => {
     });
 
     await quiesceCapacityFixture(db, owner.id);
-  }, 30_000);
+    // Timeout is a hang bound, not a speed claim. The test boots 15 workers, one after
+    // another (2 phases x holder, contender, recovered, releaser; the 2 sweepers boot
+    // concurrently; then 3 scheduler rounds). A boot is `node --import tsx` transforming
+    // the capacity graph: ~1.1 s on an idle host, ~2.1 s at 2x CPU oversubscription
+    // (31.7 s total, which the old 30 s missed). 90 s is ~2.8x that contended total, and
+    // none of the inner awaits has its own bound, so this is the only hang bound.
+  }, 90_000);
 
   it("drains a deterministic high-contention process queue without retry exhaustion", async () => {
     if (!db) return;

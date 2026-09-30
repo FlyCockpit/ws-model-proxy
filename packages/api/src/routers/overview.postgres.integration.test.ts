@@ -22,6 +22,7 @@ integration("overview metrics with real PostgreSQL", () => {
   let emptyLatencyHistogram: typeof import("@ws-model-proxy/config/usage-metrics").emptyLatencyHistogram;
   const created: string[] = [];
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
@@ -35,7 +36,7 @@ integration("overview metrics with real PostgreSQL", () => {
     overviewRouter = router.overviewRouter;
     latencyBucketIndex = metrics.latencyBucketIndex;
     emptyLatencyHistogram = metrics.emptyLatencyHistogram;
-  });
+  }, 120_000);
 
   afterAll(async () => {
     if (!prisma) return;

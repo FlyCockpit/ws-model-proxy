@@ -17,6 +17,7 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
   let fixtures: ReturnType<typeof createFixturePrismaClient>;
   const memberIds: string[] = [];
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
@@ -82,7 +83,7 @@ integration("pool member half-open trial lease (PostgreSQL)", () => {
       });
       memberIds.push(member.id);
     }
-  });
+  }, 120_000);
 
   afterAll(async () => {
     // Fixture rows carry unique identities; nothing here is shared or global.
