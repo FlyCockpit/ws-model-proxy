@@ -168,7 +168,10 @@ impl MarkerScanner {
                 Some("ready") => MarkerEvent::Ready,
                 Some("accepted") => MarkerEvent::Accepted,
                 Some(value) if value.starts_with("blocked;") => {
+                    // `uncertain_outcome` is an apply-time verdict only the daemon
+                    // produces after acceptance; the confirm child never has it.
                     FileErrorCode::from_wire_code(&value["blocked;".len()..])
+                        .filter(|code| !matches!(code, FileErrorCode::UncertainOutcome))
                         .map(MarkerEvent::Blocked)
                         .unwrap_or(MarkerEvent::Invalid)
                 }
@@ -293,7 +296,13 @@ mod tests {
         assert!(pieces.contains(&Piece::Event(MarkerEvent::Ready)));
         assert!(pieces.contains(&Piece::Event(MarkerEvent::Blocked(FileErrorCode::Conflict))));
 
-        for kind in ["blocked;made_up", "blocked;conflict;extra", "surprise"] {
+        // An apply-time verdict the confirm child never produces is malformed there.
+        for kind in [
+            "blocked;made_up",
+            "blocked;conflict;extra",
+            "blocked;uncertain_outcome",
+            "surprise",
+        ] {
             let mut scanner = MarkerScanner::new(marker);
             let mut stream = supervised_marker("ready", marker);
             stream.extend(supervised_marker(kind, marker));

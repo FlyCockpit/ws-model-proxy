@@ -23,6 +23,11 @@ type CliCommandDeps = {
 // All command-tool descriptions share the CLI's masking and server scrubbing notice.
 export { CLI_COMMAND_OUTPUT_NOTICE } from "@ws-model-proxy/config/cli-command-output";
 
+// A supervised agent has no read grant and receives no recovery paths: those go
+// to the person's daemon log (headless results carry them instead).
+const SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE =
+  "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations";
+
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
  * token, 2 the device's dashboard grant, 3 the CLI's own
@@ -264,7 +269,10 @@ export async function runForwarderCliCommandResult(
           ? {
               error: {
                 ...supervised.fileError,
-                message: FILE_ERROR_MESSAGES[supervised.fileError.code],
+                message:
+                  supervised.fileError.code === "uncertain_outcome"
+                    ? SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE
+                    : FILE_ERROR_MESSAGES[supervised.fileError.code],
               },
             }
           : {}),

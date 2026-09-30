@@ -65,6 +65,12 @@ where
 }
 
 pub const MAX_FILE_ROOTS: usize = 32;
+/// Aggregate JSON-serialized size of the whole roots set (control characters
+/// and quotes count as their escapes). The supervised confirm child receives
+/// the set through one environment variable (< 128 KiB per string on Linux), so
+/// a larger set is refused where it is accepted instead of leaving supervised
+/// writes unusable at runtime (fail closed).
+pub const MAX_FILE_ROOTS_SERIALIZED_BYTES: usize = 64 * 1024;
 
 fn deserialize_file_roots<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
 where
@@ -81,6 +87,14 @@ pub(crate) fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
     anyhow::ensure!(
         roots.len() <= MAX_FILE_ROOTS,
         "at most {MAX_FILE_ROOTS} file roots are allowed"
+    );
+    let serialized: usize = roots
+        .iter()
+        .map(|root| serde_json::to_string(root).map_or(usize::MAX, |json| json.len() + 1))
+        .fold(0, usize::saturating_add);
+    anyhow::ensure!(
+        serialized <= MAX_FILE_ROOTS_SERIALIZED_BYTES,
+        "the file roots are too long in total (at most {MAX_FILE_ROOTS_SERIALIZED_BYTES} bytes once serialized, control characters counting as escapes)"
     );
     let mut seen = std::collections::HashSet::new();
     for root in roots {
@@ -2452,5 +2466,40 @@ mod tests {
                 serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid.clone()).is_err()
             );
         }
+    }
+
+    /// The roots set is bounded in aggregate (serialized, control characters
+    /// counting as escapes) wherever roots are accepted, so the supervised
+    /// confirm child can always receive it; realistic sets stay accepted.
+    #[test]
+    fn file_roots_have_an_aggregate_serialized_bound() {
+        // Realistic: the maximum count of ordinary 200-byte roots fits.
+        let ordinary: Vec<PathBuf> = (0..MAX_FILE_ROOTS)
+            .map(|n| PathBuf::from(format!("/{}{n}", "r".repeat(200))))
+            .collect();
+        validate_file_root_shape(&ordinary).expect("ordinary roots");
+        // Pathological: each control character serializes to six bytes, so a
+        // handful of valid (under 4096-byte) names pass the per-root shape but
+        // not the aggregate bound.
+        let heavy: Vec<PathBuf> = (0..17)
+            .map(|n| PathBuf::from(format!("/{n}{}", "\u{1}".repeat(1500))))
+            .collect();
+        for root in &heavy {
+            validate_file_root_shape(std::slice::from_ref(root)).expect("one root");
+        }
+        let error = validate_file_root_shape(&heavy).expect_err("aggregate bound");
+        assert!(error.to_string().contains("too long in total"), "{error}");
+        // The same set fails closed when a config file carries it.
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(deserialize_with = "deserialize_file_roots")]
+            #[allow(dead_code)]
+            roots: Vec<PathBuf>,
+        }
+        let raw = serde_json::json!({ "roots": heavy });
+        assert!(
+            serde_json::from_value::<Probe>(raw).is_err(),
+            "config deserialization must refuse the set"
+        );
     }
 }

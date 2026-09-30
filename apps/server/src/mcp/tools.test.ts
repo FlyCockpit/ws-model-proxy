@@ -3042,13 +3042,21 @@ describe("CLI file tools", () => {
     ["offline", "The CLI is offline or does not support file tools"],
     ["io_error", "The file operation failed"],
     [
+      "uncertain_outcome",
+      "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations",
+    ],
+    [
       "secret_file",
       "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
     ],
   ] as const)(
     "polls supervised file error %s with its exact documented message",
     async (code, message) => {
-      const unknown = code === "timeout" || code === "offline" || code === "io_error";
+      const unknown =
+        code === "timeout" ||
+        code === "offline" ||
+        code === "io_error" ||
+        code === "uncertain_outcome";
       cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
         kind: "supervised",
         requestKind: "file",
