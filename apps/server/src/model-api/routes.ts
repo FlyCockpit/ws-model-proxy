@@ -184,6 +184,7 @@ import {
   createProtocolAdaptationTransform,
   executionTargetAcceptsTopK,
   executionTargetSupportsStreamUsage,
+  isRequestDepthError,
   type ProtocolSurface,
   parseCanonicalRequest,
   reasoningControlForSurface,
@@ -1856,6 +1857,20 @@ function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boole
   if (target === "openai-responses")
     return /event: (?:response\.(?:completed|incomplete|failed)|error)\r?\n/.test(text);
   return /event: (?:message_stop|error)\r?\n/.test(text);
+}
+
+function adapterRequestErrorResponse(surface: ProtocolSurface, error: AdapterError): Response {
+  const canonicalError = {
+    code: "invalid_request_error",
+    message: error.message,
+    parameter: error.parameter,
+    upstreamStatus: 400,
+  };
+  const metadata = renderProtocolErrorMetadata(surface, canonicalError);
+  return new Response(JSON.stringify(renderProtocolError(surface, canonicalError)), {
+    status: metadata.status,
+    headers: metadata.headers,
+  });
 }
 
 function renderForExecutionTarget({
@@ -4512,7 +4527,29 @@ async function relayPool({
       // Compatible members whose capacity lease was already lost in this
       // request's precommit window; the same physical member is never
       // re-admitted during this tier traversal.
-      const compatibleAll = compatibleTargets(listed.targets);
+      let providerDepthError: AdapterError | undefined;
+      const compatibleAll = compatibleTargets(listed.targets).filter((providerTarget) => {
+        const nativeSurface = providerTarget.resolvedExecution?.nativeSurface;
+        if (!canonical || !nativeSurface || nativeSurface === requestedSurface) return true;
+        try {
+          renderForExecutionTarget({
+            request: canonical,
+            target: nativeSurface,
+            model: providerTarget.upstreamModelId,
+            allowLossyDeveloperRoleCollapse: providerTarget.ownKey
+              ? false
+              : operation.adaptation?.allowLossyDeveloperRoleCollapse,
+            capabilities: providerTarget.capabilityInventory,
+          });
+        } catch (error) {
+          if (isRequestDepthError(error)) {
+            providerDepthError = error;
+            return false;
+          }
+        }
+        return true;
+      });
+      if (providerDepthError && compatibleAll.length === 0) throw providerDepthError;
       const compatible = orderChatTestProviderTargets(
         compatibleAll.filter(
           (providerTarget) => !lostExternalExecutionTargetIds.has(providerTarget.executionTargetId),
@@ -4817,6 +4854,16 @@ async function relayPool({
         // from the hand-off refusal below.
         return await commitExternalResponse();
       } catch (error) {
+        if (isRequestDepthError(error)) {
+          releaseCallerLease();
+          await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+          await failPoolRelayMetadata({
+            relayRequestId,
+            startedAt,
+            failure: "unsupported_capability",
+          }).catch(metadataUpdateError);
+          return adapterRequestErrorResponse(requestedSurface, error);
+        }
         const leaseLost = precommitLeaseLost(error, providerCapacityLease?.signal, request.signal);
         // A lost lease abandons a provider body that never reached the client:
         // settle its attempt (a no-op when already read, cancelled or locked).
@@ -5385,6 +5432,7 @@ async function relayPool({
       ),
     ]),
   );
+  let adaptationDepthError: AdapterError | undefined;
   const protocolCandidates = contextEligibleMembers.filter((member) => {
     const execution = executionByMember.get(member.id);
     if (!execution)
@@ -5405,10 +5453,20 @@ async function relayPool({
         capabilities: effectivePoolMemberCapabilities(member),
       });
       return true;
-    } catch {
+    } catch (error) {
+      if (isRequestDepthError(error)) adaptationDepthError = error;
       return false;
     }
   });
+  if (adaptationDepthError && operation.adaptation && protocolCandidates.length === 0) {
+    await operation.dispose?.();
+    await failPoolRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unsupported_capability",
+    }).catch(metadataUpdateError);
+    return adapterRequestErrorResponse(operation.adaptation.requestedSurface, adaptationDepthError);
+  }
   const nativeProtocolCandidates = protocolCandidates.filter(
     (member) => executionByMember.get(member.id)?.mode === "native",
   );

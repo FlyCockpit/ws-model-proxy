@@ -45,10 +45,10 @@ export function asJson(value: unknown, maximumBytes = MAX_CANONICAL_BYTES): Json
       entry === null ||
       typeof entry === "boolean" ||
       typeof entry === "string" ||
-      (typeof entry === "number" && Number.isFinite(entry))
+      typeof entry === "number"
     ) {
       charge(Buffer.byteLength(JSON.stringify(entry)));
-      return entry;
+      return typeof entry === "number" && !Number.isFinite(entry) ? null : entry;
     }
     if (typeof entry !== "object") return undefined;
     charge(2);
@@ -84,34 +84,167 @@ export function asJson(value: unknown, maximumBytes = MAX_CANONICAL_BYTES): Json
   }
 }
 
-/** Serialize own keys only; iterative traversal also handles synthetic layer wrappers. */
-export function stableJson(value: JsonValue): string {
+/** A request shares this counter across validation, extraction and serialization. */
+export type CanonicalWork = { steps: number };
+export const MAX_CANONICAL_STEPS = 8 * MAX_CANONICAL_BYTES;
+export function visitCanonical(work: CanonicalWork) {
+  if (work.steps >= MAX_CANONICAL_STEPS) throw new RangeError("Affinity work limit");
+  work.steps++;
+}
+
+export class CanonicalSizeError extends Error {}
+
+/** Sorted object keys, indexed arrays, and output bounded before each append. */
+export function budgetedStableJson(
+  value: unknown,
+  maximumBytes = MAX_CANONICAL_BYTES,
+  work: CanonicalWork = { steps: 0 },
+): string {
+  let bytes = 0;
   const pieces: string[] = [];
-  const pending: Array<{ value: JsonValue } | { text: string }> = [{ value }];
-  while (pending.length) {
-    const item = pending.pop()!;
-    if ("text" in item) {
-      pieces.push(item.text);
-      continue;
+  const append = (text: string) => {
+    bytes += Buffer.byteLength(text);
+    if (bytes > maximumBytes) throw new CanonicalSizeError("Affinity canonical size limit");
+    pieces.push(text);
+  };
+  const quoted = (text: string, emit: (part: string) => void) => {
+    emit('"');
+    for (let i = 0; i < text.length; ) {
+      let end = Math.min(i + 4096, text.length);
+      // Never split a surrogate pair: chunking must preserve JSON.stringify bytes.
+      if (
+        end < text.length &&
+        text.charCodeAt(end - 1) >= 0xd800 &&
+        text.charCodeAt(end - 1) <= 0xdbff
+      )
+        end--;
+      emit(JSON.stringify(text.slice(i, end)).slice(1, -1));
+      i = end;
     }
-    const entry = item.value;
-    if (entry === null || typeof entry !== "object") {
-      pieces.push(JSON.stringify(entry));
-      continue;
+    emit('"');
+  };
+  const write = (entry: unknown, depth: number) => {
+    visitCanonical(work);
+    // Synthetic root wrappers can add four levels to an accepted depth-128 payload.
+    if (depth > MAX_CANONICAL_DEPTH + 4) throw new RangeError("Affinity canonical depth limit");
+    if (typeof entry === "string") {
+      quoted(entry, append);
+      return;
     }
-    const array = Array.isArray(entry);
-    const keys = Object.keys(entry).sort();
-    pieces.push(array ? "[" : "{");
-    pending.push({ text: array ? "]" : "}" });
-    const count = array ? entry.length : keys.length;
-    for (let i = count - 1; i >= 0; i--) {
-      if (i < count - 1) pending.push({ text: "," });
+    if (entry === null || typeof entry === "number" || typeof entry === "boolean") {
+      append(JSON.stringify(entry));
+      return;
+    }
+    if (typeof entry !== "object") throw new TypeError("Non-JSON affinity value");
+    if (Array.isArray(entry)) {
+      append("[");
+      for (let i = 0; i < entry.length; i++) {
+        if (i) append(",");
+        write(entry[i], depth + 1);
+      }
+      append("]");
+      return;
+    }
+    // Gather only keys whose minimum encoded cost still fits, before sorting.
+    const keys: string[] = [];
+    let keyBytes = 2;
+    for (const key in entry) {
+      if (!Object.hasOwn(entry, key)) continue;
+      visitCanonical(work);
+      quoted(key, (part) => {
+        keyBytes += Buffer.byteLength(part);
+        if (bytes + keyBytes > maximumBytes)
+          throw new CanonicalSizeError("Affinity canonical size limit");
+      });
+      keyBytes += 2; // colon and at least one value byte (commas charged below)
+      if (keys.length) keyBytes++;
+      if (bytes + keyBytes > maximumBytes)
+        throw new CanonicalSizeError("Affinity canonical size limit");
+      keys.push(key);
+    }
+    keys.sort();
+    append("{");
+    for (let i = 0; i < keys.length; i++) {
+      if (i) append(",");
       const key = keys[i]!;
-      pending.push({ value: array ? entry[i]! : entry[key]! });
-      if (!array) pending.push({ text: `${JSON.stringify(key)}:` });
+      quoted(key, append);
+      append(":");
+      write((entry as Record<string, unknown>)[key], depth + 1);
+    }
+    append("}");
+  };
+  write(value, 0);
+  return pieces.join("");
+}
+
+export function stableJson(value: JsonValue): string {
+  return budgetedStableJson(value);
+}
+
+/** Raw iterators avoid copying or converting the conversation before budgeting it. */
+export function rawAffinityLayers(
+  surface: string | null,
+  payload: Record<string, unknown>,
+  work: CanonicalWork,
+) {
+  const chat = surface === "openai-chat";
+  const responses = surface === "openai-responses";
+  const units = responses ? payload.input : payload.messages;
+  const consumedKeys: string[] = [];
+  if (Array.isArray(units) || (responses && typeof units === "string"))
+    consumedKeys.push(responses ? "input" : "messages");
+  const topInstruction = responses ? "instructions" : "system";
+  if (!chat && payload[topInstruction] !== undefined) consumedKeys.push(topInstruction);
+  if (responses && payload.previous_response_id !== undefined)
+    consumedKeys.push("previous_response_id");
+  if (payload.tools !== undefined) consumedKeys.push("tools");
+  if (chat && payload.functions !== undefined) consumedKeys.push("functions");
+  const tools =
+    chat && payload.functions !== undefined
+      ? { tools: payload.tools ?? null, functions: payload.functions }
+      : payload.tools;
+  function* instructions() {
+    if (!chat && payload[topInstruction] !== undefined) yield payload[topInstruction];
+    if ((chat || responses) && Array.isArray(units)) {
+      for (const unit of units) {
+        visitCanonical(work);
+        if (INSTRUCTION_ROLES.has(objectRole(unit) ?? "")) yield unit;
+      }
     }
   }
-  return pieces.join("");
+  function* conversation() {
+    if (responses && typeof units === "string") yield units;
+    if (Array.isArray(units)) {
+      for (const unit of units) {
+        visitCanonical(work);
+        if ((!chat && !responses) || !INSTRUCTION_ROLES.has(objectRole(unit) ?? "")) yield unit;
+      }
+    }
+  }
+  return { instructions, conversation, tools, consumedKeys };
+}
+
+export function continuationEvidence(units: Iterable<unknown>, work: CanonicalWork): boolean {
+  let sawUser = false;
+  for (const unit of units) {
+    visitCanonical(work);
+    const item = object(unit);
+    if (sawUser && item) {
+      if (
+        CONTINUATION_ROLES.has(normalizedType(item.role) ?? "") ||
+        typeMarksContinuation(normalizedType(item.type))
+      )
+        return true;
+      if (Array.isArray(item.content)) {
+        for (const block of item.content) {
+          visitCanonical(work);
+          if (typeMarksContinuation(normalizedType(object(block)?.type))) return true;
+        }
+      }
+    }
+    if (objectRole(unit) === "user") sawUser = true;
+  }
+  return false;
 }
 
 function emptyLayers(): AffinityLayers {
@@ -164,7 +297,7 @@ function hasContinuationEvidence(units: JsonValue[]): boolean {
 }
 
 function pushJson(units: JsonValue[], value: unknown) {
-  const json = asJson(value, Number.POSITIVE_INFINITY);
+  const json = asJson(value, MAX_CANONICAL_BYTES);
   if (json !== undefined) units.push(json);
 }
 
@@ -172,7 +305,7 @@ function extractTools(payload: Record<string, unknown>): {
   tools: JsonValue | undefined;
   consumed: boolean;
 } {
-  const tools = asJson(payload.tools, Number.POSITIVE_INFINITY);
+  const tools = asJson(payload.tools, MAX_CANONICAL_BYTES);
   return { tools, consumed: tools !== undefined };
 }
 
@@ -188,7 +321,7 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
     }
   }
   const extracted = extractTools(payload);
-  const functions = asJson(payload.functions, Number.POSITIVE_INFINITY);
+  const functions = asJson(payload.functions, MAX_CANONICAL_BYTES);
   const tools =
     functions === undefined ? extracted.tools : { tools: extracted.tools ?? null, functions };
   if (extracted.consumed) consumedKeys.push("tools");

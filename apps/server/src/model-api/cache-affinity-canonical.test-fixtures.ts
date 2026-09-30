@@ -69,3 +69,54 @@ export const depthRows = canonicalLocations.flatMap((location) =>
     })),
   ),
 );
+
+export function embeddedArgumentsRequest(surface: string, argumentsText: string, model = "m") {
+  const tool = { name: "lookup", parameters: { type: "object" } };
+  const common = { model, max_output_tokens: 16, parallel_tool_calls: false };
+  if (surface === "openai-responses")
+    return {
+      ...common,
+      tools: [{ type: "function", ...tool }],
+      input: [
+        { role: "user", content: "start" },
+        { type: "function_call", call_id: "call-1", name: "lookup", arguments: argumentsText },
+      ],
+    };
+  return {
+    model,
+    max_tokens: 16,
+    parallel_tool_calls: false,
+    tools: [{ type: "function", function: tool }],
+    messages: [
+      { role: "user", content: "start" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "lookup", arguments: argumentsText },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+export const numericOverflowRows = [
+  "openai-chat",
+  "anthropic-messages",
+  "openai-responses",
+].flatMap((surface) => ["scalar", "object", "array"].map((shape) => ({ surface, shape })));
+
+export function numericOverflowPayload(surface: string, shape: string, value: string | undefined) {
+  const extension =
+    value === undefined
+      ? ""
+      : `,"vendor_extension":${shape === "object" ? `{"field":${value}}` : shape === "array" ? `[${value}]` : value}`;
+  const units = '[{"role":"user","content":"U"},{"role":"assistant","content":"A"}]';
+  return JSON.parse(
+    `{${surface === "openai-responses" ? '"input"' : '"messages"'}:${units}${extension}}`,
+  );
+}

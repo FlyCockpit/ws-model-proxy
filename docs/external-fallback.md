@@ -295,8 +295,24 @@ publishes no delta-only nodes, including with a client id; that id can still
 identify the session footprint. Canonicalization preserves every own JSON key,
 including `__proto__`. Affinity's advisory depth limit is 128 (request root at
 depth 0; each object property or array entry adds one level). Exceeding that
-limit or a converter/HMAC error makes the whole request unidentifiable: no
-nodes, hints, client session footprint or Responses lineage.
+limit or a converter/HMAC/work-budget error makes the whole request unidentifiable:
+no nodes, hints, client session footprint or Responses lineage.
+
+Ranking builds canonical request material once and reuses it across targets;
+only binding and HMAC work depends on the target. A shared **16,777,216 visited-node
+budget (8 × 2 MiB)** bounds validation, extraction and incremental serialization.
+Work-budget exhaustion makes the whole advisory request unidentifiable. Arrays
+are visited by index without copying or sorting keys; object keys are collected
+only while their minimum encoded byte cost fits. Strings are escaped in chunks
+of at most 4096 code units, preserving surrogate pairs. Conversation processing
+also stops after **4096 units** with the same identity-refusal behavior as byte
+overflow. These bounds prevent many tiny values from monopolizing the process.
+Ordinary requests retain the same canonical bytes and v5 digests.
+
+Non-finite numbers accepted by JSON parsing, such as `1e400` and `-1e400`, bind
+as `null`, matching native `JSON.stringify` forwarding. This applies to scalar
+values, object members and array elements in parameters, tools, instructions
+and messages; no member, array property or conversation unit is silently dropped.
 
 The 2 MiB canonical identity limit is separate: bytes are counted for the
 instruction/tools/parameters root and then each conversation unit. Size-only
@@ -309,12 +325,21 @@ session footprint; without an id only shared hints are refreshed, with no new
 per-turn footprint. Routing hints never establish resolver identity.
 
 Model API JSON acceptance has a separate **256-level request nesting limit**,
-measured iteratively immediately after JSON parsing, before model lookup,
-counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
+measured iteratively with parallel container/depth stacks immediately after JSON
+parsing, before model lookup, counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
 a protocol-appropriate invalid-request error: `request JSON nesting exceeds 256
 levels`. Depth 129 through 256 is served with affinity advisory identity off,
 including bound Responses follow-ups. Realistic tool/JSON schemas are far below
 256, which also stays safely below Node 24's recursive serializer limit.
+
+Adapters enforce the same literal **256-level** bound whenever embedded tool
+argument JSON strings are decoded into objects, including request rendering,
+nonstream responses and stream validation. Each decoded argument has a fresh
+depth-0 boundary: depth 256 is supported, and 257 or greater fails with
+`request JSON nesting exceeds 256 levels`. Local and external request render
+preflight returns the requested protocol's HTTP 400 before member admission or
+dispatch, without recording a member health failure. Native argument strings
+that are passed through without decoding retain their existing behavior.
 
 The shared parser covers `/chat/completions`, `/messages`,
 `/messages/count_tokens`, `/responses` (create and bound input follow-ups),

@@ -3,13 +3,18 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import {
-  asJson,
+  budgetedStableJson,
+  CanonicalSizeError,
+  type CanonicalWork,
   canonicalizeAffinitySurface,
-  extractAffinityLayers,
-  type JsonValue,
+  continuationEvidence,
   MAX_CANONICAL_BYTES,
+  MAX_CANONICAL_DEPTH,
+  rawAffinityLayers,
   stableJson,
+  visitCanonical,
 } from "./cache-affinity-layers.js";
+import { requestJsonDepthExceeded } from "./request-json-depth.js";
 
 const DIGEST_VERSION = 5;
 const MAX_PREFIXES_PER_REQUEST = 64;
@@ -212,13 +217,13 @@ function hmacValue(value: string) {
 }
 
 function cumulativePrefixDigests(
-  units: JsonValue[],
+  units: string[],
   encode: (index: number, cumulative: string) => string,
 ) {
   const digests: string[] = [];
   let cumulative = "";
   for (let index = 0; index < units.length; index += 1) {
-    cumulative += `${index}:${stableJson(units[index]!)}\n`;
+    cumulative += `${index}:${units[index]!}\n`;
     if (Buffer.byteLength(cumulative) > MAX_CANONICAL_BYTES) break;
     digests.push(encode(index + 1, cumulative));
   }
@@ -263,34 +268,7 @@ function unidentifiableMaterial(canonicalBytes = MAX_CANONICAL_BYTES + 1): Affin
   };
 }
 
-/** Advisory identity must never reject a served request or expose partial material. */
-export function affinityPrefixDigests(
-  args: Parameters<typeof buildAffinityMaterial>[0],
-): AffinityMaterial {
-  try {
-    // The ingress body limit bounds work; bytes refuse identity per layer, never routing.
-    const payload = asJson(args.payload, Number.POSITIVE_INFINITY);
-    if (!payload || typeof payload !== "object" || Array.isArray(payload))
-      return unidentifiableMaterial();
-    return buildAffinityMaterial({ ...args, payload });
-  } catch {
-    return unidentifiableMaterial();
-  }
-}
-
-/** One chain for both routing warmth and session continuity; only its tail is retained. */
-function buildAffinityMaterial({
-  ownerId,
-  resourceOwnerId,
-  poolId,
-  securityScope,
-  accessGrantId,
-  surface,
-  payload,
-  runtimeIdentity,
-  sessionBinding,
-  headers,
-}: {
+type AffinityRequestArgs = {
   ownerId: string;
   resourceOwnerId: string;
   poolId: string;
@@ -301,29 +279,217 @@ function buildAffinityMaterial({
   runtimeIdentity: string;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
-}): AffinityMaterial {
-  const canonicalSurface = canonicalizeAffinitySurface(surface);
-  const layers = extractAffinityLayers(canonicalSurface, payload);
-  const carrier = selectClientConversationCarrier(headers, payload, surface);
-  const excluded = new Set([...layers.consumedKeys, ...PARAMETER_EXCLUSIONS]);
-  if (carrier?.key && carrier.key !== "metadata.user_id") excluded.add(carrier.key);
-  // Unknown semantics bind by default. Only the owner-approved sampling list is free.
-  const parameters = Object.fromEntries(
-    Object.entries(payload).flatMap(([key, raw]) => {
-      if (excluded.has(key)) return [];
-      const metadata =
+};
+
+type CanonicalRequest = {
+  surface: ReturnType<typeof canonicalizeAffinitySurface>;
+  carrier: ClientConversationCarrier | undefined;
+  instructions: string[];
+  tools: string | undefined;
+  rootSuffix: string;
+  rootBytes: number;
+  hasRootFields: boolean;
+  conversationUnits: string[];
+  conversationOverflow: boolean;
+  isContinuation: boolean;
+  conversation: string | undefined;
+  previousResponse: boolean;
+};
+
+/** Once per request; all request-derived traversal shares an 8 * 2 MiB node cap. */
+export function buildCanonicalRequest(
+  { surface, payload, headers }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers">,
+  work: CanonicalWork = { steps: 0 },
+): CanonicalRequest | null {
+  try {
+    if (requestJsonDepthExceeded(payload, MAX_CANONICAL_DEPTH, () => visitCanonical(work)))
+      return null;
+    const canonicalSurface = canonicalizeAffinitySurface(surface);
+    if (!canonicalSurface) return null;
+    const layers = rawAffinityLayers(canonicalSurface, payload, work);
+    const carrier = selectClientConversationCarrier(headers, payload, surface);
+    const excluded = new Set([...layers.consumedKeys, ...PARAMETER_EXCLUSIONS]);
+    if (carrier?.key && carrier.key !== "metadata.user_id") excluded.add(carrier.key);
+    const instructions: string[] = [];
+    let instructionBytes = 2;
+    let rootOverflow = false;
+    const encode = (value: unknown, bytes: number): string | undefined => {
+      try {
+        return budgetedStableJson(value, bytes, work);
+      } catch (error) {
+        if (!(error instanceof CanonicalSizeError)) throw error;
+        return undefined;
+      }
+    };
+    for (const unit of layers.instructions()) {
+      const text = encode(
+        unit,
+        MAX_CANONICAL_BYTES - instructionBytes - (instructions.length ? 1 : 0),
+      );
+      if (text === undefined) {
+        rootOverflow = true;
+        break;
+      }
+      instructionBytes += Buffer.byteLength(text) + (instructions.length ? 1 : 0);
+      instructions.push(text);
+    }
+    const start = `{"bindingDigest":"${"x".repeat(43)}"`;
+    const beforeParams = `,"instructions":[${instructions.join(",")}],"parameters":`;
+    const rootFrameBytes =
+      Buffer.byteLength(start) +
+      Buffer.byteLength(beforeParams) +
+      Buffer.byteLength(',"tools":}') +
+      2;
+    const tools =
+      layers.tools === undefined
+        ? undefined
+        : encode(layers.tools, MAX_CANONICAL_BYTES - rootFrameBytes);
+    if (layers.tools !== undefined && tools === undefined) rootOverflow = true;
+    const parameters: Record<string, unknown> = Object.create(null);
+    let parameterKeyBytes = 2;
+    const parameterBudget =
+      MAX_CANONICAL_BYTES - rootFrameBytes - Buffer.byteLength(tools ?? "null") + 2;
+    let hasParameters = false;
+    for (const key in payload) {
+      if (rootOverflow) break;
+      if (!Object.hasOwn(payload, key) || excluded.has(key)) continue;
+      visitCanonical(work);
+      const encodedKey = encode(key, parameterBudget - parameterKeyBytes);
+      if (encodedKey === undefined) {
+        rootOverflow = true;
+        break;
+      }
+      parameterKeyBytes += Buffer.byteLength(encodedKey) + 3;
+      if (parameterKeyBytes > parameterBudget) {
+        rootOverflow = true;
+        break;
+      }
+      let raw = payload[key];
+      if (raw === undefined || typeof raw === "function" || typeof raw === "symbol") continue;
+      if (
         carrier?.key === "metadata.user_id" &&
         key === "metadata" &&
         raw &&
         typeof raw === "object" &&
         !Array.isArray(raw)
-          ? Object.fromEntries(Object.entries(raw).filter(([name]) => name !== "user_id"))
-          : undefined;
-      if (metadata && Object.keys(metadata).length === 0) return [];
-      const value = asJson(metadata ?? raw, Number.POSITIVE_INFINITY);
-      return value === undefined ? [] : [[key, value] as const];
-    }),
-  );
+      ) {
+        const metadata: Record<string, unknown> = Object.create(null);
+        for (const name in raw) {
+          if (!Object.hasOwn(raw, name) || name === "user_id") continue;
+          visitCanonical(work);
+          const text = encode(name, parameterBudget - parameterKeyBytes);
+          if (text === undefined) {
+            rootOverflow = true;
+            break;
+          }
+          parameterKeyBytes += Buffer.byteLength(text) + 3;
+          metadata[name] = (raw as Record<string, unknown>)[name];
+        }
+        if (Object.keys(metadata).length === 0) {
+          hasParameters = Object.keys(parameters).length > 0;
+          continue;
+        }
+        raw = metadata;
+      }
+      parameters[key] = raw;
+      hasParameters = true;
+    }
+    // SHA-256 base64url binding digests are always 43 ASCII bytes. The suffix is
+    // target-independent and exactly the previous stableJson root byte sequence.
+    const afterParams = `,"tools":${tools ?? "null"}}`;
+    const parameterText = rootOverflow
+      ? undefined
+      : encode(
+          parameters,
+          MAX_CANONICAL_BYTES -
+            Buffer.byteLength(start) -
+            Buffer.byteLength(beforeParams) -
+            Buffer.byteLength(afterParams),
+        );
+    if (parameterText === undefined) rootOverflow = true;
+    const rootSuffix = rootOverflow ? "" : `${beforeParams}${parameterText}${afterParams}`;
+    const rootBytes = rootOverflow
+      ? MAX_CANONICAL_BYTES + 1
+      : Buffer.byteLength(start) + Buffer.byteLength(rootSuffix);
+    const conversationUnits: string[] = [];
+    let bytes = rootBytes;
+    let conversationOverflow = rootOverflow;
+    if (!rootOverflow) {
+      for (const unit of layers.conversation()) {
+        if (conversationUnits.length === 4096) {
+          conversationOverflow = true;
+          break;
+        }
+        const text = encode(unit, MAX_CANONICAL_BYTES - bytes);
+        if (text === undefined) {
+          conversationOverflow = true;
+          break;
+        }
+        bytes += Buffer.byteLength(text);
+        conversationUnits.push(text);
+      }
+    }
+    const isContinuation = continuationEvidence(layers.conversation(), work);
+    const forwardedValue = (value: unknown) =>
+      typeof value === "number" && !Number.isFinite(value) ? null : value;
+    const conversationValue =
+      forwardedValue(payload.conversation) ?? forwardedValue(payload.conversation_id);
+    const conversation =
+      conversationValue === undefined ? undefined : encode(conversationValue, MAX_CANONICAL_BYTES);
+    return {
+      surface: canonicalSurface,
+      carrier,
+      instructions,
+      tools,
+      rootSuffix,
+      rootBytes,
+      hasRootFields:
+        instructions.length > 0 || rootOverflow || layers.tools !== undefined || hasParameters,
+      conversationUnits,
+      conversationOverflow,
+      isContinuation,
+      conversation,
+      previousResponse:
+        canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Advisory identity must never reject a served request or expose partial material. */
+export function affinityPrefixDigests(args: AffinityRequestArgs): AffinityMaterial {
+  const canonical = buildCanonicalRequest(args);
+  return materialFromCanonical(args, canonical);
+}
+
+function materialFromCanonical(
+  args: AffinityRequestArgs,
+  canonical: CanonicalRequest | null,
+): AffinityMaterial {
+  try {
+    return canonical ? buildAffinityMaterial(args, canonical) : unidentifiableMaterial();
+  } catch {
+    return unidentifiableMaterial();
+  }
+}
+
+/** One chain for both routing warmth and session continuity; only its tail is retained. */
+function buildAffinityMaterial(
+  {
+    ownerId,
+    resourceOwnerId,
+    poolId,
+    securityScope,
+    accessGrantId,
+    surface,
+    runtimeIdentity,
+    sessionBinding,
+  }: AffinityRequestArgs,
+  canonical: CanonicalRequest,
+): AffinityMaterial {
+  const canonicalSurface = canonical.surface;
+  const carrier = canonical.carrier;
   const bindingDigest = hmacValue(
     `affinity-binding-v5:${stableJson({
       v: DIGEST_VERSION,
@@ -341,24 +507,13 @@ function buildAffinityMaterial({
     clientId === undefined
       ? undefined
       : hmacValue(`affinity-client-session-v5:${stableJson({ bindingDigest, id: clientId })}`);
-  const rootMaterial = stableJson({
-    bindingDigest,
-    instructions: layers.instructionUnits,
-    tools: layers.tools ?? null,
-    parameters,
-  });
-  const rootBytes = Buffer.byteLength(rootMaterial);
+  const rootMaterial = `{"bindingDigest":"${bindingDigest}"${canonical.rootSuffix}`;
+  const rootBytes = canonical.rootBytes;
   const computedRoot =
     rootBytes <= MAX_CANONICAL_BYTES ? hmacValue(`affinity-root-v5:${rootMaterial}`) : "";
-  const parent =
-    canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string"
-      ? sessionBinding
-      : undefined;
+  const parent = canonical.previousResponse ? sessionBinding : undefined;
   const scopedParent = scopedAffinitySessionId(parent, bindingDigest);
-  const hasRootFields =
-    layers.instructionUnits.length > 0 ||
-    layers.tools !== undefined ||
-    Object.keys(parameters).length > 0;
+  const hasRootFields = canonical.hasRootFields;
   const boundSessionId =
     scopedParent && (!hasRootFields || computedRoot === parent?.rootDigest)
       ? scopedParent
@@ -369,23 +524,23 @@ function buildAffinityMaterial({
   let tip = boundSessionId && parent ? parent.tipDigest : rootDigest;
   const nodes: AffinityMaterial["nodes"] = [];
   let identifiable = canonicalSurface !== null && canonicalBytes <= MAX_CANONICAL_BYTES;
-  for (const unit of layers.conversationUnits) {
+  for (const unit of canonical.conversationUnits) {
     if (!identifiable) break;
-    const canonical = stableJson(unit);
-    canonicalBytes += Buffer.byteLength(canonical);
+    canonicalBytes += Buffer.byteLength(unit);
     if (canonicalBytes > MAX_CANONICAL_BYTES) {
       identifiable = false;
       break;
     }
     depth += 1;
-    tip = hmacValue(`affinity-node-v5:${tip}:${canonical}`);
+    tip = hmacValue(`affinity-node-v5:${tip}:${unit}`);
     nodes.push({ digest: tip, depth });
     if (nodes.length > MAX_PREFIXES_PER_REQUEST) nodes.shift();
   }
-  const missingParent =
-    canonicalSurface === "openai-responses" &&
-    typeof payload.previous_response_id === "string" &&
-    !boundSessionId;
+  if (canonical.conversationOverflow && identifiable) {
+    canonicalBytes = MAX_CANONICAL_BYTES + 1;
+    identifiable = false;
+  }
+  const missingParent = canonical.previousResponse && !boundSessionId;
   // An unbound native delta is not full history. Do not publish it as a
   // starter that a later stateless request could mistakenly take as a tip.
   if (missingParent) identifiable = false;
@@ -397,17 +552,17 @@ function buildAffinityMaterial({
   }
   if (!identifiable) nodes.length = 0;
   const textCap =
-    layers.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
+    canonical.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
   const instructionUnits =
-    layers.tools !== undefined
-      ? [...layers.instructionUnits.slice(0, textCap), layers.tools]
-      : layers.instructionUnits.slice(0, textCap);
+    canonical.tools !== undefined
+      ? [...canonical.instructions.slice(0, textCap), canonical.tools]
+      : canonical.instructions.slice(0, textCap);
   const instructionDigests = cumulativePrefixDigests(
     instructionUnits,
     (index, cumulative) =>
       `${INSTRUCTION_HINT_PREFIX}${hmacValue(`instruction-layer-v5:${bindingDigest}:prefix:${index}:${cumulative}`)}`,
   );
-  const conversation = asJson(payload.conversation ?? payload.conversation_id);
+  const conversation = canonical.conversation;
   return {
     bindingDigest,
     rootDigest,
@@ -417,7 +572,7 @@ function buildAffinityMaterial({
     digests: routingNodes.map(({ digest }) => digest),
     canonicalBytes,
     identifiable,
-    isContinuation: layers.isContinuation || boundSessionId !== undefined,
+    isContinuation: canonical.isContinuation || boundSessionId !== undefined,
     clientSessionId,
     boundSessionId: identifiable ? boundSessionId : undefined,
     missingParent,
@@ -427,7 +582,7 @@ function buildAffinityMaterial({
     conversationDigest:
       !identifiable || conversation === undefined
         ? null
-        : hmacValue(`affinity-conversation-v5:${rootDigest}:${stableJson(conversation)}`),
+        : hmacValue(`affinity-conversation-v5:${rootDigest}:${conversation}`),
   };
 }
 
@@ -588,21 +743,25 @@ export async function rankAffinityTargets({
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
+  const canonical = buildCanonicalRequest({ surface, payload, headers });
   const materialByIdentity = new Map(
     targets.map((target) => [
       target.targetIdentity,
-      affinityPrefixDigests({
-        ownerId,
-        resourceOwnerId,
-        poolId,
-        securityScope: securityScope ?? ownerId,
-        accessGrantId,
-        surface,
-        payload,
-        runtimeIdentity: target.targetIdentity,
-        sessionBinding,
-        headers,
-      }),
+      materialFromCanonical(
+        {
+          ownerId,
+          resourceOwnerId,
+          poolId,
+          securityScope: securityScope ?? ownerId,
+          accessGrantId,
+          surface,
+          payload,
+          runtimeIdentity: target.targetIdentity,
+          sessionBinding,
+          headers,
+        },
+        canonical,
+      ),
     ]),
   );
   const conversationPrefixDigests = [

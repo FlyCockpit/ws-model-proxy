@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { nestedWire } from "../cache-affinity-canonical.test-fixtures.js";
 import type { CanonicalEvent } from "./canonical.js";
 import {
   CanonicalStreamParser,
@@ -274,4 +275,30 @@ describe("protocol-conformant stateful rendering", () => {
       bounded.writable.getWriter().write({ type: "message_start", id: "too-large", model: "m" }),
     ).rejects.toThrow("bounded buffer");
   });
+});
+
+it.each([20, 256, 257, 10_000])("R4 stream tool JSON validation depth %s", (depth) => {
+  const renderer = new CanonicalStreamRenderer("anthropic-messages");
+  renderer.push({
+    type: "message_start",
+    id: "r",
+    model: "m",
+    usage: { inputTokens: 1, outputTokens: 0 },
+  });
+  renderer.push({
+    type: "item_start",
+    index: 0,
+    itemType: "tool_call",
+    id: "call",
+  });
+  renderer.push({
+    type: "tool_arguments_delta",
+    index: 0,
+    id: "call",
+    name: "lookup",
+    delta: nestedWire(depth, "object"),
+  });
+  const finish = () => renderer.push({ type: "item_complete", index: 0 });
+  if (depth <= 256) expect(finish).not.toThrow();
+  else expect(finish).toThrow("request JSON nesting exceeds 256 levels");
 });

@@ -1,3 +1,4 @@
+import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "../request-json-depth.js";
 import type { ProtocolSurface } from "./canonical.js";
 
 export class AdapterError extends Error {
@@ -9,6 +10,23 @@ export class AdapterError extends Error {
     super(message);
     this.name = "AdapterError";
   }
+}
+
+/** Every JSON-string expansion has its own depth-0 acceptance boundary. */
+export function parseEmbeddedJson(value: string, parameter: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    invalid(parameter, "must be a complete JSON object");
+  }
+  if (requestJsonDepthExceeded(parsed))
+    throw new AdapterError("request_json_depth_exceeded", REQUEST_JSON_DEPTH_ERROR, parameter);
+  return parsed;
+}
+
+export function isRequestDepthError(error: unknown): error is AdapterError {
+  return error instanceof AdapterError && error.code === "request_json_depth_exceeded";
 }
 
 export function unsupported(parameter: string, reason = "is not safely adaptable"): never {

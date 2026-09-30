@@ -7,6 +7,8 @@ import {
   canonicalPayloadWire,
   depthPayloadWire,
   depthRows,
+  numericOverflowPayload,
+  numericOverflowRows,
 } from "./cache-affinity-canonical.test-fixtures.js";
 import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
 
@@ -148,6 +150,78 @@ integration("cache-prefix identity #160", () => {
     target: row.target(0),
     now: new Date("2030-01-01T00:00:00Z"),
   });
+  it.each(numericOverflowRows)(
+    "R4 PG numeric overflow $surface $shape uses forwarded null identity",
+    async ({ surface, shape }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const absent = await service.rememberAffinity({
+        ...args,
+        payload: numericOverflowPayload(surface, shape, undefined),
+      });
+      const nilPayload = numericOverflowPayload(surface, shape, "null");
+      const nil = await service.rememberAffinity({ ...args, payload: nilPayload });
+      const finite = await service.rememberAffinity({
+        ...args,
+        payload: numericOverflowPayload(surface, shape, "1e300"),
+      });
+      expect(nil!.rootDigest).not.toBe(absent!.rootDigest);
+      expect(nil!.sessionId).not.toBe(absent!.sessionId);
+      expect(finite!.sessionId).not.toBe(nil!.sessionId);
+      for (const value of ["1e400", "-1e400"]) {
+        const payload = numericOverflowPayload(surface, shape, value);
+        const material = service.affinityPrefixDigests({
+          ...args,
+          payload,
+          runtimeIdentity: args.target.targetIdentity,
+        });
+        expect(material.rootDigest).toBe(nil!.rootDigest);
+        expect(
+          await service.resolveAffinitySession(
+            producer,
+            {
+              userId: args.resourceOwnerId,
+              tenantUserId: args.ownerId,
+              poolId: args.poolId,
+              executionTargetId: args.target.executionTargetId,
+            },
+            material,
+            args.now,
+          ),
+        ).toBe(nil!.sessionId);
+        const bound = await service.rememberAffinity({ ...args, payload });
+        expect(bound!.sessionId).toBe(nil!.sessionId);
+        expect(bound!.rootDigest).toBe(nil!.rootDigest);
+        expect(
+          (await service.rememberAffinity({
+            ...args,
+            payload: JSON.parse(JSON.stringify(payload)),
+          }))!.sessionId,
+        ).toBe(nil!.sessionId);
+      }
+      if (surface === "openai-responses") {
+        for (const value of ["1e400", "-1e400"]) {
+          const payload = {
+            ...numericOverflowPayload(surface, shape, value),
+            previous_response_id: "parent",
+            input: "delta",
+          };
+          const material = service.affinityPrefixDigests({
+            ...args,
+            payload,
+            sessionBinding: nil!,
+            runtimeIdentity: args.target.targetIdentity,
+          });
+          expect(material.boundSessionId).toBe(nil!.sessionId);
+          expect(material.rootDigest).toBe(nil!.rootDigest);
+          const bound = await service.rememberAffinity({ ...args, payload, sessionBinding: nil! });
+          expect(bound!.sessionId).toBe(nil!.sessionId);
+          expect(bound!.rootDigest).toBe(nil!.rootDigest);
+        }
+      }
+    },
+  );
+
   it.each(["parameter", "tools", "instructions", "messages"] as const)(
     "R2 wire __proto__ changes %s roots or nodes and committed sessions PG",
     async (location) => {

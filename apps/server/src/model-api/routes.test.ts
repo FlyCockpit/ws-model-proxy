@@ -45,7 +45,10 @@ import {
   canonicalShapes,
   depthPayloadWire,
   depthRows,
+  embeddedArgumentsRequest,
   nestedWire,
+  numericOverflowPayload,
+  numericOverflowRows,
 } from "./cache-affinity-canonical.test-fixtures.js";
 import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
 
@@ -414,7 +417,7 @@ const externalPoolTarget: VisibleModelPoolTarget = {
 const EXTERNAL_MODEL_ID = `${externalPoolTarget.modelId}:external`;
 
 function listedExternalTargets(
-  targets: ReturnType<typeof externalProviderTarget>[],
+  targets: PublicProviderTarget[],
   overrides: { enabled?: boolean; fallbackForGrantees?: boolean; ownerActive?: boolean } = {},
 ) {
   return {
@@ -2875,6 +2878,279 @@ describe("model API routes", () => {
       error: { code: "unsupported_capability" },
     });
   });
+
+  it.each(
+    ["openai-chat", "openai-responses"].flatMap((surface) =>
+      [false, true].flatMap((external) =>
+        [20, 256, 257, 10_000].map((depth) => ({ surface, external, depth })),
+      ),
+    ),
+  )(
+    "R4 embedded arguments $surface external=$external depth=$depth refuse before admission/health",
+    async ({ surface, external, depth }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...(external ? externalPoolTarget : poolTarget), protocolAdaptationEnabled: true },
+        ],
+      });
+      const inventory = {
+        version: 3 as const,
+        protocol: "anthropic-compatible" as const,
+        surfaces: {
+          anthropicMessages: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            tools: true,
+            protocolVersion: "2023-06-01",
+          },
+        },
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-anthropic"];
+      const runtime = admittingCapacityRuntime();
+      if (external) {
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const provider: PublicProviderTarget = {
+          ...externalProviderTarget(),
+          protocol: "anthropic",
+          nativeProtocols: ["anthropic"],
+          nativeSurfaces: ["anthropic-messages"],
+          supportedFeatures: ["tools"],
+          capabilityInventory: inventory,
+        };
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+        if (depth <= 256)
+          publicOverflow.dispatch.mockImplementationOnce(async (request) => {
+            const rendered = await request.renderForTarget(provider, "anthropic-messages");
+            const forwarded = JSON.parse(new TextDecoder().decode(rendered.body));
+            expect(forwarded.messages[1].content[0].input).toEqual(
+              JSON.parse(nestedWire(depth, "object")),
+            );
+            return {
+              ...externalDispatchResult(provider, {
+                id: "msg",
+                type: "message",
+                role: "assistant",
+                model: "m",
+                content: [{ type: "text", text: "ok" }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              nativeSurface: "anthropic-messages",
+            };
+          });
+      } else {
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "anthropic-member",
+            discoveredModelId: "anthropic-model",
+            upstreamModelId: "m",
+            cliDeviceId: "cli-anthropic",
+            capabilityOverrideMetadata: inventory,
+          }),
+        ]);
+      }
+      const body = embeddedArgumentsRequest(
+        surface,
+        nestedWire(depth, "object"),
+        external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+      );
+      const pending = appWith(manager, runtime).request(
+        surface === "openai-chat" ? "/chat/completions" : "/responses",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (depth <= 256 && !external) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        const forwarded = JSON.parse(await relayBodyText(sent));
+        expect(forwarded.messages[1].content[0].input).toEqual(
+          JSON.parse(nestedWire(depth, "object")),
+        );
+        await completeJsonRelay({
+          manager,
+          requestId: sent.requestId,
+          body: {
+            id: "msg",
+            type: "message",
+            role: "assistant",
+            model: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        });
+      }
+      const response = await pending;
+      expect(response.status).toBe(depth <= 256 ? 200 : 400);
+      if (depth > 256) {
+        expect(await response.json()).toMatchObject({
+          error: { message: "request JSON nesting exceeds 256 levels" },
+        });
+        expect(manager.sent).toEqual([]);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: "FAILED",
+              errorClass: "unsupported_capability",
+            }),
+          }),
+        );
+        expect(db.poolMember.update).not.toHaveBeenCalled();
+        expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+      } else await response.text();
+    },
+  );
+
+  it.each(["openai-chat", "openai-responses"] as const)(
+    "R4 native %s passes deep argument strings with an adapted alternative",
+    async (surface) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+      });
+      const key = surface === "openai-chat" ? "openaiChatCompletions" : "openaiResponses";
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "native",
+          discoveredModelId: "native-model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-native",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              [key]: { source: "declared", confidence: "exact", supported: true, tools: true },
+            },
+          },
+        }),
+        poolMemberRow({
+          id: "adapted",
+          discoveredModelId: "adapted-model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-adapted",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "anthropic-compatible",
+            surfaces: {
+              anthropicMessages: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                tools: true,
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-native", "cli-adapted"];
+      const argumentsText = nestedWire(10_000, "object");
+      const request = embeddedArgumentsRequest(surface, argumentsText, poolTarget.modelId);
+      const pending = appWith(manager).request(
+        surface === "openai-chat" ? "/chat/completions" : "/responses",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify(request),
+        },
+      );
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.endpointSlug).toBe("native-endpoint");
+      const body = JSON.parse(await relayBodyText(sent));
+      expect(
+        surface === "openai-chat"
+          ? body.messages[1].tool_calls[0].function.arguments
+          : body.input[1].arguments,
+      ).toBe(argumentsText);
+      await completeJsonRelay({ manager, requestId: sent.requestId });
+      const response = await pending;
+      expect(response.status).toBe(200);
+      await response.text();
+    },
+  );
+
+  it.each(numericOverflowRows)(
+    "R4 native wire numeric overflow $surface $shape forwards null",
+    async ({ surface, shape }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      const surfaceKey =
+        surface === "openai-chat"
+          ? "openaiChatCompletions"
+          : surface === "openai-responses"
+            ? "openaiResponses"
+            : "anthropicMessages";
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "native",
+          discoveredModelId: "model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-native",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              [surfaceKey]: {
+                supported: true,
+                source: "declared",
+                confidence: "exact",
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-native"];
+      const parsed = numericOverflowPayload(surface, shape, "1e400");
+      parsed.model = poolTarget.modelId;
+      // Preserve the genuine wire token: JSON.stringify alone would normalize it first.
+      const wire = JSON.stringify(parsed)
+        .replace('"vendor_extension":null', '"vendor_extension":1e400')
+        .replace('"field":null', '"field":1e400')
+        .replace('"vendor_extension":[null]', '"vendor_extension":[1e400]');
+      const pending = appWith(manager).request(
+        surface === "openai-chat"
+          ? "/chat/completions"
+          : surface === "openai-responses"
+            ? "/responses"
+            : "/messages",
+        {
+          method: "POST",
+          headers: {
+            authorization: "Bearer wsmp_model_test",
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+          },
+          body: wire,
+        },
+      );
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      const forwarded = JSON.parse(await relayBodyText(sent));
+      expect(forwarded.vendor_extension).toEqual(
+        numericOverflowPayload(surface, shape, "null").vendor_extension,
+      );
+      await completeJsonRelay({ manager, requestId: sent.requestId });
+      expect((await pending).status).toBe(200);
+      await (await pending).text();
+    },
+  );
 
   it("surfaces developer authority loss when Chat adapts through Anthropic", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
@@ -6056,7 +6332,7 @@ describe("model API routes", () => {
   });
 
   function externalDispatchResult(
-    target: ReturnType<typeof externalProviderTarget>,
+    target: PublicProviderTarget,
     body: unknown = { id: "external", model: target.upstreamModelId },
   ) {
     return {

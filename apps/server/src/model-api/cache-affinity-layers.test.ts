@@ -7,8 +7,10 @@ import {
 } from "./cache-affinity-canonical.test-fixtures.js";
 import {
   asJson,
+  budgetedStableJson,
   canonicalizeAffinitySurface,
   extractAffinityLayers,
+  type JsonValue,
   MAX_CANONICAL_DEPTH,
   stableJson,
 } from "./cache-affinity-layers.js";
@@ -643,3 +645,54 @@ it("R3 converter charges mostly-key bytes at the exact 2 MiB boundary", () => {
   expect(asJson(atBound)).toBeDefined();
   expect(asJson({ [`${key}k`]: 0 })).toBeUndefined();
 });
+
+it("R4 pins the literal affinity depth 128", () => {
+  expect(MAX_CANONICAL_DEPTH).toBe(128);
+  expect(asJson(JSON.parse(nestedWire(128, "object")))).toBeDefined();
+  expect(asJson(JSON.parse(nestedWire(129, "object")))).toBeUndefined();
+});
+
+it("R4 preserves the previous serializer bytes on seeded random JSON and escaping boundaries", () => {
+  const previous = (value: JsonValue): string => {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(previous).join(",")}]`;
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${previous(value[key]!)}`)
+      .join(",")}}`;
+  };
+  let seed = 160;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 2 ** 32;
+  };
+  const value = (depth: number): JsonValue => {
+    const kind = Math.floor(random() * (depth ? 6 : 4));
+    if (kind === 0) return null;
+    if (kind === 1) return random() < 0.5;
+    if (kind === 2) return (random() - 0.5) * 1e12;
+    if (kind === 3) return canonicalKeys[Math.floor(random() * canonicalKeys.length)]!;
+    const entries = Array.from({ length: Math.floor(random() * 8) }, () => value(depth - 1));
+    return kind === 4
+      ? entries
+      : Object.fromEntries(entries.map((entry, i) => [canonicalKeys[i]!, entry]));
+  };
+  for (let i = 0; i < 300; i++) {
+    const entry = value(5);
+    expect(budgetedStableJson(entry)).toBe(previous(entry));
+    expect(stableJson(asJson(entry)!)).toBe(previous(entry));
+  }
+  for (const suffix of ["😀", "\ud800", "\udc00", '"\\\n']) {
+    const text = `${"x".repeat(4095)}${suffix}${"y".repeat(8192)}`;
+    expect(budgetedStableJson({ [text]: text })).toBe(previous({ [text]: text }));
+  }
+});
+
+it.each(["1e400", "-1e400"])(
+  "R4 converts wire overflow %s to null without dropping members or arrays",
+  (value) => {
+    const parsed = JSON.parse(`{"scalar":${value},"object":{"field":${value}},"array":[${value}]}`);
+    expect(asJson(parsed)).toEqual({ scalar: null, object: { field: null }, array: [null] });
+    expect(JSON.parse(stableJson(asJson(parsed)!))).toEqual(JSON.parse(JSON.stringify(parsed)));
+  },
+);

@@ -7,8 +7,14 @@ import {
   canonicalShapes,
   depthPayloadWire,
   depthRows,
+  numericOverflowPayload,
+  numericOverflowRows,
 } from "./cache-affinity-canonical.test-fixtures.js";
-import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
+import {
+  extractAffinityLayers,
+  type JsonValue,
+  MAX_CANONICAL_DEPTH,
+} from "./cache-affinity-layers.js";
 
 const db = vi.hoisted(() => ({
   cacheAffinityNode: {
@@ -50,6 +56,7 @@ import {
   type AffinityTarget,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
+  buildCanonicalRequest,
   extractClientConversationId,
   FREE_SAMPLING_PARAMS,
   rankAffinityTargets,
@@ -3115,4 +3122,223 @@ it("R3 affinityPrefixDigests catches HMAC failures after successful conversion",
   } finally {
     hmac.mockRestore();
   }
+});
+
+it.each(numericOverflowRows)(
+  "R4 numeric overflow $surface $shape binds forwarded null",
+  ({ surface, shape }) => {
+    const absent = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, undefined), surface),
+    );
+    const nil = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, "null"), surface),
+    );
+    const finite = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, "1e300"), surface),
+    );
+    expect(nil.rootDigest).not.toBe(absent.rootDigest);
+    expect(finite.rootDigest).not.toBe(nil.rootDigest);
+    for (const value of ["1e400", "-1e400"]) {
+      const wireParsed = numericOverflowPayload(surface, shape, value);
+      const original = affinityPrefixDigests(digestArgs("runtime", wireParsed, surface));
+      const forwarded = affinityPrefixDigests(
+        digestArgs("runtime", JSON.parse(JSON.stringify(wireParsed)), surface),
+      );
+      expect(original.identifiable).toBe(true);
+      expect(original.rootDigest).toBe(nil.rootDigest);
+      expect(original.nodes).toEqual(nil.nodes);
+      expect(forwarded).toEqual(original);
+    }
+  },
+);
+
+it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", async () => {
+  db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+  db.capacityLease.groupBy.mockResolvedValue([]);
+  db.capacityWaiter.groupBy.mockResolvedValue([]);
+  const wide = {
+    conversation: "client",
+    messages: [
+      { role: "system", content: "rules" },
+      { role: "user", content: "U" },
+      { role: "assistant", content: "A" },
+      { role: "user", content: new Array(4_000_000).fill(0) },
+    ],
+  };
+  const work = { steps: 0 };
+  const ownKeys = Object.keys;
+  const keys = vi.spyOn(Object, "keys").mockImplementation((entry) => {
+    if (Array.isArray(entry) && entry.length >= 4_000_000)
+      throw new Error("wide arrays must be indexed");
+    return ownKeys(entry);
+  });
+  let canonical: ReturnType<typeof buildCanonicalRequest>;
+  try {
+    canonical = buildCanonicalRequest(digestArgs("runtime", wide), work);
+  } finally {
+    keys.mockRestore();
+  }
+  expect(canonical).not.toBeNull();
+  expect(canonical!.conversationUnits).toHaveLength(2);
+  expect(canonical!.conversationOverflow).toBe(true);
+  expect(work.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  expect(work.steps).toBeGreaterThan(4_000_000);
+  const material = affinityPrefixDigests(digestArgs("runtime", wide));
+  expect(material).toMatchObject({ identifiable: false, nodes: [] });
+  expect(material.routingNodes).toHaveLength(2);
+  expect(material.instructionDigests).toHaveLength(1);
+  expect(material.clientSessionId).toBeDefined();
+  const deepWork = { steps: 0 };
+  expect(
+    buildCanonicalRequest(
+      digestArgs(
+        "runtime",
+        JSON.parse(depthPayloadWire("tools", 128, "mixed")),
+        "openai-responses",
+      ),
+      deepWork,
+    ),
+  ).not.toBeNull();
+  expect(deepWork.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  const rootWork = { steps: 0 };
+  const root = buildCanonicalRequest(
+    digestArgs("runtime", {
+      messages: wide.messages.slice(0, 3),
+      conversation: "client",
+      vendor_extension: wide.messages[3]!.content,
+    }),
+    rootWork,
+  );
+  expect(root).not.toBeNull();
+  expect(root!.rootBytes).toBe(2 * 1024 * 1024 + 1);
+  expect(root!.conversationUnits).toEqual([]);
+  expect(rootWork.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  let reads = 0;
+  Object.defineProperty(wide, "vendor_extension", {
+    enumerable: true,
+    get() {
+      reads++;
+      return "bind";
+    },
+  });
+  const start = performance.now();
+  await rankAffinityTargets({
+    ...digestArgs("runtime", wide),
+    policy,
+    targets: [target("a", "a"), target("b", "b"), target("c", "c")],
+  });
+  const elapsed = performance.now() - start;
+  console.info(
+    `R4 canonical smoke: ${work.steps} steps; rank(4M,3) ${Math.round(elapsed)} ms; payload reads ${reads}`,
+  );
+  expect(reads).toBe(2); // validation and root capture, independent of target count
+  expect(elapsed).toBeLessThan(2000);
+}, 10_000);
+
+it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {
+  const request = {
+    conversation: "client",
+    messages: Array.from({ length: 4097 }, (_, i) => ({
+      role: i % 2 ? "assistant" : "user",
+      content: "x",
+    })),
+  };
+  const refused = affinityPrefixDigests(digestArgs("runtime", request));
+  expect(refused.identifiable).toBe(false);
+  expect(refused.nodes).toEqual([]);
+  expect(refused.routingNodes).toHaveLength(64);
+  expect(refused.routingNodes.at(-1)?.depth).toBe(4096);
+  expect(refused.clientSessionId).toBeDefined();
+  expect(
+    affinityPrefixDigests(
+      digestArgs("runtime", { ...request, messages: request.messages.slice(0, 4096) }),
+    ).identifiable,
+  ).toBe(true);
+});
+
+it("R4 ordinary request roots and nodes retain the previous v5 digest bytes", async () => {
+  const { hmacDigestForForwarderPurpose } = await import("@ws-model-proxy/db/forwarder-security");
+  const previous = (value: JsonValue): string => {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(previous).join(",")}]`;
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${previous(value[key]!)}`)
+      .join(",")}}`;
+  };
+  const hash = (value: string) =>
+    hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
+  for (const surface of ["openai-chat", "anthropic-messages", "openai-responses"]) {
+    for (let seed = 0; seed < 40; seed++) {
+      const extension: JsonValue = {
+        "01": [seed, true, null, "☃😀"],
+        nested: { [canonicalKeys[seed % canonicalKeys.length]!]: seed / 7 },
+      };
+      const units = [
+        { role: "user", content: "U" },
+        { role: "assistant", content: `A${seed}` },
+      ];
+      const request = {
+        ...(surface === "openai-responses"
+          ? { input: units, instructions: "rules" }
+          : surface === "anthropic-messages"
+            ? { messages: units, system: "rules" }
+            : { messages: [{ role: "system", content: "rules" }, ...units] }),
+        tools: [{ name: "lookup", parameters: extension }],
+        vendor_extension: extension,
+      };
+      const args = digestArgs("runtime", request, surface);
+      const material = affinityPrefixDigests(args);
+      const layers = extractAffinityLayers(surface, request);
+      const bindingDigest = hash(
+        `affinity-binding-v5:${previous({ v: 5, ownerId: "owner", resourceOwnerId: "owner", poolId: "pool", securityScope: "token", accessGrantId: null, surface, runtimeIdentity: "runtime" })}`,
+      );
+      expect(material.bindingDigest).toBe(bindingDigest);
+      const root = hash(
+        `affinity-root-v5:${previous({ bindingDigest, instructions: layers.instructionUnits, tools: layers.tools ?? null, parameters: { vendor_extension: extension } })}`,
+      );
+      expect(material.rootDigest).toBe(root);
+      let tip = root;
+      const nodes = layers.conversationUnits.map((unit, index) => {
+        tip = hash(`affinity-node-v5:${tip}:${previous(unit)}`);
+        return { digest: tip, depth: index + 1 };
+      });
+      expect(material.nodes).toEqual(nodes);
+    }
+  }
+});
+
+it.each(["parameter", "tools", "instructions", "messages"] as const)(
+  "R4 wire non-finite %s never drops root fields or conversation units",
+  (location) => {
+    for (const surface of ["openai-chat", "anthropic-messages", "openai-responses"]) {
+      for (const value of ["1e400", "-1e400", '{"field":1e400}', "[1e400]"]) {
+        const request = JSON.parse(canonicalPayloadWire(location, value, surface));
+        const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+        expect(material.identifiable).toBe(true);
+        expect(material).toEqual(
+          affinityPrefixDigests(
+            digestArgs("runtime", JSON.parse(JSON.stringify(request)), surface),
+          ),
+        );
+        expect(material.nodes).toHaveLength(2);
+      }
+    }
+  },
+);
+
+it("R4 work exhaustion is atomic and the injected counter never exceeds its literal cap", () => {
+  const work = { steps: 8 * 2 * 1024 * 1024 - 1 };
+  expect(
+    buildCanonicalRequest(
+      digestArgs("runtime", { messages: [{ role: "user", content: "U" }], conversation: "client" }),
+      work,
+    ),
+  ).toBeNull();
+  expect(work.steps).toBe(8 * 2 * 1024 * 1024);
+  expect(
+    buildCanonicalRequest(digestArgs("runtime", { messages: [{ role: "user", content: "U" }] }), {
+      steps: 0,
+    }),
+  ).not.toBeNull();
 });

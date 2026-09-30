@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
+import { nestedWire } from "../cache-affinity-canonical.test-fixtures.js";
 import {
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
@@ -9,6 +10,7 @@ import {
   renderOpenAiChatRequest,
   renderProtocolError,
   renderProtocolErrorMetadata,
+  renderProtocolResponse,
 } from "./index.js";
 
 describe("request adapter semantic validation", () => {
@@ -654,4 +656,49 @@ describe("upstream reply envelopes ignore unknown fields", () => {
     });
     expect(debug).toEqual([]);
   });
+});
+
+it.each([20, 256, 257, 10_000])("R4 nonstream argument expansion depth %s", (depth) => {
+  const argumentsText = nestedWire(depth, "object");
+  const response = {
+    id: "reply",
+    items: [{ type: "tool_call" as const, id: "call", name: "lookup", arguments: argumentsText }],
+    stopReason: "tool" as const,
+  };
+  const render = () => renderProtocolResponse("anthropic-messages", response);
+  const parse = () =>
+    parseProtocolResponse({
+      surface: "openai-chat",
+      status: 200,
+      body: {
+        id: "reply",
+        object: "chat.completion",
+        model: "m",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call",
+                  type: "function",
+                  function: { name: "lookup", arguments: argumentsText },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+  if (depth <= 256) {
+    expect(() => JSON.stringify(render())).not.toThrow();
+    expect(parse).not.toThrow();
+  } else {
+    expect(render).toThrow("request JSON nesting exceeds 256 levels");
+    expect(parse).toThrow("request JSON nesting exceeds 256 levels");
+  }
 });

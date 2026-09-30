@@ -8,8 +8,10 @@ import {
 } from "node:http";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { embeddedArgumentsRequest, nestedWire } from "./cache-affinity-canonical.test-fixtures.js";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
+import { parseCanonicalRequest, renderCanonicalRequest } from "./protocols/adaptation.js";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -5895,3 +5897,55 @@ describe("OpenRouter data_collection privacy (D9)", () => {
 function claimPrivacyAccount() {
   return { providerType: "openai", allowDataCollection: false };
 }
+
+it.each(["openai-chat", "openai-responses"] as const)(
+  "R4 public dispatcher propagates %s embedded-depth refusal before budget/send/health",
+  async (surface) => {
+    vi.clearAllMocks();
+    db.modelPool.findFirst.mockResolvedValue(
+      dispatchPoolFixture("anthropic", "anthropic-messages", "anthropic"),
+    );
+    const payload = embeddedArgumentsRequest(surface, nestedWire(257, "object"));
+    const canonical = parseCanonicalRequest(surface, payload);
+    const request = {
+      userId: "owner",
+      poolId: "pool",
+      requestId: "depth-refusal",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      ...ownerConsentFields(),
+      requestedProtocol: "openai" as const,
+      requestedSurface: surface,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new TextEncoder().encode(JSON.stringify(payload)),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" },
+      releaseLocalCapacity: vi.fn(),
+      adaptationEnabled: true,
+      retrySafe: false,
+      renderForTarget: async () => ({
+        protocol: "anthropic" as const,
+        path: "/v1/messages",
+        headers: new Headers(),
+        body: new TextEncoder().encode(
+          JSON.stringify(
+            renderCanonicalRequest({
+              request: canonical,
+              target: "anthropic-messages",
+              model: "m",
+            }),
+          ),
+        ),
+      }),
+    };
+    await expect(dispatchPublicOverflow(request)).rejects.toMatchObject({
+      code: "request_json_depth_exceeded",
+      message: "request JSON nesting exceeds 256 levels",
+    });
+    expect(admitProviderBudget).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
+  },
+);

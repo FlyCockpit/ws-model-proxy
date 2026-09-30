@@ -6,7 +6,7 @@ import type {
   ProtocolResponseMetadata,
   ProtocolSurface,
 } from "./canonical.js";
-import { AdapterError, invalid, unsupported } from "./errors.js";
+import { AdapterError, invalid, parseEmbeddedJson, unsupported } from "./errors.js";
 import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
@@ -377,11 +377,7 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
 
 function completeArguments(value: unknown, parameter: string): string {
   const raw = string(value, parameter);
-  try {
-    object(JSON.parse(raw), parameter);
-  } catch {
-    invalid(parameter, "must be a complete JSON object");
-  }
+  object(parseEmbeddedJson(raw, parameter), parameter);
   return raw;
 }
 
@@ -577,7 +573,15 @@ function renderAnthropic(response: CanonicalResponse) {
       item.type === "text"
         ? item
         : item.type === "tool_call"
-          ? { type: "tool_use", id: item.id, name: item.name, input: JSON.parse(item.arguments) }
+          ? {
+              type: "tool_use",
+              id: item.id,
+              name: item.name,
+              input: object(
+                parseEmbeddedJson(item.arguments, `tool_call[${item.id}].arguments`),
+                `tool_call[${item.id}].arguments`,
+              ),
+            }
           : unsupported("response.refusal", "Anthropic has no lossless refusal block"),
     ),
     stop_reason:

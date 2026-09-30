@@ -47,6 +47,7 @@ import {
   openRouterDataCollectionPolicy,
 } from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
+import { isRequestDepthError } from "./protocols/errors.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
 import {
@@ -2586,7 +2587,7 @@ export async function buildProviderAffinityTargets(input: {
         upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
         runtimeIdentityKey: target.providerAccountId,
         runtimeModel: target.upstreamModelId,
-        runtimeRevision: target.providerVersion,
+        runtimeRevision: target.providerVersion ?? null,
         tokenizer: null,
         tokenizerVersion: null,
         template: null,
@@ -2853,7 +2854,8 @@ export async function dispatchPublicOverflow(
         ...upstream,
         body: applyOpenRouterDataCollection(upstream.body, target.dataCollectionPolicy),
       };
-    } catch {
+    } catch (error) {
+      if (isRequestDepthError(error)) throw error;
       await recordProviderAttemptEvent({
         userId: request.userId,
         providerAccountId: target.providerAccountId,

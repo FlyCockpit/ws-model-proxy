@@ -4,7 +4,7 @@ import {
   type CanonicalRequest,
   type CanonicalThinking,
 } from "./canonical.js";
-import { invalid, unsupported } from "./errors.js";
+import { invalid, parseEmbeddedJson, unsupported } from "./errors.js";
 import {
   boolean,
   object,
@@ -330,9 +330,6 @@ export function renderAnthropicMessagesRequest(
 }
 
 function parseArguments(value: string, id: string): Record<string, unknown> {
-  try {
-    return object(JSON.parse(value), `tool_call[${id}].arguments`);
-  } catch {
-    invalid(`tool_call[${id}].arguments`, "must be a complete JSON object");
-  }
+  const parameter = `tool_call[${id}].arguments`;
+  return object(parseEmbeddedJson(value, parameter), parameter);
 }
