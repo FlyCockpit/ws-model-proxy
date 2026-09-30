@@ -579,7 +579,40 @@ fn sealed_frame(
     )
 }
 
+/// One info line per command operation (headless `exec` or `supervised`):
+/// the operation, the relay command id and a stable outcome code. Never the
+/// command text, cwd, environment or output (the server's audit log holds a
+/// hash of the command text plus its program name; this log is the CLI-side
+/// record of what happened).
+fn log_command_op(op: &'static str, command_id: &str, outcome: &str) {
+    tracing::info!(op, command_id, outcome, "command operation");
+}
+
+fn rejected_outcome(reason: &str) -> String {
+    format!("rejected:{reason}")
+}
+
+/// One info line for a command-op rejection the relay could not read as a
+/// request at all (a malformed `term.spawn` frame). Otherwise the request
+/// never reaches `TerminalRegistry`, so this is the only place it is logged.
+pub(crate) fn log_command_rejected(op: &'static str, command_id: &str, reason: &str) {
+    log_command_op(op, command_id, &rejected_outcome(reason));
+}
+
+fn done_outcome(exit_code: Option<i32>, signal: Option<i32>, timed_out: bool) -> String {
+    if timed_out {
+        "timed_out".to_string()
+    } else if let Some(code) = exit_code {
+        format!("exited:{code}")
+    } else if let Some(signal) = signal {
+        format!("signaled:{signal}")
+    } else {
+        "ended".to_string()
+    }
+}
+
 fn exec_rejected(command_id: &str, reason: &str) -> OutboundFrame {
+    log_command_op("exec", command_id, &rejected_outcome(reason));
     OutboundFrame::Control(ClientControlMessage::ExecRejected {
         command_id: command_id.to_string(),
         reason: reason.to_string(),
@@ -596,6 +629,8 @@ fn exec_done(
     signal: Option<i32>,
     timed_out: bool,
 ) -> OutboundFrame {
+    let outcome = done_outcome(exit_code, signal, timed_out);
+    log_command_op("exec", command_id, &outcome);
     OutboundFrame::Control(ClientControlMessage::ExecDone {
         command_id: command_id.to_string(),
         exit_code,
@@ -1242,6 +1277,10 @@ struct Supervised {
     /// A person pressed Enter but `go` could not be written (the PTY is
     /// going away): the command never started, and this is not a decline.
     start_failed: bool,
+    /// Whether the one `command operation` outcome line for this command was
+    /// written. `close` is the only path that can run after another one
+    /// already ended the command, so it asks before logging.
+    logged_outcome: bool,
 }
 
 impl Supervised {
@@ -1250,6 +1289,44 @@ impl Supervised {
             self.phase,
             SupervisedPhase::Starting | SupervisedPhase::Confirm
         )
+    }
+
+    /// The outcome of a command that never took an Enter.
+    fn waiting_outcome(&self) -> &'static str {
+        if self.start_failed {
+            "start_failed"
+        } else {
+            "declined"
+        }
+    }
+
+    /// The one outcome line for this command, whichever path ends it. Later
+    /// paths see the flag and stay silent, so a command never logs twice.
+    fn log_outcome(&mut self, outcome: &str) {
+        if self.logged_outcome {
+            return;
+        }
+        self.logged_outcome = true;
+        log_command_op("supervised", &self.command_id, outcome);
+    }
+
+    /// The outcome for a path that ends the command without its own report
+    /// (`close`): a running command is `cancelled`, one that never took an
+    /// Enter is its decline/start_failed outcome, and one that already
+    /// reported (its exit, a decline from the declined frame path, or the
+    /// close of a waiting screen) is `None` — that line was already written.
+    fn closing_outcome(&self) -> Option<&'static str> {
+        if self.logged_outcome {
+            return None;
+        }
+        match self.phase {
+            SupervisedPhase::Running => Some("cancelled"),
+            // A Finished terminal already reported its exit through
+            // `finish_supervised`; closing it (review expiry, a stop) must
+            // not report a second time.
+            SupervisedPhase::Finished => None,
+            SupervisedPhase::Starting | SupervisedPhase::Confirm => Some(self.waiting_outcome()),
+        }
     }
 
     fn capture_message(&self) -> TermPlaintextV2 {
@@ -1301,6 +1378,9 @@ impl TerminalSession {
     fn supervised_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
         let mut frames = Vec::new();
         let mut display = Vec::new();
+        // An Enter that starts the command logs its outcome outside the
+        // borrow below, so the log line instruction stays out of the loop.
+        let mut accepted = false;
         {
             let Some(supervised) = self.supervised.as_mut() else {
                 return frames;
@@ -1333,6 +1413,7 @@ impl TerminalSession {
                             .map(|pty| pty.input.push_control(supervised.child.go.clone()));
                         if let Some(Ok(())) = released {
                             supervised.phase = SupervisedPhase::Running;
+                            accepted = true;
                             frames.push(OutboundFrame::Control(
                                 ClientControlMessage::SupervisedAccepted {
                                     command_id: supervised.command_id.clone(),
@@ -1347,6 +1428,13 @@ impl TerminalSession {
                         }
                     }
                 }
+            }
+        }
+        if accepted {
+            // "started" is not the command's outcome line: only the path that
+            // ends the command logs that, and only once.
+            if let Some(supervised) = self.supervised.as_ref() {
+                log_command_op("supervised", &supervised.command_id, "started");
             }
         }
         if !display.is_empty() {
@@ -1592,6 +1680,7 @@ pub(crate) struct TerminalRegistry {
 }
 
 fn supervised_rejected(command_id: &str, reason: &str) -> OutboundFrame {
+    log_command_op("supervised", command_id, &format!("rejected:{reason}"));
     OutboundFrame::Control(ClientControlMessage::SupervisedRejected {
         command_id: command_id.to_string(),
         reason: reason.to_string(),
@@ -1836,6 +1925,7 @@ impl TerminalRegistry {
                     finished_at: None,
                     exit_status: (None, None),
                     start_failed: false,
+                    logged_outcome: false,
                 }),
             },
         );
@@ -1872,6 +1962,8 @@ impl TerminalRegistry {
         let Some((terminal_id, awaiting, start_failed)) = found else {
             return Vec::new();
         };
+        // Not a decline request, or an Enter whose `go` could not be written:
+        // end the terminal. It never started, so `close` logs that outcome.
         if !if_waiting || start_failed {
             return self.close(&terminal_id);
         }
@@ -1891,7 +1983,7 @@ impl TerminalRegistry {
     /// the terminal, or keep a finished one whose capture waits for review.
     #[cfg(unix)]
     fn finish_supervised(&mut self, terminal_id: &str, now: Instant) -> Vec<OutboundFrame> {
-        let (status, phase, command_id, share_output, review, start_failed) = {
+        let (status, phase, command_id, share_output, review, terminal_outcome) = {
             let Some(session) = self.sessions.get_mut(terminal_id) else {
                 return Vec::new();
             };
@@ -1910,20 +2002,29 @@ impl TerminalRegistry {
                 return Vec::new();
             };
             supervised.exit_status = status;
+            // This path ends the command, so it logs the one outcome line:
+            // a running command reports its exit status, a never-started one
+            // its decline/start_failed outcome. `close` later logs nothing.
+            let terminal_outcome = if phase == SupervisedPhase::Running {
+                done_outcome(status.0, status.1, false)
+            } else {
+                supervised.waiting_outcome().to_string()
+            };
+            supervised.log_outcome(&terminal_outcome);
             (
                 status,
                 phase,
                 supervised.command_id.clone(),
                 supervised.share_output,
                 supervised.review,
-                supervised.start_failed,
+                terminal_outcome,
             )
         };
         let mut frames = Vec::new();
         if phase != SupervisedPhase::Running {
             // No Enter was taken (or its `go` never reached the child): the
             // command did not start. Only a real decline says `declined`.
-            if !start_failed {
+            if terminal_outcome == "declined" {
                 frames.push(OutboundFrame::Control(
                     ClientControlMessage::SupervisedDeclined { command_id },
                 ));
@@ -2502,10 +2603,19 @@ impl TerminalRegistry {
         frames
     }
 
+    /// End the terminal now. A supervised command killed here (a stop, a
+    /// malformed frame, shutdown, or an expired confirm screen/review) gets
+    /// its one outcome line, unless it already reported one (its exit, or a
+    /// decline from a path that logged before calling `close`).
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        let Some(session) = self.sessions.remove(terminal_id) else {
+        let Some(mut session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
+        if let Some(supervised) = session.supervised.as_mut()
+            && let Some(outcome) = supervised.closing_outcome()
+        {
+            supervised.log_outcome(outcome);
+        }
         let recorded = session
             .supervised
             .as_ref()
@@ -3139,6 +3249,7 @@ impl ExecRegistry {
         match spawn_exec(&self.tx, command_id, command, &cwd, config) {
             Ok(session) => {
                 self.sessions.insert(command_id.to_string(), session);
+                log_command_op("exec", command_id, "started");
                 vec![OutboundFrame::Control(ClientControlMessage::ExecStarted {
                     command_id: command_id.to_string(),
                 })]
@@ -3494,6 +3605,110 @@ mod tests {
         assert_eq!(terminal_supported(), cfg!(unix));
     }
 
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut inner) = self.0.lock() {
+                inner.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn command_ops_log_op_and_outcome_but_never_the_command_text() {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (tx, _rx) = channel();
+            let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+            let startup = enabled_startup(false);
+            let config = Config::default();
+            // Refused: bad cwd, and the command carries a secret-looking token.
+            let secret_cmd = "echo TOPSECRET_TOKEN_9f3a";
+            let _ = execs.start(&startup, &config, "ref1", secret_cmd, Some("relative"));
+            let _ = supervised_rejected("sup1", REASON_LIMIT);
+            let _ = exec_done("done1", Some(3), None, false);
+        });
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            log.contains("op=\"exec\"") || log.contains("op=exec"),
+            "{log}"
+        );
+        assert!(log.contains("rejected:bad_cwd"), "{log}");
+        assert!(log.contains("rejected:limit"), "{log}");
+        assert!(log.contains("exited:3"), "{log}");
+        assert!(log.contains("ref1") && log.contains("sup1"), "{log}");
+        assert!(!log.contains("TOPSECRET_TOKEN_9f3a"), "{log}");
+        assert!(!log.contains("relative"), "{log}");
+    }
+
+    #[test]
+    fn a_started_exec_logs_started_and_never_the_command_or_cwd() {
+        // The only `start` path the shared log test drives is a refusal; this
+        // pins the `Ok` arm's "started" line, which used to go unasserted.
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let (pid, command, dir) = tracing::subscriber::with_default(subscriber, || {
+            let (tx, rx) = channel();
+            let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
+            let command = slow_command();
+            let dir = cwd.path().to_string_lossy().into_owned();
+            let started = execs.start(
+                &enabled_startup(false),
+                &Config::default(),
+                "started1",
+                command,
+                Some(&dir),
+            );
+            assert!(matches!(
+                started[0],
+                OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+            ));
+            let pid = execs.pid("started1").expect("pid");
+            drop(execs);
+            drop(rx);
+            (pid, command, dir)
+        });
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        let ops = command_ops(&log);
+        let started = ops
+            .iter()
+            .filter(|(_, id, outcome)| id == "started1" && outcome == "started")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started.len(),
+            1,
+            "no single started line for the exec: {ops:?}"
+        );
+        assert!(!log.contains(command), "the command text leaked: {log}");
+        assert!(!log.contains(&dir), "the cwd leaked: {log}");
+        assert!(!process_exists(pid), "the started child was reaped");
+    }
+
     #[test]
     fn exec_rejects_size_nul_cwd_and_the_concurrency_cap() {
         let (tx, _rx) = channel();
@@ -3580,6 +3795,63 @@ mod tests {
         ));
         drop(execs);
         drop(rx);
+    }
+
+    #[test]
+    fn a_timed_out_exec_logs_the_timed_out_outcome() {
+        // The frame's `timed_out` flag is asserted above; this pins the CLI
+        // log's outcome code, which a dropped branch would quietly turn into
+        // `ended`/`signaled` while the frame stayed correct.
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let (tx, rx) = channel();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
+            execs.start(
+                &enabled_startup(false),
+                &Config::default(),
+                "slow",
+                slow_command(),
+                None,
+            );
+            std::thread::sleep(Duration::from_millis(350));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while execs.poll(Instant::now()).is_empty() {
+                while let Ok(message) = rx.try_recv() {
+                    match message {
+                        FromWorker::ExecBytes {
+                            command_id,
+                            stderr,
+                            bytes,
+                        } => {
+                            let _ = execs.on_bytes(&command_id, stderr, &bytes);
+                        }
+                        FromWorker::ExecEof { command_id, stderr } => {
+                            let _ = execs.on_eof(&command_id, stderr);
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(Instant::now() < deadline, "the exec never timed out");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        drop(rx);
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        let outcomes = command_ops(&log)
+            .into_iter()
+            .filter(|(_, id, _)| id == "slow")
+            .map(|(_, _, outcome)| outcome)
+            .collect::<Vec<_>>();
+        assert!(
+            outcomes.contains(&"timed_out".to_string()),
+            "no timed_out outcome line for a timed-out exec: {outcomes:?}\nlog:\n{log}"
+        );
     }
 
     #[test]
@@ -5205,18 +5477,70 @@ mod tests {
         drop(rx);
     }
 
-    /// Dead or a zombie. Elsewhere than Linux a killed orphan is reaped by
-    /// init, so plain existence is enough.
+    /// Dead or a zombie: the process can no longer act. A zombie is already
+    /// dead and only waits for its parent to reap it, and `kill(pid, 0)` still
+    /// succeeds for one, so a bare existence check would spin until its
+    /// deadline on a loaded macOS runner. Without `/proc` the state comes from
+    /// `ps`; if that is unavailable the process is assumed alive (fail closed).
     #[cfg(unix)]
-    fn process_gone(pid: u32) -> bool {
+    fn process_dead(pid: u32) -> bool {
+        if !process_exists(pid) {
+            return true;
+        }
         #[cfg(target_os = "linux")]
         {
             !process_running(pid)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            !process_exists(pid)
+            std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .is_some_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_start()
+                        .starts_with('Z')
+                })
         }
+    }
+
+    /// Dead or a zombie. Killed orphans are reaped by init after a moment.
+    #[cfg(unix)]
+    fn process_gone(pid: u32) -> bool {
+        process_dead(pid)
+    }
+
+    /// The zombie case that made the macOS confirm-child wait spin: a child
+    /// that exited but was not reaped still satisfies `kill(pid, 0)`, so a bare
+    /// existence check cannot tell it apart from a live one. Only a state
+    /// check can, and this pins that `process_dead` does so without reaping.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_exited_child_reads_as_dead_but_still_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("touch '{}'; exit 0", marker.display())])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_dead(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the exited child was never seen as dead"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Never reaped here, so it is still a zombie: a bare existence check
+        // would call it alive, which is what wedged the confirm-child wait.
+        assert!(process_exists(pid), "the child was reaped, not a zombie");
+        assert!(marker.exists());
+        let _ = child.wait();
     }
 
     #[cfg(unix)]
@@ -5427,6 +5751,33 @@ mod tests {
     #[cfg(unix)]
     const SUPERVISED_COMMAND_ID: &str = "cmd-supervised-1";
 
+    /// The confirm script that ends a started command by itself (exit 3 after
+    /// `after-accept`), so a test needs no cancel to reach `done`.
+    #[cfg(unix)]
+    fn self_ending_confirm(witness: Option<&Path>) -> String {
+        let touch = witness.map_or(String::new(), |path| {
+            format!("touch '{}'\n", path.display())
+        });
+        let record_pid = witness.map_or(String::new(), |path| {
+            format!("echo $$ > '{}'\n", path.with_extension("pid").display())
+        });
+        let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
+        format!(
+            r#"{record_pid}sleep 0.4
+printf 'SCREEN\n'
+printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
+IFS= read -r line
+stty -echo -icanon min 1 time 0
+printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
+go=$(head -c {go_len})
+stty echo icanon
+[ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
+{touch}printf 'after-accept\n'
+exit 3
+"#
+        )
+    }
+
     /// Stands in for `wsmp terminal supervised-run`: draws a screen, prints the
     /// ready marker, reads one line (canonical tty, so type-ahead would be
     /// read too), declines on `q`, else prints the accepted marker and "runs".
@@ -5462,9 +5813,13 @@ exit 3
         )
     }
 
-    /// Waits until the confirm child recorded next to `witness` is gone. A dead
-    /// child cannot create the witness later, so the caller can then assert its
-    /// absence without guessing how long a live child would need.
+    /// Waits until the confirm child recorded next to `witness` can no longer
+    /// run. A reaped or zombie child cannot create the witness later, so the
+    /// caller can then assert its absence without guessing how long a live
+    /// child would need. Zombie-aware on purpose: the child is the test's own
+    /// direct child, and on macOS `kill(pid, 0)` keeps succeeding for a zombie
+    /// that the test has not reaped yet (reaping here would lose the exit
+    /// status this helper does not need, so it just stops waiting).
     #[cfg(unix)]
     fn wait_for_confirm_child_exit(witness: &Path) {
         let pid = std::fs::read_to_string(witness.with_extension("pid"))
@@ -5473,7 +5828,7 @@ exit 3
             .parse::<u32>()
             .expect("pid");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while process_exists(pid) {
+        while !process_dead(pid) {
             assert!(Instant::now() < deadline, "the confirm child kept running");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -5598,6 +5953,343 @@ exit 3
             .collect()
     }
 
+    /// The `command operation` info lines as `(op, command_id, outcome)`.
+    /// The default formatter writes the message last, then the fields in the
+    /// `tracing::info!` order; `command_id` is quoted, the other two are bare
+    /// (the `op` may be quoted too, depending on the value).
+    fn command_ops(log: &str) -> Vec<(String, String, String)> {
+        const MESSAGE: &str = "command operation";
+        log.lines()
+            .filter_map(|line| {
+                let marker = line.find(MESSAGE)?;
+                let rest = &line[marker + MESSAGE.len()..];
+                let words = rest.split_whitespace().collect::<Vec<_>>();
+                let [op, command_id, outcome] = words[words.len().checked_sub(3)?..] else {
+                    return None;
+                };
+                Some((
+                    op.strip_prefix("op=")?.trim_matches('"').to_string(),
+                    command_id
+                        .strip_prefix("command_id=")?
+                        .trim_matches('"')
+                        .to_string(),
+                    outcome
+                        .strip_prefix("outcome=")?
+                        .trim_matches('"')
+                        .to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The one line that ends this command (its outcome, never `started`),
+    /// with the "logged exactly once" invariant: zero is missing, two double.
+    #[cfg(unix)]
+    fn sole_supervised_end(log: &str, command_id: &str) -> (String, String, String) {
+        let ops = command_ops(log);
+        let mine = ops
+            .iter()
+            .filter(|(_, id, outcome)| id == command_id && outcome != "started")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mine.len(),
+            1,
+            "expected exactly one ending line for {command_id}: {ops:?}\nlog:\n{log}"
+        );
+        let (op, id, outcome) = mine[0];
+        (op.clone(), id.clone(), outcome.clone())
+    }
+
+    /// The number of `started` lines for a command, which is 1 only while it
+    /// runs and 0 for a request that never took an Enter.
+    #[cfg(unix)]
+    fn started_lines(log: &str, command_id: &str) -> usize {
+        command_ops(log)
+            .iter()
+            .filter(|(_, id, outcome)| id == command_id && outcome == "started")
+            .count()
+    }
+
+    /// The command text of the log-invariant requests: the child echoes it,
+    /// and it must never reach the log.
+    #[cfg(unix)]
+    const SUPERVISED_COMMAND_TEXT: &str = "echo SUPERVISED_COMMAND_TEXT_9f3a";
+
+    /// What the supervised child prints after it is accepted, never logged.
+    #[cfg(unix)]
+    const SUPERVISED_OUTPUT_TEXT: &str = "after-accept";
+
+    /// The `reason` of the log-invariant requests, never logged.
+    #[cfg(unix)]
+    const SUPERVISED_CWD_TEXT: &str = "wsmp-supervised-reason-9f3a";
+
+    #[cfg(unix)]
+    fn supervised_outcome_log(
+        script: &str,
+        witness: Option<&Path>,
+        review: bool,
+        end: impl FnOnce(
+            &mut TerminalRegistry,
+            &mut TestViewer,
+            &mpsc::Receiver<FromWorker>,
+        ) -> Vec<OutboundFrame>,
+        outcome: &str,
+    ) -> (String, Vec<OutboundFrame>) {
+        // The command reports its exit and its session is removed by `end`.
+        supervised_outcome_log_then_close(script, witness, review, end, outcome, false)
+    }
+
+    /// Like [`supervised_outcome_log`], but the terminal keeps its session
+    /// until it is closed after `end`; with `review` this is the double-log
+    /// scenario: the command reports its exit, stays Finished, and a later
+    /// close must not log a second outcome.
+    #[cfg(unix)]
+    fn supervised_outcome_log_then_close(
+        script: &str,
+        witness: Option<&Path>,
+        review: bool,
+        body: impl FnOnce(
+            &mut TerminalRegistry,
+            &mut TestViewer,
+            &mpsc::Receiver<FromWorker>,
+        ) -> Vec<OutboundFrame>,
+        outcome: &str,
+        close_after: bool,
+    ) -> (String, Vec<OutboundFrame>) {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let mut cwd_dir = None;
+        let frames = tracing::subscriber::with_default(subscriber, || {
+            let (tx, rx) = channel();
+            let mut terminals = supervised_registry(tx, script);
+            let startup = supervised_startup(McpCommandMode::Supervised, false);
+            // The cwd must exist (the confirm screen shows the physical path),
+            // but neither it nor the command text may reach the log.
+            let cwd = tempfile::tempdir().expect("tempdir");
+            let request = SupervisedSpawn {
+                cwd: Some(cwd.path().to_string_lossy().into_owned()),
+                command: SUPERVISED_COMMAND_TEXT.to_string(),
+                reason: Some(SUPERVISED_CWD_TEXT.to_string()),
+                share_output: review,
+                ..spawn_request(review)
+            };
+            cwd_dir = Some(cwd);
+            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+            assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
+            let mut a = TestViewer::new(7);
+            let _ = attach_viewer(&mut terminals, &startup, &mut a);
+            pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
+                phase(terminals) == Some(SupervisedPhase::Confirm)
+            });
+            let label = a.id.clone();
+            // Review-pending ends hold the capture, so turn review on before
+            // the Enter when the caller keeps the Finished terminal.
+            if review && close_after {
+                frames.extend(send(
+                    &mut terminals,
+                    &mut a,
+                    &label,
+                    &TermPlaintextV2::ReviewToggle(true),
+                ));
+            }
+            frames.extend(send(
+                &mut terminals,
+                &mut a,
+                &label,
+                &TermPlaintextV2::Data(b"ok\r".to_vec()),
+            ));
+            frames.extend(body(&mut terminals, &mut a, &rx));
+            if close_after {
+                frames.extend(terminals.close(MULTI_TERMINAL));
+            }
+            frames
+        });
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        let line = sole_supervised_end(&log, SUPERVISED_COMMAND_ID);
+        assert_eq!(line.0, "supervised", "{log}");
+        assert_eq!(line.2, outcome, "{log}");
+        // "started" appears exactly once while the command runs, and not at
+        // all for a request that never took an Enter.
+        let started = started_lines(&log, SUPERVISED_COMMAND_ID);
+        if outcome == "exited:3" || outcome == "cancelled" {
+            assert_eq!(started, 1, "the running command logged no started: {log}");
+        } else {
+            assert_eq!(started, 0, "a command that never ran logged started: {log}");
+        }
+        for leaked in [
+            SUPERVISED_COMMAND_TEXT,
+            SUPERVISED_OUTPUT_TEXT,
+            SUPERVISED_CWD_TEXT,
+        ] {
+            assert!(!log.contains(leaked), "log leaked {leaked:?}: {log}");
+        }
+        if let Some(cwd) = cwd_dir {
+            let path = cwd.path().to_string_lossy().into_owned();
+            assert!(!log.contains(&path), "log leaked the cwd {path}: {log}");
+        }
+        if let Some(witness) = witness {
+            wait_for_confirm_child_exit(witness);
+        }
+        (log, frames)
+    }
+
+    /// Every supervised ending, each asserted to write exactly one outcome
+    /// line and never the command text, cwd or output (AC 8's supervised
+    /// half): accept, browser/confirm decline, stop of a waiting screen, stop
+    /// of a running command, `start_failed`, and the confirm deadline.
+    #[cfg(unix)]
+    #[test]
+    fn supervised_logs_one_outcome_per_command_for_every_ending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // 1. A person's Enter starts the command.
+        let witness = tmp.path().join("started-ran");
+        let (log, frames) = supervised_outcome_log(
+            &self_ending_confirm(Some(&witness)),
+            Some(&witness),
+            true,
+            |terminals, _, rx| {
+                let mut frames = Vec::new();
+                pump_until(terminals, rx, &mut frames, has_exit);
+                frames
+            },
+            "exited:3",
+        );
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "head", "done", "exit"],
+            "{log}"
+        );
+        assert!(witness.exists());
+
+        // 2. A browser decline / confirm deadline while the screen waits.
+        let witness = tmp.path().join("declined-ran");
+        let (log, frames) = supervised_outcome_log(
+            &fake_confirm(Some(&witness)),
+            Some(&witness),
+            true,
+            |terminals, _, _| terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true),
+            "declined",
+        );
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "declined", "exit"],
+            "{log}"
+        );
+        assert!(!witness.exists(), "the declined command must not run");
+
+        // 3. A server stop of a running command (`if_waiting` false): the
+        //    command was killed mid-run, so it is cancelled, not done.
+        let witness = tmp.path().join("stopped-ran");
+        let (log, frames) = supervised_outcome_log(
+            &self_ending_confirm(Some(&witness)),
+            Some(&witness),
+            false,
+            |terminals, _, rx| {
+                let mut frames = Vec::new();
+                pump_until(terminals, rx, &mut frames, |terminals, _| {
+                    phase(terminals) == Some(SupervisedPhase::Running)
+                });
+                frames.extend(terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false));
+                frames
+            },
+            "cancelled",
+        );
+        assert_eq!(
+            outcome_kinds(&frames),
+            vec!["spawned", "accepted", "exit"],
+            "{log}"
+        );
+
+        // 4. Enter was pressed but `go` could not be written: the command
+        //    never started, and calling it a decline would be a lie.
+        let witness = tmp.path().join("start-failed-ran");
+        let (log, frames) = supervised_outcome_log(
+            &fake_confirm(Some(&witness)),
+            Some(&witness),
+            true,
+            |terminals, _, rx| {
+                let held = hold_output_until(rx, b"wsmp-supervised;accepted;");
+                terminals
+                    .sessions
+                    .get(MULTI_TERMINAL)
+                    .and_then(|session| session.pty.as_ref())
+                    .expect("pty")
+                    .input
+                    .fail();
+                let mut frames = Vec::new();
+                for bytes in held {
+                    frames.extend(terminals.on_bytes(MULTI_TERMINAL, &bytes));
+                }
+                frames.extend(terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true));
+                frames
+            },
+            "start_failed",
+        );
+        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
+        assert!(!witness.exists(), "the command started without go");
+
+        // 5. A confirm screen nobody answered past its deadline, ended by a
+        //    stop while it still waits (`if_waiting` false). It never ran:
+        //    the log must say declined, not cancelled.
+        let witness = tmp.path().join("expired-ran");
+        let (log, frames) = supervised_outcome_log(
+            &fake_confirm(Some(&witness)),
+            Some(&witness),
+            false,
+            |terminals, _, _| terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false),
+            "declined",
+        );
+        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
+        assert!(!witness.exists());
+
+        // 6. The confirm screen's own deadline (`poll`) closes the terminal
+        //    directly (no `supervised.declined` frame), and `close` logs the
+        //    declined outcome for it.
+        let witness = tmp.path().join("poll-ran");
+        let (log, frames) = supervised_outcome_log(
+            &fake_confirm(Some(&witness)),
+            Some(&witness),
+            true,
+            |terminals, _, _| {
+                // The registry's confirm TTL is 15 minutes; move the clock.
+                terminals.confirm_ttl = Duration::ZERO;
+                terminals.poll(Instant::now() + Duration::from_secs(1))
+            },
+            "declined",
+        );
+        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
+        assert!(!witness.exists());
+    }
+
+    /// A review-pending capture ends the command, then the terminal is closed
+    /// later: the outcome must still appear exactly once (the close path must
+    /// not log a second line for an already-reported command).
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_review_pending_supervised_command_logs_one_outcome() {
+        let witness: Option<&Path> = None;
+        let (log, frames) = supervised_outcome_log_then_close(
+            &self_ending_confirm(witness),
+            witness,
+            true,
+            |terminals, _, rx| {
+                let mut frames = Vec::new();
+                pump_until(terminals, rx, &mut frames, |terminals, _| {
+                    phase(terminals) == Some(SupervisedPhase::Finished)
+                });
+                frames
+            },
+            "exited:3",
+            true,
+        );
+        assert!(outcome_kinds(&frames).contains(&"exit"), "{log}");
+        assert_eq!(started_lines(&log, SUPERVISED_COMMAND_ID), 1, "{log}");
+    }
     #[cfg(unix)]
     #[test]
     fn type_ahead_before_the_screen_is_dropped_and_enter_after_it_runs_and_shares() {

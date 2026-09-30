@@ -537,6 +537,40 @@ starts an immediate sweep that will remove artifacts already past eligibility
 - Automatic CIMD-client deletion and JWKS key deletion are deliberately
   deferred pending a separately reviewed policy.
 
+## Agent audit log
+
+Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
+`forwarder_cli_supervised_command_start`), including refused ones, is recorded
+in `cli_agent_action_event` (file operations join it with the file tools). The
+log is **metadata only**: who (user, device, token), what (kind, and for a
+command a keyed HMAC-SHA256 of the command text plus its program name — never
+the command text itself), when, and how it ended (`completed`, `refused`, `failed`,
+`cancelled`, `declined`, `expired`, `unknown`, with a stable reason such as
+`exit:1` or `limit`). The reason is a stable machine code: a CLI rejection frame
+(`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
+stored as `rejected`, so CLI-supplied text never reaches the column. File
+content, diffs and command output are never stored, and the command's arguments
+are never stored: the server reduces the command text to its program (the
+first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
+`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
+command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
+flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
+for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
+(fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
+used to check a guessed command; when the key cannot be derived the hash is
+stored as `hmac-sha256:unavailable` and still leaks nothing. Writing an
+event never blocks or fails the operation (a bounded in-process queue, dropped
+and counted when the database cannot keep up). Rows are deleted after **90
+days** by the hourly retention sweep, and with the user on account deletion
+(the deletion drain removes them; a row recorded or skipped after that drain,
+such as the cancellation of a command still running when the account is
+deleted, is removed by the deleted-user purge within its grace period, and the
+hourly retention sweep deletes any event whose user no longer exists).
+The owner reads them under `Dashboard → CLIs → Agent activity` and through
+`forwarder_cli_activity_list` (read scope; visible only to a personal token
+minted with CLI commands, like the other CLI tools).
+
 ## Rate limits (process-local)
 
 - `/mcp`: an unconditional, pre-authentication IP-keyed bucket
