@@ -293,17 +293,50 @@ nodes when it contains continuation evidence (assistant/tool output). A
 user-only history stays fresh under the starter rule. A missing/expired parent
 publishes no delta-only nodes, including with a client id; that id can still
 identify the session footprint. Canonicalization preserves every own JSON key,
-including `__proto__`. Its depth limit is 128 (request root at depth 0; each object
-property or array entry adds one level), and its canonical JSON / cumulative
-identity size cap is 2 MiB. Exceeding either bound makes the **whole request
-unidentifiable**: no identity nodes, routing or instruction hints, client session
-footprint, or Responses lineage are published. Affinity errors also fail closed;
-the request is still served, including bound Responses follow-ups. Realistic
-nested schemas within both bounds remain identifiable.
+including `__proto__`. Affinity's advisory depth limit is 128 (request root at
+depth 0; each object property or array entry adds one level). Exceeding that
+limit or a converter/HMAC error makes the whole request unidentifiable: no
+nodes, hints, client session footprint or Responses lineage.
+
+The 2 MiB canonical identity limit is separate: bytes are counted for the
+instruction/tools/parameters root and then each conversation unit. Size-only
+overflow refuses identity and lineage, while retaining safe instruction hints
+and the last 64 nodes of the under-cap chain prefix as routing hints. An oversized
+root cannot produce conversation routing hints; an oversized unit stops the
+chain, and later units cannot restart it. Large supported vision histories can
+therefore remain warm. A valid authoritative client id still refreshes its one
+session footprint; without an id only shared hints are refreshed, with no new
+per-turn footprint. Routing hints never establish resolver identity.
+
+Model API JSON acceptance has a separate **256-level request nesting limit**,
+measured iteratively immediately after JSON parsing, before model lookup,
+counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
+a protocol-appropriate invalid-request error: `request JSON nesting exceeds 256
+levels`. Depth 129 through 256 is served with affinity advisory identity off,
+including bound Responses follow-ups. Realistic tool/JSON schemas are far below
+256, which also stays safely below Node 24's recursive serializer limit.
+
+The shared parser covers `/chat/completions`, `/messages`,
+`/messages/count_tokens`, `/responses` (create and bound input follow-ups),
+`/responses/count_tokens`, `/embeddings` and `/audio/speech`, including local,
+public-overflow and authenticated Chat Test paths. MCP tool arguments use the
+same guard before their first size serialization, and the chat diagnostic core
+checks again before creating its synthetic model API request. Multipart audio
+routes do not parse JSON bodies. Responses retrieve/delete/cancel/input-items/
+compact use empty relay bodies. Other JSON reads in routing, public overflow,
+privacy, diagnostics and protocol adapters inspect already accepted internal
+requests, upstream responses/SSE, or embedded tool argument strings; they are
+not separate HTTP JSON acceptance paths.
 
 Retention keeps at most 64 nodes and one tip per identifiable session, plus a
-separate session footprint. Pruning removes hints for discarded conversation
-nodes and preserves instruction hints when bound deltas omit instructions. Bound turns refresh the committed token estimate with a
+separate session footprint. Bound writes retain only the selected server parent's
+same-root tail, up to its bound tip depth, after proving that tip is still on the parent's current
+chain. A client-id override copies and re-stamps that proven tail, discarding
+its own unrelated old nodes/hints. Instruction hints carry a type namespace so
+routing-only hints without node rows cannot be inherited as instructions. A stale
+binding after a stateless rewrite
+cannot retain unproven ancestors. Pruning preserves omitted instruction hints
+from the proven chain. Bound turns refresh the committed token estimate with a
 delta estimate computed before dispatch (empty deltas carry size forward).
 EOF awaits the affinity commit before saving Responses warm lineage. Persistence
 uses `maxWait=2000ms`, `timeout=2500ms`, and `lock_timeout=1000ms`; errors save the

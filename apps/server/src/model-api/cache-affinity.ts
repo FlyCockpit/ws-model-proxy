@@ -14,6 +14,9 @@ import {
 const DIGEST_VERSION = 5;
 const MAX_PREFIXES_PER_REQUEST = 64;
 const MAX_INSTRUCTION_PREFIXES = 8;
+// Routing-only byte-overflow hints may have no node row. Tag instruction hints
+// so a rebase cannot mistake those unproven conversation hints for instructions.
+const INSTRUCTION_HINT_PREFIX = "instruction-v5:";
 
 export type AffinityPolicy = {
   enabled: boolean;
@@ -229,7 +232,7 @@ export type AffinityMaterial = {
   digests: string[];
   /** Complete-chain nodes only: the resolver must never see a truncated chain. */
   nodes: { digest: string; depth: number }[];
-  /** Routing-only tail, also retained for histories over the identity byte budget. */
+  /** Last <=64 under-cap chain nodes for routing; size refusal keeps them, depth/errors do not. */
   routingNodes: { digest: string; depth: number }[];
   conversationDigest: string | null;
   hasExplicitConversation: boolean;
@@ -265,7 +268,8 @@ export function affinityPrefixDigests(
   args: Parameters<typeof buildAffinityMaterial>[0],
 ): AffinityMaterial {
   try {
-    const payload = asJson(args.payload);
+    // The ingress body limit bounds work; bytes refuse identity per layer, never routing.
+    const payload = asJson(args.payload, Number.POSITIVE_INFINITY);
     if (!payload || typeof payload !== "object" || Array.isArray(payload))
       return unidentifiableMaterial();
     return buildAffinityMaterial({ ...args, payload });
@@ -316,7 +320,7 @@ function buildAffinityMaterial({
           ? Object.fromEntries(Object.entries(raw).filter(([name]) => name !== "user_id"))
           : undefined;
       if (metadata && Object.keys(metadata).length === 0) return [];
-      const value = asJson(metadata ?? raw);
+      const value = asJson(metadata ?? raw, Number.POSITIVE_INFINITY);
       return value === undefined ? [] : [[key, value] as const];
     }),
   );
@@ -343,7 +347,9 @@ function buildAffinityMaterial({
     tools: layers.tools ?? null,
     parameters,
   });
-  const computedRoot = hmacValue(`affinity-root-v5:${rootMaterial}`);
+  const rootBytes = Buffer.byteLength(rootMaterial);
+  const computedRoot =
+    rootBytes <= MAX_CANONICAL_BYTES ? hmacValue(`affinity-root-v5:${rootMaterial}`) : "";
   const parent =
     canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string"
       ? sessionBinding
@@ -358,13 +364,13 @@ function buildAffinityMaterial({
       ? scopedParent
       : undefined;
   const rootDigest = boundSessionId && parent ? parent.rootDigest : computedRoot;
-  let canonicalBytes =
-    boundSessionId && parent ? parent.canonicalBytes : Buffer.byteLength(rootMaterial);
+  let canonicalBytes = boundSessionId && parent ? parent.canonicalBytes : rootBytes;
   let depth = boundSessionId && parent ? parent.tipDepth : 0;
   let tip = boundSessionId && parent ? parent.tipDigest : rootDigest;
   const nodes: AffinityMaterial["nodes"] = [];
   let identifiable = canonicalSurface !== null && canonicalBytes <= MAX_CANONICAL_BYTES;
   for (const unit of layers.conversationUnits) {
+    if (!identifiable) break;
     const canonical = stableJson(unit);
     canonicalBytes += Buffer.byteLength(canonical);
     if (canonicalBytes > MAX_CANONICAL_BYTES) {
@@ -376,7 +382,6 @@ function buildAffinityMaterial({
     nodes.push({ digest: tip, depth });
     if (nodes.length > MAX_PREFIXES_PER_REQUEST) nodes.shift();
   }
-  if (canonicalBytes > MAX_CANONICAL_BYTES) return unidentifiableMaterial(canonicalBytes);
   const missingParent =
     canonicalSurface === "openai-responses" &&
     typeof payload.previous_response_id === "string" &&
@@ -385,20 +390,22 @@ function buildAffinityMaterial({
   // starter that a later stateless request could mistakenly take as a tip.
   if (missingParent) identifiable = false;
   const routingNodes = missingParent ? [] : [...nodes];
-  if (!identifiable) nodes.length = 0;
-  else if (boundSessionId && parent && nodes.length === 0) {
+  if (boundSessionId && parent && nodes.length === 0) {
     // An empty native delta still refreshes the committed parent tip and size.
-    nodes.push({ digest: parent.tipDigest, depth: parent.tipDepth });
+    if (identifiable) nodes.push({ digest: parent.tipDigest, depth: parent.tipDepth });
     routingNodes.push({ digest: parent.tipDigest, depth: parent.tipDepth });
   }
+  if (!identifiable) nodes.length = 0;
   const textCap =
     layers.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
   const instructionUnits =
     layers.tools !== undefined
       ? [...layers.instructionUnits.slice(0, textCap), layers.tools]
       : layers.instructionUnits.slice(0, textCap);
-  const instructionDigests = cumulativePrefixDigests(instructionUnits, (index, cumulative) =>
-    hmacValue(`instruction-layer-v5:${bindingDigest}:prefix:${index}:${cumulative}`),
+  const instructionDigests = cumulativePrefixDigests(
+    instructionUnits,
+    (index, cumulative) =>
+      `${INSTRUCTION_HINT_PREFIX}${hmacValue(`instruction-layer-v5:${bindingDigest}:prefix:${index}:${cumulative}`)}`,
   );
   const conversation = asJson(payload.conversation ?? payload.conversation_id);
   return {
@@ -414,8 +421,8 @@ function buildAffinityMaterial({
     clientSessionId,
     boundSessionId: identifiable ? boundSessionId : undefined,
     missingParent,
-    parentTipDigest: boundSessionId ? parent?.tipDigest : undefined,
-    parentTipDepth: boundSessionId ? parent?.tipDepth : undefined,
+    parentTipDigest: identifiable && boundSessionId ? parent?.tipDigest : undefined,
+    parentTipDepth: identifiable && boundSessionId ? parent?.tipDepth : undefined,
     hasExplicitConversation: conversation !== undefined,
     conversationDigest:
       !identifiable || conversation === undefined
@@ -961,23 +968,38 @@ export async function rememberAffinity({
     // branch. The fence was acquired before all reads; no graph locks or effects.
     const existingNodes = material.identifiable
       ? await tx.cacheAffinityNode.findMany({
-          where: { ...scope, sessionId },
+          where: { ...scope, sessionId, expiresAt: { gt: now } },
           select: { nodeDigest: true, depth: true, rootDigest: true },
         })
       : [];
-    const combined =
-      material.boundSessionId !== undefined
-        ? [
-            ...existingNodes
-              .filter(
-                (node) =>
-                  node.rootDigest === material.rootDigest &&
-                  node.depth <= (material.parentTipDepth ?? 0),
-              )
-              .map(({ nodeDigest, depth }) => ({ digest: nodeDigest, depth })),
-            ...material.nodes,
-          ]
-        : material.nodes;
+    const parentNodes = material.boundSessionId
+      ? material.boundSessionId === sessionId
+        ? existingNodes
+        : await tx.cacheAffinityNode.findMany({
+            where: { ...scope, sessionId: material.boundSessionId, expiresAt: { gt: now } },
+            select: { nodeDigest: true, depth: true, rootDigest: true },
+          })
+      : [];
+    // A same-root rewrite can replace even this session's chain. The durable
+    // binding alone proves the parent tip, not ancestry of the current rows.
+    const parentChainProven = parentNodes.some(
+      (node) =>
+        node.rootDigest === material.rootDigest &&
+        node.nodeDigest === material.parentTipDigest &&
+        node.depth === material.parentTipDepth,
+    );
+    const combined = [
+      ...(parentChainProven
+        ? parentNodes
+            .filter(
+              (node) =>
+                node.rootDigest === material.rootDigest &&
+                node.depth <= (material.parentTipDepth ?? 0),
+            )
+            .map(({ nodeDigest, depth }) => ({ digest: nodeDigest, depth }))
+        : []),
+      ...material.nodes,
+    ];
     const retained = [...new Map(combined.map((node) => [node.digest, node])).values()]
       .sort((a, b) => b.depth - a.depth)
       .slice(0, MAX_PREFIXES_PER_REQUEST);
@@ -1025,6 +1047,58 @@ export async function rememberAffinity({
           prefixDigest: { in: discardedDigests },
         },
       });
+    const rebased =
+      material.identifiable &&
+      (material.boundSessionId
+        ? material.boundSessionId !== sessionId || !parentChainProven
+        : existingNodes.some((node) => node.rootDigest !== material.rootDigest));
+    const inheritedInstructions =
+      rebased && parentChainProven
+        ? await tx.cacheAffinityRecord.findMany({
+            where: {
+              ...scope,
+              sessionId: {
+                in: [
+                  material.boundSessionId!,
+                  ...(existingNodes.length > 0 &&
+                  existingNodes.every((node) => node.rootDigest === material.rootDigest)
+                    ? [sessionId]
+                    : []),
+                ],
+              },
+              targetIdentity: target.targetIdentity,
+              bindingDigest: material.bindingDigest,
+              expiresAt: { gt: now },
+              prefixDigest: {
+                not: null,
+                startsWith: INSTRUCTION_HINT_PREFIX,
+              },
+            },
+            select: { prefixDigest: true, prefixDepth: true },
+            take: MAX_INSTRUCTION_PREFIXES,
+          })
+        : [];
+    if (rebased) {
+      // Same-root instructions also remain valid when their shared record was
+      // last stamped by the chosen client. Conversation hints require parent proof.
+      // Chosen-client rows describe its old branch and cannot establish ancestry.
+      await tx.cacheAffinityRecord.deleteMany({
+        where: {
+          ...scope,
+          sessionId,
+          prefixDigest: {
+            not: null,
+            notIn: [
+              ...retainedDigests,
+              ...material.instructionDigests,
+              ...inheritedInstructions.flatMap((row) =>
+                row.prefixDigest ? [row.prefixDigest] : [],
+              ),
+            ],
+          },
+        },
+      });
+    }
     const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
       await tx.cacheAffinityRecord.upsert({
         where: {
@@ -1064,8 +1138,15 @@ export async function rememberAffinity({
       });
     };
     const prefixes = [
-      ...material.instructionDigests.map((digest, index) => ({ digest, depth: index + 1 })),
-      ...material.routingNodes,
+      ...new Map(
+        [
+          ...material.instructionDigests.map((digest, index) => ({ digest, depth: index + 1 })),
+          ...inheritedInstructions.flatMap((row) =>
+            row.prefixDigest ? [{ digest: row.prefixDigest, depth: row.prefixDepth }] : [],
+          ),
+          ...(material.boundSessionId ? retained : material.routingNodes),
+        ].map((node) => [node.digest, node]),
+      ).values(),
     ];
     // Small requests avoid bulk serialization; large histories use one statement,
     // never 64 sequential upserts while holding the owner/pool fence.

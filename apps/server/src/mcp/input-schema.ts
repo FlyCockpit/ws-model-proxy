@@ -1,3 +1,7 @@
+import {
+  REQUEST_JSON_DEPTH_ERROR,
+  requestJsonDepthExceeded,
+} from "../model-api/request-json-depth.js";
 /**
  * The ONE generator for every MCP tool's advertised `inputSchema` (#117).
  *
@@ -79,6 +83,12 @@ function inputByteLength(value: unknown): number {
  */
 function inputSizeGuard(maxBytes: number) {
   return z.transform((value, ctx) => {
+    // The diagnostic relay serializes these arguments before entering HTTP
+    // parsing. Refuse deep JSON at this first stage, before its size serializer.
+    if (requestJsonDepthExceeded(value)) {
+      ctx.addIssue({ code: "custom", message: REQUEST_JSON_DEPTH_ERROR, input: value, path: [] });
+      return value;
+    }
     if (inputByteLength(value) > maxBytes) {
       ctx.addIssue({
         code: "custom",

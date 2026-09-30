@@ -731,9 +731,9 @@ const READ_TOOLS: readonly McpToolSpec[] = [
  * chat-test core owns the real per-entry validation. Mirroring per-entry
  * object schemas here would both diverge from HTTP again and let an
  * abusive input produce one zod issue PER ENTRY, which the installed SDK
- * echoes into an unbounded tool result. The ONLY intentional restriction
- * is the 64 KiB first-stage byte bound (withInputSizeBound) — the same
- * budget the pass-4 design established.
+ * echoes into an unbounded tool result. First-stage bounds enforce the
+ * established 64 KiB byte budget and the shared 256-level JSON depth limit
+ * before serialization (withInputSizeBound).
  */
 const CHAT_MESSAGES_SCHEMA = z.array(z.unknown());
 

@@ -227,6 +227,7 @@ import {
 } from "./relay-usage-facts.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
+import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -1112,35 +1113,23 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseRequestPayload(body: Uint8Array): JsonObject | Response {
+function parseRequestPayload(body: Uint8Array, anthropic = false): JsonObject | Response {
+  const invalid = (message: string, code = "invalid_json") =>
+    anthropic
+      ? anthropicErrorResponse(400, message)
+      : new Response(
+          JSON.stringify(openAiErrorBody({ message, type: "invalid_request_error", code })),
+          { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+        );
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(body));
   } catch {
-    return new Response(
-      JSON.stringify(
-        openAiErrorBody({
-          message: "Request body must be valid JSON.",
-          type: "invalid_request_error",
-          code: "invalid_json",
-        }),
-      ),
-      { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
+    return invalid("Request body must be valid JSON.");
   }
-
-  if (!isJsonObject(parsed)) {
-    return new Response(
-      JSON.stringify(
-        openAiErrorBody({
-          message: "Request body must be a JSON object.",
-          type: "invalid_request_error",
-          code: "invalid_json",
-        }),
-      ),
-      { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
-  }
+  if (!isJsonObject(parsed)) return invalid("Request body must be a JSON object.");
+  if (requestJsonDepthExceeded(parsed))
+    return invalid(REQUEST_JSON_DEPTH_ERROR, "request_json_too_deep");
   return parsed;
 }
 
@@ -9385,14 +9374,8 @@ async function prepareAnthropicModeledRequest(
       "request_too_large",
     );
   }
-  let payload: JsonObject;
-  try {
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object");
-    payload = parsed as JsonObject;
-  } catch {
-    return anthropicErrorResponse(400, "Request body must be a JSON object.");
-  }
+  const payload = parseRequestPayload(body, true);
+  if (payload instanceof Response) return payload;
   if (typeof payload.model !== "string" || payload.model.trim().length === 0) {
     return anthropicErrorResponse(400, "model is required and must be a non-empty string.");
   }

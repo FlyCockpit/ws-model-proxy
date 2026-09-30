@@ -1462,8 +1462,9 @@ describe("cache affinity", () => {
       const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
       expect(material.identifiable).toBe(false);
       expect(material.nodes).toEqual([]);
-      expect(material.routingNodes).toEqual([]);
-      expect(material.instructionDigests).toEqual([]);
+      expect(material.routingNodes).toHaveLength(64);
+      expect(material.routingNodes.at(-1)?.depth).toBe(80);
+      expect(material.instructionDigests).toHaveLength(1);
       db.$queryRaw.mockClear();
       expect(
         await resolveAffinitySession(
@@ -1483,6 +1484,49 @@ describe("cache affinity", () => {
         }),
       ).toBeNull();
       expect(conversationWrites()).toEqual([]);
+    },
+  );
+
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+      ["parameter", "tools", "instructions"].map((layer) => ({ surface, layer })),
+    ),
+  )(
+    "R3 oversized root $layer degrades only bounded hints on $surface",
+    async ({ surface, layer }) => {
+      const huge = "x".repeat(2 * 1024 * 1024 + 1);
+      const units = [
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+      ];
+      const instructions = layer === "instructions" ? huge : "safe rules";
+      const request = {
+        ...(surface === "openai-responses"
+          ? { instructions, input: units }
+          : surface === "anthropic-messages"
+            ? { system: instructions, messages: units }
+            : { messages: [{ role: "system", content: instructions }, ...units] }),
+        ...(layer === "parameter" ? { extension: { [huge]: 0 } } : {}),
+        ...(layer === "tools" ? { tools: [{ schema: huge }] } : {}),
+      };
+      const args = {
+        ...digestArgs("runtime", request, surface),
+        headers: new Headers({ "session-id": "client" }),
+      };
+      const material = affinityPrefixDigests(args);
+      expect(material.identifiable).toBe(false);
+      expect(material.nodes).toEqual([]);
+      expect(material.routingNodes).toEqual([]);
+      expect(material.instructionDigests).toHaveLength(layer === "instructions" ? 0 : 1);
+      expect(material.clientSessionId).toBeDefined();
+      expect(material.boundSessionId).toBeUndefined();
+      expect(material.rootDigest).toBe("");
+      db.$executeRaw.mockClear();
+      expect(
+        await rememberAffinity({ ...args, policy, target: target("target", "runtime") }),
+      ).toBeNull();
+      expect(conversationWrites()).toHaveLength(1);
+      expect(conversationWrites()[0]!.data.sessionId).toBe(material.clientSessionId);
     },
   );
 
@@ -2999,7 +3043,7 @@ describe("R2 adversarial identity material", () => {
 });
 
 it.each([false, true])(
-  "R2 bound cumulative 2 MiB cap clears all identity client=%s",
+  "R3 bound cumulative 2 MiB cap retains routing/client footprint without lineage client=%s",
   async (client) => {
     const args = digestArgs("runtime", { input: "parent" }, "openai-responses");
     const first = affinityPrefixDigests(args);
@@ -3024,12 +3068,11 @@ it.each([false, true])(
     expect(material).toMatchObject({
       identifiable: false,
       nodes: [],
-      routingNodes: [],
       instructionDigests: [],
-      digests: [],
       conversationDigest: null,
     });
-    expect(material.clientSessionId).toBeUndefined();
+    expect(material.routingNodes).toEqual([{ digest: sessionBinding.tipDigest, depth: 1 }]);
+    expect(Boolean(material.clientSessionId)).toBe(client);
     expect(material.boundSessionId).toBeUndefined();
     expect(material.parentTipDigest).toBeUndefined();
     expect(material.parentTipDepth).toBeUndefined();
@@ -3037,7 +3080,8 @@ it.each([false, true])(
     expect(
       await rememberAffinity({ ...request, policy, target: target("target", "runtime") }),
     ).toBeNull();
-    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(conversationWrites()).toHaveLength(client ? 1 : 0);
   },
 );
 
@@ -3051,4 +3095,24 @@ it("R2 wire __proto__ in legacy Chat function schemas binds the root", () => {
   expect(one.identifiable).toBe(true);
   expect(two.rootDigest).not.toBe(one.rootDigest);
   expect(two.nodes).not.toEqual(one.nodes);
+});
+
+it("R3 affinityPrefixDigests catches HMAC failures after successful conversion", async () => {
+  const security = await import("@ws-model-proxy/db/forwarder-security");
+  const hmac = vi.spyOn(security, "hmacDigestForForwarderPurpose").mockImplementation(() => {
+    throw new Error("HMAC unavailable");
+  });
+  try {
+    expect(() => affinityPrefixDigests(digestArgs("runtime", payload))).not.toThrow();
+    expect(affinityPrefixDigests(digestArgs("runtime", payload))).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      routingNodes: [],
+      instructionDigests: [],
+      bindingDigest: "",
+    });
+    expect(hmac).toHaveBeenCalled();
+  } finally {
+    hmac.mockRestore();
+  }
 });

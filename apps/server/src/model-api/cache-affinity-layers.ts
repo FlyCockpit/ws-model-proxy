@@ -32,12 +32,12 @@ export function canonicalizeAffinitySurface(surface: string): AffinityProtocolSu
 export const MAX_CANONICAL_DEPTH = 128;
 export const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
 
-/** One bounded converter; an exceeded budget rejects the entire value. */
-export function asJson(value: unknown): JsonValue | undefined {
+/** Depth/errors reject atomically. The default byte budget bounds individual layers. */
+export function asJson(value: unknown, maximumBytes = MAX_CANONICAL_BYTES): JsonValue | undefined {
   let bytes = 0;
   const charge = (size: number) => {
     bytes += size;
-    if (bytes > MAX_CANONICAL_BYTES) throw new RangeError("Affinity canonical size limit");
+    if (bytes > maximumBytes) throw new RangeError("Affinity canonical size limit");
   };
   const convert = (entry: unknown, depth: number): JsonValue | undefined => {
     if (depth > MAX_CANONICAL_DEPTH) throw new RangeError("Affinity canonical depth limit");
@@ -164,7 +164,7 @@ function hasContinuationEvidence(units: JsonValue[]): boolean {
 }
 
 function pushJson(units: JsonValue[], value: unknown) {
-  const json = asJson(value);
+  const json = asJson(value, Number.POSITIVE_INFINITY);
   if (json !== undefined) units.push(json);
 }
 
@@ -172,7 +172,7 @@ function extractTools(payload: Record<string, unknown>): {
   tools: JsonValue | undefined;
   consumed: boolean;
 } {
-  const tools = asJson(payload.tools);
+  const tools = asJson(payload.tools, Number.POSITIVE_INFINITY);
   return { tools, consumed: tools !== undefined };
 }
 
@@ -188,7 +188,7 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
     }
   }
   const extracted = extractTools(payload);
-  const functions = asJson(payload.functions);
+  const functions = asJson(payload.functions, Number.POSITIVE_INFINITY);
   const tools =
     functions === undefined ? extracted.tools : { tools: extracted.tools ?? null, functions };
   if (extracted.consumed) consumedKeys.push("tools");

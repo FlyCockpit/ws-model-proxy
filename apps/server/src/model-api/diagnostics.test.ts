@@ -6,6 +6,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { nestedWire } from "./cache-affinity-canonical.test-fixtures.js";
 import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 
@@ -641,6 +642,25 @@ describe("Hono route ↔ core parity (pool member test)", () => {
 });
 
 describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => {
+  it.each([257, 10_000])(
+    "R3 diagnostic rejects depth %s before synthetic serialization",
+    async (depth) => {
+      const manager = new FakeRelayManager();
+      const runtime = admittingCapacityRuntime();
+      const body = JSON.parse(
+        `{"model":${JSON.stringify(directTarget.modelId)},"messages":[],"extension":${nestedWire(depth - 1, "object")}}`,
+      );
+      await expect(
+        runChatCompletionDiagnostic({ userId: "user-id", body, manager, capacityRuntime: runtime }),
+      ).resolves.toEqual({
+        outcome: "invalid-request",
+        reason: "request JSON nesting exceeds 256 levels",
+      });
+      expect(manager.sent).toEqual([]);
+      expect(runtime.acquire).not.toHaveBeenCalled();
+    },
+  );
+
   it("projects a successful completion without ever returning the raw body", async () => {
     const manager = new FakeRelayManager();
     const diagnosticPromise = runChatCompletionDiagnostic({

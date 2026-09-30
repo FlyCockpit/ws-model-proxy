@@ -40,7 +40,13 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://routes-test", NODE_ENV: "test" },
 }));
 
-import { depthPayloadWire, depthRows } from "./cache-affinity-canonical.test-fixtures.js";
+import {
+  canonicalLocations,
+  canonicalShapes,
+  depthPayloadWire,
+  depthRows,
+  nestedWire,
+} from "./cache-affinity-canonical.test-fixtures.js";
 import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
 
 const affinity = vi.hoisted(() => ({
@@ -934,6 +940,128 @@ describe("model API routes", () => {
         costPenalty: 0,
       })),
     );
+  });
+
+  it.each(
+    [
+      "/chat/completions",
+      "/messages",
+      "/messages/count_tokens",
+      "/responses",
+      "/responses/count_tokens",
+      "/embeddings",
+      "/audio/speech",
+    ].flatMap((path) =>
+      canonicalShapes.flatMap((shape) =>
+        [256, 257, 10_000].map((depth) => ({ path, shape, depth })),
+      ),
+    ),
+  )("R3 request acceptance $path $shape depth $depth", async ({ path, shape, depth }) => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+    );
+    if (path.startsWith("/messages")) {
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          countStrategy: "CONSERVATIVE_ESTIMATE",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              anthropicMessages: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                streaming: true,
+                countTokens: true,
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      );
+    }
+    const manager = new FakeRelayManager();
+    const runtime = admittingCapacityRuntime();
+    const wire = `{"model":${JSON.stringify(directTarget.modelId)},"messages":[{"role":"user","content":"U"}],"input":"U","extension":${nestedWire(depth - 1, shape)}}`;
+    const pending = appWith(manager, runtime).request(path, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
+      body: wire,
+    });
+    if (depth > 256) {
+      const response = await pending;
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        error: {
+          type: "invalid_request_error",
+          message: "request JSON nesting exceeds 256 levels",
+        },
+      });
+      if (path.startsWith("/messages")) expect(body).toMatchObject({ type: "error" });
+      else expect(body).toMatchObject({ error: { code: "request_json_too_deep" } });
+      expect(manager.sent).toEqual([]);
+      expect(runtime.acquire).not.toHaveBeenCalled();
+      expect(affinity.material).not.toHaveBeenCalled();
+      expect(affinity.rank).not.toHaveBeenCalled();
+      expect(affinity.remember).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(db.relayRequest.create).not.toHaveBeenCalled();
+      expect(mockedTokenAccess.listVisibleModelTargetsForToken).not.toHaveBeenCalled();
+      return;
+    }
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const forwarded = JSON.parse(firstBodyChunkText(requireSent(manager)));
+    expect(forwarded.extension).toEqual(JSON.parse(nestedWire(depth - 1, shape)));
+    const actual =
+      await vi.importActual<typeof import("./cache-affinity.js")>("./cache-affinity.js");
+    const material = actual.affinityPrefixDigests({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      surface: path.startsWith("/messages")
+        ? "anthropic-messages"
+        : path.startsWith("/responses")
+          ? "openai-responses"
+          : "openai-chat",
+      payload: forwarded,
+      runtimeIdentity: "runtime",
+    });
+    expect(material.identifiable).toBe(false);
+    expect(material.routingNodes).toEqual([]);
+    await completeJsonRelay({
+      manager,
+      requestId: requireSent(manager).requestId,
+      body:
+        path === "/responses"
+          ? {
+              id: "resp_depth",
+              object: "response",
+              status: "completed",
+              output: [],
+              usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+            }
+          : path === "/messages"
+            ? {
+                id: "msg_depth",
+                type: "message",
+                role: "assistant",
+                content: [{ type: "text", text: "ok" }],
+                model: "model",
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }
+            : { choices: [], input_tokens: 1 },
+    });
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await response.text();
   });
 
   it("applies affinity only after pool compatibility and persists it after success", async () => {
@@ -13470,7 +13598,12 @@ describe("model API routes", () => {
         canonical: undefined as (typeof depthRows)[number] | undefined,
         materialError: false,
       })),
-    ...depthRows.map((canonical) => ({
+    ...[
+      ...depthRows,
+      ...canonicalLocations.flatMap((location) =>
+        canonicalShapes.flatMap((shape) => [256, 257].map((depth) => ({ location, shape, depth }))),
+      ),
+    ].map((canonical) => ({
       name: `R2 ${canonical.location} ${canonical.shape} depth ${canonical.depth}`,
       invalid: true,
       path: "bound Responses",
@@ -13771,6 +13904,22 @@ describe("model API routes", () => {
           ? `${depthPayloadWire(row.canonical.location, row.canonical.depth, row.canonical.shape).slice(0, -1)},"model":${JSON.stringify(poolTarget.modelId)},"previous_response_id":"resp_carrier"}`
           : JSON.stringify(payload),
       });
+      if (row.canonical && row.canonical.depth > 256) {
+        const response = await pending;
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          error: {
+            type: "invalid_request_error",
+            code: "request_json_too_deep",
+            message: "request JSON nesting exceeds 256 levels",
+          },
+        });
+        expect(manager.sent).toHaveLength(1);
+        expect(affinity.rank).not.toHaveBeenCalled();
+        expect(affinity.remember).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        return;
+      }
       if (row.path !== "overflow") {
         await vi.waitFor(() => expect(manager.sent).toHaveLength(isBound ? 2 : 1));
         await completeJsonRelay({

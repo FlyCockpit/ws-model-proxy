@@ -634,3 +634,12 @@ it("R2 converter enforces the exact 2 MiB size boundary atomically", () => {
   expect(asJson(`${atBound}x`)).toBeUndefined();
   expect(asJson({ first: "safe", last: atBound })).toBeUndefined();
 });
+
+it("R3 converter charges mostly-key bytes at the exact 2 MiB boundary", () => {
+  // {"<key>":0}: six bytes of punctuation/value, all other bytes are the key.
+  const key = "k".repeat(2 * 1024 * 1024 - 6);
+  const atBound = { [key]: 0 };
+  expect(Buffer.byteLength(JSON.stringify(atBound))).toBe(2 * 1024 * 1024);
+  expect(asJson(atBound)).toBeDefined();
+  expect(asJson({ [`${key}k`]: 0 })).toBeUndefined();
+});
