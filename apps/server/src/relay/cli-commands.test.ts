@@ -1280,6 +1280,74 @@ describe("cli commands", () => {
       });
     });
 
+    it("a late exec.rejected keeps the reason the server ended the command for and frees its slot", async () => {
+      const socket = await connect("desktop");
+      const start = (tokenId: string, command: string) =>
+        startCliCommand({
+          userId: "user-id",
+          tokenId,
+          expiresAt: null,
+          cliDeviceId: "desktop",
+          command,
+        });
+      const first = await start("token-a", "sleep 1");
+      const second = await start("token-a", "sleep 2");
+      if (!first.ok || !second.ok) throw new Error("expected two starts");
+      await notifyUserBanned("user-id");
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      await expect(start("token-b", "pwd")).resolves.toEqual({ ok: false, error: "limit" });
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "exec.rejected", commandId: first.commandId, reason: "limit" }),
+      );
+      // The record is still the server's cancel: neither its status nor its audit reason changed.
+      expect(snapshotCliCommand(first.commandId, "user-id", "token-a")).toMatchObject({
+        status: "cancelled",
+        rejectionReason: "user_banned",
+      });
+      // (The refused start above is its own "refused" row; the ended commands have exactly one each.)
+      expect(
+        audit.mock.calls
+          .map(([event]) => [event.outcome, event.reason])
+          .filter(([outcome]) => outcome !== "refused"),
+      ).toEqual([
+        ["cancelled", "user_banned"],
+        ["cancelled", "user_banned"],
+      ]);
+      await expect(start("token-b", "pwd")).resolves.toMatchObject({ ok: true });
+    });
+
+    it("a lost session keeps the held slot only until the grace runs out (over-holds, never under-holds)", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      await connect("desktop");
+      const start = (tokenId: string, command: string) =>
+        startCliCommand({
+          userId: "user-id",
+          tokenId,
+          expiresAt: null,
+          cliDeviceId: "desktop",
+          command,
+        });
+      const first = await start("token-a", "sleep 1");
+      const second = await start("token-a", "sleep 2");
+      if (!first.ok || !second.ok) throw new Error("expected two starts");
+      await notifyUserBanned("user-id");
+      await resetRelaySessions();
+      await connect("desktop");
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      await expect(start("token-b", "pwd")).resolves.toEqual({ ok: false, error: "limit" });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(start("token-b", "pwd")).resolves.toMatchObject({ ok: true });
+    });
+
     it("holds the execution slot of a cancelled command until the CLI answers or the grace runs out", async () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const socket = await connect("desktop");

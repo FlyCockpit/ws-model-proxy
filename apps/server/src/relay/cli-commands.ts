@@ -201,8 +201,10 @@ type CommandRecord = TrackedCliCommand & {
    * The server ended the record (authority gone) but the CLI has not yet
    * acknowledged the `exec.cancel`, so the remote process may still exist: the
    * record keeps its per-CLI and per-user slot until the CLI's `exec.done` /
-   * `exec.rejected`, the session's loss, or {@link SERVER_COMMAND_GRACE_MS}.
-   * Nothing caller-visible depends on it (see {@link endExecFromServer}).
+   * `exec.rejected` or {@link SERVER_COMMAND_GRACE_MS}, whichever comes first. A
+   * lost session does not release it early (the CLI has killed the process, so
+   * this only over-holds, by at most the grace). Nothing caller-visible depends
+   * on it (see {@link endExecFromServer}).
    */
   slotHeld: boolean;
   waiters: Set<(snapshot: CliCommandSnapshot) => void>;
