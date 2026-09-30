@@ -871,7 +871,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     // Bound both the request-state join and Prisma's relation assembly.
     // An unbounded join can choose a nested-loop plan over the entire queue;
     // ids first, then small primary-key batches, keep that work bounded.
-    // The held capacity/request fences keep all batches in one snapshot.
+    // Rows the plan can grant are stable under the held fences; batches may
+    // use separate READ COMMITTED snapshots, and #persistGrants re-validates winners.
     const readBatch = (ids: string[]) =>
       tx.capacityWaiter.findMany({
         where: { id: { in: ids }, AdmissionRequest: { state: "WAITING" } },
