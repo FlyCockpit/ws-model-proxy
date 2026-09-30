@@ -2322,6 +2322,10 @@ export function retainProviderUsageTail(
 const MAX_RETRYABLE_PROVIDER_BODY_BYTES = 1024 * 1024;
 const providerBodyTeardowns = new WeakMap<Pick<Readable, "pause" | "destroy">, Promise<void>>();
 
+function providerBodyTornDown(response: Pick<Readable, "pause" | "destroy">): boolean {
+  return providerBodyTeardowns.has(response);
+}
+
 function teardownProviderBody(
   response: Pick<Readable, "pause" | "destroy">,
   reader?: ReadableStreamDefaultReader<Uint8Array>,
@@ -3584,9 +3588,16 @@ export async function dispatchPublicOverflow(
               } finally {
                 if (drainTimer !== undefined) clearTimeout(drainTimer);
               }
-              // A client cancel resolved this read (cancel() cancelled the reader and
-              // owns the settlement); never touch the cancelled controller.
+              // Cancellation can resolve a read as done while discarding queued
+              // records. Client cancel owns settlement; other teardown is an error,
+              // even if the upstream transport has already marked itself complete.
               if (clientCancelled) return;
+              if (providerBodyTornDown(response) || attemptController.signal.aborted) {
+                throw (
+                  attemptController.signal.reason ??
+                  new Error("Provider response body was torn down before EOF")
+                );
+              }
               if (!chunk) {
                 accountingIncomplete = true;
                 openRouterStreamRecords?.markUnreadable();

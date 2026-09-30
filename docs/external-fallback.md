@@ -533,6 +533,8 @@ Reads can overshoot by one transport chunk. If either bound is reached, the
 liability stays, even when that chunk already contains the whole response.
 The terminal audit event records actual transport completion independently of
 the answer's success. Cleanup pauses the upstream before cancelling its reader.
+Reader completion caused by internal teardown or attempt ownership loss is an
+error, even if the transport is complete; unread records keep the liability.
 Cancellation is snapshotted at settlement entry: a later client disconnect
 stops delivery without changing that settlement's outcome.
 OpenRouter's native Responses stream sends no

@@ -1,4 +1,10 @@
 import { readFileSync } from "node:fs";
+import {
+  createServer,
+  request as httpRequest,
+  IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
@@ -2630,7 +2636,7 @@ describe("public overflow terminal response dispatch", () => {
     }
   });
 
-  it("does not record a retryable failure after heartbeat ownership is lost", async () => {
+  it("rejects a late response without recording a retryable failure after heartbeat ownership is lost", async () => {
     vi.useFakeTimers();
     try {
       recordProviderOutcome.mockClear();
@@ -2701,19 +2707,15 @@ describe("public overflow terminal response dispatch", () => {
       const result = await dispatched;
       expect(result).toMatchObject({ dispatched: true, attemptCount: 1 });
       if (!result.dispatched) throw new Error("expected terminal provider response");
-      await result.response.text();
-      await result.terminal;
+      await expect(result.response.text()).rejects.toThrow("provider attempt lease expired");
+      expect(await result.terminal).toMatchObject({ ok: false });
       expect(recordProviderOutcome).not.toHaveBeenCalled();
       expect(reconcileProviderBudget).toHaveBeenCalledWith(
         expect.objectContaining({
           reason: "FAILED",
-          usageSource: "openai-response",
-          usage: expect.objectContaining({
-            inputTokens: 9n,
-            outputTokens: 2n,
-            reportedCost: 0.003,
-            rawUsage: expect.objectContaining({ input_tokens: 9, output_tokens: 2 }),
-          }),
+          observationComplete: false,
+          usageSource: "missing-provider-usage",
+          usage: undefined,
         }),
       );
       expect(releaseProviderHealthTrial).toHaveBeenCalledWith({
@@ -3235,11 +3237,13 @@ describe("OpenRouter owner-paid settlement", () => {
       callback(tx),
     );
     providerHttpsRequest.mockResolvedValueOnce(
-      Object.assign(Array.isArray(upstream) ? Readable.from(upstream) : upstream, {
-        statusCode: 200,
-        headers: { "content-type": "text/event-stream" },
-        complete: transportComplete,
-      }),
+      upstream instanceof IncomingMessage
+        ? upstream
+        : Object.assign(Array.isArray(upstream) ? Readable.from(upstream) : upstream, {
+            statusCode: 200,
+            headers: { "content-type": "text/event-stream" },
+            complete: transportComplete,
+          }),
     );
     const result = await dispatchPublicOverflow({
       userId: "owner",
@@ -4076,6 +4080,236 @@ describe("OpenRouter owner-paid settlement", () => {
       }
     });
 
+    // Abort rows fail without the post-read lifecycle check. Honest EOF,
+    // client cancel and bound hit are controls for over-conservative rejection.
+    it.each([
+      { name: "heartbeat failure during drain", trigger: "heartbeat", draining: true },
+      { name: "lease loss during drain", trigger: "lease", draining: true },
+      { name: "abort before terminal", trigger: "heartbeat", draining: false },
+      { name: "client cancel", trigger: "client", draining: true },
+      { name: "honest EOF", trigger: "eof", draining: true },
+      { name: "bound hit", trigger: "bound", draining: true },
+    ] as const)("classifies lifecycle EOF: $name", async ({ trigger, draining }) => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ objectMode: true, read() {} });
+      const processErrors: unknown[] = [];
+      const captureError = (error: unknown) => processErrors.push(error);
+      process.on("uncaughtException", captureError);
+      process.on("unhandledRejection", captureError);
+      heartbeatProviderAttempt.mockReset().mockResolvedValue(true);
+      try {
+        const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        const reader = result.response.body!.getReader();
+        const readOutcome = (async () => {
+          const chunks: Uint8Array[] = [];
+          while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) return Buffer.concat(chunks).toString();
+            chunks.push(chunk.value);
+          }
+        })().then(
+          (text) => ({ text, failure: undefined }),
+          (failure: unknown) => ({ text: undefined, failure }),
+        );
+        await vi.advanceTimersByTimeAsync(9_990);
+        if (draining) upstream.push(lowResponsesTerminal);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(reconcileProviderBudget).not.toHaveBeenCalled();
+        const queueTail = () => {
+          for (let i = 0; i < 8; i++)
+            upstream.push(record("response.output_text.delta", { delta: "padding" }));
+          upstream.push(responsesTerminal);
+        };
+        if (trigger === "heartbeat" || trigger === "lease") {
+          // Queue a higher usage record in the same timer turn as ownership
+          // loss. complete=true must not make the cancelled read a clean EOF.
+          heartbeatProviderAttempt.mockImplementationOnce(() => {
+            queueTail();
+            return trigger === "heartbeat"
+              ? Promise.reject(new Error("heartbeat database failure"))
+              : Promise.resolve(false);
+          });
+          await vi.advanceTimersByTimeAsync(10);
+        } else if (trigger === "client") {
+          queueTail();
+          await reader.cancel("client disconnected");
+        } else if (trigger === "eof") {
+          // Identical terminal usage is legitimate and must remain attributable.
+          upstream.push(lowResponsesTerminal);
+          upstream.push(null);
+        } else {
+          upstream.push(Buffer.from(`: ${"x".repeat(POST_TERMINAL_DRAIN_MAX_BYTES)}\n\n`));
+          upstream.push(responsesTerminal);
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        const outcome = await readOutcome;
+        const successful = trigger === "eof" || trigger === "bound";
+        expect(await result.terminal).toMatchObject({ ok: successful });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: trigger === "client" ? "CANCELLED" : successful ? "COMPLETED" : "FAILED",
+            observationComplete: trigger === "eof",
+          }),
+        );
+        if (trigger === "heartbeat" || trigger === "lease") {
+          expect(outcome.failure).toBeInstanceOf(Error);
+          expect((outcome.failure as Error).message).toBe(
+            trigger === "heartbeat"
+              ? "provider attempt heartbeat failed"
+              : "provider attempt lease expired",
+          );
+          if (draining) {
+            const usage = reconcileProviderBudget.mock.calls[0]?.[0].usage;
+            expect(usage).toMatchObject({
+              observationComplete: false,
+              categoriesComplete: false,
+              inputTokens: 10n,
+              outputTokens: 1n,
+            });
+            expect(providerBillableTokens(usage)).toBeUndefined();
+            expect(usage.reportedCost).toBeUndefined();
+          }
+        } else if (trigger === "client") {
+          expect(outcome).toMatchObject({ text: "", failure: undefined });
+        } else {
+          expect(outcome.failure).toBeUndefined();
+          expect(outcome.text).toBe(lowResponsesTerminal.toString());
+          if (trigger === "eof")
+            expect(reconcileProviderBudget.mock.calls[0]?.[0].usage).toMatchObject({
+              categoriesComplete: true,
+              inputTokens: 10n,
+              outputTokens: 1n,
+            });
+        }
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        vi.useRealTimers();
+        for (let turn = 0; turn < 3; turn++)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(processErrors).toEqual([]);
+      } finally {
+        upstream.pause();
+        upstream.destroy();
+        heartbeatProviderAttempt.mockReset().mockResolvedValue(true);
+        process.off("uncaughtException", captureError);
+        process.off("unhandledRejection", captureError);
+        vi.useRealTimers();
+      }
+    });
+
+    async function socketUpstream() {
+      let outgoing!: ServerResponse;
+      let resolveSocketClosed!: () => void;
+      const socketClosed = new Promise<void>((resolve) => {
+        resolveSocketClosed = resolve;
+      });
+      const server = createServer((request, response) => {
+        outgoing = response;
+        request.socket.once("close", resolveSocketClosed);
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.flushHeaders();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("expected loopback address");
+      const incoming = await new Promise<IncomingMessage>((resolve, reject) => {
+        const request = httpRequest({ host: "127.0.0.1", port: address.port }, resolve);
+        request.once("error", reject);
+        request.end();
+      });
+      return {
+        incoming,
+        outgoing,
+        socketClosed,
+        async close() {
+          incoming.destroy();
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    // Native complete/destroy/error behavior is part of the contract. The
+    // reset and clean-EOF rows are production controls; heartbeat catches C1b-1.
+    it.each(["honest EOF", "reset after terminal", "heartbeat during drain", "bound hit"] as const)(
+      "classifies socket-backed EOF: %s",
+      async (trigger) => {
+        const upstream = await socketUpstream();
+        const processErrors: unknown[] = [];
+        const captureError = (error: unknown) => processErrors.push(error);
+        process.on("uncaughtException", captureError);
+        process.on("unhandledRejection", captureError);
+        // Keep socket I/O and drain deadlines real; advance only the heartbeat.
+        vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+        heartbeatProviderAttempt.mockReset().mockResolvedValue(true);
+        try {
+          const result = await startOwnerStream(
+            "openrouter",
+            upstream.incoming,
+            "owner",
+            "openai-responses",
+          );
+          expect(upstream.incoming.complete).toBe(false);
+          const bodyOutcome = result.response.text().then(
+            (text) => ({ text, failure: undefined }),
+            (failure: unknown) => ({ text: undefined, failure }),
+          );
+          const receivedTerminal = new Promise<void>((resolve) =>
+            upstream.incoming.once("data", () => resolve()),
+          );
+          upstream.outgoing.write(responsesTerminal);
+          await receivedTerminal;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(reconcileProviderBudget).not.toHaveBeenCalled();
+          if (trigger === "honest EOF") upstream.outgoing.end();
+          else if (trigger === "reset after terminal") upstream.outgoing.socket!.resetAndDestroy();
+          else if (trigger === "heartbeat during drain") {
+            heartbeatProviderAttempt.mockRejectedValueOnce(new Error("heartbeat database failure"));
+            await vi.advanceTimersByTimeAsync(10_000);
+          } else {
+            upstream.outgoing.write(
+              Buffer.from(`: ${"x".repeat(POST_TERMINAL_DRAIN_MAX_BYTES)}\n\n`),
+            );
+          }
+          const outcome = await bodyOutcome;
+          const successful = trigger === "honest EOF" || trigger === "bound hit";
+          expect(await result.terminal).toMatchObject({ ok: successful });
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          expect(reconcileProviderBudget).toHaveBeenCalledWith(
+            expect.objectContaining({
+              reason: successful ? "COMPLETED" : "FAILED",
+              observationComplete: trigger === "honest EOF",
+              usage: expect.objectContaining({ categoriesComplete: trigger === "honest EOF" }),
+            }),
+          );
+          if (successful)
+            expect(outcome).toMatchObject({
+              text: responsesTerminal.toString(),
+              failure: undefined,
+            });
+          else expect(outcome.failure).toBeInstanceOf(Error);
+          if (trigger === "heartbeat during drain")
+            expect((outcome.failure as Error).message).toBe("provider attempt heartbeat failed");
+          expect(upstream.incoming.complete).toBe(trigger === "honest EOF");
+          expect(upstream.incoming.destroyed).toBe(true);
+          await upstream.socketClosed;
+          expect(vi.getTimerCount()).toBe(0);
+          vi.useRealTimers();
+          for (let turn = 0; turn < 3; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(processErrors).toEqual([]);
+        } finally {
+          await upstream.close();
+          heartbeatProviderAttempt.mockReset().mockResolvedValue(true);
+          process.off("uncaughtException", captureError);
+          process.off("unhandledRejection", captureError);
+          vi.useRealTimers();
+        }
+      },
+    );
+
     it("cancels a pending accounting drain once without touching the cancelled controller", async () => {
       vi.useFakeTimers();
       const upstream = new Readable({ read() {} });
@@ -4196,6 +4430,9 @@ describe("OpenRouter owner-paid settlement", () => {
         expect(destroyPaused[0]).toBe(true);
         expect(upstream.destroyed).toBe(true);
         expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({ observationComplete: false }),
+        );
         expect(processErrors).toEqual([]);
       } finally {
         upstream.pause();
