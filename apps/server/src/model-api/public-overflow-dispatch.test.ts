@@ -2891,7 +2891,7 @@ describe("public overflow terminal response dispatch", () => {
     expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         eventType: "TERMINAL",
-        reason: "FAILED",
+        reason: "CANCELLED",
         terminalState: "CANCELLED",
       }),
     );
@@ -3533,11 +3533,13 @@ describe("OpenRouter owner-paid settlement", () => {
       });
       try {
         const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        vi.mocked(recordProviderAttemptEvent).mockClear();
         reconcileProviderBudget.mockImplementationOnce(() => durable);
+        const reader = result.response.body!.getReader();
         let delivered = false;
-        const body = result.response.text().then((text) => {
+        const first = reader.read().then((chunk) => {
           delivered = true;
-          return text;
+          return chunk;
         });
         upstream.push(responsesTerminal);
         upstream.push(null);
@@ -3545,7 +3547,8 @@ describe("OpenRouter owner-paid settlement", () => {
         expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
         expect(delivered).toBe(false);
         releaseSettlement();
-        expect(await body).toBe(responsesTerminal.toString());
+        expect(Buffer.from((await first).value!).toString()).toBe(responsesTerminal.toString());
+        expect(await reader.read()).toMatchObject({ done: true });
         expect(await result.terminal).toMatchObject({ ok: true });
         expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
         expect(reconcileProviderBudget).toHaveBeenCalledWith(
@@ -3555,11 +3558,178 @@ describe("OpenRouter owner-paid settlement", () => {
             usage: expect.objectContaining({ categoriesComplete: true }),
           }),
         );
+        expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+          expect.objectContaining({
+            eventType: "TERMINAL",
+            metadata: expect.objectContaining({ streamComplete: true }),
+          }),
+        );
         expect(vi.getTimerCount()).toBe(0);
       } finally {
         releaseSettlement();
         upstream.destroy();
         vi.useRealTimers();
+      }
+    });
+
+    it.each(["before settlement", "during health write", "during budget write"] as const)(
+      "snapshots one cancellation outcome: $0",
+      async (timing) => {
+        vi.useFakeTimers();
+        const upstream = new Readable({ objectMode: true, read() {} });
+        const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+        const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+        const close = vi.spyOn(ReadableStreamDefaultController.prototype, "close");
+        const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+        let releaseSettlement!: () => void;
+        const durable = new Promise<void>((resolve) => {
+          releaseSettlement = resolve;
+        });
+        let enteredSettlement = false;
+        const hold = async () => {
+          enteredSettlement = true;
+          await durable;
+        };
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        let cancellation: Promise<void> | undefined;
+        try {
+          const result = await startOwnerStream(
+            "openrouter",
+            upstream,
+            "owner",
+            "openai-responses",
+            false,
+          );
+          vi.mocked(recordProviderAttemptEvent).mockClear();
+          if (timing === "during health write") recordProviderOutcome.mockImplementationOnce(hold);
+          if (timing === "during budget write")
+            reconcileProviderBudget.mockImplementationOnce(hold);
+          reader = result.response.body!.getReader();
+          const first = reader.read();
+          upstream.push(responsesTerminal);
+          await vi.advanceTimersByTimeAsync(0);
+          if (timing !== "before settlement") {
+            await vi.advanceTimersByTimeAsync(POST_TERMINAL_DRAIN_MAX_MS);
+            expect(enteredSettlement).toBe(true);
+          }
+          cancellation = reader.cancel("client disconnected around settlement");
+          releaseSettlement();
+          await cancellation;
+          expect(await first).toMatchObject({ done: true });
+          const cancelled = timing === "before settlement";
+          expect(await result.terminal).toMatchObject({ ok: !cancelled });
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          expect(reconcileProviderBudget).toHaveBeenCalledWith(
+            expect.objectContaining({
+              reason: cancelled ? "CANCELLED" : "COMPLETED",
+              observationComplete: false,
+            }),
+          );
+          const terminalEvents = vi
+            .mocked(recordProviderAttemptEvent)
+            .mock.calls.filter(([event]) => event.eventType === "TERMINAL");
+          expect(terminalEvents).toHaveLength(1);
+          expect(terminalEvents[0]?.[0]).toMatchObject({
+            reason: cancelled ? "CANCELLED" : "COMPLETED",
+            terminalState: cancelled ? "CANCELLED" : "COMPLETED",
+            metadata: { streamComplete: false },
+          });
+          expect(upstream.destroyed).toBe(true);
+          expect(cancel).toHaveBeenCalledTimes(2); // client and one upstream cancellation
+          expect(vi.getTimerCount()).toBe(0);
+          vi.useRealTimers();
+          for (let turn = 0; turn < 3; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          const upstreamController = enqueue.mock.contexts[0];
+          expect(upstreamController).toBeDefined();
+          for (const action of [enqueue, close, error]) {
+            expect(
+              action.mock.contexts.filter((context) => context !== upstreamController),
+            ).toEqual([]);
+          }
+        } finally {
+          releaseSettlement();
+          await cancellation;
+          await reader?.cancel().catch(() => undefined);
+          upstream.pause();
+          upstream.destroy();
+          vi.useRealTimers();
+          // Keep spies installed until this adapter's eos callbacks finish,
+          // so they cannot be mistaken for the next row's client controller.
+          for (let turn = 0; turn < 3; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          cancel.mockRestore();
+          enqueue.mockRestore();
+          close.mockRestore();
+          error.mockRestore();
+        }
+      },
+    );
+
+    it.each(["split", "coalesced", "terminal split"] as const)(
+      "does not charge >=256 KiB of pre-terminal content to the drain: $0",
+      async (chunking) => {
+        const prefix = record("response.output_text.delta", { delta: "é".repeat(160 * 1024) });
+        expect(prefix.byteLength).toBeGreaterThanOrEqual(POST_TERMINAL_DRAIN_MAX_BYTES);
+        const tail = Buffer.from(": small tail\n\n");
+        const chunks =
+          chunking === "coalesced"
+            ? [Buffer.concat([prefix, responsesTerminal, tail])]
+            : chunking === "terminal split"
+              ? [
+                  Buffer.concat([prefix, responsesTerminal.subarray(0, 19)]),
+                  Buffer.concat([responsesTerminal.subarray(19), tail]),
+                ]
+              : [prefix, responsesTerminal, tail];
+        const result = await startOwnerStream("openrouter", chunks, "owner", "openai-responses");
+        expect(await result.response.text()).toContain(prefix.toString());
+        expect(await result.terminal).toMatchObject({
+          ok: true,
+          responseBytes: prefix.byteLength + responsesTerminal.byteLength + tail.byteLength,
+        });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: "COMPLETED",
+            observationComplete: true,
+            usage: expect.objectContaining({ categoriesComplete: true }),
+          }),
+        );
+      },
+    );
+
+    // The small tail is a legitimate control; an oversized tail must retain
+    // liability for split, coalesced and partially coalesced transport chunks.
+    it.each([
+      { name: "small", tailBytes: 8 * 1024, complete: true },
+      {
+        name: "over budget",
+        tailBytes: POST_TERMINAL_DRAIN_MAX_BYTES + 64 * 1024,
+        complete: false,
+      },
+    ])("counts $name trailing bytes inside the held chunk", async ({ tailBytes, complete }) => {
+      const tail = Buffer.from(`: ${"x".repeat(tailBytes - 4)}\n\n`);
+      expect(tail.byteLength).toBe(tailBytes);
+      const chunkings = [
+        [responsesTerminal, tail],
+        [Buffer.concat([responsesTerminal, tail])],
+        [Buffer.concat([responsesTerminal, tail.subarray(0, 1024)]), tail.subarray(1024)],
+      ];
+      for (const chunks of chunkings) {
+        const result = await startOwnerStream("openrouter", chunks, "owner", "openai-responses");
+        expect(await result.response.text()).toContain(responsesTerminal.toString());
+        expect(await result.terminal).toMatchObject({
+          ok: true,
+          responseBytes: responsesTerminal.byteLength + tailBytes,
+        });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: "COMPLETED",
+            observationComplete: complete,
+            usage: expect.objectContaining({ categoriesComplete: complete }),
+          }),
+        );
       }
     });
 
@@ -3671,14 +3841,26 @@ describe("OpenRouter owner-paid settlement", () => {
       // Node prefetch coalescing the terminal and the flood into one read.
       const upstream = new Readable({ objectMode: true, read() {} });
       const destroy = vi.spyOn(upstream, "destroy");
+      const cancelReader = ReadableStreamDefaultReader.prototype.cancel;
       const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      const processErrors: unknown[] = [];
+      const captureError = (error: unknown) => processErrors.push(error);
+      process.on("uncaughtException", captureError);
+      process.on("unhandledRejection", captureError);
+      const bufferedBytesAtCancel: number[] = [];
+      // Keep a substantial unread source backlog, rather than the original
+      // single spare chunk, when the real Node adapter is cancelled.
+      cancel.mockImplementation(function (this: ReadableStreamDefaultReader<Uint8Array>, reason) {
+        bufferedBytesAtCancel.push(upstream.readableLength * 1024);
+        return cancelReader.call(this, reason);
+      });
       try {
         expect(POST_TERMINAL_DRAIN_MAX_BYTES).toBe(256 * 1024);
         heartbeatProviderAttempt.mockClear();
         upstream.push(responsesTerminal);
         const block = Buffer.from(`: ${"x".repeat(1020)}\n\n`);
         expect(block.length).toBe(1024);
-        for (let bytes = 0; bytes <= POST_TERMINAL_DRAIN_MAX_BYTES; bytes += block.length)
+        for (let bytes = 0; bytes < POST_TERMINAL_DRAIN_MAX_BYTES * 4; bytes += block.length)
           upstream.push(block);
         const result = await startOwnerStream(
           "openrouter",
@@ -3701,17 +3883,166 @@ describe("OpenRouter owner-paid settlement", () => {
           }),
         );
         expect(cancel).toHaveBeenCalledTimes(1);
+        expect(bufferedBytesAtCancel[0]).toBeGreaterThanOrEqual(64 * 1024);
         expect(destroy).toHaveBeenCalled();
         expect(upstream.destroyed).toBe(true);
         await vi.advanceTimersByTimeAsync(20_000);
         expect(heartbeatProviderAttempt).not.toHaveBeenCalled();
         expect(vi.getTimerCount()).toBe(0);
+        vi.useRealTimers();
+        // Flush resume_/flow and destroy/eos callbacks left by Readable.toWeb.
+        for (let turn = 0; turn < 3; turn++)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(processErrors).toEqual([]);
       } finally {
         upstream.destroy();
         cancel.mockRestore();
         vi.useRealTimers();
+        process.off("uncaughtException", captureError);
+        process.off("unhandledRejection", captureError);
       }
     });
+
+    const bufferedFloodCases = (["bound hit", "client cancel", "decode error"] as const).flatMap(
+      (trigger) => [true, false].map((objectMode) => ({ trigger, objectMode })),
+    );
+    it.each(bufferedFloodCases)(
+      "$trigger safely tears down a buffered flood (objectMode $objectMode)",
+      async ({ trigger, objectMode }) => {
+        const upstream = new Readable({ objectMode, read() {} });
+        const block = Buffer.from(`: ${"x".repeat(1020)}\n\n`);
+        const processErrors: unknown[] = [];
+        const captureError = (error: unknown) => processErrors.push(error);
+        process.on("uncaughtException", captureError);
+        process.on("unhandledRejection", captureError);
+        const originalCancel = ReadableStreamDefaultReader.prototype.cancel;
+        const originalEnqueue = ReadableStreamDefaultController.prototype.enqueue;
+        const destroy = vi.spyOn(upstream, "destroy");
+        const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+        const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+        const close = vi.spyOn(ReadableStreamDefaultController.prototype, "close");
+        const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+        const bufferedBytesAtCancel: number[] = [];
+        const pausedAtCancel: boolean[] = [];
+        let clientReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+        let clientCancellation: Promise<void> | undefined;
+        let queuedCancel = false;
+        let result: Awaited<ReturnType<typeof startOwnerStream>> | undefined;
+        cancel.mockImplementation(function (this: ReadableStreamDefaultReader<Uint8Array>, reason) {
+          if (this !== clientReader) {
+            bufferedBytesAtCancel.push(upstream.readableLength * (objectMode ? block.length : 1));
+            pausedAtCancel.push(upstream.isPaused());
+          }
+          return originalCancel.call(this, reason);
+        });
+        enqueue.mockImplementation(function (
+          this: ReadableStreamDefaultController<Uint8Array>,
+          chunk,
+        ) {
+          upstreamController ??= this;
+          originalEnqueue.call(this, chunk);
+          if (trigger === "client cancel" && this === upstreamController && !queuedCancel) {
+            queuedCancel = true;
+            // The terminal read continuation runs first, then cancel while
+            // the adapter has prefetched flood data and the source is buffered.
+            queueMicrotask(() => {
+              clientCancellation = clientReader!.cancel("client disconnected in flood");
+            });
+          }
+        });
+        try {
+          result = await startOwnerStream(
+            "openrouter",
+            upstream,
+            "owner",
+            "openai-responses",
+            false,
+          );
+          clientReader = result.response.body!.getReader();
+          const first = clientReader.read();
+          // Attach the rejection handler before the decoder can reject a read.
+          const firstOutcome = first.then(
+            (chunk) => ({ chunk, failure: undefined }),
+            (failure: unknown) => ({ chunk: undefined, failure }),
+          );
+          upstream.push(responsesTerminal);
+          if (trigger === "decode error") {
+            // Read through part of the flood before the malformed record so
+            // byte-mode backpressure has scheduled a source resume at cancel.
+            for (let index = 0; index < 32; index++) upstream.push(block);
+            upstream.push(
+              Buffer.concat([Buffer.from("data: "), Buffer.from([0xff]), Buffer.from("\n\n")]),
+            );
+          }
+          for (let bytes = 0; bytes < POST_TERMINAL_DRAIN_MAX_BYTES * 4; bytes += block.length)
+            upstream.push(block);
+          const firstResult = await firstOutcome;
+          const terminal = await result.terminal;
+          await clientCancellation;
+          if (trigger === "bound hit") {
+            expect(firstResult.failure).toBeUndefined();
+            expect(Buffer.from(firstResult.chunk!.value!).toString()).toBe(
+              responsesTerminal.toString(),
+            );
+            expect(await clientReader.read()).toMatchObject({ done: true });
+            expect(terminal).toMatchObject({ ok: true });
+          } else if (trigger === "client cancel") {
+            expect(firstResult.chunk).toMatchObject({ done: true });
+            expect(terminal).toMatchObject({ ok: false });
+          } else {
+            expect(firstResult.failure).toBeInstanceOf(Error);
+            expect(terminal).toMatchObject({ ok: false });
+          }
+          // Real event-loop turns expose pending Node flow ticks, adapter eos
+          // callbacks, and unhandled promise rejections after cancellation.
+          for (let turn = 0; turn < 3; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(processErrors).toEqual([]);
+          expect(bufferedBytesAtCancel).toHaveLength(1);
+          expect(bufferedBytesAtCancel[0]).toBeGreaterThanOrEqual(64 * 1024);
+          expect(pausedAtCancel).toEqual([true]);
+          expect(destroy).toHaveBeenCalled();
+          expect(upstream.destroyed).toBe(true);
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          expect(reconcileProviderBudget).toHaveBeenCalledWith(
+            expect.objectContaining({
+              reason:
+                trigger === "bound hit"
+                  ? "COMPLETED"
+                  : trigger === "client cancel"
+                    ? "CANCELLED"
+                    : "FAILED",
+              observationComplete: false,
+              usage: expect.objectContaining({ observationComplete: false }),
+            }),
+          );
+          if (trigger === "client cancel") {
+            // Only the real upstream adapter may touch its own controller.
+            // No client controller action is allowed after cancellation.
+            for (const action of [enqueue, close, error]) {
+              expect(
+                action.mock.contexts.filter((context) => context !== upstreamController),
+              ).toEqual([]);
+            }
+          }
+        } finally {
+          upstream.pause();
+          upstream.destroy();
+          await clientReader?.cancel().catch(() => undefined);
+          await result?.terminal;
+          for (let turn = 0; turn < 3; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          cancel.mockRestore();
+          enqueue.mockRestore();
+          close.mockRestore();
+          error.mockRestore();
+          destroy.mockRestore();
+          process.off("uncaughtException", captureError);
+          process.off("unhandledRejection", captureError);
+        }
+      },
+    );
 
     it("cancels the upstream when the post-terminal drain hits a decode error", async () => {
       const upstream = new Readable({ objectMode: true, read() {} });

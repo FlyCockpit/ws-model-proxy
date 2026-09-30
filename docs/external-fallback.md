@@ -526,8 +526,16 @@ a final below that snapshot in any token count is a regression that keeps the
 liability);
 Responses, the `response` body or the terminal `response.completed` event
 (`usage: null` is absence). A recognised terminal is held until the rest of the
-response is read, bounded by 256 KiB and 2 seconds after recognition. If either
-bound is reached, the liability stays. OpenRouter's native Responses stream sends no
+response is read, bounded by 256 KiB and 2 seconds after recognition. The byte
+budget includes trailing bytes in the held terminal chunk, measured from the
+terminal record's framing boundary; pre-terminal content does not consume it.
+Reads can overshoot by one transport chunk. If either bound is reached, the
+liability stays, even when that chunk already contains the whole response.
+The terminal audit event records actual transport completion independently of
+the answer's success. Cleanup pauses the upstream before cancelling its reader.
+Cancellation is snapshotted at settlement entry: a later client disconnect
+stops delivery without changing that settlement's outcome.
+OpenRouter's native Responses stream sends no
 `event:` lines and its terminal is not recognised: the stream is read to EOF and
 the full hold stays (the surface is unclaimed). Several different authoritative usages, usage in
 any other root carrier (`usage`, `response.usage`, `message.usage`; nested

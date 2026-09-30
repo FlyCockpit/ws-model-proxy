@@ -2320,9 +2320,33 @@ export function retainProviderUsageTail(
 }
 
 const MAX_RETRYABLE_PROVIDER_BODY_BYTES = 1024 * 1024;
+const providerBodyTeardowns = new WeakMap<Pick<Readable, "pause" | "destroy">, Promise<void>>();
+
+function teardownProviderBody(
+  response: Pick<Readable, "pause" | "destroy">,
+  reader?: ReadableStreamDefaultReader<Uint8Array>,
+  reason?: unknown,
+): Promise<void> {
+  // Readable.toWeb can still have a flowing data tick queued when cancel
+  // closes its controller. Stop that flow synchronously before cancellation.
+  response.pause();
+  const existing = providerBodyTeardowns.get(response);
+  if (existing) return existing;
+  const teardown = (async () => {
+    try {
+      if (reader) await reader.cancel(reason);
+    } catch {
+      // Cancellation failure must not leave the upstream socket alive.
+    } finally {
+      response.destroy(reason instanceof Error ? reason : undefined);
+    }
+  })();
+  providerBodyTeardowns.set(response, teardown);
+  return teardown;
+}
 
 async function readRetryableProviderUsage(
-  response: AsyncIterable<Uint8Array> & { complete: boolean; destroy(error?: Error): void },
+  response: AsyncIterable<Uint8Array> & Pick<Readable, "pause" | "destroy"> & { complete: boolean },
   pricing?: ProviderPricingSchedule,
   dialect: ProviderUsageDialect = "generic",
   surface: ProtocolSurface = "openai-chat",
@@ -2335,7 +2359,11 @@ async function readRetryableProviderUsage(
       const chunk = Uint8Array.from(rawChunk);
       receivedBytes += chunk.byteLength;
       if (receivedBytes > MAX_RETRYABLE_PROVIDER_BODY_BYTES) {
-        response.destroy(new Error("Retryable provider response exceeded accounting limit"));
+        await teardownProviderBody(
+          response,
+          undefined,
+          new Error("Retryable provider response exceeded accounting limit"),
+        );
         return undefined;
       }
       retainedBytes = retainProviderUsageTail(
@@ -3221,7 +3249,9 @@ export async function dispatchPublicOverflow(
         upstream.protocol,
         auth,
       );
-      destroyAttempt = (error) => response.destroy(error);
+      destroyAttempt = (error) => {
+        void teardownProviderBody(response, undefined, error);
+      };
       const status = response.statusCode ?? 502;
       // Retry only before exposing headers/body to the caller.
       if (
@@ -3244,7 +3274,7 @@ export async function dispatchPublicOverflow(
           status,
           retryAfter: typeof retryAfter === "string" ? retryAfter : undefined,
         };
-        if (!response.complete) response.destroy();
+        if (!response.complete) await teardownProviderBody(response);
         // Heartbeat loss means a successor may already own health state. Do
         // not let this orphan's retryable response mutate that state. The
         // fenced release is deliberately attempted in either case: it clears
@@ -3308,6 +3338,9 @@ export async function dispatchPublicOverflow(
       }
       const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
       const reader = body.getReader();
+      destroyAttempt = (error) => {
+        void teardownProviderBody(response, reader, error);
+      };
       let reconciliation: Promise<void> | undefined;
       let responseBytes = 0;
       let firstClientByteAt: Date | undefined;
@@ -3342,6 +3375,11 @@ export async function dispatchPublicOverflow(
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
           stopHeartbeat();
+          // Choose one outcome before any health/budget await. A later client
+          // disconnect stops delivery without splitting this durable settlement.
+          const cancelledAtSettlement = clientCancelled;
+          const settleFacts = request.signal.aborted ? abortedAttemptFacts(request.signal) : null;
+          const settleCancelled = cancelledAtSettlement && !capacityLeaseLostSignal(request.signal);
           const transportComplete = streamComplete && (response.complete || protocolTerminal);
           const surface = nativeSurface ?? request.requestedSurface;
           let nonstreamEnvelope: Record<string, unknown> | undefined;
@@ -3374,10 +3412,10 @@ export async function dispatchPublicOverflow(
             streamTerminal &&
             (request.stream || nonstreamEnvelope !== undefined) &&
             !providerFailed &&
-            !clientCancelled;
+            !cancelledAtSettlement;
           const healthOutcome = providerHealthOutcome(status);
           const attemptAborted =
-            request.signal.aborted || attemptController.signal.aborted || clientCancelled;
+            request.signal.aborted || attemptController.signal.aborted || cancelledAtSettlement;
           if (!attemptAborted && healthOutcome !== "NEUTRAL") {
             await recordProviderHealth(
               target,
@@ -3445,11 +3483,6 @@ export async function dispatchPublicOverflow(
           // Publish the settled usage before the terminal resolves so the
           // best-effort affinity write observes the same evidence as billing.
           settledUsage = usage;
-          // Snapshot the outcome ONCE: the budget write below awaits, and a
-          // cancel or lease loss landing during it must not split one attempt
-          // into different budget/state/event outcomes.
-          const settleFacts = request.signal.aborted ? abortedAttemptFacts(request.signal) : null;
-          const settleCancelled = clientCancelled && !capacityLeaseLostSignal(request.signal);
           await reconcileProviderBudget({
             userId: request.userId,
             providerAccountId: target.providerAccountId,
@@ -3487,7 +3520,13 @@ export async function dispatchPublicOverflow(
             attemptId,
             fencingToken,
             eventType: "TERMINAL",
-            reason: settleFacts ? settleFacts.reason : ok ? "COMPLETED" : "FAILED",
+            reason: settleCancelled
+              ? "CANCELLED"
+              : settleFacts
+                ? settleFacts.reason
+                : ok
+                  ? "COMPLETED"
+                  : "FAILED",
             ...providerEventRouting({ request, target, nativeSurface }),
             reservationId: admission.reservationIds[0],
             reservationIds: admission.reservationIds,
@@ -3508,7 +3547,7 @@ export async function dispatchPublicOverflow(
                   confidence: usage.confidence,
                 }
               : undefined,
-            metadata: { status, responseBytes, streamComplete: transportComplete },
+            metadata: { status, responseBytes, streamComplete: response.complete === true },
           }).catch(() => undefined);
           resolveTerminal({ ok, responseBytes, usage });
         })();
@@ -3516,6 +3555,7 @@ export async function dispatchPublicOverflow(
       };
       const heldBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
+          if (clientCancelled) return;
           if (deliveredProtocolTerminal) {
             controller.close();
             return;
@@ -3551,10 +3591,10 @@ export async function dispatchPublicOverflow(
                 accountingIncomplete = true;
                 openRouterStreamRecords?.markUnreadable();
                 await reconcile(true);
+                await teardownProviderBody(response, reader);
+                if (clientCancelled) return;
                 deliveredProtocolTerminal = true;
                 controller.enqueue(heldTerminalChunk!);
-                await reader.cancel().catch(() => undefined);
-                response.destroy();
                 return;
               }
               if (chunk.done) {
@@ -3578,6 +3618,7 @@ export async function dispatchPublicOverflow(
                 // Do not expose either a streaming terminal event or EOF until
                 // correctness-required settlement and health release are durable.
                 await reconcile(response.complete);
+                if (clientCancelled) return;
                 if (heldTerminalChunk) {
                   deliveredProtocolTerminal = true;
                   controller.enqueue(heldTerminalChunk);
@@ -3612,16 +3653,19 @@ export async function dispatchPublicOverflow(
               // after arbitrarily large content deltas.
               usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
               if (terminalDecoder) {
-                const records = terminalDecoder.push(chunk.value);
-                for (const record of records) {
+                terminalDecoder.push(chunk.value, (record, endByteOffset) => {
                   openRouterStreamRecords?.observeData(record.data);
                   const outcome = classifyTerminalRecord(
                     record,
                     nativeSurface ?? request.requestedSurface,
                   );
+                  // Include bytes following the first terminal in its own chunk.
+                  // Absolute decoder offsets exclude earlier streamed content.
+                  if (!protocolTerminal && outcome !== undefined)
+                    postTerminalBytes = responseBytes - endByteOffset;
                   protocolTerminal ||= outcome !== undefined;
                   protocolFailed ||= outcome === "FAILED";
-                }
+                });
               }
               if (protocolTerminal) {
                 heldTerminalChunk ??= chunk.value;
@@ -3632,12 +3676,10 @@ export async function dispatchPublicOverflow(
               return;
             }
           } catch (error) {
-            if (terminalDecoder) {
-              accountingIncomplete = true;
-              openRouterStreamRecords?.markUnreadable();
-              await reader.cancel().catch(() => undefined);
-              response.destroy();
-            }
+            accountingIncomplete = true;
+            openRouterStreamRecords?.markUnreadable();
+            await teardownProviderBody(response, reader);
+            if (clientCancelled) return;
             if (reachedEof && reconciliation) {
               // A failed durable success terminal remains ACTIVE for retry or
               // crash repair; never rewrite it as a transport failure.
@@ -3650,24 +3692,22 @@ export async function dispatchPublicOverflow(
                 await reconcile(false);
               } catch (reconcileError) {
                 resolveTerminal({ ok: false, responseBytes });
-                controller.error(reconcileError);
+                if (!clientCancelled) controller.error(reconcileError);
                 return;
               }
             }
-            controller.error(error);
+            if (!clientCancelled) controller.error(error);
           }
         },
         async cancel(reason) {
           clientCancelled = true;
-          await reader.cancel(reason).catch(() => undefined);
-          response.destroy(reason instanceof Error ? reason : undefined);
+          await teardownProviderBody(response, reader, reason);
           await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
         },
       });
       const bodyForbidden = status === 204 || status === 205 || status === 304;
       if (bodyForbidden) {
-        await reader.cancel().catch(() => undefined);
-        response.destroy();
+        await teardownProviderBody(response, reader);
         await reconcile(true);
       }
       const markFirstClientByte = async () => {
