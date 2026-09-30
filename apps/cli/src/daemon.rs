@@ -3518,6 +3518,7 @@ mod tests {
     /// log here, a refused command would leave no CLI-side record at all.
     #[test]
     fn malformed_command_requests_log_one_rejection_each() {
+        let _capture = crate::logging::test_capture_lock();
         let buf = LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())

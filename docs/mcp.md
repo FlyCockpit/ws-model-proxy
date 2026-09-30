@@ -713,7 +713,8 @@ loss leaves the result uncertain record `unknown`; a reported file error records
 `failed`, a spawn/admission rejection `refused`, and a CLI-acknowledged confirm
 expiry or decline records `expired` or `declined`. Before acceptance, revocation,
 policy changes and session loss record `cancelled`. Headless file operations retain their per-tool
-`file_*` kinds. Unverified device ids are stored as `unknown`. The
+`file_*` kinds and use `<code>` for their reason. Both reason shapes are returned
+by `forwarder_cli_activity_list`. Unverified device ids are stored as `unknown`. The
 log is **metadata only**: who (user, device, token), what (kind, and for a
 command a keyed HMAC-SHA256 of the command text plus its program name — never
 the command text itself), when, and how it ended (`completed`, `refused`, `failed`,

@@ -1561,8 +1561,12 @@ impl TerminalSession {
                         if !mode_allows {
                             supervised.start_failed = true;
                             supervised.marker_invalid = true;
-                            frames
-                                .push(supervised_rejected(&supervised.command_id, REASON_DISABLED));
+                            let reject = if supervised.file.is_some() {
+                                supervised_file_rejected
+                            } else {
+                                supervised_rejected
+                            };
+                            frames.push(reject(&supervised.command_id, REASON_DISABLED));
                             continue;
                         }
                         let released = self
@@ -1908,6 +1912,33 @@ pub(crate) struct TerminalRegistry {
     next_file_generation: u64,
 }
 
+/// Closed pre-display file refusal contract, mirrored by the server schema.
+const SUPERVISED_FILE_REJECT_REASONS: &[&str] = &[
+    "disabled",
+    "unsupported",
+    "limit",
+    "already_open",
+    "spawn_failed",
+    "bad_command",
+    "bad_frame",
+    "invalid_input",
+    "path_denied",
+    "secret_file",
+    "too_large",
+    "redacted_span",
+];
+
+/// The only file rejection reason mapping. Internal failures and unexpected
+/// state-dependent prepare errors reveal no filesystem state before display.
+fn supervised_file_rejected(command_id: &str, reason: &str) -> OutboundFrame {
+    let reason = if SUPERVISED_FILE_REJECT_REASONS.contains(&reason) {
+        reason
+    } else {
+        REASON_SPAWN_FAILED
+    };
+    supervised_rejected(command_id, reason)
+}
+
 fn supervised_rejected(command_id: &str, reason: &str) -> OutboundFrame {
     log_command_op("supervised", command_id, &format!("rejected:{reason}"));
     OutboundFrame::Control(ClientControlMessage::SupervisedRejected {
@@ -1964,7 +1995,7 @@ impl TerminalRegistry {
     fn queue_file_prepare(&mut self, command_id: &str) -> Vec<OutboundFrame> {
         let Some(runtime) = self.file_runtime.as_ref().map(Arc::clone) else {
             self.pending_files.remove(command_id);
-            return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
+            return vec![supervised_file_rejected(command_id, REASON_UNSUPPORTED)];
         };
         let Some(pending) = self.pending_files.get_mut(command_id) else {
             return Vec::new();
@@ -1972,7 +2003,7 @@ impl TerminalRegistry {
         pending.stage = PendingFileStage::Preparing;
         let Some(file_op) = pending.spawn.file_op.as_ref() else {
             self.pending_files.remove(command_id);
-            return vec![supervised_rejected(command_id, REASON_BAD_FRAME)];
+            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
         };
         let op = file_op.op.clone();
         let args = file_op.args.clone();
@@ -1994,7 +2025,7 @@ impl TerminalRegistry {
             Ok(()) => Vec::new(),
             Err(error) => {
                 self.pending_files.remove(command_id);
-                vec![supervised_rejected(command_id, error.code.as_str())]
+                vec![supervised_file_rejected(command_id, error.code.as_str())]
             }
         }
     }
@@ -2016,7 +2047,7 @@ impl TerminalRegistry {
             if let Some(pending) = pending {
                 pending.cancel.cancel();
             }
-            return Ok(vec![supervised_rejected(command_id, REASON_DISABLED)]);
+            return Ok(vec![supervised_file_rejected(command_id, REASON_DISABLED)]);
         }
         let expected = match pending.stage {
             PendingFileStage::Body { expected } => expected,
@@ -2025,7 +2056,7 @@ impl TerminalRegistry {
                 if let Some(pending) = pending {
                     pending.cancel.cancel();
                 }
-                return Ok(vec![supervised_rejected(command_id, REASON_BAD_FRAME)]);
+                return Ok(vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)]);
             }
         };
         if body.len() != expected {
@@ -2033,7 +2064,7 @@ impl TerminalRegistry {
             if let Some(pending) = pending {
                 pending.cancel.cancel();
             }
-            return Ok(vec![supervised_rejected(command_id, REASON_BAD_FRAME)]);
+            return Ok(vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)]);
         }
         if let Some(pending) = self.pending_files.get_mut(command_id) {
             pending.body = Some(body);
@@ -2176,7 +2207,10 @@ impl TerminalRegistry {
         _startup: &TerminalStartup,
         spawn: &SupervisedSpawn,
     ) -> Vec<OutboundFrame> {
-        vec![supervised_rejected(&spawn.command_id, REASON_UNSUPPORTED)]
+        vec![supervised_file_rejected(
+            &spawn.command_id,
+            REASON_UNSUPPORTED,
+        )]
     }
 
     #[cfg(unix)]
@@ -2193,7 +2227,7 @@ impl TerminalRegistry {
                     "edit" | "write" | "rename" | "mkdir" | "delete"
                 )
             }) {
-                return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
+                return vec![supervised_file_rejected(command_id, REASON_BAD_COMMAND)];
             }
             if spawn
                 .file_op
@@ -2203,18 +2237,18 @@ impl TerminalRegistry {
                     .body_bytes
                     .is_some_and(|bytes| bytes > crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES)
             {
-                return vec![supervised_rejected(command_id, "too_large")];
+                return vec![supervised_file_rejected(command_id, "too_large")];
             }
-            return vec![supervised_rejected(command_id, REASON_BAD_FRAME)];
+            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
         }
         if !startup.mcp_command_mode().allows_supervised() {
-            return vec![supervised_rejected(command_id, REASON_DISABLED)];
+            return vec![supervised_file_rejected(command_id, REASON_DISABLED)];
         }
         let Some(runtime) = self.file_runtime.as_ref() else {
-            return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
+            return vec![supervised_file_rejected(command_id, REASON_UNSUPPORTED)];
         };
         if let Err(error) = runtime.policy().check_process() {
-            return vec![supervised_rejected(command_id, error.code.as_str())];
+            return vec![supervised_file_rejected(command_id, error.code.as_str())];
         }
         if self.sessions.contains_key(&spawn.terminal_id)
             || self.pending_files.values().any(|pending| {
@@ -2228,28 +2262,28 @@ impl TerminalRegistry {
                     .is_some_and(|supervised| supervised.command_id == command_id)
             })
         {
-            return vec![supervised_rejected(command_id, REASON_ALREADY_OPEN)];
+            return vec![supervised_file_rejected(command_id, REASON_ALREADY_OPEN)];
         }
         let (awaiting, running) = self.supervised_counts();
         if awaiting >= MAX_SUPERVISED_AWAITING || awaiting + running >= MAX_SUPERVISED_LIVE {
-            return vec![supervised_rejected(command_id, REASON_LIMIT)];
+            return vec![supervised_file_rejected(command_id, REASON_LIMIT)];
         }
         if spawn.requester.is_empty()
             || spawn.requester.contains('\0')
             || spawn.requester.chars().count() > SUPERVISED_REQUESTER_MAX_CHARS
         {
-            return vec![supervised_rejected(command_id, REASON_INVALID_INPUT)];
+            return vec![supervised_file_rejected(command_id, REASON_INVALID_INPUT)];
         }
         let Some(file_op) = spawn.file_op.as_ref() else {
-            return vec![supervised_rejected(command_id, REASON_BAD_FRAME)];
+            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
         };
         let first = match terminal_crypto::random_nonce() {
             Ok(value) => value,
-            Err(_) => return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)],
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
         };
         let second = match terminal_crypto::random_nonce() {
             Ok(value) => value,
-            Err(_) => return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)],
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
         };
         let mut key = [0_u8; 32];
         key[..16].copy_from_slice(&first);
@@ -2412,13 +2446,13 @@ impl TerminalRegistry {
         }
         if !startup.mcp_command_mode().allows_supervised() {
             self.pending_files.remove(command_id);
-            return vec![supervised_rejected(command_id, REASON_DISABLED)];
+            return vec![supervised_file_rejected(command_id, REASON_DISABLED)];
         }
         let prepared = match outcome {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.pending_files.remove(command_id);
-                return vec![supervised_rejected(command_id, error.code.as_str())];
+                return vec![supervised_file_rejected(command_id, error.code.as_str())];
             }
         };
         let Some(pending) = self.pending_files.remove(command_id) else {
@@ -2444,14 +2478,14 @@ impl TerminalRegistry {
             prepared.child_input().blocked.map(Into::into);
         let args = match serde_json::to_string(&child_args) {
             Ok(args) if args.len() <= 128 * 1024 => args,
-            _ => return vec![supervised_rejected(command_id, "too_large")],
+            _ => return vec![supervised_file_rejected(command_id, "too_large")],
         };
         let body_file = match pending.body.as_deref() {
             Some(body) => match PrivateBody::create(body) {
                 Ok(file) => Some(file),
                 Err(error) => {
                     tracing::warn!(error = %error, command_id, "creating a supervised body failed");
-                    return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                    return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
                 }
             },
             None => None,
@@ -2463,14 +2497,14 @@ impl TerminalRegistry {
                 .collect::<String>(),
             Err(error) => {
                 tracing::warn!(error = %error, command_id, "generating a supervised marker failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
             }
         };
         let out = match OutputKey::first() {
             Ok(out) => out,
             Err(error) => {
                 tracing::warn!(error = %error, command_id, "generating a terminal output key failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
             }
         };
         let (program, program_args) = match self.supervised_program.clone() {
@@ -2482,17 +2516,17 @@ impl TerminalRegistry {
                 ),
                 Err(error) => {
                     tracing::warn!(error = %error, command_id, "locating the wsmp binary failed");
-                    return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                    return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
                 }
             },
         };
         let home = match user_home() {
             Ok(home) => home,
-            Err(_) => return vec![supervised_rejected(command_id, REASON_BAD_CWD)],
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_BAD_CWD)],
         };
         let cwd = match child_env::confirm_screen_cwd(&home) {
             Ok((physical, _)) => physical,
-            Err(_) => return vec![supervised_rejected(command_id, REASON_BAD_CWD)],
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_BAD_CWD)],
         };
         let mut env = terminal_env(config);
         env.extend([
@@ -2519,7 +2553,7 @@ impl TerminalRegistry {
         ]);
         if let Some(body) = body_file.as_ref() {
             let Some(path) = body.path.to_str() else {
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
             };
             env.push((SUPERVISED_ENV_FILE_BODY.to_string(), path.to_string()));
         }
@@ -2547,7 +2581,7 @@ impl TerminalRegistry {
             Ok(pty) => pty,
             Err(error) => {
                 tracing::warn!(error = %error, command_id, "starting a supervised file terminal failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
+                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
             }
         };
         let now = Instant::now();
@@ -2808,6 +2842,9 @@ impl TerminalRegistry {
                 return Vec::new();
             };
             supervised.exit_status = status;
+            if phase == SupervisedPhase::Starting {
+                supervised.start_failed = true;
+            }
             // This path ends the command, so it logs the one outcome line:
             // a running command reports its exit status, a never-started one
             // its decline/start_failed outcome. `close` later logs nothing.
@@ -3753,7 +3790,18 @@ impl TerminalRegistry {
             };
             if invalid {
                 if frames.is_empty() {
-                    frames.push(supervised_rejected(&command_id, REASON_BAD_FRAME));
+                    let is_file = self.sessions.get(terminal_id).is_some_and(|session| {
+                        session
+                            .supervised
+                            .as_ref()
+                            .is_some_and(|supervised| supervised.file.is_some())
+                    });
+                    let reject = if is_file {
+                        supervised_file_rejected
+                    } else {
+                        supervised_rejected
+                    };
+                    frames.push(reject(&command_id, REASON_BAD_FRAME));
                 }
                 frames.extend(self.close(terminal_id));
                 return TerminalBytesDispatch {
@@ -3847,7 +3895,7 @@ impl TerminalRegistry {
             for (command_id, reason) in expired_files {
                 if let Some(pending) = self.pending_files.remove(&command_id) {
                     pending.cancel.cancel();
-                    frames.push(supervised_rejected(&command_id, reason));
+                    frames.push(supervised_file_rejected(&command_id, reason));
                 }
             }
             if !mode_allows {
@@ -3861,7 +3909,7 @@ impl TerminalRegistry {
                     })
                     .collect::<Vec<_>>();
                 for (terminal_id, command_id) in live_files {
-                    frames.push(supervised_rejected(&command_id, REASON_DISABLED));
+                    frames.push(supervised_file_rejected(&command_id, REASON_DISABLED));
                     frames.extend(self.close(&terminal_id));
                 }
             }
@@ -4706,6 +4754,7 @@ mod tests {
 
     #[test]
     fn command_ops_log_op_and_outcome_but_never_the_command_text() {
+        let _capture = crate::logging::test_capture_lock();
         let buf = LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -4741,6 +4790,7 @@ mod tests {
     fn a_started_exec_logs_started_and_never_the_command_or_cwd() {
         // The only `start` path the shared log test drives is a refusal; this
         // pins the `Ok` arm's "started" line, which used to go unasserted.
+        let _capture = crate::logging::test_capture_lock();
         let buf = LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -4879,6 +4929,7 @@ mod tests {
         // The frame's `timed_out` flag is asserted above; this pins the CLI
         // log's outcome code, which a dropped branch would quietly turn into
         // `ended`/`signaled` while the frame stayed correct.
+        let _capture = crate::logging::test_capture_lock();
         let buf = LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -6952,6 +7003,7 @@ exit 0
 
     #[cfg(unix)]
     fn supervised_registry(tx: SyncSender<FromWorker>, script: &str) -> TerminalRegistry {
+        crate::logging::init_test_subscriber();
         let mut terminals = multi_registry(tx);
         terminals.supervised_program = Some((
             "/bin/sh".to_string(),
@@ -7248,6 +7300,7 @@ exit 0
         outcome: &str,
         close_after: bool,
     ) -> (String, Vec<OutboundFrame>) {
+        let _capture = crate::logging::test_capture_lock();
         let buf = LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -7502,6 +7555,7 @@ exit 0
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let target = dir.path().join("target");
+            let _capture = crate::logging::test_capture_lock();
             let buf = LogBuf::default();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(buf.clone())

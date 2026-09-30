@@ -475,27 +475,17 @@ fn path_specs(op: &str, raw: Value) -> FileResult<Vec<(String, Access, bool)>> {
     })
 }
 
-fn precheck_paths(ops: &FileOps, op: &str, raw: Value, cancel: &Cancel) -> FileResult<()> {
+fn precheck_paths(ops: &FileOps, op: &str, raw: Value) -> FileResult<()> {
     ops.policy.check_process()?;
-    for (path, access, follow_last) in path_specs(op, raw)? {
-        super::resolve::expand(&path)?;
-        match resolve(
-            &path,
-            &ResolveOpts {
-                follow_last,
-                make_parents: None,
-                policy: &ops.policy,
-                access,
-                preview_missing: true,
-                pin: None,
-                cancel: Some(cancel),
-            },
-        ) {
-            Ok(_) => {}
+    for (path, access, _) in path_specs(op, raw)? {
+        let path = super::resolve::expand(&path)?;
+        // Physical resolution and inode policy belong on the blocked screen.
+        // Only lexical path refusals can precede the person's dismissal key.
+        match ops.policy.check_path(access, &path) {
             Err(error) if matches!(error.code, ErrorCode::PathDenied | ErrorCode::SecretFile) => {
                 return Err(error);
             }
-            Err(_) => {}
+            _ => {}
         }
     }
     Ok(())
@@ -1007,7 +997,7 @@ impl FileOps {
         cancel: &Cancel,
     ) -> FileResult<PreparedSupervised> {
         static_validate(op, args.clone(), body.as_deref())?;
-        precheck_paths(self, op, args.clone(), cancel)?;
+        precheck_paths(self, op, args.clone())?;
         let material = match material(self, op, args.clone(), body.as_deref(), preview_key, cancel)
         {
             Ok(material) => material,
@@ -1097,7 +1087,7 @@ impl FileOps {
         #[cfg(test)]
         preview_ops.set_rename_atomic_capability(self.rename_atomic_capability());
         static_validate(op, args.clone(), body)?;
-        precheck_paths(&preview_ops, op, args.clone(), cancel)?;
+        precheck_paths(&preview_ops, op, args.clone())?;
         let material = match material(&preview_ops, op, args.clone(), body, preview_key, cancel) {
             Ok(material) => material,
             Err(error) => {

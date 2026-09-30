@@ -1419,6 +1419,14 @@ describe("CLI command tools", () => {
     );
   });
 
+  it("documents supervised and headless file audit reason shapes in the activity tool", () => {
+    const tool = requireDescriptor("forwarder_cli_activity_list");
+    expect(tool.descriptionNote).toContain("<op>:<code>");
+    expect(tool.descriptionNote).toContain("write:completed");
+    expect(tool.descriptionNote).toContain("edit:conflict");
+    expect(tool.descriptionNote).toContain("headless file reasons use <code>");
+  });
+
   it("the activity tool call fails closed as not-found for OAuth and a PAT without the flag", async () => {
     const tool = requireDescriptor("forwarder_cli_activity_list");
     for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {

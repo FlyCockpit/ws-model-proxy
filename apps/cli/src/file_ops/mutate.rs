@@ -304,9 +304,11 @@ fn rename_impl(
     ops.step(Step::EtagRechecked)?;
     if let Some(pin) = from_pin {
         pin.verify(ops, &from, Access::Remove, cancel)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     if let Some(pin) = to_pin {
         pin.verify(ops, &to, Access::Write, cancel)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     cancel.check()?;
     commit_rename(
@@ -723,6 +725,7 @@ fn delete_impl(
     ops.step(Step::EtagRechecked)?;
     if let Some(pin) = pin {
         pin.verify(ops, &resolved, Access::Remove, cancel)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     cancel.check()?;
     // The name must still be the object we inspected.

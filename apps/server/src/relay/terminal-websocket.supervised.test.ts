@@ -1,7 +1,7 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -101,7 +101,7 @@ function uncompressedKey(): string {
   return bytes.toString("base64url");
 }
 
-function hello() {
+function hello(terminalApproval = false) {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
@@ -127,7 +127,7 @@ function hello() {
         features: {
           humanTerminal: false,
           mcpCommandMode: "supervised",
-          terminalApproval: false,
+          terminalApproval,
           terminalSupported: true,
           remoteMetricSources: false,
           mcpFileRead: false,
@@ -286,6 +286,119 @@ describe("terminal list pushes for supervised requests", () => {
       .at(-1);
     expect(last).toMatchObject({ pushed: true, terminals: [] });
     expect(stranger.sends).toEqual([]);
+  });
+
+  it("keeps supervised file viewers pending until each attach approval succeeds", async () => {
+    // Reconnect with the attach-approval feature enabled, retaining no human grant.
+    await relaySessionManager.removeSession(cli, now);
+    cli = new FakeSocket();
+    relaySessionManager.acceptAuthenticatedSocket({ socket: cli, identity, now });
+    await relaySessionManager.handleTextFrame(cli, hello(true), now);
+    const request = await startSupervisedRequest({
+      kind: "file",
+      userId: "user-id",
+      tokenId: "token-a",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      fileOp: { op: "mkdir", args: { path: "~/reviewed-directory" } },
+    });
+    if (!request.ok) throw new Error("expected file start");
+    const cliSays = (message: Record<string, unknown>) =>
+      relaySessionManager.handleTextFrame(cli, JSON.stringify(message), now);
+    await cliSays({
+      type: "term.spawned",
+      terminalId: request.terminalId,
+      commandId: request.commandId,
+    });
+    const approved = new FakeSocket();
+    const refused = new FakeSocket();
+    for (const [index, tab] of [approved, refused].entries()) {
+      terminalBrowserHub.accept({ socket: tab, userId: "user-id", sessionId: `approval-${index}` });
+      await terminalBrowserHub.handleText(
+        tab,
+        JSON.stringify({
+          type: "attach",
+          terminalId: request.terminalId,
+          publicKey: uncompressedKey(),
+          nonce: "AAECAwQFBgcICQoLDA0ODw",
+        }),
+      );
+    }
+    const attaches = cli.json().filter((message) => message.type === "term.attach");
+    expect(attaches).toHaveLength(2);
+    expect(approved.json().some((message) => message.type === "attached")).toBe(false);
+    expect(refused.json().some((message) => message.type === "attached")).toBe(false);
+    const broadcast = (seq: number) =>
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId: request.terminalId, seq, epoch: 1 },
+          new Uint8Array([1, 2, 3]),
+        ),
+      );
+    broadcast(1);
+    expect(approved.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    expect(refused.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    for (const attach of attaches) {
+      await cliSays({
+        type: "term.pending",
+        terminalId: request.terminalId,
+        viewerId: attach.viewerId,
+        cliNonce: "AAECAwQFBgcICQoLDA0ODw",
+        approvalCode: "ABCDEFGH",
+      });
+    }
+    expect(approved.json().filter((message) => message.type === "pending")).toHaveLength(1);
+    expect(refused.json().filter((message) => message.type === "pending")).toHaveLength(1);
+    await terminalBrowserHub.handleText(
+      approved,
+      JSON.stringify({
+        type: "auth",
+        terminalId: request.terminalId,
+        signature: "c2lnbmF0dXJl",
+      }),
+    );
+    expect(cli.json().filter((message) => message.type === "term.auth")).toEqual([
+      {
+        type: "term.auth",
+        terminalId: request.terminalId,
+        viewerId: attaches[0]?.viewerId,
+        signature: "c2lnbmF0dXJl",
+      },
+    ]);
+    await cliSays({
+      type: "term.attached",
+      terminalId: request.terminalId,
+      viewerId: attaches[0]?.viewerId,
+      cliNonce: "AAECAwQFBgcICQoLDA0ODw",
+    });
+    await cliSays({
+      type: "term.rejected",
+      terminalId: request.terminalId,
+      viewerId: attaches[1]?.viewerId,
+      reason: "approval_required",
+    });
+    expect(approved.json().filter((message) => message.type === "attached")).toHaveLength(1);
+    expect(approved.json().some((message) => message.type === "rejected")).toBe(false);
+    expect(refused.json().filter((message) => message.type === "rejected")).toEqual([
+      {
+        type: "rejected",
+        terminalId: request.terminalId,
+        reason: "approval_required",
+      },
+    ]);
+    expect(refused.json().some((message) => message.type === "attached")).toBe(false);
+    broadcast(2);
+    expect(approved.sends.filter((send) => typeof send !== "string")).toHaveLength(1);
+    expect(refused.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    expect(snapshotSupervisedCommand(request.commandId, "user-id", "token-a")).toMatchObject({
+      requestKind: "file",
+      status: "awaiting_user",
+      started: null,
+      file: null,
+      fileError: null,
+    });
+    expect(cli.json().some((message) => message.type === "supervised.accepted")).toBe(false);
   });
 
   describe("Decline from the browser", () => {

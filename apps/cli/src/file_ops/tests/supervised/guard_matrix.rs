@@ -271,6 +271,26 @@ fn run(row: Row) {
 }
 
 #[test]
+fn supervised_tail_cancel_rename_and_delete() {
+    for operand in [
+        "rename-source",
+        "rename-overwrite",
+        "rename-absent",
+        "delete",
+    ] {
+        run(Row {
+            operand,
+            step: Some(Step::SupervisedPinVerified),
+            // Initial and final verifies: two pins for rename, one for delete.
+            occurrence: if operand == "delete" { 2 } else { 4 },
+            attack: Attack::Cancel,
+            restore: None,
+            no_op: false,
+        });
+    }
+}
+
+#[test]
 fn supervised_guard_matrix() {
     for operand in OPERANDS.into_iter().chain(["rename-absent"]) {
         for attack in [Attack::AncestorDirectory, Attack::AncestorSymlink] {

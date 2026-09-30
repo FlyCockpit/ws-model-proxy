@@ -6,6 +6,7 @@ import {
   fileCancelFrameSchema,
   fileOpFrameSchema,
   fileSpawnSpecSchema,
+  supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import {
   encodeRelayBinaryFrame,
@@ -448,5 +449,42 @@ describe("relay 2.8 supervised-file strict schema", () => {
     expect(names).toEqual(
       expect.arrayContaining(["file-cancel.json", "file-rejected-conflict.json"]),
     );
+  });
+});
+
+describe("supervised file pre-display rejection contract", () => {
+  it("matches the CLI's closed list exactly", () => {
+    const rust = readFileSync(new URL("../../../cli/src/sessions.rs", import.meta.url), "utf8");
+    const table = rust.match(
+      /const SUPERVISED_FILE_REJECT_REASONS: &[\s\S]*?= &\[([\s\S]*?)\];/,
+    )?.[1];
+    expect(table).toBeDefined();
+    const reasons = [...(table ?? "").matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+    expect(reasons).toEqual(supervisedFileRejectReasonSchema.options);
+    for (const reason of reasons) {
+      expect(supervisedFileRejectReasonSchema.parse(reason)).toBe(reason);
+    }
+  });
+
+  it.each([
+    "bad_cwd",
+    "io_error",
+    "not_found",
+    "not_a_file",
+    "not_a_dir",
+    "binary_file",
+    "exists",
+    "conflict",
+    "match_count",
+    "no_match",
+    "hard_linked",
+    "owner_mismatch",
+    "setuid",
+    "special_file",
+    "timeout",
+    "cancelled",
+    "future_internal_error",
+  ])("rejects %s without widening the schema", (code) => {
+    expect(supervisedFileRejectReasonSchema.safeParse(code).success).toBe(false);
   });
 });

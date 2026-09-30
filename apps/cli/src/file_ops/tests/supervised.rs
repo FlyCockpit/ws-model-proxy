@@ -1166,3 +1166,57 @@ fn supervised_mutations_share_the_headless_namespace_guard() {
         assert!(!fx.root.join("moved-other").exists());
     }
 }
+
+#[test]
+fn physical_path_policy_errors_are_blocked_for_every_supervised_operand() {
+    use crate::file_ops::policy::{Deny, Protected};
+    let fx = Fx::with_policy(|root| {
+        Policy::new(
+            vec![],
+            vec![Protected {
+                path: root.join("protected"),
+                subtree: true,
+                deny: Deny::WriteOnly,
+            }],
+            true,
+        )
+    });
+    for (directory, expected) in [
+        (".ssh", ErrorCode::SecretFile),
+        ("protected", ErrorCode::PathDenied),
+    ] {
+        std::fs::create_dir(fx.root.join(directory)).unwrap();
+        fx.put(&format!("{directory}/private"), "private fixture\n");
+        let alias_name = format!("alias-{}", expected.as_str());
+        std::os::unix::fs::symlink(fx.root.join(directory), fx.root.join(&alias_name)).unwrap();
+        let alias = fx.p(&format!("{alias_name}/private"));
+        for (op, args, body) in [
+            (
+                "edit",
+                json!({"path":alias,"edits":[{"oldText":"private","newText":"changed"}]}),
+                None,
+            ),
+            ("write", json!({"path":alias}), Some(b"new\n".to_vec())),
+            ("delete", json!({"path":alias}), None),
+            (
+                "mkdir",
+                json!({"path":fx.p(&format!("{alias_name}/new"))}),
+                None,
+            ),
+            ("rename", json!({"from":alias,"to":fx.p("dest")}), None),
+            ("rename", json!({"from":fx.p("source"),"to":alias}), None),
+        ] {
+            fx.put("source", "source\n");
+            let prepared = fx
+                .ops
+                .prepare_supervised(op, args, body, &key(), &fx.cancel)
+                .expect("physical path policy waits for a dismissal key");
+            assert_eq!(
+                prepared.child_input().blocked,
+                Some(expected),
+                "{op} {directory}"
+            );
+        }
+        assert_eq!(fx.get(&format!("{directory}/private")), "private fixture\n");
+    }
+}

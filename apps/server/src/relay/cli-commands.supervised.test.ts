@@ -2449,6 +2449,7 @@ describe("supervised commands", () => {
       ["invalid_input", "invalid_input"],
       ["bad_frame", "io_error"],
       ["already_open", "limit"],
+      ["limit", "limit"],
       ["spawn_failed", "io_error"],
       ["unsupported", "unsupported"],
       ["path_denied", "path_denied"],

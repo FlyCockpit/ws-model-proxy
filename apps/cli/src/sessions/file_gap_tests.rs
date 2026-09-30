@@ -974,3 +974,274 @@ fn supervised_committed_result_encoding_failure_is_io_error() {
     assert!(target.is_dir());
     assert!(terminals.sessions.is_empty());
 }
+
+#[test]
+fn supervised_file_rejections_cover_every_error_code_and_registry_reason() {
+    use crate::file_ops::{ErrorCode, FileError};
+    // Read the enum and REASON constants rather than a second hand-maintained
+    // table, so adding a prepare error or registry reason extends this sweep.
+    let error_source = include_str!("../file_ops/error.rs");
+    let variants = error_source
+        .split("pub enum ErrorCode {")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    let codes = variants
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(','))
+        .map(|line| {
+            let name = line.trim_end_matches(',');
+            let wire = name
+                .chars()
+                .enumerate()
+                .fold(String::new(), |mut out, (i, c)| {
+                    if i > 0 && c.is_uppercase() {
+                        out.push('_');
+                    }
+                    out.extend(c.to_lowercase());
+                    out
+                });
+            serde_json::from_value::<ErrorCode>(serde_json::json!(wire)).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let (tx, _rx) = channel();
+    let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
+    let startup = supervised_startup(McpCommandMode::Supervised, false);
+    for code in codes {
+        let request =
+            file_spawn_request("write", serde_json::json!({"path":"~/reviewed"}), Some(1));
+        assert!(
+            terminals
+                .spawn_supervised(&startup, &Config::default(), &request)
+                .is_empty()
+        );
+        let generation = terminals.pending_files[&request.command_id].generation;
+        let frames = terminals.on_file_prepared(
+            &startup,
+            &Config::default(),
+            &request.command_id,
+            generation,
+            Err(FileError::new(
+                code,
+                "internal state must not leave the daemon",
+            )),
+        );
+        let reason = supervised_rejection_reason(&frames).expect("file rejection");
+        assert!(
+            SUPERVISED_FILE_REJECT_REASONS.contains(&reason),
+            "{code:?}: {reason}"
+        );
+        let expected = if SUPERVISED_FILE_REJECT_REASONS.contains(&code.as_str()) {
+            code.as_str()
+        } else {
+            REASON_SPAWN_FAILED
+        };
+        assert_eq!(reason, expected, "{code:?}");
+        assert!(terminals.pending_files.is_empty());
+        assert!(terminals.sessions.is_empty());
+    }
+    for reason in include_str!("../sessions.rs")
+        .lines()
+        .filter(|line| line.starts_with("const REASON_"))
+        .map(|line| line.split('"').nth(1).unwrap())
+        .chain(SUPERVISED_FILE_REJECT_REASONS.iter().copied())
+        .chain(["future_internal_error", "bad_cwd", "io_error"])
+    {
+        let frames = [supervised_file_rejected("file-command", reason)];
+        let actual = supervised_rejection_reason(&frames).unwrap();
+        assert!(SUPERVISED_FILE_REJECT_REASONS.contains(&actual), "{reason}");
+        assert_eq!(
+            actual,
+            if SUPERVISED_FILE_REJECT_REASONS.contains(&reason) {
+                reason
+            } else {
+                REASON_SPAWN_FAILED
+            }
+        );
+    }
+    // The command rejection contract retains command-only reasons.
+    assert_eq!(
+        supervised_rejection_reason(&[supervised_rejected("command", REASON_BAD_CWD)]),
+        Some(REASON_BAD_CWD)
+    );
+}
+
+#[test]
+fn supervised_confirm_exit_before_ready_is_start_failed_and_after_ready_is_declined() {
+    let _capture = crate::logging::test_capture_lock();
+    for is_file in [false, true] {
+        for ready in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("never-created");
+            let script = if ready {
+                "printf '\\033]7717;wsmp-supervised;ready;%s\\007' \"$WSMP_SUPERVISED_MARKER\"\nexit 17\n"
+            } else {
+                "exit 17\n"
+            };
+            let buf = LogBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let (tx, rx) = channel();
+                let mut terminals = supervised_file_registry(tx, script);
+                let runtime = Arc::clone(terminals.file_runtime.as_ref().unwrap());
+                let startup = supervised_startup(McpCommandMode::Supervised, false);
+                let request = if is_file {
+                    file_spawn_request("mkdir", serde_json::json!({"path":target}), None)
+                } else {
+                    spawn_request(false)
+                };
+                let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+                pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
+                assert_eq!(
+                    outcome_kinds(&frames)
+                        .iter()
+                        .filter(|kind| **kind == "declined")
+                        .count(),
+                    usize::from(ready),
+                    "file={is_file}, ready={ready}"
+                );
+                assert_eq!(
+                    outcome_kinds(&frames)
+                        .iter()
+                        .filter(|kind| **kind == "exit")
+                        .count(),
+                    1
+                );
+                assert!(!outcome_kinds(&frames).contains(&"accepted"));
+                assert!(!outcome_kinds(&frames).contains(&"done"));
+                assert_eq!(runtime.apply_submissions(), 0);
+                assert!(!target.exists());
+                assert!(terminals.sessions.is_empty());
+            });
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let expected = if ready { "declined" } else { "start_failed" };
+            if is_file {
+                let outcomes = log
+                    .lines()
+                    .filter(|line| line.contains("file op"))
+                    .collect::<Vec<_>>();
+                assert_eq!(outcomes.len(), 1, "{log}");
+                assert!(
+                    outcomes[0].contains(&format!("outcome={expected}")),
+                    "{log}"
+                );
+            } else {
+                assert_eq!(sole_supervised_end(&log, SUPERVISED_COMMAND_ID).2, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn supervised_file_attach_requires_signed_approved_identity_before_input() {
+    use p256::elliptic_curve::Generate;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("never-created");
+    let approval_dir = tempfile::tempdir().unwrap();
+    let (tx, rx) = channel();
+    let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
+    let startup = supervised_startup(McpCommandMode::Supervised, true);
+    let request = file_spawn_request("mkdir", serde_json::json!({"path":target}), None);
+    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+    pump_file_until(&mut terminals, &rx, &startup, &mut frames, |t, _| {
+        phase(t) == Some(SupervisedPhase::Confirm)
+    });
+    let mut viewer = TestViewer::new(97);
+    let id = viewer.id.clone();
+    let refused = terminals.attach(
+        &startup,
+        Some(approval_dir.path()),
+        viewer.handshake(MULTI_TERMINAL, 0, 0),
+    );
+    assert_eq!(
+        rejection(&refused),
+        Some((Some(id.clone()), REASON_APPROVAL_REQUIRED.to_string()))
+    );
+    assert!(terminals.sessions[MULTI_TERMINAL].viewers.is_empty());
+
+    let identity_key = p256::ecdsa::SigningKey::try_generate().unwrap();
+    let point = identity_key.verifying_key().to_sec1_point(false);
+    let identity_raw: [u8; 65] = point.as_bytes().try_into().unwrap();
+    let identity = TerminalIdentity {
+        public_key: terminal_crypto::encode_b64url(&identity_raw),
+        signature: None,
+    };
+    let mut handshake = viewer.handshake(MULTI_TERMINAL, 0, 0);
+    handshake.identity = Some(&identity);
+    let pending = terminals.attach(&startup, Some(approval_dir.path()), handshake);
+    assert!(matches!(
+        controls(&pending)[0],
+        ClientControlMessage::TermPending { .. }
+    ));
+    let cli_nonce = cli_nonce_of(&pending);
+    viewer.bind(&startup, MULTI_TERMINAL, &cli_nonce);
+    // Knowing pairwise keys does not make a pending viewer an admitted writer.
+    let before_auth = send(
+        &mut terminals,
+        &mut viewer,
+        &id,
+        &TermPlaintextV2::Data(b"\r".to_vec()),
+    );
+    assert!(!outcome_kinds(&before_auth).contains(&"accepted"));
+    assert_eq!(phase(&terminals), Some(SupervisedPhase::Confirm));
+    assert!(terminals.sessions[MULTI_TERMINAL].viewers.is_empty());
+    let signature = terminal_crypto::sign_approval_v2(
+        &identity_key,
+        MULTI_TERMINAL,
+        &id,
+        viewer.browser.public_raw(),
+        &viewer.nonce,
+        startup.key().public_raw(),
+        &terminal_crypto::decode_nonce(&cli_nonce).unwrap(),
+    )
+    .unwrap();
+    let signature = terminal_crypto::encode_b64url(&signature);
+    let unapproved = terminals.auth(
+        &startup,
+        &Config::default(),
+        Some(approval_dir.path()),
+        MULTI_TERMINAL,
+        Some(&id),
+        &signature,
+    );
+    assert_eq!(
+        rejection(&unapproved),
+        Some((Some(id.clone()), REASON_APPROVAL_REQUIRED.to_string()))
+    );
+    assert!(terminals.sessions[MULTI_TERMINAL].viewers.is_empty());
+    crate::approvals::approve(
+        approval_dir.path(),
+        &terminal_crypto::approval_code(&identity_raw),
+    )
+    .unwrap();
+    let attached = terminals.auth(
+        &startup,
+        &Config::default(),
+        Some(approval_dir.path()),
+        MULTI_TERMINAL,
+        Some(&id),
+        &signature,
+    );
+    assert!(matches!(
+        controls(&attached)[0],
+        ClientControlMessage::TermAttached { .. }
+    ));
+    viewer.receive(MULTI_TERMINAL, &attached);
+    assert_eq!(terminals.sessions[MULTI_TERMINAL].viewers.len(), 1);
+    frames.extend(send(
+        &mut terminals,
+        &mut viewer,
+        &id,
+        &TermPlaintextV2::Data(b"q\r".to_vec()),
+    ));
+    pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
+    assert!(outcome_kinds(&frames).contains(&"declined"));
+    assert!(!outcome_kinds(&frames).contains(&"accepted"));
+    assert!(!target.exists());
+}

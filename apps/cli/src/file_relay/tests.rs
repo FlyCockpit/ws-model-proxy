@@ -608,6 +608,7 @@ fn dropping_the_session_cancels_every_pending_op() {
 
 #[test]
 fn every_op_is_logged_once_by_the_settle_point_without_content() {
+    let _capture = crate::logging::test_capture_lock();
     use std::io::Write;
     use std::sync::Mutex as StdMutex;
 
