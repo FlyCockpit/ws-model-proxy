@@ -2552,29 +2552,61 @@ mod tests {
     }
 
     /// The aggregate bound also covers the list as accepted (before symlinks
-    /// shrink it) and puts a non-UTF-8 root's own error first.
+    /// shrink it), the resolved list (short aliases of long real paths), and puts
+    /// a non-UTF-8 root's own error first. Every created path stays well under
+    /// 600 bytes (macOS caps paths at 1024) and the totals are asserted to sit
+    /// over the bound so the test cannot pass for the wrong reason.
     #[cfg(unix)]
     #[test]
     fn file_roots_bound_covers_the_expanded_list_and_error_order() {
         use std::os::unix::ffi::OsStrExt;
+        let serialized = |roots: &[PathBuf]| -> usize {
+            roots
+                .iter()
+                .map(|root| serde_json::to_string(root).unwrap().len() + 1)
+                .sum()
+        };
+        let ctl = |len: usize| "\u{1}".repeat(len);
         let base = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(base.path()).unwrap();
         let target = base.join("short");
         std::fs::create_dir(&target).unwrap();
-        // 17 aliases whose typed names are long (control characters) but resolve short.
+        // 32 aliases whose typed names are long (control characters) but resolve short.
         let mut long_dir = base.clone();
-        for _ in 0..4 {
-            long_dir.push("\u{1}".repeat(200));
+        for _ in 0..2 {
+            long_dir.push(ctl(120));
         }
         std::fs::create_dir_all(&long_dir).unwrap();
-        let aliases: Vec<PathBuf> = (0..17)
+        let aliases: Vec<PathBuf> = (0..MAX_FILE_ROOTS)
             .map(|n| {
-                let link = long_dir.join(format!("{n}{}", "\u{1}".repeat(200)));
+                let link = long_dir.join(format!("{n:02}{}", ctl(120)));
                 std::os::unix::fs::symlink(&target, &link).unwrap();
                 link
             })
             .collect();
+        assert!(serialized(&aliases) > MAX_FILE_ROOTS_SERIALIZED_BYTES);
         let error = validate_file_roots(&aliases, None).expect_err("expanded list over bound");
+        assert!(error.to_string().contains("too long in total"), "{error}");
+        // Short aliases that resolve to real paths over the bound are refused too.
+        let real_parent = base.join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let mut resolved_len = 0;
+        let short_aliases: Vec<PathBuf> = (0..MAX_FILE_ROOTS)
+            .map(|n| {
+                let real = real_parent
+                    .join(format!("{n:02}{}", ctl(175)))
+                    .join(ctl(175));
+                std::fs::create_dir_all(&real).unwrap();
+                resolved_len += serde_json::to_string(&real).unwrap().len() + 1;
+                let alias = base.join(format!("a{n:02}"));
+                std::os::unix::fs::symlink(&real, &alias).unwrap();
+                alias
+            })
+            .collect();
+        assert!(serialized(&short_aliases) < MAX_FILE_ROOTS_SERIALIZED_BYTES);
+        assert!(resolved_len > MAX_FILE_ROOTS_SERIALIZED_BYTES);
+        let error =
+            validate_file_roots(&short_aliases, None).expect_err("resolved list over bound");
         assert!(error.to_string().contains("too long in total"), "{error}");
         // Within both bounds: ordinary aliases resolve and are accepted.
         let ordinary = base.join("alias");
