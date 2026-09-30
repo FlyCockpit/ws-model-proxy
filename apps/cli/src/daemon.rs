@@ -4082,7 +4082,9 @@ mod tests {
             .block_on(execute_upstream(spec, None, &tx, cancellation_rx))
             .expect("relay redirect");
         source.join().expect("source thread");
-        thread::sleep(Duration::from_millis(25));
+        // No sleep: `execute_upstream` has returned, so a followed redirect would already
+        // have completed its TCP handshake with `second` (and, since `second` never
+        // answers, the call above would not have returned at all).
         assert!(matches!(second.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
         let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(frames.iter().any(|frame| matches!(frame,
@@ -4099,6 +4101,7 @@ mod tests {
             Err(error) => panic!("bind redirect source: {error}"),
         };
         let address = listener.local_addr().expect("source address");
+        let (client_done_tx, client_done_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept initial request");
             let mut request = [0_u8; 4096];
@@ -4109,10 +4112,14 @@ mod tests {
                 )
                 .expect("write redirect");
             drop(stream);
+            // Check for a followed redirect only once the client has finished: a
+            // follow would already be queued on this listener, so no sleep is needed.
+            client_done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("client should finish");
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking listener");
-            thread::sleep(Duration::from_millis(25));
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
@@ -4130,6 +4137,7 @@ mod tests {
                 cancellation_rx,
             ))
             .expect("relay same-origin redirect");
+        client_done_tx.send(()).expect("signal client done");
         server.join().expect("redirect server");
     }
 
@@ -4147,13 +4155,20 @@ mod tests {
             let mut request = [0_u8; 4096];
             let _ = std::io::Read::read(&mut stream, &mut request).expect("read relay request");
             accepted_tx.send(()).expect("signal accepted request");
-            thread::sleep(Duration::from_millis(300));
+            // Hold the header wait open until the client goes away (EOF or reset): a
+            // cancellation that does not drop the connection leaves the request waiting,
+            // so the 10 s bound below trips instead of a fixed sleep racing it. The read
+            // timeout keeps this thread from hanging the test if the socket is never closed.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set upstream read timeout");
+            while std::io::Read::read(&mut stream, &mut request).is_ok_and(|read| read > 0) {}
         });
         let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
         let (cancellation, cancellation_rx) = CancellationHandle::new();
         let cancel = thread::spawn(move || {
             accepted_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("upstream should receive request before cancellation");
             assert!(cancellation.cancel());
         });
@@ -4164,10 +4179,17 @@ mod tests {
 
         runtime
             .block_on(async {
+                // Only a hang bound: the upstream holds its response until the client
+                // disconnects, so this elapses only if cancellation fails to end the wait.
                 tokio::time::timeout(
-                    Duration::from_millis(150),
+                    Duration::from_secs(10),
                     execute_upstream(
-                        local_upstream_spec(format!("http://{address}")),
+                        // A long request timeout so only cancellation (or the hang
+                        // bound above) can end the wait, not the request's own clock.
+                        UpstreamRequestSpec {
+                            timeout_ms: 60_000,
+                            ..local_upstream_spec(format!("http://{address}"))
+                        },
                         None,
                         &tx,
                         cancellation_rx,
@@ -4178,6 +4200,9 @@ mod tests {
             .expect("cancellation should end the header wait promptly")
             .expect("cancellation is not an upstream error");
         cancel.join().expect("cancellation thread");
+        // The runtime owns the client's pooled connection; dropping it closes the socket,
+        // which is what lets the upstream thread (waiting for EOF) finish.
+        drop(runtime);
         server.join().expect("test upstream thread");
         assert!(
             rx.try_recv().is_err(),

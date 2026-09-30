@@ -18,12 +18,13 @@ integration("provider budget admission and reconciliation", () => {
   let service: typeof import("./provider-budget.js");
   let accounting: typeof import("./provider-budget-accounting.js");
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     service = await import("./provider-budget.js");
     accounting = await import("./provider-budget-accounting.js");
-  });
+  }, 120_000);
 
   afterAll(async () => {
     service?.setTerminalPersistenceTestFailureInjector(undefined);

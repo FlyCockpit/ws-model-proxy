@@ -46,6 +46,13 @@ const publicOverflow = vi.hoisted(() => ({
   list: vi.fn(),
   buildAffinityTargets: vi.fn(),
 }));
+// The 32 MiB production cap makes the oversize tests build and parse 32 MB bodies (6-7 s,
+// timing out under load). The cap is only compared against byte counts, so a small cap
+// exercises the same rejection paths.
+vi.mock("./limits.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./limits.js")>();
+  return { ...actual, MODEL_API_MAX_REQUEST_BODY_BYTES: 1024 * 1024 };
+});
 vi.mock("./public-overflow.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./public-overflow.js")>();
   return {

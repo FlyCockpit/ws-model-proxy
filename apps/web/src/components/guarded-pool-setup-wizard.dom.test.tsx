@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, configure, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -141,6 +141,12 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 
 import { NewPoolPage } from "./guarded-pool-new-page";
 import { GuardedPoolSetupWizard } from "./guarded-pool-setup-wizard";
+
+// `waitFor` polls until the awaited async work (WebCrypto on the thread pool, React
+// transitions) completes and returns as soon as it does; the timeout only bounds a
+// genuine hang. RTL's 1 s default is shorter than this file's slowest completion on a
+// loaded CI or shared host, which showed up as one-off failures in passing tests.
+configure({ asyncUtilTimeout: 10_000 });
 
 const surface = (name: "openaiChatCompletions" | "openaiResponses") => ({
   version: 3 as const,

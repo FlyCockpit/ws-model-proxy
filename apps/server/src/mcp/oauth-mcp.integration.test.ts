@@ -524,7 +524,10 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
       create: { identifier: CANONICAL, name: "WS Model Proxy MCP" },
       update: {},
     });
-  });
+    // The hook cold-imports the whole production auth graph (Vite transforms it on
+    // first use) and builds the app; on a contended host that alone can outlast
+    // vitest's 10 s default hook timeout, which is a bound on a hang, not on speed.
+  }, 120_000);
 
   afterAll(async () => {
     listener?.close();
