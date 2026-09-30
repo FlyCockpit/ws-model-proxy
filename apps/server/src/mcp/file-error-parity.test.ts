@@ -160,6 +160,8 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
       ...FILE_ERROR_CODES,
       ...FILE_WIRE_REASONS.filter((reason) => reason !== "bad_frame"),
       ...serverOnly,
+      // The person declined a supervised file request (polled result only).
+      "declined",
     ]);
     expect(sorted([...documented])).toEqual(sorted([...returnable]));
   });
