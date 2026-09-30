@@ -77,10 +77,14 @@ pub fn detect_eol(bytes: &[u8]) -> Eol {
     }
 }
 
-/// Line body without its terminator (`\n` or `\r\n`).
+/// Line body without its terminator (`\n`, `\r\n`) and without any stray
+/// trailing `\r`: this is the one line-splitting rule every masking consumer
+/// shares (`redact::mask` trims the same characters), so a `\r\r\n` file is not
+/// masked differently by a read than by an edit or a search.
 pub fn strip_eol(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line)
+    let end = line.iter().rposition(|b| *b != b'\r').map_or(0, |i| i + 1);
+    &line[..end]
 }
 
 /// Largest index `<= idx` that is a char boundary of `s`.

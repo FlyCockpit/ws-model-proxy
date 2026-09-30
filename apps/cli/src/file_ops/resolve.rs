@@ -32,7 +32,7 @@ use std::fs::{File, Metadata};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat, readlinkat};
@@ -378,7 +378,7 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     comp.as_os_str(),
                     nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
                 ) {
-                    Ok(_) => return Err(FileError::conflict("path appeared")),
+                    Ok(_) => return Err(FileError::conflict("replaced")),
                     Err(Errno::ENOENT) => {}
                     Err(errno) => return Err(FileError::errno(errno)),
                 }
@@ -447,7 +447,7 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
     let checked = result.and_then(|()| {
         check_pin(&resolved.dir, &names, opts.pin, &mut pin_checked)?;
         if opts.pin.is_some() && !pin_checked {
-            return Err(FileError::conflict("parent replaced"));
+            return Err(FileError::conflict("replaced"));
         }
         if fd_path(&resolved.dir).is_none() && cfg!(target_os = "linux") {
             return Err(FileError::new(ErrorCode::NotFound, "directory was removed"));
@@ -477,7 +477,7 @@ fn check_pin(
     }
     let now = Stat::from_raw(&fstat(dir.as_fd()).map_err(FileError::errno)?);
     if !now.same_object(&pin.stat) {
-        return Err(FileError::conflict("parent replaced"));
+        return Err(FileError::conflict("replaced"));
     }
     *checked = true;
     Ok(())
@@ -526,13 +526,4 @@ fn join_names(names: &[OsString]) -> PathBuf {
         path.push(name);
     }
     path
-}
-
-/// `unlinkat` a leaf that this call created (used to roll back a failed create).
-pub fn unlink_created(dir: &OwnedFd, name: &OsStr) {
-    let _ = unlinkat(dir.as_fd(), name, UnlinkatFlags::NoRemoveDir);
-}
-
-pub fn path_of(dir_path: &Path, name: &OsStr) -> PathBuf {
-    dir_path.join(name)
 }

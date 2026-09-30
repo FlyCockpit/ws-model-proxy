@@ -19,6 +19,7 @@ vi.mock("./relay/cli-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
 }));
 
 // Same process-dependency mocks as app-order.test.ts: importing app.ts must

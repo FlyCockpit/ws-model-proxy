@@ -81,8 +81,10 @@ pub(crate) fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResul
     let mut entries = Vec::with_capacity(args.paths.len());
     for path in &args.paths {
         cancel.check()?;
-        entries.push(match stat_one(ops, path, hash) {
+        entries.push(match stat_one(ops, path, hash, cancel) {
             Ok(entry) => entry,
+            // a cancelled hash is a cancelled call, not one more per-path error
+            Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
             Err(err) => StatEntry {
                 path: path.clone(),
                 error: Some(err.code.as_str()),
@@ -93,7 +95,7 @@ pub(crate) fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResul
     Ok(StatResult { entries })
 }
 
-fn stat_one(ops: &FileOps, path: &str, hash: bool) -> FileResult<StatEntry> {
+fn stat_one(ops: &FileOps, path: &str, hash: bool, cancel: &Cancel) -> FileResult<StatEntry> {
     let opts = |follow_last| ResolveOpts {
         follow_last,
         make_parents: None,
@@ -117,8 +119,8 @@ fn stat_one(ops: &FileOps, path: &str, hash: bool) -> FileResult<StatEntry> {
         Kind::File => {
             entry.etag = Some(if hash && st.size <= STRONG_ETAG_MAX_BYTES {
                 let (mut file, opened) = resolved.open_regular(&ops.policy, Access::Read)?;
-                let bytes = load_all(&mut file, &opened, STRONG_ETAG_MAX_BYTES)?;
-                ops.key.strong(&bytes)
+                let bytes = load_all(&mut file, &opened, STRONG_ETAG_MAX_BYTES, cancel)?;
+                ops.key.strong(&opened, &bytes)
             } else {
                 ops.key.weak_stat(&st)
             });

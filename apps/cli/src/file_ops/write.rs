@@ -156,6 +156,7 @@ fn write_validated(
     pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<WriteResult> {
+    let _namespace = ops.namespace_shared(cancel)?;
     let mut resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -203,12 +204,11 @@ fn write_resolved(
     let _lock = ops.lock_path(full.clone(), cancel)?;
     if let Some(pin) = pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, resolved, Access::Write)?;
+        pin.verify(ops, resolved, Access::Write, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
-    let etag = ops.key.strong(content);
 
     let Some(existing) = existing else {
         if if_exists == IfExists::Replace {
@@ -219,10 +219,10 @@ fn write_resolved(
         }
         ops.step(Step::EtagRechecked)?;
         if let Some(pin) = pin {
-            pin.verify(ops, resolved, Access::Write)?;
+            pin.verify(ops, resolved, Access::Write, cancel)?;
         }
         cancel.check()?;
-        atomic::create_new(
+        let created = atomic::create_new(
             &resolved.dir,
             &resolved.name,
             content,
@@ -230,7 +230,7 @@ fn write_resolved(
         )?;
         resolved.created.clear(); // committed: parents stay
         return Ok(WriteResult {
-            etag,
+            etag: ops.key.strong(&created, content),
             size: content.len() as u64,
             created: true,
             added: None,
@@ -260,7 +260,7 @@ fn write_resolved(
     // The atomic recheck binds this fd to the named object, and verify_at
     // binds that object to the preview. No early return can report success
     // before those checks on the replace path.
-    let previous_etag = current_etag(ops, &mut file, &stat)?;
+    let previous_etag = current_etag(ops, &mut file, &stat, cancel)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
     }
@@ -272,7 +272,7 @@ fn write_resolved(
     if stat.size <= super::etag::STRONG_ETAG_MAX_BYTES {
         use std::io::Seek;
         file.rewind()?;
-        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
+        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES, cancel)?;
         if text::sniff_binary(&bytes).is_none()
             && let Ok(text) = String::from_utf8(bytes)
         {
@@ -284,7 +284,7 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    match pin {
+    let new_stat = match pin {
         Some(pin) => atomic::replace_supervised(
             ops,
             &resolved.dir,
@@ -306,10 +306,10 @@ fn write_resolved(
             content,
             cancel,
         )?,
-    }
+    };
 
     let mut result = WriteResult {
-        etag,
+        etag: ops.key.strong(&new_stat, content),
         size: content.len() as u64,
         created: false,
         added: None,

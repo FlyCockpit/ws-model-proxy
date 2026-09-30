@@ -1,9 +1,12 @@
 //! Keyed content ETags (plan section 2.1).
 //!
-//! A strong etag is `"h:" + base64url(HMAC-SHA256(key, bytes))[..22]`. The key
-//! is random per daemon start, so an etag never lets a caller guess a
-//! low-entropy secret offline from a known-shape file, and a restart
-//! invalidates every etag (one extra `conflict`, which is safe). Files over
+//! A strong etag is `"h:" + base64url(HMAC-SHA256(key, device, inode, bytes))[..22]`.
+//! The key is random per daemon start, so an etag never lets a caller guess a
+//! low-entropy secret offline from a known-shape file; binding it to the file
+//! object stops the online version of the same guess (write a candidate file,
+//! compare its etag with the masked file's). A restart invalidates every etag
+//! (one extra `conflict`, which is safe), and so does replacing a file by a new
+//! inode, which is a replacement anyway. Files over
 //! [`STRONG_ETAG_MAX_BYTES`] get a weak `"w:"` etag over identity and
 //! timestamps instead of a full read.
 
@@ -42,9 +45,25 @@ impl EtagKey {
         Self(bytes)
     }
 
-    /// Strong etag of `bytes`.
-    pub fn strong(&self, bytes: &[u8]) -> String {
-        let mac = hmac_sha256(&self.0, &[bytes]);
+    /// Strong etag of `bytes` held by the file object `stat` describes. The
+    /// etag is bound to the object (device and inode): a second file with the
+    /// same bytes, such as a guess an agent writes next to a masked value, gets a
+    /// different etag, so an etag never confirms a guess of a masked value.
+    pub fn strong(&self, stat: &super::resolve::Stat, bytes: &[u8]) -> String {
+        // device, inode and modification time: a recycled inode number (delete, then
+        // create a candidate) is a different file with a different mtime
+        let identity = format!(
+            "{}:{}:{}:{}:",
+            stat.dev, stat.ino, stat.mtime_secs, stat.mtime_nanos
+        );
+        let mac = hmac_sha256(&self.0, &[b"strong:", identity.as_bytes(), bytes]);
+        format!("h:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
+    }
+
+    /// Request-local approval binding. Kept in a separate MAC domain from file
+    /// etags: a payload token must never act as a content-only file hash.
+    pub(crate) fn supervised_token(&self, bytes: &[u8]) -> String {
+        let mac = hmac_sha256(&self.0, &[b"supervised:", bytes]);
         format!("h:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
     }
 
@@ -113,20 +132,36 @@ mod tests {
     }
 
     #[test]
-    fn etag_is_keyed_stable_and_shaped() {
+    fn etag_is_keyed_stable_shaped_and_bound_to_the_file_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p1, p2) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&p1, b"x").unwrap();
+        std::fs::write(&p2, b"x").unwrap();
+        let s1 = crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&p1).unwrap());
+        let s2 = crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&p2).unwrap());
         let a = EtagKey::from_bytes([1; 32]);
         let b = EtagKey::from_bytes([2; 32]);
-        let one = a.strong(b"HF_TOKEN=hunter2\n");
-        assert_eq!(one, a.strong(b"HF_TOKEN=hunter2\n"));
+        let one = a.strong(&s1, b"HF_TOKEN=hunter2\n");
+        assert_eq!(one, a.strong(&s1, b"HF_TOKEN=hunter2\n"));
         assert_ne!(
             one,
-            b.strong(b"HF_TOKEN=hunter2\n"),
+            b.strong(&s1, b"HF_TOKEN=hunter2\n"),
             "key must change the etag"
         );
-        assert_ne!(one, a.strong(b"HF_TOKEN=hunter3\n"));
+        assert_ne!(one, a.strong(&s1, b"HF_TOKEN=hunter3\n"));
+        assert_ne!(
+            one,
+            a.strong(&s2, b"HF_TOKEN=hunter2\n"),
+            "the same bytes in another file must not share an etag (no guess oracle)"
+        );
+        // the same device, inode and bytes with another modification time (a recycled inode
+        // number is a different file) is a different etag
+        let mut later = s1;
+        later.mtime_secs += 1;
+        assert_ne!(one, a.strong(&later, b"HF_TOKEN=hunter2\n"));
         assert!(one.starts_with("h:"));
         assert_eq!(one.len(), 2 + ETAG_CHARS);
-        assert_ne!(one, EtagKey::random().strong(b"HF_TOKEN=hunter2\n"));
+        assert_ne!(one, EtagKey::random().strong(&s1, b"HF_TOKEN=hunter2\n"));
     }
 
     #[test]

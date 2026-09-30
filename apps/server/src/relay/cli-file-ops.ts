@@ -160,6 +160,17 @@ function takeRateSlot(
   return { ok: true };
 }
 
+/** Gives back the slot of an op that was never sent (nothing reached the CLI). */
+function refundRateSlot(userId: string, mutating: boolean, at: number): void {
+  for (const map of mutating ? [opTimesByUser, mutationTimesByUser] : [opTimesByUser]) {
+    const times = map.get(userId);
+    if (!times) continue;
+    const index = times.lastIndexOf(at);
+    if (index >= 0) times.splice(index, 1);
+    if (times.length === 0) map.delete(userId);
+  }
+}
+
 function pendingCounts(userId: string, cliDeviceId: string): { user: number; cli: number } {
   let user = 0;
   let cli = 0;
@@ -267,10 +278,36 @@ function auditOutcomeOf(
   if (outcome.ok) return { outcome: "completed", reason: null };
   if (outcome.outcome === "unknown") return { outcome: "unknown", reason: outcome.code };
   if (!audit.registered) return { outcome: "refused", reason: outcome.code };
+  if (CLI_ANSWERED.has(outcome)) {
+    // The CLI answered: its mode/root/load refusals ran nothing, its own
+    // `cancelled` is a cancellation, everything else (including its own
+    // timeout) is a failure of the op.
+    if (REFUSED_BY_CLI_CODES.has(outcome.code)) return { outcome: "refused", reason: outcome.code };
+    return {
+      outcome: outcome.code === "cancelled" ? "cancelled" : "failed",
+      reason: outcome.code,
+    };
+  }
   return {
     outcome: CANCELLED_CODES.has(outcome.code) ? "cancelled" : "failed",
     reason: outcome.code,
   };
+}
+
+/**
+ * An input the MCP layer refused before `runFileOp` (strict shape, content the
+ * relay cannot carry): recorded as a refusal like the commands' `invalid_command`.
+ * The device is unverified there, so the row stores the unknown-device id.
+ */
+export function auditRefusedFileInput(input: {
+  userId: string;
+  tokenId: string;
+  cliDeviceId: string;
+  op: FileOp;
+  args: unknown;
+}): void {
+  const audit = newFileAudit({ ...input, expiresAt: null });
+  recordFileAudit(audit, { ok: false, code: "invalid_input" });
 }
 
 /** The ONE call site of `recordCliAgentAction` for file ops. Never throws. */
@@ -336,10 +373,37 @@ function serverFailure(record: FileOpRecord, code: FileOpErrorCode): FileOpFailu
   return { ok: false, code, ...(record.mutating ? { outcome: "unknown" as const } : {}) };
 }
 
-function rejectionFailure(reason: FileRejectReason, detail?: FileRejectDetail): FileOpFailure {
-  // The CLI's own refusals are definitive: nothing was committed.
-  if (reason === "bad_frame") return { ok: false, code: "io_error" };
-  return { ok: false, code: reason, ...(detail ? { detail } : {}) };
+/** Failures the CLI itself answered with (rather than the server ending the op), for the audit. */
+const CLI_ANSWERED = new WeakSet<object>();
+
+/** The CLI's own mode/root/load refusals: nothing ran. */
+const REFUSED_BY_CLI_CODES: ReadonlySet<string> = new Set([
+  "unsupported",
+  "limit",
+  "supervised_only",
+  "feature_disabled",
+]);
+
+function cliAnswered<T extends FileOpFailure>(failure: T): T {
+  CLI_ANSWERED.add(failure);
+  return failure;
+}
+
+function rejectionFailure(
+  reason: FileRejectReason,
+  detail: FileRejectDetail | undefined,
+  mutating: boolean,
+): FileOpFailure {
+  // The CLI's own refusals are definitive (nothing was committed), with one
+  // exception: after its commit point the file library can still fail (a
+  // directory sync, a post-rename check) and the CLI cannot send a result that
+  // is too big. For a mutation those two say nothing about whether the change
+  // was made, so the outcome is unknown and the agent must file_stat first.
+  if (mutating && reason === "io_error") {
+    return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
+  }
+  if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
+  return cliAnswered({ ok: false, code: reason, ...(detail ? { detail } : {}) });
 }
 
 const utf8 = new TextDecoder("utf-8", { fatal: true });
@@ -348,6 +412,11 @@ const utf8 = new TextDecoder("utf-8", { fatal: true });
 function finishResult(record: FileOpRecord, frame: FileResultFrame, spilled: string | null) {
   if (frame.op !== record.op) {
     settle(record, serverFailure(record, "io_error"));
+    return;
+  }
+  // An answer that lands after the credential expired is not delivered.
+  if (record.tokenExpiresAt !== null && Date.now() >= record.tokenExpiresAt) {
+    settle(record, serverFailure(record, "token_inactive"));
     return;
   }
   const result = { ...frame.result };
@@ -407,7 +476,7 @@ function newRecord(input: {
       finishResult(record, frame, text);
     },
     markRejected(reason, detail) {
-      settle(record, rejectionFailure(reason, detail));
+      settle(record, rejectionFailure(reason, detail, record.mutating));
     },
     markMalformed() {
       settle(record, serverFailure(record, "io_error"));
@@ -477,6 +546,9 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   }
   // An abort before registration applies nothing; once a supervised id exists
   // its caller preserves it and no abort cancels the person's pending request.
+  // The caller may have gone while the admission read: never start new work for
+  // a request that is already aborted (a cancel after the dispatch could lose a
+  // race with a fast mutation).
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
   const verdict = judgeCliAgentAdmission(reads, mutating ? "file_write" : "file_read");
   // From the verdict to the dispatch nothing awaits (see `Admission`).
@@ -565,7 +637,8 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   if (counts.cli >= FILE_OPS_PER_CLI || counts.user >= FILE_OPS_PER_USER) {
     return { ok: false, code: "limit", retryAfterMs: CONCURRENCY_RETRY_AFTER_MS };
   }
-  const slot = takeRateSlot(input.userId, mutating, Date.now());
+  const slotAt = Date.now();
+  const slot = takeRateSlot(input.userId, mutating, slotAt);
   if (!slot.ok) return { ok: false, code: "limit", retryAfterMs: slot.retryAfterMs };
 
   return await new Promise<FileOpOutcome>((resolve) => {
@@ -576,7 +649,14 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       tokenId: input.tokenId,
       cliDeviceId: input.cliDeviceId,
       op: input.op,
-      tokenExpiresAt: verdict.token.expiresAt ? verdict.token.expiresAt.getTime() : null,
+      // The earliest expiry the credential carries (its row and the one it was admitted with).
+      tokenExpiresAt: [verdict.token.expiresAt, input.expiresAt]
+        .filter((date): date is Date => date !== null)
+        .reduce<number | null>(
+          (earliest, date) =>
+            earliest === null ? date.getTime() : Math.min(earliest, date.getTime()),
+          null,
+        ),
       resolve,
     });
     pendingById.set(opId, record);
@@ -595,15 +675,24 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       pendingById.delete(opId);
       record.settled = true;
       audit.registered = false;
+      refundRateSlot(input.userId, mutating, slotAt);
       relaySessionManager.forgetFileOp(record.cliDeviceId, opId);
       const refusal = relaySessionManager.fileOpModeRefusal(input.cliDeviceId, opClass);
       resolve({ ok: false, code: refusal ?? "offline" });
       return;
     }
-    record.deadlineTimer = setTimeout(() => {
-      relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
-      settle(record, serverFailure(record, "timeout"));
-    }, FILE_OP_DEADLINE_MS);
+    // The op ends at its deadline, or at the credential's expiry if that is
+    // sooner: an expiring token keeps no authority until the minute sweep.
+    const untilExpiry =
+      record.tokenExpiresAt === null ? Infinity : record.tokenExpiresAt - Date.now();
+    const expiresFirst = untilExpiry < FILE_OP_DEADLINE_MS;
+    record.deadlineTimer = setTimeout(
+      () => {
+        relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
+        settle(record, serverFailure(record, expiresFirst ? "token_inactive" : "timeout"));
+      },
+      expiresFirst ? Math.max(0, untilExpiry) : FILE_OP_DEADLINE_MS,
+    );
     record.deadlineTimer.unref?.();
     const onAbort = () => {
       if (record.settled) return;

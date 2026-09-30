@@ -48,6 +48,8 @@ const requiredFragments = [
   "capacity_lease_one_live_attempt",
   "enforce_capacity_reference_consistency",
   "create_execution_target_capacity",
+  "inference_capacity_auto_label",
+  "allocate_auto_capacity_label",
   "execution-target:' || target.id",
   "pg_get_constraintdef",
   'ON CONFLICT ("discoveredModelId") DO NOTHING',

@@ -38,8 +38,8 @@ type CliOwnerState = {
 };
 
 /**
- * The owner's account state, read inside the admission (same `Promise.all`
- * as the device and token reads) so the verdict needs no await after
+ * The owner's account state, read last inside the admission, after the
+ * device and token reads, so the verdict needs no await after
  * `admitted()`. See `Admission` for why a mark committed after this read is
  * still covered.
  */
@@ -66,9 +66,9 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
  * - swept later: the record exists by then (closing the admission,
  *   registering the record and sending the frame happen in one synchronous
  *   step) and the sweep ends it like any other.
- * The owner read (ban, ban expiry, deletion marker) is issued in the same
- * `Promise.all`, so its verdict is also taken without an await after
- * `admitted()`. A deletion mark is ordered against a start the same way:
+ * The owner read (ban, ban expiry, deletion marker) is issued last, so its
+ * verdict is taken without an await after `admitted()`. A deletion mark is
+ * ordered against a start the same way:
  * - committed before the owner read: the read sees it and the start refuses;
  * - committed after it: `notifyUserDeletionMarked` runs the in-process
  *   `closeSessionsForUser`, which tears down and detaches the device socket
@@ -154,8 +154,8 @@ export type CliAgentAdmissionReads = {
 };
 
 /**
- * Open the admission and read the device, the live token and the owner in one
- * `Promise.all`. The admission is closed before this returns; the verdict
+ * Open the admission, read the device and live token together, then the
+ * owner last. The admission is closed before this returns; the verdict
  * (`judgeCliAgentAdmission`) must be taken in the caller's next synchronous step.
  */
 export async function readCliAgentAdmission(
@@ -166,7 +166,7 @@ export async function readCliAgentAdmission(
   let token: LiveCliToken | null;
   let owner: CliOwnerState | null;
   try {
-    [device, token, owner] = await Promise.all([
+    [device, token] = await Promise.all([
       prisma.cliDevice.findUnique({
         where: { id: input.cliDeviceId },
         select: {
@@ -177,8 +177,12 @@ export async function readCliAgentAdmission(
         },
       }),
       liveCliToken(input.tokenId, input.userId),
-      readCliOwner(input.userId),
     ]);
+    // The owner is read LAST: a ban or deletion committed before this read is
+    // seen by the verdict, and the window between this read and the dispatch is
+    // one synchronous step (a stale owner snapshot taken before the slower
+    // device read would extend it).
+    owner = await readCliOwner(input.userId);
   } finally {
     openAdmissions.delete(admission);
   }

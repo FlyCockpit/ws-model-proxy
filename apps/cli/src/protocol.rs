@@ -237,7 +237,7 @@ impl SupervisedFileOutcome {
             "rename" => FileMutationOp::Rename,
             "mkdir" => FileMutationOp::Mkdir,
             "delete" => FileMutationOp::Delete,
-            _ => return Self::error(FileErrorCode::InvalidInput),
+            _ => return Self::error(FileErrorCode::IoError),
         };
         // The only wire-enforcement point for the supervised no-read rule.
         // A future library result must not leak a diff through this frame.
@@ -3068,6 +3068,33 @@ mod relay_27_vectors {
     }
 
     #[test]
+    fn llama_alias_probe_survives_endpoint_inventory_wire_projection() {
+        for (props, expected) in [
+            (r#"{"total_slots":4}"#, Some(vec!["a", "b"])),
+            (r#"{"role":"router","total_slots":4}"#, None),
+        ] {
+            let detected = crate::engine::detect_with(
+                None,
+                &[("a".to_string(), None), ("b".to_string(), None)],
+                |route, _| (route == "props").then(|| props.to_string()),
+            );
+            let endpoint = EndpointConfig {
+                last_probe: probed(detected, &["a", "b"]),
+                ..EndpointConfig::default()
+            };
+            let encoded = serde_json::to_value(inventory(&endpoint)).expect("inventory wire");
+            let aliases = encoded["engineFacts"].get("servedModelAliases");
+            match expected {
+                Some(ids) => assert_eq!(
+                    aliases,
+                    Some(&serde_json::json!({"value": ids, "source": "probe"}))
+                ),
+                None => assert!(aliases.is_none()),
+            }
+        }
+    }
+
+    #[test]
     fn hello_with_engine_facts_matches_the_shared_vector() {
         let vllm = EndpointConfig {
             slug: "vllm".to_string(),
@@ -3767,7 +3794,7 @@ mod relay_28_vectors {
     #[test]
     fn a_malformed_file_op_is_rejected_by_name_and_other_bad_file_frames_are_ignored() {
         let id = "AAECAwQFBgcICQoLDA0ODw";
-        // Missing `args`: unparseable, but it names its op.
+        // Missing `args`: unparsable, but it names its op.
         let missing = format!(r#"{{"type":"file.op","opId":"{id}","op":"read"}}"#);
         assert!(parse_server_control(&missing).is_err());
         assert!(matches!(

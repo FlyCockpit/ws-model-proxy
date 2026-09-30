@@ -57,12 +57,13 @@ const cliRuntime = vi.hoisted(() => ({
 
 vi.mock("../relay/cli-commands.js", () => cliRuntime);
 
-const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn() }));
+const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn(), auditRefusedFileInput: vi.fn() }));
 
 vi.mock("../relay/cli-file-ops.js", () => ({
   runFileOp: fileRuntime.runFileOp,
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: fileRuntime.auditRefusedFileInput,
 }));
 
 // The full-chain test drives the Phase 4 request handler whose verifier is
@@ -2206,10 +2207,14 @@ describe("CLI file tools", () => {
     const edit = tools.find((tool) => tool.name === "forwarder_cli_file_edit");
     expect(read?.description).toContain("NOT a security boundary");
     expect(read?.description).toContain("⟦redacted:N⟧");
-    expect(read?.description).toContain("SSH private keys");
+    expect(read?.description).toContain("private-key blocks");
     expect(read?.description).toContain("ifNoneMatch");
     expect(edit?.description).toContain("expectedEtag");
     expect(edit?.description).toContain("forwarder_cli_file_stat");
+    expect(edit?.description).toContain("io_error");
+    expect(edit?.description).toContain("NOT idempotent");
+    const commandResult = tools.find((tool) => tool.name === "forwarder_cli_command_result");
+    expect(commandResult?.description).toContain("CLI io_error");
     expect(edit?.description).toContain('confirm: "RUN"');
     // G3: the 64 KiB request-fit rule is stated on the tools whose advertised
     // maxima can exceed it (stat's 50 paths, list/search patterns), and the
@@ -2303,6 +2308,44 @@ describe("CLI file tools", () => {
       if (field !== "(input)") expect(issues?.some((i) => i.path.join(".") === field)).toBe(true);
     }
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("audits an input refused in the MCP layer as a refusal (#104)", async () => {
+    fileRuntime.auditRefusedFileInput.mockClear();
+    await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", surprise: 1 });
+    await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n",
+      content: "not base64!!",
+      encoding: "base64",
+      confirm: "RUN",
+    });
+    expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(2);
+    expect(fileRuntime.auditRefusedFileInput.mock.calls[1]?.[0]).toMatchObject({
+      op: "write",
+      userId: USER.id,
+      tokenId: "token-pat-1",
+    });
+    expect(JSON.stringify(fileRuntime.auditRefusedFileInput.mock.calls)).not.toContain(
+      "not base64",
+    );
+  });
+
+  it("scrubs credential substrings from a CLI-supplied error detail", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "conflict",
+      detail: { currentEtag: "h:wsmp_cli_abcdef0123456789xyz" },
+    });
+    const result = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      edits: [{ oldText: "a", newText: "b" }],
+      confirm: "RUN",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toMatch(/wsmp_cli_[A-Za-z0-9]{6,}/);
+    expect(structured(result).error?.code).toBe("conflict");
   });
 
   it("keeps unchanged:true in the ifNoneMatch answer", async () => {
@@ -2496,6 +2539,10 @@ describe("CLI file tools", () => {
       [
         { ok: false, code: "offline", outcome: "unknown" },
         { code: "offline", outcome: "unknown" },
+      ],
+      [
+        { ok: false, code: "io_error", outcome: "unknown" },
+        { code: "io_error", outcome: "unknown" },
       ],
       [
         { ok: false, code: "upgrade_required", rejectedProtocolVersion: "2.7" },
@@ -2692,6 +2739,7 @@ describe("CLI file tools", () => {
     ["declined", "The person declined the file operation; nothing was applied"],
     ["timeout", "The file operation timed out"],
     ["offline", "The CLI is offline or does not support file tools"],
+    ["io_error", "The file operation failed"],
     [
       "secret_file",
       "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
@@ -2699,7 +2747,7 @@ describe("CLI file tools", () => {
   ] as const)(
     "polls supervised file error %s with its exact documented message",
     async (code, message) => {
-      const unknown = code === "timeout" || code === "offline";
+      const unknown = code === "timeout" || code === "offline" || code === "io_error";
       cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
         kind: "supervised",
         requestKind: "file",

@@ -25,7 +25,7 @@ import {
   stableJson,
 } from "../lib/provider-catalog-model";
 import { isOpenRouterProviderType } from "../lib/provider-type";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
+import { runSerializableCapacityCreationTransaction } from "../lib/serializable-transaction";
 
 /**
  * OpenRouter public catalog: search, "import from catalog", and the pool
@@ -398,7 +398,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
         // The pre-lock read establishes the serializable snapshot; a
         // concurrent insert, delete or restore of that row fails this
         // transaction with a serialization error, which is retried.
-        const outcome = await runSerializableTransaction(async (tx) => {
+        const outcome = await runSerializableCapacityCreationTransaction(async (tx) => {
           const known = await tx.providerModel.findFirst({
             where: {
               userId,

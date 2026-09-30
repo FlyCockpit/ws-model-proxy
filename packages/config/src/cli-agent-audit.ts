@@ -169,100 +169,185 @@ export const CLI_AGENT_ACTION_UNKNOWN_DEVICE = "unknown";
 
 /**
  * Stored as the program of a command event when it cannot be extracted (empty,
- * unparsable, or a name outside the allowed charset/length).
+ * unparsable, or not in {@link CLI_AGENT_PROGRAM_ALLOWLIST}).
  */
 export const CLI_AGENT_ACTION_UNKNOWN_PROGRAM = "?";
 
-/** The only names a stored program may have: a bare name, no `/`, `+`, quotes, NUL or non-ASCII. */
-const PROGRAM_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
-
 /**
- * cmd.exe internal commands (Microsoft's `cmd` command list and SS64's
- * internal-command list). The CLI runs a headless command through `sh -c`, or
- * through `cmd /C` on a Windows device without `sh` (apps/cli/src/child_env.rs
- * `exec_shell`), and the relay does not know which. `cmd` ends a built-in's
- * name at `.`, so `echo.x` runs `echo` with an argument: a built-in name
- * followed by `.` is not a program word.
+ * The ONLY program names that can ever be stored for a command row (owner
+ * decision 2026-09-29, #151). A fixed, code-reviewed list of common program
+ * basenames, all lowercase and all matching `[a-z0-9-]`: extraction returns a
+ * member of this set or `?`, never a substring of the command, so nothing
+ * user-controlled reaches the row. Wrappers (`sudo`, `env`, `nohup`, `time`,
+ * `exec`) are stored by their own name and never unwrapped. Add a name only
+ * after review; keep it lowercase, without `/`, `.`, quotes or non-ASCII.
  */
-const CMD_BUILTINS: ReadonlySet<string> = new Set([
-  "assoc",
-  "break",
-  "call",
-  "cd",
-  "chdir",
-  "cls",
-  "color",
-  "copy",
-  "date",
-  "del",
-  "dir",
-  "dpath",
-  "echo",
-  "endlocal",
-  "erase",
-  "exit",
-  "for",
-  "ftype",
-  "goto",
-  "if",
-  "keys",
-  "md",
-  "mkdir",
-  "mklink",
-  "move",
-  "path",
-  "pause",
-  "popd",
-  "prompt",
-  "pushd",
-  "rd",
-  "rem",
-  "ren",
-  "rename",
-  "rmdir",
-  "set",
-  "setlocal",
-  "shift",
-  "start",
+export const CLI_AGENT_PROGRAM_ALLOWLIST: ReadonlySet<string> = new Set([
+  // wrappers
+  "sudo",
+  "env",
+  "nohup",
   "time",
-  "title",
-  "type",
-  "ver",
-  "verify",
-  "vol",
+  "exec",
+  // shells
+  "bash",
+  "sh",
+  "zsh",
+  "fish",
+  "dash",
+  // vcs and network
+  "git",
+  "gh",
+  "curl",
+  "wget",
+  "ssh",
+  "scp",
+  "rsync",
+  // build and language toolchains
+  "make",
+  "cmake",
+  "ninja",
+  "cargo",
+  "rustc",
+  "rustup",
+  "go",
+  "gcc",
+  "clang",
+  "python",
+  "python3",
+  "pip",
+  "pip3",
+  "uv",
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "bun",
+  "deno",
+  "java",
+  "mvn",
+  "gradle",
+  "dotnet",
+  "ruby",
+  "gem",
+  "php",
+  "composer",
+  // containers and infrastructure
+  "docker",
+  "podman",
+  "kubectl",
+  "helm",
+  "terraform",
+  "systemctl",
+  "journalctl",
+  // archives
+  "tar",
+  "zip",
+  "unzip",
+  "gzip",
+  "gunzip",
+  // filesystem and text tools
+  "ls",
+  "cat",
+  "cp",
+  "mv",
+  "rm",
+  "mkdir",
+  "touch",
+  "chmod",
+  "chown",
+  "ln",
+  "pwd",
+  "cd",
+  "echo",
+  "printf",
+  "head",
+  "tail",
+  "less",
+  "wc",
+  "sort",
+  "uniq",
+  "diff",
+  "tee",
+  "xargs",
+  "grep",
+  "rg",
+  "find",
+  "fd",
+  "sed",
+  "awk",
+  "jq",
+  "vim",
+  "nano",
+  // system
+  "ps",
+  "top",
+  "kill",
+  "df",
+  "du",
+  "sleep",
+  "which",
+  "test",
+  // model serving and GPU
+  "llama-server",
+  "llama-cli",
+  "ollama",
+  "vllm",
+  "nvidia-smi",
 ]);
 
+/** A leading `NAME=value` the relay may skip: only a plain, expansion-free value (never stored). */
+const PLAIN_ASSIGNMENT =
+  /[A-Za-z_][A-Za-z0-9_]*=(?:[A-Za-z0-9_./:@,+%^~-]*|"[^"\\$`\r\n]*"|'[^'\\\r\n]*')(?=[ \t]|$)[ \t]*/y;
+
+/** At most this many leading assignments are skipped; more is treated as unparsable. */
+const MAX_LEADING_ASSIGNMENTS = 32;
+
+/** A program word (after one quote layer): path characters only, no leading `-`. */
+const PROGRAM_WORD = /^[A-Za-z0-9._+~/-]{1,4096}$/;
+
 /**
- * The program of a command for the audit `path`: the FIRST word, and only when
- * it is a bare name that `sh` and `cmd /C` both read as the command word. That
- * is the whole grammar (design-c1b1.md):
+ * The program of a command for the audit `path`. The grammar (design-program.md):
  *
- * - Leading spaces and tabs are skipped; the word ends at the next space or
- *   tab. Nothing else is trimmed or split on: newline, CR, VT, FF, Unicode
- *   spaces, quotes, `/`, `+`, `=`, redirections and expansions all stay in the
- *   word and fail the name charset.
- * - A word that starts like an assignment (`NAME=`) or with `-` is not
- *   skipped, unwrapped or interpreted: `cmd` has no inline assignments and the
- *   value can hide a shell word, so it fails closed. `env`, `sudo` and other
- *   wrappers are stored by their own name.
- * - A built-in name followed by `.` fails closed (see {@link CMD_BUILTINS}).
+ * 1. Skip leading spaces and tabs, then any number (at most
+ *    {@link MAX_LEADING_ASSIGNMENTS}) of plain `NAME=value` assignments. A
+ *    value holding an escape, expansion, substitution, extra quote or line
+ *    break is not plain: the result is `?`. Skipped values are never stored.
+ * 2. The candidate is the next word, up to the next space or tab. One layer of
+ *    matching quotes around it is removed. What remains must be path
+ *    characters only (no `-` first, no `=`, `$`, redirection or backslash);
+ *    its basename (after the last `/`) is lowercased.
+ * 3. The result is that basename only if it is in
+ *    {@link CLI_AGENT_PROGRAM_ALLOWLIST}, else `?`.
  *
- * Anything else returns {@link CLI_AGENT_ACTION_UNKNOWN_PROGRAM}. It never
- * returns argument text: the result is the whole first word or `?`.
+ * The result is therefore always an allowlist member or `?`: never argument
+ * text, a secret, or any other part of the command.
  */
 export function commandProgram(command: unknown): string {
   if (typeof command !== "string" || command.length === 0) {
     return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
-  const word = command.replace(/^[ \t]+/, "").split(/[ \t]/, 1)[0] ?? "";
-  if (!PROGRAM_PATTERN.test(word) || word.startsWith("-") || word.includes("=")) {
+  let index = /^[ \t]*/.exec(command)?.[0].length ?? 0;
+  for (let skipped = 0; ; skipped++) {
+    PLAIN_ASSIGNMENT.lastIndex = index;
+    const match = PLAIN_ASSIGNMENT.exec(command);
+    if (match === null) break;
+    if (skipped >= MAX_LEADING_ASSIGNMENTS) return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
+    index += match[0].length;
+  }
+  let end = index;
+  while (end < command.length && command[end] !== " " && command[end] !== "\t") end++;
+  let word = command.slice(index, end);
+  const quote = word[0];
+  if ((quote === '"' || quote === "'") && word.length >= 2 && word.endsWith(quote)) {
+    word = word.slice(1, -1);
+  }
+  if (!PROGRAM_WORD.test(word) || word.startsWith("-")) {
     return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
   }
-  const stem = word.split(".")[0] ?? "";
-  if (stem !== word && CMD_BUILTINS.has(stem.toLowerCase())) {
-    return CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
-  }
-  return word;
+  const base = (word.split("/").pop() ?? "").toLowerCase();
+  return CLI_AGENT_PROGRAM_ALLOWLIST.has(base) ? base : CLI_AGENT_ACTION_UNKNOWN_PROGRAM;
 }
 
 /**
@@ -293,9 +378,9 @@ export const CLI_AGENT_ACTION_AUDIT_HKDF_INFO = "wsmp-cli-agent-audit-v1";
  * `path` of a command event: `hmac-sha256:<hex of the command text> <program>`.
  * The digest is over the well-formed command text itself (no mask), so with the
  * server-held key it can verify a guess but never reveals text; without the key
- * it reveals nothing. The only other field is {@link commandProgram}, a
- * validated program name (`?` when the caller had to truncate the command). `digest` is injected to keep this module free of Node
- * built-ins; it must return {@link CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE} when
+ * it reveals nothing. The only other field is {@link commandProgram}, an
+ * allowlisted program name (`?` when the caller had to truncate the command). `digest` is injected to
+ * keep this module free of Node built-ins; it must return {@link CLI_AGENT_ACTION_AUDIT_HASH_UNAVAILABLE} when
  * it has no key, and its output is stored verbatim after the prefix.
  */
 export function commandAuditPath(

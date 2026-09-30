@@ -29,6 +29,7 @@ vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: audit.record }));
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
 const {
+  auditRefusedFileInput,
   cancelFileOpsForToken,
   FILE_MUTATIONS_PER_MINUTE_PER_USER,
   FILE_OP_DEADLINE_MS,
@@ -44,11 +45,17 @@ const { resetCliAgentAdmissionsForTests } = await import("./cli-agent-admission.
 const db = prisma as unknown as {
   $transaction: MockInstance;
   user: { findUnique: MockInstance };
-  cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
+  cliDevice: {
+    upsert: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+    findUnique: MockInstance;
+  };
   cliToken: { updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { findUnique: MockInstance };
+  endpoint: { findUnique: MockInstance; findMany: MockInstance };
   discoveredModel: { findMany: MockInstance };
-  executionTarget: { findMany: MockInstance };
+  poolMember: { findMany: MockInstance; updateMany: MockInstance };
+  executionTarget: { findMany: MockInstance; findUnique: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
   mcpPersonalToken: { findFirst: MockInstance };
 };
@@ -258,6 +265,7 @@ describe("cli file ops", () => {
       slug: args.create.slug,
       allowHumanTerminal: false,
       mcpCommandMode: "UNSUPERVISED",
+      connectionGeneration: 1,
       inventorySeq: 0,
       inventoryDigest: null,
       inventoryAcknowledgedAt: null,
@@ -268,11 +276,16 @@ describe("cli file ops", () => {
       inventoryAcknowledgedAt: now,
       id: "desktop",
     });
+    db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
     db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED"));
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken());
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.updateMany.mockResolvedValue({ count: 0 });
     db.inferenceCapacity.findMany.mockResolvedValue([]);
   });
 
@@ -281,6 +294,208 @@ describe("cli file ops", () => {
     vi.restoreAllMocks();
     await resetRelaySessions();
     resetFileOpsForTests();
+  });
+
+  it("reports a mutation's io_error rejection as an unknown outcome, a read's as definitive; too_large stays definitive", async () => {
+    const socket = await connect();
+    for (const reason of ["io_error"]) {
+      const write = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(write).resolves.toEqual({ ok: false, code: reason, outcome: "unknown" });
+      socket.sends.length = 0;
+      const read = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(read).resolves.toEqual({ ok: false, code: reason });
+      socket.sends.length = 0;
+    }
+    // Other CLI refusals of a mutation stay definitive (too_large is a pre-commit size refusal).
+    const tooLarge = start(socket, "write", { path: "~/big" }, { body: new Uint8Array(1) });
+    await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+    await answer(
+      socket,
+      JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "too_large" }),
+    );
+    await expect(tooLarge).resolves.toEqual({ ok: false, code: "too_large" });
+    socket.sends.length = 0;
+    const conflict = start(socket, "edit", editArgs);
+    await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+    await answer(
+      socket,
+      JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "no_match" }),
+    );
+    await expect(conflict).resolves.toEqual({ ok: false, code: "no_match" });
+  });
+
+  it("gives the rate slot back for an op that was never sent", async () => {
+    const socket = await connect();
+    // A send that throws leaves nothing at the CLI; the slot must not stay spent.
+    const realSend = socket.send.bind(socket);
+    let armed = true;
+    socket.send = (data) => {
+      if (armed) {
+        armed = false;
+        throw new Error("socket send failed");
+      }
+      realSend(data);
+    };
+    const first = await runFileOp({
+      ...OP_TOKEN,
+      cliDeviceId: "desktop",
+      op: "delete",
+      args: { path: "~/a" },
+    });
+    expect(first.ok).toBe(false);
+    for (let index = 0; index < FILE_MUTATIONS_PER_MINUTE_PER_USER; index += 1) {
+      const outcome = start(socket, "mkdir", { path: `~/d${index}` });
+      await waitFor(() => expect(socket.frames("file.op").length).toBe(index + 1));
+      await answer(socket, resultFor(lastOpId(socket), "mkdir", { created: true }));
+      await expect(outcome).resolves.toMatchObject({ ok: true });
+    }
+  });
+
+  describe("credential lifetime and abort during admission", () => {
+    it("ends an in-flight op at the token's expiry, not at the minute sweep", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const socket = await connect();
+      const expiresAt = new Date(Date.now() + 5_000);
+      db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken(expiresAt));
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        expiresAt,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+      });
+      await flush();
+      const opId = lastOpId(socket);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "token_inactive",
+        outcome: "unknown",
+      });
+      expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+    });
+
+    it("does not deliver an answer that lands after the token expired", async () => {
+      const socket = await connect();
+      const expiresAt = new Date(Date.now() + 60_000);
+      db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken(expiresAt));
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        expiresAt,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      vi.spyOn(Date, "now").mockReturnValue(expiresAt.getTime() + 1);
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+
+    it("never dispatches an op whose request was aborted during admission", async () => {
+      const socket = await connect();
+      const controller = new AbortController();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+        signal: controller.signal,
+      });
+      await reached;
+      controller.abort();
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(outcome).resolves.toEqual({ ok: false, code: "cancelled" });
+      expect(socket.sends).toEqual([]);
+    });
+
+    it("sees a ban that lands while the device is being read (the owner is read last)", async () => {
+      const socket = await connect();
+      let releaseDevice!: (row: unknown) => void;
+      let deviceEntered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        deviceEntered = resolve;
+      });
+      db.cliDevice.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseDevice = resolve;
+            deviceEntered();
+          }),
+      );
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+      });
+      await reached;
+      // The ban commits while the device read is still pending.
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      releaseDevice({
+        id: "desktop",
+        userId: "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+        rejectedRelayProtocolVersion: null,
+      });
+      await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+  });
+
+  it("passes the library's replaced/gone conflict words through as a definitive conflict", async () => {
+    const socket = await connect();
+    for (const word of ["replaced", "gone"]) {
+      const outcome = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "conflict",
+          detail: { currentEtag: word },
+        }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "conflict",
+        detail: { currentEtag: word },
+      });
+      expect(socket.closes).toEqual([]);
+      socket.sends.length = 0;
+    }
   });
 
   describe("audit (#104 part B)", () => {
@@ -453,6 +668,69 @@ describe("cli file ops", () => {
       expect(events()).toHaveLength(2);
       expect(events()[0]).toMatchObject({ outcome: "cancelled", reason: "timeout" });
       expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "offline" });
+    });
+
+    it("records a mutation's unknown outcome after an io_error rejection, and CLI mode refusals as refused", async () => {
+      const socket = await connect();
+      const big = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "io_error" }),
+      );
+      await big;
+      const root = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "unsupported" }),
+      );
+      await root;
+      expect(events()[0]).toMatchObject({
+        kind: "file_edit",
+        outcome: "unknown",
+        reason: "io_error",
+      });
+      expect(events()[1]).toMatchObject({
+        kind: "file_read",
+        outcome: "refused",
+        reason: "unsupported",
+      });
+    });
+
+    it("writes a metadata-only refusal row for an input the MCP layer refused", () => {
+      auditRefusedFileInput({
+        userId: "user-id",
+        tokenId: "token",
+        cliDeviceId: "attacker-chosen-device",
+        op: "write",
+        args: { path: "~/n.txt", expectedEtag: "h:AAAAAAAAAAAAAAAAAAAAAA" },
+      });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "file_write",
+        path: "~/n.txt",
+        etagBefore: "h:AAAAAAAAAAAAAAAAAAAAAA",
+        outcome: "refused",
+        reason: "invalid_input",
+        cliDeviceId: "unknown",
+      });
+    });
+
+    it("records the CLI's own supervised_only refusal as refused and its cancelled as cancelled", async () => {
+      const socket = await connect();
+      for (const reason of ["supervised_only", "cancelled"]) {
+        const outcome = start(socket, "read", readArgs);
+        await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+        await answer(
+          socket,
+          JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+        );
+        await outcome;
+        socket.sends.length = 0;
+      }
+      expect(events()[0]).toMatchObject({ outcome: "refused", reason: "supervised_only" });
+      expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {

@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  FILE_ERROR_CODES,
   FILE_OPS,
   fileCancelFrameSchema,
   fileOpFrameSchema,
@@ -281,6 +282,25 @@ describe("relay 2.8 file frames: CLI to server", () => {
     expect(() => parseRelayClientControlFrame(JSON.stringify(noId))).toThrow();
   });
 
+  it("accepts only library-shaped etags in results and rejection details", () => {
+    const base = clone(vector("file-result-edit")) as { result: Record<string, unknown> };
+    for (const bad of [
+      "h:short",
+      "x:AAAAAAAAAAAAAAAAAAAAAA",
+      "wsmp_cli_secretsecretsecretsecret",
+      "h:AAAAAAAAAAAAAAAAAAAAA!",
+    ]) {
+      const frame = clone(base);
+      frame.result.etag = bad;
+      expect(() => parseRelayClientControlFrame(JSON.stringify(frame)), bad).toThrow();
+      const rejected = { ...clone(vector("file-rejected-conflict")), detail: { currentEtag: bad } };
+      expect(() => parseRelayClientControlFrame(JSON.stringify(rejected)), bad).toThrow();
+    }
+    const weak = clone(base);
+    weak.result.etag = "w:AAAAAAAAAAAAAAAAAAAAAA";
+    expect(() => parseRelayClientControlFrame(JSON.stringify(weak))).not.toThrow();
+  });
+
   it("frames file.data metadata", () => {
     const metadata = vector("file-data-metadata") as { type: "file.data"; opId: string };
     const frame = encodeRelayBinaryFrame(metadata, new Uint8Array(70_000));
@@ -291,6 +311,37 @@ describe("relay 2.8 file frames: CLI to server", () => {
 });
 
 describe("relay 2.8 supervised-file strict schema", () => {
+  it.each(FILE_ERROR_CODES)("accepts the shared file error code %s after a keypress", (code) => {
+    const frame = { type: "supervised.done", commandId: OP_ID, review: false, fileError: { code } };
+    expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+  });
+
+  it.each(["replaced", "gone"])(
+    "keeps %s as a conflict detail, outside the error-code set",
+    (currentEtag) => {
+      const frame = {
+        type: "file.rejected",
+        opId: OP_ID,
+        reason: "conflict",
+        detail: { currentEtag },
+      };
+      expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+      expect(() =>
+        parseRelayClientControlFrame(JSON.stringify({ ...frame, reason: currentEtag })),
+      ).toThrow();
+      expect(() =>
+        parseRelayClientControlFrame(
+          JSON.stringify({
+            type: "supervised.done",
+            commandId: OP_ID,
+            review: false,
+            fileError: { code: currentEtag },
+          }),
+        ),
+      ).toThrow();
+    },
+  );
+
   it("accepts the file term.spawn payload and supervised.done fileResult vectors", () => {
     const spawn = vector("file-term-spawn") as {
       fileOp: unknown;

@@ -112,6 +112,11 @@ impl Policy {
                 "this tree holds special files and is not accessible",
             ));
         }
+        if access != Access::Read && is_staging_name(full) {
+            return Err(FileError::denied(
+                "temporary files of the file tools are not accessible",
+            ));
+        }
         if access != Access::Read && super::redact::is_secret_scope(full) {
             return Err(FileError::new(
                 ErrorCode::SecretFile,
@@ -178,27 +183,73 @@ impl Policy {
     }
 }
 
+/// A name that `atomic::replace` stages a replacement under
+/// (`.<name>.wsmp-<10 alphanumerics>`): another tool call must not be able to
+/// swap the staged object between its fsync and its rename.
+fn is_staging_name(path: &Path) -> bool {
+    // folded like every path classification: Unicode case variants (`.wſmp-`) and
+    // trailing dots or spaces name the same staged object on a casefold volume
+    let folded = super::redact::fold(&path.to_string_lossy());
+    let name = folded.rsplit('/').next().unwrap_or_default();
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    rest.rsplit_once(".wsmp-").is_some_and(|(_, suffix)| {
+        suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
 /// `path` with its deepest existing ancestor resolved to the physical path
 /// (`WSMP_STATE_DIR` may be reached through a symlink, and the leaf may not
 /// exist yet). Resolution compares physical paths, so a protected entry must be
 /// expressed as one too.
 fn physical(path: &Path) -> PathBuf {
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut base = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(base) {
-            let mut out = real;
-            out.extend(rest.iter().rev());
-            return out;
-        }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
-                base = parent;
+    // a relative selector (`WSMP_STATE_DIR=state`) is anchored to the working
+    // directory first: resolved paths are absolute, so the alias must be too
+    let anchored;
+    let path = if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                anchored = cwd.join(path);
+                anchored.as_path()
             }
-            _ => return path.to_path_buf(),
+            Err(_) => path,
+        }
+    } else {
+        path
+    };
+    // Components are applied in order, the way the OS walks them: an existing
+    // component is resolved physically (symlinks included) before the component
+    // after it is looked at, and a missing name is only cancelled by a following
+    // `..` once no existing symlink stands in between.
+    let mut cur = PathBuf::new();
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if missing.pop().is_none() {
+                    cur.pop();
+                }
+            }
+            std::path::Component::Normal(name) if missing.is_empty() => {
+                let next = cur.join(name);
+                match std::fs::canonicalize(&next) {
+                    Ok(real) => cur = real,
+                    Err(_) => missing.push(name),
+                }
+            }
+            std::path::Component::Normal(name) => missing.push(name),
+            root => {
+                cur.push(root.as_os_str());
+                if let Ok(real) = std::fs::canonicalize(&cur) {
+                    cur = real;
+                }
+            }
         }
     }
+    cur.extend(missing);
+    cur
 }
 
 /// Every protected entry under both its configured and its physical name.
@@ -262,6 +313,61 @@ mod tests {
             subtree,
             deny,
         }
+    }
+
+    /// A relative selector whose parents do not exist yet still gets an absolute
+    /// alias (the operation paths are absolute).
+    #[test]
+    fn relative_missing_protected_path_gets_an_absolute_alias() {
+        let rel = PathBuf::from("wsmp-nonexistent-state-dir/deeper/device-auth.json");
+        let aliases = with_physical_aliases(vec![Protected {
+            path: rel.clone(),
+            subtree: false,
+            deny: Deny::ReadWrite,
+        }]);
+        let want = physical(&std::env::current_dir().unwrap()).join(&rel);
+        assert!(
+            aliases.iter().any(|p| p.path == want),
+            "{aliases:?} lacks {want:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_after_a_collapsed_dotdot_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
+        let configured = root.join("missing/../link/f");
+        assert_eq!(physical(&configured), root.join("real/sub/f"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_then_parent_after_a_missing_ancestor_follows_the_os() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
+        // ghost/.. cancels; then link -> real/sub, and `..` leaves it for `real`
+        let configured = root.join("ghost/../link/../state/device-auth.json");
+        assert_eq!(
+            physical(&configured),
+            root.join("real/state/device-auth.json")
+        );
+    }
+
+    #[test]
+    fn dotdot_after_a_missing_ancestor_is_collapsed_in_the_alias() {
+        let cwd = physical(&std::env::current_dir().unwrap());
+        let rel = PathBuf::from("wsmp-missing-a/spare/../state/device-auth.json");
+        assert_eq!(
+            physical(&rel),
+            cwd.join("wsmp-missing-a/state/device-auth.json")
+        );
+        let up = PathBuf::from("wsmp-missing-a/../../wsmp-x.json");
+        assert_eq!(physical(&up), cwd.parent().unwrap().join("wsmp-x.json"));
     }
 
     #[test]

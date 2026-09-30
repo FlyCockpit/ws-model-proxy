@@ -260,9 +260,27 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
     assert!(file.exists());
 
     assert_eq!(
-        filter_detail(&json!({ "currentEtag": "h:x", "secret": "leak", "lines": [1, 2] })),
-        Some(json!({ "currentEtag": "h:x", "lines": [1, 2] }))
+        filter_detail(
+            &json!({ "currentEtag": "h:AAAAAAAAAAAAAAAAAAAAAA", "secret": "leak", "lines": [1, 2] })
+        ),
+        Some(json!({ "currentEtag": "h:AAAAAAAAAAAAAAAAAAAAAA", "lines": [1, 2] }))
     );
+    // Only etag-shaped text, or the library's `replaced`/`gone`, is a currentEtag.
+    for word in ["replaced", "gone"] {
+        assert_eq!(
+            filter_detail(&json!({ "currentEtag": word })),
+            Some(json!({ "currentEtag": word }))
+        );
+    }
+    for bad in [
+        "h:x",
+        "wsmp_cli_secretsecretsecretsecret",
+        "x:AAAAAAAAAAAAAAAAAAAAAA",
+        "",
+    ] {
+        assert_eq!(filter_detail(&json!({ "currentEtag": bad })), None, "{bad}");
+    }
+    assert_eq!(filter_detail(&json!({ "etag": "gone" })), None);
     assert_eq!(filter_detail(&json!({ "lines": [1, 2, 3, 4, 5, 6] })), None);
     assert_eq!(filter_detail(&json!({ "sniff": 5 })), None);
     assert_eq!(filter_detail(&json!("x")), None);
@@ -449,6 +467,38 @@ fn text_at_the_inline_limit_stays_inline() {
 }
 
 #[test]
+fn a_committed_mutation_whose_result_is_too_big_is_never_a_definitive_refusal() {
+    // 10,000 separated matches: the hunk list alone is over one control frame.
+    let hunks: Vec<Value> = (0..10_000).map(|n| json!([n * 2, 1])).collect();
+    let result = json!({
+        "etag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+        "previousEtag": "h:BBBBBBBBBBBBBBBBBBBBBB",
+        "added": 10_000,
+        "removed": 10_000,
+        "applied": true,
+        "hunks": hunks,
+    });
+    let frames = settle(
+        &op_id(22),
+        &summarize("edit", &json!({ "path": "/a" })),
+        Ok(result),
+    );
+    let message = only_control(&frames);
+    assert_eq!(message["type"], "file.result");
+    assert!(message["result"].get("hunks").is_none());
+    assert_eq!(message["result"]["applied"], true);
+    // A read that is too big is still a plain too_large (nothing was changed).
+    let read = settle(
+        &op_id(23),
+        &summarize("stat", &json!({ "paths": ["/a"] })),
+        Ok(
+            json!({ "entries": (0..50).map(|n| json!({ "path": format!("/{}{n}", "p".repeat(3000)) })).collect::<Vec<_>>() }),
+        ),
+    );
+    assert_eq!(only_control(&read)["reason"], "too_large");
+}
+
+#[test]
 fn a_control_frame_over_64_kib_after_spilling_is_too_large() {
     let paths: Vec<Value> = (0..50)
         .map(|n| json!({ "path": format!("/{}{n}", "p".repeat(3000)) }))
@@ -470,7 +520,9 @@ fn cancelling_before_the_commit_point_leaves_the_file_alone_and_drops_the_result
     let reached = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let hook_gate = Arc::clone(&gate);
     let hook_reached = Arc::clone(&reached);
-    let policy = Policy::from_environment(Vec::new(), false).with_euid(1000);
+    // The real euid: the owner check of the replace must see the real file owner.
+    let euid = nix::unistd::geteuid().as_raw();
+    let policy = Policy::from_environment(Vec::new(), euid == 0).with_euid(euid);
     // Pause the atomic replace after its etag re-check, just before the
     // cancel check that guards `renameat`.
     let ops = FileOps::new(policy, EtagKey::random()).with_step_hook(Arc::new(move |step| {

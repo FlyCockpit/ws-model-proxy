@@ -167,6 +167,7 @@ fn edit_validated(
     pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<EditResult> {
+    let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -176,7 +177,7 @@ fn edit_validated(
             access: Access::Write,
             preview_missing: false,
             pin: pin.map(|pin| &pin.ancestor),
-            cancel: None,
+            cancel: Some(cancel),
         },
     )?;
     // Lock first (as `write` does): a queued edit then opens the file after the
@@ -185,7 +186,7 @@ fn edit_validated(
     let _lock = ops.lock_path(full.clone(), cancel)?;
     if let Some(pin) = pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, &resolved, Access::Write)?;
+        pin.verify(ops, &resolved, Access::Write, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
     if pin.is_some() {
@@ -198,8 +199,8 @@ fn edit_validated(
         ops.step(Step::SupervisedOpenedVerified)?;
     }
 
-    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
-    let previous_etag = ops.key.strong(&original);
+    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
+    let previous_etag = ops.key.strong(&stat, &original);
     if let Some(expected) = &args.expected_etag
         && *expected != previous_etag
     {
@@ -222,6 +223,9 @@ fn edit_validated(
     for (index, op) in args.edits.iter().enumerate() {
         new_texts.push(translate_eol(&op.new_text, crlf));
         let new_text = &new_texts[index];
+        if new_text.len() > MAX_NEW_TEXT_BYTES {
+            return Err(FileError::invalid("newText is longer than 1 MiB"));
+        }
         match (&op.old_text, op.start_line, op.end_line) {
             (Some(old), _, _) => {
                 plan_exact(
@@ -281,6 +285,12 @@ fn edit_validated(
     // An edit that touches no masked value can still change that context, so no
     // masked byte of the original may show up unmasked in the result or in its
     // diff, `dryRun` included.
+    if after_view.long_construct {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "the file contains, or the edit would create, a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
+        ));
+    }
     if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,
@@ -297,7 +307,7 @@ fn edit_validated(
 
     if updated == original {
         if let Some(pin) = pin {
-            pin.verify(ops, &resolved, Access::Write)?;
+            pin.verify(ops, &resolved, Access::Write, cancel)?;
         }
         return Ok(EditResult {
             etag: previous_etag.clone(),
@@ -324,7 +334,7 @@ fn edit_validated(
     }
 
     cancel.check()?;
-    match pin {
+    let new_stat = match pin {
         Some(pin) => atomic::replace_supervised(
             ops,
             &resolved.dir,
@@ -346,9 +356,9 @@ fn edit_validated(
             &updated,
             cancel,
         )?,
-    }
+    };
     Ok(EditResult {
-        etag: ops.key.strong(&updated),
+        etag: ops.key.strong(&new_stat, &updated),
         previous_etag,
         added: summary.added,
         removed: summary.removed,

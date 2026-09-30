@@ -411,7 +411,7 @@ fn gap_assert_body_removed(body: Option<(PathBuf, PathBuf)>) {
 fn gap_supervised_cancel_after_go_obeys_the_commit_point() {
     use crate::file_ops::{EtagKey, FileOps, Policy, Step};
 
-    for step_to_cancel in [Step::TempSynced, Step::Renamed] {
+    for step_to_cancel in [Step::TempSynced, Step::Renamed, Step::BeforeDirSync] {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("file");
         std::fs::write(&target, b"old").unwrap();
@@ -420,7 +420,9 @@ fn gap_supervised_cancel_after_go_obeys_the_commit_point() {
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let release_rx = Mutex::new(release_rx);
         let key = EtagKey::random();
-        let etag = key.strong(b"old");
+        let stat =
+            crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&target).unwrap());
+        let etag = key.strong(&stat, b"old");
         let ops = FileOps::new(Policy::from_environment(vec![], true), key).with_step_hook(
             Arc::new(move |step| {
                 if step == step_to_cancel {
@@ -430,6 +432,11 @@ fn gap_supervised_cancel_after_go_obeys_the_commit_point() {
                         .unwrap()
                         .recv_timeout(Duration::from_secs(10))
                         .unwrap();
+                }
+                if step_to_cancel == Step::BeforeDirSync && step == Step::BeforeDirSync {
+                    // A failed completion after commit must not become a
+                    // definitive cancelled result, even with cancellation set.
+                    return Err(crate::file_ops::FileError::cancelled());
                 }
                 Ok(())
             }),
@@ -503,6 +510,11 @@ fn gap_supervised_cancel_after_go_obeys_the_commit_point() {
             assert_eq!(done["fileError"], serde_json::json!({"code":"cancelled"}));
             assert!(done.get("fileResult").is_none());
             assert_eq!(gap_disk_tree(dir.path()), before);
+        } else if step_to_cancel == Step::BeforeDirSync {
+            assert_eq!(done["fileError"], serde_json::json!({"code":"io_error"}));
+            assert!(done.get("fileResult").is_none());
+            assert_eq!(std::fs::read(&target).unwrap(), b"new");
+            assert_eq!(gap_disk_tree(dir.path()).len(), 1);
         } else {
             assert!(done.get("fileError").is_none());
             assert_eq!(done["fileResult"]["op"], "write");
@@ -530,12 +542,12 @@ fn gap_registry_reports_stale_etag_conflict_without_changing_disk() {
                 None,
             ),
             "write" => (
-                serde_json::json!({"path":source,"ifExists":"replace","expectedEtag":key.strong(b"old\n")}),
+                serde_json::json!({"path":source,"ifExists":"replace","expectedEtag":key.strong(&crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&source).unwrap()), b"old\n")}),
                 Some(b"new\n".to_vec()),
             ),
             "delete" => (serde_json::json!({"path":source}), None),
             _ => (
-                serde_json::json!({"from":source,"to":destination,"overwrite":true,"expectedEtag":key.strong(b"destination\n")}),
+                serde_json::json!({"from":source,"to":destination,"overwrite":true,"expectedEtag":key.strong(&crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&destination).unwrap()), b"destination\n")}),
                 None,
             ),
         };
@@ -689,7 +701,11 @@ fn gap_registry_child_screen_ignores_spawn_summary_and_masks_nonsecret_content()
             crate::supervised_file::screen_from_registry_env(&terminals.file_child_env).unwrap();
         assert!(screen.contains("REAL FILE REASON"), "{op}: {screen}");
         assert!(screen.contains("Masked unified diff:"), "{op}: {screen}");
-        assert!(screen.contains("DEMO_TOKEN=⟦redacted:"), "{op}: {screen}");
+        assert!(screen.contains("⟦redacted line⟧"), "{op}: {screen}");
+        assert!(
+            !screen.contains("masked-adjacent=old"),
+            "{op}: exposed following line"
+        );
         assert!(!screen.contains(secret), "{op}: exposed fixture value");
         assert!(!screen.contains(&request.command));
         assert!(!screen.contains(request.reason.as_ref().unwrap()));
@@ -915,4 +931,46 @@ fn supervised_file_drop_cancels_without_a_registry_close() {
     drop(file);
     assert!(cancel.is_cancelled());
     assert!(!dir.path().join("new").exists());
+}
+
+#[test]
+fn supervised_committed_result_encoding_failure_is_io_error() {
+    use crate::file_ops::{EtagKey, FileOps, Policy};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("new");
+    let (tx, rx) = channel();
+    let mut terminals = supervised_registry(tx, &fake_file_confirm(None));
+    terminals.set_file_runtime(Arc::new(crate::file_relay::FileRuntime::new(FileOps::new(
+        Policy::from_environment(vec![], true),
+        EtagKey::random(),
+    ))));
+    let startup = supervised_startup(McpCommandMode::Supervised, false);
+    let request = file_spawn_request("mkdir", serde_json::json!({"path":target}), None);
+    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+    pump_file_until(&mut terminals, &rx, &startup, &mut frames, |t, _| {
+        phase(t) == Some(SupervisedPhase::Confirm)
+    });
+    let supervised = terminals
+        .sessions
+        .get_mut(MULTI_TERMINAL)
+        .unwrap()
+        .supervised
+        .as_mut()
+        .unwrap();
+    supervised.phase = SupervisedPhase::Running;
+    let file = supervised.file.as_mut().unwrap();
+    file.applied = true;
+    let generation = file.generation;
+    // Represent a committed worker whose result no longer fits a control frame.
+    std::fs::create_dir(&target).unwrap();
+    let frames = terminals.on_file_applied(&request.command_id, generation,
+        Ok(serde_json::json!({"created":true,"resolvedPath":"x".repeat(crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES)})));
+    let done = gap_done(&frames);
+    assert_eq!(done["fileError"], serde_json::json!({"code":"io_error"}));
+    assert!(done.get("fileResult").is_none());
+    for message in controls(&frames) {
+        crate::protocol::encode_control(message).unwrap();
+    }
+    assert!(target.is_dir());
+    assert!(terminals.sessions.is_empty());
 }

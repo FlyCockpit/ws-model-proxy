@@ -252,11 +252,16 @@ enum CapacityLimitMode {
   UNLIMITED
 }
 
+/// Durable assignment intent on each target, independent of hard-limit source.
+/// OWNER includes explicit detach and selecting an existing AUTO capacity.
+enum CapacityAssignmentSource {
+  AUTO
+  OWNER
+}
+
 /// Who last authored an inference capacity's hard concurrency limit. AUTO rows
-/// (created by discovery, the CLI report, or the startup backfill) may have a
-/// null limit filled in, and engine-reported slots refresh it. USER rows were
-/// saved through a user-facing path; a null USER limit means explicitly
-/// unlimited and is never overwritten automatically.
+/// may refresh from discovery; USER limits, including null = unlimited, stay
+/// owner controlled.
 enum CapacityLimitSource {
   AUTO
   USER
@@ -925,28 +930,32 @@ model ProviderAuditEvent {
 /// The named database CHECK installed by prisma/schema-hardening.sql enforces the
 /// kind/FK XOR that Prisma cannot express.
 model ExecutionTarget {
-  id                     String                        @id @default(cuid(2))
-  createdAt              DateTime                      @default(now())
-  updatedAt              DateTime                      @default(now()) @updatedAt
-  userId                 String
-  kind                   ExecutionTargetKind
-  discoveredModelId      String?                       @unique
-  providerModelId        String?                       @unique
-  inferenceCapacityId    String?
+  id                           String                        @id @default(cuid(2))
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @default(now()) @updatedAt
+  userId                       String
+  kind                         ExecutionTargetKind
+  discoveredModelId            String?                       @unique
+  providerModelId              String?                       @unique
+  inferenceCapacityId          String?
+  /// Assignment intent is independent of the capacity hard-limit provenance, including detach.
+  capacityAssignmentSource     CapacityAssignmentSource      @default(AUTO)
+  /// Latest per-target automatic seed; retained when a member is absent from inventory.
+  capacityAutoConcurrencyLimit Int                           @default(1)
   /// Direct requests participate in the same 0..31 scheduler as pool traffic.
-  directPriority         Int                           @default(16)
-  directConcurrencyLimit Int?
-  directReservedSlots    Int                           @default(0)
-  directBorrowPolicy     CapacityBorrowPolicy          @default(WHEN_IDLE)
-  directWaitBudgetMs     Int?
-  directContextCeiling   Int?
-  directContextMargin    Int                           @default(0)
-  User                   User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DiscoveredModel        DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel          ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity      InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  PoolMembers            PoolMember[]
-  TokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
+  directPriority               Int                           @default(16)
+  directConcurrencyLimit       Int?
+  directReservedSlots          Int                           @default(0)
+  directBorrowPolicy           CapacityBorrowPolicy          @default(WHEN_IDLE)
+  directWaitBudgetMs           Int?
+  directContextCeiling         Int?
+  directContextMargin          Int                           @default(0)
+  User                         User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel              DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel                ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity            InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  PoolMembers                  PoolMember[]
+  TokenAllowlistEntries        ModelApiTokenAllowlistEntry[]
 
   @@unique([discoveredModelId, userId])
   @@unique([providerModelId, userId])
@@ -1139,6 +1148,12 @@ model PoolMember {
   nextRetryAt                  DateTime?
   halfOpenTrialStartedAt       DateTime?
   lastRoutedAt                 DateTime?
+  /// S-D: AUTO lets live engine load (`endpoint.load`) mark this member FULL
+  /// (per the capacity's engine kind); OFF ignores engine load for it.
+  engineLoadMode               EngineLoadMode          @default(AUTO)
+  /// KV usage fraction (0-1] at which a vLLM/SGLang member counts as FULL.
+  /// Null = the default (0.95).
+  kvFullThreshold              Float?
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1290,6 +1305,10 @@ model PoolMemberRoutingVerdict {
   verdict      MetricRoutingVerdict
   /// Per rule (by index): `triggered`, `clear` or `stale`.
   ruleStates   Json
+  /// S-D live engine load reading behind the verdict: `off`, `none` (no
+  /// engine signal), `stale`, `clear`, `full_waiting`, `full_kv`,
+  /// `full_slots` or `full_deferred`. FULL from load is folded into `verdict`.
+  engineState  String               @default("none")
   evaluatedAt  DateTime
   /// The evaluation state that wrote this row. Together with `evaluatedAt` it
   /// orders writers: a write replaces a row only when it is strictly newer or
@@ -1302,6 +1321,11 @@ model PoolMemberRoutingVerdict {
   @@index([poolId])
   @@index([expiresAt])
   @@map("pool_member_routing_verdict")
+}
+
+enum EngineLoadMode {
+  AUTO
+  OFF
 }
 
 enum MetricRoutingVerdict {

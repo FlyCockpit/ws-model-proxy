@@ -5,7 +5,7 @@
   "fileResult": {
     "op": "write",
     "result": {
-      "etag": "h:aaa",
+      "etag": "h:AAAAAAAAAAAAAAAAAAAAAA",
       "size": 4,
       "created": true
     }

@@ -128,6 +128,7 @@ vi.mock("../relay/cli-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
 }));
 
 const BASE = "https://proxy.example.com";

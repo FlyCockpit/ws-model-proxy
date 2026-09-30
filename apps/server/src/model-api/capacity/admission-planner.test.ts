@@ -6,6 +6,7 @@ import {
   type PlannerWaiter,
   planGrants,
 } from "./admission-planner.js";
+import { referencePlanGrants } from "./admission-planner.reference.js";
 import {
   PRIORITY_CLASS_COUNT,
   type SchedulerCandidate,
@@ -690,3 +691,164 @@ describe("planGrants: equivalence with the previous single-step decision", () =>
     expect(multi).toBeGreaterThan(100);
   });
 });
+
+// Seeded scenarios exercise interactions, while the fixed rows above pin the
+// named boundary cases independently of the frozen implementation.
+describe("indexed planner matches the frozen bc0c677 planner", () => {
+  it.each(rows)("reference: $name", (row) => {
+    const input = row.snapshot();
+    expect(planGrants(input, NOW, row.options)).toEqual(
+      referencePlanGrants(input, NOW, row.options),
+    );
+  });
+
+  it("preserves all 32 classes with a nonzero cursor and carried deficits", () => {
+    const input = snapshot(
+      Array.from({ length: 96 }, (_, i) =>
+        waiter(`all-${i}`, {
+          seq: 96 - i,
+          priority: i % 32,
+        }),
+      ),
+      {
+        scheduler: {
+          cursor: 19,
+          deficits: Array.from({ length: 32 }, (_, i) => i % 7),
+          version: 1,
+        },
+      },
+    );
+    expect(planGrants(input, NOW)).toEqual(referencePlanGrants(input, NOW));
+  });
+
+  it("revisits a borrower blocked by a needy owner after that owner's scope fills", () => {
+    const input = snapshot(
+      [
+        waiter("borrower-a", { seq: 1, priority: 0, ownerKey: "member:b" }),
+        waiter("borrower-b", { seq: 2, priority: 0, ownerKey: "member:b" }),
+        waiter("needy", {
+          seq: 3,
+          priority: 31,
+          ownerKey: "member:n",
+          memberLimit: 1,
+          scopeKey: "POOL:needy",
+          leaseScopeKeys: ["POOL:needy"],
+        }),
+        waiter("needy-sibling", {
+          seq: 3,
+          priority: 31,
+          ownerKey: "member:n",
+          memberLimit: 1,
+          scopeKey: "POOL:needy",
+          leaseScopeKeys: ["POOL:needy"],
+        }),
+      ],
+      {
+        capacityLimit: 5,
+        active: 2,
+        reservationsByOwner: new Map([["member:n", 3]]),
+        scopeActive: new Map([["POOL:needy", 0]]),
+      },
+    );
+    const plan = planGrants(input, NOW);
+    expect(ids(plan)).toEqual(["needy", "borrower-a", "borrower-b"]);
+    expect(plan).toEqual(referencePlanGrants(input, NOW));
+  });
+
+  it("matches 400 seeded mixed scenarios including siblings and temporary borrow blocks", () => {
+    let seed = 0x131139;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let value = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      value ^= value + Math.imul(value ^ (value >>> 7), 61 | value);
+      return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = (n: number) => Math.floor(random() * n);
+    const time = () => [null, at(-1), at(0), at(1)][pick(4)]!;
+    for (let scenario = 0; scenario < 400; scenario++) {
+      const owners = Array.from({ length: 1 + pick(12) }, (_, i) => `member:o${i}`);
+      const scopes = Array.from({ length: 1 + pick(8) }, (_, i) => `POOL:s${i}`);
+      const inputWaiters = Array.from({ length: 1 + pick(90) }, (_, i) => {
+        const request = pick(25);
+        const scopeKey = scopes[pick(scopes.length)]!;
+        return waiter(`random-${i}`, {
+          admissionRequestId: `r${request}`,
+          candidateOrder: i,
+          seq: request,
+          ownerKey: owners[pick(owners.length)]!,
+          scopeKey,
+          leaseScopeKeys: [scopeKey],
+          memberLimit: [null, undefined, 0, 1, 3, 8][pick(6)],
+          priority: pick(32),
+          borrowPolicy: pick(2) ? "NEVER" : "WHEN_IDLE",
+          notBefore: time(),
+          deadlineAt: time(),
+          requestDeadlineAt: time(),
+        });
+      });
+      const input = snapshot(inputWaiters, {
+        capacityLimit: pick(4) === 0 ? null : pick(30),
+        active: pick(8),
+        activeByOwner: new Map(owners.map((owner) => [owner, pick(4)])),
+        reservationsByOwner: new Map(owners.map((owner) => [owner, pick(6)])),
+        scopeActive: new Map(scopes.map((scope) => [scope, pick(4)])),
+        scheduler: {
+          cursor: pick(32),
+          deficits: Array.from({ length: 32 }, () => pick(9)),
+          version: 1,
+        },
+      });
+      const options: PlannerOptions = {
+        requestId: pick(3) === 0 ? `r${pick(25)}` : undefined,
+        creatingRequestId: pick(2) ? `r${pick(25)}` : undefined,
+        lastChanceWaiterIds: inputWaiters.filter(() => pick(4) === 0).map((w) => w.waiterId),
+        maxGrants: pick(3) === 0 ? pick(15) : undefined,
+      };
+      expect(planGrants(input, NOW, options), `scenario ${scenario}`).toEqual(
+        referencePlanGrants(input, NOW, options),
+      );
+    }
+  });
+});
+
+it.each([null, 2500])(
+  "plans 5000 waiters with scope limit %s within a loose budget",
+  (scopeLimit) => {
+    const input = snapshot(
+      Array.from({ length: 5000 }, (_, i) =>
+        waiter(`load-${i}`, {
+          seq: i,
+          priority: i % 32,
+          ownerKey: "member:load",
+          scopeKey: "POOL:load",
+          memberLimit: scopeLimit,
+          leaseScopeKeys: ["POOL:load"],
+        }),
+      ),
+      { scopeActive: new Map([["POOL:load", 0]]) },
+    );
+    let ownerReads = 0;
+    for (const entry of input.waiters)
+      Object.defineProperty(entry, "ownerKey", {
+        get: () => {
+          ownerReads++;
+          return "member:load";
+        },
+      });
+    const started = performance.now();
+    const plan = planGrants(input, NOW);
+    const elapsed = performance.now() - started;
+    console.log(
+      `[planner-volume] scope=${scopeLimit} ${plan.grants.length} grants: ${elapsed.toFixed(0)} ms`,
+    );
+    expect(plan.grants).toHaveLength(scopeLimit ?? 5000);
+    expect(new Set(plan.grants.map((g) => g.admissionRequestId)).size).toBe(scopeLimit ?? 5000);
+    expect(plan.stoppedBy).toBe("none");
+    // Pin queue work independently of machine speed: a full rescan per
+    // grant performs millions of owner lookups on this reservation-free queue.
+    expect(ownerReads).toBeLessThan(500_000);
+    // Measured below 500 ms on the shared runner; > 10x CI headroom.
+    expect(elapsed).toBeLessThan(6000);
+  },
+  15_000,
+);

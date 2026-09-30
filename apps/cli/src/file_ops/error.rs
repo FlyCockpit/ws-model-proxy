@@ -127,6 +127,13 @@ impl FileError {
         }
     }
 
+    /// Mutations may have committed before completion or rollback failed.
+    /// Both relay paths interpret `io_error` as an unknown mutation outcome;
+    /// a definitive refusal (including `cancelled`) would invite an unsafe retry.
+    pub(crate) fn mutation_uncertain() -> Self {
+        Self::new(ErrorCode::IoError, "the mutation outcome is unknown")
+    }
+
     pub fn cancelled() -> Self {
         Self::new(ErrorCode::Cancelled, "the operation was cancelled")
     }

@@ -95,7 +95,14 @@ export const filePathSchema = z
   .refine((value) => utf8Bytes(value) <= PATH_MAX_BYTES, "Path is longer than 4096 bytes.")
   .refine((value) => !value.includes("\0"), "Path must not contain NUL.");
 
+/** An etag an agent passes back (`expectedEtag`, `ifNoneMatch`): any short token. */
 const etagSchema = z.string().min(1).max(64);
+/**
+ * An etag the CLI reports: exactly the shape the library produces (`h:` strong
+ * or `w:` weak plus 22 base64url characters). Anything else is refused, so a
+ * hostile CLI cannot ride text into a result or a rejection detail.
+ */
+const reportedEtagSchema = z.string().regex(/^[hw]:[A-Za-z0-9_-]{22}$/);
 const reasonSchema = z.string().max(500);
 const modeStringSchema = z.string().regex(/^[0-7]{3,4}$/);
 const uintSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
@@ -253,7 +260,7 @@ const readMoreSchema = z
 
 export const readContentResultSchema = z
   .object({
-    etag: etagSchema,
+    etag: reportedEtagSchema,
     size: uintSchema,
     mtime: mtimeSchema,
     mode: z.string().max(8),
@@ -269,7 +276,7 @@ export const readContentResultSchema = z
   })
   .strict();
 export const readUnchangedResultSchema = z
-  .object({ unchanged: z.literal(true), etag: etagSchema })
+  .object({ unchanged: z.literal(true), etag: reportedEtagSchema })
   .strict();
 export const readResultSchema = z.union([readContentResultSchema, readUnchangedResultSchema]);
 
@@ -281,7 +288,7 @@ export const statEntrySchema = z
     mtime: mtimeSchema.optional(),
     mode: z.string().max(8).optional(),
     owner: z.string().max(256).optional(),
-    etag: etagSchema.optional(),
+    etag: reportedEtagSchema.optional(),
     target: shortText.optional(),
     targetType: z.enum(["file", "dir", "symlink", "other"]).optional(),
     resolvedPath: shortText.optional(),
@@ -317,8 +324,8 @@ export const searchResultSchema = z
 
 export const editResultSchema = z
   .object({
-    etag: etagSchema,
-    previousEtag: etagSchema,
+    etag: reportedEtagSchema,
+    previousEtag: reportedEtagSchema,
     added: uintSchema,
     removed: uintSchema,
     applied: z.boolean(),
@@ -333,7 +340,7 @@ export const editResultSchema = z
 
 export const writeResultSchema = z
   .object({
-    etag: etagSchema,
+    etag: reportedEtagSchema,
     size: uintSchema,
     created: z.boolean(),
     added: uintSchema.optional(),
@@ -343,7 +350,7 @@ export const writeResultSchema = z
   })
   .strict();
 
-export const renameResultSchema = z.object({ etag: etagSchema.nullable() }).strict();
+export const renameResultSchema = z.object({ etag: reportedEtagSchema.nullable() }).strict();
 export const mkdirResultSchema = z.object({ created: z.boolean() }).strict();
 export const deleteResultSchema = z
   .object({ deleted: z.boolean(), type: z.enum(["file", "dir", "symlink", "other"]) })
@@ -359,20 +366,6 @@ export const FILE_DATA_FIELDS = {
 } as const;
 export type FileDataOp = keyof typeof FILE_DATA_FIELDS;
 export const fileDataFieldSchema = z.enum(["text", "entries", "matches", "diff"]);
-export type FileDataField = z.infer<typeof fileDataFieldSchema>;
-
-/** Raw (strict, per op) result shapes by op. */
-export const fileResultSchemas = {
-  read: readResultSchema,
-  stat: statResultSchema,
-  list: listResultSchema,
-  search: searchResultSchema,
-  edit: editResultSchema,
-  write: writeResultSchema,
-  rename: renameResultSchema,
-  mkdir: mkdirResultSchema,
-  delete: deleteResultSchema,
-} as const;
 
 /** Headless `op` + `result`; supervised results use the metadata-only schema below. */
 export const fileOpResultSchema = z.discriminatedUnion("op", [
@@ -429,8 +422,9 @@ export type FileResultFrame = z.infer<typeof fileResultFrameSchema>;
 /** Small strict detail object of a rejection (the union of the P1 error details). */
 export const fileRejectDetailSchema = z
   .object({
-    currentEtag: etagSchema.optional(),
-    etag: etagSchema.optional(),
+    // The library reports the words `replaced` / `gone` when the file was swapped or removed mid-edit.
+    currentEtag: z.union([reportedEtagSchema, z.enum(["replaced", "gone"])]).optional(),
+    etag: reportedEtagSchema.optional(),
     size: uintSchema.optional(),
     sniff: z.string().max(32).optional(),
     edit: uintSchema.optional(),

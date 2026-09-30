@@ -149,14 +149,19 @@ fn resolve_for_pin(
 }
 
 /// The etag a caller would have seen for the object `stat` describes.
-fn object_etag(ops: &FileOps, resolved: &Resolved, stat: &Stat) -> FileResult<Option<String>> {
+fn object_etag(
+    ops: &FileOps,
+    resolved: &Resolved,
+    stat: &Stat,
+    cancel: &Cancel,
+) -> FileResult<Option<String>> {
     Ok(match stat.kind() {
         Kind::File => {
             let (mut file, opened) = resolved.open_regular(&ops.policy, Access::Remove)?;
             if !opened.same_object(stat) {
                 return Err(FileError::conflict("replaced"));
             }
-            Some(current_etag(ops, &mut file, &opened)?)
+            Some(current_etag(ops, &mut file, &opened, cancel)?)
         }
         Kind::Symlink => Some(ops.key.weak_stat(stat)),
         Kind::Dir | Kind::Other => None,
@@ -190,14 +195,22 @@ fn rename_impl(
 ) -> FileResult<RenameResult> {
     let supervised = from_pin.is_some() && to_pin.is_some();
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_exclusive(cancel)?;
     let overwrite = args.overwrite.unwrap_or(false);
     if overwrite && args.expected_etag.is_none() {
         return Err(FileError::invalid(
             "expectedEtag (of the destination) is required for overwrite",
         ));
     }
-    let from = resolve_for_pin(ops, &args.from, Access::Remove, false, from_pin, None)?;
-    let to = resolve_for_pin(ops, &args.to, Access::Write, false, to_pin, None)?;
+    let from = resolve_for_pin(
+        ops,
+        &args.from,
+        Access::Remove,
+        false,
+        from_pin,
+        Some(cancel),
+    )?;
+    let to = resolve_for_pin(ops, &args.to, Access::Write, false, to_pin, Some(cancel))?;
     if from.is_self() || to.is_self() {
         return Err(FileError::invalid(
             "cannot rename a directory reference such as `/` or `..`",
@@ -219,12 +232,12 @@ fn rename_impl(
     let _lock_b = ops.lock_path(second, cancel)?;
     if let Some(pin) = from_pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, &from, Access::Remove)?;
+        pin.verify(ops, &from, Access::Remove, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
     if let Some(pin) = to_pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, &to, Access::Write)?;
+        pin.verify(ops, &to, Access::Write, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
 
@@ -240,7 +253,7 @@ fn rename_impl(
     ops.step(Step::BeforeIdentity)?;
     ops.policy.check_identity(Access::Remove, &src)?;
     ops.step(Step::IdentityChecked)?;
-    let src_etag = object_etag(ops, &from, &src)?;
+    let src_etag = object_etag(ops, &from, &src, cancel)?;
     if !overwrite && let Some(expected) = &args.expected_etag {
         match &src_etag {
             Some(current) if current == expected => {}
@@ -272,7 +285,7 @@ fn rename_impl(
         ops.step(Step::BeforeIdentity)?;
         ops.policy.check_identity(Access::Write, dst)?;
         ops.step(Step::IdentityChecked)?;
-        let current = object_etag(ops, &to, dst)?.unwrap_or_default();
+        let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
         }
@@ -290,10 +303,10 @@ fn rename_impl(
     // Test seam: the last point at which the world can change before the commit.
     ops.step(Step::EtagRechecked)?;
     if let Some(pin) = from_pin {
-        pin.verify(ops, &from, Access::Remove)?;
+        pin.verify(ops, &from, Access::Remove, cancel)?;
     }
     if let Some(pin) = to_pin {
-        pin.verify(ops, &to, Access::Write)?;
+        pin.verify(ops, &to, Access::Write, cancel)?;
     }
     cancel.check()?;
     commit_rename(
@@ -323,8 +336,9 @@ fn rename_impl(
 /// rejected before reaching that fallback.
 /// Crash states: between the exchange and the unlink the old destination is
 /// under the source name; after `linkat` and before the unlink both names exist.
-/// Neither loses data. The undo moves the object now at the destination back only
-/// when it is the object that was moved.
+/// Neither loses data. The undo moves back whatever object the move actually put
+/// at the destination (a same-user cross-process successor in that window is the
+/// accepted residual).
 fn commit_rename(
     from: &Resolved,
     to: &Resolved,
@@ -351,11 +365,12 @@ fn verify_moved(
     supervised: bool,
     capability: RenameAtomicCapability,
 ) -> FileResult<()> {
-    match to.lstat()? {
+    match to.lstat().map_err(|_| FileError::mutation_uncertain())? {
         Some(now) if now.same_object(src) => Ok(()),
         _ => {
             // Another object was moved. Put it back when nothing took its place.
-            let _ = move_no_replace(to, from, src, supervised, capability);
+            move_no_replace(to, from, src, supervised, capability)
+                .map_err(|_| FileError::mutation_uncertain())?;
             Err(FileError::conflict("replaced"))
         }
     }
@@ -450,20 +465,21 @@ fn move_no_replace(
         }
         Err(errno) => return Err(FileError::errno(errno)),
     }
-    match from.lstat()? {
+    match from.lstat().map_err(|_| FileError::mutation_uncertain())? {
         Some(now) if now.same_object(src) => unlinkat(
             from.dir.as_fd(),
             from.name.as_os_str(),
             UnlinkatFlags::NoRemoveDir,
         )
-        .map_err(FileError::errno),
+        .map_err(|_| FileError::mutation_uncertain()),
         _ => {
             // The source name changed hands: undo our new link, keep theirs.
-            let _ = unlinkat(
+            unlinkat(
                 to.dir.as_fd(),
                 to.name.as_os_str(),
                 UnlinkatFlags::NoRemoveDir,
-            );
+            )
+            .map_err(|_| FileError::mutation_uncertain())?;
             Err(FileError::conflict("replaced"))
         }
     }
@@ -505,7 +521,7 @@ fn exchange_over(
     let old_ok = matches!(from.lstat(), Ok(Some(ref now)) if now.same_object(dst));
     if !(moved_ok && old_ok) {
         // A different object was in play: exchange back, refuse.
-        let _ = swap();
+        swap().map_err(|_| FileError::mutation_uncertain())?;
         return Err(FileError::conflict("replaced"));
     }
     unlinkat(
@@ -513,7 +529,7 @@ fn exchange_over(
         from.name.as_os_str(),
         UnlinkatFlags::NoRemoveDir,
     )
-    .map_err(FileError::errno)
+    .map_err(|_| FileError::mutation_uncertain())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -535,9 +551,9 @@ fn exchange_over(
 
 #[cfg(not(target_os = "linux"))]
 fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
-    match to.lstat()? {
+    match to.lstat().map_err(|_| FileError::mutation_uncertain())? {
         Some(now) if now.same_object(src) => Ok(()),
-        _ => Err(FileError::conflict("replaced")),
+        _ => Err(FileError::mutation_uncertain()),
     }
 }
 
@@ -561,6 +577,7 @@ fn mkdir_impl(
     cancel: &Cancel,
 ) -> FileResult<MkdirResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_shared(cancel)?;
     let mode = args
         .mode
         .as_deref()
@@ -601,13 +618,13 @@ fn mkdir_resolved(
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
     if let Some(pin) = pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, resolved, Access::Write)?;
+        pin.verify(ops, resolved, Access::Write, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
     match resolved.lstat()? {
         Some(st) if st.kind() == Kind::Dir => {
             if let Some(pin) = pin {
-                pin.verify(ops, resolved, Access::Write)?;
+                pin.verify(ops, resolved, Access::Write, cancel)?;
             }
             return Ok(MkdirResult { created: false });
         }
@@ -621,7 +638,7 @@ fn mkdir_resolved(
     }
     ops.step(Step::EtagRechecked)?;
     if let Some(pin) = pin {
-        pin.verify(ops, resolved, Access::Write)?;
+        pin.verify(ops, resolved, Access::Write, cancel)?;
     }
     cancel.check()?;
     match mkdirat(
@@ -668,7 +685,8 @@ fn delete_impl(
     cancel: &Cancel,
 ) -> FileResult<DeleteResult> {
     check_reason(&args.reason)?;
-    let resolved = resolve_for_pin(ops, &args.path, Access::Remove, false, pin, None)?;
+    let _namespace = ops.namespace_exclusive(cancel)?;
+    let resolved = resolve_for_pin(ops, &args.path, Access::Remove, false, pin, Some(cancel))?;
     if resolved.is_self() {
         return Err(FileError::invalid(
             "cannot delete a directory reference such as `/` or `..`",
@@ -677,7 +695,7 @@ fn delete_impl(
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
     if let Some(pin) = pin {
         ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, &resolved, Access::Remove)?;
+        pin.verify(ops, &resolved, Access::Remove, cancel)?;
         ops.step(Step::SupervisedPinVerified)?;
     }
     let st = resolved
@@ -695,7 +713,7 @@ fn delete_impl(
         }
     };
     if let Some(expected) = &args.expected_etag {
-        match object_etag(ops, &resolved, &st)? {
+        match object_etag(ops, &resolved, &st, cancel)? {
             Some(current) if current == *expected => {}
             Some(current) => return Err(FileError::conflict(&current)),
             None => return Err(FileError::invalid("directories have no etag")),
@@ -704,7 +722,7 @@ fn delete_impl(
     // Observable seam for the pre-unlink re-check (race tests swap the name here).
     ops.step(Step::EtagRechecked)?;
     if let Some(pin) = pin {
-        pin.verify(ops, &resolved, Access::Remove)?;
+        pin.verify(ops, &resolved, Access::Remove, cancel)?;
     }
     cancel.check()?;
     // The name must still be the object we inspected.

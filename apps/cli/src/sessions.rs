@@ -8,9 +8,9 @@
 //! for exec) and are stopped with `SIGKILL` to the group. Closing a terminal
 //! also kills every process in the shell's session, including background jobs
 //! in their own process groups and `nohup`/disowned jobs; only a process that
-//! calls `setsid()` itself leaves that session and survives. Windows has no
-//! process-group kill: only the direct child is terminated, so grandchildren of
-//! an exec may survive.
+//! calls `setsid()` itself leaves that session and survives. Windows execs
+//! run in a job object assigned before the child starts. Terminating the job
+//! kills the whole tree, including detached grandchildren.
 //!
 //! Every live Unix exec group and PTY session, and every Windows exec, is also
 //! recorded in a global list, so a forced shutdown (`crate::shutdown`) can
@@ -34,11 +34,15 @@
 //! epoch whenever a viewer leaves. The PTY size follows the writer, the viewer
 //! that most recently typed.
 
+#[cfg(windows)]
+use crate::job_tree::Child as ExecChild;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::process::Child as ExecChild;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Condvar;
@@ -825,12 +829,15 @@ fn kill_session(leader: u32) {
 
 /// A child the relay thread owns, recorded so a forced shutdown can kill it
 /// from another thread without the registries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(unix, derive(Clone, Copy, Debug, PartialEq, Eq))]
+#[cfg_attr(windows, derive(Clone, Debug))]
 enum LiveChild {
-    /// An exec shell: the leader of its own process group on Unix. On
-    /// Windows its process handle stays open while it is tracked, so the pid
-    /// cannot be reused.
+    /// An exec shell: the leader of its own process group on Unix.
+    #[cfg(unix)]
     ExecGroup(u32),
+    /// A shared job handle, retained even after the root exits.
+    #[cfg(windows)]
+    ExecJob(crate::job_tree::JobTree),
     /// A PTY shell: the leader of its own session.
     #[cfg(unix)]
     PtySession(u32),
@@ -870,6 +877,7 @@ pub fn kill_tracked_children() {
     kill_live_children(|_| true);
 }
 
+#[cfg(unix)]
 fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
     let children = LIVE_CHILDREN
         .lock()
@@ -882,8 +890,6 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
         match child {
             #[cfg(unix)]
             LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
-            #[cfg(not(unix))]
-            LiveChild::ExecGroup(pid) => kill_process_tree(pid),
             #[cfg(unix)]
             LiveChild::PtySession(pid) => {
                 kill_session(pid);
@@ -893,16 +899,25 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
     }
 }
 
-/// Windows has no process groups. The relay thread owns the `Child`, so a
-/// forced shutdown ends the exec and its descendants with `taskkill /T /F`.
-#[cfg(not(unix))]
-fn kill_process_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+/// Ownership: the session owns the child; this list owns a job handle clone.
+/// Lock order: snapshot under LIVE_CHILDREN, release it, then terminate jobs.
+/// Job operations never acquire this list or a session registry. Forced
+/// shutdown has one deadline for all lock retries, including a stuck relay.
+#[cfg(windows)]
+fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
+    let until = Instant::now() + Duration::from_millis(200);
+    let Ok(live) = crate::job_tree::lock_until(&LIVE_CHILDREN, until) else {
+        return;
+    };
+    let children = live
+        .values()
+        .filter(|child| select(child))
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(live);
+    for LiveChild::ExecJob(job) in children {
+        let _ = job.terminate_until(until);
+    }
 }
 
 /// Browser input waiting for a terminal's writer thread.
@@ -2666,6 +2681,38 @@ impl TerminalRegistry {
         let Some((terminal_id, op)) = found else {
             return Vec::new();
         };
+        let (file, mut outcome_code) = match outcome {
+            Ok(result) => (
+                crate::protocol::SupervisedFileOutcome::result(op, result),
+                "ok",
+            ),
+            Err(error) => (
+                crate::protocol::SupervisedFileOutcome::error(error.code.into()),
+                error.code.as_str(),
+            ),
+        };
+        let mut message = ClientControlMessage::SupervisedDone {
+            command_id: command_id.to_string(),
+            exit_code: None,
+            signal: None,
+            review: false,
+            output_bytes: None,
+            file,
+        };
+        if crate::protocol::encode_control(&message).is_err() {
+            if let ClientControlMessage::SupervisedDone { file, .. } = &mut message {
+                *file = crate::protocol::SupervisedFileOutcome::error(
+                    crate::protocol::FileErrorCode::IoError,
+                );
+            }
+            outcome_code = "io_error";
+        } else if let ClientControlMessage::SupervisedDone {
+            file: crate::protocol::SupervisedFileOutcome::Error { file_error },
+            ..
+        } = &message
+        {
+            outcome_code = file_error.code.as_str();
+        }
         if let Some(supervised) = self
             .sessions
             .get_mut(&terminal_id)
@@ -2674,26 +2721,9 @@ impl TerminalRegistry {
             if let Some(file) = supervised.file.as_mut() {
                 file.settled = true;
             }
-            let outcome_code = match &outcome {
-                Ok(_) => "ok",
-                Err(error) => error.code.as_str(),
-            };
             supervised.log_outcome(outcome_code);
         }
-        let file = match outcome {
-            Ok(result) => crate::protocol::SupervisedFileOutcome::result(op, result),
-            Err(error) => crate::protocol::SupervisedFileOutcome::error(error.code.into()),
-        };
-        let mut frames = vec![OutboundFrame::Control(
-            ClientControlMessage::SupervisedDone {
-                command_id: command_id.to_string(),
-                exit_code: None,
-                signal: None,
-                review: false,
-                output_bytes: None,
-                file,
-            },
-        )];
+        let mut frames = vec![OutboundFrame::Control(message)];
         frames.extend(self.close(&terminal_id));
         frames
     }
@@ -4122,7 +4152,7 @@ fn spawn_pty(
 }
 
 struct ExecSession {
-    child: Option<std::process::Child>,
+    child: Option<ExecChild>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
@@ -4330,7 +4360,10 @@ impl ExecRegistry {
                     // The direct child is already reaped. Kill grandchildren
                     // that stayed in its group, without signalling the pid
                     // itself again.
+                    #[cfg(not(windows))]
                     kill_exec(session.pid, None, false);
+                    #[cfg(windows)]
+                    kill_exec(session.pid, session.child.as_mut(), false);
                     session.reaped = Some((parts.0, parts.1, now));
                 }
                 let Some((code, signal, reaped_at)) = session.reaped else {
@@ -4404,7 +4437,7 @@ impl Drop for ExecRegistry {
     }
 }
 
-fn reap_child(child: Option<&mut std::process::Child>) -> (Option<i32>, Option<i32>) {
+fn reap_child(child: Option<&mut ExecChild>) -> (Option<i32>, Option<i32>) {
     let Some(child) = child else {
         return (None, None);
     };
@@ -4423,7 +4456,7 @@ fn reap_child(child: Option<&mut std::process::Child>) -> (Option<i32>, Option<i
     (None, None)
 }
 
-fn kill_exec(pid: u32, child: Option<&mut std::process::Child>, fallback_to_pid: bool) {
+fn kill_exec(pid: u32, child: Option<&mut ExecChild>, fallback_to_pid: bool) {
     #[cfg(unix)]
     {
         kill_process_group(pid, fallback_to_pid);
@@ -4433,7 +4466,7 @@ fn kill_exec(pid: u32, child: Option<&mut std::process::Child>, fallback_to_pid:
     {
         let _ = (pid, fallback_to_pid);
         if let Some(child) = child {
-            let _ = child.kill();
+            let _ = child.job().terminate();
         }
     }
 }
@@ -4463,9 +4496,15 @@ fn spawn_exec(
         use std::os::unix::process::CommandExt;
         process.process_group(0);
     }
+    #[cfg(not(windows))]
     let mut child = process.spawn()?;
+    #[cfg(windows)]
+    let mut child = crate::job_tree::spawn(process)?;
     let pid = child.id();
+    #[cfg(not(windows))]
     let tracked = LiveChildGuard::track(LiveChild::ExecGroup(pid));
+    #[cfg(windows)]
+    let tracked = LiveChildGuard::track(LiveChild::ExecJob(child.job()));
     let stdout = child
         .stdout
         .take()
@@ -4550,6 +4589,71 @@ mod tests {
             "sleep 30"
         } else {
             "ping -n 30 127.0.0.1"
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exec_cancel_timeout_drop_and_forced_shutdown_kill_grandchildren() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        for action in ["cancel", "timeout", "drop", "forced", "root-exit"] {
+            let tree = Tree::new();
+            let (tx, rx) = channel();
+            let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
+            // Git Bash can make exec_shell choose sh; both shells and their
+            // descendants must remain in the Windows job.
+            let mode = if action == "root-exit" {
+                "root-exit"
+            } else {
+                "detach"
+            };
+            // Exec needs one shell string for sh -c or cmd /C. The fixture
+            // cwd lets both shells use relative paths without embedded quotes
+            // or Windows backslash escaping, even when the cwd has spaces.
+            let command = format!("python tree.py grandchild.pid root.pid {mode}");
+            let frames = execs.start(
+                &enabled_startup(false),
+                &Config::default(),
+                "windows-tree",
+                &command,
+                Some(tree.cwd().to_str().expect("fixture cwd")),
+            );
+            assert!(matches!(
+                &frames[0],
+                OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+            ));
+            let grandchild = tree.read_marker().parse().expect("grandchild PID");
+            let root = execs.pid("windows-tree").expect("exec root");
+            match action {
+                "cancel" => {
+                    let _ = execs.cancel("windows-tree");
+                }
+                "timeout" => {
+                    let _ = execs.poll(Instant::now() + Duration::from_secs(31));
+                }
+                "drop" => {
+                    drop(execs);
+                    assert_dead(grandchild);
+                    drop(rx);
+                    continue;
+                }
+                "forced" => kill_live_children(
+                    |child| matches!(child, LiveChild::ExecJob(job) if job.id() == root),
+                ),
+                "root-exit" => {
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while !execs.sessions.is_empty() && Instant::now() < until {
+                        let _ = execs.poll(Instant::now());
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(execs.sessions.is_empty(), "exited exec kept its slot");
+                }
+                _ => unreachable!(),
+            }
+            assert_dead(grandchild);
+            assert_dead(root);
+            drop(execs);
+            drop(rx);
         }
     }
 
@@ -8029,7 +8133,9 @@ exit 0
             Ok(())
         });
         let etag_key = crate::file_ops::EtagKey::random();
-        let expected_etag = etag_key.strong(b"old");
+        let stat =
+            crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&target).unwrap());
+        let expected_etag = etag_key.strong(&stat, b"old");
         let ops = crate::file_ops::FileOps::new(
             crate::file_ops::Policy::from_environment(Vec::new(), true),
             etag_key,

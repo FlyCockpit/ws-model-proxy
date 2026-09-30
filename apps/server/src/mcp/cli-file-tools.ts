@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  auditRefusedFileInput,
   type FileOpFailure,
   type FileOpOutcome,
   type FileOpSuccess,
@@ -36,9 +37,6 @@ export const FILE_TOOLS = [
 ] as const satisfies ReadonlyArray<{ name: string; op: FileOp; target: string }>;
 
 export type FileToolName = (typeof FILE_TOOLS)[number]["name"];
-
-/** Read-class ops run without changing anything; write-class ops need `confirm`. */
-export const FILE_READ_OPS: ReadonlySet<FileOp> = new Set(["read", "stat", "list", "search"]);
 
 /**
  * Largest read window the MCP layer asks for. The CLI's own cap is 128 KiB,
@@ -199,11 +197,16 @@ export class McpCliFileError extends Error {
     this.name = "McpCliFileError";
     this.validation = validation;
     this.code = failure.code;
-    const extra: Record<string, unknown> = { ...(failure.detail ?? {}) };
+    // Everything the CLI sent (detail values) is untrusted text: the same
+    // credential-substring removal as a result, and only small facts.
+    const extra: Record<string, unknown> = scrub({ ...(failure.detail ?? {}) }) as Record<
+      string,
+      unknown
+    >;
     if (failure.retryAfterMs !== undefined) extra.retryAfterMs = failure.retryAfterMs;
     if (failure.outcome !== undefined) extra.outcome = failure.outcome;
     if (failure.rejectedProtocolVersion !== undefined) {
-      extra.relayProtocolVersion = failure.rejectedProtocolVersion;
+      extra.relayProtocolVersion = scrub(failure.rejectedProtocolVersion);
     }
     this.extra = extra;
   }
@@ -235,6 +238,16 @@ function fail(outcome: FileOpOutcome): never {
   throw new McpCliFileError(outcome);
 }
 
+/** The only request fields an audit row may see: never content, edits or patterns. */
+function auditArgsOf(input: unknown): Record<string, unknown> {
+  const record = asRecord(input);
+  const out: Record<string, unknown> = {};
+  for (const key of ["path", "root", "from", "paths", "expectedEtag"]) {
+    if (record[key] !== undefined) out[key] = record[key];
+  }
+  return out;
+}
+
 /** Run one tool's op and return the settled success (`{op, result}`), or throw `McpCliFileError`. */
 export async function runForwarderCliFileTool(
   op: FileOp,
@@ -246,13 +259,29 @@ export async function runForwarderCliFileTool(
   // shape is enforced here, and its issues reach the agent as named fields.
   const checked = strictInput(op).safeParse(input);
   if (!checked.success) {
+    auditRefusedFileInput({
+      userId: deps.userId,
+      tokenId: pat.tokenId,
+      cliDeviceId: "",
+      op,
+      args: auditArgsOf(input),
+    });
     throw new McpCliFileError(
       { ok: false, code: "invalid_input" },
       { issues: checked.error.issues },
     );
   }
   const adapted = adaptFileToolInput(op, checked.data);
-  if (adapted === null) return fail({ ok: false, code: "invalid_input" });
+  if (adapted === null) {
+    auditRefusedFileInput({
+      userId: deps.userId,
+      tokenId: pat.tokenId,
+      cliDeviceId: "",
+      op,
+      args: auditArgsOf(checked.data),
+    });
+    return fail({ ok: false, code: "invalid_input" });
+  }
   const outcome = await runFileOp({
     userId: deps.userId,
     tokenId: pat.tokenId,
@@ -376,7 +405,7 @@ export function projectFileToolOutput(output: unknown): unknown {
 // Descriptions
 
 export const FILE_MASKING_NOTICE =
-  "Masking is narrow: only SSH private keys, environment-variable secrets (dotenv and env files, and secret-named KEY=value assignments) and the Hugging Face token file and --api-key/--hf-token flag values are masked, shown as ⟦redacted:N⟧. Anything else in a file is returned as is. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
+  "Masking is bounded and shown in the text: dotenv values as KEY=⟦redacted:N⟧; in other files any line containing a secret-name word (…_TOKEN, …_KEY, …_SECRET, …_PASSWORD, apikey, api-key, hf-token, PASSWORD), the next non-blank line and every deeper-indented continuation as ⟦redacted line⟧; --api-key/--hf-token flag values; private-key blocks and SSH private key files; Hugging Face token files. There is no vendor-prefix scanner and a construct opened before the bounded lookback of a windowed read is a documented residual. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
 
 export const FILE_ACCESS_NOTICE =
   "On an unsupervised CLI, reads and writes run headless. On a supervised CLI, writes return a commandId: a person must press Enter on the CLI-drawn screen showing the operation, resolved physical path, reason and masked diff computed from disk. Poll forwarder_cli_command_result; no read grant is implied. State-dependent failures reach the agent only after a person dismisses the screen. Supervised dryRun is refused. Off refuses grant_disabled. Mode is the lowest of the dashboard grant and CLI config. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
@@ -385,7 +414,7 @@ export const FILE_ETAG_NOTICE =
   "Pass expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete. Line-range edits, replace and rename overwrite require it. Stale etags return conflict; supervised errors contain only code, without currentEtag or file content. Supervised edit/write results omit diff and hunks. The CLI rechecks the pre-image before applying. Etags reset when the wsmp daemon restarts: with a read grant, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'An error.outcome "unknown" means the change may have been made. A supervised timeout/offline is unknown only after supervised.accepted; before that it is definitively not applied. Ask the person to inspect the file, or use forwarder_cli_file_stat with a read grant, before retrying.';
+  'An error.outcome "unknown", including timeout, offline or io_error, means the change may have been made. A supervised timeout/offline or CLI io_error is unknown only after supervised.accepted; before that it is definitively not applied. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag, before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict); an exact-match edit without expectedEtag is NOT idempotent.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Headless operations are never queued and time out after 30 seconds. Supervised writes share command limits (1 awaiting per CLI, 2 per user, 2 live per CLI), wait up to 15 minutes for approval, then time out 30 seconds after acceptance.";

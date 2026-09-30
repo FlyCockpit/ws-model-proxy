@@ -173,7 +173,7 @@ const HOT_PATH_WRITERS: Record<string, string> = {
  */
 const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/metric-routing.ts":
-    "M: pool routing rules (one owner-scoped row update of a non-key JSON column)",
+    "M: pool routing rules and member engine-load override (one owner-scoped row update of non-key columns each)",
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/relay/session-manager.ts": "H status: device connection state",
   "apps/server/src/model-api/provider-attempt-runtime.ts":
@@ -182,6 +182,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/model-pool-routing.ts":
     "H status: pool member health, one row per statement",
   "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
+  "packages/api/src/lib/engine-process-capacity.ts":
+    "M: process capacity lifecycle and orphan cleanup",
   "packages/api/src/lib/discovered-inference-capacity.ts": "M: capacity discovery and backfill",
   "packages/api/src/lib/engine-facts.ts":
     "M: relay engine facts and AUTO limit refresh (registration holds the capacity fences)",

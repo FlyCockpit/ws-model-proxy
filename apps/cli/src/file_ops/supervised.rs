@@ -100,6 +100,7 @@ impl PinnedPath {
         ops: &FileOps,
         resolved: &Resolved,
         access: Access,
+        cancel: &Cancel,
     ) -> FileResult<()> {
         // The ancestor pin binds the parent; bind the leaf name separately.
         // An inode moved within that parent and reached through a new symlink
@@ -109,7 +110,7 @@ impl PinnedPath {
             .file_name()
             .is_some_and(|name| name != resolved.name)
         {
-            return Err(FileError::conflict("path changed"));
+            return Err(FileError::conflict("replaced"));
         }
         match (&self.object, resolved.lstat()?) {
             (None, None) => Ok(()),
@@ -124,7 +125,7 @@ impl PinnedPath {
                             if !opened.same_object(&expected.stat) {
                                 return Err(FileError::conflict("replaced"));
                             }
-                            super::read::current_etag(ops, &mut file, &opened)?
+                            super::read::current_etag(ops, &mut file, &opened, cancel)?
                         }
                         Kind::Symlink => ops.key.weak_stat(&now),
                         Kind::Dir | Kind::Other => String::new(),
@@ -139,11 +140,11 @@ impl PinnedPath {
         }?;
         if let Some((path, expected, target)) = &self.route_leaf {
             let metadata =
-                std::fs::symlink_metadata(path).map_err(|_| FileError::conflict("path changed"))?;
+                std::fs::symlink_metadata(path).map_err(|_| FileError::conflict("replaced"))?;
             let current_target =
-                std::fs::read_link(path).map_err(|_| FileError::conflict("path changed"))?;
+                std::fs::read_link(path).map_err(|_| FileError::conflict("replaced"))?;
             if !Stat::from_metadata(&metadata).same_object(expected) || &current_target != target {
-                return Err(FileError::conflict("path changed"));
+                return Err(FileError::conflict("replaced"));
             }
         }
         // Re-resolve the pinned physical ancestor after every observable race
@@ -161,7 +162,7 @@ impl PinnedPath {
                     stat: self.ancestor.stat,
                     missing_paths: Vec::new(),
                 }),
-                cancel: None,
+                cancel: Some(cancel),
             },
         )?;
         // PinOpened is the last hook in this verifier. Check the name again:
@@ -186,11 +187,12 @@ impl PinnedPath {
         dir: &OwnedFd,
         name: &std::ffi::OsStr,
         access: Access,
+        cancel: &Cancel,
     ) -> FileResult<()> {
         let parent = self
             .physical
             .parent()
-            .ok_or_else(|| FileError::conflict("parent replaced"))?
+            .ok_or_else(|| FileError::conflict("replaced"))?
             .to_path_buf();
         let resolved = Resolved {
             dir: dir.try_clone()?,
@@ -199,7 +201,7 @@ impl PinnedPath {
             created: Vec::new(),
             missing_suffix: Vec::new(),
         };
-        self.verify(ops, &resolved, access)
+        self.verify(ops, &resolved, access, cancel)
     }
 }
 
@@ -258,6 +260,7 @@ fn snapshot(
     access: Access,
     follow_last: bool,
     token_key: &EtagKey,
+    cancel: &Cancel,
 ) -> FileResult<(PinnedPath, Vec<u8>)> {
     let expanded = super::resolve::expand(path)?;
     let route_leaf = match std::fs::symlink_metadata(&expanded) {
@@ -277,7 +280,7 @@ fn snapshot(
             access,
             preview_missing: true,
             pin: None,
-            cancel: None,
+            cancel: Some(cancel),
         },
     )?;
     let ancestor_stat = Stat::from_raw(&fstat(resolved.dir.as_fd()).map_err(FileError::errno)?);
@@ -317,9 +320,13 @@ fn snapshot(
                     stat = opened;
                     atomic::check_replaceable(ops, &stat)?;
                     if stat.size <= super::etag::STRONG_ETAG_MAX_BYTES {
-                        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
+                        let bytes =
+                            load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES, cancel)?;
                         ops.step(Step::SupervisedSnapshotRead)?;
-                        (Some(ops.key.strong(&bytes)), Some(token_key.strong(&bytes)))
+                        (
+                            Some(ops.key.strong(&stat, &bytes)),
+                            Some(token_key.strong(&stat, &bytes)),
+                        )
                     } else {
                         (
                             Some(ops.key.weak_stat(&stat)),
@@ -376,13 +383,13 @@ fn token(
         FileError::new(ErrorCode::IoError, format!("argument encoding: {error}"))
     })?);
     if let Some(body) = body {
-        bytes.extend_from_slice(key.strong(body).as_bytes());
+        bytes.extend_from_slice(key.supervised_token(body).as_bytes());
     }
     for fingerprint in fingerprints {
         bytes.extend_from_slice(&(fingerprint.len() as u64).to_le_bytes());
         bytes.extend_from_slice(fingerprint);
     }
-    Ok(key.strong(&bytes))
+    Ok(key.supervised_token(&bytes))
 }
 
 struct Built {
@@ -468,7 +475,7 @@ fn path_specs(op: &str, raw: Value) -> FileResult<Vec<(String, Access, bool)>> {
     })
 }
 
-fn precheck_paths(ops: &FileOps, op: &str, raw: Value) -> FileResult<()> {
+fn precheck_paths(ops: &FileOps, op: &str, raw: Value, cancel: &Cancel) -> FileResult<()> {
     ops.policy.check_process()?;
     for (path, access, follow_last) in path_specs(op, raw)? {
         super::resolve::expand(&path)?;
@@ -481,7 +488,7 @@ fn precheck_paths(ops: &FileOps, op: &str, raw: Value) -> FileResult<()> {
                 access,
                 preview_missing: true,
                 pin: None,
-                cancel: None,
+                cancel: Some(cancel),
             },
         ) {
             Ok(_) => {}
@@ -526,7 +533,7 @@ fn require_agent_etag(agent: Option<&str>, current: Option<&str>) -> FileResult<
     if let Some(agent) = agent
         && Some(agent) != current
     {
-        return Err(FileError::conflict(current.unwrap_or("absent")));
+        return Err(FileError::conflict(current.unwrap_or("gone")));
     }
     Ok(())
 }
@@ -536,7 +543,7 @@ fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> File
     // Entry points already ran static_validate before any disk access.
     edit::validate_args(&args)?;
     let agent_etag = args.expected_etag.clone();
-    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
+    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key, cancel)?;
     let current = object(&pin, ErrorCode::NotFound)?;
     if current.stat.kind() == Kind::File {
         atomic::check_replaceable(ops, &current.stat)?;
@@ -564,7 +571,13 @@ fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> File
     })
 }
 
-fn build_write(ops: &FileOps, raw: Value, body: Option<&[u8]>, key: &EtagKey) -> FileResult<Built> {
+fn build_write(
+    ops: &FileOps,
+    raw: Value,
+    body: Option<&[u8]>,
+    key: &EtagKey,
+    cancel: &Cancel,
+) -> FileResult<Built> {
     let supplied: SupervisedWriteArgs = parse(raw)?;
     let body = body.ok_or_else(|| FileError::invalid("write body is missing"))?;
     let mut args = WriteArgs {
@@ -586,7 +599,7 @@ fn build_write(ops: &FileOps, raw: Value, body: Option<&[u8]>, key: &EtagKey) ->
         ));
     }
     let agent_etag = args.expected_etag.clone();
-    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
+    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key, cancel)?;
     args.path = path_text(&pin.physical)?;
     let mut before = String::new();
     match (&pin.object, if_exists) {
@@ -627,7 +640,7 @@ fn build_write(ops: &FileOps, raw: Value, body: Option<&[u8]>, key: &EtagKey) ->
                     access: Access::Write,
                     preview_missing: false,
                     pin: None,
-                    cancel: None,
+                    cancel: Some(cancel),
                 },
             )?;
             ops.step(Step::SupervisedPreviewRead)?;
@@ -640,9 +653,9 @@ fn build_write(ops: &FileOps, raw: Value, body: Option<&[u8]>, key: &EtagKey) ->
                     "the existing file is too large to preview",
                 ));
             }
-            let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
-            if object.etag.as_deref() != Some(ops.key.strong(&bytes).as_str()) {
-                return Err(FileError::conflict("content changed"));
+            let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES, cancel)?;
+            if object.etag.as_deref() != Some(ops.key.strong(&stat, &bytes).as_str()) {
+                return Err(FileError::conflict("replaced"));
             }
             if text::sniff_binary(&bytes).is_some() {
                 return Err(FileError::new(
@@ -700,6 +713,7 @@ fn material(
     raw: Value,
     body: Option<&[u8]>,
     key: &EtagKey,
+    cancel: &Cancel,
 ) -> FileResult<Material> {
     ops.policy.check_process()?;
     match op {
@@ -707,7 +721,7 @@ fn material(
             let mut args: EditArgs = parse(raw)?;
             // Entry points already ran static_validate before any disk access.
             edit::validate_args(&args)?;
-            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
+            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key, cancel)?;
             args.path = path_text(&pin.physical)?;
             if let Some(etag) = request_etag(&pin) {
                 args.expected_etag = Some(etag);
@@ -735,7 +749,8 @@ fn material(
                 reason: supplied.reason.clone(),
             };
             write::validate_args(&validate)?;
-            let (pin, fingerprint) = snapshot(ops, &supplied.path, Access::Write, true, key)?;
+            let (pin, fingerprint) =
+                snapshot(ops, &supplied.path, Access::Write, true, key, cancel)?;
             let normalized = SupervisedWriteArgs {
                 path: path_text(&pin.physical)?,
                 expected_etag: if supplied.if_exists == Some(IfExists::Replace) {
@@ -758,8 +773,8 @@ fn material(
             if args.overwrite.unwrap_or(false) && args.expected_etag.is_none() {
                 return Err(FileError::invalid("expectedEtag is required for overwrite"));
             }
-            let (from, from_fp) = snapshot(ops, &args.from, Access::Remove, false, key)?;
-            let (to, to_fp) = snapshot(ops, &args.to, Access::Write, false, key)?;
+            let (from, from_fp) = snapshot(ops, &args.from, Access::Remove, false, key, cancel)?;
+            let (to, to_fp) = snapshot(ops, &args.to, Access::Write, false, key, cancel)?;
             args.from = path_text(&from.physical)?;
             args.to = path_text(&to.physical)?;
             args.expected_etag = if args.overwrite.unwrap_or(false) {
@@ -782,7 +797,7 @@ fn material(
             if let Some(mode) = &args.mode {
                 write::parse_mode(mode)?;
             }
-            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
+            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key, cancel)?;
             args.path = path_text(&pin.physical)?;
             Ok(Material {
                 paths: vec![("path".to_string(), args.path.clone())],
@@ -793,7 +808,7 @@ fn material(
         "delete" if body.is_none() => {
             let mut args: DeleteArgs = parse(raw)?;
             check_reason(&args.reason)?;
-            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Remove, false, key)?;
+            let (pin, fingerprint) = snapshot(ops, &args.path, Access::Remove, false, key, cancel)?;
             args.path = path_text(&pin.physical)?;
             if let Some(etag) = request_etag(&pin) {
                 args.expected_etag = Some(etag);
@@ -811,7 +826,7 @@ fn material(
     }
 }
 
-fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
+fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> FileResult<Built> {
     let mut args: RenameArgs = parse(raw)?;
     check_reason(&args.reason)?;
     let overwrite = args.overwrite.unwrap_or(false);
@@ -819,8 +834,8 @@ fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
         return Err(FileError::invalid("expectedEtag is required for overwrite"));
     }
     let agent_etag = args.expected_etag.clone();
-    let (from, from_fp) = snapshot(ops, &args.from, Access::Remove, false, key)?;
-    let (to, to_fp) = snapshot(ops, &args.to, Access::Write, false, key)?;
+    let (from, from_fp) = snapshot(ops, &args.from, Access::Remove, false, key, cancel)?;
+    let (to, to_fp) = snapshot(ops, &args.to, Access::Write, false, key, cancel)?;
     if from.physical == to.physical {
         return Err(FileError::invalid(
             "source and destination are the same path",
@@ -890,13 +905,13 @@ fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
     })
 }
 
-fn build_mkdir(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
+fn build_mkdir(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> FileResult<Built> {
     let mut args: MkdirArgs = parse(raw)?;
     check_reason(&args.reason)?;
     if let Some(mode) = &args.mode {
         write::parse_mode(mode)?;
     }
-    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
+    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key, cancel)?;
     if pin.object.is_none()
         && pin.physical.parent() != Some(pin.ancestor.path.as_path())
         && !args.parents.unwrap_or(true)
@@ -924,11 +939,11 @@ fn build_mkdir(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
     })
 }
 
-fn build_delete(ops: &FileOps, raw: Value, key: &EtagKey) -> FileResult<Built> {
+fn build_delete(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> FileResult<Built> {
     let mut args: DeleteArgs = parse(raw)?;
     check_reason(&args.reason)?;
     let agent_etag = args.expected_etag.clone();
-    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Remove, false, key)?;
+    let (pin, fingerprint) = snapshot(ops, &args.path, Access::Remove, false, key, cancel)?;
     let object = object(&pin, ErrorCode::NotFound)?;
     if object.stat.kind() == Kind::Other {
         return Err(FileError::new(
@@ -971,10 +986,10 @@ fn build(
     ops.policy.check_process()?;
     match op {
         "edit" if body.is_none() => build_edit(ops, args, key, cancel),
-        "write" => build_write(ops, args, body, key),
-        "rename" if body.is_none() => build_rename(ops, args, key),
-        "mkdir" if body.is_none() => build_mkdir(ops, args, key),
-        "delete" if body.is_none() => build_delete(ops, args, key),
+        "write" => build_write(ops, args, body, key, cancel),
+        "rename" if body.is_none() => build_rename(ops, args, key, cancel),
+        "mkdir" if body.is_none() => build_mkdir(ops, args, key, cancel),
+        "delete" if body.is_none() => build_delete(ops, args, key, cancel),
         "edit" | "rename" | "mkdir" | "delete" => {
             Err(FileError::invalid("only write accepts a body"))
         }
@@ -992,8 +1007,9 @@ impl FileOps {
         cancel: &Cancel,
     ) -> FileResult<PreparedSupervised> {
         static_validate(op, args.clone(), body.as_deref())?;
-        precheck_paths(self, op, args.clone())?;
-        let material = match material(self, op, args.clone(), body.as_deref(), preview_key) {
+        precheck_paths(self, op, args.clone(), cancel)?;
+        let material = match material(self, op, args.clone(), body.as_deref(), preview_key, cancel)
+        {
             Ok(material) => material,
             Err(error) => {
                 let material = fallback_material(op, args)?;
@@ -1081,8 +1097,8 @@ impl FileOps {
         #[cfg(test)]
         preview_ops.set_rename_atomic_capability(self.rename_atomic_capability());
         static_validate(op, args.clone(), body)?;
-        precheck_paths(&preview_ops, op, args.clone())?;
-        let material = match material(&preview_ops, op, args.clone(), body, preview_key) {
+        precheck_paths(&preview_ops, op, args.clone(), cancel)?;
+        let material = match material(&preview_ops, op, args.clone(), body, preview_key, cancel) {
             Ok(material) => material,
             Err(error) => {
                 let material = fallback_material(op, args)?;

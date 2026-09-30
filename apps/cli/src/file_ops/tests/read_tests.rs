@@ -90,6 +90,14 @@ fn window_parameter_table() {
 }
 
 #[test]
+fn unnumbered_window_keeps_leading_blank_lines_aligned_with_start_line() {
+    let fx = Fx::new();
+    fx.put("g.txt", "one\n\n\nfour\nfive\n");
+    let r = fx.read_with(json!({ "path": fx.p("g.txt"), "startLine": 2, "lineNumbers": false }));
+    assert!(r.text.starts_with("\n\nfour\nfive"), "{:?}", r.text);
+}
+
+#[test]
 fn byte_cap_stops_at_a_line_boundary_with_next_call_hint() {
     let fx = Fx::new();
     fx.put("f.txt", numbered(1000));
@@ -237,11 +245,11 @@ fn secret_files_return_a_masked_view() {
         "{}",
         r.text
     );
-    // plain file: only secret-named assignments
+    // Plain files mask token lines and the next line; a blank ends that scope.
     fx.put(
         "run.sh",
         format!(
-            "export X_API_KEY=abcdef\nmax_tokens=4096\n{}\n",
+            "export X_API_KEY=abcdef\n\nmax_tokens=4096\n{}\n",
             aws_style_id()
         ),
     );
@@ -252,11 +260,10 @@ fn secret_files_return_a_masked_view() {
     assert!(!r.text.contains("abcdef"));
 }
 
-/// AC 32's named negative: a `~/.aws/credentials`-shaped file is not a secret
-/// class (the classifier has no cloud-credential rule) and its lower-case keys
-/// are outside the assignment name set, so the content is returned as it is.
+/// The path has no cloud-specific class; its case-insensitive `_key` word
+/// nevertheless goes through the same bounded token rule as every plain file.
 #[test]
-fn an_aws_credentials_file_is_not_masked_by_class_or_name() {
+fn a_plain_credentials_file_uses_case_insensitive_token_masking() {
     let fx = Fx::new();
     fx.put(
         ".aws/credentials",
@@ -264,20 +271,17 @@ fn an_aws_credentials_file_is_not_masked_by_class_or_name() {
     );
     let r = fx.read(".aws/credentials");
     assert!(!r.secret_file);
-    assert_eq!(r.redactions, 0);
-    assert!(
-        r.text
-            .contains("aws_secret_access_key = examplesecretvalue"),
-        "{}",
-        r.text
-    );
-    // and there is nothing for an edit to probe: the view is the raw text
+    assert_eq!(r.redactions, 1);
+    assert!(r.text.contains("[default]") && r.text.contains("EXAMPLEKEYIDVALUE"));
+    assert!(!r.text.contains("examplesecretvalue"), "{}", r.text);
+    assert!(r.text.contains("⟦redacted line⟧"));
+    // Reads and the edit view agree on the protected source range.
     let view = super::super::redact::mask(
         super::super::redact::FileClass::Plain,
         &fx.get(".aws/credentials"),
     );
-    assert_eq!(view.redactions(), 0);
-    assert_eq!(view.text, fx.get(".aws/credentials"));
+    assert_eq!(view.redactions(), 1);
+    assert!(!view.text.contains("examplesecretvalue"));
 }
 
 #[test]
@@ -296,7 +300,7 @@ fn ssh_keys_pem_keys_and_hf_token_files_are_masked() {
             pem("PRIVATE KEY", "KEYBODY\n")
         ),
     );
-    fx.put(".cache/huggingface/token", "hf_abcdefghijklmnop\n");
+    fx.put(".cache/huggingface/token", "fake-hf-value\n");
     assert!(!fx.read(".ssh/id_ed25519").text.contains("SECRETBODY"));
     assert!(fx.read(".ssh/id_ed25519.pub").text.contains("AAAAPUBLIC"));
     let pem = fx.read("tls/server.pem").text;

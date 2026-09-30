@@ -551,7 +551,10 @@ export function cancelCommandsForToken(tokenId: string) {
 export function resetCliCommandsForTests(): void {
   for (const record of commandsById.values()) clearCommandTimers(record);
   commandsById.clear();
-  for (const record of supervisedById.values()) clearWaitTimer(record);
+  for (const record of supervisedById.values()) {
+    clearWaitTimer(record);
+    clearSupervisedTokenTimer(record);
+  }
   supervisedById.clear();
   resetCliAgentAdmissionsForTests();
 }
@@ -610,6 +613,8 @@ type SupervisedRecord = {
   finishedAt: number | null;
   /** The MCP token's own expiry. */
   tokenExpiresAt: number | null;
+  /** File requests lose authority at expiry, without waiting for the sweep. */
+  tokenExpiryTimer: ReturnType<typeof setTimeout> | null;
   /** Deadline of the current wait (confirm or review). */
   waitDeadline: number | null;
   waitTimer: ReturnType<typeof setTimeout> | null;
@@ -678,6 +683,11 @@ function clearWaitTimer(record: SupervisedRecord) {
   record.waitDeadline = null;
 }
 
+function clearSupervisedTokenTimer(record: SupervisedRecord) {
+  if (record.tokenExpiryTimer) clearTimeout(record.tokenExpiryTimer);
+  record.tokenExpiryTimer = null;
+}
+
 function armWait(record: SupervisedRecord, ttlMs: number, onExpire: () => void) {
   clearWaitTimer(record);
   record.waitDeadline = Date.now() + ttlMs;
@@ -706,6 +716,7 @@ function finishSupervised(
 ) {
   if (!isActiveSupervised(record.status)) return;
   clearWaitTimer(record);
+  clearSupervisedTokenTimer(record);
   record.status = status;
   record.finishedAt = Date.now();
   if (fields.rejectionReason !== undefined) record.rejectionReason = fields.rejectionReason;
@@ -817,6 +828,19 @@ function endSupervisedFromServer(
   relaySessionManager.cancelSupervised(record.cliDeviceId, record.commandId, "closed");
 }
 
+/** The timer and incoming file answers enforce the same expiry decision. */
+function expireSupervisedFile(record: SupervisedRecord): boolean {
+  if (
+    record.requestKind !== "file" ||
+    !isActiveSupervised(record.status) ||
+    record.tokenExpiresAt === null ||
+    record.tokenExpiresAt > Date.now()
+  )
+    return false;
+  endSupervisedFromServer(record, "token_expired");
+  return true;
+}
+
 /**
  * Ask the CLI to stop a request that still waits for Enter. The CLI owns the
  * decision: a request still waiting there is declined and never starts
@@ -894,6 +918,12 @@ function goneReason(cause: SupervisedTerminalGoneCause): string {
 }
 
 function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
+  // File settle table (CLI answers never carry detail):
+  // - before accepted: fileError is definitive; success is forbidden;
+  // - after accepted: io_error may follow commit, so its outcome is unknown;
+  // - other CLI fileErrors are definitive, including conflict/cancelled/timeout;
+  // - server termination after accepted is unknown;
+  // - expired credentials never deliver a file answer, even before the timer runs.
   return {
     commandId: record.commandId,
     terminalId: record.terminalId,
@@ -925,6 +955,7 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       clearWaitTimer(record);
       record.status = "running";
       record.acceptedAt = Date.now();
+      if (expireSupervisedFile(record)) return;
       if (record.requestKind === "file") {
         armWait(record, FILE_OP_DEADLINE_MS, () => {
           if (record.status !== "running") return;
@@ -973,9 +1004,13 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
     onDone(result) {
       if (record.requestKind === "file") {
         if (record.status !== "running" && record.status !== "awaiting_user") return;
+        if (expireSupervisedFile(record)) return;
         record.cliSettled = true;
         if (result.fileError) {
-          finishSupervised(record, "rejected", { fileError: result.fileError, definitive: true });
+          finishSupervised(record, "rejected", {
+            fileError: result.fileError,
+            definitive: record.acceptedAt === null || result.fileError.code !== "io_error",
+          });
         } else if (result.fileResult && record.status === "running") {
           record.fileResult = result.fileResult;
           finishSupervised(record, "exited");
@@ -1231,7 +1266,19 @@ async function admitSupervisedRequest(
     spawnedAt: null,
     acceptedAt: null,
     finishedAt: null,
-    tokenExpiresAt: token.expiresAt ? token.expiresAt.getTime() : null,
+    tokenExpiresAt:
+      input.kind === "file"
+        ? [token.expiresAt, input.expiresAt]
+            .filter((date): date is Date => date !== null)
+            .reduce<number | null>(
+              (earliest, date) =>
+                earliest === null ? date.getTime() : Math.min(earliest, date.getTime()),
+              null,
+            )
+        : token.expiresAt
+          ? token.expiresAt.getTime()
+          : null,
+    tokenExpiryTimer: null,
     waitDeadline: null,
     waitTimer: null,
     head: null,
@@ -1281,6 +1328,14 @@ async function admitSupervisedRequest(
     // No live session to ask: its terminal is already gone with it.
     finishSupervised(record, "expired");
   });
+  if (record.requestKind === "file" && record.tokenExpiresAt !== null) {
+    // Long-lived tokens outlast the bounded request; avoid Node timer overflow.
+    record.tokenExpiryTimer = setTimeout(
+      () => expireSupervisedFile(record),
+      Math.min(2 ** 31 - 1, Math.max(0, record.tokenExpiresAt - Date.now())),
+    );
+    record.tokenExpiryTimer.unref?.();
+  }
   // Synchronous with registration: the MCP abort race must now preserve this id.
   if (input.kind === "file") input.onStarted?.();
   return {

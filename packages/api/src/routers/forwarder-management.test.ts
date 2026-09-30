@@ -20,7 +20,7 @@ const testEnv = vi.hoisted(() => ({
 // The parent-delete fence prelude runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
 const { fenceParentDelete } = vi.hoisted(() => ({
-  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown): Promise<string[]> => []),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
@@ -910,9 +910,13 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
-    expect(db.executionTarget.update).toHaveBeenCalledWith({
-      where: { id: expect.stringMatching(/^provider-target-/) },
-      data: { inferenceCapacityId: "provider-capacity-id" },
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: expect.stringMatching(/^provider-target-/),
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
     });
     // Writer class M: the owner fence, then the provider identity fences and
     // the capacity-policy fences of every existing target it changes (one
@@ -3763,6 +3767,10 @@ describe("forwarderManagementRouter", () => {
       where: { id: "provider-member" },
       data: { publicOrder: 0 },
     });
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: { id: "provider-target", capacityAssignmentSource: "AUTO" },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
+    });
   });
 
   it("rejects attaching an external member when inherited pool capacity exceeds its hard limit", async () => {
@@ -5016,7 +5024,7 @@ describe("forwarderManagementRouter", () => {
           });
         } finally {
           fenceParentDelete.mockReset();
-          fenceParentDelete.mockImplementation(async () => undefined);
+          fenceParentDelete.mockImplementation(async () => []);
         }
         // Retried with a fresh plan each time, never deleting.
         expect(db.$transaction).toHaveBeenCalledTimes(5);
@@ -5970,6 +5978,227 @@ describe("metric routing procedures (S-B part 2)", () => {
       "endpoint.running",
       "endpoint.waiting",
     ]);
+  });
+
+  it("reports live engine load, the override and the verdict state per member (S-D)", async () => {
+    const now = Date.now();
+    const model = (upstreamModelId: string) => ({
+      slug: null,
+      upstreamModelId,
+      Endpoint: {
+        slug: "gpu",
+        cliDeviceId: "cli-id",
+        CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+      },
+    });
+    const target = (engineKind: string) => ({
+      InferenceCapacity: { engineKind, engineSlots: 4 },
+      DiscoveredModel: model("a"),
+    });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      slug: "coder",
+      routingRules: [],
+      PoolMembers: [
+        {
+          id: "m1",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
+        {
+          id: "m2",
+          engineLoadMode: "OFF",
+          kvFullThreshold: 0.5,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
+        {
+          id: "m3",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("OLLAMA"),
+        },
+        {
+          id: "m4",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: target("VLLM"),
+        },
+        {
+          id: "m5",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: { engineKind: "VLLM", engineSlots: 4 },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "stale",
+              Endpoint: {
+                slug: "stale-gpu",
+                cliDeviceId: "cli-id",
+                CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+              },
+            },
+          },
+        },
+      ],
+    });
+    deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+      {
+        poolMemberId: "m1",
+        verdict: "FULL",
+        ruleStates: [],
+        engineState: "full_waiting",
+        evaluatedAt: new Date(now - 1_000),
+        expiresAt: new Date(now + 10_000),
+      },
+      {
+        poolMemberId: "m4",
+        verdict: "FULL",
+        ruleStates: [],
+        engineState: "full_kv",
+        evaluatedAt: new Date(now - 60_000),
+        expiresAt: new Date(now - 30_000),
+      },
+    ]);
+    deep.cliDevice.findMany.mockResolvedValue([]);
+    const fresh = new Date(now - 2_000);
+    // Outside the 15 s staleness window: ageSeconds > 15 and `live.stale` true.
+    const stale = new Date(now - 20_000);
+    const result = await client({
+      getLiveNodeTelemetry: (ids: readonly string[]) =>
+        new Map(
+          ids.map((id) => [
+            id,
+            {
+              nodeMetrics: null,
+              nodeMetricsReceivedAt: null,
+              endpointLoad: [
+                {
+                  endpointSlug: "gpu",
+                  modelSlug: null,
+                  running: 4,
+                  waiting: 2,
+                  kvUsage: 0.5,
+                  waitingStreak: 3,
+                  prefixCacheHitsTotal: 30,
+                  prefixCacheQueriesTotal: 60,
+                  source: "vllm-metrics",
+                  ts: fresh.toISOString(),
+                  receivedAt: fresh,
+                },
+                {
+                  endpointSlug: "stale-gpu",
+                  modelSlug: null,
+                  running: 1,
+                  waiting: 2,
+                  kvUsage: 0.1,
+                  waitingStreak: 3,
+                  source: "vllm-metrics",
+                  ts: stale.toISOString(),
+                  receivedAt: stale,
+                },
+              ],
+            },
+          ]),
+        ),
+    }).getPoolRoutingRules({ poolId: "pool-1" });
+    const byId = new Map(result.members.map((member) => [member.poolMemberId, member.engineLoad]));
+    expect(byId.get("m1")).toMatchObject({
+      mode: "auto",
+      engineKind: "VLLM",
+      hasSignal: true,
+      state: "full_waiting",
+      full: true,
+      snapshotState: "full_waiting",
+      live: {
+        running: 4,
+        waiting: 2,
+        kvUsage: 0.5,
+        waitingStreak: 3,
+        stale: false,
+        prefixCacheHits: 30,
+        prefixCacheQueries: 60,
+      },
+    });
+    // 'off' ignores the same reading; the threshold override is reported.
+    expect(byId.get("m2")).toMatchObject({
+      mode: "off",
+      state: "off",
+      full: false,
+      kvFullThreshold: 0.5,
+      effectiveKvFullThreshold: 0.5,
+    });
+    // An expired snapshot row is not reported as the shared state.
+    expect(byId.get("m4")?.snapshotState).toBeNull();
+    // A reading older than the staleness window reports its own age and does
+    // not hold FULL (fail open to lease counts).
+    expect(byId.get("m5")).toMatchObject({
+      state: "stale",
+      full: false,
+      live: { stale: true, ageSeconds: 20 },
+    });
+    // Ollama has no engine signal.
+    expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
+  });
+
+  it("sets a member's engine load override, scoped to the owner, and has the relay clear the pool's verdicts (S-D)", async () => {
+    deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
+    deep.poolMember.findFirst.mockResolvedValue({
+      id: "m1",
+      poolId: "pool-1",
+      engineLoadMode: "OFF",
+      kvFullThreshold: 0.8,
+    });
+    const result = await client({ onPoolRoutingRulesChanged }).setPoolMemberEngineLoad({
+      poolMemberId: "m1",
+      mode: "off",
+      kvFullThreshold: 0.8,
+    });
+    expect(deep.poolMember.updateMany).toHaveBeenCalledWith({
+      where: { id: "m1", ModelPool: { userId: "user-id" } },
+      data: { engineLoadMode: "OFF", kvFullThreshold: 0.8 },
+    });
+    expect(onPoolRoutingRulesChanged).toHaveBeenCalledWith("pool-1");
+    // The H-class verdict table is never written by this M writer.
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ mode: "off", kvFullThreshold: 0.8 });
+  });
+
+  it("leaves the threshold alone when omitted and rejects foreign members and bad thresholds (S-D)", async () => {
+    deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
+    deep.poolMember.findFirst.mockResolvedValue({
+      id: "m1",
+      poolId: "pool-1",
+      engineLoadMode: "AUTO",
+      kvFullThreshold: null,
+    });
+    await client().setPoolMemberEngineLoad({ poolMemberId: "m1", mode: "auto" });
+    expect(deep.poolMember.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "m1", ModelPool: { userId: "user-id" } },
+      data: { engineLoadMode: "AUTO" },
+    });
+    deep.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    deep.poolMemberRoutingVerdict.deleteMany.mockClear();
+    await expect(
+      client().setPoolMemberEngineLoad({ poolMemberId: "other", mode: "off" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+    for (const bad of [0, 1.5, -0.1]) {
+      await expect(
+        client().setPoolMemberEngineLoad({
+          poolMemberId: "m1",
+          mode: "auto",
+          kvFullThreshold: bad,
+        }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    }
   });
 
   it("stores remote metric sources only while the device is unsupervised and pushes them", async () => {

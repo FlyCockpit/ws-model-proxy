@@ -617,7 +617,11 @@ fn new_write_preview_masks_body_assignments_and_leaves_disk_unchanged() {
         panic!("expected masked write preview");
     };
     let diff = allowed.diff.join("\n");
-    assert!(diff.contains("DEMO_TOKEN=⟦redacted:"), "{diff}");
+    assert!(diff.contains("+⟦redacted line⟧"), "{diff}");
+    assert!(
+        !diff.contains("masked-adjacent=old"),
+        "the following line is masked: {diff}"
+    );
     assert!(!diff.contains(secret), "{diff}");
     assert!(!fx.root.join("new.conf").exists());
 }
@@ -629,7 +633,8 @@ fn write_preview_blocks_when_diff_bytes_change_after_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("f.txt");
     std::fs::write(&path, "pinned\n").expect("fixture");
-    let expected_etag = key().strong(b"pinned\n");
+    let stat = super::super::resolve::Stat::from_metadata(&std::fs::metadata(&path).unwrap());
+    let expected_etag = key().strong(&stat, b"pinned\n");
     let hook_path = path.clone();
     let ops = FileOps::new(
         Policy::new(vec![], vec![], true),
@@ -672,7 +677,8 @@ fn snapshot_derives_both_etags_from_the_same_buffered_bytes() {
     let path = dir.path().join("f.txt");
     std::fs::write(&path, "pinned\n").expect("fixture");
     let daemon_key = EtagKey::from_bytes([7; 32]);
-    let daemon_etag = daemon_key.strong(b"pinned\n");
+    let stat = super::super::resolve::Stat::from_metadata(&std::fs::metadata(&path).unwrap());
+    let daemon_etag = daemon_key.strong(&stat, b"pinned\n");
     let hook_path = path.clone();
     let ops = FileOps::new(Policy::new(vec![], vec![], true), daemon_key).with_step_hook(Arc::new(
         move |step| {
@@ -699,7 +705,7 @@ fn snapshot_derives_both_etags_from_the_same_buffered_bytes() {
     assert_eq!(prepared.child_input().blocked, Some(ErrorCode::Conflict));
     assert_eq!(
         prepared.child_input().args["expectedEtag"],
-        key().strong(b"pinned\n")
+        key().strong(&stat, b"pinned\n")
     );
 }
 
@@ -1055,5 +1061,108 @@ fn supervised_dry_run_is_invalid_before_disk_and_in_both_entry_points() {
         );
         assert_eq!(fx.get("present"), "old\n");
         assert!(!fx.root.join("absent").exists());
+    }
+}
+
+#[test]
+fn supervised_result_etags_describe_the_committed_file_object() {
+    for op in ["edit", "write-create", "write-replace", "rename"] {
+        let fx = Fx::new();
+        fx.put("source", "old\n");
+        let (wire_op, args, body, result_path) = match op {
+            "edit" => (
+                "edit",
+                json!({"path":fx.p("source"), "edits":[{"oldText":"old", "newText":"new"}]}),
+                None,
+                "source",
+            ),
+            "write-create" => (
+                "write",
+                json!({"path":fx.p("new")}),
+                Some(b"new\n".to_vec()),
+                "new",
+            ),
+            "write-replace" => (
+                "write",
+                json!({"path":fx.p("source"), "ifExists":"replace", "expectedEtag":fx.etag("source")}),
+                Some(b"new\n".to_vec()),
+                "source",
+            ),
+            _ => (
+                "rename",
+                json!({"from":fx.p("source"), "to":fx.p("new")}),
+                None,
+                "new",
+            ),
+        };
+        let prepared = prepare(&fx, wire_op, args, body);
+        let result = fx.ops.execute_supervised(prepared, &fx.cancel).unwrap();
+        assert_eq!(result["etag"], fx.etag(result_path), "{op}");
+    }
+}
+
+#[test]
+fn supervised_mutations_share_the_headless_namespace_guard() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    for op in ["edit", "write", "mkdir", "rename", "delete"] {
+        let fx = Fx::new();
+        fx.put("source", "old\n");
+        fx.put("other", "other\n");
+        let (request, body) = match op {
+            "edit" => (
+                json!({"path":fx.p("source"), "edits":[{"oldText":"old", "newText":"new"}]}),
+                None,
+            ),
+            "write" => (json!({"path":fx.p("new")}), Some(b"new\n".to_vec())),
+            "mkdir" => (json!({"path":fx.p("new")}), None),
+            "rename" => (json!({"from":fx.p("source"), "to":fx.p("new")}), None),
+            _ => (json!({"path":fx.p("source")}), None),
+        };
+        let prepared = prepare(&fx, op, request, body);
+        assert_eq!(prepared.child_input().blocked, None);
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        let mut fx = fx.with_hook(move |step| {
+            if step == Step::SupervisedPinVerified && first.swap(false, Ordering::SeqCst) {
+                reached_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Ok(())
+        });
+        fx.ops.limits.lock_wait = Duration::from_millis(50);
+        let fx = Arc::new(fx);
+        let worker_fx = Arc::clone(&fx);
+        let apply = std::thread::spawn(move || {
+            worker_fx
+                .ops
+                .execute_supervised(prepared, &worker_fx.cancel)
+        });
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let contending = if matches!(op, "rename" | "delete") {
+            fx.ops.execute(
+                "write",
+                json!({"path":fx.p("independent"), "content":"must wait"}),
+                &fx.cancel,
+            )
+        } else {
+            fx.ops.execute(
+                "rename",
+                json!({"from":fx.p("other"), "to":fx.p("moved-other")}),
+                &fx.cancel,
+            )
+        };
+        release_tx.send(()).unwrap();
+        apply.join().unwrap().unwrap();
+        assert_eq!(code(contending), ErrorCode::Timeout, "{op}");
+        assert_eq!(fx.get("other"), "other\n");
+        assert!(!fx.root.join("independent").exists());
+        assert!(!fx.root.join("moved-other").exists());
     }
 }

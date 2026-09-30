@@ -50,26 +50,26 @@ and release/reclaim (fill mode: grant until nothing more fits).
 3. **Write** (`#persistGrants`): one sorted `FOR UPDATE` over the winners' request rows plus a
    re-read (a winner no longer WAITING ends the persisted prefix and the pass re-plans), the
    shutdown fence checked ONCE right before the first write (armed: nothing is written), then
-   batched writes: the capacity's scheduler state and fencing counter, `createMany` leases,
+   batched writes: the capacity's scheduler state and fencing counter, leases (one `INSERT ... SELECT` over unnested arrays; Prisma's `createMany` took about 10 s for 5,000 rows),
    requests to ADMITTED, sibling waiters to CANCELLED, winner waiters to ADMITTED.
 
 The transaction can be retried (`runCapacitySerializable`): nothing is carried across attempts;
 each attempt re-reads, re-plans and takes fencing tokens from the capacity row's counter. Cost per
-transaction is one snapshot plus O(waiters) work per grant in memory and a handful of statements,
-independent of how many waiters are granted (256 grants: about 0.5 s release, 1.5 s poll on a
-loaded development machine). Lock order (`packages/db/src/capacity-lock-order.ts`) is unchanged. The planner is O(k·W) per
-transaction (k grants over W waiters) and is suited to at most a few thousand simultaneously
-grantable waiters per capacity.
+transaction is one snapshot, O(W log W) indexing, then at most 32 priority-class candidates
+and owners with unmet reservations per grant, with lazy permanent skips amortized over the queue.
+Temporarily borrow-blocked entries may be examined again on later grants; that exceptional cost
+is proportional to the skipped entries. Snapshot relation hydration and lease inserts use batches of at most 500 rows within the same
+transaction, bounding the request-state join and statement size. Load tests cover 5,000 waiters on one capacity (about 3 s for the whole fill on a loaded development machine).
 
-### Known limitation: scope fence derived before the capacity fence
+### Scope fences validated under capacity fences
 
-`fenceCapacityAdmission` reads the durable concurrency-scope set of the target capacities
-BEFORE it takes the capacity fences. A waiter committed while an admission pass waits for a
-capacity fence introduces a scope fence that can no longer be taken (WMPF2 forbids a fence below
-one already held), so two fill-mode passes on different capacities that share such a scope can
-transiently over-admit one lease. This window is pre-existing (master's
-`lockCapacityAdmissionResources` derived the scope set the same way) and is bounded by one lease
-lifetime.
+`fenceCapacityAdmission` discovers durable concurrency scopes, takes scope and capacity fences
+in global order, then re-reads the scope set while holding every capacity fence. A joining or
+scope-changing waiter requires those capacity fences, so this second read observes the final
+set. If any required scope fence is missing, WMPF2 prevents acquiring it below the held capacity
+fences: the transaction rolls back and restarts with a fresh set. `runCapacitySerializable`
+allows four retries within its 15 s deadline and then fails closed. Non-waiting sweepers return
+false and retry on the next run. A shrinking set needs no retry; extra fences are harmless.
 
 ## Spill-over `notBefore` and grant-time routability (saturation S-A)
 

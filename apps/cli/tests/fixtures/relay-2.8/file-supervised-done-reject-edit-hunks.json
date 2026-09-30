@@ -5,8 +5,8 @@
   "fileResult": {
     "op": "edit",
     "result": {
-      "etag": "h:aaa",
-      "previousEtag": "h:bbb",
+      "etag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+      "previousEtag": "h:BBBBBBBBBBBBBBBBBBBBBB",
       "added": 1,
       "removed": 1,
       "applied": true,

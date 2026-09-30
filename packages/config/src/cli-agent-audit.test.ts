@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  CLI_AGENT_PROGRAM_ALLOWLIST,
   CLI_AGENT_REJECTION_FALLBACK,
   CLI_AGENT_WIRE_REASONS,
   cliAgentSignalReason,
@@ -76,203 +77,252 @@ describe("cliAgentSignalReason", () => {
 });
 
 describe("commandProgram", () => {
-  // Adversarial table: every row must yield exactly the program, never any
-  // argument text, a secret, a quote or an unparsable fragment.
+  // Table-driven and adversarial. Every result is an allowlist member or `?`;
+  // no row may put argument text, an assignment or a fragment of one in the row.
   const rows: ReadonlyArray<readonly [string, string, string]> = [
-    ["a leading assignment fails closed (cmd has none)", "FOO=secret curl https://x", UNKNOWN],
-    ["an underscore-leading assignment fails closed", "_TOKEN=abc tool arg", UNKNOWN],
-    ["a one-character program is accepted", "x arg", "x"],
-    ["an absolute path fails closed (cmd reads / as a switch)", "/usr/bin/git push", UNKNOWN],
-    ["a wrapper is stored by its own name", "sudo rm -rf x", "sudo"],
-    ["env is not unwrapped", "env A=1 ls", "env"],
-    ["a plain command", "echo hf_abc", "echo"],
-    [
-      "an sk- token arg is not the program",
-      "curl -H 'Authorization: Bearer sk-abc123' https://x",
-      "curl",
-    ],
-    ["nothing at all", "", UNKNOWN],
-    ["whitespace only", "   \t\n  ", UNKNOWN],
+    // allowlisted, plain
+    ["a plain allowlisted command", "git status", "git"],
+    ["a hyphenated allowlisted name", "llama-server --port 1", "llama-server"],
+    ["a digit name", "python3 x.py", "python3"],
+    ["leading spaces and tabs are skipped", " \t  git push", "git"],
+    ["case is folded", "GIT status", "git"],
+    ["mixed case", "NvIdIa-Smi", "nvidia-smi"],
+    // wrappers: the wrapper only
+    ["sudo is stored, not unwrapped", "sudo rm -rf x", "sudo"],
+    ["env is stored, not unwrapped", "env A=1 ls", "env"],
+    ["nohup", "nohup make &", "nohup"],
+    ["time", "time cargo build", "time"],
+    ["exec", "exec ls", "exec"],
+    // assignments skipped
+    ["one assignment", "FOO=1 make", "make"],
+    ["an underscore-led assignment", "_X=abc git push", "git"],
+    ["several assignments", "A=1 B=two C=/x/y:z@1.2,3+4 cargo test", "cargo"],
+    ["an equals sign inside a value is not plain", "A=b=c git", UNKNOWN],
+    ["an empty value", "A= git status", "git"],
+    ["a double-quoted value with a space", 'FOO="a b" curl x', "curl"],
+    ["a single-quoted value with a space", "FOO='a b' curl x", "curl"],
+    ["an assignment whose value equals an allowlisted name", "A=git make", "make"],
+    ["an assignment carrying a token-shaped value", "TOKEN=abcdefghijklmnop0123 ls", "ls"],
     ["only assignments", "A=b", UNKNOWN],
-    ["two assignments then a program fail closed", "A=b C=d prog", UNKNOWN],
-    ["a NUL in the program", "bad\0cmd", UNKNOWN],
-    ["a control char in the program", "bad\u0007cmd", UNKNOWN],
-    ["unicode in the program", "\u00e9cho hi", UNKNOWN],
-    ["an overlong name (65)", `${"a".repeat(65)} x`, UNKNOWN],
-    ["a name of exactly 64", `${"a".repeat(64)} x`, "a".repeat(64)],
-    ["leading spaces and tabs are skipped", "\t  ls", "ls"],
-    ["a newline before the program fails closed (cmd ends the line)", "\n\npython -c x", UNKNOWN],
-    [
-      "single quotes around the program fail closed (cmd does not quote with ')",
-      "'/bin/ls' x",
-      UNKNOWN,
-    ],
-    ["double quotes around the program fail closed", '"ls" x', UNKNOWN],
-    ["an unterminated double quote fails closed", '"echo', UNKNOWN],
-    ["an unterminated single quote fails closed", "'ls", UNKNOWN],
-    ["a quoted program containing a space", "'my tool' x", UNKNOWN],
-    ["a relative script fails closed (cmd reads ./ differently)", "./run.sh", UNKNOWN],
-    ["a bare script name", "run.sh", "run.sh"],
-    ["a plus in the name fails closed", "g++ x", UNKNOWN],
-    ["a path with a trailing slash", "/usr/bin/", UNKNOWN],
-    ["a quoted assignment value with a space fails closed", 'FOO="a b" curl', UNKNOWN],
-    ["a plain assignment with path-ish value fails closed", "A=/x/y:z@1.2,3+4=5 prog", UNKNOWN],
-    ["an empty assignment value fails closed", "A= prog", UNKNOWN],
-    ["an assignment-looking invalid name is a candidate", "1A=b", UNKNOWN],
-    ["a dashed assignment-looking name is a candidate", "a-b=c", UNKNOWN],
-    ["a leading long flag is not a program", "--api-key x", UNKNOWN],
-    ["a here-string first line", "<<< hello", UNKNOWN],
-    ["a heredoc marker first line", "cat <<EOF", "cat"],
-    ["the unknown sentinel itself as input", "?", UNKNOWN],
-    ["exec is stored as a wrapper", "exec ls", "exec"],
+    ["assignments then an unknown program", "A=b C=d prog", UNKNOWN],
+    // paths and quotes
+    ["an absolute path", "/usr/bin/git push", "git"],
+    ["a relative path", "./git x", "git"],
+    ["a parent-relative path", "../bin/make", "make"],
+    ["a tilde path", "~/bin/rg pat", "rg"],
+    ["double quotes", '"python3" x.py', "python3"],
+    ["single quotes", "'git' status", "git"],
+    ["a quoted path", '"/usr/bin/git" status', "git"],
+    ["assignment, quotes and a path together", 'X=1 "/usr/local/bin/Cargo" build', "cargo"],
+    ["a trailing slash", "/usr/bin/git/", UNKNOWN],
+    ["a path to an unknown program", "/opt/x/tool run", UNKNOWN],
+    ["two quote layers", `"'git'" x`, UNKNOWN],
+    ["a mismatched quote", `"git' x`, UNKNOWN],
+    ["an unterminated quote", '"git', UNKNOWN],
+    ["a quote closing early", '"git"x status', UNKNOWN],
+    ["a quoted word with a space", "'git status'", UNKNOWN],
+    ["a Windows path", "C:\\bin\\git.exe status", UNKNOWN],
+    ["an exe suffix is not the allowlisted name", "git.exe status", UNKNOWN],
+    // adversarial leading words
+    ["an unknown program", "mytool --x", UNKNOWN],
+    ["a secret-looking first word", "abcdefghij0123456789 git", UNKNOWN],
+    ["a token-looking word before an allowlisted one", "notasecret-abc123 git push", UNKNOWN],
+    ["an allowlisted name in argument position", "mytool git", UNKNOWN],
+    ["a flag", "--git x", UNKNOWN],
+    ["a dashed path", "-x/bin/git run", UNKNOWN],
+    ["a tab ends the word", "git\tstatus", "git"],
+    ["a short flag", "-git x", UNKNOWN],
+    ["a flag with a path", "--config=/etc/git run", UNKNOWN],
+    ["an invalid assignment name with a path", "1FOO=/x/git cmd", UNKNOWN],
+    ["a redirection prefix", "2>/tmp/git ls", UNKNOWN],
+    ["an input redirection prefix", "</run/x/git psql", UNKNOWN],
+    ["an and-redirect prefix", "&>/var/log/git make", UNKNOWN],
+    ["an expansion prefix", "$HOME/bin/git", UNKNOWN],
+    ["a braced expansion prefix", "$" + "{X}/git", UNKNOWN],
+    ["a substitution", "$(git) x", UNKNOWN],
+    ["a backtick", "`git` x", UNKNOWN],
+    ["a here-string", "<<< git", UNKNOWN],
+    ["a semicolon", "git;ls", UNKNOWN],
+    ["a pipe glued on", "git|cat", UNKNOWN],
+    ["an ampersand glued on", "git&", UNKNOWN],
+    ["a plus", "g++ x", UNKNOWN],
+    ["the sentinel as input", "?", UNKNOWN],
+    // assignments that are not plain never get skipped
+    ["an escaped space in a value", "P=a\\ git make", UNKNOWN],
+    ["a command substitution value", "P=$(x y) git", UNKNOWN],
+    ["a backtick value", "P=`x y` git", UNKNOWN],
+    ["a parameter expansion value", "P=$" + "{D:-a b} git", UNKNOWN],
+    ["an array value", "P=(a b) git", UNKNOWN],
+    ["an escaped quote in a double-quoted value", 'P="a\\"b c" git', UNKNOWN],
+    ["an expansion in a double-quoted value", 'P="$X y" git', UNKNOWN],
+    ["a quote glued to a plain value", 'P=a"b c" git', UNKNOWN],
+    ["an unterminated quoted value", 'P="a git', UNKNOWN],
+    ["a digit-led assignment name", "1FOO=x git", UNKNOWN],
+    ["a dashed assignment name", "a-b=c git", UNKNOWN],
+    ["a bare dollar in an unquoted value", "P=$X git", UNKNOWN],
+    ["a backtick in an unquoted value", "P=`x` git", UNKNOWN],
+    ["a backslash in a single-quoted value", "P='a\\b' git", UNKNOWN],
+    ["a backslash in a double-quoted value", 'P="a\\b" git', UNKNOWN],
+    ["a backtick in a double-quoted value", 'P="a`b" git', UNKNOWN],
+    ["a backslash in the program word", "a\\b/git x", UNKNOWN],
+    ["a newline in a quoted value", 'P="a\nb" git', UNKNOWN],
+    ["a carriage return in a value", "P=a\rgit git", UNKNOWN],
+    ["a semicolon in a value", "P=a;git git", UNKNOWN],
+    ["a unicode space in a value", "P=a\u00a0git git", UNKNOWN],
+    // empty and whitespace
+    ["nothing at all", "", UNKNOWN],
+    ["whitespace only", "   \t  ", UNKNOWN],
+    ["a leading newline", "\ngit status", UNKNOWN],
+    ["a leading carriage return", "\rgit status", UNKNOWN],
+    ["a leading vertical tab", "\vgit status", UNKNOWN],
+    // charset attacks
+    ["a NUL in the name", "gi\0t x", UNKNOWN],
+    ["a control character in the name", "git\u0007 x", UNKNOWN],
+    ["a NUL after the name", "git\0 x", UNKNOWN],
+    ["a Cyrillic look-alike", "g\u0456t x", UNKNOWN],
+    ["a fullwidth look-alike", "\uff47\uff49\uff54 x", UNKNOWN],
+    ["a dotless-i look-alike lowercasing to ASCII", "G\u0130T x", UNKNOWN],
+    ["the Kelvin sign lowercasing to k", "\u212Aubectl x", UNKNOWN],
+    ["a long-s look-alike", "\u017Fh x", UNKNOWN],
+    ["a zero-width joiner inside", "g\u200bit x", UNKNOWN],
+    ["a soft hyphen inside", "g\u00adit x", UNKNOWN],
+    ["a right-to-left override", "\u202egit x", UNKNOWN],
+    ["a lone surrogate", "\uD800 x", UNKNOWN],
+    // overlong
+    ["an overlong word", `${"a".repeat(100_000)} git`, UNKNOWN],
+    ["an overlong path ending in an allowlisted name", `/${"a/".repeat(5000)}git x`, UNKNOWN],
+    ["an overlong assignment value", `A=${"b".repeat(100_000)} git`, "git"],
+    ["an overlong quoted assignment value", `A="${"b ".repeat(50_000)}" git`, "git"],
+    ["too many assignments", `${"A=1 ".repeat(33)}git`, UNKNOWN],
+    ["exactly the assignment cap", `${"A=1 ".repeat(32)}git`, "git"],
+    ["an overlong non-word", `${"\u00e9".repeat(100_000)} git`, UNKNOWN],
   ];
   it.each(rows)("%s", (_name, input, expected) => {
     expect(commandProgram(input)).toBe(expected);
   });
 
-  // C1b-1: a shell word can keep whitespace inside ONE assignment value, so a
-  // later piece of the secret must never be stored as the program.
-  const secretFragmentRows: ReadonlyArray<readonly [string, string, string]> = [
-    ["escaped space", "PASSWORD=correct\\ horsebattery mysql", "horsebattery"],
-    [
-      "escaped quote in a double-quoted value",
-      'PASSWORD="pa\\"ss secretword x" mysql',
-      "secretword",
-    ],
-    ["parameter expansion default", "PASS=$" + "{D:-my secretpw x} mysql", "secretpw"],
-    ["command substitution", "PASS=$(printf hunter2word x) mysql", "hunter2word"],
-    ["backtick substitution", "PASS=`printf hunter2tick x` mysql", "hunter2tick"],
-    ["array assignment", "KEYS=(aaakey bbbkey ccc) prog", "bbbkey"],
-    ["carriage return in the value", "PASS=abc\rsecretcr prog", "secretcr"],
-    ["backslash-newline in the value", "PASS=abc\\\nsecretnl prog", "secretnl"],
-    ["single-quoted value with spaces", "PASS='top secretpiece x' prog", "secretpiece"],
-    ["unicode space in the value", "PASS=abc\u00a0secretnb prog", "secretnb"],
-    ["vertical tab in the value", "PASS=abc\vsecretvt prog", "secretvt"],
-    ["semicolon then a word", "PASS=abc;secretsemi prog", "secretsemi"],
-    ["arithmetic expansion", "PASS=$((1 + secretar)) prog", "secretar"],
-  ];
-  it.each(secretFragmentRows)(
-    "never stores a fragment of an assignment value: %s",
-    (_n, input, fragment) => {
-      const program = commandProgram(input);
-      expect(program).toBe(UNKNOWN);
-      expect(program).not.toContain(fragment);
-      expect(commandAuditPath(input, () => "H")).toBe("hmac-sha256:H ?");
-    },
-  );
-
-  // C2b-1: a leading redirection or slash-bearing flag is not a program; its
-  // last path segment must never be stored.
-  const leadingWordRows: ReadonlyArray<readonly [string, string, string]> = [
-    ["stderr redirection", "2>/tmp/hunter2 ls", "hunter2"],
-    ["input redirection", "</run/secrets/ghp_notreal0000 psql", "ghp_notreal0000"],
-    ["output redirection", ">/run/secrets/db_password cat", "db_password"],
-    ["and-redirect", "&>/var/log/SeCrEt.txt make", "SeCrEt.txt"],
-    ["append redirection", "1>>/x/y/token-abc cmd", "token-abc"],
-    ["short flag with attached path", "-p/tmp/hunter2 x", "hunter2"],
-    ["long flag with equals path", "--config=/etc/secretfile run", "secretfile"],
-    ["invalid assignment name with path", "1FOO=/x/hunter2 cmd", "hunter2"],
-    ["expansion prefix", "$HOME/bin/tool", "tool"],
-    ["tilde prefix", "~/bin/tool", "tool"],
-    ["braced expansion prefix", "$" + "{X}/tool", "tool"],
-  ];
-  it.each(leadingWordRows)(
-    "never stores a fragment of a leading non-program word: %s",
-    (_n, input, fragment) => {
-      const program = commandProgram(input);
-      expect(program).toBe(UNKNOWN);
-      expect(program).not.toContain(fragment);
-    },
-  );
-
-  // C3b-1: only sh's own leading blanks and newlines are trimmed; any other
-  // leading whitespace character is part of the first shell word, so the word
-  // after it is an argument.
-  it.each([
-    "\r",
-    "\v",
-    "\f",
-    "\u00a0",
-    "\u1680",
-    "\u2000",
-    "\u200a",
-    "\u2028",
-    "\u2029",
-    "\u202f",
-    "\u205f",
-    "\u3000",
-    "\ufeff",
-  ])("does not trim leading %j: the next word is an argument", (character) => {
-    expect(commandProgram(`${character} /home/u/hunter2Secret`)).toBe(UNKNOWN);
-    expect(commandProgram(`${character}/home/u/hunter2Secret`)).toBe(UNKNOWN);
-  });
-
-  it("ends the word only at a space or tab, and only the first dot splits a built-in", () => {
-    for (const separator of ["\u000b", "\f", "\r", "\u00a0"]) {
-      expect(commandProgram(`git${separator}secret`)).toBe(UNKNOWN);
-    }
-    expect(commandProgram("echo.x.y hi")).toBe(UNKNOWN);
-    expect(commandProgram("x.echo.y hi")).toBe("x.echo.y");
-  });
-
-  it("skips only leading spaces and tabs", () => {
-    expect(commandProgram(" \t  git push")).toBe("git");
-    expect(commandProgram("\n git push")).toBe(UNKNOWN);
-    expect(commandProgram(" \n git push")).toBe(UNKNOWN);
-  });
-
-  // C4b-1: the CLI may run the command through `cmd /C` (Windows without sh),
-  // which ends the command token at `/`, `+` and, after a built-in, `.`.
-  it.each([
-    "echo/hunter2Secret",
-    "type/hunter2Secret",
-    "./hunter2Secret",
-    "../hunter2Secret",
-    "echo.hunter2Secret",
-    "ECHO.hunter2Secret",
-    "echo+hunter2Secret",
-    "dir/s/b",
-    "ping/n 1 host",
-    "a/b/hunter2Secret",
-  ])("stores ? for a word cmd would split differently: %s", (input) => {
-    expect(commandProgram(input)).toBe(UNKNOWN);
-  });
-
-  it("keeps plain names and dotted non-built-in names, and rejects absolute paths", () => {
-    expect(commandProgram("git status")).toBe("git");
-    expect(commandProgram("echo hi")).toBe("echo");
-    expect(commandProgram("/usr/bin/git status")).toBe(UNKNOWN);
-    expect(commandProgram("python3.12 x")).toBe("python3.12");
-    expect(commandProgram("node.exe x")).toBe("node.exe");
-  });
-
-  // C5b-1: cmd /C has no inline assignment, so `NAME=value word` must not
-  // yield `word`; and no `=`, DPATH/KEYS dotted names.
-  it.each([
-    "FOO=bar hunter2Secret",
-    "echo=hello hunter2Secret",
-    "PATH=/usr/bin:/bin hunter2Secret --x",
-    "set=x hunter2Secret",
-    "dpath.hunter2Secret",
-    "keys.hunter2Secret",
-    "/hunter2Secret",
-    "/echo/hunter2Secret",
-  ])("stores ? for a first word the two shells could read differently: %s", (input) => {
-    expect(commandProgram(input)).toBe(UNKNOWN);
-  });
-
-  it("returns the unknown program for non-string and non-well-formed input", () => {
+  it("returns the unknown program for non-string input", () => {
     expect(commandProgram(undefined)).toBe(UNKNOWN);
     expect(commandProgram(null)).toBe(UNKNOWN);
     expect(commandProgram(42)).toBe(UNKNOWN);
-    // A lone surrogate cannot match the ASCII program charset.
-    expect(commandProgram("\uD800")).toBe(UNKNOWN);
+    expect(commandProgram({})).toBe(UNKNOWN);
   });
 
-  it("never returns anything outside the accepted shape for adversarial rows", () => {
-    for (const [, input, expected] of rows) {
-      expect(expected).toMatch(/^(?:\?|[A-Za-z0-9._+-]{1,64})$/);
-      expect(commandProgram(input)).toMatch(/^(?:\?|[A-Za-z0-9._+-]{1,64})$/);
+  it("keeps the allowlist lowercase, charset-safe, and holding the owner's names", () => {
+    for (const name of CLI_AGENT_PROGRAM_ALLOWLIST) {
+      expect(name).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+    }
+    for (const name of [
+      "git",
+      "curl",
+      "wget",
+      "make",
+      "cmake",
+      "cargo",
+      "rustc",
+      "go",
+      "python",
+      "python3",
+      "pip",
+      "pip3",
+      "node",
+      "npm",
+      "npx",
+      "pnpm",
+      "yarn",
+      "bun",
+      "deno",
+      "docker",
+      "podman",
+      "kubectl",
+      "helm",
+      "terraform",
+      "ssh",
+      "scp",
+      "rsync",
+      "tar",
+      "zip",
+      "unzip",
+      "ls",
+      "cat",
+      "grep",
+      "rg",
+      "find",
+      "sed",
+      "awk",
+      "jq",
+      "systemctl",
+      "journalctl",
+      "sudo",
+      "env",
+      "bash",
+      "sh",
+      "zsh",
+      "llama-server",
+      "ollama",
+      "vllm",
+      "nvidia-smi",
+      "nohup",
+      "time",
+      "exec",
+    ]) {
+      expect(CLI_AGENT_PROGRAM_ALLOWLIST.has(name), name).toBe(true);
+    }
+  });
+
+  // Property-style: over every row and a generated corpus of hostile strings,
+  // a stored program is an allowlist member or `?`, and the audit path ends
+  // with exactly that, never any part of the input that is not the program.
+  it("stores only an allowlist member or ? for every input", () => {
+    const alphabet = [
+      "git",
+      "make",
+      "sudo",
+      "A=",
+      "B=x",
+      " ",
+      "\t",
+      "\n",
+      "'",
+      '"',
+      "/",
+      "\\",
+      "$",
+      "`",
+      "(",
+      ")",
+      ";",
+      "|",
+      "&",
+      "<",
+      ">",
+      "-",
+      "=",
+      ".",
+      "~",
+      "\0",
+      "\u00e9",
+      "\u212A",
+      "secretvalue",
+      "?",
+    ];
+    let seed = 12345;
+    const next = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed;
+    };
+    const corpus = rows.map((row) => row[1]);
+    for (let n = 0; n < 5000; n++) {
+      let input = "";
+      for (let k = 1 + (next() % 8); k > 0; k--) input += alphabet[next() % alphabet.length];
+      corpus.push(input);
+    }
+    for (const input of corpus) {
+      const program = commandProgram(input);
+      expect(program === UNKNOWN || CLI_AGENT_PROGRAM_ALLOWLIST.has(program), input).toBe(true);
+      const path = commandAuditPath(input, () => "H");
+      expect(path).toBe(`hmac-sha256:H ${program}`);
+      expect(program).not.toContain("secretvalue");
     }
   });
 });
@@ -313,7 +363,8 @@ describe("commandAuditPath", () => {
         if (command.includes(secret) && !command.startsWith(secret))
           expect(path, `${command} leaks ${secret}`).not.toContain(secret);
       }
-      expect(path.split(" ").slice(1).join(" ")).toMatch(/^(?:\?|[A-Za-z0-9._+-]{1,64})$/);
+      const program = path.split(" ").slice(1).join(" ");
+      expect(program === UNKNOWN || CLI_AGENT_PROGRAM_ALLOWLIST.has(program)).toBe(true);
     }
   });
 });

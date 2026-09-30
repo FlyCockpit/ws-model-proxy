@@ -98,8 +98,8 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
     )
 }
 
-/// `sh -c` when `sh` exists. Windows falls back to `cmd /C` and cannot kill a
-/// process group, so grandchildren of an exec may survive cancellation.
+/// `sh -c` when `sh` exists; Windows otherwise falls back to `cmd /C`.
+/// Windows execs use a job object to kill the whole tree on cancellation.
 pub fn exec_shell() -> (&'static str, &'static str) {
     if cfg!(unix) || sh_on_path() {
         ("sh", "-c")

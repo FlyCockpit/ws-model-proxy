@@ -713,13 +713,16 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       expect(first.state).toBe("ADMITTED");
       const second = await store.acquire(attempt("second"));
       expect(second.state).toBe("WAITING");
-      // The model (and its target) go; the capacity and the queued request stay.
+      // The model and its target go, and with them the now-empty auto capacity
+      // (#114); the queued request stays until the orphan sweep terminalizes it.
       const forwarder = createRouterClient(m.forwarder.forwarderManagementRouter, {
         context: sessionFor(user),
       });
       await forwarder.removeDiscoveredModelMetadata({ id: local.model.id });
       if (first.state !== "ADMITTED") throw new Error("unreachable");
       expect(await store.release(first.lease)).toBe(true);
+      expect(await fixtures.inferenceCapacity.count({ where: { id: local.capacityId } })).toBe(0);
+      await store.sweepOrphans({ limit: 100 });
       const queued = await fixtures.admissionRequest.findUniqueOrThrow({
         where: { attemptId: `second-${suffix}` },
         include: { Lease: true },
