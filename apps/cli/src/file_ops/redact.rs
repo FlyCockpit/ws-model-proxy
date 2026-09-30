@@ -1242,6 +1242,11 @@ mod tests {
                 "probe-line-two",
             ),
             (
+                "password flag, literal block item with a token comment",
+                "args:\n  - --password\n  - | # DB_PASSWORD comes from deployment\n    line-one\n    probe-line-two\nnext: 1\n",
+                "probe-line-two",
+            ),
+            (
                 "flag block item with a token comment",
                 "args:\n  - --api-key\n  - >- # API_KEY from vault\n    line-one\n    probe-line-two\nnext: 1\n",
                 "probe-line-two",

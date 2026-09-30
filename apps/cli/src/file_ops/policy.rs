@@ -204,6 +204,20 @@ fn is_staging_name(path: &Path) -> bool {
 /// exist yet). Resolution compares physical paths, so a protected entry must be
 /// expressed as one too.
 fn physical(path: &Path) -> PathBuf {
+    // a relative selector (`WSMP_STATE_DIR=state`) is anchored to the working
+    // directory first: resolved paths are absolute, so the alias must be too
+    let anchored;
+    let path = if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                anchored = cwd.join(path);
+                anchored.as_path()
+            }
+            Err(_) => path,
+        }
+    } else {
+        path
+    };
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     let mut base = path;
     loop {
@@ -283,6 +297,23 @@ mod tests {
             subtree,
             deny,
         }
+    }
+
+    /// A relative selector whose parents do not exist yet still gets an absolute
+    /// alias (the operation paths are absolute).
+    #[test]
+    fn relative_missing_protected_path_gets_an_absolute_alias() {
+        let rel = PathBuf::from("wsmp-nonexistent-state-dir/deeper/device-auth.json");
+        let aliases = with_physical_aliases(vec![Protected {
+            path: rel.clone(),
+            subtree: false,
+            deny: Deny::ReadWrite,
+        }]);
+        let want = physical(&std::env::current_dir().unwrap()).join(&rel);
+        assert!(
+            aliases.iter().any(|p| p.path == want),
+            "{aliases:?} lacks {want:?}"
+        );
     }
 
     #[test]
