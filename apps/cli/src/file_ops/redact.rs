@@ -1685,7 +1685,7 @@ mod tests {
         );
         let view = masked(FileClass::Plain, &deep);
         assert!(
-            !view.contains("BODYDEEP") && view.ends_with("tail\n") == false,
+            !view.contains("BODYDEEP") && !view.ends_with("tail\n"),
             "{view:?}"
         );
         // markers that share their hyphens: `END CERT-----BEGIN KEY`
