@@ -72,6 +72,14 @@ vi.mock("./prefill-estimator.js", async (importOriginal) => {
   return { ...actual, prefillSpeedSource: prefillSpeed };
 });
 
+// Warm-session protection (S-C) reads active leases and the warm set through
+// this source; stub it at the routing seam (unset = protection sees nothing).
+const warmProtection = vi.hoisted(() => ({ load: vi.fn() }));
+vi.mock("./warm-protection.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./warm-protection.js")>();
+  return { ...actual, warmProtectionSource: warmProtection };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -136,17 +144,18 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
   executionTarget: { findUnique: MockInstance };
+  poolGrant: { findUnique: MockInstance; findFirst: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
   };
-  poolGrant: { findFirst: MockInstance };
   poolMember: {
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
   };
+  poolMemberRoutingVerdict: { findMany: MockInstance };
   modelPool: {
     findFirst: MockInstance;
     findUnique: MockInstance;
@@ -177,6 +186,48 @@ const db = prisma as unknown as {
     findMany: MockInstance;
   };
 };
+
+type StickyFixture = Record<string, unknown> & {
+  poolGrantId?: string | null;
+  targetExecutionTargetId?: string | null;
+  selectedExecutionTargetId?: string | null;
+  PoolGrant?: ({ id: string } & Record<string, unknown>) | null;
+  TargetExecutionTarget?: unknown;
+  SelectedExecutionTarget?: unknown;
+};
+
+/**
+ * Stickiness records name their grant and targets by plain id (no Prisma
+ * relations, @ws-model-proxy/db/capacity-lock-order). A fixture carries the
+ * related rows as they exist in the database (`PoolGrant`,
+ * `TargetExecutionTarget`, `SelectedExecutionTarget`; null = deleted): the
+ * stored record is served without them, and the by-id lookups return a
+ * related row only for the id the record names.
+ */
+function mockStickyRecord(fixture: StickyFixture | null) {
+  if (!fixture) {
+    db.responseStickinessRecord.findUnique.mockResolvedValue(null);
+    return;
+  }
+  const { PoolGrant, TargetExecutionTarget, SelectedExecutionTarget, ...stored } = fixture;
+  if (TargetExecutionTarget && !stored.targetExecutionTargetId) {
+    throw new Error("a sticky fixture with a TargetExecutionTarget must name its id");
+  }
+  db.responseStickinessRecord.findUnique.mockResolvedValue(stored);
+  db.poolGrant.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+    PoolGrant && PoolGrant.id === where.id ? PoolGrant : null,
+  );
+  const otherTargets = db.executionTarget.findUnique.getMockImplementation();
+  db.executionTarget.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+    const sticky: Array<[unknown, unknown]> = [
+      [stored.targetExecutionTargetId, TargetExecutionTarget],
+      [stored.selectedExecutionTargetId, SelectedExecutionTarget],
+    ];
+    const match = sticky.find(([id]) => id && id === args.where.id);
+    if (match) return match[1] ?? null;
+    return otherTargets ? otherTargets(args) : undefined;
+  });
+}
 
 const ACTIVE_POOL_OWNER = { banned: false, banExpires: null, deletionRequestedAt: null };
 
@@ -470,6 +521,8 @@ function poolMemberRow({
   countStrategy,
   externalAfterWaitMs = 2_000,
   cacheHolderWaitMs = null,
+  engineKind = null,
+  kvBudgetTokens = null,
 }: {
   id: string;
   discoveredModelId: string;
@@ -492,6 +545,8 @@ function poolMemberRow({
   countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
   externalAfterWaitMs?: number;
   cacheHolderWaitMs?: number | null;
+  engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
+  kvBudgetTokens?: number | null;
 }) {
   return {
     id,
@@ -516,6 +571,11 @@ function poolMemberRow({
       capacityWaitBudgetMs: 30_000,
       externalAfterWaitMs,
       cacheHolderWaitMs,
+      protectionEnabled: true,
+      protectionWindowSeconds: 300,
+      protectMinTokens: 8192,
+      protectionShare: "EQUAL_SHARE" as const,
+      protectionFixedPercent: null,
       affinityEnabled,
       affinityTtlSeconds: 3600,
       affinityMaxRecords: 10_000,
@@ -528,7 +588,11 @@ function poolMemberRow({
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
       InferenceCapacity:
-        physicalMaxContext === undefined && !affinityEnabled && countStrategy === undefined
+        physicalMaxContext === undefined &&
+        !affinityEnabled &&
+        countStrategy === undefined &&
+        engineKind === null &&
+        kvBudgetTokens === null
           ? null
           : {
               id: `${id}-capacity`,
@@ -544,6 +608,8 @@ function poolMemberRow({
               templateVersion: "1",
               engine: "engine",
               cacheNamespace: "cache",
+              engineKind,
+              kvBudgetTokens,
             },
       DiscoveredModel: null,
     },
@@ -761,6 +827,7 @@ describe("model API routes", () => {
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
     db.executionTarget.findUnique.mockResolvedValue({ id: "execution-target-id" });
     db.modelPool.findMany.mockResolvedValue([]);
+    db.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
     db.modelPool.findUnique.mockResolvedValue({
       transformerDiscoveredModelId: null,
       transformerSystemPrompt: null,
@@ -782,7 +849,8 @@ describe("model API routes", () => {
     db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
     db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
     db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
-    db.responseStickinessRecord.findUnique.mockResolvedValue(null);
+    mockStickyRecord(null);
+    db.poolGrant.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
     // The local pool send boundary re-reads the exact grant: it still exists.
     db.poolGrant.findFirst.mockImplementation(async ({ where }: { where: { id: string } }) => ({
@@ -987,12 +1055,21 @@ describe("model API routes", () => {
     };
 
     beforeEach(() => {
+      // routes.ts anchors the local wait clock with performance.now() and
+      // subtracts the elapsed time from the spill window (2000 - elapsed). Real
+      // time made an exact `notBeforeMs` flaky (1999 after a >=1 ms pause on a
+      // loaded runner), so freeze only that clock; timers stay real.
+      vi.useFakeTimers({ toFake: ["performance"] });
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
         directModels: [],
         modelPools: [poolTarget],
       });
       // Unmeasured speed: the automatic wait falls back to the 2 s default.
       prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
     });
 
     it("defers the cold member by the default 2 s and records the spill", async () => {
@@ -1278,6 +1355,449 @@ describe("model API routes", () => {
       expect(retry?.attemptId).not.toBe(first?.attemptId);
       expect(retry?.schedule).toEqual({ anchorAttemptId: first?.attemptId, spillDelayMs: 0 });
       expect(retry?.candidates[0]?.waitBudgetMs).toBe(2_000);
+    });
+  });
+
+  describe("S-C: warm-session protection (redirect-only)", () => {
+    const members = (
+      count = 2,
+      facts: Pick<Parameters<typeof poolMemberRow>[0], "engineKind" | "kvBudgetTokens"> = {},
+    ) =>
+      ["a", "b", "c"].slice(0, count).map((suffix) =>
+        poolMemberRow({
+          id: `member-${suffix}`,
+          discoveredModelId: `model-${suffix}`,
+          upstreamModelId: `upstream-${suffix}`,
+          cliDeviceId: `cli-${suffix}`,
+          affinityEnabled: true,
+          ...facts,
+        }),
+      );
+    /** Affinity ran; `affineA` gives member A a continuation prefix hit. */
+    const decision = (affineA = false) => ({
+      orderedTargetIds: ["member-a-target", "member-b-target", "member-c-target"],
+      scores: {},
+      prefixDepths: { "member-a-target": affineA ? 2 : 0 },
+      conversationMatches: {},
+      reasons: {},
+      matchedPrefixDepth: affineA ? 2 : 0,
+      prefixTokens: affineA ? { "member-a-target": 20_000 } : {},
+    });
+    /**
+     * A conversation-only continuation of member A: the explicit conversation
+     * digest matched, but no prefix did (`prefixDepth` 0). `cache-affinity.ts`
+     * models this whenever a request names a conversation whose stored records
+     * carry no reusable prefix.
+     */
+    const conversationDecision = () => ({
+      orderedTargetIds: ["member-a-target", "member-b-target", "member-c-target"],
+      scores: {},
+      prefixDepths: { "member-a-target": 0 },
+      conversationMatches: { "member-a-target": true },
+      reasons: {},
+      matchedPrefixDepth: 0,
+      prefixTokens: {},
+    });
+    /**
+     * Member KV pools (hardConcurrencyLimit 4 in the fixture). PROTECTED:
+     * 3 active + 1 warm session of another user (the one idle slot holds it).
+     * FULL: 4 active. FREE: idle, nothing warm.
+     */
+    const kvPools = (states: Record<string, "FREE" | "FULL" | "PROTECTED">, ageSeconds = {}) => {
+      const ages = ageSeconds as Record<string, number>;
+      warmProtection.load.mockResolvedValue({
+        activeByCapacity: new Map(
+          Object.entries(states).map(([member, state]) => [
+            `member-${member}-capacity`,
+            state === "FREE" ? 0 : state === "FULL" ? 4 : 3,
+          ]),
+        ),
+        sessionsByCapacity: new Map(
+          Object.entries(states).map(([member, state]) => [
+            `member-${member}-capacity`,
+            state === "PROTECTED"
+              ? [
+                  {
+                    userId: "other-user",
+                    ageMs: (ages[member] ?? 30) * 1000,
+                    tokens: 20_000,
+                    overridePercent: null,
+                  },
+                ]
+              : [],
+          ]),
+        ),
+      });
+    };
+    /** Admits `grants[call]` (a member id) on that acquire call, else EXPIRED. */
+    const scripted = (grants: Array<string | null>) => {
+      let call = 0;
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const grant = grants[call++] ?? null;
+        const candidate = attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant);
+        if (!candidate) return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const runtime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      return { acquire, runtime };
+    };
+    /** Local admission rounds (the provider tier admits through the same runtime). */
+    const rounds = (acquire: ReturnType<typeof scripted>["acquire"]) =>
+      acquire.mock.calls
+        .flatMap(([attempt]) =>
+          attempt.candidates.some(({ poolMemberId }) => poolMemberId === "overflow-member")
+            ? []
+            : [attempt],
+        )
+        .map((attempt) =>
+          attempt.candidates.map((candidate) => ({
+            member: candidate.poolMemberId,
+            notBeforeMs: candidate.notBeforeMs,
+            waitBudgetMs: candidate.waitBudgetMs,
+          })),
+        );
+    const request = (runtime: CapacityAdmissionRuntime, model: string) => {
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
+      const response = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(model),
+      });
+      return { manager, response };
+    };
+    const serveLocal = async (runtime: CapacityAdmissionRuntime, model: string) => {
+      const { manager, response } = request(runtime, model);
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      return { manager, response: await response };
+    };
+    const useExternalPlan = () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      return provider;
+    };
+
+    beforeEach(() => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      prefillSpeed.tokensPerSecond.mockResolvedValue(undefined);
+      affinity.rank.mockResolvedValue(decision());
+    });
+    afterEach(() => {
+      warmProtection.load.mockReset();
+      externalConsent.poolIds = [];
+    });
+
+    it("a new session avoids a member whose idle capacity is all protected when another is FREE", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FREE" });
+      const { acquire, runtime } = scripted(["member-b"]);
+
+      const { response, manager } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // Affinity order was A, B: protection moves the PROTECTED member last.
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-b", "member-a"]);
+      expect(warmProtection.load).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerId: poolTarget.ownerUserId,
+          capacityIds: ["member-a-capacity", "member-b-capacity"],
+        }),
+      );
+    });
+
+    /** Member order of the first local admission round (A first = A is not deprioritized). */
+    const firstRound = async (
+      facts: Parameters<typeof members>[1],
+      states: Parameters<typeof kvPools>[0] = { a: "PROTECTED", b: "FREE" },
+      ageSeconds: Parameters<typeof kvPools>[1] = {},
+    ) => {
+      db.poolMember.findMany.mockResolvedValue(members(2, facts));
+      kvPools(states, ageSeconds);
+      const { acquire, runtime } = scripted(["member-a"]);
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+      expect(response.status).toBe(200);
+      return rounds(acquire)[0]?.map(({ member }) => member);
+    };
+
+    it("token mode: the capacity's reported KV budget decides PROTECTED (K known)", async () => {
+      // Member A: 3 active + one 20k warm session. Slot mode: the idle slot is
+      // protected. Token mode with room (20k + request < 90% of 100k): FREE.
+      expect(await firstRound({ engineKind: "VLLM", kvBudgetTokens: 100_000 })).toEqual([
+        "member-a",
+        "member-b",
+      ]);
+    });
+
+    it("token mode: a KV budget without room protects the member", async () => {
+      expect(await firstRound({ engineKind: "SGLANG", kvBudgetTokens: 20_000 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+    });
+
+    it("slot mode when the capacity reports no KV budget", async () => {
+      expect(await firstRound({ engineKind: "VLLM", kvBudgetTokens: null })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+      expect(await firstRound({})).toEqual(["member-b", "member-a"]);
+    });
+
+    it("llama.cpp is slot-based even when a KV budget is reported", async () => {
+      expect(await firstRound({ engineKind: "LLAMA_CPP", kvBudgetTokens: 100_000 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+    });
+
+    it("llama.cpp protects a warm session for a smaller window than other engines", async () => {
+      // 200 s old: inside the pool's 300 s window, outside llama.cpp's 150 s.
+      const old = { a: 200 };
+      expect(await firstRound({ engineKind: "LLAMA_CPP" }, undefined, old)).toEqual([
+        "member-a",
+        "member-b",
+      ]);
+      expect(await firstRound({ engineKind: "VLLM" }, undefined, old)).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+      expect(await firstRound({ engineKind: "LLAMA_CPP" }, undefined, { a: 100 })).toEqual([
+        "member-b",
+        "member-a",
+      ]);
+    });
+
+    it.each([
+      ["only PROTECTED members", { a: "PROTECTED", b: "PROTECTED" }],
+      ["PROTECTED and FULL members", { a: "PROTECTED", b: "FULL" }],
+    ] as const)(":external with a plan and %s goes external now", async (_label, states) => {
+      const provider = useExternalPlan();
+      publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools(states);
+      // The only admission is the provider tier's.
+      const { acquire, runtime } = scripted(["overflow-member"]);
+
+      const { response } = request(runtime, EXTERNAL_MODEL_ID);
+      const served = await response;
+
+      expect(served.status).toBe(200);
+      expect(served.headers.get("x-wsmp-fallback-reason")).toBe("local_saturated_protected");
+      expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+        reason: "LOCAL_SATURATED_PROTECTED",
+      });
+      // No local wait first: protection is part of saturation (S1).
+      expect(acquire).toHaveBeenCalledTimes(1);
+      expect(rounds(acquire)).toEqual([]);
+    });
+
+    it("without a plan it admits on the oldest protected member, never queueing behind FULL", async () => {
+      db.poolMember.findMany.mockResolvedValue(members(3));
+      // A is FULL; B's protected session is 200 s old, C's 10 s.
+      kvPools({ a: "FULL", b: "PROTECTED", c: "PROTECTED" }, { b: 200, c: 10 });
+      const { acquire, runtime } = scripted(["member-b"]);
+
+      const { response, manager } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-b-endpoint");
+      // One admission over every member: the protected ones have an idle slot,
+      // so the store grants them at once; nothing is deferred.
+      expect(rounds(acquire)).toEqual([
+        [
+          { member: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-b", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-c", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        ],
+      ]);
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+    });
+
+    it("when the protected external attempt does not dispatch, it admits locally with the full budget", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      // The provider tier finds no provider slot (PROVIDER_SATURATED).
+      const { acquire, runtime } = scripted([null, "member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      // The one external phase is used up: full local budget, every member.
+      expect(rounds(acquire)).toEqual([
+        [
+          { member: "member-b", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+          { member: "member-a", notBeforeMs: undefined, waitBudgetMs: 30_000 },
+        ],
+      ]);
+    });
+
+    it.each([
+      ["POOL_OWNER_INACTIVE", 404, "not_found"],
+      ["REQUESTER_ACCESS_BLOCKED", 401, "access_denied"],
+    ] as const)(
+      "the protected external attempt ends the request on lost access (%s), never admitting locally",
+      async (reason, status, code) => {
+        useExternalPlan();
+        db.poolMember.findMany.mockResolvedValue(members());
+        kvPools({ a: "PROTECTED", b: "PROTECTED" });
+        publicOverflow.dispatch.mockResolvedValue({ dispatched: false, reason });
+        // The provider tier admits; the send gate then finds the access lost.
+        const { acquire, runtime } = scripted(["overflow-member", "member-a"]);
+
+        const { response } = request(runtime, EXTERNAL_MODEL_ID);
+        const served = await response;
+
+        expect(served.status).toBe(status);
+        await expect(served.json()).resolves.toMatchObject({ error: { code } });
+        expect(publicOverflow.dispatch).toHaveBeenCalledOnce();
+        // No local admission round after the terminal external outcome.
+        expect(rounds(acquire)).toEqual([]);
+      },
+    );
+
+    it("with a plan, a PROTECTED member sits out only the first admission", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "PROTECTED", b: "FREE" });
+      // B is taken before this request gets it: the shortened wait expires,
+      // the provider tier finds no slot, and the resumed wait may use A.
+      const { acquire, runtime } = scripted([null, null, "member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(rounds(acquire).map((round) => round.map(({ member }) => member))).toEqual([
+        ["member-b"],
+        ["member-b", "member-a"],
+      ]);
+    });
+
+    it("a continuation (affinity hit) is never blocked by protection", async () => {
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue(decision(true));
+      // A's capacity looks PROTECTED for anyone else; this request continues
+      // a session on A, and B is FULL.
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
+    });
+
+    it("a conversation-only continuation (no prefix hit) is never blocked by protection", async () => {
+      // AC4: a continuation (any affinity hit) is never redirected, including
+      // one that matched only the conversation digest with no reusable prefix
+      // (`cache-affinity.ts:370-373`). A is PROTECTED for a new session but
+      // holds this conversation, and B is FULL: only the conversation-match
+      // arm of `affineMember` (routes.ts:5730-5731) can keep A admissible.
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue(conversationDecision());
+      kvPools({ a: "PROTECTED", b: "FULL" });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response, manager } = await serveLocal(runtime, EXTERNAL_MODEL_ID);
+
+      expect(response.status).toBe(200);
+      expect(requireSent(manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+      // A leads the first admission: it is the cache holder, never deprioritized.
+      expect(rounds(acquire)[0]?.[0]).toMatchObject({ member: "member-a", notBeforeMs: undefined });
+    });
+
+    it("a conversation-only match keeps its member ahead of the PROTECTED one", async () => {
+      // Both members are PROTECTED, but B holds this conversation: the
+      // conversation arm alone makes B a holder, so protection never pushes it
+      // behind A. A's warm session is the older one (200 s vs B's 30 s), so
+      // without the arm the guarded member would win the oldest-first order.
+      db.poolMember.findMany.mockResolvedValue(members());
+      affinity.rank.mockResolvedValue({
+        ...conversationDecision(),
+        conversationMatches: { "member-b-target": true },
+      });
+      kvPools({ a: "PROTECTED", b: "PROTECTED" }, { a: 200, b: 30 });
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-b", "member-a"]);
+    });
+
+    it("scores affinity even for a single-member pool (continuation vs new session)", async () => {
+      db.poolMember.findMany.mockResolvedValue(members(1));
+      kvPools({ a: "FREE" });
+      const { runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: true }),
+      );
+    });
+
+    it("does not score a single-member pool when protection is off (no extra reads)", async () => {
+      db.poolMember.findMany.mockResolvedValue(
+        members(1).map((member) => ({
+          ...member,
+          ModelPool: { ...member.ModelPool, protectionEnabled: false },
+        })),
+      );
+      const { runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: false }),
+      );
+    });
+
+    it("changes nothing when the warm-set read fails", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      warmProtection.load.mockRejectedValue(new Error("database unavailable"));
+      const { acquire, runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(rounds(acquire)[0]?.map(({ member }) => member)).toEqual(["member-a", "member-b"]);
     });
   });
 
@@ -7088,7 +7608,7 @@ describe("model API routes", () => {
         ]);
       }
       if (route === "local sticky") {
-        db.responseStickinessRecord.findUnique.mockResolvedValue({
+        mockStickyRecord({
           routingVersion: 2,
           userId: "user-id",
           modelApiTokenId: "token-id",
@@ -7096,6 +7616,7 @@ describe("model API routes", () => {
           targetModelPoolId: "pool-id",
           selectedDiscoveredModelId: "local-model",
           TargetExecutionTarget: null,
+          selectedExecutionTargetId: "selected-target-id",
           SelectedExecutionTarget: { discoveredModelId: "local-model" },
           expiresAt: new Date(Date.now() + 60_000),
         });
@@ -7123,8 +7644,7 @@ describe("model API routes", () => {
               }
             : externalProviderTarget();
         publicOverflow.list.mockResolvedValue(listedExternalTargets([providerTarget]));
-        if (route === "external sticky")
-          db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+        if (route === "external sticky") mockStickyRecord(consentedProviderBinding());
         publicOverflow.dispatch.mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
           providerSignal = signal;
           return new Promise((resolve) => {
@@ -7450,6 +7970,139 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(0);
     expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
       reason: "LOCAL_WAIT_EXPIRED",
+    });
+  });
+
+  describe("metric routing rules (S-B part 2)", () => {
+    const members = () =>
+      ["m1", "m2", "m3"].map((id) =>
+        poolMemberRow({
+          id,
+          discoveredModelId: `${id}-model`,
+          upstreamModelId: `${id}-upstream`,
+          cliDeviceId: "cli-local",
+        }),
+      );
+
+    it("drops metric-FULL members and ranks avoid members last at candidate build", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      db.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+        { poolMemberId: "m1", verdict: "AVOID" },
+        { poolMemberId: "m2", verdict: "FULL" },
+      ]);
+      const capacityRuntime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const [attempt] = vi.mocked(capacityRuntime.acquire).mock.calls[0]!;
+      expect(attempt.candidates.map((candidate) => candidate.poolMemberId)).toEqual(["m3", "m1"]);
+      // A plain-name caller always fails open at grant time.
+      expect(attempt.metricFailOpen).toBe(true);
+      expect(db.poolMemberRoutingVerdict.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ verdict: { in: ["FULL", "AVOID"] } }),
+        }),
+      );
+    });
+
+    it("keeps every member when all are metric-FULL", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      db.poolMemberRoutingVerdict.findMany.mockResolvedValue(
+        ["m1", "m2", "m3"].map((poolMemberId) => ({ poolMemberId, verdict: "FULL" })),
+      );
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const capacityRuntime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const [attempt] = vi.mocked(capacityRuntime.acquire).mock.calls[0]!;
+      expect(attempt.candidates.map((candidate) => candidate.poolMemberId)).toEqual([
+        "m1",
+        "m2",
+        "m3",
+      ]);
+      expect(warn).toHaveBeenCalledWith(
+        "[model-api] every pool candidate is metric-FULL",
+        expect.objectContaining({ poolId: expect.any(String) }),
+      );
+    });
+
+    it("does not fail open in an :external caller's shortened local phase; the resumed phase does", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [externalPoolTarget],
+      });
+      externalConsent.poolIds = [externalPoolTarget.id];
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ]);
+      const provider = externalProviderTarget("overflow-member");
+      publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      const localStates: Array<"EXPIRED" | "ADMITTED"> = ["EXPIRED", "ADMITTED"];
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        const state =
+          candidate.poolMemberId === "local-primary"
+            ? (localStates.shift() ?? "EXPIRED")
+            : "ADMITTED";
+        if (state === "EXPIRED") return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await responsePromise).status).toBe(200);
+      const local = acquire.mock.calls
+        .map(([attempt]) => attempt)
+        .filter((attempt) => attempt.candidates[0]?.poolMemberId === "local-primary");
+      expect(local.map((attempt) => attempt.metricFailOpen)).toEqual([false, true]);
+      // The external phase ran (and consumed its scripted dispatch).
+      expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -9962,14 +10615,14 @@ describe("model API routes", () => {
       ),
     );
     if (route === "local sticky") {
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         routingVersion: 2,
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
         targetModelPoolId: "pool-id",
         selectedDiscoveredModelId: "model-a",
-        TargetExecutionTarget: null,
+        selectedExecutionTargetId: "target-a",
         SelectedExecutionTarget: { discoveredModelId: "model-a" },
         expiresAt: new Date(Date.now() + 60_000),
       });
@@ -11059,7 +11712,7 @@ describe("model API routes", () => {
       adaptationEnabled: false,
     });
 
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       ...binding,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -11192,14 +11845,16 @@ describe("model API routes", () => {
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
       targetModelPoolId: null,
       selectedDiscoveredModelId: null,
+      targetExecutionTargetId: "bound-target-id",
       TargetExecutionTarget: { discoveredModelId: "model-id" },
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-id" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -11343,7 +11998,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
@@ -11413,7 +12068,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
@@ -11449,7 +12104,7 @@ describe("model API routes", () => {
   );
 
   it("routes Responses retrieve through the sticky selected model with no request body", async () => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 1,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -11484,7 +12139,7 @@ describe("model API routes", () => {
     });
     externalConsent.poolIds = [externalPoolTarget.id];
     publicOverflow.list.mockResolvedValue(listedExternalTargets([]));
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       fallbackRoute: "pool-external",
       routingVersion: 3,
       userId: "user-id",
@@ -11575,7 +12230,7 @@ describe("model API routes", () => {
         modelPools: [ownPool],
       });
       externalConsent.poolIds = [ownPool.id];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           fallbackRoute: "own-key",
           poolGrantId: "grant",
@@ -11629,7 +12284,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+    mockStickyRecord(consentedProviderBinding());
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/responses",
       {
@@ -11663,7 +12318,7 @@ describe("model API routes", () => {
         modelPools: [externalPoolTarget],
       });
       externalConsent.poolIds = [];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      mockStickyRecord(consentedProviderBinding());
       const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
         path,
         { method, headers: { authorization: "Bearer wsmp_model_test" } },
@@ -11737,7 +12392,7 @@ describe("model API routes", () => {
         modelPools: [externalPoolTarget],
       });
       externalConsent.poolIds = [externalPoolTarget.id];
-      db.responseStickinessRecord.findUnique.mockResolvedValue(consentedProviderBinding());
+      mockStickyRecord(consentedProviderBinding());
       publicOverflow.list.mockResolvedValue(listedExternalTargets([boundProvider()]));
     });
 
@@ -12146,7 +12801,7 @@ describe("model API routes", () => {
                 ]
               : [],
           });
-          db.responseStickinessRecord.findUnique.mockResolvedValue(
+          mockStickyRecord(
             consentedProviderBinding({
               poolGrantId: "original-grant",
               PoolGrant: replacement
@@ -12187,7 +12842,7 @@ describe("model API routes", () => {
       publicOverflow.list.mockResolvedValue(
         listedExternalTargets([boundProvider()], { fallbackForGrantees: true }),
       );
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
           PoolGrant: {
@@ -12232,7 +12887,7 @@ describe("model API routes", () => {
       publicOverflow.list.mockResolvedValue(
         listedExternalTargets([boundProvider()], { fallbackForGrantees: false }),
       );
-      db.responseStickinessRecord.findUnique.mockResolvedValue(
+      mockStickyRecord(
         consentedProviderBinding({
           poolGrantId: "binding-grant",
           PoolGrant: {
@@ -12412,9 +13067,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue(
-      consentedProviderBinding({ fallbackRoute: null }),
-    );
+    mockStickyRecord(consentedProviderBinding({ fallbackRoute: null }));
     const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
       "/responses/resp_provider",
       { headers: { authorization: "Bearer wsmp_model_test" } },
@@ -12430,7 +13083,7 @@ describe("model API routes", () => {
       modelPools: [externalPoolTarget],
     });
     externalConsent.poolIds = [externalPoolTarget.id];
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
@@ -12482,7 +13135,7 @@ describe("model API routes", () => {
         },
       ],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 3,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -12526,7 +13179,9 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: null,
         expiresAt: new Date(Date.now() + 60_000),
       },
@@ -12541,7 +13196,9 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: { discoveredModelId: "model-id" },
         expiresAt: new Date(Date.now() + 60_000),
       },
@@ -12556,14 +13213,16 @@ describe("model API routes", () => {
         targetDiscoveredModelId: "model-id",
         targetModelPoolId: null,
         selectedDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "bound-target-id",
         TargetExecutionTarget: { discoveredModelId: "model-id" },
+        selectedExecutionTargetId: "selected-target-id",
         SelectedExecutionTarget: { discoveredModelId: "model-id" },
         expiresAt: new Date(Date.now() - 1),
       },
       404,
     ],
   ] as const)("fails closed for v2 Responses lifecycle with %s", async (_label, record, status) => {
-    db.responseStickinessRecord.findUnique.mockResolvedValue(record);
+    mockStickyRecord(record);
     const manager = new FakeRelayManager();
     const response = await appWith(manager).request("/responses/resp_123", {
       headers: { authorization: "Bearer wsmp_model_test" },
@@ -12577,14 +13236,16 @@ describe("model API routes", () => {
       directModels: [{ ...directTarget, id: "other-model-id", modelId: "owner/other" }],
       modelPools: [],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: "model-id",
       targetModelPoolId: null,
       selectedDiscoveredModelId: "model-id",
+      targetExecutionTargetId: "bound-target-id",
       TargetExecutionTarget: { discoveredModelId: "model-id" },
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-id" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -12601,7 +13262,7 @@ describe("model API routes", () => {
       directModels: [],
       modelPools: [poolTarget],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
@@ -12609,6 +13270,7 @@ describe("model API routes", () => {
       targetModelPoolId: "pool-id",
       selectedDiscoveredModelId: "model-a",
       TargetExecutionTarget: null,
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -12693,6 +13355,7 @@ describe("model API routes", () => {
         granteeUserId: "user-id",
       },
       TargetExecutionTarget: null,
+      selectedExecutionTargetId: "selected-target-id",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
       ...overrides,
@@ -12761,7 +13424,7 @@ describe("model API routes", () => {
     });
 
     it("sticks a grantee follow-up to its member and re-binds it to the same grant", async () => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       db.poolMember.findMany.mockResolvedValue([memberA({ routingStatus: "DRAINING" })]);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -12794,7 +13457,7 @@ describe("model API routes", () => {
       ],
       ["an owner-style binding without a grant", { poolGrantId: null, PoolGrant: null }],
     ])("does not honor a grantee binding through %s", async (_name, overrides) => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding(overrides));
+      mockStickyRecord(granteeBinding(overrides));
       db.poolMember.findMany.mockResolvedValue([memberA()]);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -12808,7 +13471,7 @@ describe("model API routes", () => {
       ["removed from the pool", []],
       ["disabled", [memberA({ routingStatus: "DISABLED" })]],
     ])("does not route a follow-up to a member %s", async (_name, members) => {
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       db.poolMember.findMany.mockResolvedValue(members);
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -12908,7 +13571,7 @@ describe("model API routes", () => {
     ])(
       "refuses a follow-up at the send boundary when %s after resolution",
       async (_name, arrange) => {
-        db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        mockStickyRecord(granteeBinding());
         db.poolMember.findMany.mockResolvedValue([memberA()]);
         arrange();
         const manager = new FakeRelayManager();
@@ -12951,7 +13614,7 @@ describe("model API routes", () => {
         db.poolMember.findMany.mockResolvedValue([
           memberA({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
         ]);
-        if (isFollowUp) db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+        if (isFollowUp) mockStickyRecord(granteeBinding());
         // The early gate (before the native count fan-out) passes on an admitted
         // create; the read fails at the send gate after admission.
         if (withRuntime && !isFollowUp)
@@ -13162,7 +13825,7 @@ describe("model API routes", () => {
 
     it("holds a follow-up's EOF until its binding is durable", async () => {
       db.poolMember.findMany.mockResolvedValue([memberA()]);
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       await holdsEofUntilDurable(
         { model: granteePool.modelId, previous_response_id: "resp_local", input: "next" },
         replyJson,
@@ -13172,7 +13835,7 @@ describe("model API routes", () => {
 
     it("holds a streaming follow-up's EOF until its binding is durable", async () => {
       db.poolMember.findMany.mockResolvedValue([memberA()]);
-      db.responseStickinessRecord.findUnique.mockResolvedValue(granteeBinding());
+      mockStickyRecord(granteeBinding());
       await holdsEofUntilDurable(
         {
           model: granteePool.modelId,
@@ -13217,14 +13880,14 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.responseStickinessRecord.findUnique.mockResolvedValue({
+      mockStickyRecord({
         routingVersion: 2,
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: null,
         targetModelPoolId: "pool-id",
         selectedDiscoveredModelId: "model-a",
-        TargetExecutionTarget: null,
+        selectedExecutionTargetId: "target-a",
         SelectedExecutionTarget: { discoveredModelId: "model-a" },
         expiresAt: new Date(Date.now() + 60_000),
       });
@@ -13305,14 +13968,14 @@ describe("model API routes", () => {
       directModels: [],
       modelPools: [],
     });
-    db.responseStickinessRecord.findUnique.mockResolvedValue({
+    mockStickyRecord({
       routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
       targetModelPoolId: "pool-id",
       selectedDiscoveredModelId: "model-a",
-      TargetExecutionTarget: null,
+      selectedExecutionTargetId: "target-a",
       SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
     });

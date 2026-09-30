@@ -154,6 +154,7 @@
       "reasonLabel": "Motivo: {{reason}}",
       "reasons": {
         "local_wait_expired": "los miembros locales siguieron ocupados después del límite de espera",
+        "local_saturated_protected": "la capacidad libre de los miembros locales guarda conversaciones activas protegidas",
         "no_local_member": "no había un miembro local compatible disponible",
         "local_context_ceiling": "la solicitud superó el límite de contexto local",
         "local_failure": "el intento local falló",
@@ -244,12 +245,81 @@
       "cleared": "Se borró el nombre del CLI",
       "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     },
+    "activity": {
+      "title": "Actividad de agentes",
+      "show": "Mostrar la actividad de agentes de {{name}}",
+      "hide": "Ocultar la actividad de agentes de {{name}}",
+      "description": "Lo que hicieron los agentes MCP en este CLI, de lo más reciente a lo más antiguo, durante 90 días. Solo se registran metadatos: nunca se guardan el contenido de los archivos ni la salida de los comandos.",
+      "empty": "No se ha registrado actividad de agentes en este CLI.",
+      "loadFailed": "No se pudo cargar la actividad de agentes.",
+      "loadMore": "Cargar más",
+      "loadingMore": "Cargando…",
+      "listLabel": "Actividad de agentes en {{name}}",
+      "reason": "Motivo: {{value}}",
+      "bytes": "{{value}} bytes",
+      "commandHash": "Hash del comando {{value}}",
+      "program": "Programa: {{value}}",
+      "kinds": {
+        "command": "Comando",
+        "supervised_command": "Comando supervisado",
+        "file_read": "Leer archivo",
+        "file_stat": "Info del archivo",
+        "file_list": "Listar carpeta",
+        "file_search": "Buscar archivos",
+        "file_edit": "Editar archivo",
+        "file_write": "Escribir archivo",
+        "file_rename": "Renombrar",
+        "file_mkdir": "Crear carpeta",
+        "file_delete": "Eliminar",
+        "supervised_file_write": "Escritura de archivo supervisada"
+      },
+      "outcomes": {
+        "completed": "Completada",
+        "refused": "Rechazada",
+        "failed": "Fallida",
+        "cancelled": "Cancelada",
+        "declined": "Denegada",
+        "expired": "Expirada",
+        "unknown": "Desconocido"
+      }
+    },
     "serverUpgradeRequired": "Actualización del servidor necesaria: el protocolo {{protocol}} de la CLI es más nuevo de lo que admite este servidor",
     "serverUpgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}} porque es más nuevo que este servidor. Pide al administrador que actualice el servidor, o instala una versión anterior de wsmp en esta máquina.",
     "upgradeRequired": "Actualización de la CLI necesaria (protocolo {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} fue rechazado el {{value}}. Actualiza wsmp en esta máquina y reinícialo.",
     "upgradeUnknownProtocol": "desconocido",
-    "upgradeUnknownVersion": "(versión desconocida)"
+    "upgradeUnknownVersion": "(versión desconocida)",
+    "metricSources": {
+      "title": "Fuentes de métricas",
+      "loadFailed": "No se pudieron cargar las fuentes de métricas de este dispositivo.",
+      "empty": "Sin fuentes de métricas.",
+      "origins": {
+        "local": "Local",
+        "remote": "Remota"
+      },
+      "states": {
+        "active": "Activa",
+        "pending_approval": "Pendiente de aprobación",
+        "refused": "Rechazada",
+        "unsupported": "No compatible",
+        "disabled": "Desactivada",
+        "failing": "Con fallas"
+      },
+      "errors": {
+        "spawn": "no se pudo iniciar",
+        "timeout": "tiempo agotado",
+        "exit_status": "terminó con error",
+        "output_too_large": "salida demasiado grande",
+        "parse": "salida no numérica"
+      },
+      "interval": "cada {{seconds}} s",
+      "pendingHint": "Lee su comando con `wsmp metrics list` en la máquina y apruébala con `wsmp metrics approve {{name}} --sha256 <hash>`, usando el hash que aparece ahí.",
+      "refusedHint": "La CLI rechaza fuentes remotas salvo que `allowRemoteMetricSources` esté activado localmente.",
+      "notReported": "Definida en el servidor; la CLI aún no la reporta.",
+      "remoteNotAllowed": "Las fuentes remotas se envían a la CLI solo mientras su modo de comandos MCP es sin supervisión.",
+      "valuesTitle": "Valores más recientes",
+      "stale": "obsoleto"
+    }
   },
   "deploymentFeatures": {
     "unavailable": "No disponible en esta implementación.",
@@ -458,6 +528,28 @@
         "valueLabel": "Espera por el miembro con la caché en milisegundos",
         "hint": "Cuando el prefijo de una continuación está en la caché de un miembro ocupado, los demás miembros esperan este tiempo para que ese miembro la atienda. Automático usa la velocidad de prellenado medida del miembro (2 s mientras no se mide). Máximo 30000 ms. Los presupuestos de espera local y la espera antes del respaldo externo empiezan a contar después de esta espera."
       }
+    },
+    "protection": {
+      "title": "Proteger conversaciones activas",
+      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras conversaciones cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
+      "enabled": "Proteger conversaciones activas",
+      "windowSeconds": "Ventana de protección (segundos)",
+      "minTokens": "Tamaño mínimo de la conversación (tokens)",
+      "share": "Reparto entre usuarios",
+      "shareModes": {
+        "EQUAL_SHARE": "Parte igual por usuario activo",
+        "FIRST_COME": "Por orden de llegada (sin límite por usuario)",
+        "FIXED_PERCENT": "Porcentaje fijo por usuario"
+      },
+      "fixedPercent": "Porcentaje que cada usuario puede mantener protegido",
+      "ownerShare": "Tu propia parte",
+      "override": {
+        "INHERIT": "Usar la parte del pool",
+        "PERCENT": "Porcentaje fijo",
+        "UNPROTECTED": "Sin protección"
+      },
+      "percentLabel": "Porcentaje de la capacidad de un miembro (1 a 100)",
+      "hint": "El calor se estima con los registros de enrutamiento de todos los pools de este propietario en el miembro (solo tamaños y tiempos, nunca el contenido del prompt). Solo cuentan las conversaciones usadas dentro de la ventana y con al menos el tamaño mínimo. Por encima de su parte, las conversaciones más antiguas de un usuario pierden la protección primero."
     },
     "capacity": {
       "title": "Capacidad local compartida",
@@ -867,7 +959,64 @@
     "transformerTimeoutMs": "Tiempo de espera del transformador (ms)",
     "transformerMaxAssets": "Máximo de adjuntos por solicitud",
     "updated": "Pool actualizado",
-    "weight": "Peso"
+    "weight": "Peso",
+    "metricRules": {
+      "title": "Reglas de enrutamiento por métricas",
+      "description": "Marca un miembro como LLENO o evítalo según las métricas de su dispositivo. Los miembros LLENOS no reciben solicitudes nuevas (esperan en cola, van a otro miembro o salen al proveedor externo para quienes usan :external). Los miembros evitados se usan al final. Una métrica obsoleta o ausente se ignora, y si todos los miembros están LLENOS las solicitudes se siguen atendiendo.",
+      "hint": "Cada regla compara el valor más alto de una métrica (opcionalmente filtrada por etiquetas) con un umbral.",
+      "empty": "Sin reglas. El enrutamiento usa solo la capacidad.",
+      "ruleLegend": "Regla {{number}}",
+      "metric": "Métrica",
+      "labels": "Etiquetas (opcional)",
+      "op": "Comparar",
+      "threshold": "Umbral",
+      "effect": "Efecto",
+      "effects": {
+        "full": "Marcar LLENO",
+        "avoid": "Evitar"
+      },
+      "add": "Agregar regla",
+      "remove": "Quitar regla {{number}}",
+      "save": "Guardar reglas",
+      "saved": "Reglas de enrutamiento guardadas.",
+      "saveFailed": "No se pudieron guardar las reglas de enrutamiento.",
+      "loadFailed": "No se pudieron cargar las reglas de enrutamiento.",
+      "metricInvalid": "Usa de 1 a 64 letras, dígitos o _ . : -",
+      "labelsInvalid": "Usa pares clave=valor separados por comas (letras, dígitos, _ . : -).",
+      "thresholdInvalid": "Escribe un número.",
+      "membersTitle": "Miembros",
+      "badges": {
+        "full": "LLENO por métrica",
+        "avoid": "Evitado",
+        "clear": "Reglas sin activar",
+        "stale": "Métrica obsoleta",
+        "unevaluated": "Aún sin evaluar",
+        "rulesStale_one": "{{count}} regla ignorada (métrica obsoleta)",
+        "rulesStale_other": "{{count}} reglas ignoradas (métricas obsoletas)"
+      },
+      "seriesTitle": "Métricas disponibles",
+      "seriesHint": "Métricas que reportan ahora los dispositivos de los miembros. Las métricas endpoint.* (running, waiting, kv_usage, slots_busy) usan el endpoint de cada miembro.",
+      "offline": "sin conexión (instantánea guardada)",
+      "noSeries": "Aún no hay métricas.",
+      "staleValue": "obsoleta"
+    },
+    "grantRouting": {
+      "edit": "Enrutamiento",
+      "editFor": "Ajustes de enrutamiento de {{email}}",
+      "title": "Enrutamiento para esta persona",
+      "description": "Ajustes que se aplican solo a las solicitudes de {{email}}.",
+      "protection": "Parte protegida",
+      "protectionHint": "Cuánta capacidad de un miembro pueden mantener protegida frente a conversaciones nuevas las conversaciones recientes de esta persona. Sin protección: sus conversaciones nunca se resguardan.",
+      "queuePriority": "Prioridad en la cola",
+      "prioritySet": "Fijar una prioridad",
+      "priorityValue": "Prioridad en la cola (0 a 31)",
+      "priorityHint": "Sustituye la prioridad de cola del pool y del miembro para las solicitudes en espera de esta persona. Los números más altos reciben una parte mayor de los espacios liberados.",
+      "inherit": "Valor del pool",
+      "percentValue": "{{percent}} %",
+      "summary": "Parte protegida: {{protection}} · Prioridad en la cola: {{priority}}",
+      "saved": "Ajustes de enrutamiento guardados.",
+      "failed": "No se pudieron guardar los ajustes de enrutamiento."
+    }
   },
   "providers": {
     "title": "Proveedores externos",

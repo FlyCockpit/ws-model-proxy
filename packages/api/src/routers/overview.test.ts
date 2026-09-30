@@ -717,6 +717,8 @@ describe("overviewRouter.health", () => {
     db.endpoint.findMany.mockResolvedValue([
       { id: "ep-1", label: "vLLM", status: "ONLINE", cliDeviceId: "cli-1" },
       { id: "ep-2", label: "Ollama", status: "OFFLINE", cliDeviceId: "cli-2" },
+      // Reported ONLINE, but its CLI stopped heartbeating: shown unhealthy/OFFLINE.
+      { id: "ep-3", label: "Stale", status: "ONLINE", cliDeviceId: "cli-2" },
     ]);
     db.poolMember.findMany.mockResolvedValue([
       {
@@ -742,8 +744,13 @@ describe("overviewRouter.health", () => {
     expect(health.clis.offline).toEqual([
       { id: "cli-2", displayName: "Laptop", status: "CONNECTED" },
     ]);
-    expect(health.endpoints).toMatchObject({ total: 2, healthy: 1 });
+    expect(health.endpoints).toMatchObject({ total: 3, healthy: 1 });
     expect(health.endpoints.unhealthy[0]).toMatchObject({ id: "ep-2", cliDeviceId: "cli-2" });
+    expect(health.endpoints.unhealthy[1]).toMatchObject({
+      id: "ep-3",
+      status: "OFFLINE",
+      cliDeviceId: "cli-2",
+    });
     // Disabled members are not routed, so they do not count as degraded.
     expect(health.poolMembers).toMatchObject({ total: 1, degradedCount: 0, circuitOpenCount: 1 });
     expect(health.poolMembers.circuitOpen[0]).toMatchObject({ id: "member-a", poolId: "pool-1" });

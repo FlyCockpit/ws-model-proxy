@@ -23,6 +23,9 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
+const audit = vi.hoisted(() => ({ record: vi.fn() }));
+vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: audit.record }));
+
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
 const {
@@ -235,6 +238,7 @@ function lastOpId(socket: FakeSocket): string {
 
 describe("cli file ops", () => {
   beforeEach(() => {
+    audit.record.mockClear();
     resetFileOpsForTests();
     resetCliAgentAdmissionsForTests();
     vi.clearAllMocks();
@@ -277,6 +281,156 @@ describe("cli file ops", () => {
     vi.restoreAllMocks();
     await resetRelaySessions();
     resetFileOpsForTests();
+  });
+
+  describe("audit (#104 part B)", () => {
+    const events = () => audit.record.mock.calls.map(([event]) => event as Record<string, unknown>);
+
+    it("records a completed read once, with the path and etag but no content", async () => {
+      const socket = await connect();
+      const outcome = start(socket, "read", { path: "~/secret-notes.txt", ifNoneMatch: "h:x" });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        resultFor(lastOpId(socket), "read", { ...readResult, text: "1|TOPSECRET" }),
+      );
+      await outcome;
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        userId: "user-id",
+        cliDeviceId: "desktop",
+        mcpTokenId: "token",
+        kind: "file_read",
+        path: "~/secret-notes.txt",
+        etagAfter: readResult.etag,
+        outcome: "completed",
+        reason: null,
+      });
+      expect(JSON.stringify(events())).not.toContain("TOPSECRET");
+    });
+
+    it("records a write's byte count and both etags, never the body or diff", async () => {
+      const socket = await connect();
+      const body = new TextEncoder().encode("PRIVATE BODY");
+      const outcome = start(
+        socket,
+        "write",
+        { path: "~/w.txt", ifExists: "replace", expectedEtag: "h:BEFOREBEFOREBEFOREBEF" },
+        { body },
+      );
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        resultFor(lastOpId(socket), "write", {
+          etag: "h:AFTERAFTERAFTERAFTERAF",
+          size: body.byteLength,
+          created: false,
+          diff: "+PRIVATE DIFF",
+        }),
+      );
+      await outcome;
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "file_write",
+        path: "~/w.txt",
+        etagBefore: "h:BEFOREBEFOREBEFOREBEF",
+        etagAfter: "h:AFTERAFTERAFTERAFTERAF",
+        bytes: body.byteLength,
+        outcome: "completed",
+      });
+      const wire = JSON.stringify(events());
+      expect(wire).not.toContain("PRIVATE");
+    });
+
+    it("records refusals before dispatch as refused, and an unverified device as unknown", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF"));
+      await runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "delete", args: { path: "~/x" } });
+      await runFileOp({ ...OP_TOKEN, cliDeviceId: "missing", op: "read", args: readArgs });
+      db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED"));
+      await runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: { path: "" } });
+      expect(events()).toHaveLength(3);
+      expect(events()[0]).toMatchObject({
+        kind: "file_delete",
+        path: "~/x",
+        outcome: "refused",
+        reason: "grant_disabled",
+        cliDeviceId: "desktop",
+      });
+      expect(events()[1]).toMatchObject({
+        outcome: "refused",
+        reason: "not_found",
+        cliDeviceId: "unknown",
+      });
+      expect(events()[2]).toMatchObject({ outcome: "refused", reason: "invalid_input" });
+    });
+
+    it("records CLI rejections as failed and a lost mutation as unknown", async () => {
+      const socket = await connect();
+      const failed = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "conflict",
+          detail: { currentEtag: "h:CCCCCCCCCCCCCCCCCCCCCC" },
+        }),
+      );
+      await failed;
+      const lost = start(socket, "delete", { path: "~/d" });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await relaySessionManager.removeSession(socket);
+      await lost;
+      expect(events()).toHaveLength(2);
+      expect(events()[0]).toMatchObject({
+        kind: "file_edit",
+        outcome: "failed",
+        reason: "conflict",
+        etagBefore: "h:AAAAAAAAAAAAAAAAAAAAAA",
+      });
+      expect(events()[1]).toMatchObject({
+        kind: "file_delete",
+        outcome: "unknown",
+        reason: "offline",
+      });
+    });
+
+    it("records a read that timed out or was revoked as cancelled", async () => {
+      const socket = await connect();
+      const revoked = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      cancelFileOpsForToken("token");
+      await revoked;
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ outcome: "cancelled", reason: "token_inactive" });
+    });
+
+    it("records an aborted op exactly once, with the CLI's final answer", async () => {
+      const socket = await connect();
+      const controller = new AbortController();
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "edit",
+        args: editArgs,
+        signal: controller.signal,
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      const opId = lastOpId(socket);
+      controller.abort();
+      await outcome;
+      expect(events()).toHaveLength(0);
+      await answer(socket, JSON.stringify({ type: "file.rejected", opId, reason: "cancelled" }));
+      await answer(socket, JSON.stringify({ type: "file.rejected", opId, reason: "cancelled" }));
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "file_edit",
+        outcome: "cancelled",
+        reason: "cancelled",
+      });
+    });
   });
 
   describe("admission matrix", () => {

@@ -219,7 +219,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  *
  * Awaited: `deleteUserDurably` awaits the mark listeners before
  * `completeUserDeletion`, so the relay status writes finish before the
- * capacity-ordered delete starts (the DL-1 lock-order proof assumes this),
+ * graph delete under owner fences starts (hot-path writes, which take no
+ * owner fence, then no longer race the drain for this user's requests),
  * and `async` turns a synchronous throw into a rejection that
  * `notifyUserDeletionMarked` / `notifyUserDeleted` catch and log.
  */
@@ -236,6 +237,10 @@ function cliContextServices() {
       repairExpiredProviderBudgets(new Date(), scope),
     onCliFeatureGrantsChanged: (cliDeviceId: string) =>
       relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
+    onRemoteMetricSourcesChanged: (cliDeviceId: string) =>
+      relaySessionManager.onRemoteMetricSourcesChanged(cliDeviceId),
+    onPoolRoutingRulesChanged: (poolId: string) =>
+      relaySessionManager.onPoolRoutingRulesChanged(poolId),
     onCliCredentialsRevoked: (revoked: {
       kind: "cliToken" | "deviceCredential";
       ids: readonly string[];

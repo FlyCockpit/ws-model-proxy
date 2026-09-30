@@ -328,6 +328,8 @@ pub struct TerminalFeatureSnapshot {
     pub require_terminal_approval: bool,
     /// `allowFileToolsAsRoot` from config (2.8).
     pub allow_file_tools_as_root: bool,
+    /// The local `allowRemoteMetricSources` opt-in, read at startup.
+    pub allow_remote_metric_sources: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
     /// The persistent identity key and its signature over the ECDH key above.
@@ -343,7 +345,7 @@ pub struct CliReportedFeatures {
     pub terminal_approval: bool,
     pub terminal_supported: bool,
     /// 2.7: whether this CLI accepts remotely defined metric sources
-    /// (`metrics.sources.set`). Always false until the local opt-in exists.
+    /// (`metrics.sources.set`): the local `allowRemoteMetricSources` opt-in.
     pub remote_metric_sources: bool,
     /// 2.8: the CLI's read-only file grant. Always false until the grant ships (P4).
     pub mcp_file_read: bool,
@@ -405,7 +407,7 @@ impl CliCapabilities {
                 mcp_command_mode: snapshot.mcp_command_mode,
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
-                remote_metric_sources: false,
+                remote_metric_sources: snapshot.allow_remote_metric_sources,
                 mcp_file_read: false,
                 file_roots_configured: false,
                 allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
@@ -794,8 +796,9 @@ pub struct EndpointLoad {
 }
 
 /// 2.7 `metrics.sources.set` (server to CLI): remotely defined custom metric
-/// sources. This CLI does not run them yet and reports each as `unsupported`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// sources. They run only with the local opt-in (`allowRemoteMetricSources`)
+/// and a local hash approval of the exact command (`wsmp metrics approve`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteMetricSource {
     pub name: String,
@@ -805,9 +808,10 @@ pub struct RemoteMetricSource {
     pub format: MetricSourceFormat,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MetricSourceFormat {
+    #[default]
     Number,
     Json,
     Prometheus,
@@ -2129,6 +2133,7 @@ mod tests {
                 mcp_command_mode: McpCommandMode::Off,
                 require_terminal_approval: false,
                 allow_file_tools_as_root: false,
+                allow_remote_metric_sources: false,
                 terminal_public_key_b64url: "AQID".to_string(),
                 terminal_identity: None,
             }),
@@ -2152,6 +2157,7 @@ mod tests {
                     mcp_command_mode: McpCommandMode::Supervised,
                     require_terminal_approval: false,
                     allow_file_tools_as_root: false,
+                    allow_remote_metric_sources: false,
                     terminal_public_key_b64url: "AQID".to_string(),
                     terminal_identity: Some(TerminalIdentityProof {
                         public_key: "BAQE".to_string(),
@@ -2860,6 +2866,7 @@ mod relay_27_vectors {
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
             allow_file_tools_as_root: false,
+            allow_remote_metric_sources: false,
             terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
             terminal_identity: None,
         });

@@ -35,6 +35,7 @@ fails the suite when a leaf is unclassified.
 | `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
+| `cliAgentActivity.list` | `forwarder_cli_activity_list` | read | — | pure | — | — | — |
 | `cliCredentials.approveDeviceLogin` | — (excluded) | — | — | — | — | — | Human-only browser approval of a `wsmp login`: an agent must never grant a CLI credential. |
 | `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
@@ -67,6 +68,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
+| `forwarderManagement.getPoolRoutingRules` | `forwarder_pool_routing_rules_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
 | `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
@@ -81,10 +83,13 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
+| `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
+| `forwarderManagement.setPoolRoutingRules` | `forwarder_pool_routing_rules_set` | write | RUN | cost | — | — | — |
 | `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateModelPool` | `forwarder_model_pool_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
+| `forwarderManagement.updatePoolGrant` | `forwarder_pool_grant_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |

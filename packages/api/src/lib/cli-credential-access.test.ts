@@ -16,23 +16,14 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-// The ordered-delete locking itself runs against real PostgreSQL
+// The parent-delete fence prelude itself runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
-const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
-  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+const { fenceParentDelete } = vi.hoisted(() => ({
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
-  lockCapacityGraphForDelete,
-}));
-// The history drain before an ordered delete runs against real PostgreSQL
-// (parent-deletion.postgres.integration.test.ts); here it is observed.
-const { prepareParentDeletion } = vi.hoisted(() => ({
-  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
-}));
-vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
-  prepareParentDeletion,
+  fenceParentDelete,
 }));
 
 const {
@@ -44,9 +35,8 @@ const {
   mintCliDeviceCredentialFromApprovedDeviceCode,
 } = await import("./cli-credential-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
-const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
-  "@ws-model-proxy/db/parent-deletion"
-);
+const { ParentDeletionDrainPendingError } = await import("@ws-model-proxy/db/parent-deletion");
+const { FenceSetChangedError } = await import("@ws-model-proxy/db/capacity-lock-order");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -450,7 +440,7 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     expect(result.revoked).toEqual({ kind: "deviceCredential", ids: ["old-1", "old-2"] });
   });
 
-  it("takes the device, then the owner row, then consumes the code, inside one transaction", async () => {
+  it("takes the owner fence, the device, the owner row, then consumes the code, in one transaction", async () => {
     db.deviceCode.findUnique.mockResolvedValue(approvedRow());
     db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "old-1" }]);
 
@@ -465,11 +455,19 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
         expiresAt: { gt: now },
       },
     });
-    // The ordered user delete's order: device (L0), user (L7), then the
-    // cascade into device_code and credentials.
+    // Writer class M: the owner fence first (the user delete, registration
+    // and device deletes hold it too), then the device, the owner row, and
+    // the cascade into device_code and credentials.
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    const fenceCall = db.$queryRaw.mock.calls[0] ?? [];
+    expect((fenceCall[0] as TemplateStringsArray).join("?")).toContain("wsmp_acquire_fences");
+    expect(fenceCall.slice(1)).toEqual([["00:owner:user-id"], true]);
+    const ownerRead = db.$queryRaw.mock.calls[1]?.[0] as TemplateStringsArray;
+    expect(ownerRead.join("?")).toMatch(/FROM "user"[\s\S]*FOR SHARE/);
+    const [fenceOrder = Number.NaN, ownerReadOrder = Number.NaN] =
+      db.$queryRaw.mock.invocationCallOrder;
     const ordered = [
       db.cliDevice.upsert,
-      db.$queryRaw,
       db.deviceCode.deleteMany,
       db.cliDeviceCredential.create,
       db.cliDeviceCredential.updateMany,
@@ -477,10 +475,11 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     // Every call must exist before comparing indices: an absent call maps to
     // Number.NaN and would silently satisfy (or silently break) the sort check.
     for (const mock of ordered) expect(mock).toHaveBeenCalledTimes(1);
-    const order = ordered.map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
+    const [upsert = Number.NaN, ...rest] = ordered.map(
+      (mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN,
+    );
+    const order = [fenceOrder, upsert, ownerReadOrder, ...rest];
     expect(order).toEqual([...order].sort((a, b) => a - b));
-    const ownerRead = db.$queryRaw.mock.calls[0]?.[0] as TemplateStringsArray;
-    expect(ownerRead.join("?")).toMatch(/FROM "user"[\s\S]*FOR SHARE/);
   });
 
   it("mints nothing when a concurrent exchange consumed the code first", async () => {
@@ -687,23 +686,18 @@ describe("deleteCliDeviceAndCredentials", () => {
       where: { id: "cli-device-id" },
       select: { id: true },
     });
-    // Capacity lock order: the device row (L0) first, then every lock the
-    // cascade can reach, then the DELETE.
-    expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(db, {
-      userId: "user-id",
-      cliDeviceIds: ["cli-device-id"],
-    });
-    // The request history is drained first, outside the ordered transaction.
-    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+    // Writer class M: the parent-delete fences (owner fences of every user
+    // the cascade writes) before the device row lock, then the DELETE. No
+    // history drain: hot-path history keeps the deleted ids.
+    expect(fenceParentDelete).toHaveBeenCalledWith(db, {
       userId: "user-id",
       cliDeviceIds: ["cli-device-id"],
     });
     const orderedMocks = [
-      prepareParentDeletion,
+      fenceParentDelete,
       db.cliDevice.updateMany,
       db.cliDeviceCredential.findMany,
       db.cliToken.updateMany,
-      lockCapacityGraphForDelete,
       db.cliDevice.delete,
     ];
     // Every call must exist before comparing indices: an absent call maps to
@@ -723,7 +717,7 @@ describe("deleteCliDeviceAndCredentials", () => {
     await expect(
       deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "intruder", now }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
-    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(fenceParentDelete).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
   });
@@ -749,7 +743,7 @@ describe("deleteCliDeviceAndCredentials", () => {
         now,
       }),
     ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
-    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(fenceParentDelete).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
   });
@@ -781,13 +775,15 @@ describe("deleteCliDeviceAndCredentials", () => {
     ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "delete_pending" } });
   });
 
-  it("answers retained_history before draining when history must be kept", async () => {
-    prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+  it("retries with a fresh plan when the fenced owner set changed", async () => {
+    fenceParentDelete.mockRejectedValueOnce(new FenceSetChangedError());
 
     await expect(
       deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
-    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "retained_history" } });
-    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ revoked: expect.any(Array) });
+    expect(db.$transaction).toHaveBeenCalledTimes(2);
+    expect(fenceParentDelete).toHaveBeenCalledTimes(2);
+    expect(db.cliDevice.delete).toHaveBeenCalledTimes(1);
   });
 
   it("answers delete_contended when ordered delete retries are exhausted", async () => {

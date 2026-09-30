@@ -42,6 +42,10 @@ enum Sub {
     /// Let the MCP node file tools run when wsmp itself runs as root (they
     /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
     SetFileToolsAsRoot { state: Switch },
+    /// Accept metric sources defined remotely (dashboard or MCP). Each one
+    /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
+    /// starts.
+    SetRemoteMetricSources { state: Switch },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -175,6 +179,16 @@ pub fn run(args: &Args) -> Result<()> {
             set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
                 cfg.allow_file_tools_as_root = state.enabled();
             })?;
+        }
+        Sub::SetRemoteMetricSources { state } => {
+            set_flag(
+                args.json,
+                "allowRemoteMetricSources",
+                state.enabled(),
+                |cfg| {
+                    cfg.allow_remote_metric_sources = state.enabled();
+                },
+            )?;
         }
     }
     Ok(())

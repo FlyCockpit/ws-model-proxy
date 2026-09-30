@@ -23,7 +23,25 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     deleteMany: MockInstance;
   };
+  modelPool: { findMany: MockInstance };
+  executionTarget: { findMany: MockInstance };
+  discoveredModel: { findMany: MockInstance };
 };
+
+/** Relay rows carry plain resource ids; the router looks their owners up by id. */
+function mockResourceOwners({
+  pools = [],
+  targets = [],
+  models = [],
+}: {
+  pools?: Array<{ id: string; userId: string }>;
+  targets?: Array<{ id: string; userId: string }>;
+  models?: Array<{ id: string; userId: string }>;
+}) {
+  db.modelPool.findMany.mockResolvedValue(pools);
+  db.executionTarget.findMany.mockResolvedValue(targets);
+  db.discoveredModel.findMany.mockResolvedValue(models);
+}
 
 /** The two relay rows a delete batch picks, then the locks and delete it issues. */
 function expectOrderedRelayDelete(where: Record<string, unknown>) {
@@ -101,6 +119,7 @@ describe("relayMetadataRouter", () => {
     db.$transaction.mockImplementation(async (run: (tx: unknown) => Promise<unknown>) => run(db));
     db.$queryRaw.mockResolvedValue([]);
     db.$executeRaw.mockResolvedValue(2);
+    mockResourceOwners({});
   });
 
   const pickTwoRelayRows = () =>
@@ -119,7 +138,6 @@ describe("relayMetadataRouter", () => {
         selectedDiscoveredModelId: "model-id",
         requestedExecutionTargetId: "target-id",
         selectedExecutionTargetId: "target-id",
-        RequestedExecutionTarget: { userId: "user-id" },
         status: "SUCCEEDED",
         startedAt: new Date("2026-01-01T00:00:00.000Z"),
         completedAt: new Date("2026-01-01T00:00:02.000Z"),
@@ -200,6 +218,8 @@ describe("relayMetadataRouter", () => {
         responseBody: "secret answer",
       },
     ]);
+
+    mockResourceOwners({ targets: [{ id: "target-id", userId: "user-id" }] });
 
     const client = createRouterClient(relayMetadataRouter, { context: buildContext() });
     const result = await client.listOwn({ limit: 10 });
@@ -392,14 +412,19 @@ describe("shared request history provider identity", () => {
     "preserves usage but scopes resource identity for %s",
     async (viewer) => {
       db.appSetting.findUnique.mockResolvedValue(null);
+      mockResourceOwners({
+        pools:
+          viewer === "deleted-pool"
+            ? []
+            : [{ id: "shared-pool", userId: viewer === "owner" ? "user-id" : "someone-else" }],
+      });
       db.relayRequest.findMany.mockResolvedValue([
         {
           id: "my-request",
-          requestedModelPoolId: viewer === "deleted-pool" ? null : "shared-pool",
-          RequestedModelPool:
-            viewer === "deleted-pool"
-              ? null
-              : { userId: viewer === "owner" ? "user-id" : "someone-else" },
+          // A deleted pool keeps its id on the history row (no foreign key).
+          requestedModelPoolId: "shared-pool",
+          requestedExecutionTargetId: null,
+          requestedDiscoveredModelId: null,
           selectedExecutionTargetId: "private-provider-target",
           selectedPoolMemberId: "private-provider-member",
           providerAttemptId: "private-provider-attempt",
@@ -431,6 +456,10 @@ describe("shared request history provider identity", () => {
         context: buildContext(),
       }).listOwn();
       expect(result[0]).toMatchObject({ id: "my-request", promptTokens: 3, publicEgress: true });
+      expect(db.modelPool.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ["shared-pool"] } },
+        select: { id: true, userId: true },
+      });
       const wire = JSON.stringify(result);
       expect(wire).not.toMatch(/private-account|private-model|Private account label|openrouter/);
       if (viewer === "owner")

@@ -1,4 +1,8 @@
 import { modelApiSurfaces } from "@ws-model-proxy/api/lib/surface-capabilities";
+import {
+  CLI_AGENT_ACTION_KINDS,
+  CLI_AGENT_ACTION_OUTCOMES,
+} from "@ws-model-proxy/config/cli-agent-audit";
 import { describe, expect, it } from "vitest";
 import enDashboard from "../locales/en-US/dashboard.json";
 import esDashboard from "../locales/es-MX/dashboard.json";
@@ -46,6 +50,18 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esDashboard.terminals)).toEqual(keyTree(enDashboard.terminals));
     expect(keyTree(esDashboard.nav)).toEqual(keyTree(enDashboard.nav));
     expect(keyTree(esDashboard.clis.features)).toEqual(keyTree(enDashboard.clis.features));
+  });
+
+  it("has identical agent activity keys, covering every audit kind and outcome", () => {
+    expect(keyTree(esDashboard.clis.activity)).toEqual(keyTree(enDashboard.clis.activity));
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(Object.keys(bundle.clis.activity.kinds).sort()).toEqual(
+        [...CLI_AGENT_ACTION_KINDS].sort(),
+      );
+      expect(Object.keys(bundle.clis.activity.outcomes).sort()).toEqual(
+        [...CLI_AGENT_ACTION_OUTCOMES].sort(),
+      );
+    }
   });
 
   it("contains the terminals and CLI feature keys in both bundles", () => {
@@ -207,6 +223,25 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     });
   });
 
+  it("labels every chat-test fallback reason in both bundles", () => {
+    // The chip renders `dashboard:chatTest.route.reasons.${reason}` for every
+    // reason the model API may report; a missing key leaks the raw code into
+    // the chip (`reasons.other` is the deliberate passthrough for unknowns).
+    expect(keyTree(esDashboard.chatTest.route.reasons)).toEqual(
+      keyTree(enDashboard.chatTest.route.reasons),
+    );
+    const reasons = [
+      "local_wait_expired",
+      "local_saturated_protected",
+      "no_local_member",
+      "local_context_ceiling",
+      "local_failure",
+      "other",
+    ].sort();
+    expect(keyTree(enDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
+    expect(keyTree(esDashboard.chatTest.route.reasons).sort()).toEqual(reasons);
+  });
+
   it("labels every surface the ModelApiSurface union allows", () => {
     for (const surface of modelApiSurfaces) {
       expect(enDashboard.models.surfaces, `en-US missing label for ${surface}`).toHaveProperty(
@@ -251,7 +286,7 @@ it("keeps external consent keys in sync and removes obsolete pool notices", () =
   }
   const keys = keyTree(enDashboard).join("\n");
   expect(keys).not.toMatch(
-    /publicEgressAcknowledged|granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
+    /granteePrivacyConfirm|poolExternalProvider|acknowledgeEgress|providerTierDisclosure|egressWarning/,
   );
 });
 

@@ -26,7 +26,7 @@ use crate::protocol::{
 };
 use crate::telemetry::{
     BYTE_COUNTER_MAX, METRIC_SOURCE_INTERVAL_MAX_SECS, METRIC_SOURCE_INTERVAL_MIN_SECS,
-    is_metric_name,
+    is_label_key, is_metric_name,
 };
 
 /// `shortTextSchema`: OS name/version/kernel, CPU model, GPU name.
@@ -188,7 +188,7 @@ pub fn conform_node_metrics(metrics: &mut NodeMetrics) {
             && series
                 .labels
                 .iter()
-                .all(|(key, value)| is_metric_name(key) && is_metric_name(value))
+                .all(|(key, value)| is_label_key(key) && is_metric_name(value))
     });
     metrics.custom.truncate(NODE_METRICS_CUSTOM_MAX);
     metrics
@@ -417,6 +417,16 @@ mod tests {
                     source: "fans".to_string(),
                     name: "rpm".to_string(),
                     labels: [("gpu".to_string(), "0".to_string())].into_iter().collect(),
+                    value: 1800.0,
+                    ts: "2026-09-28T12:00:00.000Z".to_string(),
+                },
+                // `__proto__` matches the name pattern but the server drops it.
+                CustomMetric {
+                    source: "fans".to_string(),
+                    name: "rpm".to_string(),
+                    labels: [("__proto__".to_string(), "0".to_string())]
+                        .into_iter()
+                        .collect(),
                     value: 1800.0,
                     ts: "2026-09-28T12:00:00.000Z".to_string(),
                 },

@@ -7,12 +7,14 @@
  * those codes to `deletion_in_progress` / `retained_history` copy. The
  * HTTP/oRPC code stays CONFLICT.
  *
- * - `retained_history`: capacity or provider history must be kept, so the
- *   item (or user) can never be deleted; archive or disable it instead.
- * - `delete_pending`: requests are still in flight on the item; nothing was
- *   deleted, retry once they finish.
- * - `delete_contended`: the ordered delete kept losing its locks to live
- *   traffic; nothing was deleted, retry.
+ * - `retained_history`: provider accounting history must be kept, so the
+ *   user can never be deleted; archive them instead. Other parents keep no
+ *   blocking history since DL-1 (d): their request history stays as
+ *   orphaned hot-path rows.
+ * - `delete_pending`: the user's request history could not be drained yet;
+ *   nothing was deleted, retry once requests finish.
+ * - `delete_contended`: the set of owners the delete must fence kept
+ *   changing (or it kept deadlocking); nothing was deleted, retry.
  * - `still_attached`: a capacity is still attached to a pool member.
  * - `not_stale`: a stale-only delete found the item reporting recently.
  * - `deletion_in_progress`: the user is being deleted and cannot be restored.

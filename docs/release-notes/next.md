@@ -11,6 +11,12 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 
 ## Before you deploy
 
+- **Schema: `cli_device.connectionGeneration` is added (#129).** An additive
+  non-null `int` with a default of `0`, so `APPLY_SCHEMA=safe` applies it
+  without a "possible data loss" stop. It fences disconnect writes to the
+  connection a session was accepted under, so a close delivered after a
+  reconnect cannot re-open the pool members of a live device.
+
 - **Set a stop grace of at least 52 s.** The server can take up to 47 s to shut
   down (`PROCESS_SHUTDOWN_DEADLINE_MS`). Docker's default of 10 s cuts the HTTP
   drain and relay close short. Use `docker stop -t 52`, compose
@@ -39,6 +45,20 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
   prints before switching to `dangerous`, then go back to `APPLY_SCHEMA=off`. The schema deploy also re-applies the
   schema hardening that carries the grantee trigger fix below; with
   `APPLY_SCHEMA=off` that fix is not installed.
+
+- **Capacity lock redesign and legacy storage drop (#78, #74): one more
+  `APPLY_SCHEMA=dangerous` deploy, after a backup, with every server stopped.**
+  The push drops the foreign keys between request history (admission,
+  capacity leases, relay requests, stickiness, usage rollups, provider
+  attempts and accounting) and the dashboard graph, moves the capacity
+  scheduler state and fencing counter from `inference_capacity` into the new
+  `capacity_runtime` table (the hardening re-seeds each fencing counter from
+  its highest lease token; scheduler fairness restarts once), and drops
+  `model_pool."publicEgressAcknowledged"`, the `dashboard_notice` table and an
+  unused `user` index. `APPLY_SCHEMA=safe` stops listing exactly those
+  columns and that table. Stop every running server first: an old server
+  writes the dropped columns. Then start the new image once with
+  `APPLY_SCHEMA=dangerous` and go back to `APPLY_SCHEMA=off`.
 
 ## Breaking changes
 
@@ -78,8 +98,20 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 - **OpenRouter accounting is conservative for now.** Until OpenRouter usage
   normalization lands (#62), budgets over-count OpenRouter spend.
 
+- **Deleting a device, endpoint, model, pool, capacity or user no longer
+  waits for or is refused by its request history.** History keeps the deleted
+  ids and is removed by the retention sweeps; a deleted user's remaining history is purged after 24 h.
+  Accounts with provider accounting still cannot be deleted (archive them).
+
 ## Fixed
 
+- **A disconnect that arrives just after a CLI reconnects no longer re-opens
+  its pool members (#113, #129).** The reconnect hello had already made the
+  members due, but the old socket's close could still be processed during the
+  new registration and re-impose the full 60 s circuit-open (and a
+  `DISCONNECTED` device status) over the live session. Disconnect writes now
+  carry the connection generation they were issued under and apply only while
+  the device still holds it, so the stale close matches no row.
 - **Grantees of shared pools could not use local members.** Since #26
   (2026-08-25), on databases with schema hardening applied, a grantee's
   request to a shared pool's local member failed: the database rejected the

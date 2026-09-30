@@ -6,6 +6,14 @@ import type {
   SupervisedOutputMode,
 } from "@ws-model-proxy/api/lib/supervised-command-types";
 import {
+  CLI_AGENT_ACTION_UNKNOWN_DEVICE,
+  type CliAgentActionKind,
+  type CliAgentActionOutcome,
+  cliAgentSignalReason,
+  cliAgentWireReason,
+  commandAuditPath,
+} from "@ws-model-proxy/config/cli-agent-audit";
+import {
   appendRollingTail,
   cleanText,
   TerminalByteState,
@@ -16,6 +24,8 @@ import {
   resetCliAgentAdmissionsForTests,
   revokeOpenCliAgentAdmissions,
 } from "./cli-agent-admission.js";
+import { recordCliAgentAction } from "./cli-agent-audit.js";
+import { commandAuditDigest } from "./command-audit-digest.js";
 import {
   relaySessionManager,
   type SupervisedTerminalGoneCause,
@@ -24,6 +34,78 @@ import {
   type TrackedSupervisedCommand,
 } from "./session-manager.js";
 import { characterCount, isWellFormedText, truncateCharacters } from "./wire-text.js";
+
+// ---------------------------------------------------------------------------
+// Agent audit log: one metadata-only event per terminal outcome (see
+// ./cli-agent-audit.ts). Refusals are recorded by the start wrappers, started
+// commands by `finish` / `finishSupervised`, each the single point their
+// outcome passes through. Nothing here can fail or delay a command.
+// ---------------------------------------------------------------------------
+
+/** Input bound: a refused oversized command is still audited cheaply. */
+const AUDIT_COMMAND_MAX_CHARS = 16_384;
+
+/**
+ * `path` of a command event (keyed HMAC-SHA256 of the command text plus its
+ * program; see ./command-audit-digest.ts). Never throws: `commandAuditDigest`
+ * degrades to `unavailable` and this guards an unexpected parse error.
+ */
+function auditPathOf(command: unknown): string {
+  try {
+    if (typeof command !== "string") return "";
+    return commandAuditPath(command.slice(0, AUDIT_COMMAND_MAX_CHARS), commandAuditDigest, {
+      truncated: command.length > AUDIT_COMMAND_MAX_CHARS,
+    });
+  } catch {
+    return "";
+  }
+}
+
+/** `exit:<code>`, `signal:<name>` or `timed_out` for a command that ran. */
+function exitReason(fields: {
+  exitCode: number | null;
+  signal: string | null;
+  timedOut?: boolean;
+}): string {
+  if (fields.timedOut === true) return "timed_out";
+  if (fields.signal !== null) return cliAgentSignalReason(fields.signal);
+  return fields.exitCode !== null ? `exit:${fields.exitCode}` : "exit";
+}
+
+/**
+ * Refusals raised before (or without) the ownership check of the requested
+ * device: its id is caller-supplied text there, so the row stores
+ * {@link CLI_AGENT_ACTION_UNKNOWN_DEVICE} instead. Every other refusal comes
+ * after the device was resolved to one of the caller's own (see
+ * `admitCliCommand`, `admitSupervisedCommand`).
+ */
+const UNVERIFIED_DEVICE_REFUSALS: ReadonlySet<string> = new Set([
+  "not_found",
+  "token_inactive",
+  "internal_error",
+]);
+
+function auditRefusal(
+  kind: Extract<CliAgentActionKind, "command" | "supervised_command">,
+  input: { userId: string; tokenId: string; cliDeviceId: string; command: string },
+  startedAt: Date,
+  outcome: Extract<CliAgentActionOutcome, "refused" | "failed">,
+  reason: string,
+): void {
+  recordCliAgentAction({
+    userId: input.userId,
+    cliDeviceId: UNVERIFIED_DEVICE_REFUSALS.has(reason)
+      ? CLI_AGENT_ACTION_UNKNOWN_DEVICE
+      : input.cliDeviceId,
+    mcpTokenId: input.tokenId,
+    kind,
+    path: auditPathOf(input.command),
+    outcome,
+    reason,
+    startedAt,
+    finishedAt: new Date(),
+  });
+}
 
 const HEAD_MAX_BYTES = 8192;
 const TAIL_MAX_BYTES = 40960;
@@ -101,6 +183,8 @@ type MutableBounded = {
 type CommandRecord = TrackedCliCommand & {
   userId: string;
   tokenId: string;
+  /** Audit `path` (command hash plus program), computed once at start. */
+  auditPath: string;
   stdout: MutableBounded;
   stderr: MutableBounded;
   exitCode: number | null;
@@ -216,8 +300,35 @@ function finish(
   if (fields.exitCode !== undefined) record.exitCode = fields.exitCode;
   if (fields.signal !== undefined) record.signal = fields.signal;
   if (fields.timedOut !== undefined) record.timedOut = fields.timedOut;
+  auditHeadlessCommand(record, status);
   relaySessionManager.forgetCommand(record.cliDeviceId, record.commandId);
   notify(record);
+}
+
+function auditHeadlessCommand(
+  record: CommandRecord,
+  status: "exited" | "cancelled" | "rejected",
+): void {
+  const outcome: CliAgentActionOutcome =
+    status === "exited" ? "completed" : status === "cancelled" ? "cancelled" : "refused";
+  recordCliAgentAction({
+    userId: record.userId,
+    cliDeviceId: record.cliDeviceId,
+    mcpTokenId: record.tokenId,
+    kind: "command",
+    path: record.auditPath,
+    outcome,
+    reason:
+      status === "exited"
+        ? exitReason(record)
+        : status === "rejected"
+          ? (record.rejectionReason ?? "rejected")
+          : record.timedOut
+            ? "timed_out"
+            : null,
+    startedAt: new Date(record.startedAt),
+    finishedAt: new Date(record.finishedAt ?? Date.now()),
+  });
 }
 
 function runningCounts(userId: string, cliDeviceId: string): { user: number; cli: number } {
@@ -252,14 +363,32 @@ function validCommandInput(command: string, cwd: string | undefined): boolean {
   );
 }
 
-export async function startCliCommand(input: {
+type StartCliCommandInput = {
   userId: string;
   tokenId: string;
   expiresAt: Date | null;
   cliDeviceId: string;
   command: string;
   cwd?: string;
-}): Promise<{ ok: true; commandId: string } | { ok: false; error: CliCommandRejection }> {
+};
+
+export async function startCliCommand(
+  input: StartCliCommandInput,
+): Promise<{ ok: true; commandId: string } | { ok: false; error: CliCommandRejection }> {
+  const startedAt = new Date();
+  try {
+    const result = await admitCliCommand(input);
+    if (!result.ok) auditRefusal("command", input, startedAt, "refused", result.error);
+    return result;
+  } catch (error) {
+    auditRefusal("command", input, startedAt, "failed", "internal_error");
+    throw error;
+  }
+}
+
+async function admitCliCommand(
+  input: StartCliCommandInput,
+): Promise<{ ok: true; commandId: string } | { ok: false; error: CliCommandRejection }> {
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   const verdict = judgeCliAgentAdmission(await readCliAgentAdmission(input), "headless_exec");
   if (!verdict.ok) return verdict;
@@ -279,6 +408,7 @@ export async function startCliCommand(input: {
     cliDeviceId: input.cliDeviceId,
     userId: input.userId,
     tokenId: input.tokenId,
+    auditPath: auditPathOf(input.command),
     status: "running",
     stdout: emptyBounded(),
     stderr: emptyBounded(),
@@ -300,7 +430,9 @@ export async function startCliCommand(input: {
   };
   record.markCancelled = () => finish(record, "cancelled", {});
   record.markRejected = (reason: string) => {
-    record.rejectionReason = reason;
+    // The wire accepts any string here: store a known code or the fallback,
+    // never CLI-supplied text (see `cliAgentWireReason`).
+    record.rejectionReason = cliAgentWireReason(reason);
     finish(record, "rejected", {});
   };
   record.markDone = (result) => finish(record, "exited", result);
@@ -439,6 +571,8 @@ type SupervisedRecord = {
   userId: string;
   tokenId: string;
   command: string;
+  /** Audit `path` (command hash plus program), computed once at start. */
+  auditPath: string;
   cwd: string | null;
   reason: string | null;
   requester: string;
@@ -533,7 +667,38 @@ function finishSupervised(
   record.status = status;
   record.finishedAt = Date.now();
   if (fields.rejectionReason !== undefined) record.rejectionReason = fields.rejectionReason;
+  auditSupervisedCommand(record, status);
   relaySessionManager.notifyTerminalListChanged(record.userId);
+}
+
+function auditSupervisedCommand(
+  record: SupervisedRecord,
+  status: Exclude<SupervisedCommandStatus, "awaiting_user" | "running" | "awaiting_output_review">,
+): void {
+  const outcome: CliAgentActionOutcome =
+    status === "exited"
+      ? "completed"
+      : status === "rejected"
+        ? "refused"
+        : status === "declined"
+          ? "declined"
+          : status === "expired"
+            ? "expired"
+            : "cancelled";
+  recordCliAgentAction({
+    userId: record.userId,
+    cliDeviceId: record.cliDeviceId,
+    mcpTokenId: record.tokenId,
+    kind: "supervised_command",
+    path: record.auditPath,
+    outcome,
+    reason:
+      status === "exited"
+        ? exitReason(record)
+        : (record.rejectionReason ?? (record.acceptedAt === null ? "not_started" : null)),
+    startedAt: new Date(record.createdAt),
+    finishedAt: new Date(record.finishedAt ?? Date.now()),
+  });
 }
 
 /** Exited with this output decision. Unreviewed bytes never outlive it. */
@@ -650,7 +815,11 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
     },
     onRejected(reason) {
       if (record.status !== "awaiting_user") return;
-      finishSupervised(record, "rejected", { rejectionReason: reason.slice(0, 64) });
+      // The wire accepts any string here: store a known code or the fallback,
+      // never CLI-supplied text (see `cliAgentWireReason`).
+      finishSupervised(record, "rejected", {
+        rejectionReason: cliAgentWireReason(reason.slice(0, 64)),
+      });
     },
     onAccepted() {
       // The CLI took an Enter: that is authoritative, also over a stop the
@@ -801,7 +970,7 @@ export function requesterLabel(tokenName: string): string {
  * and its mode, limits, input), then the CLI is asked to spawn the confirm
  * terminal. Nothing runs until a person presses Enter on that screen.
  */
-export async function startSupervisedCommand(input: {
+type StartSupervisedCommandInput = {
   userId: string;
   tokenId: string;
   expiresAt: Date | null;
@@ -810,10 +979,29 @@ export async function startSupervisedCommand(input: {
   cwd?: string;
   reason?: string;
   shareOutput: boolean;
-}): Promise<
+};
+
+type StartSupervisedCommandResult =
   | { ok: true; commandId: string; terminalId: string; expiresAt: string }
-  | { ok: false; error: CliCommandRejection }
-> {
+  | { ok: false; error: CliCommandRejection };
+
+export async function startSupervisedCommand(
+  input: StartSupervisedCommandInput,
+): Promise<StartSupervisedCommandResult> {
+  const startedAt = new Date();
+  try {
+    const result = await admitSupervisedCommand(input);
+    if (!result.ok) auditRefusal("supervised_command", input, startedAt, "refused", result.error);
+    return result;
+  } catch (error) {
+    auditRefusal("supervised_command", input, startedAt, "failed", "internal_error");
+    throw error;
+  }
+}
+
+async function admitSupervisedCommand(
+  input: StartSupervisedCommandInput,
+): Promise<StartSupervisedCommandResult> {
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   const verdict = judgeCliAgentAdmission(await readCliAgentAdmission(input), "supervised");
   if (!verdict.ok) return verdict;
@@ -849,6 +1037,7 @@ export async function startSupervisedCommand(input: {
     userId: input.userId,
     tokenId: input.tokenId,
     command: input.command,
+    auditPath: auditPathOf(input.command),
     cwd: cwd ?? null,
     reason: reason ? reason : null,
     requester,
