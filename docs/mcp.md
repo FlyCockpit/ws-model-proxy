@@ -585,12 +585,14 @@ the command text itself), when, and how it ended (`completed`, `refused`, `faile
 (`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
 stored as `rejected`, so CLI-supplied text never reaches the column. File
 content, diffs and command output are never stored, and the command's arguments
-are never stored: the server reduces the command text to its program (the
-first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
-`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
-command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
-flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
-for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+are never stored: the server reduces the command text to its program name: it skips leading plain
+`NAME=value` assignments (never stored), removes one layer of quotes, takes the
+basename of a path and lowercases it, and stores the result only when it is in a
+fixed, code-reviewed allowlist of common program names
+(`CLI_AGENT_PROGRAM_ALLOWLIST` in `packages/config/src/cli-agent-audit.ts`), else `?`
+(an unknown program, a non-plain assignment value, a flag, a redirection or a
+command cut for length; a wrapper such as `sudo` or `env` is stored by its own
+name), so only allowlisted strings ever reach the row; the server also hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
 HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
 (fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
 used to check a guessed command; when the key cannot be derived the hash is

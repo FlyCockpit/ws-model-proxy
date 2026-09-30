@@ -43,8 +43,9 @@ model CliAgentActionEvent {
   /// text> <program>`, or `hmac-sha256:unavailable <program>` when the server
   /// cannot derive the audit key (packages/config/src/cli-agent-audit.ts,
   /// apps/server/src/relay/command-audit-digest.ts) — never any command text;
-  /// the program is the first word when it is a bare name (`[A-Za-z0-9._-]`,
-  /// no leading `-`, no cmd built-in followed by `.`), else `?`. The digest
+  /// the program is the basename of the command word (after leading plain
+  /// `NAME=value` assignments and one quote layer), lowercased, only when it
+  /// is in CLI_AGENT_PROGRAM_ALLOWLIST, else `?`. The digest
   /// is HMAC-SHA256 under a key derived from the server auth secret, so the
   /// table alone cannot be used to check a guessed command.
   path        String

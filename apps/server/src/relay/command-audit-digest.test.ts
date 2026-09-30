@@ -99,7 +99,7 @@ describe("commandAuditDigest (server)", () => {
   it("never leaks the raw secret or the derived key into the stored path", () => {
     const path = commandAuditPath("mysql -pPassword1 --host db", commandAuditDigest);
     expect(path).toMatch(
-      new RegExp(`^hmac-sha256:[0-9a-f]{${CLI_AGENT_ACTION_AUDIT_HASH_HEX_LENGTH}} mysql$`),
+      new RegExp(`^hmac-sha256:[0-9a-f]{${CLI_AGENT_ACTION_AUDIT_HASH_HEX_LENGTH}} \\?$`),
     );
     expect(path).not.toContain(SECRET);
     expect(path).not.toContain(PINNED_KEY_HEX);
