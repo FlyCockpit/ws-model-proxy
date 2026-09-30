@@ -92,7 +92,7 @@ fn window_parameter_table() {
 #[test]
 fn unnumbered_window_keeps_leading_blank_lines_aligned_with_start_line() {
     let fx = Fx::new();
-    fx.put("g.txt", "one\n\n\nfour\nfive\n".to_string());
+    fx.put("g.txt", "one\n\n\nfour\nfive\n");
     let r = fx.read_with(json!({ "path": fx.p("g.txt"), "startLine": 2, "lineNumbers": false }));
     assert!(r.text.starts_with("\n\nfour\nfive"), "{:?}", r.text);
 }
