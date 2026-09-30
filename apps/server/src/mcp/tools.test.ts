@@ -194,6 +194,8 @@ function bindRequest(
         kind: "pat";
         tokenId: string;
         allowCliCommands: boolean;
+        allowCliFileRead: boolean;
+        scopes: readonly string[];
         expiresAt: Date | null;
       },
 ) {
@@ -1301,6 +1303,8 @@ const PAT_WITH_CLI = {
   kind: "pat" as const,
   tokenId: "token-pat-1",
   allowCliCommands: true,
+  allowCliFileRead: false,
+  scopes: ["mcp:read", "mcp:write"],
   expiresAt: PAT_EXPIRES,
 };
 const PAT_WITHOUT_CLI = { ...PAT_WITH_CLI, allowCliCommands: false };
@@ -1311,6 +1315,8 @@ type ListedCredential =
       kind: "pat";
       tokenId: string;
       allowCliCommands: boolean;
+      allowCliFileRead: boolean;
+      scopes: readonly string[];
       expiresAt: Date | null;
     }
   | { kind: "oauth" };
@@ -1432,7 +1438,7 @@ describe("CLI command tools", () => {
     }
   });
 
-  it("tells the model that other secrets in command output are NOT redacted", async () => {
+  it("discloses the masked output classes and the unsupervised limitation", async () => {
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo, "req-list", PAT_WITH_CLI);
     const handler = createMcpTransport();
@@ -1444,12 +1450,45 @@ describe("CLI command tools", () => {
     const resultTool = body.result?.tools?.find(
       (tool) => tool.name === "forwarder_cli_command_result",
     );
-    expect(run?.description).toContain("NOT redacted");
+    const supervised = body.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_supervised_command_start",
+    );
+    for (const tool of [run, resultTool, supervised]) {
+      for (const phrase of [
+        "private key blocks",
+        "secret-name tokens",
+        "scans the terminal-cleaned view",
+        "retain private-key labels across piece boundaries",
+        "recovery unconditionally masks non-blank output until the next blank line",
+        "Normal scanning resumes after the blank unless these protections extend masking",
+        "unmasked lines keep their raw bytes",
+        "Terminal parser state carries across lines",
+        "The server cleanText still runs afterwards",
+        "following non-blank line",
+        "continuation",
+        "--api-key/--hf-token",
+        ".cache/huggingface/token",
+        "dotenv view",
+        "NOT masked",
+        "not a security boundary",
+        "A line over 64 KiB is masked whole",
+        "inside a live multi-line secret run",
+        "the next non-blank line and subsequent lines indented deeper than column 0 are also protected",
+        "Opaque fallbacks stay closed through EOF",
+        "a PEM marker exceeding the 1 KiB recovery overlap",
+        "more than 1 MiB of live masking-state input",
+        "an over-long line inside such a run",
+        "a cleaned LF inside an overlong terminal group",
+        "including LF executed inside unfinished CSI",
+      ]) {
+        expect(tool?.description).toContain(phrase);
+      }
+      expect(tool?.description).not.toContain("A line over 64 KiB or more than 1 MiB");
+    }
     expect(
       (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
         ?.destructiveHint,
     ).toBe(true);
-    expect(resultTool?.description).toContain("NOT redacted");
     expect(run?.description).toContain('confirm: "RUN"');
     expect(resultTool?.description).not.toContain('confirm: "RUN"');
   });
@@ -2150,6 +2189,66 @@ describe("CLI file tools", () => {
     // A flagged PAT that only holds mcp:read does not get the file tools in this phase.
     const readOnly = (await listedTools(PAT_WITH_CLI, ["mcp:read"])).map((tool) => tool.name);
     for (const name of CLI_FILE_TOOL_NAMES) expect(readOnly).not.toContain(name);
+  });
+
+  it("read-only PAT consent exposes and calls exactly four read file tools; every write/command remains unknown", async () => {
+    const credential = {
+      ...PAT_WITH_CLI,
+      allowCliCommands: false,
+      allowCliFileRead: true,
+      scopes: ["mcp:read"],
+    };
+    const names = (await listedTools(credential, ["mcp:read"]))
+      .map((tool) => tool.name)
+      .filter(
+        (name) =>
+          CLI_FILE_TOOL_NAMES.some((file) => file === name) ||
+          [
+            "forwarder_cli_command_run",
+            "forwarder_cli_supervised_command_start",
+            "forwarder_cli_command_result",
+          ].includes(name),
+      );
+    expect(names.sort()).toEqual(
+      [
+        "forwarder_cli_file_read",
+        "forwarder_cli_file_stat",
+        "forwarder_cli_dir_list",
+        "forwarder_cli_file_search",
+      ].sort(),
+    );
+    fileRuntime.runFileOp.mockResolvedValue({ ok: true, op: "read", result: READ_RESULT });
+    const read = await call(
+      "forwarder_cli_file_read",
+      { cliDeviceId: "cli-1", path: "~/a" },
+      { credential, scopes: ["mcp:read"] },
+    );
+    expect(read.isError).not.toBe(true);
+    expect(fileRuntime.runFileOp).toHaveBeenCalledOnce();
+    for (const name of [
+      ...CLI_FILE_TOOL_NAMES.slice(4),
+      "forwarder_cli_command_run",
+      "forwarder_cli_supervised_command_start",
+      "forwarder_cli_command_result",
+    ]) {
+      const result = await call(
+        name,
+        { cliDeviceId: "cli-1", path: "~/a", confirm: "RUN" },
+        { credential, scopes: ["mcp:read"] },
+      );
+      expect(resultText(result)).toBe(`Tool ${name} not found`);
+    }
+    expect(fileRuntime.runFileOp).toHaveBeenCalledOnce();
+    for (const flags of [
+      { allowCliCommands: false, allowCliFileRead: false, scopes: ["mcp:read"] },
+      { allowCliCommands: false, allowCliFileRead: true, scopes: [] },
+      { allowCliCommands: true, allowCliFileRead: false, scopes: ["mcp:read"] },
+    ]) {
+      const tools = await listedTools({ ...PAT_WITH_CLI, ...flags }, flags.scopes);
+      expect(
+        tools.filter((tool) => CLI_FILE_TOOL_NAMES.some((name) => name === tool.name)),
+      ).toEqual([]);
+    }
   });
 
   it("answers an unknown-tool error at call time to OAuth, a PAT without the flag, and a read-only PAT", async () => {

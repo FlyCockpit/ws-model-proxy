@@ -7,8 +7,8 @@ import type {
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   type FileOpClass,
-  fileAccessRefusal,
-  fileToolAccess,
+  fileGrantStageRefusal,
+  fileLiveStageRefusal,
 } from "@ws-model-proxy/api/lib/cli-file-access";
 import {
   allowsHeadlessCommands,
@@ -127,10 +127,11 @@ export type CliReportedFeatures = {
   mcpCommandMode: McpCommandModeName;
   terminalApproval: boolean;
   terminalSupported: boolean;
-  /** 2.8: the CLI's read-only file grant (false until P4). */
+  /** 2.8: the CLI's read-only file grant. */
   mcpFileRead: boolean;
-  /** 2.8: the CLI has `fileRoots` configured (false until P4). */
+  /** 2.8: the CLI has `fileRoots` configured. */
   fileRootsConfigured: boolean;
+  fileOps: boolean;
   /** 2.8: `wsmp config set-file-tools-as-root on`. */
   allowFileToolsAsRoot: boolean;
 };
@@ -404,6 +405,7 @@ type SessionState = {
   /** 2.5 CLI identity proof, relayed to browsers as is. */
   terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
+  mcpFileRead: boolean;
   /** Server grant for MCP commands (dashboard). The CLI's own mode is in `features`. */
   mcpCommandMode: McpCommandModeName;
   terminalsById: Map<string, TerminalRecord>;
@@ -455,7 +457,7 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   terminalIdentity: CliTerminalIdentity | null;
 } {
   return {
-    features: capabilities.features,
+    features: { ...capabilities.features, fileOps: capabilities.fileOps === true },
     terminalPublicKey: capabilities.terminalPublicKey,
     terminalViewers: capabilities.terminalViewers === true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
@@ -545,6 +547,8 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     relayProtocolVersion: message.protocolVersion,
     reportedHumanTerminal: features.humanTerminal,
     reportedMcpCommandMode: mcpCommandModeToDb(features.mcpCommandMode),
+    reportedMcpFileRead: features.mcpFileRead,
+    reportedFileRoots: features.fileRootsConfigured,
     reportedTerminalApproval: features.terminalApproval,
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
@@ -603,6 +607,11 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
+  private grantChangeSeq = 0;
+  // One integer per device changed since process start. There is no device-delete
+  // policy hook; retain the fence even while offline so delayed hellos stay fenced.
+  private lastGrantChangeSeq = new Map<string, number>();
   /**
    * Highest connection generation this process has installed or settled per
    * device. Hello results can complete out of order, so an older-committed
@@ -689,6 +698,7 @@ export class RelaySessionManager {
       terminalIdentity: null,
       allowHumanTerminal: false,
       mcpCommandMode: "off",
+      mcpFileRead: false,
       terminalsById: new Map(),
       commandsById: new Map(),
       filesById: new Map(),
@@ -741,6 +751,7 @@ export class RelaySessionManager {
 
     if (message.type === "hello") {
       try {
+        const helloSeq = this.grantChangeSeq;
         const registration = await persistRelayRegistration({
           identity: session.identity,
           cli: message.cli,
@@ -789,8 +800,16 @@ export class RelaySessionManager {
         session.endpointTargeting = true;
         session.protocolVersion = message.protocolVersion;
         session.cliVersion = message.cli.version ?? null;
-        session.allowHumanTerminal = registration.allowHumanTerminal;
-        session.mcpCommandMode = registration.mcpCommandMode;
+        // Registration can commit before a policy change but return after its
+        // refresh. Check and install without yielding: an old hello gets no
+        // authority until the same device queue establishes current policy.
+        const stalePolicy = this.featureGrantChangeSeq(registration.cliDeviceId) > helloSeq;
+        this.installSessionFeatureGrants(
+          session,
+          stalePolicy
+            ? { allowHumanTerminal: false, mcpCommandMode: "off", mcpFileRead: false }
+            : registration,
+        );
         const interactive = interactiveCapabilities(message.cli.capabilities);
         session.features = interactive.features;
         session.terminalPublicKey = interactive.terminalPublicKey;
@@ -805,6 +824,14 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        if (stalePolicy) {
+          void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
+            console.error(
+              "[relay] stale hello policy refresh failed",
+              error instanceof Error ? error.name : typeof error,
+            );
+          });
+        }
         // Members opened only by this device's disconnect are probed now, not
         // after the disconnect cooldown. Best effort: on failure the normal
         // scheduled retry still recovers them.
@@ -1371,21 +1398,58 @@ export class RelaySessionManager {
     });
   }
 
-  async onCliFeatureGrantsChanged(cliDeviceId: string) {
+  onCliFeatureGrantsChanged(cliDeviceId: string): Promise<void> {
+    this.lastGrantChangeSeq.set(cliDeviceId, ++this.grantChangeSeq);
+    return this.refreshFeatureGrants(cliDeviceId);
+  }
+
+  /** Fence an admission before its first read; compare again at its sync verdict. */
+  featureGrantChangeSeq(cliDeviceId: string): number {
+    return this.lastGrantChangeSeq.get(cliDeviceId) ?? 0;
+  }
+
+  private async refreshFeatureGrants(cliDeviceId: string) {
+    // Post-commit notifications and stale hello recovery share this queue.
+    // Own the per-device queue
+    // through the read, apply and metric push; different devices stay independent.
+    // A failed tail must not poison the next refresh or leave an idle entry.
+    const previous = this.featureGrantsRefreshByCliDeviceId.get(cliDeviceId);
+    const refresh = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const device = await prisma.cliDevice.findUnique({
+            where: { id: cliDeviceId },
+            select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
+          });
+          this.applyFeatureGrants(cliDeviceId, {
+            allowHumanTerminal: device?.allowHumanTerminal === true,
+            mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
+            mcpFileRead: device?.mcpFileRead === true,
+          });
+        } catch (error) {
+          // Unknown committed policy cannot retain old authority, including
+          // unsupervised access. Reconciliation cancels work before we rethrow.
+          this.applyFeatureGrants(cliDeviceId, {
+            allowHumanTerminal: false,
+            mcpCommandMode: "off",
+            mcpFileRead: false,
+          });
+          throw error;
+        } finally {
+          // Leaving `unsupervised` withdraws remote metric sources at once, even
+          // when the grant read above failed: the push re-reads the committed
+          // mode itself and fails closed (an empty list) on any error.
+          await this.onRemoteMetricSourcesChanged(cliDeviceId);
+        }
+      });
+    this.featureGrantsRefreshByCliDeviceId.set(cliDeviceId, refresh);
     try {
-      const device = await prisma.cliDevice.findUnique({
-        where: { id: cliDeviceId },
-        select: { allowHumanTerminal: true, mcpCommandMode: true },
-      });
-      this.applyFeatureGrants(cliDeviceId, {
-        allowHumanTerminal: device?.allowHumanTerminal === true,
-        mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
-      });
+      await refresh;
     } finally {
-      // Leaving `unsupervised` withdraws remote metric sources at once, even
-      // when the grant read above failed: the push re-reads the committed
-      // mode itself and fails closed (an empty list) on any error.
-      await this.onRemoteMetricSourcesChanged(cliDeviceId);
+      if (this.featureGrantsRefreshByCliDeviceId.get(cliDeviceId) === refresh) {
+        this.featureGrantsRefreshByCliDeviceId.delete(cliDeviceId);
+      }
     }
   }
 
@@ -1487,13 +1551,30 @@ export class RelaySessionManager {
 
   applyFeatureGrants(
     cliDeviceId: string,
-    grants: { allowHumanTerminal: boolean; mcpCommandMode: McpCommandModeName },
+    grants: {
+      allowHumanTerminal: boolean;
+      mcpCommandMode: McpCommandModeName;
+      mcpFileRead: boolean;
+    },
   ) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
+    this.installSessionFeatureGrants(session, grants);
+    this.reconcileInteractiveGrants(session);
+  }
+
+  /** The only installer for established session policy; callers never await here. */
+  private installSessionFeatureGrants(
+    session: SessionState,
+    grants: {
+      allowHumanTerminal: boolean;
+      mcpCommandMode: McpCommandModeName;
+      mcpFileRead: boolean;
+    },
+  ) {
     session.allowHumanTerminal = grants.allowHumanTerminal;
     session.mcpCommandMode = grants.mcpCommandMode;
-    this.reconcileInteractiveGrants(session);
+    session.mcpFileRead = grants.mcpFileRead === true;
   }
 
   /**
@@ -1764,7 +1845,9 @@ export class RelaySessionManager {
         supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        fileOps: relayProtocolAtLeast(session.protocolVersion, "2.8"),
+        fileOps:
+          relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+          session.features?.fileOps === true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
@@ -2271,11 +2354,23 @@ export class RelaySessionManager {
   ): "grant_disabled" | "feature_disabled" | "supervised_only" | null {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return null;
-    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass);
-    if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
-    const liveAccess = fileToolAccess(session.features?.mcpCommandMode ?? "off", opClass);
-    if (liveAccess !== "headless") return fileAccessRefusal(liveAccess, "live");
-    return null;
+    const readGrant = {
+      server: session.mcpFileRead === true,
+      live:
+        session.features?.mcpFileRead === true &&
+        session.features.fileOps === true &&
+        relayProtocolAtLeast(session.protocolVersion, "2.8"),
+      roots: session.features?.fileRootsConfigured === true,
+    };
+    return (
+      fileGrantStageRefusal(session.mcpCommandMode, opClass, readGrant) ??
+      fileLiveStageRefusal(
+        session.mcpCommandMode,
+        session.features?.mcpCommandMode ?? "off",
+        opClass,
+        readGrant,
+      )
+    );
   }
 
   sendRelayRequest({
@@ -2613,7 +2708,9 @@ export class RelaySessionManager {
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
       relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-      fileToolAccess(this.effectiveCommandMode(session), opClass) === "headless" &&
+      session.cliDeviceId !== null &&
+      this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
+      session.features?.fileOps === true &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }

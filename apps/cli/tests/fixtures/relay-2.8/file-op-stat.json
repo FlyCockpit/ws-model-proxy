@@ -5,5 +5,7 @@
   "args": {
     "paths": ["~/models/q4.gguf", "~/llama"],
     "hash": false
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

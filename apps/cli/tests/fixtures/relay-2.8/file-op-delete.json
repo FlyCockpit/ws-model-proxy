@@ -6,5 +6,7 @@
     "path": "~/old.txt",
     "expectedEtag": "h:AAAAAAAAAAAAAAAAAAAAAA",
     "reason": "cleanup"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

@@ -16,6 +16,7 @@ mod compensation;
 mod edit_write;
 mod hardening;
 mod misc;
+mod read_grant;
 mod read_tests;
 mod resolve_policy;
 mod tools;

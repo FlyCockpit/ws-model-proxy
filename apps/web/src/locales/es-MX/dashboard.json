@@ -227,7 +227,11 @@
         "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
         "grant_supervised_only": "rechazado: requiere Sin supervisión, y el permiso del panel de arriba es Supervisado. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
         "cli_supervised_only": "rechazado: requiere Sin supervisión, y la configuración propia de este CLI es Supervisado. En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
-      }
+      },
+      "fileRead": "Los agentes pueden leer archivos (solo lectura)",
+      "fileReadDisabled": "Activa wsmp config set-file-read on y reinicia la CLI primero.",
+      "fileRootsMissing": "Configura los directorios con wsmp config set-file-roots y reinicia la CLI primero.",
+      "fileToolsFollowMode": "Las herramientas de archivos siguen el modo de comandos; el permiso de solo lectura también permite lecturas sin supervisión en los directorios configurados."
     },
     "rename": {
       "action": "Renombrar",

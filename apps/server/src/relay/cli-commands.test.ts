@@ -164,6 +164,8 @@ async function resetRelaySessions() {
 
 describe("cli commands", () => {
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
     resetCliCommandsForTests();
     vi.clearAllMocks();
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
@@ -659,7 +661,7 @@ describe("cli commands", () => {
   });
 
   it("cancels and frees a command that never reports done after 11 minutes plus 15 seconds", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
       const socket = await connect();
       const started = await startCliCommand({
@@ -689,6 +691,11 @@ describe("cli commands", () => {
       await vi.advanceTimersByTimeAsync(15_000);
       expect(snapshotCliCommand(started.commandId, "user-id", "token-deadline")?.status).toBe(
         "cancelled",
+      );
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "heartbeat", id: "after-command-wait" }),
+        new Date(),
       );
       const second = await startCliCommand({
         userId: "user-id",
