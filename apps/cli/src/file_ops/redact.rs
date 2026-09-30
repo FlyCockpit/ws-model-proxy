@@ -847,7 +847,8 @@ fn pem_events(line: &str) -> Vec<(bool, &str)> {
             if label.ends_with("PRIVATE KEY") {
                 events.push((begin, label));
             }
-            at = start + 5 + (rest.len() - label_start.len()) + label_end + 5;
+            // the closing dashes may be the opening dashes of the next marker
+            at = start + 5 + (rest.len() - label_start.len()) + label_end;
             continue;
         }
         at = start + 5;
@@ -886,9 +887,10 @@ struct OpenBlock {
 pub struct LineMasker {
     class: FileClass,
     lookback: usize,
-    /// Open `-----BEGIN <label>-----` private-key blocks: label and the offset of
-    /// the BEGIN line. An END closes the innermost block of the SAME label.
-    pem_stack: Vec<(String, usize)>,
+    /// Open `-----BEGIN <label>-----` private-key blocks per label: the offsets of
+    /// their BEGIN lines. An END closes the innermost block of the SAME label. No
+    /// cap: a dropped BEGIN would leave its body visible.
+    pem_open: std::collections::BTreeMap<String, Vec<usize>>,
     pending_flag_value: bool,
     /// Offset of the latest opener of the run that masks lines until a blank line.
     until_blank: Option<usize>,
@@ -916,7 +918,7 @@ impl LineMasker {
         Self {
             class,
             lookback,
-            pem_stack: Vec::new(),
+            pem_open: std::collections::BTreeMap::new(),
             pending_flag_value: false,
             until_blank: None,
             blocks: Vec::new(),
@@ -942,7 +944,7 @@ impl LineMasker {
     /// Whether a multi-line value that started on an earlier line is still open:
     /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
-        self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_stack.is_empty()
+        self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_open.is_empty()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a
@@ -997,17 +999,22 @@ impl LineMasker {
         // same label. The markers of a line apply in byte order (`END CERT-----BEGIN
         // KEY` opens one); a mismatched END closes nothing (fail closed); several
         // blocks may be open at once, and the latest opener charges the lookback.
-        let mut pem_touched = !self.pem_stack.is_empty();
-        let pem_open_at_start = self.pem_stack.iter().map(|(_, opener)| *opener).max();
-        let mut stack = std::mem::take(&mut self.pem_stack);
+        let pem_open_at_start = self
+            .pem_open
+            .values()
+            .filter_map(|openers| openers.last())
+            .max()
+            .copied();
+        let mut pem_touched = pem_open_at_start.is_some();
         for (begin, label) in pem_events(line) {
             pem_touched = true;
             if begin {
-                if stack.len() < 16 {
-                    stack.push((label.to_string(), at));
+                self.pem_open.entry(label.to_string()).or_default().push(at);
+            } else if let Some(openers) = self.pem_open.get_mut(label) {
+                openers.pop();
+                if openers.is_empty() {
+                    self.pem_open.remove(label);
                 }
-            } else if let Some(idx) = stack.iter().rposition(|(open, _)| open == label) {
-                stack.remove(idx);
             }
         }
         let pem_opener = pem_open_at_start.or(pem_touched.then_some(at));
@@ -1043,7 +1050,6 @@ impl LineMasker {
             self.env_blocks.retain(|block| block.indent != indent);
             self.env_blocks.push(OpenBlock { indent, opener: at });
         }
-        self.pem_stack = stack;
         if masked_by.is_some() {
             return vec![(0..line.len(), token_bare())];
         }
@@ -1136,7 +1142,7 @@ impl LineMasker {
                 self.pair_opener = at;
             }
             self.pair_lines = next_pair;
-            if has_trigger(line)
+            if (has_trigger(line) || line.contains("\\u00"))
                 && let Some((start, opened)) = first_secret(line)
             {
                 masks.extend(tail_mask(line, start));
@@ -1669,6 +1675,26 @@ mod tests {
             assert!(view.starts_with("head\n"), "{view:?}");
             assert!(!must_end_visible || view.ends_with("tail\n"), "{view:?}");
         }
+        // no cap on open blocks: 20 BEGINs, closed one END at a time, keep the rest masked
+        let begin = marker("BEGIN", "RSA PRIVATE KEY");
+        let end = marker("END", "RSA PRIVATE KEY");
+        let deep = format!(
+            "{}BODYDEEP\n{}tail\n",
+            format!("{begin}\n").repeat(20),
+            format!("{end}\n").repeat(19)
+        );
+        let view = masked(FileClass::Plain, &deep);
+        assert!(
+            !view.contains("BODYDEEP") && view.ends_with("tail\n") == false,
+            "{view:?}"
+        );
+        // markers that share their hyphens: `END CERT-----BEGIN KEY`
+        let shared = format!("head\n-----END CERTIFICATE{begin}\nSHAREDBODY\n{end}\ntail\n");
+        let view = masked(FileClass::Plain, &shared);
+        assert!(
+            !view.contains("SHAREDBODY") && view.ends_with("tail\n"),
+            "{view:?}"
+        );
         // public keys and certificates stay visible
         for label in [
             "PUBLIC KEY",
@@ -2079,6 +2105,11 @@ mod tests {
                 Plain,
                 "{\"API\\u005fKEY\": \"uni-secret\", \"\\u0044B_PASSWORD\":\"uni2-secret\"}\n",
                 &["uni-secret", "uni2-secret"],
+            ),
+            (
+                Plain,
+                "{\"\\u0041\\u0050\\u0049_\\u004b\\u0045\\u0059\": \"fullyescaped-secret\"}\n",
+                &["fullyescaped-secret"],
             ),
         ];
         let mut leaks = Vec::new();

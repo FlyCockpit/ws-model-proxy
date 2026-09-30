@@ -1400,21 +1400,24 @@ fn a_large_file_tail_marks_lines_cut_by_the_output_cap_and_refuses_an_unscannabl
         r.text.get(..80).unwrap_or(&r.text)
     );
     assert!(r.text.contains("tail line 49"), "the newest line is kept");
-    // three 12 MiB lines: the raw tail is beyond the scan bound
+    // four 12 MiB lines: the raw tail of four lines is beyond the 32 MiB scan bound
+    // (the message names that bound, so it is not the output cap that fired)
     let path = fx.root.join("unscannable.log");
     let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
     for _ in 0..68 {
         file.write_all(block.as_bytes()).unwrap();
     }
-    for _ in 0..3 {
+    for _ in 0..4 {
         file.write_all("w".repeat(12 << 20).as_bytes()).unwrap();
         file.write_all(b"\n").unwrap();
     }
     file.flush().unwrap();
     drop(file);
     let r = fx.ops.read(
-        &args(json!({ "path": fx.p("unscannable.log"), "startLine": -3 })),
+        &args(json!({ "path": fx.p("unscannable.log"), "startLine": -4 })),
         &fx.cancel,
     );
-    assert_eq!(code(r), ErrorCode::TooLarge);
+    let err = r.expect_err("the tail is beyond the scan bound");
+    assert_eq!(err.code, ErrorCode::TooLarge);
+    assert!(err.message.contains("scan bound"), "{}", err.message);
 }
