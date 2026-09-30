@@ -955,7 +955,7 @@ SELECT
 FROM discovered_model
 ON CONFLICT ("discoveredModelId") DO NOTHING;
 
--- Recover explicit target assignments (including detach) independently of limit source.
+-- Recover explicit target assignments to a capacity independently of limit source.
 -- Legacy forms sent the FK even on policy-only saves: require a proven before/after change.
 -- D holds graph tables exclusively; reruns only promote AUTO to OWNER.
 UPDATE execution_target target SET "capacityAssignmentSource" = 'OWNER'
@@ -966,7 +966,12 @@ UPDATE execution_target target SET "capacityAssignmentSource" = 'OWNER'
        AND jsonb_typeof(edit.before) = 'object' AND edit.before ? 'inferenceCapacityId'
        AND jsonb_typeof(edit.after) = 'object' AND edit.after ? 'inferenceCapacityId'
        AND edit.after ->> 'inferenceCapacityId'
-         IS DISTINCT FROM edit.before ->> 'inferenceCapacityId');
+         IS DISTINCT FROM edit.before ->> 'inferenceCapacityId'
+       -- Legacy forms recorded "Not attached" (null) on pool-member creates and the next
+       -- inventory re-attached the target, so a null after is never proof of a detach choice.
+       AND edit.after ->> 'inferenceCapacityId' IS NOT NULL
+       -- A stale audit whose destination is no longer the current FK proves nothing.
+       AND edit.after ->> 'inferenceCapacityId' = target."inferenceCapacityId");
 
 -- Give every pre-capacity execution target a conservative private identity.
 -- We cannot safely infer that two independently published targets share a

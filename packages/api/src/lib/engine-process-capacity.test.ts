@@ -475,7 +475,7 @@ describe("lifecycle transaction seams", () => {
       let deletedPage = false;
       vi.mocked(prisma.$executeRaw).mockImplementation(async (query) => {
         const sql = "sql" in query ? query.sql : query.join("");
-        if (!sql.includes("DELETE FROM inference_capacity")) return 0;
+        if (!/DELETE\s+FROM\s+inference_capacity/.test(sql)) return 0;
         const count = deletedPage ? 0 : 1;
         deletedPage = true;
         return count;

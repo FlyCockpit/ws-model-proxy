@@ -711,7 +711,8 @@ integration("engine process capacity lifecycle", () => {
   // OWNER/context/aggregate rows discriminate the reviewed implementation;
   // unknown context and UNLIMITED rows are controls for established semantics.
   it.each([
-    { choice: "detach", ownerChange: true },
+    { choice: "detach", ownerChange: false },
+    { choice: "stale-after", ownerChange: false },
     { choice: "auto", ownerChange: true },
     { choice: "same-auto", ownerChange: false },
     { choice: "priority-only", ownerChange: false },
@@ -746,7 +747,9 @@ integration("engine process capacity lifecycle", () => {
             ? {}
             : { before: { inferenceCapacityId: a.inferenceCapacityId } }),
           after:
-            choice === "priority-only" ? { directPriority: 20 } : { inferenceCapacityId: chosen },
+            choice === "priority-only"
+              ? { directPriority: 20 }
+              : { inferenceCapacityId: choice === "stale-after" ? b.inferenceCapacityId : chosen },
         },
       });
       await fixture.executionTarget.update({
@@ -759,10 +762,10 @@ integration("engine process capacity lifecycle", () => {
         { env: { ...process.env, SCHEMA_HARDENING_FORCE: "1" } },
       );
       const recovered = await targets();
-      expect(recovered[0]).toMatchObject({
-        inferenceCapacityId: chosen,
-        capacityAssignmentSource: ownerChange ? "OWNER" : "AUTO",
-      });
+      // A legacy null is never an owner detach: the backfill re-attaches the target.
+      if (choice === "detach") expect(recovered[0]?.inferenceCapacityId).not.toBeNull();
+      else expect(recovered[0]?.inferenceCapacityId).toBe(chosen);
+      expect(recovered[0]?.capacityAssignmentSource).toBe(ownerChange ? "OWNER" : "AUTO");
       expect(recovered[1]).toMatchObject({
         inferenceCapacityId: b.inferenceCapacityId,
         capacityAssignmentSource: "AUTO",
