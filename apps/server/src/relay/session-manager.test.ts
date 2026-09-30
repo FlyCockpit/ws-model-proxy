@@ -1,6 +1,6 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
 import {
   encodeRelayBinaryFrame,
@@ -96,6 +96,13 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(now);
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function capabilities26(features?: {
   humanTerminal?: boolean;
@@ -635,6 +642,7 @@ describe("RelaySessionManager", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    vi.setSystemTime(now);
     seedRegistrationMocks();
   });
 
@@ -1349,6 +1357,7 @@ describe("relay terminal and exec sessions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    vi.setSystemTime(now);
     seedRegistrationMocks();
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",
@@ -1376,17 +1385,23 @@ describe("relay terminal and exec sessions", () => {
       cli: { capabilities: { features: Record<string, unknown> } };
     };
     frame.cli.capabilities.features.allowFileToolsAsRoot = true;
+    frame.cli.capabilities.features.mcpFileRead = true;
+    frame.cli.capabilities.features.fileRootsConfigured = true;
     await register(manager, socket, JSON.stringify(frame));
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
-        update: expect.objectContaining({ reportedAllowFileToolsAsRoot: true }),
+        update: expect.objectContaining({
+          reportedAllowFileToolsAsRoot: true,
+          reportedMcpFileRead: true,
+          reportedFileRoots: true,
+        }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
       protocolVersion: "2.8",
       fileOps: true,
-      mcpFileRead: false,
-      fileRootsConfigured: false,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
       allowFileToolsAsRoot: true,
     });
   });
@@ -1402,7 +1417,14 @@ describe("relay terminal and exec sessions", () => {
       { type: "file.rejected", opId: id16(9), reason: "conflict" },
       { type: "file.result", opId: id16(9), op: "mkdir", result: { created: true } },
       { type: "file.result", opId: id16(9), op: "mkdir", result: { leak: 1 } },
-      { type: "file.op", opId: id16(9), op: "read", args: { path: "~/a" } },
+      {
+        type: "file.op",
+        mode: "unsupervised",
+        readGrant: false,
+        opId: id16(9),
+        op: "read",
+        args: { path: "~/a" },
+      },
       { type: "file.cancel", opId: id16(9) },
     ]) {
       await manager.handleTextFrame(socket, JSON.stringify(frame), now);
@@ -1764,6 +1786,7 @@ describe("relay terminal and exec sessions", () => {
     });
 
     manager.applyFeatureGrants("cli-device-id", {
+      mcpFileRead: false,
       allowHumanTerminal: false,
       mcpCommandMode: "off",
     });
@@ -1889,6 +1912,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    vi.setSystemTime(now);
     seedRegistrationMocks();
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",

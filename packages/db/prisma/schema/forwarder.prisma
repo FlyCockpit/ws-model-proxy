@@ -326,10 +326,13 @@ model CliDevice {
   /// Server grants. Hello must not overwrite these; the dashboard does.
   allowHumanTerminal           Boolean               @default(false)
   mcpCommandMode               McpCommandMode        @default(OFF)
+  mcpFileRead                  Boolean               @default(false)
   cliVersion                   String?
   relayProtocolVersion         String?
   /// Null until a 2.4 hello reports the CLI's own config. False is a report.
   reportedHumanTerminal        Boolean?
+  reportedMcpFileRead          Boolean?
+  reportedFileRoots            Boolean?
   reportedMcpCommandMode       McpCommandMode?
   reportedTerminalApproval     Boolean?
   reportedTerminalSupported    Boolean?

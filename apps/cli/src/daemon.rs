@@ -853,8 +853,12 @@ fn run_relay_session(
             let _ = tx.send(FromWorker::FileFrames { op_id, frames });
         });
         crate::file_relay::FileRelay::new(
-            crate::file_relay::shared_runtime(startup.allow_file_tools_as_root()),
+            crate::file_relay::shared_runtime(
+                startup.allow_file_tools_as_root(),
+                startup.file_roots(),
+            ),
             startup.mcp_command_mode(),
+            startup.mcp_file_read(),
             sink,
         )
     };
@@ -1881,12 +1885,23 @@ where
             op,
             args,
             body_bytes,
+            mode,
+            read_grant,
         } => {
             #[cfg(unix)]
-            send_file_frames(socket, files.handle_op(&op_id, &op, args, body_bytes))?;
+            send_file_frames(
+                socket,
+                files.handle_op(
+                    &op_id,
+                    &op,
+                    args,
+                    body_bytes,
+                    crate::file_relay::FilePermission { mode, read_grant },
+                ),
+            )?;
             #[cfg(not(unix))]
             {
-                let _ = (&op, &args, &body_bytes);
+                let _ = (&op, &args, &body_bytes, mode, read_grant);
                 send_control(
                     socket,
                     &ClientControlMessage::FileRejected {

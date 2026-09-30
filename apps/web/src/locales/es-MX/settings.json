@@ -114,7 +114,9 @@
         "unsupported": "rechazado, este CLI no tiene compatibilidad con terminal",
         "grant_supervised_only": "rechazado, requiere Sin supervisión (el permiso del panel es Supervisado)",
         "cli_supervised_only": "rechazado, requiere Sin supervisión (la configuración propia del CLI es Supervisado)"
-      }
+      },
+      "allowCliFileRead": "Permitir leer archivos en las CLI",
+      "allowCliFileReadHelp": "Permite las cuatro herramientas de solo lectura con acceso de lectura. Cada CLI también requiere acceso por el modo de comandos o los permisos de lectura del panel y locales con directorios configurados."
     }
   },
   "profile": {

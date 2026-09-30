@@ -328,6 +328,8 @@ pub struct TerminalFeatureSnapshot {
     pub require_terminal_approval: bool,
     /// `allowFileToolsAsRoot` from config (2.8).
     pub allow_file_tools_as_root: bool,
+    pub mcp_file_read: bool,
+    pub file_roots_configured: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
     /// The persistent identity key and its signature over the ECDH key above.
@@ -345,9 +347,9 @@ pub struct CliReportedFeatures {
     /// 2.7: whether this CLI accepts remotely defined metric sources
     /// (`metrics.sources.set`). Always false until the local opt-in exists.
     pub remote_metric_sources: bool,
-    /// 2.8: the CLI's read-only file grant. Always false until the grant ships (P4).
+    /// 2.8: the CLI's read-only file grant. From the startup config.
     pub mcp_file_read: bool,
-    /// 2.8: `fileRoots` are configured. Always false until P4.
+    /// 2.8: `fileRoots` are configured. All configured roots were usable at startup.
     pub file_roots_configured: bool,
     /// 2.8: `allowFileToolsAsRoot` (config-backed, default false).
     pub allow_file_tools_as_root: bool,
@@ -406,8 +408,8 @@ impl CliCapabilities {
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
                 remote_metric_sources: false,
-                mcp_file_read: false,
-                file_roots_configured: false,
+                mcp_file_read: snapshot.mcp_file_read,
+                file_roots_configured: snapshot.file_roots_configured,
                 allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
@@ -961,6 +963,8 @@ enum KnownServerControlMessage {
         args: Value,
         #[serde(default)]
         body_bytes: Option<usize>,
+        mode: McpCommandMode,
+        read_grant: bool,
     },
     #[serde(rename = "file.cancel")]
     FileCancel { op_id: String },
@@ -1094,6 +1098,8 @@ pub enum ServerControlMessage {
         op: String,
         args: Value,
         body_bytes: Option<usize>,
+        mode: McpCommandMode,
+        read_grant: bool,
     },
     /// 2.8: cancel a pending file op.
     FileCancel {
@@ -1666,11 +1672,15 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 op,
                 args,
                 body_bytes,
+                mode,
+                read_grant,
             } => Self::FileOp {
                 op_id,
                 op,
                 args,
                 body_bytes,
+                mode,
+                read_grant,
             },
             KnownServerControlMessage::FileCancel { op_id } => Self::FileCancel { op_id },
         }
@@ -2129,6 +2139,8 @@ mod tests {
                 mcp_command_mode: McpCommandMode::Off,
                 require_terminal_approval: false,
                 allow_file_tools_as_root: false,
+                mcp_file_read: false,
+                file_roots_configured: false,
                 terminal_public_key_b64url: "AQID".to_string(),
                 terminal_identity: None,
             }),
@@ -2152,6 +2164,8 @@ mod tests {
                     mcp_command_mode: McpCommandMode::Supervised,
                     require_terminal_approval: false,
                     allow_file_tools_as_root: false,
+                    mcp_file_read: false,
+                    file_roots_configured: false,
                     terminal_public_key_b64url: "AQID".to_string(),
                     terminal_identity: Some(TerminalIdentityProof {
                         public_key: "BAQE".to_string(),
@@ -2860,6 +2874,8 @@ mod relay_27_vectors {
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
             allow_file_tools_as_root: false,
+            mcp_file_read: false,
+            file_roots_configured: false,
             terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
             terminal_identity: None,
         });
@@ -3255,12 +3271,16 @@ mod relay_28_vectors {
                 op: decoded_op,
                 args,
                 body_bytes,
+                mode,
+                read_grant,
             } = parse_server_control(&text_of(&name)).expect("parse")
             else {
                 panic!("{name} is not a file.op");
             };
             assert_eq!(op_id, str_field(&frame, "opId"), "{name}");
             assert_eq!(decoded_op, op, "{name}");
+            assert_eq!(mode, McpCommandMode::Unsupervised);
+            assert!(!read_grant);
             assert_eq!(args, frame["args"], "{name}");
             assert_eq!(
                 body_bytes,
@@ -3270,6 +3290,45 @@ mod relay_28_vectors {
             );
             assert_eq!(body_bytes.is_some(), op == "write", "{name}");
         }
+    }
+
+    #[test]
+    fn file_permission_frame_requires_explicit_valid_consent() {
+        let valid = vector("file-op-read");
+        for field in ["mode", "readGrant"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().expect("object").remove(field);
+            assert!(
+                parse_server_control(&missing.to_string()).is_err(),
+                "{field}"
+            );
+        }
+        for (field, bad) in [
+            ("mode", json!("on")),
+            ("mode", Value::Null),
+            ("mode", json!({"mode":"off"})),
+            ("readGrant", json!("true")),
+            ("readGrant", Value::Null),
+            ("readGrant", json!(1)),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[field] = bad;
+            assert!(
+                parse_server_control(&malformed.to_string()).is_err(),
+                "{field}"
+            );
+        }
+        let mut granted = valid;
+        granted["mode"] = json!("off");
+        granted["readGrant"] = json!(true);
+        assert!(matches!(
+            parse_server_control(&granted.to_string()).expect("grant"),
+            ServerControlMessage::FileOp {
+                mode: McpCommandMode::Off,
+                read_grant: true,
+                ..
+            }
+        ));
     }
 
     #[test]

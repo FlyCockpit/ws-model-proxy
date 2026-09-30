@@ -10,5 +10,7 @@
     "byteOffset": 0,
     "lineNumbers": true,
     "ifNoneMatch": "h:AAAAAAAAAAAAAAAAAAAAAA"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

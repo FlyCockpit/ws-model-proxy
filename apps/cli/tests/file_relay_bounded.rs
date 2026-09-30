@@ -117,7 +117,7 @@ fn slow_file_ops_never_stall_the_relay_loop() {
     let sink: FileSink = Arc::new(move |id, frames| {
         let _ = tx.lock().expect("tx").send((id, frames));
     });
-    let mut relay = FileRelay::new(runtime, McpCommandMode::Unsupervised, sink);
+    let mut relay = FileRelay::new(runtime, McpCommandMode::Unsupervised, false, sink);
 
     // A large file to hash for real: `stat` with `hash` reads all of it.
     let big = dir.path().join("big.bin");
@@ -133,6 +133,10 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "read",
             json!({ "path": path.display().to_string() }),
             None,
+            wsmp::file_relay::FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
         );
         assert!(frames.is_empty());
         let (id, frames) = rx
@@ -160,7 +164,16 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "expectedEtag": etags[n],
         });
         let frames = timed(&mut spinner, &mut slowest_call, &mut || {
-            relay.handle_op(&id, "write", args.clone(), Some(3))
+            relay.handle_op(
+                &id,
+                "write",
+                args.clone(),
+                Some(3),
+                wsmp::file_relay::FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false,
+                },
+            )
         });
         assert!(frames.is_empty());
         let frames = timed(&mut spinner, &mut slowest_call, &mut || {
@@ -175,6 +188,10 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "stat",
             json!({ "paths": [big.display().to_string()], "hash": true }),
             None,
+            wsmp::file_relay::FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
         )
     });
     assert_eq!(control(&refused)["reason"], "limit");
@@ -195,6 +212,10 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "stat",
             json!({ "paths": [big.display().to_string()], "hash": true }),
             None,
+            wsmp::file_relay::FilePermission {
+                mode: McpCommandMode::Unsupervised,
+                read_grant: false,
+            },
         )
     });
     assert!(frames.is_empty());

@@ -80,7 +80,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.renameCliDevice` | `forwarder_cli_device_rename` | write | — | pure | — | — | — |
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
+| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |

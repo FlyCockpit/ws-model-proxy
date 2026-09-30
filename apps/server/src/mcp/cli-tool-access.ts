@@ -1,4 +1,4 @@
-import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
+import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 
 /**
  * Admission credential for one verified /mcp request.
@@ -11,6 +11,8 @@ export type McpRequestCredential =
       kind: "pat";
       tokenId: string;
       allowCliCommands: boolean;
+      allowCliFileRead: boolean;
+      scopes: readonly string[];
       expiresAt: Date | null;
     }
   | { kind: "oauth" };
@@ -47,14 +49,7 @@ export function isCliTool(name: string): boolean {
   return CLI_TOOL_CAPABILITIES.has(name);
 }
 
-/**
- * CLI tools are visible and callable only for a personal token that was
- * minted with `allowCliCommands`. OAuth, and PATs without the flag, are
- * denied; a missing credential (older bindings) is treated as OAuth. File
- * tools additionally need the literal `mcp:write` scope in this phase
- * (a read-only PAT path arrives with the read grant). `scopes` is the
- * request's granted scopes; command tools ignore it, as before.
- */
+/** PAT-only capability consent, shared by listing, calls, core and admission. */
 export function cliToolAllowed(
   name: string,
   credential: McpRequestCredential | undefined,
@@ -62,7 +57,6 @@ export function cliToolAllowed(
 ): boolean {
   const capability = CLI_TOOL_CAPABILITIES.get(name);
   if (capability === undefined) return false;
-  if (credential?.kind !== "pat" || credential.allowCliCommands !== true) return false;
-  if (capability === "command") return true;
-  return mcpScopesAllow(scopes ?? [], "write");
+  if (credential?.kind !== "pat") return false;
+  return cliTokenAllows({ ...credential, scopes: scopes ?? [] }, capability);
 }

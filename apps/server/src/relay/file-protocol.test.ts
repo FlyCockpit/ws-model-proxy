@@ -131,7 +131,14 @@ describe("relay 2.8 file frames: server to CLI", () => {
       ["delete", { path: "~/a", expectedEtag: "" }],
     ];
     for (const [op, args] of bad) {
-      const frame: Record<string, unknown> = { type: "file.op", opId: OP_ID, op, args };
+      const frame: Record<string, unknown> = {
+        type: "file.op",
+        mode: "unsupervised",
+        readGrant: false,
+        opId: OP_ID,
+        op,
+        args,
+      };
       if (op === "write") frame.bodyBytes = 1;
       expect(
         () => fileOpFrameSchema.parse(frame),
@@ -315,5 +322,30 @@ describe("relay 2.8 supervised-file schema (answered unsupported until P5)", () 
     expect(names).toEqual(
       expect.arrayContaining(["file-cancel.json", "file-rejected-conflict.json"]),
     );
+  });
+});
+
+describe("file permission frame inputs", () => {
+  it("requires explicit mode and grant intent and rejects malformed values", () => {
+    const valid = vector("file-op-read");
+    for (const field of ["mode", "readGrant"]) {
+      const absent = { ...valid };
+      delete absent[field];
+      expect(() => fileOpFrameSchema.parse(absent)).toThrow();
+    }
+    for (const patch of [
+      { mode: "on" },
+      { mode: null },
+      { mode: { mode: "unsupervised" } },
+      { readGrant: "true" },
+      { readGrant: null },
+      { readGrant: 1 },
+    ]) {
+      expect(() => fileOpFrameSchema.parse({ ...valid, ...patch })).toThrow();
+    }
+    expect(fileOpFrameSchema.parse({ ...valid, mode: "off", readGrant: true })).toMatchObject({
+      mode: "off",
+      readGrant: true,
+    });
   });
 });

@@ -192,6 +192,8 @@ function bindRequest(
         kind: "pat";
         tokenId: string;
         allowCliCommands: boolean;
+        allowCliFileRead: boolean;
+        scopes: readonly string[];
         expiresAt: Date | null;
       },
 ) {
@@ -1244,6 +1246,8 @@ const PAT_WITH_CLI = {
   kind: "pat" as const,
   tokenId: "token-pat-1",
   allowCliCommands: true,
+  allowCliFileRead: false,
+  scopes: ["mcp:read", "mcp:write"],
   expiresAt: PAT_EXPIRES,
 };
 const PAT_WITHOUT_CLI = { ...PAT_WITH_CLI, allowCliCommands: false };
@@ -1254,6 +1258,8 @@ type ListedCredential =
       kind: "pat";
       tokenId: string;
       allowCliCommands: boolean;
+      allowCliFileRead: boolean;
+      scopes: readonly string[];
       expiresAt: Date | null;
     }
   | { kind: "oauth" };
@@ -1427,7 +1433,7 @@ describe("CLI command tools", () => {
       args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
     });
     expect(result.isError).toBe(true);
-    expect(resultText(result)).toContain("mcp:write");
+    expect(resultText(result)).toBe("Tool forwarder_cli_command_run not found");
     expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
   });
 
@@ -1761,7 +1767,7 @@ describe("CLI command tools", () => {
         args: startArgs,
       });
       expect(readOnly.isError).toBe(true);
-      expect(resultText(readOnly)).toContain("mcp:write");
+      expect(resultText(readOnly)).toBe("Tool forwarder_cli_supervised_command_start not found");
       expect(cliRuntime.startSupervisedCommand).not.toHaveBeenCalled();
     });
 
@@ -2044,6 +2050,66 @@ describe("CLI file tools", () => {
     // A flagged PAT that only holds mcp:read does not get the file tools in this phase.
     const readOnly = (await listedTools(PAT_WITH_CLI, ["mcp:read"])).map((tool) => tool.name);
     for (const name of CLI_FILE_TOOL_NAMES) expect(readOnly).not.toContain(name);
+  });
+
+  it("read-only PAT consent exposes and calls exactly four read file tools; every write/command remains unknown", async () => {
+    const credential = {
+      ...PAT_WITH_CLI,
+      allowCliCommands: false,
+      allowCliFileRead: true,
+      scopes: ["mcp:read"],
+    };
+    const names = (await listedTools(credential, ["mcp:read"]))
+      .map((tool) => tool.name)
+      .filter(
+        (name) =>
+          CLI_FILE_TOOL_NAMES.some((file) => file === name) ||
+          [
+            "forwarder_cli_command_run",
+            "forwarder_cli_supervised_command_start",
+            "forwarder_cli_command_result",
+          ].includes(name),
+      );
+    expect(names.sort()).toEqual(
+      [
+        "forwarder_cli_file_read",
+        "forwarder_cli_file_stat",
+        "forwarder_cli_dir_list",
+        "forwarder_cli_file_search",
+      ].sort(),
+    );
+    fileRuntime.runFileOp.mockResolvedValue({ ok: true, op: "read", result: READ_RESULT });
+    const read = await call(
+      "forwarder_cli_file_read",
+      { cliDeviceId: "cli-1", path: "~/a" },
+      { credential, scopes: ["mcp:read"] },
+    );
+    expect(read.isError).not.toBe(true);
+    expect(fileRuntime.runFileOp).toHaveBeenCalledOnce();
+    for (const name of [
+      ...CLI_FILE_TOOL_NAMES.slice(4),
+      "forwarder_cli_command_run",
+      "forwarder_cli_supervised_command_start",
+      "forwarder_cli_command_result",
+    ]) {
+      const result = await call(
+        name,
+        { cliDeviceId: "cli-1", path: "~/a", confirm: "RUN" },
+        { credential, scopes: ["mcp:read"] },
+      );
+      expect(resultText(result)).toBe(`Tool ${name} not found`);
+    }
+    expect(fileRuntime.runFileOp).toHaveBeenCalledOnce();
+    for (const flags of [
+      { allowCliCommands: false, allowCliFileRead: false, scopes: ["mcp:read"] },
+      { allowCliCommands: false, allowCliFileRead: true, scopes: [] },
+      { allowCliCommands: true, allowCliFileRead: false, scopes: ["mcp:read"] },
+    ]) {
+      const tools = await listedTools({ ...PAT_WITH_CLI, ...flags }, flags.scopes);
+      expect(
+        tools.filter((tool) => CLI_FILE_TOOL_NAMES.some((name) => name === tool.name)),
+      ).toEqual([]);
+    }
   });
 
   it("answers an unknown-tool error at call time to OAuth, a PAT without the flag, and a read-only PAT", async () => {

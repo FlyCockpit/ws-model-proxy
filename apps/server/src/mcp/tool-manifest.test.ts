@@ -409,6 +409,11 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     ]) {
       expect(excluded.has(required)).toBe(true);
     }
+    expect(
+      MCP_TOOL_MANIFEST.some(
+        (tool) => tool.target === "forwarderManagement.setCliDeviceFeatureGrants",
+      ),
+    ).toBe(false);
     // The profile-slug trio (forwarderManagement) is excluded, not exposed.
     for (const slugProc of [
       "forwarderManagement.getProfileSlug",

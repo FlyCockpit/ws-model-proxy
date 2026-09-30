@@ -4962,6 +4962,55 @@ describe("setCliDeviceFeatureGrants", () => {
     });
   });
 
+  it.each([
+    { reportedMcpFileRead: false, reportedFileRoots: true },
+    { reportedMcpFileRead: null, reportedFileRoots: true },
+    { reportedMcpFileRead: true, reportedFileRoots: false },
+    { reportedMcpFileRead: true, reportedFileRoots: null },
+    {},
+  ])("read grant refuses incomplete reports %j", async (reported) => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow(reported));
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("read grant is a human-only opt-in; complete reports enable it and missing reports still allow revocation", async () => {
+    const hook = vi.fn();
+    db.cliDevice.findUnique.mockResolvedValue(
+      deviceRow({ reportedMcpFileRead: true, reportedFileRoots: true }),
+    );
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: true,
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        fileRead: true,
+      }),
+    ).resolves.toMatchObject({ fileRead: true });
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { mcpFileRead: true } }),
+    );
+    expect(hook).toHaveBeenCalledWith("cli-id");
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+    await grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: false });
+    expect(db.cliDevice.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ data: { mcpFileRead: false } }),
+    );
+    const humanOnly = createRouterClient(forwarderManagementRouter, { context: { session: null } });
+    await expect(
+      humanOnly.setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: true }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("uses the same not-found error for an unknown device and another user's device", async () => {
     db.cliDevice.findUnique
       .mockResolvedValueOnce(null)
@@ -5121,6 +5170,58 @@ describe("setCliDeviceFeatureGrants", () => {
       }),
     ).rejects.toBeInstanceOf(ORPCError);
     expect(hook).not.toHaveBeenCalled();
+  });
+
+  it("summarizes granted reads using live consent only, and preserves the reported fields", async () => {
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        id: "cli-id",
+        slug: "desk",
+        mcpCommandMode: "OFF",
+        mcpFileRead: true,
+        reportedMcpFileRead: true,
+        reportedFileRoots: true,
+        User: { slug: "owner" },
+        Endpoints: [],
+      },
+    ]);
+    const live = {
+      protocolVersion: "2.8",
+      cliVersion: "0.4.0",
+      humanTerminal: false,
+      mcpCommandMode: "off",
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+    } as const;
+    for (const snapshot of [
+      live,
+      { ...live, mcpFileRead: false },
+      { ...live, fileRootsConfigured: false },
+      null,
+    ]) {
+      const client = createRouterClient(forwarderManagementRouter, {
+        context: {
+          ...buildContext(),
+          services: { getLiveCliFeatures: () => new Map(snapshot ? [["cli-id", snapshot]] : []) },
+        },
+      });
+      const rows = await client.listCliDevices();
+      expect(rows[0]?.fileTools).toEqual({
+        read: snapshot?.mcpFileRead && snapshot.fileRootsConfigured ? "headless" : "off",
+        write: "off",
+      });
+      expect(rows[0]).toMatchObject({
+        mcpFileRead: true,
+        reportedMcpFileRead: true,
+        reportedFileRoots: true,
+      });
+    }
   });
 
   it("reports terminal and command features from the live snapshot and stored columns", async () => {

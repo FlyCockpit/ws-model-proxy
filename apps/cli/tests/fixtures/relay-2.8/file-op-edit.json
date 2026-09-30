@@ -20,5 +20,7 @@
     "dryRun": false,
     "returnDiff": true,
     "reason": "raise context"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

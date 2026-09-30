@@ -84,8 +84,8 @@ export interface McpToolRunDeps {
    */
   signal?: AbortSignal;
   /**
-   * Admission credential. OAuth and PATs without `allowCliCommands` cannot
-   * run the CLI command tools. Missing bindings are treated as OAuth.
+   * Admission credential. CLI tools require capability-specific PAT consent
+   * and scopes. OAuth and missing bindings are always refused.
    */
   credential: McpRequestCredential;
 }
@@ -462,7 +462,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A token also needs mcp:write and allowCliCommands.",
+      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },
   {
@@ -1422,7 +1422,8 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   },
   {
     target: "forwarderManagement.setCliDeviceFeatureGrants",
-    reason: "human-only device grant",
+    reason:
+      "Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports.",
   },
   {
     target: "supervisedCommands.pending",

@@ -25,6 +25,7 @@ import {
   type FeatureSwitchReason,
   featureReasonKey,
   featureSwitchState,
+  fileReadSwitchState,
   MCP_COMMAND_MODES,
   type McpCommandMode,
   readCliDeviceFeatures,
@@ -34,6 +35,7 @@ import { orpc } from "@/utils/orpc";
 
 type OptimisticGrants = {
   terminal?: boolean;
+  fileRead?: boolean;
   commands?: McpCommandMode;
 };
 
@@ -212,6 +214,9 @@ function CommandModeControl({
           {t(featureReasonKey(firstReason))}
         </p>
       ) : null}
+      <p className="mt-1 text-xs text-muted-foreground">
+        {t("dashboard:clis.features.fileToolsFollowMode")}
+      </p>
       <EffectiveCommandMode feature={feature} />
     </fieldset>
   );
@@ -250,6 +255,7 @@ export function CliDeviceFeatureSwitches({
   });
   const terminalFeature = features.features.terminal;
   const commandFeature = features.features.commands;
+  const fileReadGate = fileReadSwitchState(features);
   const terminalGate = featureSwitchState(terminalFeature, "terminal");
   const commandMode = optimistic.commands ?? commandFeature.mode;
   const setCommandMode = (mode: McpCommandMode) => {
@@ -290,6 +296,18 @@ export function CliDeviceFeatureSwitches({
           }}
         />
       </div>
+      <FeatureSwitch
+        id={`${baseId}-file-read`}
+        label={t("dashboard:clis.features.fileRead")}
+        checked={optimistic.fileRead ?? features.mcpFileRead}
+        disabled={fileReadGate.disabled}
+        pending={grants.isPending}
+        reason={fileReadGate.reason}
+        onCheckedChange={(checked) => {
+          setOptimistic((current) => ({ ...current, fileRead: checked }));
+          grants.mutate({ cliDeviceId, fileRead: checked });
+        }}
+      />
       <AlertDialog open={confirmUnsupervised} onOpenChange={setConfirmUnsupervised}>
         <AlertDialogContent className="max-w-[calc(100%-2rem)]! sm:max-w-md! data-[size=default]:max-w-[calc(100%-2rem)]! data-[size=default]:sm:max-w-md! data-[size=sm]:max-w-[calc(100%-2rem)]! data-[size=sm]:sm:max-w-md!">
           <AlertDialogHeader>

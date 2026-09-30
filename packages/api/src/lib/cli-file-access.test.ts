@@ -1,8 +1,41 @@
 import { describe, expect, it } from "vitest";
 import { fileAccessRefusal, fileToolAccess, fileToolsSummary } from "./cli-file-access";
+import { cliTokenAllows } from "./cli-token-capability";
 import { lowestMcpCommandMode } from "./mcp-command-mode";
 
 describe("file tool permission matrix", () => {
+  const matrix = [];
+  for (const mode of ["off", "supervised", "unsupervised"] as const)
+    for (const server of [false, true])
+      for (const live of [false, true])
+        for (const roots of [false, true])
+          for (const opClass of ["read", "write"] as const) {
+            const expected =
+              mode === "unsupervised" || (opClass === "read" && server && live && roots)
+                ? "headless"
+                : mode === "supervised"
+                  ? "supervised"
+                  : "off";
+            matrix.push({ mode, server, live, roots, opClass, expected });
+          }
+  it.each(matrix)(
+    "$mode $opClass server=$server live=$live roots=$roots -> $expected",
+    ({ mode, server, live, roots, opClass, expected }) => {
+      const grant = { server, live, roots };
+      const access = fileToolAccess(mode, opClass, grant);
+      expect(access).toBe(expected);
+      expect(fileToolsSummary(mode, grant)[opClass]).toBe(expected);
+      if (access !== "headless") {
+        expect(fileAccessRefusal(access, "grant")).toBe(
+          mode === "supervised" ? "supervised_only" : "grant_disabled",
+        );
+        expect(fileAccessRefusal(access, "live")).toBe(
+          mode === "supervised" ? "supervised_only" : "feature_disabled",
+        );
+      }
+    },
+  );
+
   it("runs everything headless only on an unsupervised node", () => {
     for (const opClass of ["read", "write"] as const) {
       expect(fileToolAccess("unsupervised", opClass)).toBe("headless");
@@ -31,4 +64,15 @@ describe("file tool permission matrix", () => {
     expect(fileAccessRefusal("supervised", "grant")).toBe("supervised_only");
     expect(fileAccessRefusal("supervised", "live")).toBe("supervised_only");
   });
+});
+
+it("missing PAT flags or scopes never authorize a CLI capability", () => {
+  for (const capability of ["command", "file_read", "file_write"] as const) {
+    expect(cliTokenAllows({}, capability)).toBe(false);
+    expect(cliTokenAllows({ allowCliCommands: true, allowCliFileRead: true }, capability)).toBe(
+      false,
+    );
+    expect(cliTokenAllows({ scopes: ["mcp:read", "mcp:write"] }, capability)).toBe(false);
+  }
+  expect(cliTokenAllows({ allowCliFileRead: true, scopes: ["mcp:read"] }, "file_read")).toBe(true);
 });

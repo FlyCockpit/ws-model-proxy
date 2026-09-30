@@ -1,6 +1,10 @@
 import { randomBytes } from "node:crypto";
 import type { FileOpClass } from "@ws-model-proxy/api/lib/cli-file-access";
 import {
+  lowestMcpCommandMode,
+  mcpCommandModeFromDb,
+} from "@ws-model-proxy/api/lib/mcp-command-mode";
+import {
   type CliAgentAdmissionRejection,
   judgeCliAgentAdmission,
   readCliAgentAdmission,
@@ -310,6 +314,14 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
   }
   const parsed = fileOpFrameSchema.safeParse({
     type: "file.op",
+    mode: lowestMcpCommandMode(
+      mcpCommandModeFromDb(verdict.device.mcpCommandMode),
+      verdict.live.mcpCommandMode,
+    ),
+    readGrant:
+      verdict.device.mcpFileRead === true &&
+      verdict.live.mcpFileRead === true &&
+      verdict.live.fileRootsConfigured === true,
     opId,
     op: input.op,
     args: input.args,

@@ -1,3 +1,4 @@
+import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import {
   type CliCommandSnapshot,
   snapshotCliCommand,
@@ -99,7 +100,7 @@ function requireCliPat(credential: McpRequestCredential): {
   tokenId: string;
   expiresAt: Date | null;
 } {
-  if (credential.kind === "pat" && credential.allowCliCommands === true) {
+  if (credential.kind === "pat" && cliTokenAllows(credential, "command")) {
     return { tokenId: credential.tokenId, expiresAt: credential.expiresAt };
   }
   throw new McpCliCommandRejectedError("not_found");

@@ -1,6 +1,6 @@
 //! `wsmp config` commands.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -37,6 +37,19 @@ enum Sub {
     /// each command in a browser terminal), or `unsupervised` (headless exec
     /// too). Takes effect the next time wsmp starts.
     SetMcpCommands { mode: McpMode },
+    /// Opt in to headless read-only file access with the dashboard grant.
+    /// Requires explicit file roots. Restart wsmp to apply.
+    SetFileRead { state: Switch },
+    /// Confine every file tool to these directories. Suggested roots (never
+    /// applied automatically): ~/models, ~/deploy, ~/.config/llama-swap,
+    /// ~/.local/state/wsmp/logs. Restart wsmp to apply.
+    SetFileRoots {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+    },
+    /// Clear the file allowlist; headless reads outside unsupervised then refuse.
+    /// Restart wsmp to apply.
+    ClearFileRoots,
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
     /// Let the MCP node file tools run when wsmp itself runs as root (they
@@ -98,10 +111,13 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::Show => {
             let cfg = Config::load_required()?;
+            let mut shown = serde_json::to_value(&cfg)?;
+            shown["mcpFileRead"] = cfg.mcp_file_read.into();
+            shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
             if args.json {
-                output::json(&cfg)?;
+                output::json(&shown)?;
             } else {
-                output::text(serde_json::to_string_pretty(&cfg)?)?;
+                output::text(serde_json::to_string_pretty(&shown)?)?;
                 output::line("")?;
             }
         }
@@ -159,6 +175,34 @@ pub fn run(args: &Args) -> Result<()> {
                     )?;
                 }
                 output::line("Restart wsmp to apply.")?;
+            }
+        }
+        Sub::SetFileRead { state } => {
+            set_flag(args.json, "mcpFileRead", state.enabled(), |cfg| {
+                cfg.mcp_file_read = state.enabled()
+            })?;
+        }
+        Sub::SetFileRoots { paths } => {
+            let roots = crate::config::validate_file_roots(paths, dirs::home_dir().as_deref())?;
+            Config::update(false, |cfg| {
+                cfg.file_roots = roots.clone();
+                Ok(())
+            })?;
+            if args.json {
+                output::json(&serde_json::json!({"key":"fileRoots", "value":roots}))?;
+            } else {
+                output::line("set `fileRoots`; restart wsmp to apply")?;
+            }
+        }
+        Sub::ClearFileRoots => {
+            Config::update(false, |cfg| {
+                cfg.file_roots.clear();
+                Ok(())
+            })?;
+            if args.json {
+                output::json(&serde_json::json!({"key":"fileRoots", "value":[]}))?;
+            } else {
+                output::line("cleared `fileRoots`; restart wsmp to apply")?;
             }
         }
         Sub::SetTerminalApproval { state } => {

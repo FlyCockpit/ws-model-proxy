@@ -1644,6 +1644,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
       expiresAt: null,
       lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
       allowCliCommands: false,
+      allowCliFileRead: false,
       ...overrides,
     };
   }
@@ -1662,6 +1663,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
       expiresAt: null,
       lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
       allowCliCommands: false,
+      allowCliFileRead: false,
     }));
     const { handler, transport, quota, verified } = buildHandler({
       authenticatePersonalToken,
@@ -1680,8 +1682,26 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(verified[0]?.credential).toEqual({
       kind: "pat",
       tokenId: PAT_ID,
+      scopes: ["mcp:read"],
       allowCliCommands: false,
+      allowCliFileRead: false,
       expiresAt: null,
+    });
+  });
+
+  it("binds explicit read-only file consent and current scopes to the PAT credential", async () => {
+    const { handler, verified } = buildHandler({
+      authenticatePersonalToken: async () =>
+        patIdentity({ allowCliFileRead: true, allowCliCommands: false, scopes: ["mcp:read"] }),
+      prisma: buildPrisma({ grant: patGrant() }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(200);
+    expect(verified[0]?.credential).toMatchObject({
+      kind: "pat",
+      allowCliCommands: false,
+      allowCliFileRead: true,
+      scopes: ["mcp:read"],
     });
   });
 
@@ -1822,6 +1842,8 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(verified[0]?.credential).toEqual({
       kind: "pat",
       tokenId: PAT_ID,
+      scopes: ["mcp:read"],
+      allowCliFileRead: false,
       allowCliCommands: true,
       expiresAt,
     });

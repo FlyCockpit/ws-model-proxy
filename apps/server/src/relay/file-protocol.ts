@@ -211,7 +211,12 @@ const opId = z
   });
 
 /** The `file.op` frame body, strict per op. `bodyBytes` is present exactly for `write`. */
-const fileOpEnvelope = { type: z.literal("file.op"), opId } as const;
+const fileOpEnvelope = {
+  type: z.literal("file.op"),
+  opId,
+  mode: z.enum(["off", "supervised", "unsupervised"]),
+  readGrant: z.boolean(),
+} as const;
 export const fileOpFrameSchema = z.discriminatedUnion("op", [
   z.object({ ...fileOpEnvelope, op: z.literal("read"), args: readArgsSchema }).strict(),
   z.object({ ...fileOpEnvelope, op: z.literal("stat"), args: statArgsSchema }).strict(),

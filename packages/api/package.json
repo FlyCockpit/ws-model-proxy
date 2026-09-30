@@ -94,6 +94,9 @@
     },
     "./routers/index": {
       "default": "./src/routers/index.ts"
+    },
+    "./lib/cli-token-capability": {
+      "default": "./src/lib/cli-token-capability.ts"
     }
   },
   "scripts": {

@@ -427,6 +427,7 @@ model McpPersonalToken {
   secretDigest     String
   scopes           String[]
   allowCliCommands Boolean   @default(false)
+  allowCliFileRead Boolean   @default(false)
   lastUsedAt       DateTime?
   revokedAt        DateTime?
   expiresAt        DateTime?

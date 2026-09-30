@@ -11,5 +11,7 @@
     "returnDiff": false,
     "reason": "deploy"
   },
-  "bodyBytes": 812
+  "bodyBytes": 812,
+  "mode": "unsupervised",
+  "readGrant": false
 }

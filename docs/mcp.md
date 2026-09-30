@@ -35,34 +35,57 @@ it does not compose shell commands. Every result that touches a file carries an
 `etag`, results are bounded windows, and write-class calls take an optional `reason`
 (500 characters) that goes to the CLI log.
 
-**Who may call.** Like the CLI command tools, the file tools are visible and callable
-only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth
-is always denied and the tools are hidden from `tools/list`.
+**Who may call.** The four read tools accept a personal access token with either
+`allowCliCommands` + literal `mcp:write`, or `allowCliFileRead` + `mcp:read`.
+Write tools and command tools require `allowCliCommands` + literal `mcp:write`.
+OAuth never gets these tools. A read-grant-only PAT sees exactly the four read file
+tools; calling a hidden write or command tool returns unknown-tool. Token flags
+and scopes are reread at admission, and narrowing cancels pending operations.
 
-**Permission matrix.** What runs depends on the device's effective mode, the lowest of the
-dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live hello:
+**Permission matrix.** The effective mode is the lowest of the dashboard grant
+and the CLI's own `wsmp config set-mcp-commands` mode in its live hello.
+The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
+and live `fileRootsConfigured`; missing or stale features never authorize it.
 
-| Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
-| --- | --- | --- |
-| `unsupervised` | headless | headless |
-| `supervised` | refused `supervised_only` | refused `supervised_only` |
-| `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
+| Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
+| --- | --- | --- | --- | --- |
+| `unsupervised` | either | headless | headless |
+| `supervised` | on | headless | refused `supervised_only` |
+| `supervised` | off | refused `supervised_only` | refused `supervised_only` |
+| `off` | on | headless | refused `grant_disabled` / `feature_disabled` |
+| `off` | off | refused `grant_disabled` / `feature_disabled` | refused (same) |
 
-A supervised confirm screen for writes and an opt-in read-only grant are later phases;
-until then a supervised node refuses file tools. `listCliDevices` reports
-`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`, so
-an agent can see what works without trial calls. The CLI refuses every file tool as
-`unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
-The CLI re-checks its own mode on every operation; a server request never overrides it.
-The protected set (the wsmp state directory, `service.env`, `config.json` for writes,
-`/proc`, `/sys`, `/dev` and other special files) is refused as `path_denied`.
+Enable `wsmp config set-file-read on` and choose explicit directories with
+`wsmp config set-file-roots <path>…`, restart wsmp, then grant “Agents may read
+files (read-only)” on the dashboard. Suggested roots `~/models`, `~/deploy`,
+`~/.config/llama-swap`, `~/.local/state/wsmp/logs` are help text only and never
+applied automatically. Roots must be absolute existing directories after `~`
+expansion, UTF-8, distinct, and other than `/`. `clear-file-roots` clears them.
+Restart applies both switches. A broken root reports roots unavailable and
+retains a denying confinement policy, with no whole-filesystem fallback.
+When roots are set, every operation, including rename destinations and list/search,
+is confined on physical paths; symlinks and `..` cannot escape them. Linux also
+uses a safe `openat2` RESOLVE_BENEATH/RESOLVE_NO_MAGICLINKS second guard where
+supported. A concurrent local process that moves directories can still race a
+held fd after resolution; these tools do not confine arbitrary local processes.
+Without roots, unsupervised retains whole-filesystem access minus the protected set.
+
+`listCliDevices` reports `fileTools: {read, write}` (`headless`, `supervised`, `off`),
+`mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and `allowFileToolsAsRoot`.
+A supervised write confirm screen remains a later phase. For a supervised read
+without the grant, request `cat` via a supervised command or enable the grant.
+The CLI independently checks local mode, read switch, roots and UID at every op;
+a server request never overrides local consent. Root refuses `unsupported` unless
+`wsmp config set-file-tools-as-root on`. The protected wsmp state files,
+`service.env`, writes to `config.json`, and special trees remain inaccessible.
 
 **Masking boundary.** Only three things are masked in what the CLI returns: SSH private
 keys; environment-variable secrets (dotenv and env files such as `.env`, `*.env`, `.envrc`
 and `service.env`, plus secret-named `KEY=value` assignments in any file), shown as
 `KEY=⟦redacted:N⟧`; and the Hugging Face token file plus `--api-key` and `--hf-token`
 flag values. Masking happens before windowing, edits cannot target a masked span, and the
-etag is keyed. **On an `unsupervised` node masking is not a security boundary**: an agent
+etag is keyed. **On a read-grant-only node without exec, masking plus roots IS
+the security boundary.** **On an `unsupervised` node masking is not a security boundary**: an agent
 with command access can `cat .env`. It keeps those secrets out of transcripts on the
 normal path. Secret-class files are read-only masked views: every write, edit, rename,
 delete or mkdir that touches one, or its directory, is refused as `secret_file` (compared

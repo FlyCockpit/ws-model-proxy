@@ -7,5 +7,7 @@
     "parents": true,
     "mode": "0755",
     "reason": "setup"
-  }
+  },
+  "mode": "unsupervised",
+  "readGrant": false
 }

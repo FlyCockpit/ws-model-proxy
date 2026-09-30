@@ -133,6 +133,8 @@ export type ReportedRelayFeatures = {
   relayProtocolVersion: string;
   reportedHumanTerminal: boolean | null;
   reportedMcpCommandMode: McpCommandModeDb | null;
+  reportedMcpFileRead: boolean | null;
+  reportedFileRoots: boolean | null;
   reportedTerminalApproval: boolean | null;
   reportedTerminalSupported: boolean | null;
   /** 2.8: the CLI's `allowFileToolsAsRoot` config. */
@@ -166,6 +168,7 @@ export async function persistRelayRegistration({
   userId: string;
   allowHumanTerminal: boolean;
   mcpCommandMode: McpCommandModeName;
+  mcpFileRead: boolean;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -184,6 +187,8 @@ export async function persistRelayRegistration({
           relayProtocolVersion: reported.relayProtocolVersion,
           reportedHumanTerminal: reported.reportedHumanTerminal,
           reportedMcpCommandMode: reported.reportedMcpCommandMode,
+          reportedMcpFileRead: reported.reportedMcpFileRead,
+          reportedFileRoots: reported.reportedFileRoots,
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
           reportedAllowFileToolsAsRoot: reported.reportedAllowFileToolsAsRoot,
@@ -254,6 +259,7 @@ export async function persistRelayRegistration({
               inventoryConfirmed: true,
               allowHumanTerminal: true,
               mcpCommandMode: true,
+              mcpFileRead: true,
             },
           });
 
@@ -801,6 +807,7 @@ export async function persistRelayRegistration({
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
             mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
+            mcpFileRead: cliDevice.mcpFileRead === true,
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,

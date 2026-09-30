@@ -457,3 +457,36 @@ describe("CLI feature switches", () => {
     });
   });
 });
+
+describe("file read grant", () => {
+  it.each([
+    [false, true, "fileReadDisabled"],
+    [null, true, "fileReadDisabled"],
+    [true, false, "fileRootsMissing"],
+    [true, null, "fileRootsMissing"],
+  ] as const)("reports read=%s roots=%s disable enabling with a reason", (read, roots, reason) => {
+    renderSwitches({}, { extra: { reportedMcpFileRead: read, reportedFileRoots: roots } });
+    const toggle = screen.getByRole("switch", { name: "dashboard:clis.features.fileRead" });
+    expect(isDisabled(toggle)).toBe(true);
+    expect(screen.getByText(`dashboard:clis.features.${reason}`)).toBeTruthy();
+    expect(state.payloads).toEqual([]);
+  });
+  it("complete reports send the opt-in and existing grants can be revoked with missing reports", async () => {
+    const user = userEvent.setup();
+    const view = renderSwitches(
+      {},
+      { extra: { reportedMcpFileRead: true, reportedFileRoots: true } },
+    );
+    await user.click(screen.getByRole("switch", { name: "dashboard:clis.features.fileRead" }));
+    await waitFor(() => expect(state.payloads).toEqual([{ cliDeviceId: "cli-1", fileRead: true }]));
+    expect(screen.getByText("dashboard:clis.features.fileToolsFollowMode")).toBeTruthy();
+    view.unmount();
+    renderSwitches({}, { extra: { mcpFileRead: true } });
+    const toggle = screen.getByRole("switch", { name: "dashboard:clis.features.fileRead" });
+    expect(isDisabled(toggle)).toBe(false);
+    await user.click(toggle);
+    await waitFor(() =>
+      expect(state.payloads.at(-1)).toEqual({ cliDeviceId: "cli-1", fileRead: false }),
+    );
+  });
+});

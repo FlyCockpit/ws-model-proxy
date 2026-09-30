@@ -107,6 +107,7 @@ function tokenRow(overrides: Record<string, unknown> = {}) {
     revokedAt: null,
     expiresAt: null,
     allowCliCommands: false,
+    allowCliFileRead: false,
     ...overrides,
   };
 }
@@ -124,6 +125,54 @@ describe("mcpTokensRouter", () => {
     db.$transaction.mockImplementation(async (work: unknown) =>
       (work as (tx: unknown) => Promise<unknown>)(prisma),
     );
+  });
+
+  it("defaults file consent off and permits a read-only file token without command/write consent", async () => {
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockImplementation(async ({ data }: { data: object }) =>
+      tokenRow(data),
+    );
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    const plain = await client.create({ name: "plain" });
+    expect(plain.token.allowCliFileRead).toBe(false);
+    const read = await client.create({ name: "monitor", allowCliFileRead: true });
+    expect(read.token).toMatchObject({
+      allowCliFileRead: true,
+      allowCliCommands: false,
+      scopes: ["mcp:read"],
+    });
+  });
+
+  it("file consent widening needs MCP enabled; narrowing commits before cancellation", async () => {
+    const cancel = vi.fn(() => expect(db.mcpPersonalToken.update).toHaveBeenCalled());
+    const context = buildContext();
+    context.services = { cancelMcpTokenCommands: cancel };
+    const client = createRouterClient(mcpTokensRouter, { context });
+    envMock.WMP_MCP_ENABLED = false;
+    db.mcpPersonalToken.findFirst.mockResolvedValue(tokenRow());
+    await expect(
+      client.updateMine({
+        id: "token-1",
+        allowWrite: false,
+        allowCliCommands: false,
+        allowCliFileRead: true,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
+    db.mcpPersonalToken.findFirst.mockResolvedValue(tokenRow({ allowCliFileRead: true }));
+    db.mcpPersonalToken.update.mockResolvedValue(tokenRow());
+    await client.updateMine({
+      id: "token-1",
+      allowWrite: false,
+      allowCliCommands: false,
+      allowCliFileRead: false,
+    });
+    expect(db.mcpPersonalToken.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { scopes: ["mcp:read"], allowCliCommands: false, allowCliFileRead: false },
+      }),
+    );
+    expect(cancel).toHaveBeenCalledWith("token-1");
   });
 
   it("requires authentication", async () => {
@@ -150,6 +199,7 @@ describe("mcpTokensRouter", () => {
         revokedAt: null,
         expiresAt: null,
         allowCliCommands: false,
+        allowCliFileRead: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -179,6 +229,7 @@ describe("mcpTokensRouter", () => {
         revokedAt: createdAt,
         expiresAt: null,
         allowCliCommands: false,
+        allowCliFileRead: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -656,6 +707,7 @@ describe("mcpTokensRouter", () => {
         revokedAt: null,
         expiresAt: null,
         allowCliCommands: true,
+        allowCliFileRead: false,
       });
       expect(db.$transaction).toHaveBeenCalledTimes(1);
       expect(db.mcpPersonalToken.findFirst).toHaveBeenCalledWith(
@@ -672,7 +724,11 @@ describe("mcpTokensRouter", () => {
       expect(db.mcpPersonalToken.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: "token-1" },
-          data: { scopes: ["mcp:read", "mcp:write"], allowCliCommands: true },
+          data: {
+            scopes: ["mcp:read", "mcp:write"],
+            allowCliCommands: true,
+            allowCliFileRead: false,
+          },
         }),
       );
       expect(cancelMcpTokenCommands).not.toHaveBeenCalled();

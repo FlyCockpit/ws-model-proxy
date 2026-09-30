@@ -114,7 +114,9 @@
         "unsupported": "refused, no terminal support on this CLI",
         "grant_supervised_only": "refused, needs Unsupervised (the dashboard grant is Supervised)",
         "cli_supervised_only": "refused, needs Unsupervised (the CLI's own config is Supervised)"
-      }
+      },
+      "allowCliFileRead": "Allow reading files on CLIs",
+      "allowCliFileReadHelp": "Allows the four read-only file tools with read access. Each CLI also needs command mode access or the dashboard and local read grants with configured roots."
     }
   },
   "title": "Settings",

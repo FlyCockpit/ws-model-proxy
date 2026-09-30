@@ -1,4 +1,5 @@
 import { fileAccessRefusal, fileToolAccess } from "@ws-model-proxy/api/lib/cli-file-access";
+import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import {
   allowsHeadlessCommands,
   allowsSupervisedCommands,
@@ -98,21 +99,30 @@ export function resetCliAgentAdmissionsForTests(): void {
   openAdmissions.clear();
 }
 
-export type LiveCliToken = { name: string; expiresAt: Date | null };
+export type LiveCliToken = {
+  name: string;
+  expiresAt: Date | null;
+  allowCliCommands: boolean;
+  allowCliFileRead: boolean;
+  scopes: string[];
+};
 
 /**
  * The PAT as it is now: unrevoked (with its grant), unexpired, still minted
- * with CLI commands and mcp:write. Null when any of that no longer holds.
+ * with current flags/scopes. Capability-specific consent is checked at the verdict.
  */
 async function liveCliToken(tokenId: string, userId: string): Promise<LiveCliToken | null> {
   const token = await prisma.mcpPersonalToken.findFirst({
     where: { id: tokenId, ...activeMcpPersonalTokenWhere(userId, new Date()) },
-    select: { name: true, scopes: true, allowCliCommands: true, expiresAt: true },
+    select: {
+      name: true,
+      scopes: true,
+      allowCliCommands: true,
+      allowCliFileRead: true,
+      expiresAt: true,
+    },
   });
-  if (token?.allowCliCommands !== true || !token.scopes.includes("mcp:write")) {
-    return null;
-  }
-  return { name: token.name, expiresAt: token.expiresAt };
+  return token;
 }
 
 /**
@@ -134,6 +144,7 @@ type AdmissionDevice = {
   id: string;
   userId: string;
   mcpCommandMode: McpCommandModeDb;
+  mcpFileRead: boolean;
   rejectedRelayProtocolVersion: string | null;
 };
 
@@ -173,6 +184,7 @@ export async function readCliAgentAdmission(
           id: true,
           userId: true,
           mcpCommandMode: true,
+          mcpFileRead: true,
           rejectedRelayProtocolVersion: true,
         },
       }),
@@ -230,6 +242,13 @@ export function judgeCliAgentAdmission(
 ): CliAgentAdmissionVerdict {
   const { input, admission, device, token, owner } = reads;
   if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
+  if (
+    !cliTokenAllows(
+      token,
+      capability === "file_read" || capability === "file_write" ? capability : "command",
+    )
+  )
+    return { ok: false, error: "token_inactive" };
   if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
   if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };
   const grant = mcpCommandModeFromDb(device.mcpCommandMode);
@@ -251,11 +270,19 @@ export function judgeCliAgentAdmission(
 
   if (capability === "file_read" || capability === "file_write") {
     const opClass = capability === "file_read" ? "read" : "write";
-    const grantAccess = fileToolAccess(grant, opClass);
+    const live = liveFeatures(input.cliDeviceId);
+    const readGrant = {
+      server: device.mcpFileRead === true,
+      live:
+        live?.mcpFileRead === true &&
+        relayProtocolAtLeast(live.protocolVersion, "2.8") &&
+        live.fileOps === true,
+      roots: live?.fileRootsConfigured === true,
+    };
+    const grantAccess = fileToolAccess(grant, opClass, readGrant);
     if (grantAccess !== "headless") {
       return { ok: false, error: fileAccessRefusal(grantAccess, "grant") };
     }
-    const live = liveFeatures(input.cliDeviceId);
     if (!live) {
       // Not connected. A device whose last hello was refused for an old
       // protocol says so (#90) instead of a bare `offline`.
@@ -270,7 +297,7 @@ export function judgeCliAgentAdmission(
     if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
       return { ok: false, error: "offline" };
     }
-    const liveAccess = fileToolAccess(live.mcpCommandMode, opClass);
+    const liveAccess = fileToolAccess(live.mcpCommandMode, opClass, readGrant);
     if (liveAccess !== "headless") {
       return { ok: false, error: fileAccessRefusal(liveAccess, "live") };
     }
