@@ -1243,7 +1243,7 @@ mod tests {
             let view = mask(FileClass::Plain, &text);
             assert_eq!(
                 view.text,
-                format!("⟦redacted line⟧\r\n⟦redacted line⟧\r\nvisible\r\n")
+                "⟦redacted line⟧\r\n⟦redacted line⟧\r\nvisible\r\n".to_string()
             );
             assert_eq!(view.spans.len(), 2);
             assert_eq!(
