@@ -149,6 +149,7 @@ export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
     isoDateFields,
     coreShape,
     maxInputBytes,
+    shapeIsAdvisory,
     ...descriptor
   } = spec;
   if (isoDateFields !== undefined && descriptor.inputAdapter !== undefined) {
@@ -165,6 +166,7 @@ export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
       isoDateFields,
       coreShape,
       maxInputBytes,
+      shapeIsAdvisory,
     }),
   };
 }
@@ -431,6 +433,8 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
     classification: readClass ? "pure" : op === "delete" ? "destructive" : "external",
     descriptionNote: FILE_TOOL_NOTES[name],
     coreShape: fileToolCoreShape(name),
+    // The core enforces the strict shape: refusals are audited and name the field.
+    shapeIsAdvisory: true,
     ...(op === "write" ? { maxInputBytes: FILE_WRITE_INPUT_MAX_BYTES } : {}),
     invokeCore: (input, deps) => runForwarderCliFileTool(op, input, deps),
     outputProjector: projectFileToolOutput,

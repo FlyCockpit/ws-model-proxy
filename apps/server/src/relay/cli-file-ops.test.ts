@@ -474,6 +474,30 @@ describe("cli file ops", () => {
     });
   });
 
+  it("treats not_found on rename and delete as an unknown outcome (cleanup runs after the commit), but not on edit or read", async () => {
+    const socket = await connect();
+    const cases: Array<[Parameters<typeof runFileOp>[0]["op"], unknown, boolean]> = [
+      ["rename", { from: "~/a", to: "~/b" }, true],
+      ["delete", { path: "~/a" }, true],
+      ["edit", editArgs, false],
+      ["read", readArgs, false],
+    ];
+    for (const [op, args, unknown] of cases) {
+      const outcome = start(socket, op, args);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "not_found" }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "not_found",
+        ...(unknown ? { outcome: "unknown" } : {}),
+      });
+      socket.sends.length = 0;
+    }
+  });
+
   it("passes the library's replaced/gone conflict words through as a definitive conflict", async () => {
     const socket = await connect();
     for (const word of ["replaced", "gone"]) {

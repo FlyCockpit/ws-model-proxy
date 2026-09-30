@@ -60,7 +60,7 @@
       "fileTools": "File tools: read {{read}}, write {{write}}. They follow the MCP command mode.",
       "fileToolAccess": {
         "headless": "runs headless",
-        "supervised": "needs a person",
+        "supervised": "not available yet (needs a person)",
         "off": "off"
       },
       "fileToolsAsRoot": "This CLI allows MCP file tools to run as root (allowFileToolsAsRoot is on). An agent could read or change any file on this machine. Turn it off with wsmp config set-file-tools-as-root off.",

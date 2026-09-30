@@ -2276,6 +2276,27 @@ describe("CLI file tools", () => {
     expect(resultText(result)).toContain("⟦redacted:12⟧");
   });
 
+  it("audits and names fields for shape errors even through the real SDK transport", async () => {
+    const bad: Array<Record<string, unknown>> = [
+      { path: 42 },
+      { path: "~/a", maxLines: 5000 },
+      { path: "~/a", nested: { edits: 1 } },
+    ];
+    for (const extra of bad) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, "forwarder_cli_file_read", {
+        cliDeviceId: "cli-1",
+        ...extra,
+      });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
   it("names the failing fields of an invalid input without echoing values (#117)", async () => {
     const cases: Array<[Record<string, unknown>, RegExp, string]> = [
       [{ path: "~/a", surprise: "SECRET-VALUE-XYZ" }, /Unrecognized field/, "(input)"],

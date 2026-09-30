@@ -130,8 +130,10 @@ dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live
 
 A supervised confirm screen for writes and an opt-in read-only grant are later phases;
 until then a supervised node refuses file tools. `listCliDevices` reports
-`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`, so
-an agent can see what works without trial calls. The CLI refuses every file tool as
+`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`. That
+summary is the MODE permission only: a Windows CLI, or a root CLI without
+`allowFileToolsAsRoot`, still refuses every operation as `unsupported`. `supervised` means
+the operation needs a person, which this phase does not provide, so it is refused. The CLI refuses every file tool as
 `unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
 The CLI re-checks its own mode on every operation; a server request never overrides it.
 The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
@@ -162,7 +164,8 @@ with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-
 and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`:
 re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
 when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
-fails with `timeout`, `offline` or `io_error` carries `error.outcome: "unknown"`: call
+fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
+`token_inactive`, a mode change, `io_error`, or `not_found` on rename and delete): call
 `forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.

@@ -359,13 +359,16 @@ function rejectionFailure(
   reason: FileRejectReason,
   detail: FileRejectDetail | undefined,
   mutating: boolean,
+  ambiguousNotFound: boolean,
 ): FileOpFailure {
   // The CLI's own refusals are definitive (nothing was committed), with one
   // exception: after its commit point the file library can still fail (a
   // directory sync, a post-rename check) and the CLI cannot send a result that
   // is too big. For a mutation those two say nothing about whether the change
   // was made, so the outcome is unknown and the agent must file_stat first.
-  if (mutating && reason === "io_error") {
+  // Ops whose cleanup runs after the commit can also fail with `not_found`
+  // (the source vanished): for rename and delete that code is ambiguous.
+  if (mutating && (reason === "io_error" || (ambiguousNotFound && reason === "not_found"))) {
     return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
   }
   if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
@@ -442,7 +445,15 @@ function newRecord(input: {
       finishResult(record, frame, text);
     },
     markRejected(reason, detail) {
-      settle(record, rejectionFailure(reason, detail, record.mutating));
+      settle(
+        record,
+        rejectionFailure(
+          reason,
+          detail,
+          record.mutating,
+          record.op === "rename" || record.op === "delete",
+        ),
+      );
     },
     markMalformed() {
       settle(record, serverFailure(record, "io_error"));
