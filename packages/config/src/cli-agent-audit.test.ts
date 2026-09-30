@@ -207,6 +207,14 @@ describe("commandProgram", () => {
     expect(commandProgram(`${character}/home/u/hunter2Secret`)).toBe(UNKNOWN);
   });
 
+  it("ends the word only at a space or tab, and only the first dot splits a built-in", () => {
+    for (const separator of ["\u000b", "\f", "\r", "\u00a0"]) {
+      expect(commandProgram(`git${separator}secret`)).toBe(UNKNOWN);
+    }
+    expect(commandProgram("echo.x.y hi")).toBe(UNKNOWN);
+    expect(commandProgram("x.echo.y hi")).toBe("x.echo.y");
+  });
+
   it("skips only leading spaces and tabs", () => {
     expect(commandProgram(" \t  git push")).toBe("git");
     expect(commandProgram("\n git push")).toBe(UNKNOWN);
@@ -230,7 +238,7 @@ describe("commandProgram", () => {
     expect(commandProgram(input)).toBe(UNKNOWN);
   });
 
-  it("keeps plain names, absolute paths and dotted non-built-in names", () => {
+  it("keeps plain names and dotted non-built-in names, and rejects absolute paths", () => {
     expect(commandProgram("git status")).toBe("git");
     expect(commandProgram("echo hi")).toBe("echo");
     expect(commandProgram("/usr/bin/git status")).toBe(UNKNOWN);

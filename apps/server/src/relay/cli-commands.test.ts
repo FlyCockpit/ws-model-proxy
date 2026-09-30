@@ -1024,9 +1024,9 @@ describe("cli commands", () => {
         }),
       );
       const path = String(events()[0]?.path ?? "");
-      // The first word is a secret-bearing assignment: it is skipped, never stored.
+      // The first word is a secret-bearing assignment: it is never stored, and
+      // it is not skipped either (cmd has no inline assignment): the program is `?`.
       expect(path).not.toContain("abcdefghij");
-      // A leading assignment is not skipped (cmd has none): the program is `?`.
       expect(path.split(" ").slice(1).join(" ")).toBe("?");
       expect(path.slice(0, path.indexOf(" "))).toBe(`hmac-sha256:${commandAuditDigest(command)}`);
     });
