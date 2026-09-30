@@ -71,45 +71,51 @@
   },
   {
     "name": "long-closed-quote",
-    "input": " APP_TOKEN=\"closed\"\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": " APP_TOKEN=\"closed\"\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "long-pem-close-same-line",
-    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "long-public-unmatched-quote",
-    "input": " public=\"open\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": " public=\"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "long-malformed-pem",
-    "input": "-----BEGIN RSA PRIVATE KEY---\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": "-----BEGIN RSA PRIVATE KEY---\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "long-public-token-suffix",
-    "input": " --PUBLIC_TOKEN \"open\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": " --PUBLIC_TOKEN \"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "long-word-password-not-name",
-    "input": "PASSWORD \"open\nnext\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "input": "PASSWORD \"open\nnext\npublic-before-blank\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
-    "prefixRepeat": 140
+    "prefixRepeat": 140,
+    "productionCap": true
   },
   {
     "name": "colored-flag-variable",
@@ -134,5 +140,29 @@
     "name": "masked-interior-bom-prefix",
     "input": "public\nrun ﻿prefix --api-key flag-value-one-107 --port 80\n--max-tokens 4096\n",
     "expected": "public\nrun ﻿prefix --api-key ⟦redacted:28⟧\n--max-tokens 4096\n"
+  },
+  {
+    "name": "plain-overlong-until-blank",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\nnext\nnormal-two\nnormal-three\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "productionCap": true
+  },
+  {
+    "name": "plain-overlong-crlf-whitespace-blank",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\r\nnext\r\nnormal-two\r\n \t\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\n \t\r\nvisible\r\n",
+    "productionCap": true
+  },
+  {
+    "name": "blank-keeps-next-value-and-deeper-indent",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "\r\n\r\n \t\r\nnext\r\n  continuation\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n\r\n⟦redacted⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\nvisible\r\n",
+    "productionCap": true
   }
 ]

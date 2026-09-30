@@ -1452,9 +1452,9 @@ describe("CLI command tools", () => {
         "private key blocks",
         "secret-name tokens",
         "scans the terminal-cleaned view",
-        "retain openers across piece boundaries",
-        "openers found on that line carry into recovery",
-        "quote/backslash runs continue to a blank line",
+        "retain private-key labels across piece boundaries",
+        "recovery unconditionally masks non-blank output until the next blank line",
+        "Normal scanning resumes after the blank unless these protections extend masking",
         "unmasked lines keep their raw bytes",
         "Terminal parser state carries across lines",
         "The server cleanText still runs afterwards",
@@ -1467,11 +1467,13 @@ describe("CLI command tools", () => {
         "not a security boundary",
         "A line over 64 KiB is masked whole",
         "inside a live multi-line secret run",
-        "The next non-blank line and subsequent lines indented deeper than column 0 are masked and normal scanning resumes",
+        "the next non-blank line and subsequent lines indented deeper than column 0 are also protected",
         "Opaque fallbacks stay closed through EOF",
         "a PEM marker exceeding the 1 KiB recovery overlap",
         "more than 1 MiB of live masking-state input",
         "an over-long line inside such a run",
+        "a cleaned LF inside an overlong terminal group",
+        "including LF executed inside unfinished CSI",
       ]) {
         expect(tool?.description).toContain(phrase);
       }

@@ -432,24 +432,28 @@ continue until a blank line. Printed dotenv-style token lines are masked whole;
 Each normal line is scanned once, held until a terminal ground-state LF or
 EOF/completion, with at most
 64 KiB held per stream and no filesystem access. An overlong line is scanned
-in bounded pieces with retained opener state and overlap across piece boundaries,
+in bounded pieces with retained private-key labels and overlap across piece boundaries,
 and masked whole, never emitting a prefix or unbroken token tail. When the overlong line begins inside a live multi-line
 secret run — an open private-key PEM block, an open quote or backslash
 continuation, an indentation run — that run's remaining output is opaque through
 EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
 masks the lines that follow. Otherwise, at its terminating LF a fresh scanner is
 primed with every unclosed private-key BEGIN label from that line and an
-until-blank opener for its quote/backslash continuation. A matching END closes
-the corresponding carried block; a blank ends the quote/backslash run.
-Recovery also treats that line as a column-0 secret-name token line: the next non-blank
-line is masked whole, then subsequent lines indented deeper than column 0 stay
-masked until normal scanning resumes. Blank lines do not consume the next-line
-protection; PEM and other opener detection still run on protected lines. CR/LF
+unconditional until-blank opener. Every non-blank output line stays masked until
+the next blank line, including output after an overlong public line or closed
+quote. A matching END closes the corresponding carried PEM block.
+Recovery also treats that line as a column-0 secret-name token line: the next
+non-blank line is masked whole, and subsequent lines indented deeper than column
+0 stay masked. Blank lines do not consume the next-line protection; PEM and other
+opener detection still run on protected lines. Normal scanning resumes after
+the blank unless PEM, indentation, or next-value protection extends masking. CR/LF
 bytes are preserved. Opaque fallbacks stay closed through EOF: more than
 1 MiB of input contributing live masking state bounds PEM/indentation state, and
 an over-long line inside a live run fails closed instead of dropping the opener.
 A PEM marker exceeding the 1 KiB recovery overlap on an overlong line stays
 opaque through EOF, since its exact label cannot safely be reconstructed.
+A cleaned LF inside an overlong terminal group, including LF executed inside
+unfinished CSI, also makes the remaining stream opaque through EOF.
 The latency bound is in bytes; a silent
 process has no wall-clock flush deadline. Invalid UTF-8 passes through when its
 cleaned lossy scan finds no mask. EOF flushes partial output; teardown flushes exec tails or

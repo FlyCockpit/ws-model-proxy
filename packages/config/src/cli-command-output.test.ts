@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   appendRollingTail,
   byteTransitionTableBuildCount,
+  CLI_COMMAND_OUTPUT_NOTICE,
   CLI_OUTPUT_ELLIPSIS,
   CLI_STREAM_HEAD_MAX_BYTES,
   CLI_STREAM_TAIL_MAX_BYTES,
@@ -573,5 +574,20 @@ describe("byte transition table", () => {
     state.consume(new Uint8Array([0x1b, 0x5b, 0x31]), 0, 3);
     new fresh.TerminalByteState().feed(0x62);
     expect(fresh.byteTransitionTableBuildCount()).toBe(1);
+  });
+});
+
+describe("command-output masking notice", () => {
+  it("discloses unconditional blank-line recovery and terminal framing fallback", () => {
+    for (const phrase of [
+      "recovery unconditionally masks non-blank output until the next blank line",
+      "blank lines do not consume the next-line protection",
+      "Normal scanning resumes after the blank unless these protections extend masking",
+      "a cleaned LF inside an overlong terminal group",
+      "including LF executed inside unfinished CSI",
+    ]) {
+      expect(CLI_COMMAND_OUTPUT_NOTICE).toContain(phrase);
+    }
+    expect(CLI_COMMAND_OUTPUT_NOTICE).not.toContain("openers found on that line");
   });
 });

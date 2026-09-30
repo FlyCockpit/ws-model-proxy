@@ -127,7 +127,7 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
         None,
     );
     let input = format!(
-        "{}\r\nnext\n  continuation\nresult: 42\n",
+        "{}\r\nnext\n  continuation\nordinary output\n\nresult: 42\n",
         "z".repeat(crate::output_mask::MAX_HELD_BYTES + 1)
     );
     let mut frames = Vec::new();
@@ -139,7 +139,7 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
     let (out, err) = exec_streams(&frames);
     assert_eq!(
         out,
-        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\nresult: 42\n".as_bytes()
+        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nresult: 42\n".as_bytes()
     );
     assert_eq!(err, b"stderr-visible\n");
     assert!(execs.sessions.is_empty());
@@ -316,7 +316,7 @@ fn supervised_capture_recovers_after_a_long_line_and_counts_visible_results() {
     let _ = attach_viewer(&mut terminals, &startup, &mut viewer);
     accept(&mut terminals, &rx, &mut frames, &mut viewer);
     let input = format!(
-        "{}\r\nnext\n  continuation\nresult: 42",
+        "{}\r\nnext\n  continuation\nordinary output\n\nresult: 42",
         "z".repeat(crate::output_mask::MAX_HELD_BYTES + 1)
     );
     for chunk in input.as_bytes().chunks(997) {
@@ -327,7 +327,7 @@ fn supervised_capture_recovers_after_a_long_line_and_counts_visible_results() {
     let (head, tail, total) = shared_parts(&frames);
     assert_eq!(
         head,
-        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\nresult: 42".as_bytes()
+        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nresult: 42".as_bytes()
     );
     assert!(tail.is_empty());
     assert_eq!(total, head.len() as u64);

@@ -1,11 +1,12 @@
 [
   {
     "name": "long-pem-unbroken",
-    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\n\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "z",
     "prefixRepeat": 140,
-    "hidden": ["body-two107", "body-three107"]
+    "hidden": ["body-two107", "body-three107"],
+    "productionCap": true
   },
   {
     "name": "long-quote-unbroken",
@@ -13,7 +14,8 @@
     "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
     "prefixRepeat": 140,
-    "hidden": ["quote-two107", "quote-three107"]
+    "hidden": ["quote-two107", "quote-three107"],
+    "productionCap": true
   },
   {
     "name": "long-backslash-unbroken",
@@ -21,15 +23,17 @@
     "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "z",
     "prefixRepeat": 140,
-    "hidden": ["cont-two107", "cont-three107"]
+    "hidden": ["cont-two107", "cont-three107"],
+    "productionCap": true
   },
   {
     "name": "long-pem-word",
-    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\n\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "word ",
     "prefixRepeat": 29,
-    "hidden": ["body-two107", "body-three107"]
+    "hidden": ["body-two107", "body-three107"],
+    "productionCap": true
   },
   {
     "name": "long-quote-word",
@@ -37,7 +41,8 @@
     "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "word ",
     "prefixRepeat": 29,
-    "hidden": ["quote-two107", "quote-three107"]
+    "hidden": ["quote-two107", "quote-three107"],
+    "productionCap": true
   },
   {
     "name": "long-backslash-word",
@@ -45,36 +50,38 @@
     "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
     "prefix": "word ",
     "prefixRepeat": 29,
-    "hidden": ["cont-two107", "cont-three107"]
+    "hidden": ["cont-two107", "cont-three107"],
+    "productionCap": true
   },
   {
     "name": "pem-crossing-piece",
-    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\n\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "z",
     "prefixRepeat": 123,
-    "hidden": ["body-two107"]
+    "hidden": ["body-two107"],
+    "productionCap": true
   },
   {
     "name": "pem-duplicate",
-    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----\nbody-one107\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
-    "prefix": "z",
-    "prefixRepeat": 140,
-    "hidden": ["body-two107"]
-  },
-  {
-    "name": "pem-mismatched-nested",
-    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN EC PRIVATE KEY-----\nbody-one107\n-----END DSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
+    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----\n\nbody-one107\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
     "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "z",
     "prefixRepeat": 140,
     "hidden": ["body-two107"]
   },
   {
+    "name": "pem-mismatched-nested",
+    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN EC PRIVATE KEY-----\n\nbody-one107\n-----END DSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
     "name": "pem-adjacent",
-    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----BEGIN EC PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----BEGIN EC PRIVATE KEY-----\n\nbody-one107\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "z",
     "prefixRepeat": 140,
     "hidden": ["body-two107"]
@@ -89,8 +96,8 @@
   },
   {
     "name": "long-pem-crlf-eof",
-    "input": "-----BEGIN RSA PRIVATE KEY-----\r\nbody-one107\r\nbody-two107",
-    "expected": "⟦redacted line⟧\r\n⟦redacted⟧\r\n⟦redacted⟧",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\r\n\nbody-one107\r\nbody-two107",
+    "expected": "⟦redacted line⟧\r\n⟦redacted⟧\n⟦redacted⟧\r\n⟦redacted⟧",
     "prefix": "z",
     "prefixRepeat": 140,
     "hidden": ["body-two107"]
@@ -193,16 +200,17 @@
   },
   {
     "name": "long-colored-pem",
-    "input": "-----BEGIN RSA PRI\u001b[31mVATE KEY\u001b[0m-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----BEGIN RSA PRI\u001b[31mVATE KEY\u001b[0m-----\n\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "prefix": "z",
     "prefixRepeat": 140,
-    "hidden": ["body-two107"]
+    "hidden": ["body-two107"],
+    "productionCap": true
   },
   {
     "name": "overlong-terminal-string",
     "input": "DB_PASS\u001b]hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\n\u0007WORD=hiddenbody107\nfirst\nsecond\nvisible\n",
-    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\nsecond\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n",
     "prefix": "",
     "prefixRepeat": 0,
     "hidden": ["hiddenbody107"]
@@ -219,8 +227,8 @@
     "name": "pem-end-before-begin",
     "prefix": "z",
     "prefixRepeat": 140,
-    "input": "-----END RSA PRIVATE KEY-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
-    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "input": "-----END RSA PRIVATE KEY-----BEGIN RSA PRIVATE KEY-----\n\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "hidden": ["body-two107"]
   },
   {
@@ -262,5 +270,194 @@
     "prefix": "z",
     "prefixRepeat": 140,
     "hidden": []
+  },
+  {
+    "name": "pending-flag-value-quote-P1",
+    "inputSegments": [
+      {
+        "text": "run --password\n\""
+      },
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "run --password\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "pending-flag-value-backslash-P1b",
+    "inputSegments": [
+      {
+        "text": "run --password\n"
+      },
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      }
+    ],
+    "input": " \\\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "run --password\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "pending-token-value-quote-P2",
+    "inputSegments": [
+      {
+        "text": "SECRET_TOKEN "
+      },
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      },
+      {
+        "text": "\n\""
+      },
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n\n⟦redacted line⟧\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "overlong-csi-lf",
+    "inputSegments": [
+      {
+        "text": "\""
+      },
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      }
+    ],
+    "input": "\u001b[\nAPI_KEY=\"abc\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n\n⟦redacted line⟧\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "long-secret-flag-68",
+    "inputSegments": [
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      },
+      {
+        "text": " --"
+      },
+      {
+        "text": "b",
+        "repeat": 58
+      },
+      {
+        "text": "-api-key \"open"
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "long-secret-flag-70",
+    "inputSegments": [
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      },
+      {
+        "text": " --"
+      },
+      {
+        "text": "b",
+        "repeat": 60
+      },
+      {
+        "text": "-api-key \"open"
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "long-secret-flag-72",
+    "inputSegments": [
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      },
+      {
+        "text": " --"
+      },
+      {
+        "text": "b",
+        "repeat": 62
+      },
+      {
+        "text": "-api-key \"open"
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "long-secret-flag-90",
+    "inputSegments": [
+      {
+        "text": "A",
+        "repeat": 140,
+        "growWithCap": true
+      },
+      {
+        "text": " --"
+      },
+      {
+        "text": "b",
+        "repeat": 80
+      },
+      {
+        "text": "-api-key \"open"
+      }
+    ],
+    "input": "\ncont3\nLEAKME4\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["LEAKME4"],
+    "productionCap": true
+  },
+  {
+    "name": "pem-case-mismatched-end",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "-----BEGIN RSA PRIVATE KEY-----\n\n-----END rsa PRIVATE KEY-----\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "pem-carry-nested-end-binding",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "-----BEGIN ALPHA PRIVATE KEY-----BEGIN BETA PRIVATE KEY-----END BETA PRIVATE KEY-----\n\ncarry-body-one107\ncarry-body-two107\n-----END ALPHA PRIVATE KEY-----\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nvisible\n",
+    "hidden": ["carry-body-two107"],
+    "productionCap": true
   }
 ]

@@ -618,23 +618,14 @@ fn pem_events(line: &str) -> Vec<(bool, &str)> {
 }
 
 /// Bounded carry for one overlong terminal-cleaned line. Piece boundaries are
-/// never interpreted as blank lines, dedents, or quote boundaries. This uses
-/// the same recognizers as `LineMasker`; only recovery is conservative.
+/// never interpreted as line boundaries. Only exact private-key labels are
+/// carried; all general recovery is enforced by `StreamMasker::prime_recovery`.
 #[derive(Default)]
 pub(crate) struct SameLineCarry {
     pem_tail: String,
     pem_open: std::collections::BTreeMap<String, usize>,
     state_cost: usize,
     live_input: usize,
-    word_tail: String,
-    word_len: usize,
-    dash_word: bool,
-    saw_name: bool,
-    saw_flag: bool,
-    flag_delimiter: Option<String>,
-    quote: Option<char>,
-    escaped: bool,
-    last: Option<char>,
     unrepresentable: bool,
 }
 
@@ -647,37 +638,11 @@ impl SameLineCarry {
         if self.unrepresentable {
             return;
         }
-        for ch in piece.chars() {
-            if let Some(mut candidate) = self.flag_delimiter.take() {
-                candidate.push(ch);
-                self.saw_flag |= FLAG.is_match(&candidate);
-            }
-            if !ch.is_whitespace() {
-                self.last = Some(ch);
-            }
-            if self.escaped {
-                self.escaped = false;
-            } else if ch == '\\' {
-                self.escaped = true;
-            } else {
-                match self.quote {
-                    Some(quote) if quote == ch => self.quote = None,
-                    None if matches!(ch, '\'' | '"') => self.quote = Some(ch),
-                    _ => {}
-                }
-            }
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
-                if self.word_len == 0 {
-                    self.dash_word = ch == '-';
-                }
-                self.word_len = self.word_len.saturating_add(1);
-                self.word_tail.push(ch);
-                if self.word_tail.len() > 64 {
-                    self.word_tail.remove(0);
-                }
-            } else {
-                self.finish_word(Some(ch));
-            }
+        // A visible LF inside a terminal group cannot be represented by this
+        // single-line carry. Fail closed rather than merge visual line state.
+        if piece.contains('\n') {
+            self.unrepresentable = true;
+            return;
         }
         self.pem_tail.push_str(piece);
         loop {
@@ -740,7 +705,7 @@ impl SameLineCarry {
                 break;
             }
         }
-        if !self.pem_open.is_empty() || ((self.saw_name || self.saw_flag) && self.quote.is_some()) {
+        if !self.pem_open.is_empty() {
             self.live_input = self.live_input.saturating_add(input_bytes);
         } else {
             self.live_input = 0;
@@ -751,36 +716,7 @@ impl SameLineCarry {
         }
     }
 
-    fn finish_word(&mut self, delimiter: Option<char>) {
-        if self.word_len == 0 {
-            return;
-        }
-        if self.dash_word {
-            if let Some(delimiter) = delimiter {
-                let candidate = format!("{}{delimiter}", self.word_tail);
-                self.saw_flag |= FLAG.is_match(&candidate);
-                // FLAG also accepts escaped n/r/t or quote-comma delimiters.
-                // Carry their unfinished first character across piece cuts.
-                if matches!(delimiter, '\\' | '\'' | '"') {
-                    self.flag_delimiter = Some(candidate);
-                }
-            }
-        } else {
-            // Retain a public prefix on truncated words: bare PASSWORD is only
-            // a name when it was the complete word, whereas suffixes still match.
-            let candidate = if self.word_len > self.word_tail.len() {
-                format!("x{}", self.word_tail)
-            } else {
-                self.word_tail.clone()
-            };
-            self.saw_name |= first_secret_name(&candidate).is_some();
-        }
-        self.word_tail.clear();
-        self.word_len = 0;
-    }
-
     pub(crate) fn recover(mut self, masker: &mut LineMasker) -> Option<usize> {
-        self.finish_word(None);
         if self.unrepresentable {
             return None;
         }
@@ -790,9 +726,6 @@ impl SameLineCarry {
             for _ in 0..count {
                 let _ = masker.scan(&opener);
             }
-        }
-        if (self.saw_name || self.saw_flag) && (self.quote.is_some() || self.last == Some('\\')) {
-            let _ = masker.scan("X_TOKEN=\"");
         }
         Some(cost)
     }
@@ -809,14 +742,8 @@ impl SameLineCarry {
 
 impl Drop for SameLineCarry {
     fn drop(&mut self) {
-        if let Some(candidate) = self.flag_delimiter.take() {
-            let mut bytes = candidate.into_bytes();
-            bytes.fill(0);
-        }
-        for text in [&mut self.pem_tail, &mut self.word_tail] {
-            let mut bytes = std::mem::take(text).into_bytes();
-            bytes.fill(0);
-        }
+        let mut bytes = std::mem::take(&mut self.pem_tail).into_bytes();
+        bytes.fill(0);
     }
 }
 
@@ -922,8 +849,8 @@ impl LineMasker {
         self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_open.is_empty()
     }
 
-    /// Content constructs cannot be explained by a synthetic column-0 recovery
-    /// token. They must survive another overlong-line transition as real state.
+    /// Content constructs, including unconditional recovery UntilBlank, must
+    /// fail closed through EOF if another line crosses the hold cap.
     pub(crate) fn has_content_continuation(&self) -> bool {
         self.until_blank.is_some() || !self.pem_open.is_empty()
     }

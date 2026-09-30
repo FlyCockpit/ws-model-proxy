@@ -16,12 +16,13 @@
 //! Latency is bounded in bytes: hold at most [`MAX_HELD_BYTES`] until a
 //! ground-state LF, EOF, or the next byte. Overlong lines/groups emit only opaque
 //! markers and CR/LF; no prefix or token tail leaves the CLI. Their cleaned pieces
-//! retain same-line quote/name/flag state and a 1 KiB PEM-marker overlap. Exact
-//! private-key labels and duplicate counts prime recovery via synthetic BEGINs;
-//! open quotes/backslashes prime UntilBlank. A column-0 token also masks the next
-//! nonblank line and deeper indentation; blank lines keep that recovery guard.
+//! retain only exact private-key labels, duplicate counts and a 1 KiB marker
+//! overlap. At terminating LF, recovery always masks nonblank output until the
+//! next blank line, plus the next nonblank line and deeper indentation. PEM
+//! blocks close at their matching END; blank lines keep the next-value guard.
 //! A PEM marker larger than the overlap, or a live-state input budget larger
 //! than [`MAX_STATE_INPUT_BYTES`], makes the remaining stream opaque through EOF.
+//! A cleaned LF inside an overlong group also makes the stream opaque.
 //! An opener live BEFORE crossing the hold cap also keeps that accepted opaque
 //! policy. Opaque mode frees scanner/carry state and keeps terminal state current.
 //! EOF seals and flushes once; cancellation wipes/discards retained raw/cleaned
@@ -51,8 +52,8 @@ const LINE_MARKER: &[u8] = "⟦redacted line⟧".as_bytes();
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Scanning,
-    /// The overlong line and the next non-blank line are masked; scanning
-    /// resumes. Used only when no multi-line opener was live at the transition.
+    /// The overlong line is opaque; at LF, recovery masks through the next
+    /// blank line. Used only when no multi-line opener was already live.
     OverlongLine,
     /// Every remaining nonempty line is opaque through EOF (the 1 MiB state
     /// fallback, and an overlong line inside a live opener).
@@ -266,7 +267,10 @@ impl StreamMasker {
     }
 
     fn prime_recovery(&mut self) {
-        let _ = self.masker.scan("X_TOKEN");
+        // One unconditional recovery rule covers every overlong value shape.
+        // The open quote seeds UntilBlank alongside the token's column-0 block
+        // and next-nonblank guard; PEM labels have already been restored.
+        let _ = self.masker.scan("X_TOKEN=\"");
         self.recovery_pending = true;
     }
 
@@ -393,6 +397,57 @@ mod tests {
         prefix_repeat: usize,
         #[serde(default)]
         hidden: Vec<String>,
+        #[serde(default)]
+        input_segments: Vec<FixtureSegment>,
+        #[serde(default)]
+        production_cap: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureSegment {
+        text: String,
+        #[serde(default = "single_repeat")]
+        repeat: usize,
+        #[serde(default)]
+        grow_with_cap: bool,
+    }
+
+    fn single_repeat() -> usize {
+        1
+    }
+
+    impl DesignCase {
+        fn expanded_input(&self, hold_limit: usize) -> String {
+            let growth = hold_limit - DESIGN_HOLD_BYTES;
+            let prefix_repeat = self.prefix_repeat
+                + if self.prefix.is_empty() {
+                    0
+                } else {
+                    growth / self.prefix.len()
+                };
+            let mut input = self.prefix.repeat(prefix_repeat);
+            for segment in &self.input_segments {
+                let repeats = segment.repeat
+                    + if segment.grow_with_cap {
+                        assert!(
+                            !segment.text.is_empty(),
+                            "{} empty repeat segment",
+                            self.name
+                        );
+                        growth / segment.text.len()
+                    } else {
+                        0
+                    };
+                input.push_str(&segment.text.repeat(repeats));
+            }
+            input.push_str(&self.input);
+            input
+        }
+    }
+
+    fn design_input(case: &DesignCase, hold_limit: usize) -> String {
+        case.expanded_input(hold_limit)
     }
 
     const DESIGN_HOLD_BYTES: usize = 128;
@@ -423,8 +478,14 @@ mod tests {
     fn design_table(fixture: &str) {
         let cases: Vec<DesignCase> = serde_json::from_str(fixture).expect("design cases");
         for case in cases {
-            let input = format!("{}{}", case.prefix.repeat(case.prefix_repeat), case.input);
+            let input = design_input(&case, DESIGN_HOLD_BYTES);
             let bytes = input.as_bytes();
+            assert_eq!(
+                design_run(&[bytes], &case.hidden),
+                case.expected.as_bytes(),
+                "{} whole",
+                case.name
+            );
             for at in 0..=bytes.len() {
                 assert_eq!(
                     design_run(&[&bytes[..at], &bytes[at..]], &case.hidden),
@@ -462,21 +523,16 @@ mod tests {
             "../tests/fixtures/masking/stream-design-cases.json"
         ))
         .expect("design cases");
-        for mut case in cases.into_iter().filter(|case| {
-            [
-                "long-pem-unbroken",
-                "long-quote-unbroken",
-                "long-backslash-unbroken",
-                "long-pem-word",
-                "long-quote-word",
-                "long-backslash-word",
-                "pem-crossing-piece",
-                "long-colored-pem",
-            ]
-            .contains(&case.name.as_str())
-        }) {
-            case.prefix_repeat += (MAX_HELD_BYTES - DESIGN_HOLD_BYTES) / case.prefix.len();
-            let input = format!("{}{}", case.prefix.repeat(case.prefix_repeat), case.input);
+        let controls: Vec<DesignCase> = serde_json::from_str(include_str!(
+            "../tests/fixtures/masking/stream-design-controls.json"
+        ))
+        .expect("design controls");
+        for case in cases
+            .into_iter()
+            .chain(controls)
+            .filter(|case| case.production_cap)
+        {
+            let input = design_input(&case, MAX_HELD_BYTES);
             let bytes = input.as_bytes();
             for chunks in [
                 vec![bytes],
@@ -624,15 +680,15 @@ mod tests {
         // pieces. ALL are outside accepted bounded lines and fail closed.
         for input in [
             format!(
-                "{secret}{}\r\nnext\n  continuation\nvisible\n",
+                "{secret}{}\r\nnext\n  continuation\nordinary output\n\nvisible\n",
                 "z".repeat(3 * 1024 * 1024)
             ),
             format!(
-                "{}{secret}\r\nnext\n  continuation\nvisible\n",
+                "{}{secret}\r\nnext\n  continuation\nordinary output\n\nvisible\n",
                 "word ".repeat(800_000)
             ),
             format!(
-                "{}\nnext\n  continuation\nvisible\n",
+                "{}\nnext\n  continuation\nordinary output\n\nvisible\n",
                 "z".repeat(3 * 1024 * 1024)
             ),
             format!(
@@ -649,9 +705,9 @@ mod tests {
             );
             assert_eq!(chunked, whole);
             let expected = if input.contains("\r\n") {
-                "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n"
+                "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n"
             } else if input.contains("visible") {
-                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n"
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n"
             } else {
                 "⟦redacted line⟧\n⟦redacted line⟧\n"
             };
@@ -745,30 +801,30 @@ mod tests {
         for (name, input, expected) in [
             (
                 "next and indentation",
-                format!("{long}\nnext\n  continuation\nvisible\n"),
-                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n".to_string(),
+                format!("{long}\nnext\n  continuation\nordinary output\n\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n".to_string(),
             ),
             (
                 "CRLF and blanks before next",
-                format!("{long}\r\n\r\n \t\r\nnext\r\n  continuation\r\nvisible\r\n"),
-                "⟦redacted line⟧\r\n\r\n⟦redacted⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\nvisible\r\n"
+                format!("{long}\r\n\r\n \t\r\nnext\r\n  continuation\r\n\r\nvisible\r\n"),
+                "⟦redacted line⟧\r\n\r\n⟦redacted⟧\r\n⟦redacted line⟧\r\n⟦redacted⟧\r\n\r\nvisible\r\n"
                     .to_string(),
             ),
             (
                 "exactly cap plus one",
-                format!("{long}\nnext\nvisible\n"),
-                "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n".to_string(),
+                format!("{long}\nnext\n\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n\nvisible\n".to_string(),
             ),
             (
                 "two overlong lines",
-                format!("{long}\n{long}\nnext\n  continuation\nvisible\n"),
-                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n"
+                format!("{long}\n{long}\nnext\n  continuation\nordinary output\n\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n\n⟦redacted line⟧\n"
                     .to_string(),
             ),
             (
                 "PEM immediately after recovery",
-                format!("{long}\n{pem_input}"),
-                format!("⟦redacted line⟧\n{pem_expected}"),
+                format!("{long}\n\n{pem_input}"),
+                format!("⟦redacted line⟧\n\n{pem_expected}"),
             ),
             (
                 "EOF without LF",
@@ -828,8 +884,8 @@ mod tests {
             ),
             (
                 "no live opener still recovers",
-                format!("{long}\nnext\n  continuation\nvisible\n"),
-                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n".to_string(),
+                format!("{long}\nnext\n  continuation\nordinary output\n\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n".to_string(),
             ),
             (
                 "opaque to EOF hides a later PEM too",
@@ -957,6 +1013,31 @@ mod tests {
 
     #[test]
     fn the_documented_bounds_are_pinned() {
+        let controls: Vec<DesignCase> = serde_json::from_str(include_str!(
+            "../tests/fixtures/masking/stream-design-controls.json"
+        ))
+        .expect("design controls");
+        let default_case = controls
+            .iter()
+            .find(|case| case.name == "raw-sgr-public")
+            .expect("bounded control");
+        assert!(!default_case.production_cap);
+        assert!(default_case.input_segments.is_empty());
+        assert_eq!(
+            design_input(default_case, DESIGN_HOLD_BYTES),
+            default_case.input
+        );
+        let cases: Vec<DesignCase> = serde_json::from_str(include_str!(
+            "../tests/fixtures/masking/stream-design-cases.json"
+        ))
+        .expect("design cases");
+        let default_segment = cases
+            .iter()
+            .find(|case| case.name == "pending-flag-value-quote-P1")
+            .and_then(|case| case.input_segments.first())
+            .expect("segment with omitted defaults");
+        assert_eq!(default_segment.repeat, 1);
+        assert!(!default_segment.grow_with_cap);
         assert_eq!(MAX_HELD_BYTES, 64 * 1024);
         assert_eq!(MAX_STATE_INPUT_BYTES, 1024 * 1024);
         let mut masker = StreamMasker::new("show");
@@ -967,12 +1048,14 @@ mod tests {
         assert_eq!(masker.push(b"p"), LINE_MARKER);
         assert_eq!(masker.held(), 1);
         assert_eq!(
-            masker.push(b"\r\nnext\nvisible\n"),
+            masker.push(b"\r\nnext\nordinary output\n\nvisible\n"),
             b"\r\n"
                 .iter()
                 .copied()
                 .chain(LINE_MARKER.iter().copied())
-                .chain(*b"\nvisible\n")
+                .chain(*b"\n")
+                .chain("⟦redacted⟧".bytes())
+                .chain(*b"\n\nvisible\n")
                 .collect::<Vec<_>>()
         );
     }
