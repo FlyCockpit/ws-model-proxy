@@ -512,6 +512,12 @@ describe("cli file ops", () => {
         });
         const effective = rank[dash] < rank[cli] ? dash : cli;
         const runs = effective === "unsupervised" || (server && live && roots);
+        // Admission decides on its own, not only through the dispatch gate behind it.
+        const verdict = judgeCliAgentAdmission(
+          await readCliAgentAdmission({ ...OP_TOKEN, cliDeviceId: "desktop" }),
+          "file_read",
+        );
+        expect(verdict.ok).toBe(runs);
         const outcome = start(socket, "read", readArgs);
         await flush();
         if (runs) {
@@ -873,6 +879,50 @@ describe("cli file ops", () => {
         );
       },
     );
+
+    it("a hello installing after the refresh applied but before the change settles stays fenced", async () => {
+      const { outcome } = await grantedRead("off");
+      const metricsHeld = deferred<boolean>();
+      vi.spyOn(relaySessionManager, "onRemoteMetricSourcesChanged").mockImplementation(
+        () => metricsHeld.promise,
+      );
+      db.cliDevice.upsert.mockResolvedValue({
+        ...policy("off", true),
+        slug: "desktop",
+        allowHumanTerminal: true,
+        connectionGeneration: 2,
+      });
+      const committed = deferred<void>();
+      const release = deferred<void>();
+      db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+        const snapshot = await callback(db);
+        committed.resolve();
+        await release.promise;
+        return snapshot;
+      });
+      const replacement = new FakeSocket();
+      relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
+      const reconnect = relaySessionManager.handleTextFrame(
+        replacement,
+        hello("desktop", "off", true, true),
+        now,
+      );
+      await committed.promise;
+      db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+      const change = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      // The refresh has applied the revoke (the pending read is cancelled) while
+      // its tail still awaits the metric push.
+      await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+      release.resolve();
+      await reconnect;
+      const afterHello = relaySessionManager.fileOpModeRefusal("desktop", "read");
+      metricsHeld.resolve(false);
+      await change;
+      await flush();
+      await flush();
+      expect(afterHello).toBe("grant_disabled");
+      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe("grant_disabled");
+    });
 
     // Inverse/default rows: only a change to THIS device after hello starts
     // forces a refresh. A hello started after notification remains ordinary.
