@@ -1,0 +1,8 @@
+{
+  "type": "file.result",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "mkdir",
+  "result": {
+    "created": true
+  }
+}

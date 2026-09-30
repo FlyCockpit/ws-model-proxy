@@ -1,0 +1,14 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "read",
+  "args": {
+    "path": "~/llama/start.sh",
+    "startLine": 1,
+    "maxLines": 400,
+    "maxBytes": 32768,
+    "byteOffset": 0,
+    "lineNumbers": true,
+    "ifNoneMatch": "h:AAAAAAAAAAAAAAAAAAAAAA"
+  }
+}

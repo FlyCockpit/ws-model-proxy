@@ -83,6 +83,17 @@ function isSecretBearingKey(key: string): boolean {
   return SECRET_KEY_FRAGMENTS.some((fragment) => collapsed.includes(fragment));
 }
 
+/**
+ * Keys that only DESCRIBE a secret and hold a boolean flag (the node file
+ * tools' `secretFile`: "this file was shown as a masked view"). The value is
+ * kept when it is a boolean; any other value under the key is still redacted.
+ */
+const SECRET_FLAG_KEYS: ReadonlySet<string> = new Set(["secretfile"]);
+
+function isSecretFlag(key: string, value: unknown): boolean {
+  return typeof value === "boolean" && SECRET_FLAG_KEYS.has(key.toLowerCase());
+}
+
 function carriesProductCredential(value: string): boolean {
   return Object.values(PRODUCT_CREDENTIAL_PREFIXES).some((prefix) => value.startsWith(prefix));
 }
@@ -119,7 +130,10 @@ export function redactSecrets(value: unknown, depth = 0): unknown {
     // downstream either way; cycles are bounded by the depth guard.
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {
-      out[key] = isSecretBearingKey(key) ? MCP_REDACTED_VALUE : redactSecrets(entry, depth + 1);
+      out[key] =
+        isSecretBearingKey(key) && !isSecretFlag(key, entry)
+          ? MCP_REDACTED_VALUE
+          : redactSecrets(entry, depth + 1);
     }
     return out;
   }

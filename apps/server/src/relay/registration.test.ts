@@ -220,6 +220,7 @@ describe("capability override origin", () => {
         reportedMcpCommandMode: null,
         reportedTerminalApproval: null,
         reportedTerminalSupported: null,
+        reportedAllowFileToolsAsRoot: null,
         reportedHostname: "desk-01.local",
         featuresReportedAt: null,
       },
@@ -369,6 +370,7 @@ describe("capability override origin", () => {
       endpointTargeting: true,
       connection: true,
       reported: {
+        reportedAllowFileToolsAsRoot: null,
         cliVersion: "1.0.0",
         relayProtocolVersion: "2.7",
         reportedHumanTerminal: null,
@@ -1504,6 +1506,7 @@ describe("capability override origin", () => {
         reportedMcpCommandMode: "OFF",
         reportedTerminalApproval: false,
         reportedTerminalSupported: true,
+        reportedAllowFileToolsAsRoot: false,
         reportedHostname: null,
         featuresReportedAt: now,
       },

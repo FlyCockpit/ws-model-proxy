@@ -1,0 +1,12 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "rename",
+  "args": {
+    "from": "~/a.yaml",
+    "to": "~/b.yaml",
+    "overwrite": true,
+    "expectedEtag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+    "reason": "swap"
+  }
+}

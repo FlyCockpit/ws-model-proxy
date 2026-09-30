@@ -1,0 +1,8 @@
+{
+  "type": "file.rejected",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "reason": "conflict",
+  "detail": {
+    "currentEtag": "h:AAAAAAAAAAAAAAAAAAAAAA"
+  }
+}

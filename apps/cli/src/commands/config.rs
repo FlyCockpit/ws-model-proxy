@@ -39,6 +39,9 @@ enum Sub {
     SetMcpCommands { mode: McpMode },
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
+    /// Let the MCP node file tools run when wsmp itself runs as root (they
+    /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
+    SetFileToolsAsRoot { state: Switch },
     /// Accept metric sources defined remotely (dashboard or MCP). Each one
     /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
     /// starts.
@@ -171,6 +174,11 @@ pub fn run(args: &Args) -> Result<()> {
                     cfg.require_terminal_approval = state.enabled();
                 },
             )?;
+        }
+        Sub::SetFileToolsAsRoot { state } => {
+            set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
+                cfg.allow_file_tools_as_root = state.enabled();
+            })?;
         }
         Sub::SetRemoteMetricSources { state } => {
             set_flag(

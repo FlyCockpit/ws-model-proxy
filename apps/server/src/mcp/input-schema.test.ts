@@ -37,8 +37,17 @@ vi.mock("../relay/cli-commands.js", () => ({
   snapshotCliCommand: vi.fn(),
 }));
 
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
+
 const { MCP_TOOL_MANIFEST } = await import("./tool-manifest");
 const { appRouter } = await import("@ws-model-proxy/api/routers/index");
+const { FILE_TOOLS } = await import("./cli-file-tools");
+const { fileToolArgShapes } = await import("../relay/file-protocol");
 const { applyInputOverlay, toInputJsonSchema, MCP_TOOL_INPUT_MAX_BYTES } = await import(
   "./input-schema"
 );
@@ -122,6 +131,92 @@ const CORE_SCHEMAS: Record<string, Json> = {
   ),
 };
 
+/**
+ * The nine node file tools (relay 2.8) are extracted cores whose `coreShape` is
+ * built from the relay arg shapes (`file-protocol.ts`). Their advertised
+ * property names and required fields are pinned here; each advertised property
+ * must equal the JSON Schema of the shared shape, and the confirmation literal
+ * is the manifest's.
+ */
+const FILE_TOOL_PINS: Record<string, { properties: string[]; required: string[] }> = {
+  forwarder_cli_file_read: {
+    properties: [
+      "cliDeviceId",
+      "path",
+      "startLine",
+      "maxLines",
+      "maxBytes",
+      "byteOffset",
+      "lineNumbers",
+      "ifNoneMatch",
+    ],
+    required: ["cliDeviceId", "path"],
+  },
+  forwarder_cli_file_stat: {
+    properties: ["cliDeviceId", "paths", "hash"],
+    required: ["cliDeviceId", "paths"],
+  },
+  forwarder_cli_dir_list: {
+    properties: ["cliDeviceId", "path", "depth", "glob", "includeHidden", "maxEntries", "cursor"],
+    required: ["cliDeviceId", "path"],
+  },
+  forwarder_cli_file_search: {
+    properties: [
+      "cliDeviceId",
+      "root",
+      "pattern",
+      "mode",
+      "glob",
+      "caseInsensitive",
+      "contextLines",
+      "maxMatches",
+      "maxFiles",
+    ],
+    required: ["cliDeviceId", "root", "pattern"],
+  },
+  forwarder_cli_file_edit: {
+    properties: [
+      "cliDeviceId",
+      "path",
+      "expectedEtag",
+      "edits",
+      "dryRun",
+      "returnDiff",
+      "reason",
+      "confirm",
+    ],
+    required: ["cliDeviceId", "path", "edits", "confirm"],
+  },
+  forwarder_cli_file_write: {
+    properties: [
+      "cliDeviceId",
+      "path",
+      "ifExists",
+      "expectedEtag",
+      "mode",
+      "makeParents",
+      "returnDiff",
+      "reason",
+      "content",
+      "encoding",
+      "confirm",
+    ],
+    required: ["cliDeviceId", "path", "content", "confirm"],
+  },
+  forwarder_cli_file_rename: {
+    properties: ["cliDeviceId", "from", "to", "overwrite", "expectedEtag", "reason", "confirm"],
+    required: ["cliDeviceId", "from", "to", "confirm"],
+  },
+  forwarder_cli_dir_create: {
+    properties: ["cliDeviceId", "path", "parents", "mode", "reason", "confirm"],
+    required: ["cliDeviceId", "path", "confirm"],
+  },
+  forwarder_cli_file_delete: {
+    properties: ["cliDeviceId", "path", "expectedEtag", "reason", "confirm"],
+    required: ["cliDeviceId", "path", "confirm"],
+  },
+};
+
 function advertised(tool: Tool): Json {
   return tool.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
 }
@@ -133,11 +228,18 @@ function procedureInput(target: string): z.ZodType | undefined {
 }
 
 const procedureTools = MCP_TOOL_MANIFEST.filter((tool) => !tool.target.startsWith("core:"));
-const coreTools = MCP_TOOL_MANIFEST.filter((tool) => tool.target.startsWith("core:"));
+const isFileTool = (tool: Tool) => Object.hasOwn(FILE_TOOL_PINS, tool.name);
+const fileTools = MCP_TOOL_MANIFEST.filter(isFileTool);
+const coreTools = MCP_TOOL_MANIFEST.filter(
+  (tool) => tool.target.startsWith("core:") && !isFileTool(tool),
+);
 
 describe("advertised schema equals the procedure schema plus declared overlays", () => {
   it("covers every procedure-backed tool and every core", () => {
-    expect(procedureTools.length + coreTools.length).toBe(MCP_TOOL_MANIFEST.length);
+    expect(procedureTools.length + coreTools.length + fileTools.length).toBe(
+      MCP_TOOL_MANIFEST.length,
+    );
+    expect(fileTools).toHaveLength(9);
     expect(procedureTools.length).toBeGreaterThan(70);
     expect(coreTools.map((tool) => tool.name).sort()).toEqual(Object.keys(CORE_SCHEMAS).sort());
   });
@@ -228,6 +330,36 @@ describe("advertised schema equals the procedure schema plus declared overlays",
     expect(advertised(byName.get("forwarder_affinity_stats_get")!).required).toEqual(["poolId"]);
     expect(advertised(byName.get("model_api_tokens_preview")!).required).toEqual(["scopeMode"]);
   });
+
+  it.each(fileTools.map((tool) => [tool.name, tool] as const))(
+    "%s: file tool advertises its pinned fields, the shared shape's schema, and its confirmation",
+    (name, tool) => {
+      const json = advertised(tool) as {
+        properties: Record<string, Json>;
+        required: string[];
+        additionalProperties: unknown;
+      };
+      const pin = FILE_TOOL_PINS[name];
+      const confirm = tool.confirmation === null ? [] : ["confirm"];
+      expect(Object.keys(json.properties).sort()).toEqual([...(pin?.properties ?? [])].sort());
+      expect([...json.required].sort()).toEqual([...(pin?.required ?? [])].sort());
+      expect(json.additionalProperties).toEqual({});
+      const op = FILE_TOOLS.find((entry) => entry.name === name)?.op;
+      const shape = { cliDeviceId: z.string().min(1).max(128), ...fileToolArgShapes[op ?? "read"] };
+      const expected = toInputJsonSchema(z.looseObject(shape)) as {
+        properties: Record<string, Json>;
+      };
+      for (const field of Object.keys(expected.properties)) {
+        expect(json.properties[field], `${name}.${field}`).toEqual(expected.properties[field]);
+      }
+      expect(
+        Object.keys(json.properties).filter((field) => !(field in expected.properties)),
+      ).toEqual(confirm);
+      if (tool.confirmation !== null) {
+        expect(json.properties.confirm).toMatchObject({ const: tool.confirmation });
+      }
+    },
+  );
 
   it.each(coreTools.map((tool) => [tool.name, tool] as const))(
     "%s: extracted core advertises exactly its pinned argument schema",

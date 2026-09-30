@@ -37,6 +37,7 @@ import {
   closeRevokedCliCredentialSessions,
   deleteCliDeviceAndCredentials,
 } from "../lib/cli-credential-access";
+import { fileToolsSummary } from "../lib/cli-file-access";
 import {
   cliHeartbeatIsStale,
   cliHeartbeatStaleAt,
@@ -438,6 +439,7 @@ const listCliDevicesSelect = {
   reportedMcpCommandMode: true,
   reportedTerminalApproval: true,
   reportedTerminalSupported: true,
+  reportedAllowFileToolsAsRoot: true,
   rejectedRelayProtocolVersion: true,
   rejectedCliVersion: true,
   relayRejectedAt: true,
@@ -713,6 +715,9 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
   const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
+  // Node file tools (relay 2.8) follow the same effective mode through the one
+  // file matrix; a CLI that is offline or older than 2.8 runs none.
+  const fileToolsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.8");
   const refusals = mcpCommandRefusals({
     grant: commandsGrant,
     live:
@@ -762,6 +767,14 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
       : null,
     nodeInfoAt: row.nodeInfoAt ?? null,
     nodeMetricsAt: row.nodeMetricsAt ?? null,
+    /**
+     * What the MCP node file tools may do on this device right now
+     * (`headless`, `supervised` = needs a person, or `off`), from the effective
+     * command mode; agents read it instead of trying calls.
+     */
+    fileTools: fileToolsSummary(fileToolsLive ? commandsEffective : "off"),
+    /** `allowFileToolsAsRoot` in the CLI's config: live when connected, else the last report. */
+    allowFileToolsAsRoot: live?.allowFileToolsAsRoot ?? row.reportedAllowFileToolsAsRoot ?? null,
     features: {
       terminal: {
         granted: row.allowHumanTerminal === true,

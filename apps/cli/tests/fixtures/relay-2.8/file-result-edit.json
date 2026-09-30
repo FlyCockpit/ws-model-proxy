@@ -1,0 +1,15 @@
+{
+  "type": "file.result",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "edit",
+  "result": {
+    "etag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+    "previousEtag": "h:BBBBBBBBBBBBBBBBBBBBBB",
+    "added": 6,
+    "removed": 5,
+    "applied": true,
+    "diff": "@@ -14 +14 @@\n-a\n+b\n",
+    "hunks": [[14, 1]],
+    "resolvedPath": "/home/u/cfg.yaml"
+  }
+}
