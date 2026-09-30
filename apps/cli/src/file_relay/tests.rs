@@ -681,7 +681,9 @@ fn supervised_runtime_delivers_io_error_when_apply_panics() {
     let dir = tempfile::tempdir().expect("dir");
     let file = dir.path().join("file.txt");
     std::fs::write(&file, "before\n").expect("fixture");
-    let policy = Policy::from_environment(Vec::new(), true).with_euid(1000);
+    use std::os::unix::fs::MetadataExt;
+    let policy = Policy::from_environment(Vec::new(), true)
+        .with_euid(std::fs::metadata(&file).expect("fixture owner").uid());
     let (boundary_tx, boundary_rx) = std::sync::mpsc::sync_channel(1);
     let ops =
         FileOps::new(policy, EtagKey::from_bytes([7; 32])).with_step_hook(Arc::new(move |step| {
@@ -703,6 +705,11 @@ fn supervised_runtime_delivers_io_error_when_apply_panics() {
             &cancel,
         )
         .expect("prepare");
+    assert_eq!(
+        prepared.child_input().blocked,
+        None,
+        "panic seam must be reachable"
+    );
     let (tx, rx) = channel();
     runtime
         .apply_supervised(prepared, cancel, move |outcome| {

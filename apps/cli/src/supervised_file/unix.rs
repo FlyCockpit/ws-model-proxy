@@ -321,7 +321,7 @@ fn body_rows(display: &Display, requester: &str, reason: &str, width: usize) -> 
                 field(&mut rows, "Details: ", detail, width);
             }
             if !diff.is_empty() {
-                wrap_words(&mut rows, "Masked unified diff:", width);
+                wrap_words(&mut rows, "Unified diff (disk content masked):", width);
                 for line in diff {
                     field(&mut rows, "    ", line.trim_end_matches('\n'), width);
                 }

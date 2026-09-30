@@ -135,13 +135,21 @@ on the CLI-drawn screen to apply it, or `q` to decline. Pending list and browser
 use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` expresses
 the agent's intent; it does not replace the person's keypress. The screen shows the
 operation, resolved physical path, optional reason, and a unified diff with one context
-line capped at 8 KiB. The CLI computes and masks that diff from the real file on disk;
-the server cannot supply or forge it. Secret-class paths remain read-only and are
+line computed independently from the real file on disk; the server cannot supply
+or forge it. Only disk-derived removed/context lines are masked. Requester-authored
+added lines are shown verbatim with controls/invisible characters escaped. A diff
+whose complete escaped display exceeds 8 KiB is blocked with `too_large` after the
+person dismisses the cannot-apply screen; no hidden hunk can be approved. Details
+show byte counts, mode in octal (explicit or effective default), `ifExists`, parent
+creation and rename overwrite where applicable. Secret-class paths remain read-only and are
 refused `secret_file`. Path policy is checked before display and again at apply, and
 the daemon rechecks the etag: a file changed between display and approval returns
 `conflict` and nothing is written for that mismatch. Since this apply-time error
 arrives after acceptance with only a code, the server still reports an unknown outcome.
-Supervised `edit.dryRun:true` returns `invalid_input`.
+Supervised `edit.dryRun:true` returns `invalid_input`. On macOS, supervised rename
+with overwrite of an existing destination (or a directory no-replace move) is
+refused `unsupported`: no unsafe rename fallback is used. Regular-file no-replace
+moves remain available when the filesystem supports hard links.
 No headless read grant is implied by supervised approval.
 
 Poll `forwarder_cli_command_result` with the returned id. It reports the shared
@@ -155,12 +163,17 @@ display. Decline returns code `declined`, definitively applying nothing.
 Confirm waits expire after 15 minutes, using the same stop grace as commands.
 After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
 sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
-Session loss reports `offline`; its outcome is unknown only after acceptance.
+Session loss reports `offline`. Once `term.spawn` was dispatched, server termination
+without authoritative CLI settlement carries `outcome:"unknown"` and `started:null`,
+even before the server receives acceptance: acceptance and apply may be in flight.
+This includes confirm expiry/stop grace, token revoke/expiry, and grant changes.
+The audit records unknown exactly once; late frames cannot change a finished result.
 Every non-success after acceptance has `outcome:"unknown"`, including CLI
 `conflict`, `not_found`, `io_error`, `cancelled` and `timeout`, token inactivity and
 mode changes. The CLI sends only the error code, so the server cannot distinguish
 an apply-time pinned-etag mismatch before commit from an ambiguous failure after
-commit. Before acceptance, timeout/offline and CLI errors are definitively not applied.
+commit. Undispatched admission/spawn-send failures, CLI decline/rejection and a
+blocked-screen `done{fileError}` before acceptance are definitively not applied.
 The daemon honors cancellation only before the atomic commit point. Ask the person to inspect the file
 before retrying an unknown result; use file_stat only if a read grant permits it.
 The earliest expiry carried by the token row or the admitted credential ends a

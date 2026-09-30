@@ -1,6 +1,6 @@
 {
   "type": "term.spawn",
-  "terminalId": "ECEiIzQ1RldnaHmKm6y9zg",
+  "terminalId": "AQEBAQEBAQEBAQEBAQEBAQ",
   "commandId": "AAECAwQFBgcICQoLDA0ODw",
   "command": "file edit ~/cfg.yaml",
   "reason": "raise context",

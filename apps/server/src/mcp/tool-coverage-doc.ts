@@ -36,8 +36,16 @@ const FOOTER = `## Supervised CLI file writes
 
 The five file mutation tools return a supervised request id when the node's effective
 mode is supervised. A person's keypress on the CLI-drawn screen is required; the CLI
-computes the masked diff from disk. Poll \`forwarder_cli_command_result\` for
+computes a complete diff from disk, masks disk-derived removed/context lines only,
+and shows requester-authored additions with controls escaped. Details discloses
+creation mode, parent creation, ifExists, overwrite and byte counts. Diffs exceeding
+the 8 KiB display cap are blocked with too_large after dismissal. macOS refuses
+supervised rename overwrite of an existing destination with unsupported. Poll \`forwarder_cli_command_result\` for
 \`file:{op,result}\` or \`error:{code,message,outcome?}\`. Approval implies no read grant.
+Server termination after dispatch without authoritative CLI settlement is unknown
+with started:null even before acceptance reaches the server. CLI decline/rejection
+and blocked done before acceptance, and undispatched failures remain definitive.
+Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
 the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
 

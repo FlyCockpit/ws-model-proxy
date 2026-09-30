@@ -108,7 +108,7 @@ impl SizeBudget {
 
 pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     validate_args(args)?;
-    edit_validated(ops, args, None, cancel)
+    edit_validated(ops, args, None, cancel, DiffAudience::Mcp).map(|(result, _)| result)
 }
 
 pub(crate) fn edit_supervised(
@@ -118,7 +118,26 @@ pub(crate) fn edit_supervised(
     cancel: &Cancel,
 ) -> FileResult<EditResult> {
     validate_args(args)?;
-    edit_validated(ops, args, Some(pin), cancel)
+    edit_validated(ops, args, Some(pin), cancel, DiffAudience::Mcp).map(|(result, _)| result)
+}
+
+#[derive(Clone, Copy)]
+enum DiffAudience {
+    Mcp,
+    Consent,
+}
+
+/// This entry point always previews; it can never commit a filesystem change.
+pub(crate) fn consent_preview(
+    ops: &FileOps,
+    args: &EditArgs,
+    cancel: &Cancel,
+) -> FileResult<(EditResult, usize)> {
+    validate_args(args)?;
+    let mut args = args.clone();
+    args.dry_run = Some(true);
+    args.return_diff = Some(true);
+    edit_validated(ops, &args, None, cancel, DiffAudience::Consent)
 }
 
 pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
@@ -166,7 +185,8 @@ fn edit_validated(
     args: &EditArgs,
     pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
-) -> FileResult<EditResult> {
+    audience: DiffAudience,
+) -> FileResult<(EditResult, usize)> {
     let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
@@ -297,7 +317,10 @@ fn edit_validated(
             "the edit would expose a redacted value; masked text cannot change context",
         ));
     }
-    let summary = diff_lines(&view.text, &after_view.text);
+    let mut summary = diff_lines(&view.text, &after_view.text);
+    if matches!(audience, DiffAudience::Consent) {
+        summary.diff = super::diff::consent_diff(original_text, updated_text, &view)?;
+    }
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
     } else {
@@ -309,28 +332,34 @@ fn edit_validated(
         if let Some(pin) = pin {
             pin.verify(ops, &resolved, Access::Write, cancel)?;
         }
-        return Ok(EditResult {
-            etag: previous_etag.clone(),
-            previous_etag,
-            added: 0,
-            removed: 0,
-            applied: false,
-            diff,
-            hunks,
-            resolved_path: echo,
-        });
+        return Ok((
+            EditResult {
+                etag: previous_etag.clone(),
+                previous_etag,
+                added: 0,
+                removed: 0,
+                applied: false,
+                diff,
+                hunks,
+                resolved_path: echo,
+            },
+            updated.len(),
+        ));
     }
     if args.dry_run.unwrap_or(false) {
-        return Ok(EditResult {
-            etag: previous_etag.clone(),
-            previous_etag,
-            added: summary.added,
-            removed: summary.removed,
-            applied: false,
-            diff,
-            hunks,
-            resolved_path: echo,
-        });
+        return Ok((
+            EditResult {
+                etag: previous_etag.clone(),
+                previous_etag,
+                added: summary.added,
+                removed: summary.removed,
+                applied: false,
+                diff,
+                hunks,
+                resolved_path: echo,
+            },
+            updated.len(),
+        ));
     }
 
     cancel.check()?;
@@ -357,16 +386,19 @@ fn edit_validated(
             cancel,
         )?,
     };
-    Ok(EditResult {
-        etag: ops.key.strong(&new_stat, &updated),
-        previous_etag,
-        added: summary.added,
-        removed: summary.removed,
-        applied: true,
-        diff,
-        hunks,
-        resolved_path: echo,
-    })
+    Ok((
+        EditResult {
+            etag: ops.key.strong(&new_stat, &updated),
+            previous_etag,
+            added: summary.added,
+            removed: summary.removed,
+            applied: true,
+            diff,
+            hunks,
+            resolved_path: echo,
+        },
+        updated.len(),
+    ))
 }
 
 /// In a uniformly CRLF file, a bare `\n` in the request means `\r\n`.

@@ -160,7 +160,10 @@ fn real_child_masks_disk_diff_and_enter_never_applies() {
         String::from_utf8_lossy(&child.seen)
     );
     let screen = String::from_utf8_lossy(&child.seen);
-    assert!(screen.contains("Masked unified diff:"), "{screen}");
+    assert!(
+        screen.contains("Unified diff (disk content masked):"),
+        "{screen}"
+    );
     assert!(screen.contains("redacted"), "{screen}");
     assert!(!screen.contains("fixture-value-not-a-real-credential"));
     assert!(screen.contains("\\u{202e}\\u{1b}"), "{screen}");
@@ -232,7 +235,10 @@ fn mismatched_preview_token_becomes_blocked_before_diff_is_drawn() {
     let screen = String::from_utf8_lossy(&child.seen);
     assert!(screen.contains("cannot be applied"), "{screen}");
     assert!(screen.contains("conflict"), "{screen}");
-    assert!(!screen.contains("Masked unified diff:"), "{screen}");
+    assert!(
+        !screen.contains("Unified diff (disk content masked):"),
+        "{screen}"
+    );
     child.send(b"q");
     assert!(child.wait_for(&PtyChild::marker("blocked;conflict")));
     child.child.wait().expect("mismatch child exits");
@@ -296,4 +302,33 @@ fn gap_real_child_decline_keys_apply_nothing_for_all_five_operations() {
             );
         }
     }
+}
+
+#[test]
+fn oversized_real_child_blocks_after_dismissal_without_accepting_or_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("plain.txt");
+    std::fs::write(&target, b"old\n").unwrap();
+    let input = prepare(
+        dir.path(),
+        "edit",
+        json!({"path":target,"edits":[{"oldText":"old","newText":"padding".repeat(1500)}]}),
+        None,
+    );
+    assert_eq!(input.blocked, Some(wsmp::file_ops::ErrorCode::TooLarge));
+    let mut child = PtyChild::spawn(&input, None);
+    assert!(child.wait_for(&PtyChild::marker("ready")));
+    let screen = String::from_utf8_lossy(&child.seen);
+    assert!(screen.contains("cannot be applied"), "{screen}");
+    assert!(screen.contains("too_large"), "{screen}");
+    child.send(b"\r");
+    assert!(child.wait_for(&PtyChild::marker("blocked;too_large")));
+    assert!(
+        !child
+            .seen
+            .windows(PtyChild::marker("accepted").len())
+            .any(|part| part == PtyChild::marker("accepted"))
+    );
+    child.child.wait().expect("blocked child exits");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old\n");
 }

@@ -651,6 +651,9 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
           started.error === "invalid_command" || started.error === "invalid_reason"
             ? "invalid_input"
             : started.error,
+        ...(started.rejectedProtocolVersion
+          ? { rejectedProtocolVersion: started.rejectedProtocolVersion }
+          : {}),
       };
     return {
       ok: true,

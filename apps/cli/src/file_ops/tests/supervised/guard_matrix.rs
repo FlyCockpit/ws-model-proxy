@@ -41,7 +41,9 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
                     meta.mode(),
                     meta.uid(),
                     meta.gid(),
-                    meta.nlink(),
+                    // Directory nlink may count staged children on APFS. Their
+                    // cleanup is intentional; explicit child names remain checked.
+                    if meta.is_file() { meta.nlink() } else { 0 },
                     bytes,
                 ),
             );
@@ -130,6 +132,19 @@ fn run(row: Row) {
         _ => ("rename", json!({"from":source,"to":destination}), None),
     };
     let prepared = prepare(&fx, op, args, body);
+    if row.operand == "rename-overwrite"
+        && fx.ops.rename_atomic_capability() != RenameAtomicCapability::Kernel
+    {
+        assert_eq!(
+            prepared.child_input().blocked,
+            Some(ErrorCode::Unsupported),
+            "{row:?}"
+        );
+        assert_eq!(fx.get("parent/source"), "old\n");
+        assert_eq!(fx.get("parent/destination"), "destination\n");
+        assert!(fx.leftovers("parent").is_empty());
+        return;
+    }
     assert_eq!(prepared.child_input().blocked, None, "{row:?}");
     let root = fx.root.clone();
     let snapshot = Arc::new(Mutex::new(tree(&root)));
@@ -486,4 +501,30 @@ fn supervised_write_open_race_is_bound_by_the_commit_checks() {
         restore: None,
         no_op: false,
     });
+}
+
+#[test]
+fn snapshot_ignores_staged_directory_links_but_preserves_regular_file_links() {
+    let fx = Fx::new();
+    std::fs::create_dir(fx.root.join("parent")).unwrap();
+    fx.put("parent/source", "old\n");
+    let before = tree(&fx.root);
+    // Model APFS's directory nlink changing with a hidden staged child. A
+    // directory makes that change observable on Linux as well.
+    std::fs::create_dir(fx.root.join("parent/.wsmp-staged")).unwrap();
+    assert_eq!(tree(&fx.root), before, "staged child cleanup is legitimate");
+    std::fs::remove_dir(fx.root.join("parent/.wsmp-staged")).unwrap();
+    assert_eq!(tree(&fx.root), before);
+    std::fs::hard_link(
+        fx.root.join("parent/source"),
+        fx.root.join("parent/.wsmp-link"),
+    )
+    .unwrap();
+    assert_ne!(
+        tree(&fx.root),
+        before,
+        "regular-file nlink remains a checked guard"
+    );
+    std::fs::remove_file(fx.root.join("parent/.wsmp-link")).unwrap();
+    assert_eq!(tree(&fx.root), before);
 }

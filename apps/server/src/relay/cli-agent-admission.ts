@@ -235,7 +235,6 @@ function liveFeatures(cliDeviceId: string) {
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: "headless_exec" | "supervised",
-  options?: { fileWrite: true },
 ): CliCommandAdmissionVerdict;
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
@@ -305,6 +304,13 @@ export function judgeCliAgentAdmission(
     : allowsSupervisedCommands;
   if (!permitsSupervised(grant)) return { ok: false, error: "grant_disabled" };
   const live = liveFeatures(input.cliDeviceId);
+  if (!live && options?.fileWrite && device.rejectedRelayProtocolVersion) {
+    return {
+      ok: false,
+      error: "upgrade_required",
+      rejectedProtocolVersion: device.rejectedRelayProtocolVersion,
+    };
+  }
   if (
     !live ||
     !relayProtocolAtLeast(live.protocolVersion, options?.fileWrite ? "2.8" : "2.6") ||

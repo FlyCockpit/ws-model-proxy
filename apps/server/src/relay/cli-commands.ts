@@ -612,6 +612,8 @@ type SupervisedRecord = {
   status: SupervisedCommandStatus;
   createdAt: number;
   spawnedAt: number | null;
+  /** Successful term.spawn dispatch, independent of the CLI spawned acknowledgement. */
+  dispatched: boolean;
   acceptedAt: number | null;
   finishedAt: number | null;
   /** The MCP token's own expiry. */
@@ -639,8 +641,8 @@ type SupervisedRecord = {
    */
   stopRequested: "expire" | "decline" | null;
   /**
-   * The CLI's last word on this command arrived (its terminal exit, decline
-   * or rejection), so `acceptedAt === null` means the command never started.
+   * Authoritative CLI settlement: command exit, or file declined/rejected/done.
+   * A file terminal exit alone cannot prove that its daemon did not apply.
    */
   cliSettled: boolean;
 };
@@ -741,7 +743,9 @@ function finishSupervised(
                   : "cancelled");
     record.fileError = {
       code,
-      ...(record.acceptedAt !== null ? { outcome: "unknown" as const } : {}),
+      ...(record.acceptedAt !== null || (record.dispatched && !record.cliSettled)
+        ? { outcome: "unknown" as const }
+        : {}),
     };
   }
   auditSupervisedCommand(record, status);
@@ -873,12 +877,10 @@ function requestSupervisedStop(record: SupervisedRecord, why: "expire" | "declin
 }
 
 function startedOf(record: SupervisedRecord): boolean | null {
-  if (
-    record.requestKind === "file" &&
-    record.acceptedAt === null &&
-    !isActiveSupervised(record.status)
-  )
-    return false;
+  if (record.requestKind === "file" && !isActiveSupervised(record.status)) {
+    if (record.dispatched && !record.cliSettled) return null;
+    return record.acceptedAt !== null;
+  }
   if (
     record.acceptedAt !== null ||
     (record.requestKind === "command" && record.status === "exited")
@@ -921,10 +923,11 @@ function goneReason(cause: SupervisedTerminalGoneCause): string {
 
 function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
   // File settle table (CLI answers never carry detail):
-  // - before accepted: fileError is definitive; success is forbidden;
+  // - CLI fileError before accepted is definitive; success is forbidden;
   // - after accepted: every non-success is unknown (apply may have committed);
   // - fileError has only a code, so even a pre-commit conflict is indistinguishable;
-  // - server termination follows the same acceptance rule;
+  // - server termination after dispatch is unknown without authoritative CLI settlement;
+  // - finished file answers and their single audit event are immutable;
   // - expired credentials never deliver a file answer, even before the timer runs.
   return {
     commandId: record.commandId,
@@ -942,6 +945,7 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       if (record.status !== "awaiting_user") return;
       // The wire accepts any string here: store a known code or the fallback,
       // never CLI-supplied text (see `cliAgentWireReason`).
+      record.cliSettled = true;
       finishSupervised(record, "rejected", {
         rejectionReason: cliAgentWireReason(reason.slice(0, 64)),
         ...(record.requestKind === "file"
@@ -982,7 +986,7 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       // Reports for a request the server already ended (token revoked,
       // policy, End session, disconnect of the terminal): they only say
       // whether the command had started. No output is taken from them.
-      if (isActiveSupervised(record.status)) return;
+      if (isActiveSupervised(record.status) || record.requestKind === "file") return;
       if (report === "accepted") {
         if (record.acceptedAt === null) record.acceptedAt = Date.now();
         if (record.fileError) record.fileError = { ...record.fileError, outcome: "unknown" };
@@ -1046,8 +1050,8 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       exitSupervised(record, "shared");
     },
     onTerminalGone(cause) {
-      // `exit` is the CLI's own report that the terminal ended.
-      if (cause === "exit") record.cliSettled = true;
+      // A file confirm child exit does not settle the daemon-owned apply job.
+      if (cause === "exit" && record.requestKind === "command") record.cliSettled = true;
       if (record.status === "awaiting_output_review") {
         // The reviewer's terminal is gone and the capture with it.
         exitSupervised(record, "redacted");
@@ -1134,7 +1138,11 @@ export type StartSupervisedRequestInput = SupervisedRequestIdentity &
   );
 export type SupervisedStartResult =
   | { ok: true; commandId: string; terminalId: string; expiresAt: string }
-  | { ok: false; error: CliCommandRejection | "invalid_input" };
+  | {
+      ok: false;
+      error: CliCommandRejection | "invalid_input" | "upgrade_required";
+      rejectedProtocolVersion?: string;
+    };
 
 export async function startSupervisedCommand(
   input: SupervisedRequestIdentity & {
@@ -1148,7 +1156,12 @@ export async function startSupervisedCommand(
   if (result.ok) return result;
   return {
     ok: false as const,
-    error: result.error === "invalid_input" ? ("invalid_command" as const) : result.error,
+    error:
+      result.error === "invalid_input"
+        ? ("invalid_command" as const)
+        : result.error === "upgrade_required"
+          ? ("offline" as const)
+          : result.error,
   };
 }
 
@@ -1267,6 +1280,7 @@ async function admitSupervisedRequest(
     status: "awaiting_user",
     createdAt: now,
     spawnedAt: null,
+    dispatched: false,
     acceptedAt: null,
     finishedAt: null,
     tokenExpiresAt:
@@ -1323,6 +1337,7 @@ async function admitSupervisedRequest(
     const refusal = relaySessionManager.commandModeRefusal(input.cliDeviceId, "supervised");
     return { ok: false, error: refusal ?? "offline" };
   }
+  record.dispatched = true;
   supervisedById.set(record.commandId, record);
   lifecycle.record = record;
   armWait(record, SUPERVISED_CONFIRM_TTL_MS, () => {

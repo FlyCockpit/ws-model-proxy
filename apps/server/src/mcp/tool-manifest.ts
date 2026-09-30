@@ -1326,7 +1326,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    descriptionNote: `Poll commands or supervised file requests by commandId. Files return file:{op,result} or error:{code,message,outcome?}; no diff/hunks or file error detail is returned. Every non-success after acceptance carries outcome unknown, including any CLI fileError code (conflict, not_found, io_error, cancelled or timeout), token inactivity and mode changes; before acceptance errors are definitive. ${CLI_COMMAND_OUTPUT_NOTICE}`,
+    descriptionNote: `Poll commands or supervised file requests by commandId. Files return file:{op,result} or error:{code,message,outcome?}; no diff/hunks or file error detail is returned. Every non-success after acceptance carries outcome unknown, including any CLI fileError code (conflict, not_found, io_error, cancelled or timeout), token inactivity and mode changes. Server termination after term.spawn dispatch is also unknown with started:null before acceptance, since apply may already have started. Only undispatched admission/spawn-send failures and authoritative CLI decline/rejection/blocked done are definitively not applied; late reports cannot change finished file results. ${CLI_COMMAND_OUTPUT_NOTICE}`,
     coreShape: { commandId: z.string(), progress: z.boolean().optional() },
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),

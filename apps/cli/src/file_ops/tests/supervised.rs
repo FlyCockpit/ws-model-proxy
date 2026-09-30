@@ -588,7 +588,7 @@ fn preview_masks_assignment_values_in_plain_files() {
 }
 
 #[test]
-fn new_write_preview_masks_body_assignments_and_leaves_disk_unchanged() {
+fn new_write_preview_shows_body_assignments_and_leaves_disk_unchanged() {
     let fx = Fx::new();
     let fixture = include_str!("../../../tests/fixtures/masking/supervised-file.txt");
     let secret = fixture
@@ -614,15 +614,12 @@ fn new_write_preview_masks_body_assignments_and_leaves_disk_unchanged() {
         )
         .expect("preview");
     let SupervisedPreview::Allowed(allowed) = preview else {
-        panic!("expected masked write preview");
+        panic!("expected visible write preview");
     };
     let diff = allowed.diff.join("\n");
-    assert!(diff.contains("+⟦redacted line⟧"), "{diff}");
-    assert!(
-        !diff.contains("masked-adjacent=old"),
-        "the following line is masked: {diff}"
-    );
-    assert!(!diff.contains(secret), "{diff}");
+    assert!(diff.contains("+DEMO_TOKEN="), "{diff}");
+    assert!(diff.contains("+masked-adjacent=old"), "{diff}");
+    assert!(diff.contains(secret), "{diff}");
     assert!(!fx.root.join("new.conf").exists());
 }
 
@@ -945,6 +942,11 @@ fn gap_apply_rechecks_hardlinks_and_owner_for_every_existing_file_operand() {
                     Some(b"new\n".to_vec()),
                 ),
                 "delete" => ("delete", json!({"path":fx.p("source")}), None),
+                "rename-source" => (
+                    "rename",
+                    json!({"from":fx.p("source"),"to":fx.p("absent")}),
+                    None,
+                ),
                 _ => (
                     "rename",
                     json!({"from":fx.p("source"),"to":fx.p("destination"),"overwrite":true,"expectedEtag":fx.etag("destination")}),
@@ -952,6 +954,14 @@ fn gap_apply_rechecks_hardlinks_and_owner_for_every_existing_file_operand() {
                 ),
             };
             let prepared = prepare(&fx, operation, args.clone(), body.clone());
+            if op == "rename-destination"
+                && fx.ops.rename_atomic_capability() != RenameAtomicCapability::Kernel
+            {
+                assert_eq!(prepared.child_input().blocked, Some(ErrorCode::Unsupported));
+                assert_eq!(fx.get("source"), "old\n");
+                assert_eq!(fx.get("destination"), "destination\n");
+                continue;
+            }
             assert_eq!(prepared.child_input().blocked, None, "{op}");
             let affected = if op == "rename-destination" {
                 "destination"
@@ -1010,18 +1020,11 @@ fn gap_apply_refuses_replacement_with_hardlinked_inode_after_preview() {
                 Some(b"new\n".to_vec()),
             ),
             "delete" => (json!({"path":fx.p("source")}), None),
-            _ => (
-                json!({"from":fx.p("source"),"to":fx.p("destination"),"overwrite":true,"expectedEtag":fx.etag("destination")}),
-                None,
-            ),
+            _ => (json!({"from":fx.p("source"),"to":fx.p("absent")}), None),
         };
         let prepared = prepare(&fx, op, args, body);
         assert_eq!(prepared.child_input().blocked, None);
-        let affected = if op == "rename" {
-            "destination"
-        } else {
-            "source"
-        };
+        let affected = "source";
         fx.put("replacement", fx.get(affected));
         std::fs::remove_file(fx.root.join(affected)).unwrap();
         std::fs::hard_link(fx.root.join("replacement"), fx.root.join(affected)).unwrap();
@@ -1037,6 +1040,7 @@ fn gap_apply_refuses_replacement_with_hardlinked_inode_after_preview() {
     }
 }
 
+mod consent;
 mod guard_matrix;
 
 #[test]

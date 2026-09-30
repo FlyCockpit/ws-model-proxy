@@ -547,7 +547,7 @@ fn gap_registry_reports_stale_etag_conflict_without_changing_disk() {
             ),
             "delete" => (serde_json::json!({"path":source}), None),
             _ => (
-                serde_json::json!({"from":source,"to":destination,"overwrite":true,"expectedEtag":key.strong(&crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&destination).unwrap()), b"destination\n")}),
+                serde_json::json!({"from":source,"to":dir.path().join("absent")}),
                 None,
             ),
         };
@@ -575,11 +575,7 @@ fn gap_registry_reports_stale_etag_conflict_without_changing_disk() {
             |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
         );
         let private = gap_private_body(&terminals);
-        let affected = if op == "rename" {
-            &destination
-        } else {
-            &source
-        };
+        let affected = &source;
         std::fs::write(affected, b"old\nraced context\n").unwrap();
         let before_go = gap_disk_tree(dir.path());
         let mut viewer = TestViewer::new(91);
@@ -655,7 +651,7 @@ fn gap_agent_etag_mismatch_draws_blocked_screen_before_reporting_conflict() {
 }
 
 #[test]
-fn gap_registry_child_screen_ignores_spawn_summary_and_masks_nonsecret_content() {
+fn gap_registry_child_screen_ignores_spawn_summary_and_masks_only_disk_content() {
     let fixture = include_str!("../../tests/fixtures/masking/supervised-file.txt");
     let secret = fixture.lines().next().unwrap().split_once('=').unwrap().1;
     for op in ["edit", "write"] {
@@ -700,13 +696,15 @@ fn gap_registry_child_screen_ignores_spawn_summary_and_masks_nonsecret_content()
         let screen =
             crate::supervised_file::screen_from_registry_env(&terminals.file_child_env).unwrap();
         assert!(screen.contains("REAL FILE REASON"), "{op}: {screen}");
-        assert!(screen.contains("Masked unified diff:"), "{op}: {screen}");
-        assert!(screen.contains("⟦redacted line⟧"), "{op}: {screen}");
-        assert!(
-            !screen.contains("masked-adjacent=old"),
-            "{op}: exposed following line"
-        );
-        assert!(!screen.contains(secret), "{op}: exposed fixture value");
+        assert!(screen.contains("Unified diff (disk content masked):"), "{op}: {screen}");
+        if op == "edit" {
+            assert!(screen.contains("⟦redacted line⟧"), "{op}: {screen}");
+            assert!(!screen.contains("masked-adjacent=old"), "{op}: exposed disk line");
+            assert!(!screen.contains(secret), "{op}: exposed disk value");
+        } else {
+            assert!(screen.contains("+masked-adjacent=old"), "{op}: hidden addition");
+            assert!(screen.contains(secret), "{op}: hidden addition");
+        }
         assert!(!screen.contains(&request.command));
         assert!(!screen.contains(request.reason.as_ref().unwrap()));
         assert!(

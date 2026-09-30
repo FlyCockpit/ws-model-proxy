@@ -1,6 +1,7 @@
 //! Compact unified diffs for edit/write results (plan section 2.1): one line of
 //! context, hunks only (no file header), capped at 8 KiB. Callers pass the
-//! **masked** before/after views, so the diff never carries a secret.
+//! **masked** before/after views for MCP results. Consent previews instead use
+//! raw changes, mapping only disk-derived lines to their masked pre-image.
 
 use std::time::Duration;
 
@@ -58,6 +59,60 @@ pub fn diff_lines(before: &str, after: &str) -> DiffSummary {
         removed,
         hunks,
     }
+}
+
+/// A complete consent diff: additions are requester-authored, while deletions
+/// and context come only from the independently masked disk pre-image. Never
+/// re-diff masked text: that would turn unchanged disk secrets into additions.
+pub(crate) fn consent_diff(
+    before: &str,
+    after: &str,
+    masked: &super::redact::MaskedView,
+) -> super::error::FileResult<String> {
+    use super::error::{ErrorCode, FileError};
+    if masked.long_construct {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "cannot fully mask the disk pre-image",
+        ));
+    }
+    let lines: Vec<&str> = masked.text.split_inclusive('\n').collect();
+    if lines.len() != before.split_inclusive('\n').count() {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "cannot map the disk pre-image",
+        ));
+    }
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(before, after);
+    let mut out = String::new();
+    for hunk in diff.unified_diff().context_radius(1).iter_hunks() {
+        out.push_str(&format!("{}\n", hunk.header()));
+        for change in hunk.iter_changes() {
+            let value = match change.old_index() {
+                Some(index) => *lines.get(index).ok_or_else(|| {
+                    FileError::new(ErrorCode::RedactedSpan, "cannot map a disk diff line")
+                })?,
+                None => change.value(),
+            };
+            out.push_str(&change.tag().to_string());
+            out.push_str(value);
+            if !value.ends_with('\n') {
+                out.push_str("\n\\ No newline at end of file\n");
+            }
+            // The terminal escapes controls/invisible characters. Account for
+            // that expansion too; padding must never hide an applicable hunk.
+            if crate::display_escape::escape_for_display(&out).len() > DIFF_MAX_BYTES {
+                return Err(FileError::new(
+                    ErrorCode::TooLarge,
+                    "the complete approval diff exceeds 8 KiB",
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn cap_hunks(hunks: &[String]) -> String {

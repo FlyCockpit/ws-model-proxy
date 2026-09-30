@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::atomic;
-use super::diff::diff_lines;
+use super::diff::consent_diff;
 use super::edit::{self, EditArgs};
 use super::error::{ErrorCode, FileError, FileResult};
 use super::mutate::{DeleteArgs, MkdirArgs, RenameArgs};
@@ -543,7 +543,7 @@ fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> File
     args.expected_etag = current.etag.clone();
     args.dry_run = Some(true);
     args.return_diff = Some(true);
-    let result = ops.edit(&args, cancel)?;
+    let (result, after_bytes) = edit::consent_preview(ops, &args, cancel)?;
     let diff = result
         .diff
         .unwrap_or_default()
@@ -554,7 +554,14 @@ fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> File
     args.return_diff = Some(false);
     Ok(Built {
         paths: vec![("path".to_string(), args.path.clone())],
-        description: vec![format!("{} edit(s)", args.edits.len())],
+        description: vec![
+            format!("{} edit(s)", args.edits.len()),
+            format!("mode: {:04o} (preserved)", current.stat.mode & 0o7777),
+            format!(
+                "before: {} bytes; after: {} bytes",
+                current.stat.size, after_bytes
+            ),
+        ],
         diff,
         fingerprints: vec![fingerprint],
         apply: PreparedOp::Edit(args, pin),
@@ -581,7 +588,7 @@ fn build_write(
         return_diff: Some(false),
         reason: supplied.reason,
     };
-    let (content, _, if_exists) = write::validate_args(&args)?;
+    let (content, mode, if_exists) = write::validate_args(&args)?;
     if text::sniff_binary(&content).is_some() || std::str::from_utf8(&content).is_err() {
         return Err(FileError::new(
             ErrorCode::BinaryFile,
@@ -668,23 +675,53 @@ fn build_write(
             args.expected_etag = object.etag.clone();
         }
     }
-    let diff = match (std::str::from_utf8(&content), text::sniff_binary(&content)) {
-        (Ok(after), None) => {
-            let class = redact::classify(&pin.physical);
-            diff_lines(
-                &redact::mask(class, &before).text,
-                &redact::mask(class, after).text,
-            )
-            .diff
-            .lines()
-            .map(str::to_string)
-            .collect()
-        }
-        _ => Vec::new(),
-    };
+    let after = std::str::from_utf8(&content).map_err(|_| {
+        FileError::new(
+            ErrorCode::BinaryFile,
+            "write content cannot be fully displayed",
+        )
+    })?;
+    let class = redact::classify(&pin.physical);
+    let diff = consent_diff(&before, after, &redact::mask(class, &before))?
+        .lines()
+        .map(str::to_string)
+        .collect();
     Ok(Built {
         paths: vec![("path".to_string(), args.path.clone())],
-        description: vec![format!("{} bytes", content.len())],
+        description: vec![
+            format!(
+                "before: {} bytes; after: {} bytes",
+                before.len(),
+                content.len()
+            ),
+            format!(
+                "mode: {:04o}{}",
+                mode.unwrap_or_else(|| pin
+                    .object
+                    .as_ref()
+                    .map_or(write::DEFAULT_CREATE_MODE, |object| object.stat.mode
+                        & 0o777)),
+                if if_exists == IfExists::Replace {
+                    " (preserved)"
+                } else {
+                    ""
+                }
+            ),
+            format!(
+                "ifExists: {}",
+                if if_exists == IfExists::Replace {
+                    "replace"
+                } else {
+                    "fail"
+                }
+            ),
+            format!(
+                "creates missing parent directories: {}",
+                args.make_parents.unwrap_or(false)
+            ),
+            format!("parent mode: {:04o}", write::DEFAULT_PARENT_MODE),
+            "creation permissions are reduced by the local umask".to_string(),
+        ],
         diff,
         fingerprints: vec![fingerprint],
         apply: PreparedOp::Write(args, pin),
@@ -888,7 +925,15 @@ fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> Fi
             ("source".to_string(), args.from.clone()),
             ("destination".to_string(), args.to.clone()),
         ],
-        description: vec![format!("overwrite: {overwrite}")],
+        description: vec![
+            format!("overwrite: {overwrite}"),
+            format!(
+                "source: {} bytes; destination: {} bytes",
+                src.stat.size,
+                to.object.as_ref().map_or(0, |dst| dst.stat.size)
+            ),
+            format!("mode: {:04o} (preserved)", src.stat.mode & 0o7777),
+        ],
         diff: Vec::new(),
         fingerprints: vec![from_fp, to_fp],
         apply: PreparedOp::Rename(args, from, Box::new(to)),
@@ -922,7 +967,21 @@ fn build_mkdir(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> Fil
     args.path = path_text(&pin.physical)?;
     Ok(Built {
         paths: vec![("path".to_string(), args.path.clone())],
-        description: vec![format!("create parents: {}", args.parents.unwrap_or(true))],
+        description: vec![
+            format!(
+                "creates missing parent directories: {}",
+                args.parents.unwrap_or(true)
+            ),
+            format!(
+                "mode: {:04o}",
+                args.mode
+                    .as_deref()
+                    .map(write::parse_mode)
+                    .transpose()?
+                    .unwrap_or(write::DEFAULT_PARENT_MODE)
+            ),
+            "creation permissions are reduced by the local umask".to_string(),
+        ],
         diff: Vec::new(),
         fingerprints: vec![fingerprint],
         apply: PreparedOp::Mkdir(args, pin),
