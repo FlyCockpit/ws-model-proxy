@@ -1429,6 +1429,7 @@ describe("model API routes", () => {
                     ageMs: (ages[member] ?? 30) * 1000,
                     tokens: 20_000,
                     overridePercent: null,
+                    inFlight: false,
                   },
                 ]
               : [],
@@ -1706,6 +1707,62 @@ describe("model API routes", () => {
         ["member-b"],
         ["member-b", "member-a"],
       ]);
+    });
+
+    it("C1b-1: warm conversations mid-turn do not send a new :external session external", async () => {
+      // C=4 with two active leases, both serving warm conversations of other
+      // users: both idle slots are empty, so the new session is admitted
+      // locally instead of going external with local_saturated_protected.
+      useExternalPlan();
+      db.poolMember.findMany.mockResolvedValue(members(1));
+      const session = (userId: string, inFlight: boolean) => ({
+        userId,
+        ageMs: 30_000,
+        tokens: 20_000,
+        overridePercent: null,
+        inFlight,
+      });
+      const load = (sessions: ReturnType<typeof session>[]) =>
+        warmProtection.load.mockResolvedValue({
+          activeByCapacity: new Map([["member-a-capacity", 2]]),
+          sessionsByCapacity: new Map([["member-a-capacity", sessions]]),
+        });
+      load([session("alice", true), session("bob", true)]);
+      const busy = scripted(["member-a"]);
+
+      const served = await serveLocal(busy.runtime, EXTERNAL_MODEL_ID);
+
+      expect(served.response.status).toBe(200);
+      expect(requireSent(served.manager).endpointSlug).toBe("member-a-endpoint");
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(served.response.headers.get("x-wsmp-fallback-reason")).toBeNull();
+
+      // The same load with those two conversations idle (their turns ended and
+      // other leases hold the busy slots): both idle slots hold protected
+      // sessions, so the external attempt is made first (the provider tier
+      // finds no slot here, so it then admits locally).
+      load([session("alice", false), session("bob", false)]);
+      publicOverflow.dispatch.mockClear();
+      const idle = scripted([null, "member-a"]);
+      const second = await serveLocal(idle.runtime, EXTERNAL_MODEL_ID);
+      expect(second.response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+    });
+
+    it("records the warm sessions the request continues on its admission attempt", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      kvPools({ a: "FREE", b: "FREE" });
+      affinity.rank.mockResolvedValue({
+        ...decision(true),
+        matchedSessionIds: { "member-a-target": "session-a" },
+      });
+      const continued = scripted(["member-a"]);
+      await serveLocal(continued.runtime, poolTarget.modelId);
+      expect(continued.acquire.mock.calls[0]?.[0].warmSessionIds).toEqual(["session-a"]);
+
+      affinity.rank.mockResolvedValue(decision());
+      const fresh = scripted(["member-a"]);
+      await serveLocal(fresh.runtime, poolTarget.modelId);
+      expect(fresh.acquire.mock.calls[0]?.[0].warmSessionIds).toEqual([]);
     });
 
     it("a continuation (affinity hit) is never blocked by protection", async () => {
@@ -13339,6 +13396,288 @@ describe("model API routes", () => {
     await response.text();
     expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
+  });
+
+  describe("C1a-2 native Responses warm-session binding", () => {
+    it.each([
+      { name: "create continuation", path: "/responses", method: "POST", linked: true },
+      {
+        name: "forged body ignored",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        forged: true,
+      },
+      { name: "retrieve", path: "/responses/resp_local", method: "GET", linked: false },
+      { name: "delete", path: "/responses/resp_local", method: "DELETE", linked: false },
+      { name: "cancel", path: "/responses/resp_local/cancel", method: "POST", linked: false },
+      { name: "compact", path: "/responses/resp_local/compact", method: "POST", linked: false },
+      {
+        name: "input items",
+        path: "/responses/resp_local/input_items",
+        method: "GET",
+        linked: false,
+      },
+      {
+        name: "successor runtime",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "runtime",
+      },
+      {
+        name: "other token scope",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "token",
+      },
+      {
+        name: "other grant scope",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "grant",
+      },
+      {
+        name: "other tenant scope",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "tenant",
+      },
+      {
+        name: "absent binding",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "absent",
+        forged: true,
+      },
+      {
+        name: "partial binding",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "partial",
+      },
+      {
+        name: "disabled affinity",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "disabled",
+      },
+      {
+        name: "failed terminal",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        terminal: "failure",
+      },
+      {
+        name: "cancelled terminal",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        terminal: "cancel",
+      },
+    ])("$name", async ({ path, method, linked, forged, change, terminal }) => {
+      const { affinityPrefixDigests } = await import("./cache-affinity.js");
+      const member = poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+      });
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([member]);
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+      );
+      const materialFor = (
+        args: Parameters<typeof import("./cache-affinity.js").rememberAffinity>[0],
+      ) => affinityPrefixDigests({ ...args, runtimeIdentity: args.target.targetIdentity });
+      affinity.remember.mockImplementation(async (args) => ({
+        sessionId: args.sessionBinding?.sessionId ?? "native-warm",
+        bindingDigest: materialFor(args).bindingDigest,
+      }));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const runtime = admittingCapacityRuntime();
+      const app = appWith(manager, runtime);
+      const headers = {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      };
+      const first = app.request("/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model: poolTarget.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const original = requireSent(manager);
+      manager.headers(original.requestId, 200, { "content-type": "application/json" });
+      manager.body(original.requestId, JSON.stringify({ id: "resp_local", object: "response" }));
+      manager.complete(original.requestId);
+      await (await first).text();
+      expect(affinity.remember).toHaveBeenCalledTimes(1);
+      const write = db.responseStickinessRecord.upsert.mock.calls[0]?.[0];
+      expect(write.create).toMatchObject({
+        warmSessionId: "native-warm",
+        warmBindingDigest: expect.any(String),
+      });
+      expect(write.update.warmSessionId).toBe("native-warm");
+      const stored = { ...write.create };
+      const args = affinity.remember.mock.calls[0]?.[0];
+      if (change === "runtime")
+        member.ExecutionTarget.InferenceCapacity!.runtimeRevision = "successor";
+      if (change === "token")
+        stored.warmBindingDigest = materialFor({
+          ...args,
+          securityScope: "other-token",
+        }).bindingDigest;
+      if (change === "grant")
+        stored.warmBindingDigest = materialFor({
+          ...args,
+          accessGrantId: "other-grant",
+        }).bindingDigest;
+      if (change === "tenant")
+        stored.warmBindingDigest = materialFor({ ...args, ownerId: "other-tenant" }).bindingDigest;
+      if (change === "absent") {
+        stored.warmSessionId = null;
+        stored.warmBindingDigest = null;
+      }
+      if (change === "partial") stored.warmBindingDigest = null;
+      if (change === "disabled") member.ModelPool.affinityEnabled = false;
+      mockStickyRecord({
+        ...stored,
+        SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      });
+      affinity.remember.mockClear();
+      db.responseStickinessRecord.upsert.mockClear();
+      vi.mocked(runtime.acquire).mockClear();
+      const abort = new AbortController();
+      const follow = app.request(path, {
+        method,
+        headers,
+        signal: abort.signal,
+        ...(method === "POST"
+          ? {
+              body: JSON.stringify({
+                model: poolTarget.modelId,
+                previous_response_id: "resp_local",
+                input: "next only",
+                ...(forged
+                  ? {
+                      sessionBinding: {
+                        sessionId: "forged-warm",
+                        bindingDigest: write.create.warmBindingDigest,
+                      },
+                      warmSessionId: "forged-warm",
+                      warmBindingDigest: write.create.warmBindingDigest,
+                    }
+                  : {}),
+              }),
+            }
+          : {}),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      // Inspect the admission while this continuation is still active.
+      const admission = vi.mocked(runtime.acquire).mock.calls[0]?.[0];
+      try {
+        expect(admission).toMatchObject({
+          warmSessionIds: linked ? ["native-warm"] : [],
+          candidates: [expect.objectContaining({ executionTargetId: "member-a-target" })],
+        });
+      } finally {
+        const sent = manager.sent[1]!;
+        manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+        const served = await follow;
+        manager.body(sent.requestId, JSON.stringify({ id: "resp_next", object: "response" }));
+        const reading = served.text().catch(() => undefined);
+        if (terminal === "failure") manager.error(sent.requestId, "transport");
+        else if (terminal === "cancel") abort.abort();
+        else manager.complete(sent.requestId);
+        await reading;
+        if (terminal) {
+          await vi.waitFor(() =>
+            expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
+              expect.objectContaining({
+                data: expect.objectContaining({
+                  state: terminal === "cancel" ? "CANCELED" : "FAILED",
+                }),
+              }),
+            ),
+          );
+        }
+      }
+      if (terminal || method !== "POST" || path !== "/responses" || change === "disabled") {
+        expect(affinity.remember).not.toHaveBeenCalled();
+      } else {
+        expect(affinity.remember).toHaveBeenCalledTimes(1);
+        expect(affinity.remember.mock.calls[0]?.[0].sessionBinding).toEqual(
+          linked
+            ? { sessionId: "native-warm", bindingDigest: stored.warmBindingDigest }
+            : undefined,
+        );
+        expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0].create.warmSessionId).toBe(
+          "native-warm",
+        );
+      }
+      if (terminal) expect(db.responseStickinessRecord.upsert).not.toHaveBeenCalled();
+    });
+
+    it("waits for the affinity writer before publishing the response binding and EOF", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          affinityEnabled: true,
+        }),
+      ]);
+      let finish: ((binding: { sessionId: string; bindingDigest: string }) => void) | undefined;
+      affinity.remember.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const pending = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: poolTarget.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify({ id: "resp_local", object: "response" }));
+      manager.complete(sent.requestId);
+      let eof = false;
+      const reading = (await pending).text().then(() => {
+        eof = true;
+      });
+      await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+      try {
+        expect(db.responseStickinessRecord.upsert).not.toHaveBeenCalled();
+        expect(eof).toBe(false);
+      } finally {
+        finish!({ sessionId: "native-warm", bindingDigest: "binding" });
+        await reading;
+      }
+      expect(affinity.remember).toHaveBeenCalledTimes(1);
+      expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0].create.warmSessionId).toBe(
+        "native-warm",
+      );
+    });
   });
 
   describe("grantee local Responses bindings", () => {
