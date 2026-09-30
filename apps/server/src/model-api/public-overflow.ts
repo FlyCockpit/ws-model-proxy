@@ -3592,6 +3592,9 @@ export async function dispatchPublicOverflow(
               // records. Client cancel owns settlement; other teardown is an error,
               // even if the upstream transport has already marked itself complete.
               if (clientCancelled) return;
+              // Public Readable state also fences an EOF already queued when
+              // egress errors the response; natural auto-destruction has no error.
+              if (response.errored) throw response.errored;
               if (providerBodyTornDown(response) || attemptController.signal.aborted) {
                 throw (
                   attemptController.signal.reason ??

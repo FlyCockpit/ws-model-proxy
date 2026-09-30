@@ -1,3 +1,4 @@
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import {
   createServer,
@@ -3195,7 +3196,10 @@ describe("OpenRouter owner-paid settlement", () => {
   const liability = { tokens: 5_000n, accountingVersion: "provider-billable-v1" };
   async function startOwnerStream(
     providerType: string,
-    upstream: Buffer[] | Readable,
+    upstream:
+      | Buffer[]
+      | Readable
+      | typeof import("@ws-model-proxy/api/lib/provider-egress").providerHttpsRequest,
     requester: "owner" | "grantee" = "owner",
     surface: "openai-chat" | "openai-responses" | "anthropic-messages" = "openai-chat",
     transportComplete = true,
@@ -3236,15 +3240,17 @@ describe("OpenRouter owner-paid settlement", () => {
     db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
       callback(tx),
     );
-    providerHttpsRequest.mockResolvedValueOnce(
-      upstream instanceof IncomingMessage
-        ? upstream
-        : Object.assign(Array.isArray(upstream) ? Readable.from(upstream) : upstream, {
-            statusCode: 200,
-            headers: { "content-type": "text/event-stream" },
-            complete: transportComplete,
-          }),
-    );
+    if (typeof upstream === "function") providerHttpsRequest.mockImplementationOnce(upstream);
+    else
+      providerHttpsRequest.mockResolvedValueOnce(
+        upstream instanceof IncomingMessage
+          ? upstream
+          : Object.assign(Array.isArray(upstream) ? Readable.from(upstream) : upstream, {
+              statusCode: 200,
+              headers: { "content-type": "text/event-stream" },
+              complete: transportComplete,
+            }),
+      );
     const result = await dispatchPublicOverflow({
       userId: "owner",
       poolId: "pool",
@@ -4309,6 +4315,164 @@ describe("OpenRouter owner-paid settlement", () => {
         }
       },
     );
+
+    it.each(["response error", "honest EOF"] as const)(
+      "classifies queued EOF with public readable state: %s",
+      async (trigger) => {
+        const upstream = new Readable({ read() {} });
+        const error = new Error("provider egress teardown");
+        // Model a read whose EOF was queued immediately before teardown. The
+        // transport's public errored property is set synchronously by destroy.
+        const read = vi
+          .spyOn(ReadableStreamDefaultReader.prototype, "read")
+          .mockImplementationOnce(async () => {
+            if (trigger === "response error") upstream.destroy(error);
+            return { done: true, value: undefined };
+          });
+        try {
+          const result = await startOwnerStream(
+            "openrouter",
+            upstream,
+            "owner",
+            "openai-responses",
+          );
+          const outcome = await result.response.text().then(
+            (text) => ({ text, failure: undefined }),
+            (failure: unknown) => ({ text: undefined, failure }),
+          );
+          expect(await result.terminal).toMatchObject({ ok: false });
+          expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+          expect(reconcileProviderBudget).toHaveBeenCalledWith(
+            expect.objectContaining({ reason: "FAILED", observationComplete: false }),
+          );
+          if (trigger === "response error") expect(outcome.failure).toBe(error);
+          else expect(outcome).toEqual({ text: "", failure: undefined });
+        } finally {
+          read.mockRestore();
+          upstream.destroy();
+        }
+      },
+    );
+
+    // Use the production egress primitive, including its abort and idle-timeout
+    // wiring. The test adapter only redirects the URL to a loopback server and
+    // supplies an extra source for the combined caller/lease/deadline signal.
+    it.each(
+      (["idle timeout", "combined abort", "honest EOF"] as const).flatMap((trigger) =>
+        (["trailing failure", "conflicting usage", "identical usage"] as const).map((tail) => ({
+          trigger,
+          tail,
+        })),
+      ),
+    )("classifies real-egress EOF: $trigger / $tail", async ({ trigger, tail }) => {
+      const actual = await vi.importActual<
+        typeof import("@ws-model-proxy/api/lib/provider-egress")
+      >("@ws-model-proxy/api/lib/provider-egress");
+      let outgoing!: ServerResponse;
+      let incoming: IncomingMessage | undefined;
+      const server = createServer((_request, response) => {
+        outgoing = response;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.flushHeaders();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("expected loopback address");
+      const controller = new AbortController();
+      const processErrors: unknown[] = [];
+      const captureError = (error: unknown) => processErrors.push(error);
+      process.on("uncaughtException", captureError);
+      process.on("unhandledRejection", captureError);
+      try {
+        const result = await startOwnerStream(
+          "openrouter",
+          async (_url, options, policy, protocol, auth) => {
+            if (!options.signal) throw new Error("expected combined dispatch signal");
+            incoming = await actual.providerHttpsRequest(
+              `http://127.0.0.1:${address.port}`,
+              { ...options, signal: AbortSignal.any([options.signal, controller.signal]) },
+              { ...policy, allowPrivateNetworks: true },
+              protocol,
+              auth,
+            );
+            return incoming;
+          },
+          "owner",
+          "openai-responses",
+        );
+        if (!incoming) throw new Error("expected real egress response");
+        const upstream = incoming;
+        // Let heldBody auto-pull one delta, then leave the requester stalled.
+        const delta = record("response.output_text.delta", { delta: "hi" });
+        const receivedDelta = once(upstream, "data");
+        outgoing.write(delta);
+        await receivedDelta;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const filler = Buffer.from(`: ${"x".repeat(70 * 1024)}\n\n`);
+        const receivedPrefix = once(upstream, "data");
+        outgoing.write(Buffer.concat([lowResponsesTerminal, filler]));
+        await receivedPrefix;
+        await vi.waitFor(() => expect(upstream.isPaused()).toBe(true));
+        const trailing =
+          tail === "trailing failure"
+            ? record("response.failed", { error: { type: "upstream_error" } })
+            : tail === "conflicting usage"
+              ? responsesTerminal
+              : lowResponsesTerminal;
+        outgoing.end(trailing);
+        await vi.waitFor(() => {
+          expect(upstream.complete).toBe(true);
+          expect(upstream.readableLength).toBeGreaterThanOrEqual(trailing.byteLength);
+        });
+        expect(reconcileProviderBudget).not.toHaveBeenCalled();
+        if (trigger === "idle timeout") {
+          upstream.socket.setTimeout(20);
+          await vi.waitFor(() => expect(upstream.destroyed).toBe(true));
+        } else if (trigger === "combined abort") controller.abort();
+        const outcome = await result.response.text().then(
+          (text) => ({ text, failure: undefined }),
+          (failure: unknown) => ({ text: undefined, failure }),
+        );
+        const honest = trigger === "honest EOF";
+        const successful = honest && tail !== "trailing failure";
+        const chargeable = honest && tail === "identical usage";
+        expect(await result.terminal).toMatchObject({ ok: successful });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: successful ? "COMPLETED" : "FAILED",
+            observationComplete: successful,
+          }),
+        );
+        const usage = reconcileProviderBudget.mock.calls[0]?.[0].usage;
+        if (chargeable) {
+          expect(usage).toMatchObject({ inputTokens: 10n, outputTokens: 1n });
+          expect(providerBillableTokens(usage)).toBe(11n);
+          expect(outcome.failure).toBeUndefined();
+          expect(outcome.text).toContain(lowResponsesTerminal.toString());
+        } else if (!honest || tail === "conflicting usage") {
+          expect(usage ? providerBillableTokens(usage) : undefined).toBeUndefined();
+          expect(usage?.reportedCost).toBeUndefined();
+          if (honest) expect(outcome.failure).toBeUndefined();
+          else expect(outcome.failure).toBeInstanceOf(actual.ProviderEgressError);
+        } else {
+          // A fully read failure may retain usage for audit, but its incomplete
+          // settlement observation still keeps the reservation's liability.
+          expect(usage).toMatchObject({ observationComplete: false });
+          expect(outcome.failure).toBeUndefined();
+        }
+        expect(upstream.complete).toBe(true);
+        for (let turn = 0; turn < 3; turn++)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(processErrors).toEqual([]);
+      } finally {
+        incoming?.destroy();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        process.off("uncaughtException", captureError);
+        process.off("unhandledRejection", captureError);
+      }
+    });
 
     it("cancels a pending accounting drain once without touching the cancelled controller", async () => {
       vi.useFakeTimers();
