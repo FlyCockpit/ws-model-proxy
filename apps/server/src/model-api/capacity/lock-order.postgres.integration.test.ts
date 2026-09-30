@@ -1,7 +1,12 @@
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 
-import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  acquireFences,
+  FenceSetChangedError,
+  fenceCapacityAdmission,
+  fences,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 
@@ -794,4 +799,465 @@ integration("DL-1 capacity lock order on PostgreSQL", () => {
       ]);
     }
   }, 60_000);
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+integration("admission scope-set validation under capacity fences (#139)", () => {
+  async function fixture(db: Client) {
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Scope fence race", email: `scope-fence-${suffix}@example.test` },
+    });
+    const device = await db.cliDevice.create({
+      data: { userId: user.id, slug: `scope-${suffix}` },
+    });
+    const endpoint = await db.endpoint.create({
+      data: {
+        userId: user.id,
+        cliDeviceId: device.id,
+        slug: `scope-${suffix}`,
+        label: "Scope fence race",
+      },
+    });
+    const pool = await db.modelPool.create({
+      data: {
+        userId: user.id,
+        slug: `scope-${suffix}`,
+        name: "Shared scope",
+        capacityConcurrencyLimit: 1,
+      },
+    });
+    const oldPool = await db.modelPool.create({
+      data: {
+        userId: user.id,
+        slug: `old-scope-${suffix}`,
+        name: "Old scope",
+        capacityConcurrencyLimit: 1,
+      },
+    });
+    const candidates: Array<{
+      capacityId: string;
+      executionTargetId: string;
+      poolMemberId: string;
+      oldMemberId: string;
+      candidateOrder: number;
+    }> = [];
+    for (let index = 0; index < 2; index++) {
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          runtimeIdentityKey: `scope-${index}-${suffix}`,
+          runtimeModel: "scope-race",
+          label: `Scope race ${index}`,
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: user.id,
+          endpointId: endpoint.id,
+          upstreamModelId: `scope-${index}`,
+          encodedModelId: `scope-${index}-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const member = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: target.id },
+      });
+      const oldMember = await db.poolMember.create({
+        data: {
+          poolId: oldPool.id,
+          executionTargetId: target.id,
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 1,
+        },
+      });
+      candidates.push({
+        capacityId: capacity.id,
+        executionTargetId: target.id,
+        poolMemberId: member.id,
+        oldMemberId: oldMember.id,
+        candidateOrder: 0,
+      });
+    }
+    const attempt = (name: string, index: number, pooled = true) => ({
+      requestId: `${name}-${suffix}`,
+      attemptId: `${name}-${suffix}`,
+      ownerId: user.id,
+      sourceKind: pooled ? ("POOL" as const) : ("DIRECT" as const),
+      ...(pooled ? { poolId: pool.id } : {}),
+      basePriority: 16,
+      connectionOwner: "scope-race",
+      deadlineAt: new Date(Date.now() + 300_000),
+      candidates: [{ ...candidates[index]!, ...(pooled ? {} : { poolMemberId: undefined }) }],
+    });
+    type Tx = import("@ws-model-proxy/db").Prisma.TransactionClient;
+    const seed = async (tx: Tx, name: string, index: number, old = false) => {
+      const candidate = candidates[index]!;
+      const poolId = old ? oldPool.id : pool.id;
+      const id = `${name}-${suffix}`;
+      const sequences = await tx.$queryRaw<
+        Array<{ sequence: bigint }>
+      >`SELECT nextval('admission_enqueue_sequence') AS sequence`;
+      const sequence = sequences[0]!.sequence;
+      const request = await tx.admissionRequest.create({
+        data: {
+          id,
+          userId: user.id,
+          requestId: id,
+          attemptId: id,
+          sourceKind: "POOL",
+          poolId,
+          basePriority: 16,
+          enqueueSequence: sequence!,
+          connectionOwner: "scope-race",
+          heartbeatAt: new Date(),
+          deadlineAt: new Date(Date.now() + 300_000),
+        },
+      });
+      return tx.capacityWaiter.create({
+        data: {
+          userId: user.id,
+          admissionRequestId: request.id,
+          requestId: id,
+          attemptId: id,
+          enqueueSequence: request.enqueueSequence,
+          capacityId: candidate.capacityId,
+          executionTargetId: candidate.executionTargetId,
+          poolId,
+          poolMemberId: old ? candidate.oldMemberId : candidate.poolMemberId,
+          candidateOrder: 0,
+          deadlineAt: request.deadlineAt,
+          effectivePriority: 16,
+          effectiveConcurrencyLimit: 1,
+          effectiveConcurrencyScope: old ? "MEMBER" : "POOL",
+          effectiveConcurrencyScopeId: old ? candidate.oldMemberId : poolId,
+        },
+      });
+    };
+    return { user, pool, oldPool, candidates, attempt, seed };
+  }
+
+  const rows = [
+    {
+      name: "joining waiter brings a new scope",
+      mutation: "join",
+      wait: true,
+      retries: 1,
+      result: true,
+    },
+    {
+      name: "non-waiting pass sees growth between discovery and acquisition",
+      mutation: "join",
+      wait: false,
+      retries: 0,
+      result: false,
+    },
+    // Policy snapshots cannot be UPDATEd (the database rejects changes).
+    // Replacement under the fence models the supported net scope change.
+    {
+      name: "waiter replaced with a different scope",
+      mutation: "replace",
+      wait: true,
+      retries: 1,
+      result: true,
+    },
+    {
+      name: "unchanged set proceeds without retry (inverse)",
+      mutation: "unchanged",
+      wait: true,
+      retries: 0,
+      result: true,
+    },
+    {
+      name: "removed waiter shrinks the set without retry (inverse)",
+      mutation: "remove",
+      wait: true,
+      retries: 0,
+      result: true,
+    },
+    {
+      name: "scope already known from the second capacity (inverse)",
+      mutation: "shared",
+      wait: true,
+      retries: 0,
+      result: true,
+    },
+    {
+      name: "non-waiting busy capacity returns false (inverse)",
+      mutation: "busy",
+      wait: false,
+      retries: 0,
+      result: false,
+    },
+  ] as const;
+
+  it.each(rows)(
+    "$name",
+    async (row) => {
+      if (!databaseUrl) return;
+      const db = createFixturePrismaClient(databaseUrl);
+      const { createPrismaClient } = await import("@ws-model-proxy/db/client-factory");
+      const holder = createPrismaClient(databaseUrl);
+      const reader = createPrismaClient(databaseUrl);
+      const setup = await fixture(db);
+      const capA = setup.candidates[0]!.capacityId;
+      const capB = setup.candidates[1]!.capacityId;
+      const sharedFence = fences.concurrencyScope("POOL", setup.pool.id);
+      const oldFence = fences.concurrencyScope("MEMBER", setup.candidates[0]!.oldMemberId);
+      const release = deferred<void>();
+      const ready = deferred<number>();
+      const discovery = deferred<void>();
+      const holderDone = deferred<void>();
+      let holderSide: Promise<void> | undefined;
+      let readerSide: Promise<boolean> | undefined;
+      let initial: Awaited<ReturnType<typeof setup.seed>> | undefined;
+      const errors: unknown[] = [];
+      const heldSets: string[] = [];
+      let attempts = 0;
+      let discoveryRead = false;
+      try {
+        if (row.mutation === "replace" || row.mutation === "remove" || row.mutation === "unchanged")
+          initial = await db.$transaction((tx) => setup.seed(tx, "initial", 0, true));
+        if (row.mutation === "shared") await db.$transaction((tx) => setup.seed(tx, "shared-b", 1));
+        holderSide = holder.$transaction(
+          async (tx) => {
+            await acquireFences(tx, [sharedFence, fences.capacity(capA)]);
+            ready.resolve(await backendPid(tx));
+            await release.promise;
+            if (row.mutation === "replace" || row.mutation === "remove") {
+              await tx.capacityWaiter.delete({ where: { id: initial!.id } });
+            }
+            if (row.mutation === "replace") {
+              // Preserve both request and waiter identity across replacement:
+              // its scope changes MEMBER -> POOL without bypassing the
+              // immutable-policy UPDATE trigger.
+              await tx.admissionRequest.update({
+                where: { id: initial!.admissionRequestId },
+                data: { poolId: setup.pool.id },
+              });
+              await tx.capacityWaiter.create({
+                data: {
+                  ...initial!,
+                  poolId: setup.pool.id,
+                  poolMemberId: setup.candidates[0]!.poolMemberId,
+                  effectiveConcurrencyScope: "POOL",
+                  effectiveConcurrencyScopeId: setup.pool.id,
+                },
+              });
+            }
+            if (row.mutation === "join" || row.mutation === "shared")
+              await setup.seed(tx, "joined-a", 0);
+          },
+          { timeout: 20_000 },
+        );
+        const pid = await ready.promise;
+        // Only the non-waiting growth row needs a read barrier: it cannot wait
+        // on the held capacity. Gate AFTER its real first SELECT, then commit
+        // the holder before the try-lock. The second SELECT remains ungated.
+        const gated = reader.$extends({
+          query: {
+            capacityWaiter: {
+              async findMany({ args, query }) {
+                const result = await query(args);
+                if (!row.wait && row.mutation === "join" && args.distinct && !discoveryRead) {
+                  discoveryRead = true;
+                  discovery.resolve();
+                  await holderDone.promise;
+                }
+                return result;
+              },
+            },
+          },
+        });
+        const { runCapacitySerializable } = await import("./postgres-store.js");
+        readerSide = runCapacitySerializable(
+          gated as unknown as Client,
+          async (tx) => {
+            attempts++;
+            try {
+              const acquired = await fenceCapacityAdmission(
+                tx,
+                row.mutation === "shared" ? [capA, capB] : [capA],
+                [],
+                { wait: row.wait },
+              );
+              if (acquired) {
+                const [settings] = await tx.$queryRaw<
+                  Array<{ held: string }>
+                >`SELECT current_setting('wsmp.fences') AS held`;
+                heldSets.push(settings!.held);
+              }
+              return acquired;
+            } catch (error) {
+              errors.push(error);
+              throw error;
+            }
+          },
+          async () => undefined,
+        );
+        // Attach a rejection handler immediately so deliberate mutation runs
+        // cannot produce an unhandled rejection while the holder is settling.
+        void readerSide.catch(() => undefined);
+        if (row.wait) await waitUntilBlockedBy(db, pid);
+        else if (row.mutation === "join") await discovery.promise;
+        else await expect(readerSide).resolves.toBe(false);
+        release.resolve();
+        await holderSide;
+        holderDone.resolve();
+        await expect(readerSide).resolves.toBe(row.result);
+        expect(attempts).toBe(row.retries + 1);
+        expect(errors).toHaveLength(row.retries);
+        for (const error of errors) expect(error).toBeInstanceOf(FenceSetChangedError);
+        if (row.result) {
+          const held = heldSets[0]!;
+          expect(held).toContain(fences.capacity(capA));
+          if (["join", "replace", "shared"].includes(row.mutation))
+            expect(held).toContain(sharedFence);
+          if (["unchanged", "remove"].includes(row.mutation)) expect(held).toContain(oldFence);
+          if (row.mutation === "shared") expect(held).toContain(fences.capacity(capB));
+        } else expect(heldSets).toHaveLength(0);
+      } finally {
+        release.resolve();
+        holderDone.resolve();
+        await Promise.allSettled([holderSide, readerSide]);
+        await cleanupLiveCapacityState(db, setup.user.id);
+        await Promise.all([db.$disconnect(), holder.$disconnect(), reader.$disconnect()]);
+      }
+    },
+    30_000,
+  );
+
+  it("two releases sharing a limit-one scope do not over-admit a waiter committed during the wait", async () => {
+    if (!databaseUrl) return;
+    const db = createFixturePrismaClient(databaseUrl);
+    const { createPrismaClient } = await import("@ws-model-proxy/db/client-factory");
+    const writer = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const firstName = `scope-release-a-${suffix}`;
+    const secondName = `scope-release-b-${suffix}`;
+    const first = createPrismaClient(namedUrl(firstName));
+    const second = createPrismaClient(namedUrl(secondName));
+    const setup = await fixture(db);
+    const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+    const bCounted = deferred<void>();
+    const allowBWrite = deferred<void>();
+    let aCounted = false;
+    let raceRunning = false;
+    const observedA = first.$extends({
+      query: {
+        capacityLease: {
+          async groupBy({ args, query }) {
+            const result = await query(args);
+            if (raceRunning && args.by.includes("poolId")) aCounted = true;
+            return result;
+          },
+        },
+      },
+    });
+    const observedB = second.$extends({
+      query: {
+        capacityLease: {
+          async groupBy({ args, query }) {
+            const result = await query(args);
+            if (raceRunning && args.by.includes("poolId")) {
+              bCounted.resolve();
+              await allowBWrite.promise;
+            }
+            return result;
+          },
+        },
+      },
+    });
+    // Query extensions only gate real database reads; store behavior and
+    // transaction/fence acquisition use the ordinary production clients.
+    const storeA = new PostgresCapacityAdmissionStore(
+      observedA as unknown as Client,
+      "scope-release-a",
+    );
+    const storeB = new PostgresCapacityAdmissionStore(
+      observedB as unknown as Client,
+      "scope-release-b",
+    );
+    const release = deferred<void>();
+    const ready = deferred<number>();
+    let holderSide: Promise<void> | undefined;
+    let releaseA: Promise<boolean> | undefined;
+    let releaseB: Promise<boolean> | undefined;
+    const scope = fences.concurrencyScope("POOL", setup.pool.id);
+    try {
+      const a = await storeA.acquire(setup.attempt("holder-a", 0, false));
+      const b = await storeB.acquire(setup.attempt("holder-b", 1, false));
+      if (a.state !== "ADMITTED" || b.state !== "ADMITTED")
+        throw new Error("Expected two direct holders.");
+      await expect(storeB.acquire(setup.attempt("queued-b", 1))).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      holderSide = writer.$transaction(
+        async (tx) => {
+          await acquireFences(tx, [scope, fences.capacity(setup.candidates[0]!.capacityId)]);
+          ready.resolve(await backendPid(tx));
+          await release.promise;
+          await setup.seed(tx, "joining-a", 0);
+        },
+        { timeout: 20_000 },
+      );
+      const pid = await ready.promise;
+      // A has no scoped waiter at discovery; B already has one. Thus A
+      // waits at its capacity while B waits at the shared scope fence.
+      raceRunning = true;
+      releaseA = storeA.release(a.lease);
+      releaseB = storeB.release(b.lease);
+      void releaseA.catch(() => undefined);
+      void releaseB.catch(() => undefined);
+      await waitUntilBlockedBy(db, pid, 2);
+      release.resolve();
+      await holderSide;
+      // B is first in the shared-scope fence queue. Hold its count-zero
+      // snapshot until A either waits behind B (fixed code) or reads the
+      // same zero without the scope fence (old code). This forces the old
+      // implementation to over-admit rather than relying on timing.
+      await bCounted.promise;
+      let aBlocked = false;
+      for (let poll = 0; poll < 1000 && !aCounted && !aBlocked; poll++) {
+        const [observed] = await db.$queryRaw<Array<{ blocked: boolean }>>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity a, pg_stat_activity b
+             WHERE a.application_name = ${firstName} AND b.application_name = ${secondName}
+               AND b.pid = ANY(pg_blocking_pids(a.pid))
+          ) AS blocked`;
+        aBlocked = observed?.blocked ?? false;
+      }
+      expect(aCounted || aBlocked).toBe(true);
+      allowBWrite.resolve();
+      await expect(Promise.all([releaseA, releaseB])).resolves.toEqual([true, true]);
+      expect(
+        await db.capacityLease.count({ where: { poolId: setup.pool.id, state: "ACTIVE" } }),
+      ).toBe(1);
+      expect(
+        await db.capacityWaiter.count({ where: { poolId: setup.pool.id, state: "WAITING" } }),
+      ).toBe(1);
+    } finally {
+      release.resolve();
+      allowBWrite.resolve();
+      await Promise.allSettled([holderSide, releaseA, releaseB]);
+      await cleanupLiveCapacityState(db, setup.user.id);
+      await Promise.all([
+        db.$disconnect(),
+        writer.$disconnect(),
+        first.$disconnect(),
+        second.$disconnect(),
+      ]);
+    }
+  }, 30_000);
 });

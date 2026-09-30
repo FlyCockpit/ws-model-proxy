@@ -11,6 +11,7 @@ import {
   withDbShutdownFence,
 } from "@ws-model-proxy/db/shutdown-fence";
 import {
+  ADMISSION_ROW_BATCH_SIZE,
   allocateReservationSlots,
   candidateDeadlineAt,
   candidateSchedules,
@@ -163,15 +164,17 @@ describe("capacity reservation allocation", () => {
 
 describe("capacity lease release", () => {
   /**
-   * A fake transaction client with one WAITING direct waiter on the released
-   * capacity, so the release's fill has real new work to admit (or skip).
+   * A fake transaction client with `count` WAITING direct waiters on the
+   * released capacity, so the release's fill has real new work to admit (or
+   * skip). The default single waiter covers the retry/orphan paths; a large
+   * count exercises the batched lease INSERT.
    */
-  function releaseFixture() {
+  function releaseFixture(count = 1) {
     let admitted = false;
-    const waiter = {
-      id: "waiter-1",
+    const waiters = Array.from({ length: count }, (_, index) => ({
+      id: `waiter-${index + 1}`,
       userId: "user",
-      admissionRequestId: "request-1",
+      admissionRequestId: `request-${index + 1}`,
       capacityId: "capacity",
       executionTargetId: "target",
       poolId: null,
@@ -191,16 +194,30 @@ describe("capacity lease release", () => {
       notBefore: null,
       deadlineAt: null,
       PoolMember: null,
-    };
+    }));
+    const waiter = waiters[0]!;
     const tx = {
-      $executeRaw: vi.fn().mockResolvedValue(0),
+      // The lease write is a raw INSERT ... SELECT; committing it makes the
+      // waiters' requests ADMITTED, so a re-read of the snapshot sees them
+      // gone.
+      $executeRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        if ((strings as unknown as string[]).join("?").includes("INSERT INTO capacity_lease"))
+          admitted = true;
+        return 0;
+      }),
       $queryRaw: vi.fn().mockResolvedValue([{ now: new Date() }]),
       capacityWaiter: {
-        // The concurrency-scope fence query (distinct) sees no limited scopes;
-        // the fill's waiter query sees the one WAITING waiter until it is
-        // admitted.
-        findMany: vi.fn(async (args: { distinct?: unknown }) =>
-          args.distinct || admitted ? [] : [waiter],
+        // The concurrency-scope fence query (distinct) sees no limited scopes.
+        // The snapshot hydrates in two phases: an id-only read first, then
+        // include batches over those ids. Both shapes must be modelled so a
+        // broken id read (returning no rows) is not silently tolerated.
+        findMany: vi.fn(
+          async (args: { distinct?: unknown; include?: unknown; select?: { id?: unknown } }) => {
+            if (args.distinct || admitted) return [];
+            if (args.include) return waiters;
+            if (args.select?.id) return waiters.map((row) => ({ id: row.id }));
+            return waiters;
+          },
         ),
         updateMany: vi.fn().mockResolvedValue({ count: 0 }),
         update: vi.fn().mockResolvedValue({}),
@@ -208,10 +225,6 @@ describe("capacity lease release", () => {
       capacityLease: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findMany: vi.fn().mockResolvedValue([]),
-        createMany: vi.fn(async () => {
-          admitted = true;
-          return { count: 1 };
-        }),
       },
       // The capacity's policy is a graph row read without a lock; its
       // scheduler state lives in capacity_runtime (writer class H).
@@ -241,9 +254,13 @@ describe("capacity lease release", () => {
       admissionRequest: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         update: vi.fn().mockResolvedValue({}),
-        findMany: vi.fn(async () => [
-          { id: "request-1", state: admitted ? "ADMITTED" : "WAITING", Lease: null },
-        ]),
+        findMany: vi.fn(async () =>
+          waiters.map((row) => ({
+            id: row.admissionRequestId,
+            state: admitted ? "ADMITTED" : "WAITING",
+            Lease: null,
+          })),
+        ),
         findUnique: vi.fn(
           async (args: {
             where: { id?: string; attemptId?: string };
@@ -290,6 +307,20 @@ describe("capacity lease release", () => {
     return { tx, transaction, relayRequest, store, lease, waiter };
   }
 
+  /**
+   * The lease write is one INSERT ... SELECT per ADMISSION_ROW_BATCH_SIZE
+   * rows. Its bind parameters are the scalars first, then one array per
+   * unnested column; the fifth array (index 4 after the scalars) is
+   * admissionRequestId, so its length is the row count of that statement.
+   */
+  const leaseInsertRowCounts = (tx: { $executeRaw: { mock: { calls: unknown[][] } } }) =>
+    leaseInserts(tx).map((call) => (call[5] as unknown[]).length);
+
+  const leaseInserts = (tx: { $executeRaw: { mock: { calls: unknown[][] } } }) =>
+    tx.$executeRaw.mock.calls.filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("INSERT INTO capacity_lease"),
+    );
+
   it("retries a deadlocked release under the real permit proxy and skips the fill while the fence is armed", async () => {
     const { tx, transaction, store, lease } = releaseFixture();
     armDbShutdownFence();
@@ -306,7 +337,7 @@ describe("capacity lease release", () => {
     });
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
-    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
+    expect(leaseInserts(tx)).toHaveLength(0);
     expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
   });
 
@@ -316,7 +347,7 @@ describe("capacity lease release", () => {
     const { tx, transaction, relayRequest, store, lease } = releaseFixture();
     await expect(store.release(lease)).resolves.toBe(true);
     expect(transaction).toHaveBeenCalledTimes(2);
-    expect(tx.capacityLease.createMany).toHaveBeenCalled();
+    expect(leaseInserts(tx).length).toBeGreaterThan(0);
     const sqlOf = (call: unknown[]) => (call[0] as TemplateStringsArray).join("?");
     // The capacity fence (no inference_capacity row lock) opens each attempt.
     const fenceCalls = tx.$queryRaw.mock.calls.filter((call) =>
@@ -342,9 +373,25 @@ describe("capacity lease release", () => {
       where: { capacityId: "capacity" },
       data: expect.objectContaining({ nextFencingToken: { increment: 1 } }),
     });
-    expect(tx.capacityLease.createMany).toHaveBeenCalledWith({
-      data: [expect.objectContaining({ fencingToken: 1n, admissionRequestId: "request-1" })],
-    });
+    // Leases are one INSERT ... SELECT over unnested arrays (parameters:
+    // scalars first, then one array per column): token 1 for request-1.
+    const insert = leaseInserts(tx)[0]!;
+    expect(insert.slice(1)).toEqual(expect.arrayContaining([[1n], ["request-1"]]));
+    // M-1: the two timestamp columns must not be swapped. `heartbeatAt` is
+    // `now`; `expiresAt` is now + the 30 s lease TTL. Swapping them makes
+    // every new lease instantly stale (expiresAt = now), so heartbeat's
+    // `expiresAt > clock_timestamp()` guard rejects renewals and the lease
+    // dies at 30 s. The values are positional in the SELECT list, so pin the
+    // exact relationship rather than only the presence of the parameters.
+    const leaseParams = insert.slice(1) as [Date, Date, Date, ...unknown[]];
+    const [heartbeatAt, expiresAt] = [leaseParams[0], leaseParams[2]];
+    expect(heartbeatAt).toBeInstanceOf(Date);
+    expect(expiresAt).toBeInstanceOf(Date);
+    expect(expiresAt.getTime() - heartbeatAt.getTime()).toBe(30_000);
+    // ...and the column list places heartbeatAt before expiresAt, so the
+    // `now`/`now + TTL` values land in those columns rather than swapped.
+    const insertSql = (insert[0] as TemplateStringsArray).join("?");
+    expect(insertSql).toMatch(/"heartbeatAt", "expiresAt"\)/);
     // The waiter's graph was checked (batched, one read) before it was planned.
     expect(tx.executionTarget.findMany).toHaveBeenCalledWith({
       where: { id: { in: ["target"] }, inferenceCapacityId: "capacity" },
@@ -357,7 +404,41 @@ describe("capacity lease release", () => {
       data: { admissionTerminalState: "TERMINAL" },
     });
     expect(relayRequest.updateMany.mock.invocationCallOrder[0]).toBeGreaterThan(
-      Math.max(...tx.capacityLease.createMany.mock.invocationCallOrder),
+      Math.max(...tx.$executeRaw.mock.invocationCallOrder),
+    );
+  });
+
+  it("batches the lease INSERT by ADMISSION_ROW_BATCH_SIZE and persists every winner", async () => {
+    // M-2: the array parameters (and statement time) are bounded per
+    // statement; the 5000-row load test cannot tell a missing bound from a
+    // present one in row counts, a plan with more than one batch can.
+    // 1200 winners => 3 chunks (500, 500, 200).
+    const winners = ADMISSION_ROW_BATCH_SIZE * 2 + 200;
+    const { tx, store, lease } = releaseFixture(winners);
+    // The fixture's scheduler state must leave room for every winner.
+    tx.inferenceCapacity.findUnique.mockResolvedValue({
+      userId: "user",
+      hardConcurrencyLimit: null,
+    });
+    await expect(store.release(lease)).resolves.toBe(true);
+    const rowCounts = leaseInsertRowCounts(tx);
+    expect(rowCounts).toEqual([ADMISSION_ROW_BATCH_SIZE, ADMISSION_ROW_BATCH_SIZE, 200]);
+    // No statement carries more rows than the bound.
+    expect(Math.max(...rowCounts)).toBeLessThanOrEqual(ADMISSION_ROW_BATCH_SIZE);
+    // Every winner is persisted exactly once (all waiters share one priority and
+    // enqueue sequence, so the DRR order is the id order, not the fixture
+    // order); chunk order preserves the global grant order.
+    const persistedRequestIds = leaseInserts(tx).flatMap((call) => call[5] as string[]);
+    expect(persistedRequestIds).toHaveLength(winners);
+    expect(new Set(persistedRequestIds).size).toBe(winners);
+    expect([...persistedRequestIds].sort()).toEqual(
+      Array.from({ length: winners }, (_, index) => `request-${index + 1}`).sort(),
+    );
+    // The fencing counter advances by the whole plan, not per batch.
+    expect(tx.capacityRuntime.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ nextFencingToken: { increment: winners } }),
+      }),
     );
   });
 
@@ -391,7 +472,7 @@ describe("capacity lease release", () => {
       return { count: 1 };
     });
     await expect(store.release(lease)).resolves.toBe(true);
-    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
+    expect(leaseInserts(tx)).toHaveLength(0);
     expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
     expect(tx.capacityWaiter.updateMany).toHaveBeenCalledWith({
       where: { id: "waiter-1", state: "WAITING" },
@@ -428,7 +509,7 @@ describe("capacity wakeup polling", () => {
     ).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "23505" })).toBe(false);
   });
-  it.each(["P2034", "40001", "40P01"])(
+  it.each(["P2034", "40001", "40P01", "FENCE_SET_CHANGED"])(
     "retries %s after rollback without leaking work",
     async (code) => {
       let attempts = 0;
@@ -478,6 +559,18 @@ describe("capacity wakeup polling", () => {
     expect(pauses).toHaveLength(4);
     expect(pauses.every((pause, index) => pause >= 0 && pause <= 7 + index * 8)).toBe(true);
     expect(pauses.reduce((total, pause) => total + pause, 0)).toBeLessThanOrEqual(76);
+  });
+  it("fails closed after four retries under continuing scope churn", async () => {
+    const changed = Object.assign(new Error("scope set grew"), { code: "FENCE_SET_CHANGED" });
+    const transaction = vi.fn().mockRejectedValue(changed);
+    await expect(
+      runCapacitySerializable(
+        { $transaction: transaction } as never,
+        async () => undefined,
+        async () => undefined,
+      ),
+    ).rejects.toBe(changed);
+    expect(transaction).toHaveBeenCalledTimes(5);
   });
   it("treats notifications as hints and re-polls durable state", async () => {
     const admitted = {
