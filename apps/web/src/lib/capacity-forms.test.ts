@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   advancedDisclosureProps,
+  capacityAttachmentChange,
   capacityFormSchema,
   capacityListViewState,
   capacityMutationPayload,
@@ -66,11 +67,59 @@ describe("capacity form", () => {
 });
 
 describe("capacity mutation planning", () => {
+  it.each([
+    { name: "untouched attached", choice: undefined, current: "auto", expected: {} },
+    { name: "same AUTO", choice: "auto", current: "auto", expected: {} },
+    { name: "untouched null", choice: undefined, current: null, expected: {} },
+    { name: "same null", choice: "", current: null, expected: {} },
+    { name: "real detach", choice: "", current: "auto", expected: { inferenceCapacityId: null } },
+    {
+      name: "real attach",
+      choice: "other",
+      current: "auto",
+      expected: { inferenceCapacityId: "other" },
+    },
+  ])("sends only changed capacity choices: $name", ({ choice, current, expected }) => {
+    expect(capacityAttachmentChange(choice, current)).toEqual(expected);
+    const payload = directPolicyPayload({
+      executionTargetId: "target",
+      capacityId: choice,
+      currentCapacityId: current,
+      priority: "20",
+      concurrency: "1",
+      reserved: "0",
+      wait: "30",
+      ceiling: "2048",
+      margin: "0",
+      borrow: "NEVER",
+    });
+    expect(Object.hasOwn(payload, "inferenceCapacityId")).toBe(
+      Object.hasOwn(expected, "inferenceCapacityId"),
+    );
+    expect(payload).toMatchObject(expected);
+    const steps = createMemberFollowUps({
+      memberId: "member",
+      executionTargetId: "target",
+      capacityId: choice,
+      currentCapacityId: current,
+      priority: "20",
+      reserved: "0",
+      wait: "30",
+      ceiling: "2048",
+    });
+    expect(steps.map((step) => step.kind)).toEqual(
+      Object.hasOwn(expected, "inferenceCapacityId")
+        ? ["member-policy", "capacity-attachment"]
+        : ["member-policy"],
+    );
+  });
+
   it("builds exact direct and member payloads", () => {
     expect(
       directPolicyPayload({
         executionTargetId: "target",
         capacityId: "cap",
+        currentCapacityId: null,
         priority: "31",
         concurrency: "2",
         reserved: "1",
@@ -142,6 +191,7 @@ describe("capacity mutation planning", () => {
       memberId: "member",
       executionTargetId: "target",
       capacityId: "cap",
+      currentCapacityId: null,
       priority: "16",
       reserved: "1",
       wait: "30000",

@@ -40,6 +40,18 @@ export interface McpInputOverlay {
    * procedure schema to generate from).
    */
   coreShape?: z.ZodRawShape;
+  /**
+   * Override of the first-stage input size bound ({@link MCP_TOOL_INPUT_MAX_BYTES})
+   * for a tool whose legitimate input is larger (a file write carries up to
+   * 1 MiB of content). The raw request body stays capped by the /mcp body cap.
+   */
+  maxInputBytes?: number;
+  /**
+   * Extracted-core tools whose core validates its own strict input: `coreShape`
+   * is advertised (JSON Schema) but NOT enforced by the SDK validator, so a bad
+   * field reaches the core, which audits the refusal and names the field.
+   */
+  shapeIsAdvisory?: boolean;
 }
 
 export interface McpInputSchemaSpec extends McpInputOverlay {
@@ -65,20 +77,25 @@ function inputByteLength(value: unknown): number {
  * ahead of the object schema so it always runs and child parsing never
  * executes for an oversized input (bounding the SDK's issue echo).
  */
-const INPUT_SIZE_GUARD = z.transform((value, ctx) => {
-  if (inputByteLength(value) > MCP_TOOL_INPUT_MAX_BYTES) {
-    ctx.addIssue({
-      code: "custom",
-      message: `input exceeds the maximum size of ${MCP_TOOL_INPUT_MAX_BYTES} bytes`,
-      input: value,
-      path: [],
-    });
-  }
-  return value;
-});
+function inputSizeGuard(maxBytes: number) {
+  return z.transform((value, ctx) => {
+    if (inputByteLength(value) > maxBytes) {
+      ctx.addIssue({
+        code: "custom",
+        message: `input exceeds the maximum size of ${maxBytes} bytes`,
+        input: value,
+        path: [],
+      });
+    }
+    return value;
+  });
+}
 
-function withInputSizeBound<T extends z.ZodType>(schema: T) {
-  return z.pipe(INPUT_SIZE_GUARD, schema as z.ZodType);
+const INPUT_SIZE_GUARD = inputSizeGuard(MCP_TOOL_INPUT_MAX_BYTES);
+
+function withInputSizeBound<T extends z.ZodType>(schema: T, maxBytes?: number) {
+  const guard = maxBytes === undefined ? INPUT_SIZE_GUARD : inputSizeGuard(maxBytes);
+  return z.pipe(guard, schema as z.ZodType);
 }
 
 /**
@@ -86,15 +103,19 @@ function withInputSizeBound<T extends z.ZodType>(schema: T) {
  * only. Every other argument is left for the oRPC procedure to validate.
  */
 function buildValidator(spec: McpInputSchemaSpec): z.ZodType {
-  const shape: { -readonly [K in string]: z.core.$ZodType } = { ...spec.coreShape };
+  const shape: { -readonly [K in string]: z.core.$ZodType } =
+    spec.shapeIsAdvisory === true ? {} : { ...spec.coreShape };
   for (const [field, message] of Object.entries(spec.emptyArrayInputs ?? {})) {
     shape[field] = z.array(z.unknown()).max(0, message).optional();
   }
   for (const [field, message] of Object.entries(spec.forbiddenInputs ?? {})) {
     shape[field] = z.never(message).optional();
   }
-  if (spec.confirmation !== null) shape.confirm = z.literal(spec.confirmation);
-  return withInputSizeBound(z.looseObject(shape));
+  // An advisory-shape tool checks its confirmation in the wrapper (which audits the refusal).
+  if (spec.confirmation !== null && spec.shapeIsAdvisory !== true) {
+    shape.confirm = z.literal(spec.confirmation);
+  }
+  return withInputSizeBound(z.looseObject(shape), spec.maxInputBytes);
 }
 
 /** Resolve a dotted `appRouter` target to its procedure's zod input schema. */

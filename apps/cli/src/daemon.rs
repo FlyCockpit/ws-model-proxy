@@ -844,6 +844,20 @@ fn run_relay_session(
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
     let mut terminals = TerminalRegistry::new(worker_tx.clone());
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
+    // 2.8 node file ops run on the daemon's file pool, never on this loop; the
+    // relay keeps only the ops it has pending. Dropping it cancels them all.
+    #[cfg(unix)]
+    let mut files = {
+        let tx = worker_tx.clone();
+        let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
+            let _ = tx.send(FromWorker::FileFrames { op_id, frames });
+        });
+        crate::file_relay::FileRelay::new(
+            crate::file_relay::shared_runtime(startup.allow_file_tools_as_root()),
+            startup.mcp_command_mode(),
+            sink,
+        )
+    };
 
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
@@ -898,6 +912,8 @@ fn run_relay_session(
             &mut terminals,
             &mut execs,
             #[cfg(unix)]
+            &mut files,
+            #[cfg(unix)]
             &mut reload_preparing,
             #[cfg(unix)]
             &mut pending_preparation,
@@ -911,6 +927,10 @@ fn run_relay_session(
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
+            break Err(error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = send_file_frames(&mut socket, files.expire_stale(now)) {
             break Err(error);
         }
 
@@ -1012,6 +1032,8 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
+                #[cfg(unix)]
+                &mut files,
                 &mut registered,
                 telemetry.as_ref(),
             ),
@@ -1022,6 +1044,8 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
+                #[cfg(unix)]
+                &mut files,
             ),
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server");
@@ -1094,6 +1118,9 @@ fn run_relay_session(
     drop(telemetry);
     let _ = send_outbound_frames(&mut socket, terminals.kill_all());
     let _ = send_outbound_frames(&mut socket, execs.kill_all());
+    // In-flight file ops are cancelled; their results are dropped.
+    #[cfg(unix)]
+    files.cancel_all();
     abort_all_workers(workers);
     if matches!(result, Err(RelaySessionError::Shutdown(_))) {
         // The connection is still open: say goodbye so the server marks the
@@ -1134,6 +1161,7 @@ fn drain_worker_output<S>(
     recent_finished: &mut RecentlyFinished,
     #[cfg(unix)] terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     #[cfg(unix)] reload_preparing: &mut bool,
     #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
     #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
@@ -1195,6 +1223,13 @@ where
                 socket
                     .send(Message::Text(text.into()))
                     .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
+            }
+            #[cfg(unix)]
+            Ok(FromWorker::FileFrames { op_id, frames }) => {
+                // Cancelled or torn-down ops are no longer pending: drop them.
+                if files.complete(&op_id) {
+                    send_file_frames(socket, frames)?;
+                }
             }
             #[cfg(unix)]
             Ok(FromWorker::InventoryPrepared { candidate }) => {
@@ -1553,6 +1588,7 @@ fn handle_text<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     registered: &mut bool,
     telemetry: Option<&crate::telemetry::Telemetry>,
 ) -> RelaySessionResult<()>
@@ -1843,6 +1879,34 @@ where
         } => {
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
         }
+        ServerControlMessage::FileOp {
+            op_id,
+            op,
+            args,
+            body_bytes,
+        } => {
+            #[cfg(unix)]
+            send_file_frames(socket, files.handle_op(&op_id, &op, args, body_bytes))?;
+            #[cfg(not(unix))]
+            {
+                let _ = (&op, &args, &body_bytes);
+                send_control(
+                    socket,
+                    &ClientControlMessage::FileRejected {
+                        op_id,
+                        reason: "unsupported".to_string(),
+                        detail: None,
+                    },
+                    "sending a file op rejection",
+                )?;
+            }
+        }
+        ServerControlMessage::FileCancel { op_id } => {
+            #[cfg(unix)]
+            files.handle_cancel(&op_id);
+            #[cfg(not(unix))]
+            let _ = op_id;
+        }
         ServerControlMessage::MetricsSourcesSet { id, sources } => {
             // Stored even without the opt-in so `wsmp metrics list` and
             // `wsmp metrics approve` can show them. A remote source runs only
@@ -2040,6 +2104,18 @@ where
                 "sending a supervised command rejection",
             )
         }
+        FrameFault::RejectFile { op_id } => {
+            tracing::warn!("refusing a malformed file op");
+            send_control(
+                socket,
+                &ClientControlMessage::FileRejected {
+                    op_id,
+                    reason: "bad_frame".to_string(),
+                    detail: None,
+                },
+                "sending a file op rejection",
+            )
+        }
         FrameFault::CancelSupervised { command_id } => {
             tracing::warn!(
                 command_id,
@@ -2057,6 +2133,7 @@ fn handle_binary<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2107,6 +2184,17 @@ where
             }
             RelayBinaryFrameMetadata::SupervisedOutput { .. } => {
                 tracing::warn!("ignoring an unexpected supervised output frame");
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::FileBody { op_id } => {
+                #[cfg(unix)]
+                send_file_frames(socket, files.handle_body(&op_id, body))?;
+                #[cfg(not(unix))]
+                let _ = (&op_id, &body);
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::FileData { .. } => {
+                tracing::warn!("ignoring an unexpected file.data frame");
                 Ok(())
             }
             RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
@@ -2725,6 +2813,8 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }
         | ClientControlMessage::ExecDone { .. }
+        | ClientControlMessage::FileResult { .. }
+        | ClientControlMessage::FileRejected { .. }
         | ClientControlMessage::NodeInfo(_)
         | ClientControlMessage::NodeMetrics(_)
         | ClientControlMessage::EndpointLoad(_) => {
@@ -2794,6 +2884,34 @@ where
         },
         "sending relay error",
     )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_file_frames<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    frames: Vec<crate::file_relay::FileFrame>,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    use crate::file_relay::FileFrame;
+    for frame in frames {
+        match frame {
+            FileFrame::Control(message) => {
+                send_control(socket, &message, "sending a file op frame")?;
+            }
+            FileFrame::Binary(metadata, body) => {
+                let encoded =
+                    encode_binary_frame(&metadata, &body).map_err(RelaySessionError::Fatal)?;
+                socket
+                    .send(Message::Binary(encoded.into()))
+                    .map_err(|error| {
+                        websocket_session_error(error, "sending a file op frame", true)
+                    })?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4082,7 +4200,9 @@ mod tests {
             .block_on(execute_upstream(spec, None, &tx, cancellation_rx))
             .expect("relay redirect");
         source.join().expect("source thread");
-        thread::sleep(Duration::from_millis(25));
+        // No sleep: `execute_upstream` has returned, so a followed redirect would already
+        // have completed its TCP handshake with `second` (and, since `second` never
+        // answers, the call above would not have returned at all).
         assert!(matches!(second.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
         let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(frames.iter().any(|frame| matches!(frame,
@@ -4099,6 +4219,7 @@ mod tests {
             Err(error) => panic!("bind redirect source: {error}"),
         };
         let address = listener.local_addr().expect("source address");
+        let (client_done_tx, client_done_rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept initial request");
             let mut request = [0_u8; 4096];
@@ -4109,10 +4230,14 @@ mod tests {
                 )
                 .expect("write redirect");
             drop(stream);
+            // Check for a followed redirect only once the client has finished: a
+            // follow would already be queued on this listener, so no sleep is needed.
+            client_done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("client should finish");
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking listener");
-            thread::sleep(Duration::from_millis(25));
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
@@ -4130,6 +4255,7 @@ mod tests {
                 cancellation_rx,
             ))
             .expect("relay same-origin redirect");
+        client_done_tx.send(()).expect("signal client done");
         server.join().expect("redirect server");
     }
 
@@ -4147,13 +4273,20 @@ mod tests {
             let mut request = [0_u8; 4096];
             let _ = std::io::Read::read(&mut stream, &mut request).expect("read relay request");
             accepted_tx.send(()).expect("signal accepted request");
-            thread::sleep(Duration::from_millis(300));
+            // Hold the header wait open until the client goes away (EOF or reset): a
+            // cancellation that does not drop the connection leaves the request waiting,
+            // so the 10 s bound below trips instead of a fixed sleep racing it. The read
+            // timeout keeps this thread from hanging the test if the socket is never closed.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set upstream read timeout");
+            while std::io::Read::read(&mut stream, &mut request).is_ok_and(|read| read > 0) {}
         });
         let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
         let (cancellation, cancellation_rx) = CancellationHandle::new();
         let cancel = thread::spawn(move || {
             accepted_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("upstream should receive request before cancellation");
             assert!(cancellation.cancel());
         });
@@ -4164,10 +4297,17 @@ mod tests {
 
         runtime
             .block_on(async {
+                // Only a hang bound: the upstream holds its response until the client
+                // disconnects, so this elapses only if cancellation fails to end the wait.
                 tokio::time::timeout(
-                    Duration::from_millis(150),
+                    Duration::from_secs(10),
                     execute_upstream(
-                        local_upstream_spec(format!("http://{address}")),
+                        // A long request timeout so only cancellation (or the hang
+                        // bound above) can end the wait, not the request's own clock.
+                        UpstreamRequestSpec {
+                            timeout_ms: 60_000,
+                            ..local_upstream_spec(format!("http://{address}"))
+                        },
                         None,
                         &tx,
                         cancellation_rx,
@@ -4178,6 +4318,9 @@ mod tests {
             .expect("cancellation should end the header wait promptly")
             .expect("cancellation is not an upstream error");
         cancel.join().expect("cancellation thread");
+        // The runtime owns the client's pooled connection; dropping it closes the socket,
+        // which is what lets the upstream thread (waiting for EOF) finish.
+        drop(runtime);
         server.join().expect("test upstream thread");
         assert!(
             rx.try_recv().is_err(),

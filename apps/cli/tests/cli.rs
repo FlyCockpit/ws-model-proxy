@@ -954,6 +954,43 @@ fn config_terminal_flags_persist_and_ask_for_a_restart() {
         .stdout(predicate::str::contains("Restart wsmp to apply."));
 }
 
+#[test]
+fn config_file_tools_as_root_defaults_off_persists_and_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowFileToolsAsRoot").is_none());
+    cli(&config, &state)
+        .args(["config", "--json", "set-file-tools-as-root", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""key":"allowFileToolsAsRoot""#))
+        .stdout(predicate::str::contains(r#""value":true"#));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowFileToolsAsRoot"], true);
+    cli(&config, &state)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""allowFileToolsAsRoot": true"#));
+    cli(&config, &state)
+        .args(["config", "set-file-tools-as-root", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowFileToolsAsRoot").is_none());
+    cli(&config, &state)
+        .args(["config", "set-file-tools-as-root", "maybe"])
+        .assert()
+        .failure();
+}
+
 #[cfg(unix)]
 #[test]
 fn supervised_run_without_the_daemon_env_fails_and_runs_nothing() {

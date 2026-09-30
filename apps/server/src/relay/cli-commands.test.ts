@@ -42,7 +42,12 @@ const db = prisma as unknown as {
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
+  endpoint: {
+    upsert: MockInstance;
+    findUnique: MockInstance;
+    findMany: MockInstance;
+    updateMany: MockInstance;
+  };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
@@ -101,13 +106,13 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.7",
+        protocolVersion: "2.8",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -126,11 +131,15 @@ function hello(slug: string, features: { mcpCommandMode: Mode }) {
           terminalApproval: false,
           terminalSupported: false,
           remoteMetricSources: false,
+          mcpFileRead: false,
+          fileRootsConfigured: false,
+          allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
         nodeTelemetry: true,
+        fileOps: true,
       },
     },
     endpoints: [],
@@ -192,6 +201,7 @@ describe("cli commands", () => {
     });
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken());
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);
@@ -870,10 +880,12 @@ describe("cli commands", () => {
     it("stores ? as the program of an oversized refused command, never a cut path component", async () => {
       await connect();
       db.cliDevice.findUnique.mockResolvedValue(null);
-      const command = `${"/".repeat(16_384 - "AUDIT_DIRECTORY".length)}AUDIT_DIRECTORY/git ARG`;
+      // The cut lands right after an allowlisted word ("... git"), so only the relay's truncated flag yields "?".
+      const command = `A=${"b".repeat(16_384 - 6)} gitx status`;
       await startCliCommand({ ...base, command });
       expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} \?$/);
-      expect(JSON.stringify(events())).not.toContain("AUDIT_DIRECTORY");
+      expect(JSON.stringify(events())).not.toContain("bbbbbbbb");
+      expect(JSON.stringify(events())).not.toContain("gitx");
     });
 
     it("stores an unknown device for a token_inactive refusal raised before the ownership check", async () => {
@@ -925,7 +937,7 @@ describe("cli commands", () => {
 
     it("records one completed event with the exit status and no output", async () => {
       const socket = await connect();
-      const result = await startCliCommand({ ...base, command: "run --api-key sk-secret-9 x" });
+      const result = await startCliCommand({ ...base, command: "curl --api-key sk-secret-9 x" });
       if (!result.ok) throw new Error("expected start");
       expect(events()).toEqual([]);
       await relaySessionManager.handleTextFrame(
@@ -955,10 +967,10 @@ describe("cli commands", () => {
         mcpTokenId: "token-audit",
       });
       const path = String(events()[0]?.path);
-      expect(path).toMatch(/^hmac-sha256:[0-9a-f]{64} run$/);
+      expect(path).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
       expect(JSON.stringify(events())).not.toContain("sk-secret-9");
       // No stored field of the row may contain any argument text.
-      expect(path.split(" ").slice(1).join(" ")).toBe("run");
+      expect(path.split(" ").slice(1).join(" ")).toBe("curl");
     });
 
     it("maps a signalled exec to signal:<name> and a timeout to timed_out", async () => {
@@ -1011,7 +1023,7 @@ describe("cli commands", () => {
 
     it("stores the hash of the command text and its program, never a preview", async () => {
       const socket = await connect();
-      const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz tool run";
+      const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz git run";
       const result = await startCliCommand({ ...base, command });
       if (!result.ok) throw new Error("expected start");
       await relaySessionManager.handleTextFrame(
@@ -1024,10 +1036,10 @@ describe("cli commands", () => {
         }),
       );
       const path = String(events()[0]?.path ?? "");
-      // The first word is a secret-bearing assignment: it is never stored, and
-      // it is not skipped either (cmd has no inline assignment): the program is `?`.
+      // The first word is a secret-bearing assignment: it is skipped and never
+      // stored; the program is the allowlisted word after it.
       expect(path).not.toContain("abcdefghij");
-      expect(path.split(" ").slice(1).join(" ")).toBe("?");
+      expect(path.split(" ").slice(1).join(" ")).toBe("git");
       expect(path.slice(0, path.indexOf(" "))).toBe(`hmac-sha256:${commandAuditDigest(command)}`);
     });
 

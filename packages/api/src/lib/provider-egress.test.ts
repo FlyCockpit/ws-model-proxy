@@ -1,9 +1,11 @@
 import { once } from "node:events";
-import { createServer } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { createServer, type ServerResponse } from "node:http";
+import { Readable } from "node:stream";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertResolvedAddressesSafe,
   isPrivateOrSpecialAddress,
+  ProviderEgressError,
   providerHttpsRequest,
   redactProviderError,
   sanitizeProviderHeaders,
@@ -13,9 +15,10 @@ import {
 const servers: ReturnType<typeof createServer>[] = [];
 afterEach(async () => {
   await Promise.all(
-    servers
-      .splice(0)
-      .map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+    servers.splice(0).map((server) => {
+      server.closeAllConnections();
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    }),
   );
 });
 
@@ -239,22 +242,121 @@ describe("provider egress policy", () => {
       ),
     ).rejects.toThrow("Provider request failed");
   });
-  it("bounds stalled provider requests", async () => {
-    const server = createServer(() => undefined);
+  it.each(["idle timeout", "abort signal", "already-aborted signal"] as const)(
+    "rejects before response: %s",
+    async (trigger) => {
+      let received!: () => void;
+      const requestReceived = new Promise<void>((resolve) => {
+        received = resolve;
+      });
+      const server = createServer(() => received());
+      servers.push(server);
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("test server did not bind");
+      const controller = new AbortController();
+      if (trigger === "already-aborted signal") controller.abort();
+      const rejection = expect(
+        providerHttpsRequest(
+          `http://127.0.0.1:${address.port}`,
+          { method: "GET", signal: controller.signal },
+          {
+            allowPrivateNetworks: true,
+            egressEnabled: true,
+            // Disable the idle timeout for abort rows so it cannot hide a
+            // missing signal handler by eventually rejecting for another reason.
+            timeoutMs: trigger === "idle timeout" ? 100 : 0,
+          },
+          "anthropic",
+          { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
+        ),
+      ).rejects.toBeInstanceOf(ProviderEgressError);
+      if (trigger === "abort signal") {
+        await requestReceived;
+        controller.abort();
+      }
+      await rejection;
+    },
+  );
+
+  // A stalled web reader fills toWeb's queue. A separate trailing write then
+  // remains in IncomingMessage even though the HTTP parser has seen the FIN.
+  // Honest EOF rows preserve exactly the same bytes as the teardown rows.
+  it.each(
+    (["idle timeout", "abort signal", "honest EOF"] as const).flatMap((trigger) =>
+      (["response.failed", "conflicting usage"] as const).map((tail) => ({ trigger, tail })),
+    ),
+  )("classifies buffered egress EOF: $trigger / $tail", async ({ trigger, tail }) => {
+    let outgoing!: ServerResponse;
+    const server = createServer((_request, response) => {
+      outgoing = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.flushHeaders();
+    });
     servers.push(server);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server did not bind");
-    await expect(
-      providerHttpsRequest(
-        `http://127.0.0.1:${address.port}`,
-        { method: "GET" },
-        { allowPrivateNetworks: true, egressEnabled: true, timeoutMs: 20 },
-        "anthropic",
-        { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
-      ),
-    ).rejects.toThrow("Provider request failed");
+    const controller = new AbortController();
+    const response = await providerHttpsRequest(
+      `http://127.0.0.1:${address.port}`,
+      { method: "GET", signal: controller.signal },
+      { allowPrivateNetworks: true, egressEnabled: true, timeoutMs: 5_000 },
+      "openai",
+      { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
+    );
+    const reader = Readable.toWeb(response).getReader();
+    try {
+      const terminal = 'event: response.completed\ndata: {"usage":{"output_tokens":1}}\n\n';
+      const prefix = `${terminal}: ${"x".repeat(70 * 1024)}\n\n`;
+      const trailing =
+        tail === "response.failed"
+          ? 'event: response.failed\ndata: {"error":{}}\n\n'
+          : 'event: response.completed\ndata: {"usage":{"output_tokens":14}}\n\n';
+      const receivedPrefix = once(response, "data");
+      outgoing.write(prefix);
+      await receivedPrefix;
+      await vi.waitFor(() => expect(response.isPaused()).toBe(true));
+      outgoing.end(trailing);
+      await vi.waitFor(() => {
+        expect(response.complete).toBe(true);
+        expect(response.readableLength).toBeGreaterThanOrEqual(Buffer.byteLength(trailing));
+      });
+      if (trigger === "idle timeout") {
+        // Shorten the real socket's idle timer only once the unread tail is in
+        // place. The callback remains the one installed by provider egress.
+        response.socket.setTimeout(20);
+        await vi.waitFor(() => expect(response.destroyed).toBe(true));
+      } else if (trigger === "abort signal") {
+        controller.abort();
+      }
+      let bytes = "";
+      let failure: unknown;
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          bytes += Buffer.from(chunk.value).toString("utf8");
+        }
+      } catch (error) {
+        failure = error;
+      }
+      if (trigger === "honest EOF") {
+        expect(failure).toBeUndefined();
+        expect(bytes).toBe(prefix + trailing);
+        controller.abort();
+        expect(response.errored).toBeNull();
+      } else {
+        expect(failure).toBeInstanceOf(ProviderEgressError);
+        expect((failure as Error).message).toBe("Provider request failed");
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      response.destroy();
+      server.closeAllConnections();
+    }
   });
   it("fails closed when the public-provider egress release gate is omitted", async () => {
     await expect(

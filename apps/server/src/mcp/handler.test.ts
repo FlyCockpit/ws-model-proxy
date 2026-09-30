@@ -55,10 +55,17 @@ vi.mock("../relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
 }));
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
 
 /** Minimal well-typed CallToolResult for the probe tool. */
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
+import { isCliTool } from "./cli-tool-access";
 import { MCP_TOOL_MANIFEST } from "./tool-manifest";
 import { registerMcpTools } from "./tools";
 
@@ -149,7 +156,7 @@ describe("createMcpTransport — pinned configuration", () => {
     registerMcpTools(server);
     const handler = createMcpTransport();
     return handler.fetch(modernRequest("tools/list", 1), undefined).then(async (res) => {
-      // No authInfo is bound, so the two CLI command tools are not
+      // No authInfo is bound, so the CLI command and node file tools are not
       // registered. Every other catalog name is advertised.
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
@@ -158,14 +165,7 @@ describe("createMcpTransport — pinned configuration", () => {
       const names = body.result?.tools?.map((tool) => tool.name).sort();
       expect(names).toEqual(
         MCP_TOOL_MANIFEST.map((tool) => tool.name)
-          .filter(
-            (name) =>
-              name !== "forwarder_cli_command_run" &&
-              name !== "forwarder_cli_supervised_command_start" &&
-              name !== "forwarder_cli_command_result" &&
-              name !== "forwarder_cli_activity_list" &&
-              name !== "forwarder_device_metric_sources_set",
-          )
+          .filter((name) => !isCliTool(name))
           .sort(),
       );
     });

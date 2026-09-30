@@ -44,9 +44,10 @@
 //! stdout itself (non-blocking, polled), so no thread or descriptor outlives
 //! a run; a helper that left the group holding the pipe cannot leak either.
 //!
-//! Windows has no process groups: the tree is ended with `taskkill /T` while
-//! the direct child (`cmd`) is still alive. Helpers that outlive an already
-//! exited root cannot be found (no job objects without a new dependency).
+//! Windows assigns each suspended child to a job object before it can run.
+//! Terminating the job kills the whole tree, including detached helpers and
+//! helpers whose root already exited. Owner drop also terminates leftovers,
+//! and closing the last job handle kills the tree even on abrupt CLI exit.
 //!
 //! # Daemon exit
 //! Each live run's process group is in a process-wide registry.
@@ -57,11 +58,18 @@
 //! mid-spawn (each kills its own group at registration), so an exiting daemon does not orphan the group of
 //! a command that was running. A panic in a release build (which aborts)
 //! ends the runs in flight first ([`kill_all_active_for_panic`], installed by
-//! `main`). `SIGKILL` of the daemon itself cannot be caught and can leave a
-//! command running until it exits by itself.
+//! `main`). On Unix, `SIGKILL` of the daemon itself cannot be caught and can
+//! leave a command running until it exits by itself.
 
+#[cfg(windows)]
+use crate::job_tree::{Child, JobTree};
+#[cfg(windows)]
+use std::collections::BTreeMap;
+#[cfg(not(windows))]
 use std::collections::BTreeSet;
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -138,19 +146,28 @@ impl Drop for Permit {
     }
 }
 
+#[cfg(windows)]
+type Groups = BTreeMap<u64, JobTree>;
+#[cfg(not(windows))]
+type Groups = BTreeSet<u32>;
+
 #[derive(Default)]
 struct Registry {
     closed: bool,
-    groups: BTreeSet<u32>,
+    groups: Groups,
     /// Runs between the shutdown check and their registration: shutdown
     /// waits for them, so none can start a command it never signals.
     spawning: usize,
+    #[cfg(windows)]
+    next_token: u64,
 }
 
 static ACTIVE: Mutex<Registry> = Mutex::new(Registry {
     closed: false,
-    groups: BTreeSet::new(),
+    groups: Groups::new(),
     spawning: 0,
+    #[cfg(windows)]
+    next_token: 0,
 });
 
 fn lock_registry(shared: &'static Mutex<Registry>) -> std::sync::MutexGuard<'static, Registry> {
@@ -185,29 +202,99 @@ fn spawn_failed() {
 /// Record a live run. `false` when the process began exiting after
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
+#[cfg(unix)]
 fn register(pid: u32) -> bool {
     register_in(&ACTIVE, pid)
 }
 
+#[cfg(unix)]
 fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
     let mut registry = lock_registry(shared);
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
         kill_run(pid);
-        #[cfg(not(unix))]
-        {
-            drop(registry);
-            kill_group(pid);
-        }
         return false;
     }
     registry.groups.insert(pid);
     true
 }
 
+#[cfg(not(windows))]
 fn unregister(pid: u32) {
     registry().groups.remove(&pid);
+}
+
+/// Ownership: the run owns the child and the registry owns a job handle clone
+/// until termination succeeds, including a pending reaper handoff. Lock order
+/// on Windows: release the registry before touching
+/// a job. No job operation acquires the registry or budget lock. Job operations
+/// hold their lock only for nonblocking OS calls, never for a wait or pipe read.
+#[cfg(windows)]
+fn register_job_in(shared: &'static Mutex<Registry>, job: JobTree) -> Option<JobRegistration> {
+    let mut registry = lock_registry(shared);
+    let token = registry.next_token.checked_add(1);
+    if registry.closed || token.is_none() {
+        // Exhaustion must fail closed rather than wrap and reuse an identity.
+        registry.closed = true;
+        drop(registry);
+        kill_group(&job);
+        // Keep this run counted as spawning until its job has been signalled.
+        lock_registry(shared).spawning -= 1;
+        return None;
+    }
+    let token = token?;
+    registry.next_token = token;
+    registry.groups.insert(token, job);
+    registry.spawning -= 1;
+    Some(JobRegistration { shared, token })
+}
+
+/// A run's identity, independent of its cached diagnostic PID. This guard
+/// moves to the reaper on a pending kill, so shutdown can still reach the job.
+#[cfg(windows)]
+struct JobRegistration {
+    shared: &'static Mutex<Registry>,
+    token: u64,
+}
+
+#[cfg(windows)]
+impl Drop for JobRegistration {
+    fn drop(&mut self) {
+        lock_registry(self.shared).groups.remove(&self.token);
+    }
+}
+
+/// Shutdown and panic share one deadline for lock retries across every job.
+/// A stuck lock cannot block shutdown, nor prevent signalling accessible jobs.
+#[cfg(windows)]
+fn close_jobs_in(shared: &'static Mutex<Registry>, until: Instant) -> bool {
+    let Ok(mut registry) = crate::job_tree::lock_until(shared, until) else {
+        return false;
+    };
+    registry.closed = true;
+    // Retain handles until each owner unregisters: shutdown never relies on a
+    // recycled PID, and panic/abort still closes every live kernel job handle.
+    let jobs = registry.groups.values().cloned().collect::<Vec<_>>();
+    let spawning = registry.spawning;
+    drop(registry);
+    for job in jobs {
+        let _ = job.terminate_until(until);
+    }
+    spawning == 0
+}
+
+#[cfg(windows)]
+fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
+    close_jobs_in(shared, Instant::now() + Duration::from_millis(200));
+}
+
+#[cfg(windows)]
+fn kill_all_in(shared: &'static Mutex<Registry>) {
+    let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+    while !close_jobs_in(shared, until) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Runs in flight (registered and not yet finished).
@@ -231,6 +318,7 @@ pub fn kill_all_active_for_panic() {
     kill_all_for_panic_in(&ACTIVE);
 }
 
+#[cfg(unix)]
 fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     let mut registry = match shared.try_lock() {
         Ok(registry) => registry,
@@ -256,15 +344,9 @@ fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     for pid in groups {
         kill_run(pid);
     }
-    #[cfg(not(unix))]
-    {
-        drop(registry);
-        for pid in groups {
-            kill_group(pid);
-        }
-    }
 }
 
+#[cfg(unix)]
 fn kill_all_in(shared: &'static Mutex<Registry>) {
     {
         let mut registry = lock_registry(shared);
@@ -276,14 +358,6 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
         #[cfg(unix)]
         for pid in groups {
             kill_run(pid);
-        }
-        // Elsewhere `taskkill` blocks: signal after unlocking.
-        #[cfg(not(unix))]
-        {
-            drop(registry);
-            for pid in groups {
-                kill_group(pid);
-            }
         }
     }
     // A run past its shutdown check but not yet registered is killed by its
@@ -330,6 +404,7 @@ pub fn run(
         // Its own group, so the deadline kills everything it started.
         command.process_group(0);
     }
+    #[cfg(not(windows))]
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -337,8 +412,27 @@ pub fn run(
             return Err(RunError::Spawn);
         }
     };
+    #[cfg(windows)]
+    let mut child = match crate::job_tree::spawn(command) {
+        Ok(child) => child,
+        Err(_) => {
+            spawn_failed();
+            return Err(RunError::Spawn);
+        }
+    };
+    #[cfg(not(windows))]
     let pid = child.id();
-    if !register(pid) {
+    #[cfg(not(windows))]
+    let registered = register(pid);
+    #[cfg(windows)]
+    let registration = register_job_in(&ACTIVE, child.job());
+    #[cfg(windows)]
+    let registered = registration.is_some();
+    #[cfg(windows)]
+    let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
+        finish_job(child, until, permit, cancelled, registration)
+    };
+    if !registered {
         finish(child, Instant::now(), permit, &|| true);
         return Err(RunError::Cancelled);
     }
@@ -461,7 +555,7 @@ fn collect(
 
 /// Windows has no pollable pipe here: a reader thread owns the pipe and the
 /// result arrives on a channel, so a leaked pipe never blocks the caller
-/// (`taskkill /T` at the deadline ends the tree that holds it).
+/// (terminating the Windows job at the deadline closes every writer).
 #[cfg(not(unix))]
 fn collect(
     stdout: ChildStdout,
@@ -522,6 +616,7 @@ struct Finished {
 /// with that id has members, so a surviving helper keeps the id safe; with no
 /// helper left the kill can only miss (a recycled pid would also have to have
 /// become a group leader in the microseconds between).
+#[cfg(not(windows))]
 fn finish(
     mut child: Child,
     until: Instant,
@@ -543,10 +638,44 @@ fn finish(
     Finished { exited, status }
 }
 
+/// Windows settlement uses one grace deadline for termination and reaping.
+/// A busy lock is inconclusive: keep both the registration and permit with
+/// the cleanup owner until the pending job kill is actually issued.
+#[cfg(windows)]
+fn finish_job(
+    mut child: Child,
+    until: Instant,
+    permit: Permit,
+    cancelled: &dyn Fn() -> bool,
+    registration: Option<JobRegistration>,
+) -> Finished {
+    let exited = wait_for_exit(&mut child, until, cancelled);
+    let reap_until = Instant::now() + REAP_GRACE;
+    if !child.ensure_terminated(reap_until) {
+        hand_off_job_to_reaper(child, permit, registration);
+        return Finished {
+            exited,
+            status: None,
+        };
+    }
+    drop(registration);
+    let status = reap_within(&mut child, reap_until);
+    if status.is_none() {
+        hand_off_job_to_reaper(child, permit, None);
+    }
+    Finished { exited, status }
+}
+
 fn reap_within(child: &mut Child, until: Instant) -> Option<ExitStatus> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until =>
+            {
+                thread::sleep(REAP_POLL);
+            }
             Ok(None) if Instant::now() < until => thread::sleep(REAP_POLL),
             _ => return None,
         }
@@ -557,6 +686,7 @@ fn reap_within(child: &mut Child, until: Instant) -> Option<ExitStatus> {
 /// detached thread so it does not stay a zombie. The thread ends when the
 /// child finally dies; until then the run's permit stays held and the child
 /// counts as stuck.
+#[cfg(not(windows))]
 fn hand_off_to_reaper(mut child: Child, permit: Permit) {
     lock(permit.0).stuck += 1;
     let shared = permit.0;
@@ -573,6 +703,31 @@ fn hand_off_to_reaper(mut child: Child, permit: Permit) {
     if spawned.is_err() {
         // The child (dropped with the closure) is not reaped; nothing more
         // can be done without a thread.
+        let mut budget = lock(shared);
+        budget.stuck = budget.stuck.saturating_sub(1);
+    }
+}
+
+#[cfg(windows)]
+fn hand_off_job_to_reaper(mut child: Child, permit: Permit, registration: Option<JobRegistration>) {
+    lock(permit.0).stuck += 1;
+    let shared = permit.0;
+    let spawned = thread::Builder::new()
+        .name("wsmp-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+            // wait retries termination before observing even a cached exit.
+            // Drop the child before the guard on errors or thread failure,
+            // leaving kill-on-close as the fallback for the owned wrapper.
+            drop(child);
+            drop(registration);
+            {
+                let mut budget = lock(shared);
+                budget.stuck = budget.stuck.saturating_sub(1);
+            }
+            drop(permit);
+        });
+    if spawned.is_err() {
         let mut budget = lock(shared);
         budget.stuck = budget.stuck.saturating_sub(1);
     }
@@ -613,24 +768,9 @@ fn kill_run(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_group(pid: u32) {
-    // No process groups: end the whole tree, bounded so a stuck `taskkill`
-    // cannot stall the deadline or shutdown. Needs the root alive (a tree
-    // whose root already exited cannot be found; see the module docs).
-    let Ok(mut taskkill) = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    if reap_within(&mut taskkill, Instant::now() + REAP_GRACE).is_none() {
-        let _ = taskkill.kill();
-        let _ = taskkill.wait();
-    }
+#[cfg(windows)]
+fn kill_group(job: &JobTree) {
+    let _ = job.terminate();
 }
 
 /// Kill everything the run started: the group, then the direct child itself
@@ -640,15 +780,6 @@ fn kill_group(pid: u32) {
 fn kill_group_or_child(child: &mut Child) {
     kill_group(child.id());
     let _ = child.kill();
-}
-
-/// The tree first (`taskkill /T` needs the root alive), then the child.
-#[cfg(not(unix))]
-fn kill_group_or_child(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        kill_group(child.id());
-        let _ = child.kill();
-    }
 }
 
 /// Poll until the child has exited, `until` passes or the caller cancels,
@@ -677,6 +808,13 @@ fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool
 fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool) -> bool {
     loop {
         match child.try_wait() {
+            #[cfg(windows)]
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= until || cancelled() {
+                    return false;
+                }
+                thread::sleep(REAP_POLL);
+            }
             Ok(None) if Instant::now() < until && !cancelled() => thread::sleep(REAP_POLL),
             Ok(None) => return false,
             _ => return true,
@@ -687,6 +825,437 @@ fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn fresh_job_registry() -> &'static Mutex<Registry> {
+        Box::leak(Box::new(Mutex::new(Registry::default())))
+    }
+
+    #[cfg(windows)]
+    fn job_tree(tree: &crate::windows_test_tree::Tree) -> Child {
+        let mut command = Command::new("cmd");
+        command.args(tree.command("hang"));
+        crate::job_tree::spawn(command).expect("job spawn")
+    }
+
+    #[cfg(windows)]
+    fn held_job(job: JobTree) -> (std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            job.with_job_lock(|| {
+                ready_tx.send(()).expect("lock notification");
+                release_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release lock");
+            });
+            // Deliberately no kill here: cleanup must issue its own kill.
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held job lock");
+        (release_tx, holder)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_busy_exit_observations_are_inconclusive() {
+        use crate::windows_test_tree::Tree;
+        // Release rows fail on the old wildcard matches. Deadline/cancel
+        // rows pin bounded waiting rather than an unbounded lock acquisition.
+        for row in [
+            "wait-release",
+            "reap-release",
+            "wait-deadline",
+            "wait-cancel",
+        ] {
+            let tree = Tree::new();
+            let mut command = Command::new("cmd");
+            command.args(tree.command(if row.ends_with("release") {
+                "success"
+            } else {
+                "hang"
+            }));
+            let mut child = crate::job_tree::spawn(command).expect("job spawn");
+            tree.read_marker();
+            if row.ends_with("release") {
+                assert!(wait_for_exit(
+                    &mut child,
+                    Instant::now() + Duration::from_secs(5),
+                    &|| false
+                ));
+            }
+            let (release, holder) = held_job(child.job());
+            thread::scope(|scope| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let child = &mut child;
+                scope.spawn(move || {
+                    let until = Instant::now() + Duration::from_millis(150);
+                    let observed = if row == "reap-release" {
+                        reap_within(child, until).is_some()
+                    } else {
+                        wait_for_exit(child, until, &|| row == "wait-cancel")
+                    };
+                    done_tx.send(observed).expect("observation result");
+                });
+                if row.ends_with("release") {
+                    assert!(
+                        done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                        "{row}: busy is not exited"
+                    );
+                    release.send(()).expect("release");
+                    assert!(
+                        done_rx
+                            .recv_timeout(Duration::from_secs(1))
+                            .expect("observed exit"),
+                        "{row}"
+                    );
+                } else {
+                    assert!(
+                        !done_rx
+                            .recv_timeout(Duration::from_secs(1))
+                            .expect("bounded observation"),
+                        "{row}"
+                    );
+                    release.send(()).expect("release");
+                }
+            });
+            holder.join().expect("lock holder");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_contention_keeps_cleanup_owned_and_retries_termination() {
+        use crate::windows_test_tree::{Tree, assert_dead, process_exists};
+        // EOF fails on premature Timeout. Short timeout/cancel rows require
+        // kill before settlement; long rows require a registered, charged
+        // pending owner and a kill after unlock without help from the holder.
+        for (path, pending_handoff) in [
+            ("eof", false),
+            ("timeout", false),
+            ("cancel", false),
+            ("timeout", true),
+            ("cancel", true),
+        ] {
+            let tree = Tree::new();
+            let cancel = AtomicBool::new(false);
+            let timeout = if path == "timeout" {
+                Duration::from_secs(4)
+            } else {
+                Duration::from_secs(30)
+            };
+            let args = tree.command(if path == "eof" { "eof" } else { "detach" });
+            let run_started = Instant::now();
+            thread::scope(|scope| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let args = &args;
+                let cancel = &cancel;
+                scope.spawn(move || {
+                    done_tx
+                        .send(run("python", &args[2..], timeout, 1024, Some(cancel)))
+                        .expect("run result");
+                });
+                let grandchild = tree.read_marker().parse().expect("grandchild PID");
+                let root = std::fs::read_to_string(&tree.root)
+                    .expect("root PID")
+                    .trim()
+                    .parse::<u32>()
+                    .expect("root PID");
+                let (token, job) = {
+                    let registry = registry();
+                    registry
+                        .groups
+                        .iter()
+                        .find(|(_, job)| job.id() == root)
+                        .map(|(token, job)| (*token, job.clone()))
+                        .expect("run registered in ACTIVE")
+                };
+                let (release, holder) = held_job(job);
+                let mut holder = Some(holder);
+                let started = Instant::now();
+                if path == "eof" {
+                    std::fs::write(tree.root.with_extension("eof"), "").expect("close stdout");
+                    assert!(
+                        done_rx.recv_timeout(REAP_GRACE * 2).is_err(),
+                        "EOF settled before its deadline under contention"
+                    );
+                    assert!(registry().groups.contains_key(&token));
+                    release.send(()).expect("release");
+                    holder.take().expect("holder").join().expect("lock holder");
+                    std::fs::write(tree.root.with_extension("exit"), "")
+                        .expect("allow natural exit");
+                    assert_eq!(
+                        done_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("EOF result"),
+                        Ok(Vec::new())
+                    );
+                } else {
+                    if path == "cancel" {
+                        cancel.store(true, Ordering::SeqCst);
+                    } else {
+                        // The deadline runs from run() entry, not from fixture startup.
+                        thread::sleep(timeout.saturating_sub(run_started.elapsed()));
+                    }
+                    if !pending_handoff {
+                        assert!(
+                            done_rx.recv_timeout(REAP_GRACE / 2).is_err(),
+                            "{path}: settled before kill with a live tree"
+                        );
+                        release.send(()).expect("release");
+                        holder.take().expect("holder").join().expect("lock holder");
+                    }
+                    let result = done_rx
+                        .recv_timeout(REAP_GRACE + Duration::from_secs(2))
+                        .expect("bounded run result");
+                    assert_eq!(
+                        result,
+                        Err(if path == "cancel" {
+                            RunError::Cancelled
+                        } else {
+                            RunError::Timeout
+                        })
+                    );
+                    assert!(
+                        started.elapsed()
+                            < timeout.min(Duration::from_secs(4))
+                                + REAP_GRACE
+                                + Duration::from_secs(2)
+                    );
+                    if pending_handoff {
+                        assert!(
+                            registry().groups.contains_key(&token),
+                            "pending tree hidden from shutdown"
+                        );
+                        assert!(lock(&BUDGET).stuck > 0, "pending child lost its permit");
+                        assert!(process_exists(root) && process_exists(grandchild));
+                        release.send(()).expect("release");
+                        holder.take().expect("holder").join().expect("lock holder");
+                    }
+                }
+                assert_dead(root);
+                assert_dead(grandchild);
+                let until = Instant::now() + Duration::from_secs(2);
+                while registry().groups.contains_key(&token) {
+                    assert!(
+                        Instant::now() < until,
+                        "registration not released after termination"
+                    );
+                    thread::sleep(REAP_POLL);
+                }
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registration_identity_survives_a_recycled_root_pid() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        // Both states would overwrite/remove B on the old PID-keyed map.
+        for root_reaped in [false, true] {
+            let shared = fresh_job_registry();
+            let first_tree = Tree::new();
+            let second_tree = Tree::new();
+            let mut command = Command::new("cmd");
+            command.args(first_tree.command(if root_reaped { "success" } else { "hang" }));
+            let mut first = crate::job_tree::spawn(command).expect("first job");
+            let first_grandchild = first_tree
+                .read_marker()
+                .parse()
+                .expect("first grandchild PID");
+            assert!(begin_spawn_in(shared));
+            let first_registration =
+                register_job_in(shared, first.job()).expect("first registration");
+            if root_reaped {
+                assert!(wait_for_exit(
+                    &mut first,
+                    Instant::now() + Duration::from_secs(5),
+                    &|| false
+                ));
+            }
+            let second = job_tree(&second_tree);
+            let second_grandchild = second_tree
+                .read_marker()
+                .parse()
+                .expect("second grandchild PID");
+            assert_eq!(second.job().id(), second.id(), "default diagnostic PID");
+            assert!(begin_spawn_in(shared));
+            let reused_pid_job = second.job().with_test_pid(first.id());
+            assert_eq!(reused_pid_job.id(), first.id(), "forced PID reuse seam");
+            let second_registration =
+                register_job_in(shared, reused_pid_job).expect("second registration");
+            assert_ne!(first_registration.token, second_registration.token);
+            assert_eq!(
+                lock_registry(shared).groups.len(),
+                2,
+                "insertion replaced a live registration"
+            );
+            let permit = admit_in(fresh()).expect("permit");
+            finish_job(
+                first,
+                Instant::now(),
+                permit,
+                &|| true,
+                Some(first_registration),
+            );
+            assert_dead(first_grandchild);
+            assert_eq!(lock_registry(shared).groups.len(), 1);
+            assert!(
+                lock_registry(shared)
+                    .groups
+                    .contains_key(&second_registration.token)
+            );
+            kill_all_in(shared);
+            assert_dead(second.id());
+            assert_dead(second_grandchild);
+            drop(second);
+            drop(second_registration);
+            assert!(lock_registry(shared).groups.is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pending_termination_precedes_even_a_cached_root_exit() {
+        use crate::windows_test_tree::{Tree, assert_dead, process_exists};
+        for root_reaped in [false, true] {
+            let tree = Tree::new();
+            let shared = fresh_job_registry();
+            let budget = fresh();
+            let mut command = Command::new("cmd");
+            command.args(tree.command(if root_reaped { "success" } else { "hang" }));
+            let mut child = crate::job_tree::spawn(command).expect("job spawn");
+            let grandchild = tree.read_marker().parse().expect("grandchild PID");
+            if root_reaped {
+                assert!(wait_for_exit(
+                    &mut child,
+                    Instant::now() + Duration::from_secs(5),
+                    &|| false
+                ));
+            }
+            assert!(begin_spawn_in(shared));
+            let registration = register_job_in(shared, child.job()).expect("registration");
+            let (release, holder) = held_job(child.job());
+            let started = Instant::now();
+            let result = finish_job(
+                child,
+                Instant::now(),
+                admit_in(budget).expect("permit"),
+                &|| true,
+                Some(registration),
+            );
+            assert!(started.elapsed() < REAP_GRACE + Duration::from_millis(500));
+            assert!(result.status.is_none());
+            assert_eq!(lock_registry(shared).groups.len(), 1);
+            assert_eq!(lock(budget).held, 1);
+            assert_eq!(lock(budget).stuck, 1);
+            assert!(process_exists(grandchild));
+            release.send(()).expect("release");
+            holder.join().expect("lock holder");
+            assert_dead(grandchild);
+            let until = Instant::now() + Duration::from_secs(2);
+            while lock(budget).held != 0 {
+                assert!(
+                    Instant::now() < until,
+                    "cleanup permit retained after reaping"
+                );
+                thread::sleep(REAP_POLL);
+            }
+            assert_eq!(lock(budget).stuck, 0);
+            assert!(lock_registry(shared).groups.is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registration_token_exhaustion_fails_closed() {
+        let shared = fresh_job_registry();
+        assert_eq!(lock_registry(shared).next_token, 0, "default token seed");
+        lock_registry(shared).next_token = u64::MAX;
+        assert!(begin_spawn_in(shared));
+        let tree = crate::windows_test_tree::Tree::new();
+        let child = job_tree(&tree);
+        assert!(register_job_in(shared, child.job()).is_none());
+        assert!(!begin_spawn_in(shared));
+        assert!(lock_registry(shared).groups.is_empty());
+        assert_eq!(lock_registry(shared).spawning, 0);
+        crate::windows_test_tree::assert_dead(child.id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_and_panic_terminate_registered_jobs_from_another_thread() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        for panic_hook in [false, true] {
+            let tree = Tree::new();
+            let shared = fresh_job_registry();
+            assert!(begin_spawn_in(shared));
+            let child = job_tree(&tree);
+            let grandchild = tree.read_marker().parse().expect("grandchild PID");
+            let _registration = register_job_in(shared, child.job()).expect("registration");
+            thread::spawn(move || {
+                if panic_hook {
+                    kill_all_for_panic_in(shared);
+                } else {
+                    kill_all_in(shared);
+                }
+            })
+            .join()
+            .expect("shutdown thread");
+            assert_dead(grandchild);
+            assert_dead(child.id());
+            assert!(!begin_spawn_in(shared));
+            // The owner is still live: its Drop did not cause the tree kill.
+            drop(child);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_waits_for_and_kills_a_run_mid_spawn() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        let tree = Tree::new();
+        let shared = fresh_job_registry();
+        assert!(begin_spawn_in(shared));
+        let child = job_tree(&tree);
+        let grandchild = tree.read_marker().parse().expect("grandchild PID");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let exiting = thread::spawn(move || {
+            kill_all_in(shared);
+            done_tx.send(()).expect("shutdown notification");
+        });
+        let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+        while !lock_registry(shared).closed {
+            assert!(Instant::now() < until, "shutdown did not close admission");
+            thread::sleep(REAP_POLL);
+        }
+        assert!(done_rx.try_recv().is_err(), "shutdown missed mid-spawn run");
+        assert!(register_job_in(shared, child.job()).is_none());
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown bounded");
+        exiting.join().expect("shutdown thread");
+        assert_dead(grandchild);
+        assert_dead(child.id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_and_panic_never_block_on_a_held_registry_lock() {
+        for panic_hook in [false, true] {
+            let shared = fresh_job_registry();
+            let guard = lock_registry(shared);
+            let started = Instant::now();
+            if panic_hook {
+                kill_all_for_panic_in(shared);
+            } else {
+                kill_all_in(shared);
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(guard);
+        }
+    }
 
     fn fresh() -> &'static Mutex<Budget> {
         Box::leak(Box::new(Mutex::new(Budget { held: 0, stuck: 0 })))

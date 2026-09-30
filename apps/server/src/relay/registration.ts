@@ -9,6 +9,8 @@ import {
   isContextWindowSeedAdmissible,
 } from "@ws-model-proxy/api/lib/declared-context-window";
 import {
+  AUTO_CAPACITY_RUNTIME_KEY_PREFIXES,
+  discoveredHardConcurrencyLimit,
   ensureDiscoveredInferenceCapacity,
   existingDiscoveredCapacityCandidates,
   fillNullAutoDiscoveredCapacityLimit,
@@ -24,6 +26,11 @@ import {
   sameStoredEngineFacts,
   storedEngineFacts,
 } from "@ws-model-proxy/api/lib/engine-facts";
+import {
+  applyEngineProcessCapacityPlan,
+  deleteOrphanAutoCapacities,
+  engineProcessRuntimeIdentityKey,
+} from "@ws-model-proxy/api/lib/engine-process-capacity";
 import {
   type McpCommandModeDb,
   type McpCommandModeName,
@@ -132,6 +139,8 @@ export type ReportedRelayFeatures = {
   reportedMcpCommandMode: McpCommandModeDb | null;
   reportedTerminalApproval: boolean | null;
   reportedTerminalSupported: boolean | null;
+  /** 2.8: the CLI's `allowFileToolsAsRoot` config. */
+  reportedAllowFileToolsAsRoot: boolean | null;
   /** Already normalized (see `normalizeReportedHostname`); null when not reported. */
   reportedHostname: string | null;
   featuresReportedAt: Date | null;
@@ -183,6 +192,7 @@ export async function persistRelayRegistration({
           reportedMcpCommandMode: reported.reportedMcpCommandMode,
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
+          reportedAllowFileToolsAsRoot: reported.reportedAllowFileToolsAsRoot,
           reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
           // An accepted hello ends any "CLI upgrade required" state.
@@ -225,29 +235,21 @@ export async function persistRelayRegistration({
           // capacity it would adopt). Targets, models and capacities created
           // by this transaction are invisible to every other transaction
           // until commit, so their policy writes need no fence.
-          const inventoryModelFilters = endpoints.flatMap((endpoint) =>
-            endpoint.models.length > 0
-              ? [
-                  {
-                    Endpoint: { slug: endpoint.slug },
-                    upstreamModelId: { in: endpoint.models.map((model) => model.upstreamModelId) },
-                  },
-                ]
-              : [],
-          );
           const knownDevice = await tx.cliDevice.findUnique({
             where: { userId_slug: { userId: identity.userId, slug: cliSlug } },
             select: { id: true },
           });
           const existingInventoryTargets =
-            knownDevice && inventoryModelFilters.length > 0
+            knownDevice && endpoints.length > 0
               ? await tx.executionTarget.findMany({
                   where: {
                     userId: identity.userId,
                     DiscoveredModel: {
                       is: {
-                        Endpoint: { cliDeviceId: knownDevice.id },
-                        OR: inventoryModelFilters,
+                        Endpoint: {
+                          cliDeviceId: knownDevice.id,
+                          slug: { in: endpoints.map((endpoint) => endpoint.slug) },
+                        },
                       },
                     },
                   },
@@ -257,7 +259,7 @@ export async function persistRelayRegistration({
           const candidateCapacityIds = new Set<string>();
           for (const target of existingInventoryTargets) {
             if (target.inferenceCapacityId) candidateCapacityIds.add(target.inferenceCapacityId);
-            else if (target.discoveredModelId)
+            if (target.discoveredModelId)
               for (const id of await existingDiscoveredCapacityCandidates(tx, {
                 userId: identity.userId,
                 discoveredModelId: target.discoveredModelId,
@@ -265,7 +267,60 @@ export async function persistRelayRegistration({
               }))
                 candidateCapacityIds.add(id);
           }
+          // Shared destinations may have no targets and must be found by key,
+          // independently of the bounded orphan batch.
+          const knownEndpoints = knownDevice
+            ? await tx.endpoint.findMany({
+                where: {
+                  userId: identity.userId,
+                  cliDeviceId: knownDevice.id,
+                  slug: { in: endpoints.map((endpoint) => endpoint.slug) },
+                },
+                select: { id: true },
+              })
+            : [];
+          const sharedRows =
+            knownEndpoints.length > 0
+              ? await tx.inferenceCapacity.findMany({
+                  where: {
+                    userId: identity.userId,
+                    runtimeIdentityKey: {
+                      in: knownEndpoints.map((endpoint) =>
+                        engineProcessRuntimeIdentityKey(endpoint.id),
+                      ),
+                    },
+                  },
+                  select: { id: true },
+                })
+              : [];
+          const orphanRows = await tx.inferenceCapacity.findMany({
+            where: {
+              userId: identity.userId,
+              hardConcurrencyLimitSource: "AUTO",
+              ExecutionTargets: { none: {} },
+              OR: AUTO_CAPACITY_RUNTIME_KEY_PREFIXES.map((prefix) => ({
+                runtimeIdentityKey: { startsWith: prefix },
+              })),
+            },
+            orderBy: { id: "asc" },
+            take: 200,
+            select: { id: true },
+          });
+          for (const row of [...sharedRows, ...orphanRows]) candidateCapacityIds.add(row.id);
+          // Shared/owner assignments can attach targets from another endpoint.
+          // Limit refresh validates all dependents, so fence their policy rows too.
+          const attachedCapacityTargets =
+            candidateCapacityIds.size > 0
+              ? await tx.executionTarget.findMany({
+                  where: {
+                    userId: identity.userId,
+                    inferenceCapacityId: { in: [...candidateCapacityIds] },
+                  },
+                  select: { id: true },
+                })
+              : [];
           await acquireFences(tx, [
+            ...attachedCapacityTargets.map((target) => fences.capacityPolicy(target.id)),
             ...existingInventoryTargets.map((target) => fences.capacityPolicy(target.id)),
             ...[...candidateCapacityIds].map((capacityId) => fences.capacity(capacityId)),
           ]);
@@ -345,7 +400,9 @@ export async function persistRelayRegistration({
           const publishedEndpointSlugs = endpoints.map((endpoint) => endpoint.slug);
           const capacityWork: Array<{
             targetId: string;
+            endpointId: string;
             inferenceCapacityId: string | null;
+            capacityAssignmentSource: string;
             discoveredModelId: string;
             upstreamModelId: string;
             reportedConcurrency: number | undefined;
@@ -353,9 +410,11 @@ export async function persistRelayRegistration({
             engineFacts: StoredEngineFacts | null;
           }> = [];
 
-          const policyFencedTargetIds = new Set(
-            existingInventoryTargets.map((target) => target.id),
-          );
+          const endpointCapacityWork: Array<{
+            endpointId: string;
+            endpointSlug: string;
+            inventory: EndpointInventory;
+          }> = [];
 
           for (const endpoint of endpoints) {
             const coarseCapabilities = endpoint.defaultCapabilities
@@ -412,6 +471,12 @@ export async function persistRelayRegistration({
                 statusChangedAt: now,
               },
               select: { id: true, slug: true },
+            });
+
+            endpointCapacityWork.push({
+              endpointId: persistedEndpoint.id,
+              endpointSlug: persistedEndpoint.slug,
+              inventory: endpoint,
             });
 
             for (const model of endpoint.models) {
@@ -511,7 +576,7 @@ export async function persistRelayRegistration({
               // and block admission's FK FOR KEY SHARE checks (DL-1).
               let target = await tx.executionTarget.findUnique({
                 where: { discoveredModelId: discoveredModel.id },
-                select: { id: true, inferenceCapacityId: true },
+                select: { id: true, inferenceCapacityId: true, capacityAssignmentSource: true },
               });
               if (!target) {
                 target = await tx.executionTarget.create({
@@ -520,17 +585,18 @@ export async function persistRelayRegistration({
                     kind: "DISCOVERED_MODEL",
                     discoveredModelId: discoveredModel.id,
                   },
-                  select: { id: true, inferenceCapacityId: true },
+                  select: { id: true, inferenceCapacityId: true, capacityAssignmentSource: true },
                 });
               }
               // A target outside the fenced set was created by this
               // transaction (the owner fence excludes every other creator).
-              policyFencedTargetIds.add(target.id);
               upsertedTargetIds.add(target.id);
               const modelEngineFacts = mergeEngineFacts(endpoint.engineFacts, model.engineFacts);
               capacityWork.push({
                 targetId: target.id,
+                endpointId: persistedEndpoint.id,
                 inferenceCapacityId: target.inferenceCapacityId,
+                capacityAssignmentSource: target.capacityAssignmentSource,
                 discoveredModelId: discoveredModel.id,
                 upstreamModelId: model.upstreamModelId,
                 // The AUTO seed of a new capacity: the CLI's configured
@@ -569,15 +635,44 @@ export async function persistRelayRegistration({
             });
           }
 
-          // Every existing capacity row the loop below may write holds its
-          // fence (taken above); a capacity created below is a new row.
+          // All graph mutations below use the pre-write fence set. New rows
+          // are transaction-private; existing destinations were read under owner.
+          const orphanCapacityIds = new Set(candidateCapacityIds);
+          for (const { endpointId, endpointSlug, inventory } of endpointCapacityWork) {
+            // Persist each automatic member seed independently of the shared
+            // aggregate so absence from a later inventory cannot erase it.
+            for (const work of capacityWork.filter((work) => work.endpointId === endpointId)) {
+              await tx.executionTarget.updateMany({
+                where: {
+                  id: work.targetId,
+                  userId: identity.userId,
+                  capacityAssignmentSource: "AUTO",
+                },
+                data: {
+                  capacityAutoConcurrencyLimit: discoveredHardConcurrencyLimit(
+                    work.reportedConcurrency,
+                  ),
+                },
+              });
+            }
+            const result = await applyEngineProcessCapacityPlan(tx, {
+              userId: identity.userId,
+              endpointId,
+              endpointSlug,
+              engineFacts: inventory.engineFacts,
+              inventoryModelIds: inventory.models.map((model) => model.upstreamModelId),
+            });
+            for (const id of result.capacityIds) orphanCapacityIds.add(id);
+            for (const work of capacityWork) {
+              const assignment = result.assignments.get(work.targetId);
+              if (assignment) work.inferenceCapacityId = assignment;
+            }
+          }
+
           const engineFactsByCapacityId = new Map<string, StoredEngineFacts[]>();
           for (const work of capacityWork) {
-            // Keep a capacity that is already attached. Otherwise create one
-            // and set the foreign key before this transaction commits.
-            // A null limit on this target's auto key is the schema-hardening
-            // trigger, which cannot see the CLI report. Fill only that null.
             let inferenceCapacityId = work.inferenceCapacityId;
+            if (inferenceCapacityId === null && work.capacityAssignmentSource === "OWNER") continue;
             if (inferenceCapacityId === null) {
               inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
                 userId: identity.userId,
@@ -597,15 +692,16 @@ export async function persistRelayRegistration({
                 capacityId: inferenceCapacityId,
                 discoveredModelId: work.discoveredModelId,
                 executionTargetId: work.targetId,
+                endpointId: work.endpointId,
                 reportedConcurrency: work.reportedConcurrency,
               });
             }
-            if (work.engineFacts && inferenceCapacityId) {
+            if (work.engineFacts) {
               const facts = engineFactsByCapacityId.get(inferenceCapacityId) ?? [];
               facts.push(work.engineFacts);
               engineFactsByCapacityId.set(inferenceCapacityId, facts);
             }
-            if (work.declaredContext != null && inferenceCapacityId) {
+            if (work.declaredContext != null) {
               declaredContextByCapacityId.set(
                 inferenceCapacityId,
                 Math.max(
@@ -615,6 +711,7 @@ export async function persistRelayRegistration({
               );
             }
           }
+          await deleteOrphanAutoCapacities(tx, identity.userId, [...orphanCapacityIds]);
 
           if (declaredContextByCapacityId.size > 0) {
             // Every inventory target already holds its policy fence (above).
@@ -647,8 +744,8 @@ export async function persistRelayRegistration({
               },
             });
             for (const capacity of capacities) {
-              // Dashboard flows own shared capacities. Registration may seed
-              // only the 1:1 topology whose every target was upserted above.
+              // Seed only when every attached target was in this inventory.
+              // This also covers the process alias group after re-pointing.
               if (
                 capacity.ExecutionTargets.some((target) => !lockedExecutionTargetIds.has(target.id))
               ) {

@@ -746,23 +746,44 @@ integration("PostgreSQL capacity admission primitives", () => {
       const releaseLock = new Promise<void>((resolve) => {
         unlock = resolve;
       });
+      let shortenedDeadline!: Date;
       const lockHolder = first.$transaction(async (tx) => {
         await acquireFences(tx, [fences.capacity(capacity.id)]);
         // Shorten only the persisted candidate deadline after setup has
         // completed. The competing manager must re-read it after obtaining the
         // advisory lock instead of trusting its pre-lock view or process clock.
-        await tx.$executeRaw`
+        const [shortened] = await tx.$queryRaw<Array<{ deadlineAt: Date }>>`
           UPDATE capacity_waiter
              SET "deadlineAt" = clock_timestamp() + interval '150 milliseconds'
            WHERE "admissionRequestId" = (
              SELECT id FROM admission_request WHERE "attemptId" = ${deadlineAttempt.attemptId}
-           )`;
+           )
+       RETURNING "deadlineAt"`;
+        if (!shortened) throw new Error("Shortened waiter deadline unavailable.");
+        shortenedDeadline = shortened.deadlineAt;
         locked();
         await releaseLock;
       });
       await hasLock;
       const delayedPoll = secondManager.acquire({ ...deadlineAttempt, candidates: [] });
-      await new Promise((resolve) => setTimeout(resolve, 225));
+      // Deterministic ordering instead of a fixed sleep: the competing manager is
+      // provably queued behind the lock holder's fences, and the database clock is
+      // provably past the shortened deadline, before the lock is released.
+      for (let poll = 0; ; poll++) {
+        const [row] = await first.$queryRaw<Array<{ queued: boolean }>>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND cardinality(pg_blocking_pids(pid)) > 0
+          ) AS queued`;
+        if (row?.queued) break;
+        if (poll >= 500) throw new Error("Competing manager never queued behind the lock holder.");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      while ((await databaseNow()).getTime() <= shortenedDeadline.getTime()) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       unlock();
       await lockHolder;
       await expect(delayedPoll).resolves.toEqual({ state: "EXPIRED" });

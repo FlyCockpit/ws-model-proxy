@@ -49,8 +49,9 @@ import {
   isDeletionConflictReason,
 } from "@ws-model-proxy/config/deletion-conflict";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
-import { cliCommandsAllowed, isCliCommandTool } from "./cli-command-access";
 import { McpCliCommandRejectedError } from "./cli-command-tools";
+import { McpCliFileError } from "./cli-file-tools";
+import { cliToolAllowed, isCliTool } from "./cli-tool-access";
 import { mcpSanitizedLog } from "./errors";
 import {
   collectSchemaPropertyNames,
@@ -190,25 +191,32 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
     : undefined;
 
   for (const descriptor of MCP_TOOL_MANIFEST) {
-    // CLI command tools stay unregistered unless this request's credential
-    // is a personal token minted with allowCliCommands. OAuth, a PAT
-    // without the flag, and an unbound dispatch (treated as OAuth) do not
-    // see them. Call time checks the same predicate again.
-    if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(dispatch?.credential)) {
+    // CLI tools (commands and node file tools) stay unregistered unless this
+    // request's credential is a personal token minted with allowCliCommands
+    // (file tools also need mcp:write). OAuth, a PAT without the flag, and an
+    // unbound dispatch (treated as OAuth) do not see them. Call time checks
+    // the same predicate again.
+    if (
+      isCliTool(descriptor.name) &&
+      !cliToolAllowed(descriptor.name, dispatch?.credential, scopes)
+    ) {
       continue;
     }
     // Explicit type arguments: the SDK's first overload cannot infer
     // OutputArgs when no outputSchema is passed (tools deliberately declare
     // none — no output validation, no SEP-2106 result wrapping), and InputArgs
     // is the erased descriptor schema. The callback receives `unknown` args
-    // (already validated by the schema) and returns the SDK's own
-    // CallToolResult shape.
+    // (audited tools defer their schema validation to the wrapper) and
+    // returns the SDK's own CallToolResult shape.
     server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
       descriptor.name,
       {
         title: descriptor.name,
         description: toolDescription(descriptor),
-        inputSchema: descriptor.inputSchema,
+        inputSchema:
+          descriptor.auditInputRefusal !== undefined
+            ? deferInputValidation(descriptor.inputSchema)
+            : descriptor.inputSchema,
         annotations: {
           readOnlyHint: descriptor.scope === "read",
           destructiveHint:
@@ -224,6 +232,21 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
         runManifestTool(descriptor, { dispatch, scopes, client, args }),
     );
   }
+}
+
+/**
+ * Advertise the same schema, but let the wrapper validate audited tools. The
+ * SDK's own validation errors have no stable structured code. The wrapper
+ * enforces the original validator before confirmation or invocation, audits
+ * its refusal once, and returns a sanitized in-band error.
+ */
+function deferInputValidation(schema: StandardSchemaWithJSON): StandardSchemaWithJSON {
+  return {
+    "~standard": {
+      ...schema["~standard"],
+      validate: (input: unknown) => ({ value: input }),
+    },
+  };
 }
 
 function toolDescription(descriptor: McpToolDescriptor): string {
@@ -275,11 +298,11 @@ export async function runManifestTool(
   const signal = dispatch.signal;
   const credential = dispatch.credential ?? { kind: "oauth" as const };
 
-  // CLI command tools are re-checked before scope and confirmation so a
-  // credential that cannot see them gets the same not-found answer as an
-  // unregistered name, not an insufficient-scope or confirmation error
-  // that would reveal the tool.
-  if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(credential)) {
+  // CLI tools are re-checked before scope and confirmation so a credential
+  // that cannot see them gets the same not-found answer as an unregistered
+  // name, not an insufficient-scope or confirmation error that would reveal
+  // the tool.
+  if (isCliTool(descriptor.name) && !cliToolAllowed(descriptor.name, credential, scopes)) {
     mcpSanitizedLog("tool call rejected: unknown tool", {
       toolName: descriptor.name,
       requestId,
@@ -301,6 +324,33 @@ export async function runManifestTool(
     return insufficientScopeError(descriptor);
   }
 
+  // Audited tools enforce their original SDK validator here, including the
+  // first-stage size bound, so refusals also carry the stable error contract.
+  if (descriptor.auditInputRefusal !== undefined) {
+    let validationFailure: unknown;
+    try {
+      const validated = await descriptor.inputSchema["~standard"].validate(args);
+      if (validated.issues !== undefined) validationFailure = validated;
+    } catch {
+      // A validator/serializer exception is a refusal too. Do not let the
+      // SDK echo its message, or skip the metadata-only refusal audit.
+      validationFailure = {};
+    }
+    if (validationFailure !== undefined) {
+      descriptor.auditInputRefusal(args, {
+        userId: dispatch.orpcContext.session.user.id,
+        credential,
+      });
+      const issues = sanitizeValidationIssues(validationFailure, declaredInputKeys(descriptor));
+      return toolError(
+        issues === null ? "Invalid input" : `Invalid input: ${formatValidationIssues(issues)}`,
+        {
+          error: { code: "invalid_input", ...(issues === null ? {} : { issues }) },
+        },
+      );
+    }
+  }
+
   // 3. Confirmation gate + field stripping.
   const argsRecord =
     args !== null && typeof args === "object" && !Array.isArray(args)
@@ -310,6 +360,10 @@ export async function runManifestTool(
     mcpSanitizedLog("tool call denied: missing confirmation", {
       toolName: descriptor.name,
       requestId,
+    });
+    descriptor.auditInputRefusal?.(argsRecord, {
+      userId: dispatch.orpcContext.session.user.id,
+      credential,
     });
     return confirmationRequiredError(descriptor);
   }
@@ -421,6 +475,24 @@ export async function runManifestTool(
         requestId,
       });
       return toolError(error.message, { error: { code: error.code } });
+    }
+    if (error instanceof McpCliFileError) {
+      // The code is a fixed runtime value. Paths and file content are not logged.
+      mcpSanitizedLog(`tool call rejected: cli file ${error.code}`, {
+        toolName: descriptor.name,
+        requestId,
+      });
+      // #117: an invalid_input names the failing field(s) (sanitized issues only).
+      const issues =
+        error.validation === null
+          ? null
+          : sanitizeValidationIssues(error.validation, declaredInputKeys(descriptor));
+      if (issues !== null) {
+        return toolError(`${error.message}: ${formatValidationIssues(issues)}`, {
+          error: { code: error.code, ...error.extra, issues },
+        });
+      }
+      return toolError(error.message, { error: { code: error.code, ...error.extra } });
     }
     return mapToolError(error, descriptor, requestId);
   }

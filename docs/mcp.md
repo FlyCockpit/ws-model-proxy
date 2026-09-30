@@ -11,7 +11,8 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.7) is read-only over MCP.
+Node telemetry (relay protocol 2.7) is read-only over MCP. Node file tools
+(relay protocol 2.8) are described in [CLI file tools](#cli-file-tools-relay-protocol-28).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
 stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
@@ -21,6 +22,31 @@ stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
 every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
+
+Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
+when the CLI proves that at least two inventory model ids are aliases served
+by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
+capacities. Model-swapping front ends are excluded only through engine detection
+and router-role proof. Owner assignments are recorded per target only when the
+capacity FK changes, including a real detach to null or a move to an existing AUTO
+capacity. Equal-FK and policy-only inputs preserve provenance; an untouched web
+attachment field preserves the target's current capacity. USER limits remain owner
+controlled. Removed aliases split on a later idle inventory. Discovery defers each
+connected move group while its source or destination capacities have ACTIVE leases
+or WAITING waiters. Unrelated capacities and independent endpoint groups do not block
+it. Every later inventory retries deferred groups; the CLI sends inventory on reconnect
+or operator reload, so an involved busy capacity can defer moves until an idle inventory.
+Existing handles keep their original capacity.
+Every join and split must fit direct and effective pool concurrency and context policies.
+Shared AUTO limits follow engine slots, otherwise the sum of current automatic member
+limits; incompatible lowerings wait for a policy change and the next inventory.
+Startup leaves unknown shared AUTO limits for that complete inventory aggregate.
+Empty AUTO discovery capacities are removed with model, endpoint, and device
+deletes, and an idempotent startup sweep repairs existing idle orphans. The sweep skips
+contended owners and capacities for the next registration or startup.
+Owner-created empty capacities remain visible in `capacity_records_list`.
+Automatic capacity labels get a numeric suffix when an owner's existing label
+collides; repeated discovery preserves the capacity identity and its label.
 
 `forwarder_device_metrics_get` also lists `series`: every metric a pool routing
 rule can name on that device (built-in `node.*` series such as
@@ -76,6 +102,93 @@ Metric routing rules (S-B part 2):
   (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
   read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
+
+## CLI file tools (relay protocol 2.8)
+
+Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
+`forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
+(read class, scope `read`, no confirmation) and `forwarder_cli_file_edit`,
+`forwarder_cli_file_write`, `forwarder_cli_file_rename`, `forwarder_cli_dir_create`
+(write class, `confirm: "RUN"`) and `forwarder_cli_file_delete` (`confirm: "DELETE"`).
+All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
+it does not compose shell commands. Every result that touches a file carries an
+`etag`, results are bounded windows, and write-class calls take an optional `reason`
+(500 characters) that goes to the CLI log.
+
+**Who may call.** Like the CLI command tools, the file tools are visible and callable
+only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth
+is always denied and the tools are hidden from `tools/list`.
+
+**Permission matrix.** What runs depends on the device's effective mode, the lowest of the
+dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live hello:
+
+| Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
+| --- | --- | --- |
+| `unsupervised` | headless | headless |
+| `supervised` | refused `supervised_only` | refused `supervised_only` |
+| `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
+
+A supervised confirm screen for writes and an opt-in read-only grant are later phases;
+until then a supervised node refuses file tools. `listCliDevices` reports
+`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`. That
+summary is the MODE permission only: a Windows CLI, or a root CLI without
+`allowFileToolsAsRoot`, still refuses every operation as `unsupported`. `supervised` means
+the operation needs a person, which this phase does not provide, so it is refused. The CLI refuses every file tool as
+`unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
+The CLI re-checks its own mode on every operation; a server request never overrides it.
+The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
+the terminal approval files, `instances.json` and `relay-control.sock`; `service.env`;
+`config.json` and its lock for writes; and the special trees `/proc`, `/sys` and `/dev`)
+is refused as `path_denied` or `special_file`.
+
+**Masking boundary.** The CLI masks, before anything is windowed: (1) in dotenv and env
+files (`.env`, `*.env`, `.envrc`, `service.env`) every value, shown as `KEY=⟦redacted:N⟧`
+(other lines that are not blanks, comments or a simple `KEY=` are masked whole); (2) in
+any other file, every line containing a secret-name word (ending in `_TOKEN`, `_KEY`,
+`_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `hf-token`, or equal to `PASSWORD`), the
+following non-blank line, and every line indented deeper than it, each shown as
+`⟦redacted line⟧`, plus the value of `--api-key` / `--hf-token` style flags; (3) private
+key blocks (PEM BEGIN to the matching END) and SSH private key files; (4) the Hugging Face
+token files. There is no vendor-prefix scanner. A construct that opens further back than
+the bounded lookback of a windowed read is a documented residual. Edits cannot target a
+masked span, and the etag is keyed. **On an `unsupervised` node masking is not a security
+boundary**: an agent with command access can `cat .env`. It keeps those secrets out of
+transcripts on the normal path. Secret-class files (dotenv, key and token files, and their
+directories) are read-only masked views: every write, edit, rename, delete or mkdir that
+touches one is refused as `secret_file` (compared case-insensitively on every OS); use a
+command to change such a file. The server never logs or stores file content, and it
+additionally removes `wsmp_` credential substrings from every returned string.
+
+**ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
+with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
+and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`
+(an etag, or the word `gone` when the file was removed): re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
+when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
+fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
+`token_inactive`, a mode change, `io_error`, `not_found` on rename and delete, or `conflict` when the file was swapped during the change): call
+`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
+that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
+without `expectedEtag` is not idempotent, so check with `file_stat` first.
+
+**Limits.** 120 file operations per minute per user, of which at most 30 change files;
+4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
+Operations are never queued and time out after 30 seconds (search and hashing have shorter
+CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
+windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
+request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
+DECODED, and the whole request of stat, list, search and edit must fit one 64 KiB relay
+frame. The 1 MB `/mcp` request-body cap that every call shares is the
+real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
+decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
+current tools. Errors are
+in-band `isError` results with a stable `error.code`: the command codes
+(`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
+`unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
+file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
+`too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
+`hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
+`cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
+("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
 
@@ -560,12 +673,14 @@ the command text itself), when, and how it ended (`completed`, `refused`, `faile
 (`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
 stored as `rejected`, so CLI-supplied text never reaches the column. File
 content, diffs and command output are never stored, and the command's arguments
-are never stored: the server reduces the command text to its program (the
-first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
-`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
-command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
-flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
-for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+are never stored: the server reduces the command text to its program name: it skips leading plain
+`NAME=value` assignments (never stored), removes one layer of quotes, takes the
+basename of a path and lowercases it, and stores the result only when it is in a
+fixed, code-reviewed allowlist of common program names
+(`CLI_AGENT_PROGRAM_ALLOWLIST` in `packages/config/src/cli-agent-audit.ts`), else `?`
+(an unknown program, a non-plain assignment value, a flag, a redirection or a
+command cut for length; a wrapper such as `sudo` or `env` is stored by its own
+name), so only allowlisted strings ever reach the row; the server also hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
 HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
 (fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
 used to check a guessed command; when the key cannot be derived the hash is

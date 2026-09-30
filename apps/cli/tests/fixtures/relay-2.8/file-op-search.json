@@ -1,0 +1,15 @@
+{
+  "type": "file.op",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "search",
+  "args": {
+    "root": "~/deploy",
+    "pattern": "--ctx-size",
+    "mode": "literal",
+    "glob": "*.sh",
+    "caseInsensitive": false,
+    "contextLines": 1,
+    "maxMatches": 100,
+    "maxFiles": 20000
+  }
+}

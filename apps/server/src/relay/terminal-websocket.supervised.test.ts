@@ -49,7 +49,7 @@ const db = prisma as unknown as {
     findMany: MockInstance;
   };
   cliToken: { updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { findUnique: MockInstance };
+  endpoint: { findUnique: MockInstance; findMany: MockInstance };
   discoveredModel: { findMany: MockInstance };
   executionTarget: { findMany: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
@@ -100,13 +100,13 @@ function hello() {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug: "desktop",
       hostname: "desktop.local",
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.7",
+        protocolVersion: "2.8",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -125,11 +125,15 @@ function hello() {
           terminalApproval: false,
           terminalSupported: true,
           remoteMetricSources: false,
+          mcpFileRead: false,
+          fileRootsConfigured: false,
+          allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
         nodeTelemetry: true,
+        fileOps: true,
       },
     },
     endpoints: [],
@@ -190,6 +194,7 @@ describe("terminal list pushes for supervised requests", () => {
     ]);
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken("Agent"));
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);

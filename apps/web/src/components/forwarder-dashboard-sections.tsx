@@ -50,6 +50,7 @@ import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
+  capacityAttachmentChange,
   capacityFormSchema,
   capacityMutationPayload,
   directPolicyIsValid,
@@ -1121,7 +1122,8 @@ function DirectCapacityPolicyForm({
   const { t } = useTranslation(["common", "dashboard"]);
   const capacityEnabled = capacityAvailability === "enabled";
   const queryClient = useQueryClient();
-  const [capacityId, setCapacityId] = useState(target.inferenceCapacityId ?? "");
+  const [capacityChoice, setCapacityId] = useState<string>();
+  const capacityId = capacityChoice ?? target.inferenceCapacityId ?? "";
   const [priority, setPriority] = useState(String(target.directPriority));
   const [concurrencyMode, setConcurrencyMode] = useState<FiniteLimitMode>(
     target.directConcurrencyLimit === null ? "UNLIMITED" : "LIMITED",
@@ -1173,7 +1175,8 @@ function DirectCapacityPolicyForm({
         mutation.mutate(
           directPolicyPayload({
             executionTargetId: target.id,
-            capacityId,
+            capacityId: capacityChoice,
+            currentCapacityId: target.inferenceCapacityId,
             priority,
             concurrency,
             reserved,
@@ -2910,7 +2913,14 @@ export function PoolMemberForm({
   const [memberTier, setMemberTier] = useState<"PRIMARY" | "PUBLIC_OVERFLOW">(
     member?.tier ?? "PRIMARY",
   );
-  const [capacityId, setCapacityId] = useState(member?.inferenceCapacityId ?? "");
+  const [capacityChoice, setCapacityId] = useState<string>();
+  const currentCapacityId =
+    mode === "create"
+      ? (directModels.find((model) => model.id === discoveredModelId)?.executionTarget
+          ?.inferenceCapacityId ?? null)
+      : (member?.inferenceCapacityId ?? null);
+  const capacityId = capacityChoice ?? currentCapacityId ?? "";
+  const attachment = capacityAttachmentChange(capacityChoice, currentCapacityId);
   const [priorityMode, setPriorityMode] = useState<"INHERIT" | "OVERRIDE">(
     member?.capacityPriority == null ? "INHERIT" : "OVERRIDE",
   );
@@ -3039,11 +3049,11 @@ export function PoolMemberForm({
                 ),
               );
               const createdExecutionTargetId = created.executionTargetId;
-              if (createdExecutionTargetId) {
+              if (createdExecutionTargetId && attachment.inferenceCapacityId !== undefined) {
                 await runMutation(() =>
                   attachCapacity.mutateAsync({
                     executionTargetId: createdExecutionTargetId,
-                    inferenceCapacityId: capacityId || null,
+                    ...attachment,
                   }),
                 );
               }
@@ -3111,12 +3121,17 @@ export function PoolMemberForm({
                 );
               }
             }
-            if (capacityEnabled && member.executionTargetId && !member.providerModel) {
+            if (
+              capacityEnabled &&
+              member.executionTargetId &&
+              !member.providerModel &&
+              attachment.inferenceCapacityId !== undefined
+            ) {
               const memberExecutionTargetId = member.executionTargetId;
               await runMutation(() =>
                 attachCapacity.mutateAsync({
                   executionTargetId: memberExecutionTargetId,
-                  inferenceCapacityId: capacityId || null,
+                  ...attachment,
                 }),
               );
             }
@@ -3138,7 +3153,10 @@ export function PoolMemberForm({
             id={selectId}
             className="h-11 w-full rounded-md border bg-background px-3 text-sm"
             value={discoveredModelId}
-            onChange={(event) => setDiscoveredModelId(event.target.value)}
+            onChange={(event) => {
+              setDiscoveredModelId(event.target.value);
+              setCapacityId(undefined);
+            }}
           >
             {directModels.map((model) => (
               <option key={model.id} value={model.id}>

@@ -57,6 +57,15 @@ const cliRuntime = vi.hoisted(() => ({
 
 vi.mock("../relay/cli-commands.js", () => cliRuntime);
 
+const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn(), auditRefusedFileInput: vi.fn() }));
+
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: fileRuntime.runFileOp,
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: fileRuntime.auditRefusedFileInput,
+}));
+
 // The full-chain test drives the Phase 4 request handler whose verifier is
 // the upstream requireMcpAuth wrapper. Mock ONLY that wrapper (keeping the
 // real `mcp` plugin via importOriginal — the auth package's plugin chain
@@ -119,12 +128,17 @@ function toolCallRequest(id: number, tool: string, args: unknown = {}) {
       "mcp-method": "tools/call",
       "mcp-name": tool,
     },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: { name: tool, arguments: args, _meta: ENVELOPE },
-    }),
+    body: toolCallBody(tool, args, id),
+  });
+}
+
+/** The exact JSON-RPC body a `tools/call` sends (byte length is what the /mcp body cap measures). */
+function toolCallBody(tool: string, args: unknown, id = 1) {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: tool, arguments: args, _meta: ENVELOPE },
   });
 }
 
@@ -195,12 +209,26 @@ function bindRequest(
   });
 }
 
+const CLI_FILE_TOOL_NAMES = [
+  "forwarder_cli_file_read",
+  "forwarder_cli_file_stat",
+  "forwarder_cli_dir_list",
+  "forwarder_cli_file_search",
+  "forwarder_cli_file_edit",
+  "forwarder_cli_file_write",
+  "forwarder_cli_file_rename",
+  "forwarder_cli_dir_create",
+  "forwarder_cli_file_delete",
+] as const;
+
+/** Every PAT-only CLI tool: the three command tools and the nine node file tools. */
 const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
   "forwarder_cli_activity_list",
   "forwarder_device_metric_sources_set",
+  ...CLI_FILE_TOOL_NAMES,
 ]);
 
 function catalogNames(includeCliCommands: boolean): string[] {
@@ -2029,4 +2057,751 @@ describe("MCP preview provider disclosure", () => {
         providerGate.enabled = true;
       }
     });
+});
+
+describe("CLI file tools", () => {
+  const READ_RESULT = {
+    etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    size: 12,
+    mtime: "2026-01-01T00:00:00Z",
+    mode: "0644",
+    totalLines: 1,
+    startLine: 1,
+    endLine: 1,
+    eol: "lf",
+    text: "1|KEY=⟦redacted:12⟧",
+    redactions: 1,
+    more: null,
+    secretFile: true,
+  };
+
+  beforeEach(() => {
+    fileRuntime.runFileOp.mockReset();
+  });
+
+  async function listedTools(
+    credential: ListedCredential | undefined,
+    scopes: string[],
+  ): Promise<Array<{ name: string; description?: string; annotations?: Record<string, unknown> }>> {
+    const authInfo = buildAuthInfo(scopes);
+    if (credential !== undefined) bindRequest(authInfo, "req-list", credential);
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(9), { authInfo });
+    const body = (await response.json()) as {
+      result?: { tools?: Array<{ name: string; description?: string }> };
+    };
+    return body.result?.tools ?? [];
+  }
+
+  async function call(
+    name: string,
+    args: unknown,
+    options: { credential?: ListedCredential; scopes?: string[]; signal?: AbortSignal } = {},
+  ) {
+    return runManifestTool(requireDescriptor(name), {
+      dispatch: cliDispatch(options.credential ?? PAT_WITH_CLI, options.signal),
+      scopes: options.scopes ?? ["mcp:write"],
+      client: undefined,
+      args,
+    });
+  }
+
+  function structured(result: { structuredContent?: unknown }) {
+    return result.structuredContent as {
+      result?: Record<string, unknown>;
+      error?: Record<string, unknown>;
+    };
+  }
+
+  it("registers 4 read-class and 5 write-class descriptors with the documented policy", () => {
+    const table: Array<[string, "read" | "write", "DELETE" | "RUN" | null, string]> = [
+      ["forwarder_cli_file_read", "read", null, "pure"],
+      ["forwarder_cli_file_stat", "read", null, "pure"],
+      ["forwarder_cli_dir_list", "read", null, "pure"],
+      ["forwarder_cli_file_search", "read", null, "pure"],
+      ["forwarder_cli_file_edit", "write", "RUN", "external"],
+      ["forwarder_cli_file_write", "write", "RUN", "external"],
+      ["forwarder_cli_file_rename", "write", "RUN", "external"],
+      ["forwarder_cli_dir_create", "write", "RUN", "external"],
+      ["forwarder_cli_file_delete", "write", "DELETE", "destructive"],
+    ];
+    for (const [name, scope, confirmation, classification] of table) {
+      const descriptor = requireDescriptor(name);
+      expect(
+        `${name} ${descriptor.scope} ${descriptor.confirmation} ${descriptor.classification}`,
+      ).toBe(`${name} ${scope} ${confirmation} ${classification}`);
+      expect(descriptor.target).toMatch(/^core:forwarderCliFile/);
+      expect(descriptor.deliverDespiteAbort).not.toBe(true);
+    }
+  });
+
+  it("hides all nine tools from OAuth and from a PAT without the flag, and lists them for a flagged PAT with mcp:write", async () => {
+    for (const [credential, scopes] of [
+      [OAUTH_CREDENTIAL, ["mcp:write"]],
+      [OAUTH_CREDENTIAL, ["mcp:read"]],
+      [PAT_WITHOUT_CLI, ["mcp:write"]],
+      [undefined, ["mcp:write"]],
+    ] as const) {
+      const names = (await listedTools(credential, [...scopes])).map((tool) => tool.name);
+      for (const name of CLI_FILE_TOOL_NAMES) expect(names).not.toContain(name);
+    }
+    const flagged = (await listedTools(PAT_WITH_CLI, ["mcp:write"])).map((tool) => tool.name);
+    for (const name of CLI_FILE_TOOL_NAMES) expect(flagged).toContain(name);
+    // A flagged PAT that only holds mcp:read does not get the file tools in this phase.
+    const readOnly = (await listedTools(PAT_WITH_CLI, ["mcp:read"])).map((tool) => tool.name);
+    for (const name of CLI_FILE_TOOL_NAMES) expect(readOnly).not.toContain(name);
+  });
+
+  it("answers an unknown-tool error at call time to OAuth, a PAT without the flag, and a read-only PAT", async () => {
+    for (const [credential, scopes] of [
+      [OAUTH_CREDENTIAL, ["mcp:write"]],
+      [PAT_WITHOUT_CLI, ["mcp:write"]],
+      [PAT_WITH_CLI, ["mcp:read"]],
+    ] as const) {
+      for (const name of CLI_FILE_TOOL_NAMES) {
+        const result = await call(
+          name,
+          { cliDeviceId: "cli-1", path: "~/a", confirm: "RUN" },
+          { credential, scopes: [...scopes] },
+        );
+        expect(result.isError).toBe(true);
+        expect(resultText(result)).toBe(`Tool ${name} not found`);
+      }
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("requires the confirmation literal on write-class tools before anything runs", async () => {
+    for (const [name, literal] of [
+      ["forwarder_cli_file_edit", "RUN"],
+      ["forwarder_cli_file_write", "RUN"],
+      ["forwarder_cli_file_rename", "RUN"],
+      ["forwarder_cli_dir_create", "RUN"],
+      ["forwarder_cli_file_delete", "DELETE"],
+    ] as const) {
+      const result = await call(name, { cliDeviceId: "cli-1", path: "~/a" });
+      expect(resultText(result)).toContain(`confirm="${literal}"`);
+      const wrong = await call(name, {
+        cliDeviceId: "cli-1",
+        path: "~/a",
+        confirm: literal === "RUN" ? "DELETE" : "RUN",
+      });
+      expect(resultText(wrong)).toContain(`confirm="${literal}"`);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("advertises strict inputs and states the masking boundary, the ETag workflow, and the unknown-outcome recovery", async () => {
+    const tools = await listedTools(PAT_WITH_CLI, ["mcp:write"]);
+    const read = tools.find((tool) => tool.name === "forwarder_cli_file_read");
+    const edit = tools.find((tool) => tool.name === "forwarder_cli_file_edit");
+    expect(read?.description).toContain("NOT a security boundary");
+    expect(read?.description).toContain("⟦redacted:N⟧");
+    expect(read?.description).toContain("private-key blocks");
+    expect(read?.description).toContain("ifNoneMatch");
+    expect(edit?.description).toContain("expectedEtag");
+    expect(edit?.description).toContain("forwarder_cli_file_stat");
+    expect(edit?.description).toContain('confirm: "RUN"');
+    // G3: the 64 KiB request-fit rule is stated on the tools whose advertised
+    // maxima can exceed it (stat's 50 paths, list/search patterns), and the
+    // read note names the escape-dense too_large case.
+    const stat = tools.find((tool) => tool.name === "forwarder_cli_file_stat");
+    const list = tools.find((tool) => tool.name === "forwarder_cli_dir_list");
+    const search = tools.find((tool) => tool.name === "forwarder_cli_file_search");
+    for (const tool of [stat, list, search, edit]) {
+      expect(tool?.description).toContain("64 KiB relay frame");
+    }
+    expect(read?.description).toContain("escape-dense");
+    expect(read?.annotations?.readOnlyHint).toBe(true);
+    expect(edit?.annotations?.readOnlyHint).toBe(false);
+    const listing = await (async () => {
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-schema", PAT_WITH_CLI);
+      const response = await createMcpTransport().fetch(toolsListRequest(10), { authInfo });
+      return (await response.json()) as {
+        result?: {
+          tools?: Array<{
+            name: string;
+            inputSchema?: { properties?: Record<string, unknown>; additionalProperties?: unknown };
+          }>;
+        };
+      };
+    })();
+    const schema = listing.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_file_read",
+    )?.inputSchema;
+    expect(Object.keys(schema?.properties ?? {}).sort()).toEqual(
+      [
+        "byteOffset",
+        "cliDeviceId",
+        "ifNoneMatch",
+        "lineNumbers",
+        "maxBytes",
+        "maxLines",
+        "path",
+        "startLine",
+      ].sort(),
+    );
+    // The generated schema is advisory and loose (#117); the core enforces the strict shape.
+    expect(schema?.additionalProperties).toEqual({});
+  });
+
+  it("runs a read with exactly the documented arguments, and projects only documented fields", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: { ...READ_RESULT, leaked: "SHOULD_NOT_APPEAR", nested: { more: 1 } },
+    });
+    const result = await call("forwarder_cli_file_read", {
+      cliDeviceId: "cli-1",
+      path: "~/.env",
+      startLine: 1,
+      maxLines: 10,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(fileRuntime.runFileOp).toHaveBeenCalledWith({
+      userId: USER.id,
+      tokenId: "token-pat-1",
+      expiresAt: PAT_EXPIRES,
+      cliDeviceId: "cli-1",
+      op: "read",
+      args: { path: "~/.env", startLine: 1, maxLines: 10 },
+      signal: undefined,
+    });
+    const payload = structured(result).result;
+    expect(payload).toEqual(READ_RESULT);
+    expect(JSON.stringify(result)).not.toContain("SHOULD_NOT_APPEAR");
+    // The boolean secretFile flag survives the generic key redactor.
+    expect(payload?.secretFile).toBe(true);
+    expect(resultText(result)).toContain("⟦redacted:12⟧");
+  });
+
+  it("audits and names fields for shape errors even through the real SDK transport", async () => {
+    const bad: Array<Record<string, unknown>> = [
+      { path: 42 },
+      { path: "~/a", maxLines: 5000 },
+      { path: "~/a", nested: { edits: 1 } },
+    ];
+    for (const extra of bad) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, "forwarder_cli_file_read", {
+        cliDeviceId: "cli-1",
+        ...extra,
+      });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("audits missing confirmation and oversized input through the real SDK transport (#104)", async () => {
+    const confirmed: Array<[string, Record<string, unknown>]> = [
+      ["forwarder_cli_file_write", { path: "~/n", content: "x" }],
+      ["forwarder_cli_file_edit", { path: "~/a", oldString: "a", newString: "b" }],
+      ["forwarder_cli_file_rename", { from: "~/a", to: "~/b" }],
+      ["forwarder_cli_dir_create", { path: "~/n" }],
+      ["forwarder_cli_file_delete", { path: "~/a" }],
+    ];
+    const cases: Array<[string, Record<string, unknown>, string]> = [];
+    for (const [name, args] of confirmed) {
+      cases.push([name, args, "CONFIRMATION_REQUIRED"]);
+      cases.push([name, { ...args, confirm: "NOPE" }, "CONFIRMATION_REQUIRED"]);
+    }
+    cases.push([
+      "forwarder_cli_file_read",
+      { path: "~/a", pad: "x".repeat(70_000) },
+      "invalid_input",
+    ]);
+    for (const [name, args, code] of cases) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk-c", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
+      expect(body.error).toBeUndefined();
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe(code);
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+      expect(fileRuntime.auditRefusedFileInput.mock.calls[0]?.[0]).toMatchObject({
+        cliDeviceId: "",
+        userId: USER.id,
+        tokenId: "token-pat-1",
+      });
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("audits deeply nested invalid JSON without echoing values through the SDK", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo, "req-sdk-deep", PAT_WITH_CLI);
+    const request = toolCallRequest(1, "forwarder_cli_file_read");
+    // Send the nested value as raw JSON, without pre-processing it through
+    // the test client's serializer. The request stays under the size bound.
+    const nested = `${'{"x":'.repeat(10_000)}"SECRET-DEEP-VALUE"${"}".repeat(10_000)}`;
+    const rawArgs = `{"cliDeviceId":"cli-1","path":"~/a","extra":${nested}}`;
+    const body = (await request.text()).replace('"arguments":{}', `"arguments":${rawArgs}`);
+    const response = await createMcpTransport().fetch(
+      new Request(request.url, { method: request.method, headers: request.headers, body }),
+      { authInfo },
+    );
+    const result = (await response.json()) as Awaited<ReturnType<typeof callTool>>["body"];
+    expect(result.error).toBeUndefined();
+    expect(result.result?.isError).toBe(true);
+    expect(result.result?.structuredContent?.error?.code).toBe("invalid_input");
+    expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toMatch(/SECRET-DEEP-VALUE|stack|RangeError/);
+  });
+
+  it.each(["sync", "async"])(
+    "audits a %s validator exception without SDK message echo",
+    async (mode) => {
+      const validate = vi
+        .spyOn(requireDescriptor("forwarder_cli_file_read").inputSchema["~standard"], "validate")
+        .mockImplementationOnce(() => {
+          const error = new Error("SECRET-VALIDATOR-VALUE");
+          if (mode === "async") return Promise.reject(error);
+          throw error;
+        });
+      try {
+        const authInfo = buildAuthInfo(["mcp:write"]);
+        bindRequest(authInfo, "req-sdk-validator", PAT_WITH_CLI);
+        const { body } = await callTool(authInfo, "forwarder_cli_file_read", {
+          cliDeviceId: "cli-1",
+          path: "~/a",
+        });
+        expect(body.error).toBeUndefined();
+        expect(body.result?.isError).toBe(true);
+        expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+        expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+        expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+        expect(JSON.stringify(body)).not.toContain("SECRET-VALIDATOR-VALUE");
+      } finally {
+        validate.mockRestore();
+      }
+    },
+  );
+
+  it("names the failing fields of an invalid input without echoing values (#117)", async () => {
+    const cases: Array<[Record<string, unknown>, RegExp, string]> = [
+      [{ path: "~/a", surprise: "SECRET-VALUE-XYZ" }, /Unrecognized field/, "(input)"],
+      [{ path: "~/a", maxLines: 5000 }, /maxLines/, "maxLines"],
+      [{ path: 42 }, /path/, "path"],
+      [{}, /path/, "path"],
+    ];
+    for (const [extra, pattern, field] of cases) {
+      const result = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", ...extra });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("invalid_input");
+      const issues = structured(result).error?.issues as Array<{ path: unknown[] }> | undefined;
+      expect(issues?.length).toBeGreaterThan(0);
+      expect(resultText(result)).toMatch(pattern);
+      expect(JSON.stringify(result)).not.toContain("SECRET-VALUE-XYZ");
+      if (field !== "(input)") expect(issues?.some((i) => i.path.join(".") === field)).toBe(true);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("audits an input refused in the MCP layer as a refusal (#104)", async () => {
+    fileRuntime.auditRefusedFileInput.mockClear();
+    await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", surprise: 1 });
+    await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n",
+      content: "not base64!!",
+      encoding: "base64",
+      confirm: "RUN",
+    });
+    expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(2);
+    expect(fileRuntime.auditRefusedFileInput.mock.calls[1]?.[0]).toMatchObject({
+      op: "write",
+      userId: USER.id,
+      tokenId: "token-pat-1",
+    });
+    expect(JSON.stringify(fileRuntime.auditRefusedFileInput.mock.calls)).not.toContain(
+      "not base64",
+    );
+  });
+
+  it("scrubs credential substrings from a CLI-supplied error detail", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "conflict",
+      detail: { currentEtag: "h:wsmp_cli_abcdef0123456789xyz" },
+    });
+    const result = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      edits: [{ oldText: "a", newText: "b" }],
+      confirm: "RUN",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toMatch(/wsmp_cli_[A-Za-z0-9]{6,}/);
+    expect(structured(result).error?.code).toBe("conflict");
+  });
+
+  it("keeps unchanged:true in the ifNoneMatch answer", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: { unchanged: true, etag: "h:AAAAAAAAAAAAAAAAAAAAAA", junk: 1 },
+    });
+    const result = await call("forwarder_cli_file_read", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      ifNoneMatch: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    });
+    expect(structured(result).result).toEqual({
+      unchanged: true,
+      etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+    });
+  });
+
+  it("clamps a read window to the MCP output budget", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({ ok: true, op: "read", result: READ_RESULT });
+    await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", maxBytes: 131072 });
+    expect(fileRuntime.runFileOp.mock.calls[0]?.[0]).toMatchObject({ args: { maxBytes: 98304 } });
+  });
+
+  it("projects stat entries, list, search, and the write-class results field by field", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "stat",
+      result: { entries: [{ path: "~/a", type: "file", size: 1, junk: true }], junk: 1 },
+    });
+    expect(
+      structured(await call("forwarder_cli_file_stat", { cliDeviceId: "cli-1", paths: ["~/a"] }))
+        .result,
+    ).toEqual({ entries: [{ path: "~/a", type: "file", size: 1 }] });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "list",
+      result: { entries: "f 1B ~/a", count: 1, more: { cursor: "c", junk: 1 }, junk: 1 },
+    });
+    expect(
+      structured(await call("forwarder_cli_dir_list", { cliDeviceId: "cli-1", path: "~/" })).result,
+    ).toEqual({ entries: "f 1B ~/a", count: 1, more: { cursor: "c" } });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "search",
+      result: { matches: "a:1|x", files: 1, count: 1, scannedFiles: 3, more: null, junk: 1 },
+    });
+    expect(
+      structured(
+        await call("forwarder_cli_file_search", { cliDeviceId: "cli-1", root: "~/", pattern: "x" }),
+      ).result,
+    ).toEqual({ matches: "a:1|x", files: 1, count: 1, scannedFiles: 3, more: null });
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "edit",
+      result: {
+        etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+        previousEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+        added: 1,
+        removed: 1,
+        applied: true,
+        junk: 1,
+      },
+    });
+    const edited = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      edits: [{ oldText: "a", newText: "b" }],
+      reason: "why",
+      confirm: "RUN",
+    });
+    expect(structured(edited).result).toEqual({
+      etag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+      previousEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      added: 1,
+      removed: 1,
+      applied: true,
+    });
+    // The optional reason and the confirm-stripped arguments reach the op.
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0]).toMatchObject({
+      op: "edit",
+      args: {
+        path: "~/a",
+        expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+        edits: [{ oldText: "a", newText: "b" }],
+        reason: "why",
+      },
+    });
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0].args).not.toHaveProperty("confirm");
+  });
+
+  it("decodes write content into the binary body and keeps it out of the args", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "write",
+      result: { etag: "h:AAAAAAAAAAAAAAAAAAAAAA", size: 5, created: true },
+    });
+    const text = await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n.txt",
+      content: "héllo",
+      confirm: "RUN",
+    });
+    expect(text.isError).toBeUndefined();
+    const first = fileRuntime.runFileOp.mock.calls[0]?.[0];
+    expect(Buffer.from(first.body).toString("utf8")).toBe("héllo");
+    expect(first.args).toEqual({ path: "~/n.txt" });
+    await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n.bin",
+      content: Buffer.from([0, 255, 1]).toString("base64"),
+      encoding: "base64",
+      ifExists: "replace",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+      confirm: "RUN",
+    });
+    const second = fileRuntime.runFileOp.mock.calls[1]?.[0];
+    expect([...second.body]).toEqual([0, 255, 1]);
+    expect(second.args).toEqual({
+      path: "~/n.bin",
+      ifExists: "replace",
+      expectedEtag: "h:BBBBBBBBBBBBBBBBBBBBBB",
+    });
+  });
+
+  it("refuses content the relay cannot carry as invalid_input without calling the op", async () => {
+    for (const content of [
+      { content: "\ud800", encoding: "utf-8" },
+      { content: "not base64!!", encoding: "base64" },
+      { content: "QQ=x", encoding: "base64" },
+      { content: "x".repeat(1024 * 1024 + 1) },
+    ]) {
+      const result = await call("forwarder_cli_file_write", {
+        cliDeviceId: "cli-1",
+        path: "~/n",
+        confirm: "RUN",
+        ...content,
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("invalid_input");
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("removes wsmp_ credential substrings from every string, not only whole values", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "read",
+      result: {
+        ...READ_RESULT,
+        secretFile: false,
+        text: "1|export T=wsmp_mcp_abcdef0123456789 # and wsmp_cli_zzzzzzzz\n2|wsmp_model_qqqqqqqq",
+        resolvedPath: "/home/u/wsmp_device_abcdefabcdef",
+      },
+    });
+    const result = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    const wire = JSON.stringify(result);
+    expect(wire).not.toMatch(/wsmp_(mcp|cli|model|device)_[A-Za-z0-9]{6,}/);
+    expect(resultText(result)).toContain("export T=");
+    expect(structured(result).result?.secretFile).toBe(false);
+  });
+
+  it("refuses a result that does not fit twice into the 256 KiB output cap with too_large", async () => {
+    fileRuntime.runFileOp.mockResolvedValue({
+      ok: true,
+      op: "list",
+      result: { entries: "f 1B ~/a\n".repeat(30_000), count: 30_000, more: null },
+    });
+    const result = await call("forwarder_cli_dir_list", { cliDeviceId: "cli-1", path: "~/" });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("too_large");
+    expect(JSON.stringify(result).length).toBeLessThan(1024);
+  });
+
+  it("returns failures in-band with a stable code and the small documented facts", async () => {
+    const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [
+        { ok: false, code: "conflict", detail: { currentEtag: "h:CCCCCCCCCCCCCCCCCCCCCC" } },
+        { code: "conflict", currentEtag: "h:CCCCCCCCCCCCCCCCCCCCCC" },
+      ],
+      [
+        { ok: false, code: "limit", retryAfterMs: 1500 },
+        { code: "limit", retryAfterMs: 1500 },
+      ],
+      [
+        { ok: false, code: "timeout", outcome: "unknown" },
+        { code: "timeout", outcome: "unknown" },
+      ],
+      [
+        { ok: false, code: "offline", outcome: "unknown" },
+        { code: "offline", outcome: "unknown" },
+      ],
+      [
+        { ok: false, code: "upgrade_required", rejectedProtocolVersion: "2.7" },
+        { code: "upgrade_required", relayProtocolVersion: "2.7" },
+      ],
+      [{ ok: false, code: "supervised_only" }, { code: "supervised_only" }],
+      [{ ok: false, code: "grant_disabled" }, { code: "grant_disabled" }],
+      [{ ok: false, code: "token_inactive" }, { code: "token_inactive" }],
+      [
+        {
+          ok: false,
+          code: "match_count",
+          detail: { edit: 0, expected: 1, found: 3, lines: [1, 2, 3] },
+        },
+        { code: "match_count", edit: 0, expected: 1, found: 3, lines: [1, 2, 3] },
+      ],
+    ];
+    for (const [failure, expected] of cases) {
+      fileRuntime.runFileOp.mockResolvedValueOnce(failure);
+      const result = await call("forwarder_cli_file_edit", {
+        cliDeviceId: "cli-1",
+        path: "~/a",
+        edits: [{ oldText: "a", newText: "b" }],
+        confirm: "RUN",
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error).toEqual(expected);
+      expect(resultText(result).length).toBeGreaterThan(0);
+      expect(resultText(result)).not.toContain("~/a");
+    }
+  });
+
+  it("tells the agent that secret files are read-only masked views (secret_file)", async () => {
+    for (const [tool, args] of [
+      ["forwarder_cli_file_write", { path: "~/.env", content: "A=1", confirm: "RUN" }],
+      [
+        "forwarder_cli_file_edit",
+        { path: "~/.env", edits: [{ oldText: "a", newText: "b" }], confirm: "RUN" },
+      ],
+      ["forwarder_cli_file_rename", { from: "~/.env", to: "~/x", confirm: "RUN" }],
+      ["forwarder_cli_file_delete", { path: "~/.env", confirm: "DELETE" }],
+      ["forwarder_cli_dir_create", { path: "~/.ssh/new", confirm: "RUN" }],
+    ] as const) {
+      fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "secret_file" });
+      const result = await call(tool, { cliDeviceId: "cli-1", ...args });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error?.code).toBe("secret_file");
+      expect(resultText(result)).toContain("read-only masked views");
+    }
+    const tools = await listedTools(PAT_WITH_CLI, ["mcp:write"]);
+    for (const name of [
+      "forwarder_cli_file_edit",
+      "forwarder_cli_file_write",
+      "forwarder_cli_file_rename",
+      "forwarder_cli_dir_create",
+      "forwarder_cli_file_delete",
+    ]) {
+      expect(tools.find((tool) => tool.name === name)?.description, name).toContain("secret_file");
+    }
+  });
+
+  it("names the old protocol for upgrade_required and says the device, not a file, was not found", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "upgrade_required",
+      rejectedProtocolVersion: "2.7",
+    });
+    const upgrade = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    expect(resultText(upgrade)).toBe("This CLI speaks relay 2.7; upgrade wsmp");
+    fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "not_found", scope: "device" });
+    const device = await call("forwarder_cli_file_read", { cliDeviceId: "nope", path: "~/a" });
+    expect(resultText(device)).toBe("CLI device not found");
+    fileRuntime.runFileOp.mockResolvedValueOnce({ ok: false, code: "not_found" });
+    const missing = await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a" });
+    expect(resultText(missing)).toBe("No such file or directory");
+  });
+
+  it("does not deliver a result after the request aborts", async () => {
+    const controller = new AbortController();
+    fileRuntime.runFileOp.mockImplementation(async () => {
+      controller.abort();
+      return { ok: true, op: "read", result: READ_RESULT };
+    });
+    const result = await call(
+      "forwarder_cli_file_read",
+      { cliDeviceId: "cli-1", path: "~/a" },
+      { signal: controller.signal },
+    );
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+  });
+
+  it("accepts a base64 write at the 1 MiB decoded cap through the advertised schema (G2)", async () => {
+    // The base64 text of a 1 MiB body is ~1.4 MiB, so the schema's
+    // first-stage input bound must be sized for the ENCODED form. The row
+    // below is exactly what the old `FILE_BODY_MAX_BYTES + 16 KiB` bound
+    // refused before `adaptFileToolInput` ever decoded it. (The matching
+    // JSON-RPC request then exceeds the 1 MB /mcp body cap, so on the real
+    // wire this size is refused in transport, not by this guard; the guard
+    // must not be the thing that refuses a body the tool advertises.)
+    const schema = requireDescriptor("forwarder_cli_file_write").inputSchema;
+    const argsFor = (content: string) => ({
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content,
+    });
+    const full = Buffer.alloc(1024 * 1024, 0x41).toString("base64");
+    expect(Buffer.from(full, "base64").length).toBe(1024 * 1024);
+    const fullValidated = (await schema["~standard"].validate(argsFor(full))) as {
+      issues?: unknown[];
+    };
+    expect(fullValidated.issues).toBeUndefined();
+
+    // The largest request that can actually arrive under the 1 MB /mcp body
+    // cap still round-trips end to end: decode → body → relay op.
+    const overhead = new TextEncoder().encode(
+      toolCallBody("forwarder_cli_file_write", argsFor("")),
+    ).length;
+    const contentLength = Math.floor((1024 * 1024 - overhead) / 4) * 4;
+    const content = "A".repeat(contentLength);
+    const args = argsFor(content);
+    expect(
+      new TextEncoder().encode(toolCallBody("forwarder_cli_file_write", args)).length,
+    ).toBeLessThanOrEqual(1024 * 1024);
+    const decoded = (contentLength / 4) * 3;
+    expect(decoded).toBeGreaterThan(700 * 1024);
+    expect(decoded).toBeLessThanOrEqual(1024 * 1024);
+
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: true,
+      op: "write",
+      result: { etag: "h:AAAAAAAAAAAAAAAAAAAAAA", size: decoded, created: true },
+    });
+    const result = await call("forwarder_cli_file_write", args);
+    expect(result.isError).toBeUndefined();
+    expect(fileRuntime.runFileOp.mock.calls.at(-1)?.[0].body?.byteLength).toBe(decoded);
+  });
+
+  it("refuses a base64 write whose body would decode past the decoded cap (G2 inverse)", async () => {
+    const schema = requireDescriptor("forwarder_cli_file_write").inputSchema;
+    // A JSON input far above the first-stage bound is refused there (one size issue).
+    const oversized = {
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content: "A".repeat(1500 * 1024),
+    };
+    const guarded = (await schema["~standard"].validate(oversized)) as {
+      issues?: { message: string }[];
+    };
+    expect(guarded.issues).toHaveLength(1);
+    expect(guarded.issues?.[0]?.message).toContain("input exceeds the maximum size");
+
+    // And an input UNDER the guard whose decoded body exceeds 1 MiB is refused
+    // as invalid_input by the decoded-body cap, before any op runs.
+    fileRuntime.runFileOp.mockClear();
+    const decoded = Buffer.alloc(1024 * 1024 + 1, 1).toString("base64");
+    const result = await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/big.bin",
+      encoding: "base64",
+      confirm: "RUN",
+      content: decoded,
+    });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error?.code).toBe("invalid_input");
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
 });

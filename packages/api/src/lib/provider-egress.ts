@@ -1,5 +1,5 @@
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import type { ProviderProtocol } from "./provider-protocol";
@@ -283,12 +283,14 @@ export async function providerHttpsRequest(
 ) {
   if (policy.egressEnabled !== true) throw new ProviderEgressError();
   const url = validateProviderBaseUrl(rawUrl, policy);
-  const { body, ...requestOptions } = options;
+  // Node's built-in signal handler destroys the request and dumps unread
+  // response bytes. Own the signal so teardown always errors the body.
+  const { body, signal, ...requestOptions } = options;
   const headers = {
     ...sanitizeProviderHeaders((requestOptions.headers ?? {}) as Record<string, string>, protocol),
     ...providerAuthHeaders(auth),
   };
-  return new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+  return new Promise<IncomingMessage>((resolve, reject) => {
     const requestFunction = url.protocol === "https:" ? httpsRequest : httpRequest;
     const request = requestFunction(url, {
       ...requestOptions,
@@ -308,12 +310,20 @@ export async function providerHttpsRequest(
         });
       },
     });
+    let response: IncomingMessage | undefined;
+    // Once headers exist, only a natural EOF with all bytes delivered or a
+    // rejecting read is valid. ClientRequest.destroy() can discard buffered
+    // records and end cleanly even when response.complete is already true.
+    const teardownExchange = (error: ProviderEgressError) => {
+      if (response) response.destroy(error);
+      else request.destroy(error);
+    };
     const timeoutMs = policy.timeoutMs ?? 10_000;
-    request.setTimeout(timeoutMs, () => request.destroy(new ProviderEgressError()));
-    const abort = () => request.destroy(new ProviderEgressError());
-    requestOptions.signal?.addEventListener("abort", abort, { once: true });
-    request.once("response", (response) => {
-      const detachAbort = () => requestOptions.signal?.removeEventListener("abort", abort);
+    request.setTimeout(timeoutMs, () => teardownExchange(new ProviderEgressError()));
+    const abort = () => teardownExchange(new ProviderEgressError());
+    const detachAbort = () => signal?.removeEventListener("abort", abort);
+    request.once("response", (incoming) => {
+      response = incoming;
       response.once("end", detachAbort);
       response.once("close", detachAbort);
       response.once("error", detachAbort);
@@ -325,9 +335,11 @@ export async function providerHttpsRequest(
       resolve(response);
     });
     request.once("error", () => {
-      requestOptions.signal?.removeEventListener("abort", abort);
+      detachAbort();
       reject(new ProviderEgressError());
     });
-    request.end(body);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    else request.end(body);
   });
 }

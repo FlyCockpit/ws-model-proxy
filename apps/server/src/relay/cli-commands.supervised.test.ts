@@ -53,7 +53,7 @@ const db = prisma as unknown as {
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { findUnique: MockInstance };
+  endpoint: { findUnique: MockInstance; findMany: MockInstance };
   discoveredModel: { findMany: MockInstance };
   executionTarget: { findMany: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
@@ -109,13 +109,13 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.7",
+    protocolVersion: "2.8",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.7",
+        protocolVersion: "2.8",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -134,11 +134,15 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
           terminalApproval: false,
           terminalSupported: features.terminalSupported,
           remoteMetricSources: false,
+          mcpFileRead: false,
+          fileRootsConfigured: false,
+          allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
         terminalViewers: true,
         supervisedCommands: true,
         nodeTelemetry: true,
+        fileOps: true,
       },
     },
     endpoints: [],
@@ -269,6 +273,7 @@ describe("supervised commands", () => {
     });
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken("Build agent"));
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);
@@ -1382,10 +1387,12 @@ describe("supervised commands", () => {
     it("stores ? as the program of an oversized refused command, never a cut path component", async () => {
       await connect();
       db.cliDevice.findUnique.mockResolvedValueOnce(null);
-      const command = `${"/".repeat(16_384 - "AUDIT_DIRECTORY".length)}AUDIT_DIRECTORY/git ARG`;
+      // The cut lands right after an allowlisted word ("... git"), so only the relay's truncated flag yields "?".
+      const command = `A=${"b".repeat(16_384 - 6)} gitx status`;
       await start({ command });
       expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} \?$/);
-      expect(JSON.stringify(events())).not.toContain("AUDIT_DIRECTORY");
+      expect(JSON.stringify(events())).not.toContain("bbbbbbbb");
+      expect(JSON.stringify(events())).not.toContain("gitx");
     });
 
     it("stores an unknown device for a token_inactive refusal raised before the ownership check", async () => {
