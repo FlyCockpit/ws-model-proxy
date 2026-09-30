@@ -3779,7 +3779,6 @@ export async function dispatchPublicOverflow(
                   policy: listed.affinityPolicy,
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,
-                  requestId: request.requestId,
                   target: target.affinityTarget,
                   engineCacheConfirmed: engineCacheConfirmedFromUsage(settledUsage),
                   estimatedTokens:

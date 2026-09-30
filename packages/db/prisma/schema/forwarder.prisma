@@ -1087,52 +1087,35 @@ model ModelPool {
 /// `conversationDigest` are tenant-scoped, purpose-separated HMACs over
 /// canonical material. The source material is never persisted.
 model CacheAffinityRecord {
-  id                         String     @id @default(cuid(2))
-  createdAt                  DateTime   @default(now())
-  lastUsedAt                 DateTime   @default(now())
-  expiresAt                  DateTime
-  userId                     String
+  id                   String   @id @default(cuid(2))
+  createdAt            DateTime @default(now())
+  lastUsedAt           DateTime @default(now())
+  expiresAt            DateTime
+  userId               String
   /// Requester tenant; may differ from userId for an explicitly granted pool.
   // NOT NULL since cache-affinity v3 (schema-hardening.sql deletes older rows
   // first). Declared here so `prisma db push` stops dropping the constraint.
-  tenantUserId               String
-  poolId                     String
-  executionTargetId          String
-  targetIdentity             String
-  digestVersion              Int        @default(4)
+  tenantUserId         String
+  poolId               String
+  executionTargetId    String
+  targetIdentity       String
+  digestVersion        Int      @default(4)
   /// Stable execution/security binding, separate from request content and conversation identity.
-  bindingDigest              String
-  prefixDigest               String?
-  conversationDigest         String?
-  /// Warm-session link. One durable depth-zero snapshot per session and target.
-  /// Shared hints never establish ownership; null legacy rows stand for their id.
-  sessionId                  String?
-  /// Latest cumulative history HMACs bound to instructions/tools, free of sampling
-  /// parameters (at most 64); empty on hints.
-  /// PostgreSQL scalar lists are nullable; defaults make existing rows harmless.
-  historyDigests             String[]   @default([])
-  /// Caller conversation HMAC; null for implicit sessions and shared hints.
-  explicitConversationDigest String?
-  /// Last successful relay request HMAC; repeating that completion is a no-op.
-  writeDigest                String?
-  /// Up to 64 completion HMACs retain replay identity across successor turns.
-  completedWriteDigests      String[]   @default([])
-  /// At most 64 undominated size samples within TTL, so a sub-floor turn can
-  /// refresh age without losing an older eligible size. Empty on shared hints.
-  sessionTokenEstimates      Int[]      @default([])
-  sessionTokenTimes          DateTime[] @default([])
-  prefixDepth                Int
-  estimatedTokens            Int?
-  engineCacheConfirmed       Boolean    @default(false)
+  bindingDigest        String
+  prefixDigest         String?
+  conversationDigest   String?
+  /// Warm-session identity (S-C): every record one request writes carries the
+  /// session it continued (matched conversation or deepest prefix record on
+  /// the same target) or a fresh id. Null on rows from before it existed: the
+  /// row's own id stands in. Not part of the record's identity or uniqueness.
+  sessionId            String?
+  prefixDepth          Int
+  estimatedTokens      Int?
+  engineCacheConfirmed Boolean  @default(false)
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])
   @@index([tenantUserId, poolId, conversationDigest, expiresAt])
-  @@index([historyDigests], type: Gin)
-  @@index([completedWriteDigests], type: Gin)
-  @@index([tenantUserId, poolId, explicitConversationDigest, expiresAt])
-  @@index([tenantUserId, poolId, writeDigest, expiresAt])
-  @@index([tenantUserId, poolId, executionTargetId, prefixDepth, lastUsedAt(sort: Desc), id(sort: Desc)])
   @@index([userId, poolId, expiresAt])
   @@index([executionTargetId, expiresAt])
   // Warm-session protection (S-C): recent sessions per member KV pool.
@@ -1287,9 +1270,8 @@ model AdmissionRequest {
   /// pool/member capacity priority applies. No foreign key: a grant revoke
   /// must never write admission rows (capacity lock order).
   priorityGrantId         String?
-  /// Warm sessions (`cache_affinity_record.sessionId`, current candidate targets)
-  /// this request continues. Only the lease's execution target is considered
-  /// when deciding which protected session an
+  /// Warm sessions (`cache_affinity_record.sessionId`, any candidate target)
+  /// this request continues. With its lease it says which protected session an
   /// active lease is serving right now (S-C slot mode). Advisory routing state:
   /// no foreign key, never read by admission.
   warmSessionIds          String[]              @default([])
@@ -1526,9 +1508,6 @@ model ResponseStickinessRecord {
   updatedAt                 DateTime  @default(now()) @updatedAt
   userId                    String
   modelApiTokenId           String?
-  /// Scoped session returned by the successful cache-affinity writer, local creates only.
-  warmSessionId             String?
-  warmBindingDigest         String?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.

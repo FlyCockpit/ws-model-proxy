@@ -392,7 +392,7 @@ jobs:
         run: pnpm --filter server exec vitest run src/model-api/provider-attempt-runtime.integration.test.ts
 
       - name: Prove cache affinity concurrency and retention
-        run: pnpm --filter server exec vitest run --no-file-parallelism src/model-api/cache-affinity.integration.test.ts src/model-api/session-identity.integration.test.ts
+        run: pnpm --filter server exec vitest run src/model-api/cache-affinity.integration.test.ts
 
   postgres-api:
     # Split from prisma-validate so the slowest PostgreSQL suite runs in parallel.

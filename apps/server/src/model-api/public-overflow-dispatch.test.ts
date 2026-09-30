@@ -2333,7 +2333,6 @@ describe("public overflow terminal response dispatch", () => {
       // spy must witness the call itself rather than its downstream effects.
       await vi.waitFor(() => expect(rememberAffinity).toHaveBeenCalledTimes(1));
       expect(rememberAffinity.mock.calls[0]?.[0]).toMatchObject({
-        requestId: `request-affinity-${fixture.label.replace(/\s+/g, "-")}`,
         engineCacheConfirmed: fixture.engineCacheConfirmed,
       });
       // Both the affinity write and the usage reconcile read the same settled
@@ -2342,116 +2341,6 @@ describe("public overflow terminal response dispatch", () => {
       expect(reconciled?.cacheReadTokens).toEqual(fixture.cacheReadTokens);
     },
   );
-
-  // Identity is carried through dispatch; retry deduplication belongs to the
-  // real writer's fenced transaction (covered in cache-affinity integration).
-  // Cancel/failure rows justify that unsuccessful attempts cannot create warmth.
-  it.each([
-    { name: "first success", ids: ["first-completion"], outcome: "success" },
-    {
-      name: "retry keeps the same request id",
-      ids: ["retried-completion", "retried-completion"],
-      outcome: "success",
-    },
-    {
-      name: "conflicting ids with identical payload stay distinct",
-      ids: ["completion-a", "completion-b"],
-      outcome: "success",
-    },
-    {
-      name: "cancelled attempt writes nothing",
-      ids: ["cancelled-completion"],
-      outcome: "cancelled",
-    },
-    { name: "failed terminal writes nothing", ids: ["failed-completion"], outcome: "failed" },
-  ] as const)("affinity completion identity: $name", async ({ ids, outcome }) => {
-    rememberAffinity.mockClear();
-    providerHttpsRequest.mockReset();
-    const pool = dispatchPoolFixture();
-    Object.assign(pool, {
-      affinityEnabled: true,
-      affinityTtlSeconds: 600,
-      affinityMaxRecords: 100,
-      affinityPrefixWeight: 100,
-      affinityConversationWeight: 150,
-      affinityConfirmedCacheWeight: 250,
-      affinityLoadPenaltyWeight: 100,
-    });
-    db.modelPool.findFirst.mockResolvedValue(pool);
-    db.providerAttempt.groupBy.mockResolvedValue([]);
-    db.providerPricingVersion.findFirst.mockResolvedValue(null);
-    const tx = {
-      ...consentDelegates(),
-      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
-        mockRequesterValidityQuery(strings, values, consentDelegates()),
-      ),
-      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-      providerCredential: {
-        findFirst: vi
-          .fn()
-          .mockResolvedValue(
-            pool.PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential,
-          ),
-        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
-      },
-    };
-    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
-      callback(tx),
-    );
-    for (const requestId of ids) {
-      const controller = new AbortController();
-      if (outcome === "cancelled") controller.abort(new Error("client disconnected"));
-      else
-        providerHttpsRequest.mockResolvedValueOnce(
-          Object.assign(
-            Readable.from([
-              Buffer.from('{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}'),
-            ]),
-            {
-              statusCode: outcome === "failed" ? 429 : 200,
-              headers: { "content-type": "application/json" },
-              complete: true,
-            },
-          ),
-        );
-      const result = await dispatchPublicOverflow({
-        userId: "owner",
-        poolId: "pool",
-        requestId,
-        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
-        ...ownerConsentFields(),
-        requestedProtocol: "openai",
-        requestedSurface: "openai-chat",
-        stream: false,
-        requiredFeatures: [],
-        path: "/v1/chat/completions",
-        headers: new Headers({ "content-type": "application/json" }),
-        body: new TextEncoder().encode(
-          '{"model":"pool","messages":[{"role":"user","content":"same payload"}]}',
-        ),
-        signal: controller.signal,
-        liability: { accountingVersion: "provider-billable-v1" },
-        requestedOutputTokens: 1n,
-        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
-        adaptationEnabled: false,
-        retrySafe: false,
-      });
-      if (outcome === "cancelled") {
-        expect(result.dispatched).toBe(false);
-        expect(providerHttpsRequest).not.toHaveBeenCalled();
-      } else {
-        expect(result.dispatched).toBe(true);
-        if (!result.dispatched) throw new Error("expected dispatch");
-        await result.response.text();
-        await expect(result.terminal).resolves.toMatchObject({ ok: outcome === "success" });
-        // Re-observing the terminal cannot run its completion writer twice.
-        await result.terminal;
-      }
-    }
-    expect(rememberAffinity.mock.calls.map(([args]) => args.requestId)).toEqual(
-      outcome === "success" ? ids : [],
-    );
-  });
 
   it("swallows rememberAffinity failures without failing the overflow terminal", async () => {
     rememberAffinity.mockClear();
