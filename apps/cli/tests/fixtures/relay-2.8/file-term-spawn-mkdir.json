@@ -1,0 +1,16 @@
+{
+  "type": "term.spawn",
+  "terminalId": "ECEiIzQ1RldnaHmKm6y9zg",
+  "commandId": "AAECAwQFBgcICQoLDA0ODw",
+  "command": "file edit ~/cfg.yaml",
+  "reason": "raise context",
+  "requester": "agent",
+  "shareOutput": false,
+  "kind": "file",
+  "fileOp": {
+    "op": "mkdir",
+    "args": {
+      "path": "~/dir"
+    }
+  }
+}

@@ -113,7 +113,8 @@ Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_c
 All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
 it does not compose shell commands. Every result that touches a file carries an
 `etag`, results are bounded windows, and write-class calls take an optional `reason`
-(500 characters) that goes to the CLI log.
+(500 characters) that goes to the CLI log and is shown on the CLI confirm screen
+on a supervised node.
 
 **Who may call.** Like the CLI command tools, the file tools are visible and callable
 only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth
@@ -125,15 +126,52 @@ dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live
 | Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
 | --- | --- | --- |
 | `unsupervised` | headless | headless |
-| `supervised` | refused `supervised_only` | refused `supervised_only` |
+| `supervised` | refused `supervised_only` (read grant not implemented here) | CLI keypress required |
 | `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
 
-A supervised confirm screen for writes and an opt-in read-only grant are later phases;
-until then a supervised node refuses file tools. `listCliDevices` reports
-`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`. That
-summary is the MODE permission only: a Windows CLI, or a root CLI without
-`allowFileToolsAsRoot`, still refuses every operation as `unsupported`. `supervised` means
-the operation needs a person, which this phase does not provide, so it is refused. The CLI refuses every file tool as
+Supervised writes return `{commandId, kind:"supervised", status:"awaiting_user", waitingUntil, next}`.
+A person opens the pending request in the dashboard Terminals screen and presses Enter
+on the CLI-drawn screen to apply it, or `q` to decline. Pending list and browser Decline
+use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` expresses
+the agent's intent; it does not replace the person's keypress. The screen shows the
+operation, resolved physical path, optional reason, and a unified diff with one context
+line capped at 8 KiB. The CLI computes and masks that diff from the real file on disk;
+the server cannot supply or forge it. Secret-class paths remain read-only and are
+refused `secret_file`. Path policy is checked before display and again at apply, and
+the daemon rechecks the etag: a file changed between display and approval returns
+`conflict` and nothing is written for that mismatch. Since this apply-time error
+arrives after acceptance with only a code, the server still reports an unknown outcome.
+Supervised `edit.dryRun:true` returns `invalid_input`.
+No headless read grant is implied by supervised approval.
+
+Poll `forwarder_cli_command_result` with the returned id. It reports the shared
+supervised statuses, plus `file:{op,result}` on success or `error:{code,message,outcome?}`.
+Edit/write results omit `diff` and `hunks`; file errors have no path, current etag or
+other detail. State-dependent refusals (including `not_found`, `exists`, `conflict`,
+`hard_linked` and `owner_mismatch`) appear on a cannot-apply screen and reach the
+agent only after a person dismisses it. Path-string/input refusals may arrive before
+display. Decline returns code `declined`, definitively applying nothing.
+
+Confirm waits expire after 15 minutes, using the same stop grace as commands.
+After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
+sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
+Session loss reports `offline`; its outcome is unknown only after acceptance.
+Every non-success after acceptance has `outcome:"unknown"`, including CLI
+`conflict`, `not_found`, `io_error`, `cancelled` and `timeout`, token inactivity and
+mode changes. The CLI sends only the error code, so the server cannot distinguish
+an apply-time pinned-etag mismatch before commit from an ambiguous failure after
+commit. Before acceptance, timeout/offline and CLI errors are definitively not applied.
+The daemon honors cancellation only before the atomic commit point. Ask the person to inspect the file
+before retrying an unknown result; use file_stat only if a read grant permits it.
+The earliest expiry carried by the token row or the admitted credential ends a
+supervised file request immediately, with `token_inactive`; after acceptance its
+outcome is unknown. Results arriving at or after that expiry are not delivered.
+`listCliDevices` reports
+`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`.
+That summary is the mode permission only: a Windows CLI, or a root CLI without
+`allowFileToolsAsRoot`, still refuses every operation as `unsupported`.
+`supervised` writes need a person's keypress; an opt-in read grant is a later phase.
+The CLI refuses every file tool as
 `unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
 The CLI re-checks its own mode on every operation; a server request never overrides it.
 The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
@@ -161,33 +199,44 @@ additionally removes `wsmp_` credential substrings from every returned string.
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
-and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`
-(an etag, or the word `gone` when the file was removed): re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
-when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
-fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
-`token_inactive`, a mode change, `io_error`, `not_found` on rename and delete, or `conflict` when the file was swapped during the change): call
-`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
+and replaces require it. A headless stale-etag failure returns `error.code` `conflict`
+with `currentEtag` (an etag, or the word `gone` when the file was removed): re-read
+and retry. Supervised failures report only the code after the person's keypress.
+`read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset when the wsmp
+daemon restarts, which costs one extra `conflict`. A write-class call that fails with
+`error.outcome: "unknown"` may have changed the file, with any code: `timeout`,
+`offline`, `cancelled`, `token_inactive`, a mode change, `io_error`, `not_found` on
+rename/delete, or `conflict` when a file was swapped during the change. Headless
+`replaced` conflicts are unknown and omit `currentEtag`. For supervised requests,
+every non-success after acceptance is unknown, even a `conflict` caused by the
+pinned pre-image changing before commit, because the error frame has only a code.
+Ask the person to inspect the file, or call `forwarder_cli_file_stat` with `hash: true`
+and a read grant to compare the etag before retrying. A retry
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
-**Limits.** 120 file operations per minute per user, of which at most 30 change files;
-4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
-Operations are never queued and time out after 30 seconds (search and hashing have shorter
-CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
+**Limits.** Supervised writes share command limits: one awaiting per CLI, two awaiting
+per user, and two live per CLI. Headless limits are 120 file operations per minute per user, of which at most 30 change files;
+4 in flight per CLI and 16 per user. Headless limits return `limit` with `retryAfterMs`;
+supervised admission limits return `limit`. Operations are never queued. Headless
+operations time out after 30 seconds (search and hashing have shorter CLI budgets);
+an MCP abort sends `file.cancel`, honored before a mutation's rename. Once a supervised
+request is registered, an MCP abort preserves its id and the person's pending decision. Read
 windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
 request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
 DECODED, and the whole request of stat, list, search and edit must fit one 64 KiB relay
 frame. The 1 MB `/mcp` request-body cap that every call shares is the
 real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
 decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
-current tools. Errors are
-in-band `isError` results with a stable `error.code`: the command codes
+current tools. Admission and headless errors are in-band `isError` results;
+completed supervised failures appear in the polled `result.error`. Both use a stable
+`error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
 `too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
+`cancelled`, `declined`). A CLI that speaks an older relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
@@ -664,7 +713,18 @@ starts an immediate sweep that will remove artifacts already past eligibility
 
 Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
 `forwarder_cli_supervised_command_start`), including refused ones, is recorded
-in `cli_agent_action_event` (file operations join it with the file tools). The
+in `cli_agent_action_event`, along with file operations. Supervised edit, write,
+rename, mkdir and delete requests each record exactly one `supervised_file_write`
+event, including admission refusals; they do not also record a headless file
+event. Its path is the requested path (the source for rename), its reason is
+`<op>:<code>` (`write:completed`, `edit:conflict`, etc.), and available etags and
+write byte counts are metadata. Accepted writes whose apply deadline or session
+loss leaves the result uncertain record `unknown`; a reported file error records
+`failed`, a spawn/admission rejection `refused`, and a CLI-acknowledged confirm
+expiry or decline records `expired` or `declined`. Before acceptance, revocation,
+policy changes and session loss record `cancelled`. Headless file operations retain their per-tool
+`file_*` kinds and use `<code>` for their reason. Both reason shapes are returned
+by `forwarder_cli_activity_list`. Unverified device ids are stored as `unknown`. The
 log is **metadata only**: who (user, device, token), what (kind, and for a
 command a keyed HMAC-SHA256 of the command text plus its program name — never
 the command text itself), when, and how it ended (`completed`, `refused`, `failed`,

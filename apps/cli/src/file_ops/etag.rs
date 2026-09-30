@@ -60,6 +60,13 @@ impl EtagKey {
         format!("h:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
     }
 
+    /// Request-local approval binding. Kept in a separate MAC domain from file
+    /// etags: a payload token must never act as a content-only file hash.
+    pub(crate) fn supervised_token(&self, bytes: &[u8]) -> String {
+        let mac = hmac_sha256(&self.0, &[b"supervised:", bytes]);
+        format!("h:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
+    }
+
     /// Weak etag from file identity, size, and modification time.
     pub fn weak(&self, meta: &Metadata) -> String {
         self.weak_stat(&super::resolve::Stat::from_metadata(meta))

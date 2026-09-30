@@ -14,6 +14,32 @@ pub const MAX_IN_FLIGHT: usize = 4;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+thread_local! {
+    static CONTAINED_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The process panic hook must not shut down unrelated telemetry for a file
+/// job whose panic is caught and reported as io_error. The flag is private,
+/// per-thread, and set only around the pool's catch boundary.
+#[doc(hidden)]
+pub fn worker_panic_is_contained() -> bool {
+    CONTAINED_PANIC.get()
+}
+
+struct PanicBoundary(bool);
+
+impl PanicBoundary {
+    fn enter() -> Self {
+        Self(CONTAINED_PANIC.replace(true))
+    }
+}
+
+impl Drop for PanicBoundary {
+    fn drop(&mut self) {
+        CONTAINED_PANIC.set(self.0);
+    }
+}
+
 pub struct FilePool {
     tx: Option<SyncSender<Job>>,
     in_flight: Arc<AtomicUsize>,
@@ -80,6 +106,7 @@ impl FilePool {
         let (result_tx, result_rx) = mpsc::channel();
         let job: Job = Box::new(move || {
             let _guard = guard;
+            let _panic_boundary = PanicBoundary::enter();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| {
                     Err(FileError::new(

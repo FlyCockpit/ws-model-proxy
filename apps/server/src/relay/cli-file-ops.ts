@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import type { FileOpClass } from "@ws-model-proxy/api/lib/cli-file-access";
+import { type FileOpClass, fileToolAccess } from "@ws-model-proxy/api/lib/cli-file-access";
+import { mcpCommandModeFromDb } from "@ws-model-proxy/api/lib/mcp-command-mode";
 import {
   CLI_AGENT_ACTION_UNKNOWN_DEVICE,
   type CliAgentActionKind,
@@ -7,6 +8,7 @@ import {
 } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   type CliAgentAdmissionRejection,
+  type CliAgentAdmissionVerdict,
   closeCliAgentAdmission,
   judgeCliAgentAdmission,
   readCliAgentAdmission,
@@ -14,7 +16,13 @@ import {
 } from "./cli-agent-admission.js";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
 import {
+  auditRefusal,
+  type SupervisedStartResult,
+  startSupervisedRequest,
+} from "./cli-commands.js";
+import {
   FILE_BODY_MAX_BYTES,
+  FILE_OP_DEADLINE_MS,
   type FileErrorCode,
   type FileOp,
   type FileOpFrame,
@@ -23,6 +31,7 @@ import {
   type FileRejectReason,
   type FileResultFrame,
   fileOpFrameSchema,
+  fileSpawnSpecSchema,
   isMutatingFileOp,
 } from "./file-protocol.js";
 import { encodeRelayServerControlMessage } from "./protocol.js";
@@ -42,7 +51,8 @@ export const FILE_MUTATIONS_PER_MINUTE_PER_USER = 30;
 export const FILE_OPS_PER_CLI = 4;
 export const FILE_OPS_PER_USER = 16;
 /** The server deadline; the CLI's own budgets (search 25 s, hash 20 s) are shorter. */
-export const FILE_OP_DEADLINE_MS = 30_000;
+export { FILE_OP_DEADLINE_MS } from "./file-protocol.js";
+
 const RATE_WINDOW_MS = 60_000;
 /** Advice for a `limit` caused by concurrency (an op is normally short). */
 const CONCURRENCY_RETRY_AFTER_MS = 1_000;
@@ -59,7 +69,8 @@ export type FileOpErrorCode =
   | CliAgentAdmissionRejection
   | FileErrorCode
   | "supervised_only"
-  | "feature_disabled";
+  | "feature_disabled"
+  | "declined";
 
 export type FileOpFailure = {
   ok: false;
@@ -81,7 +92,16 @@ export type FileOpSuccess = {
   result: FileOpResult["result"];
 };
 
-export type FileOpOutcome = FileOpSuccess | FileOpFailure;
+export type SupervisedFileStart = {
+  ok: true;
+  kind: "supervised";
+  commandId: string;
+  terminalId: string;
+  status: "awaiting_user";
+  waitingUntil: string;
+  next: string;
+};
+export type FileOpOutcome = FileOpSuccess | FileOpFailure | SupervisedFileStart;
 
 type FileOpRecord = TrackedFileOp & {
   audit: FileAudit;
@@ -201,6 +221,9 @@ type FileAudit = {
   /** The op was registered: `settle` records it. */
   registered: boolean;
   recorded: boolean;
+  /** Audit ownership moves to the shared supervised lifecycle before its start. */
+  supervisedOwned: boolean;
+  op: FileOp;
 };
 
 function stringField(source: unknown, key: string): string | null {
@@ -234,6 +257,8 @@ function newFileAudit(input: RunFileOpInput): FileAudit {
     deviceVerified: false,
     registered: false,
     recorded: false,
+    supervisedOwned: false,
+    op: input.op,
   };
 }
 
@@ -289,12 +314,22 @@ export function auditRefusedFileInput(input: {
 
 /** The ONE call site of `recordCliAgentAction` for file ops. Never throws. */
 function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
-  if (audit.recorded) return;
+  if (audit.recorded || audit.supervisedOwned) return;
   audit.recorded = true;
+  if (audit.kind === "supervised_file_write" && !outcome.ok && isMutatingFileOp(audit.op)) {
+    auditRefusal(audit.kind, audit, audit.startedAt, "refused", outcome.code, {
+      op: audit.op,
+      path: audit.path,
+      etagBefore: audit.etagBefore,
+      bytes: audit.bytes,
+      deviceVerified: audit.deviceVerified,
+    });
+    return;
+  }
   const { outcome: auditOutcome, reason } = auditOutcomeOf(audit, outcome);
   let etagAfter: string | null = null;
   let bytes = audit.bytes;
-  if (outcome.ok) {
+  if (outcome.ok && "result" in outcome) {
     etagAfter = stringField(outcome.result, "etag");
     const size: unknown = Reflect.get(outcome.result, "size");
     if (bytes === null && audit.kind === "file_write" && typeof size === "number") bytes = size;
@@ -483,6 +518,7 @@ export type RunFileOpInput = {
   /** Write content bytes (at most 1 MiB); required for `write`, absent otherwise. */
   body?: Uint8Array;
   signal?: AbortSignal;
+  onSupervisedStart?: () => void;
 };
 
 function invalid(): FileOpFailure {
@@ -517,14 +553,35 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
 
   const reads = await readCliAgentAdmission(input);
-  // The caller may have gone while the admission read: never start new work for
-  // a request that is already aborted (a cancel after the dispatch could lose a
-  // race with a fast mutation).
-  if (input.signal?.aborted) {
-    closeCliAgentAdmission(reads);
-    return { ok: false, code: "cancelled" };
+  let supervised = false;
+  let verdict: CliAgentAdmissionVerdict;
+  let admissionOpen = true;
+  try {
+    // Identify supervised writes even when admission refuses. Unverified
+    // devices never supply an audit kind or id.
+    if (mutating && reads.device?.userId === input.userId) {
+      const live = relaySessionManager
+        .getLiveCliFeatures([input.cliDeviceId])
+        .get(input.cliDeviceId);
+      supervised =
+        fileToolAccess(mcpCommandModeFromDb(reads.device.mcpCommandMode), "write") ===
+          "supervised" || fileToolAccess(live?.mcpCommandMode, "write") === "supervised";
+      if (supervised) audit.kind = "supervised_file_write";
+    }
+    // An abort before registration applies nothing; once a supervised id exists
+    // its caller preserves it. Never start new work for an aborted request.
+    if (input.signal?.aborted) return { ok: false, code: "cancelled" };
+    // Judge exactly once, for the selected capability. The judge owns closing
+    // from here; every earlier return or exception closes in finally.
+    admissionOpen = false;
+    verdict = judgeCliAgentAdmission(
+      reads,
+      supervised ? "supervised" : mutating ? "file_write" : "file_read",
+      supervised ? { fileWrite: true } : undefined,
+    );
+  } finally {
+    if (admissionOpen) closeCliAgentAdmission(reads);
   }
-  const verdict = judgeCliAgentAdmission(reads, mutating ? "file_write" : "file_read");
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   // The verdict resolved the device to one of the caller's own unless it said
   // the device is unknown or the token/owner is out (checked before ownership).
@@ -568,6 +625,43 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
     return invalid();
   }
 
+  if (supervised) {
+    // Same strict frame/input path as headless; reuse the supervised verdict
+    // so no await can interleave a revoke before registration.
+    const fileOp = fileSpawnSpecSchema.safeParse({ op: frame.op, args: frame.args });
+    if (!fileOp.success) return invalid();
+    audit.supervisedOwned = true;
+    const started: SupervisedStartResult = await startSupervisedRequest(
+      {
+        kind: "file",
+        userId: input.userId,
+        tokenId: input.tokenId,
+        expiresAt: input.expiresAt,
+        cliDeviceId: input.cliDeviceId,
+        fileOp: fileOp.data,
+        ...(input.onSupervisedStart ? { onStarted: input.onSupervisedStart } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      },
+      verdict,
+    );
+    if (!started.ok)
+      return {
+        ok: false,
+        code:
+          started.error === "invalid_command" || started.error === "invalid_reason"
+            ? "invalid_input"
+            : started.error,
+      };
+    return {
+      ok: true,
+      kind: "supervised",
+      commandId: started.commandId,
+      terminalId: started.terminalId,
+      status: "awaiting_user",
+      waitingUntil: started.expiresAt,
+      next: "Ask the user to open Terminals in the dashboard and answer the CLI file request; then poll forwarder_cli_command_result with commandId.",
+    };
+  }
   const counts = pendingCounts(input.userId, input.cliDeviceId);
   if (counts.cli >= FILE_OPS_PER_CLI || counts.user >= FILE_OPS_PER_USER) {
     return { ok: false, code: "limit", retryAfterMs: CONCURRENCY_RETRY_AFTER_MS };

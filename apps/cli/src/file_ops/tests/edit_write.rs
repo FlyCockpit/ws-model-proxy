@@ -625,7 +625,7 @@ fn ssh_key_files_cannot_be_edited_at_all() {
 
 // ---- atomic replace -------------------------------------------------------
 
-const ORDER: [Step; 8] = [
+const ORDER: [Step; 9] = [
     Step::TempCreated,
     Step::TempWritten,
     Step::TempSynced,
@@ -633,6 +633,7 @@ const ORDER: [Step; 8] = [
     Step::Chmodded,
     Step::EtagRechecked,
     Step::Renamed,
+    Step::BeforeDirSync,
     Step::DirSynced,
 ];
 

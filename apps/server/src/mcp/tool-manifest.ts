@@ -76,6 +76,8 @@ export type McpToolClass = "pure" | "external" | "cost" | "destructive";
 
 /** Everything the tool wrapper needs to execute a procedure-backed tool. */
 export interface McpToolRunDeps {
+  /** Internal latch: a supervised file id was registered synchronously. */
+  claimDeliverDespiteAbort?: () => void;
   /** Verified user id (`sub`) — the ONLY identity the tools ever act for. */
   userId: string;
   /**
@@ -144,6 +146,8 @@ export interface McpToolDescriptor {
    * result must still carry `commandId`.
    */
   deliverDespiteAbort?: boolean;
+  /** File writes await their core to learn whether it started a supervised request. */
+  deliverDespiteAbortWhen?: (output: unknown) => boolean;
 }
 
 /**
@@ -432,6 +436,16 @@ const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
  * through the one file-op relay path; visibility is the PAT-only
  * `cliToolAllowed` predicate.
  */
+function isSupervisedFileStart(output: unknown): boolean {
+  return (
+    output !== null &&
+    typeof output === "object" &&
+    "kind" in output &&
+    output.kind === "supervised" &&
+    "commandId" in output
+  );
+}
+
 function fileToolSpec(name: FileToolName): McpToolSpec {
   const entry = FILE_TOOLS.find((tool) => tool.name === name);
   if (!entry) throw new Error(`unknown file tool ${name}`);
@@ -443,6 +457,9 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
     scope: readClass ? "read" : "write",
     confirmation: readClass ? null : op === "delete" ? "DELETE" : "RUN",
     classification: readClass ? "pure" : op === "delete" ? "destructive" : "external",
+    ...(!readClass
+      ? { deliverDespiteAbort: true, deliverDespiteAbortWhen: isSupervisedFileStart }
+      : {}),
     descriptionNote: FILE_TOOL_NOTES[name],
     coreShape: fileToolCoreShape(name),
     // The core enforces the strict shape: refusals are audited and name the field.
@@ -1309,7 +1326,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    descriptionNote: CLI_COMMAND_OUTPUT_NOTICE,
+    descriptionNote: `Poll commands or supervised file requests by commandId. Files return file:{op,result} or error:{code,message,outcome?}; no diff/hunks or file error detail is returned. Every non-success after acceptance carries outcome unknown, including any CLI fileError code (conflict, not_found, io_error, cancelled or timeout), token inactivity and mode changes; before acceptance errors are definitive. ${CLI_COMMAND_OUTPUT_NOTICE}`,
     coreShape: { commandId: z.string(), progress: z.boolean().optional() },
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),

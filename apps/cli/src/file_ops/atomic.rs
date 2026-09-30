@@ -109,6 +109,48 @@ pub(crate) fn replace(
     content: &[u8],
     cancel: &Cancel,
 ) -> FileResult<Stat> {
+    replace_impl(
+        ops, dir, name, orig, orig_stat, orig_etag, content, None, cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_supervised(
+    ops: &FileOps,
+    dir: &OwnedFd,
+    name: &OsStr,
+    orig: &mut File,
+    orig_stat: &Stat,
+    orig_etag: &str,
+    content: &[u8],
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<Stat> {
+    replace_impl(
+        ops,
+        dir,
+        name,
+        orig,
+        orig_stat,
+        orig_etag,
+        content,
+        Some(pin),
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_impl(
+    ops: &FileOps,
+    dir: &OwnedFd,
+    name: &OsStr,
+    orig: &mut File,
+    orig_stat: &Stat,
+    orig_etag: &str,
+    content: &[u8],
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<Stat> {
     check_replaceable(ops, orig_stat)?;
     let tmp = temp_name(name);
     let fd = openat(
@@ -145,6 +187,9 @@ pub(crate) fn replace(
 
     recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
     ops.step(Step::EtagRechecked)?;
+    if let Some(pin) = pin {
+        pin.verify_at(ops, dir, name, super::policy::Access::Write, cancel)?;
+    }
     cancel.check()?;
 
     commit_stage(
@@ -156,9 +201,12 @@ pub(crate) fn replace(
         &mut guard.armed,
     )?;
     guard.armed = false;
-    // Committed: hook errors below cannot undo the rename.
+    // Committed: cancellation and observational hook errors cannot undo the
+    // rename. Any failure to finish syncing has an unknown mutation outcome.
     let _ = ops.step(Step::Renamed);
-    fsync(dir.as_fd()).map_err(FileError::errno)?;
+    ops.step(Step::BeforeDirSync)
+        .map_err(|_| FileError::mutation_uncertain())?;
+    fsync(dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
     let _ = ops.step(Step::DirSynced);
     Ok(new_stat)
 }
@@ -212,7 +260,7 @@ fn commit_stage(
                 }
                 // a successor: restore it, and drop our staged file only when the
                 // stage name holds it again
-                let _ = swap();
+                swap().map_err(|_| FileError::mutation_uncertain())?;
                 if holds(staged_stat) {
                     let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
                 }

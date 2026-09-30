@@ -1,10 +1,12 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  FILE_ERROR_CODES,
   FILE_OPS,
   fileCancelFrameSchema,
   fileOpFrameSchema,
   fileSpawnSpecSchema,
+  supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import {
   encodeRelayBinaryFrame,
@@ -309,7 +311,38 @@ describe("relay 2.8 file frames: CLI to server", () => {
   });
 });
 
-describe("relay 2.8 supervised-file schema (answered unsupported until P5)", () => {
+describe("relay 2.8 supervised-file strict schema", () => {
+  it.each(FILE_ERROR_CODES)("accepts the shared file error code %s after a keypress", (code) => {
+    const frame = { type: "supervised.done", commandId: OP_ID, review: false, fileError: { code } };
+    expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+  });
+
+  it.each(["replaced", "gone"])(
+    "keeps %s as a conflict detail, outside the error-code set",
+    (currentEtag) => {
+      const frame = {
+        type: "file.rejected",
+        opId: OP_ID,
+        reason: "conflict",
+        detail: { currentEtag },
+      };
+      expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+      expect(() =>
+        parseRelayClientControlFrame(JSON.stringify({ ...frame, reason: currentEtag })),
+      ).toThrow();
+      expect(() =>
+        parseRelayClientControlFrame(
+          JSON.stringify({
+            type: "supervised.done",
+            commandId: OP_ID,
+            review: false,
+            fileError: { code: currentEtag },
+          }),
+        ),
+      ).toThrow();
+    },
+  );
+
   it("accepts the file term.spawn payload and supervised.done fileResult vectors", () => {
     const spawn = vector("file-term-spawn") as {
       fileOp: unknown;
@@ -325,6 +358,88 @@ describe("relay 2.8 supervised-file schema (answered unsupported until P5)", () 
     expect(() => fileSpawnSpecSchema.parse({ op: "edit", args: { path: "~/a" } })).toThrow();
   });
 
+  const fixtures = readdirSync(FIXTURE_DIR).filter(
+    (name) =>
+      (name.startsWith("file-term-spawn-") || name.startsWith("file-supervised-done-")) &&
+      name.endsWith(".json"),
+  );
+  it.each(fixtures)("strict cross-language fixture %s", (name) => {
+    const frame = vector(name.slice(0, -5));
+    const parse = () =>
+      name.startsWith("file-term-spawn-")
+        ? JSON.parse(encodeRelayServerControlMessage(frame as never))
+        : parseRelayClientControlFrame(JSON.stringify(frame));
+    if (name.includes("-reject-")) expect(parse).toThrow();
+    else expect(parse()).toEqual(frame);
+  });
+
+  it.each([
+    { kind: "forged", fileOp: undefined },
+    { kind: "command", fileOp: { op: "mkdir", args: { path: "~/a" } } },
+    { kind: "file", bodyBytes: 1 },
+    { kind: "file", cwd: "/tmp" },
+    { kind: "file", diff: "forged" },
+  ])("refuses forged/inconsistent spawn fields %j", (extra) => {
+    expect(() =>
+      encodeRelayServerControlMessage({ ...vector("file-term-spawn"), ...extra } as never),
+    ).toThrow();
+  });
+
+  it.each(["edit", "write", "rename", "mkdir", "delete"])(
+    "rejects extra fields at every supervised %s level",
+    (op) => {
+      const spawn =
+        op === "edit"
+          ? vector("file-term-spawn")
+          : op === "mkdir"
+            ? vector("file-term-spawn-mkdir")
+            : vector(`file-term-spawn-${op}`);
+      const fileOp = spawn.fileOp as { op: string; args: Record<string, unknown> };
+      for (const invalid of [
+        { ...spawn, fileOp: { ...fileOp, extra: "forged" } },
+        { ...spawn, fileOp: { ...fileOp, args: { ...fileOp.args, extra: "forged" } } },
+      ])
+        expect(() => encodeRelayServerControlMessage(invalid as never)).toThrow();
+      const done =
+        op === "mkdir" ? vector("file-supervised-done") : vector(`file-supervised-done-${op}`);
+      const fileResult = done.fileResult as { op: string; result: Record<string, unknown> };
+      for (const invalid of [
+        { ...done, fileResult: { ...fileResult, extra: "forged" } },
+        {
+          ...done,
+          fileResult: { ...fileResult, result: { ...fileResult.result, extra: "forged" } },
+        },
+        { ...done, review: true },
+        { ...done, exitCode: 0 },
+        { ...done, signal: "TERM" },
+        { ...done, outputBytes: 4 },
+      ])
+        expect(() => parseRelayClientControlFrame(JSON.stringify(invalid))).toThrow();
+      if (op === "edit" || op === "write")
+        expect(() =>
+          parseRelayClientControlFrame(
+            JSON.stringify({
+              ...done,
+              fileResult: { ...fileResult, result: { ...fileResult.result, diff: "forged" } },
+            }),
+          ),
+        ).toThrow();
+    },
+  );
+
+  it("caps the entire supervised control frame before dispatch", () => {
+    const spawn = vector("file-term-spawn");
+    expect(() =>
+      encodeRelayServerControlMessage({
+        ...spawn,
+        fileOp: {
+          op: "edit",
+          args: { path: "~/a", edits: [{ oldText: "a", newText: "x".repeat(64 * 1024) }] },
+        },
+      } as never),
+    ).toThrow("JSON control frame exceeds 64 KiB.");
+  });
+
   it("has a fixture for every documented file frame", () => {
     const names = readdirSync(FIXTURE_DIR).filter((name) => name.startsWith("file-"));
     for (const op of FILE_OPS) {
@@ -334,5 +449,42 @@ describe("relay 2.8 supervised-file schema (answered unsupported until P5)", () 
     expect(names).toEqual(
       expect.arrayContaining(["file-cancel.json", "file-rejected-conflict.json"]),
     );
+  });
+});
+
+describe("supervised file pre-display rejection contract", () => {
+  it("matches the CLI's closed list exactly", () => {
+    const rust = readFileSync(new URL("../../../cli/src/sessions.rs", import.meta.url), "utf8");
+    const table = rust.match(
+      /const SUPERVISED_FILE_REJECT_REASONS: &[\s\S]*?= &\[([\s\S]*?)\];/,
+    )?.[1];
+    expect(table).toBeDefined();
+    const reasons = [...(table ?? "").matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+    expect(reasons).toEqual(supervisedFileRejectReasonSchema.options);
+    for (const reason of reasons) {
+      expect(supervisedFileRejectReasonSchema.parse(reason)).toBe(reason);
+    }
+  });
+
+  it.each([
+    "bad_cwd",
+    "io_error",
+    "not_found",
+    "not_a_file",
+    "not_a_dir",
+    "binary_file",
+    "exists",
+    "conflict",
+    "match_count",
+    "no_match",
+    "hard_linked",
+    "owner_mismatch",
+    "setuid",
+    "special_file",
+    "timeout",
+    "cancelled",
+    "future_internal_error",
+  ])("rejects %s without widening the schema", (code) => {
+    expect(supervisedFileRejectReasonSchema.safeParse(code).success).toBe(false);
   });
 });

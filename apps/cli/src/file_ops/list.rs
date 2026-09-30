@@ -79,6 +79,9 @@ pub(crate) fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResul
             make_parents: None,
             policy: &ops.policy,
             access: Access::Read,
+            preview_missing: false,
+            pin: None,
+            cancel: None,
         },
     )?;
     let root = resolved.open_dir()?;

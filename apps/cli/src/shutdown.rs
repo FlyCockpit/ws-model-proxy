@@ -173,6 +173,16 @@ mod tracked {
     #[must_use = "the cleanup is unregistered when this guard drops"]
     pub struct ExitCleanup(u64);
 
+    #[cfg(all(test, unix))]
+    impl ExitCleanup {
+        pub(crate) fn run_registered(&self) {
+            let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cleanup) = cleanups.get(&self.0) {
+                cleanup();
+            }
+        }
+    }
+
     impl Drop for ExitCleanup {
         fn drop(&mut self) {
             CLEANUPS
@@ -207,10 +217,19 @@ mod tracked {
             let guard = register_exit_cleanup(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
             });
-            run_exit_cleanups();
+            let id = guard.0;
+            // A process-wide cleanup is only safe on the way out. Other tests
+            // can own live runtime files, so invoke only this registration.
+            let run_registered_cleanup = || {
+                let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(cleanup) = cleanups.get(&id) {
+                    cleanup();
+                }
+            };
+            run_registered_cleanup();
             assert_eq!(runs.load(Ordering::SeqCst), 1);
             drop(guard);
-            run_exit_cleanups();
+            run_registered_cleanup();
             assert_eq!(
                 runs.load(Ordering::SeqCst),
                 1,

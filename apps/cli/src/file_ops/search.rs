@@ -117,6 +117,9 @@ pub(crate) fn search(
             make_parents: None,
             policy: &ops.policy,
             access: Access::Read,
+            preview_missing: false,
+            pin: None,
+            cancel: None,
         },
     )?;
     let started = Instant::now();
@@ -142,6 +145,7 @@ pub(crate) fn search(
                 .unwrap_or_default(),
             name: entry.name.into(),
             created: Vec::new(),
+            missing_suffix: Vec::new(),
         };
         let Ok((mut file, stat)) = opened.open_regular(&ops.policy, Access::Read) else {
             return Ok(());

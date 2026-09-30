@@ -11,6 +11,7 @@ import {
   presentCliCommand,
   presentSupervisedCommand,
 } from "./cli-command-output.js";
+import { FILE_ERROR_MESSAGES, projectFileToolOutput } from "./cli-file-tools.js";
 import type { McpRequestCredential } from "./cli-tool-access.js";
 
 type CliCommandDeps = {
@@ -20,11 +21,10 @@ type CliCommandDeps = {
 };
 
 /**
- * Shown on both CLI command tools. Only the wsmp_ credential substrings
- * are removed; other secrets in command output are NOT redacted.
+ * Shown on CLI command tools: the CLI's narrow masking and server credential scrub.
  */
 export const CLI_COMMAND_OUTPUT_NOTICE =
-  "Other secrets in command output are NOT redacted. Only substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed.";
+  "The CLI masks SSH private keys, environment-variable secrets, Hugging Face token files and --api-key/--hf-token flag values in supervised and unsupervised command output. Other secrets in command output are NOT redacted. The server additionally removes substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters.";
 
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
@@ -54,7 +54,7 @@ const CLI_REJECTION_MESSAGES = {
 
 /** Shown on `forwarder_cli_activity_list`: what the audit log holds. */
 export const CLI_AGENT_ACTIVITY_NOTICE =
-  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
+  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. Supervised file audit reasons use <op>:<code> (for example write:completed or edit:conflict); headless file reasons use <code>. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */
 export const CLI_SUPERVISED_COMMAND_NOTICE =
@@ -250,7 +250,31 @@ export async function runForwarderCliCommandResult(
   const pat = requireCliPat(deps.credential);
   const adapted = adaptCliCommandResultInput(input);
   const supervised = snapshotSupervisedCommand(adapted.commandId, deps.userId, pat.tokenId);
-  if (supervised !== null) return presentSupervisedCommand(supervised);
+  if (supervised !== null) {
+    if (supervised.requestKind === "file") {
+      return {
+        commandId: supervised.commandId,
+        kind: "supervised",
+        status: supervised.status,
+        started: supervised.started,
+        ...(supervised.waitDeadline !== null
+          ? { waitingUntil: new Date(supervised.waitDeadline).toISOString() }
+          : {}),
+        ...(supervised.file
+          ? { file: { op: supervised.file.op, result: projectFileToolOutput(supervised.file) } }
+          : {}),
+        ...(supervised.fileError
+          ? {
+              error: {
+                ...supervised.fileError,
+                message: FILE_ERROR_MESSAGES[supervised.fileError.code],
+              },
+            }
+          : {}),
+      };
+    }
+    return presentSupervisedCommand(supervised);
+  }
   const raw = await snapshotCliCommand(adapted.commandId, deps.userId, pat.tokenId);
   if (raw == null) throw new McpCliCommandRejectedError("not_found");
   const parsed = parseCliCommandSnapshot(raw, adapted.commandId);
