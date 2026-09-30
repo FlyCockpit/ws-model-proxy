@@ -199,14 +199,8 @@ describe("relay 2.8 file frames: CLI to server", () => {
   });
 
   it("accepts every reason the CLI dispatcher can emit, and nothing else", () => {
-    // Pinned to the Rust set: `FILE_WIRE_REASONS` mirrors `admit`/`refuse` in
-    // apps/cli/src/file_relay.rs; `FILE_ERROR_CODES` mirrors file_ops/error.rs.
-    expect(FILE_WIRE_REASONS).toEqual([
-      "bad_frame",
-      "supervised_only",
-      "grant_disabled",
-      "feature_disabled",
-    ]);
+    // Both sets are compared with the Rust source itself (parsed, not copied) in
+    // src/mcp/file-error-parity.test.ts.
     for (const reason of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
       // `uncertain_outcome` is only valid with its recovery facts (pinned below)
       const detail =

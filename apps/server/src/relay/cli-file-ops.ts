@@ -15,6 +15,7 @@ import {
   judgeCliAgentAdmission,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
+  revokeOpenCliAgentAdmissionsForUser,
 } from "./cli-agent-admission.js";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
 import {
@@ -673,14 +674,29 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   });
 }
 
-/** Cancel the in-flight file ops of a revoked or narrowed token, and refuse ops still in admission. */
-export function cancelFileOpsForToken(tokenId: string): void {
-  revokeOpenCliAgentAdmissions(tokenId);
+/** The ONE sweep behind the token and user cancels: every matching record ends `token_inactive`. */
+function cancelFileOpsWhere(matches: (record: FileOpRecord) => boolean): void {
   for (const record of [...pendingById.values()]) {
-    if (record.tokenId !== tokenId) continue;
+    if (!matches(record)) continue;
     relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
     settle(record, serverFailure(record, "token_inactive"));
   }
+}
+
+/** Cancel the in-flight file ops of a revoked or narrowed token, and refuse ops still in admission. */
+export function cancelFileOpsForToken(tokenId: string): void {
+  revokeOpenCliAgentAdmissions(tokenId);
+  cancelFileOpsWhere((record) => record.tokenId === tokenId);
+}
+
+/**
+ * A user was banned: cancel every in-flight file op they own (any token, any
+ * device) and refuse ops still in admission (#159). Mutating ops end with an
+ * unknown outcome like any other server-side cancel (`serverFailure`).
+ */
+export function cancelFileOpsForUser(userId: string): void {
+  revokeOpenCliAgentAdmissionsForUser(userId);
+  cancelFileOpsWhere((record) => record.userId === userId);
 }
 
 /** Expired tokens end their in-flight ops; also drops rate-limit windows that have emptied. */
