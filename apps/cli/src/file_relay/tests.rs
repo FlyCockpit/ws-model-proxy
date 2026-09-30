@@ -162,6 +162,91 @@ fn read_grant_admit_matrix() {
 }
 
 #[test]
+fn read_grant_admit_literal_rows() {
+    use McpCommandMode::{Off, Supervised, Unsupervised};
+    // (local, server, read, grant, switch, roots) -> result, at euid 1000.
+    let rows = [
+        (Supervised, Unsupervised, true, true, true, true, Ok(())),
+        (Off, Unsupervised, true, true, true, true, Ok(())),
+        (
+            Supervised,
+            Unsupervised,
+            false,
+            true,
+            true,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Off,
+            Unsupervised,
+            false,
+            true,
+            true,
+            true,
+            Err("feature_disabled"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            false,
+            true,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            true,
+            false,
+            true,
+            Err("supervised_only"),
+        ),
+        (
+            Supervised,
+            Unsupervised,
+            true,
+            true,
+            true,
+            false,
+            Err("supervised_only"),
+        ),
+        (Unsupervised, Off, true, true, true, true, Ok(())),
+        (
+            Unsupervised,
+            Off,
+            true,
+            false,
+            true,
+            true,
+            Err("grant_disabled"),
+        ),
+        (
+            Unsupervised,
+            Unsupervised,
+            false,
+            false,
+            false,
+            false,
+            Ok(()),
+        ),
+    ];
+    for (local, server, read, grant, switch, roots, expected) in rows {
+        let permission = FilePermission {
+            mode: server,
+            read_grant: grant,
+        };
+        assert_eq!(
+            admit(local, permission, read, switch, roots, 1000, false),
+            expected,
+            "{local:?} {server:?} read={read} grant={grant} switch={switch} roots={roots}"
+        );
+    }
+}
+
+#[test]
 fn local_read_consent_and_roots_are_rechecked_for_server_requests() {
     let dir = tempfile::tempdir().expect("root");
     let path = dir.path().join("plain.txt");

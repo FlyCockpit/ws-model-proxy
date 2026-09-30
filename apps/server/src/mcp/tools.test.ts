@@ -1538,7 +1538,7 @@ describe("CLI command tools", () => {
       args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
     });
     expect(result.isError).toBe(true);
-    expect(resultText(result)).toBe("Tool forwarder_cli_command_run not found");
+    expect(resultText(result)).toContain("mcp:write");
     expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
   });
 
@@ -1872,7 +1872,7 @@ describe("CLI command tools", () => {
         args: startArgs,
       });
       expect(readOnly.isError).toBe(true);
-      expect(resultText(readOnly)).toBe("Tool forwarder_cli_supervised_command_start not found");
+      expect(resultText(readOnly)).toContain("mcp:write");
       expect(cliRuntime.startSupervisedCommand).not.toHaveBeenCalled();
     });
 

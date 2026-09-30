@@ -63,5 +63,9 @@ export function cliToolAllowed(
   const capability = CLI_TOOL_CAPABILITIES.get(name);
   if (capability === undefined) return false;
   if (credential?.kind !== "pat") return false;
+  // Command tools (and the read-only activity log) are gated by the flag
+  // alone here, as before: each tool's own scope rule is enforced by the
+  // manifest and by admission. File tools consult the shared consent table.
+  if (capability === "command") return credential.allowCliCommands === true;
   return cliTokenAllows({ ...credential, scopes: scopes ?? [] }, capability);
 }

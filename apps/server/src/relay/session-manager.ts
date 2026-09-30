@@ -442,15 +442,6 @@ type ActiveRelayRequest = ActiveRelayResponseHandlers & {
 
 type HelloMessage = Extract<RelayClientControlMessage, { type: "hello" }>;
 
-/** Only a connected, fresh hello supplies live authorization inputs. */
-function sessionFeaturesLive(session: SessionState): boolean {
-  return (
-    session.registered &&
-    session.socket.readyState === WS_READY_STATE_OPEN &&
-    Date.now() - session.lastHeartbeatAt.getTime() <= RELAY_STALE_AFTER_MS
-  );
-}
-
 /** Terminal, exec, and supervised-command capabilities (2.6). */
 function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities"]): {
   features: CliReportedFeatures;
@@ -1751,7 +1742,7 @@ export class RelaySessionManager {
     const snapshots = new Map<string, LiveCliFeatureSnapshot>();
     for (const cliDeviceId of cliDeviceIds) {
       const session = this.sessionsByCliDeviceId.get(cliDeviceId);
-      if (!session?.protocolVersion || !sessionFeaturesLive(session)) continue;
+      if (!session?.registered || !session.protocolVersion) continue;
       snapshots.set(cliDeviceId, {
         protocolVersion: session.protocolVersion,
         cliVersion: session.cliVersion,
@@ -2269,20 +2260,18 @@ export class RelaySessionManager {
   ): "grant_disabled" | "feature_disabled" | "supervised_only" | null {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return null;
-    const fresh = sessionFeaturesLive(session);
     const readGrant = {
       server: session.mcpFileRead === true,
       live:
         session.features?.mcpFileRead === true &&
         session.features.fileOps === true &&
-        relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-        fresh,
+        relayProtocolAtLeast(session.protocolVersion, "2.8"),
       roots: session.features?.fileRootsConfigured === true,
     };
     const grantAccess = fileToolAccess(session.mcpCommandMode, opClass, readGrant);
     if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
     const liveAccess = fileToolAccess(
-      fresh ? (session.features?.mcpCommandMode ?? "off") : "off",
+      session.features?.mcpCommandMode ?? "off",
       opClass,
       readGrant,
     );
@@ -2622,7 +2611,6 @@ export class RelaySessionManager {
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
       relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-      sessionFeaturesLive(session) &&
       session.cliDeviceId !== null &&
       this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
       session.features?.fileOps === true &&

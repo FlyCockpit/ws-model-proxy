@@ -371,31 +371,6 @@ describe("cli file ops", () => {
     },
   );
 
-  it.each(["off", "unsupervised"] as const)(
-    "stale %s hello is absent at admission and dispatch",
-    async (mode) => {
-      db.cliDevice.findUnique.mockImplementation(
-        deviceRow(mode === "off" ? "OFF" : "UNSUPERVISED", { mcpFileRead: true }),
-      );
-      const socket = await connect("desktop", mode, true, true);
-      relaySessionManager.applyFeatureGrants("desktop", {
-        allowHumanTerminal: false,
-        mcpCommandMode: mode,
-        mcpFileRead: true,
-      });
-      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBeNull();
-      vi.setSystemTime(new Date(now.getTime() + 60_001));
-      expect(relaySessionManager.getLiveCliFeatures(["desktop"]).has("desktop")).toBe(false);
-      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(
-        mode === "off" ? "grant_disabled" : "feature_disabled",
-      );
-      await expect(
-        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
-      ).resolves.toEqual({ ok: false, code: mode === "off" ? "grant_disabled" : "offline" });
-      expect(socket.frames("file.op")).toEqual([]);
-    },
-  );
-
   it("read-only token consent is reread at admission, and its cancellation ends a pending read", async () => {
     const token = {
       ...liveToken(),

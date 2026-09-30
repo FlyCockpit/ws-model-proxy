@@ -1,6 +1,6 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
 import {
   encodeRelayBinaryFrame,
@@ -97,13 +97,6 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
-beforeEach(() => {
-  vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(now);
-});
-afterEach(() => {
-  vi.useRealTimers();
-});
 
 /** Holds the next registration transaction until `release()`. */
 function holdNextRegistration() {
@@ -994,7 +987,6 @@ describe("RelaySessionManager", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
     seedRegistrationMocks();
   });
 
@@ -1997,7 +1989,6 @@ describe("relay terminal and exec sessions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
     seedRegistrationMocks();
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",
@@ -2555,7 +2546,6 @@ describe("relay protocol 2.5 terminal viewers", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
     seedRegistrationMocks();
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",

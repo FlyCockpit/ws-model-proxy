@@ -36,6 +36,25 @@ describe("file tool permission matrix", () => {
     },
   );
 
+  it("literal read-grant rows (independent of the computed table)", () => {
+    const all = { server: true, live: true, roots: true };
+    // [mode, grant, read, write]
+    const rows = [
+      ["supervised", all, "headless", "supervised"],
+      ["off", all, "headless", "off"],
+      ["unsupervised", undefined, "headless", "headless"],
+      ["supervised", undefined, "supervised", "supervised"],
+      ["off", undefined, "off", "off"],
+      ["off", { ...all, server: false }, "off", "off"],
+      ["off", { ...all, live: false }, "off", "off"],
+      ["supervised", { ...all, roots: false }, "supervised", "supervised"],
+    ] as const;
+    for (const [mode, grant, read, write] of rows) {
+      expect(fileToolAccess(mode, "read", grant)).toBe(read);
+      expect(fileToolAccess(mode, "write", grant)).toBe(write);
+    }
+  });
+
   it("runs everything headless only on an unsupervised node", () => {
     for (const opClass of ["read", "write"] as const) {
       expect(fileToolAccess("unsupervised", opClass)).toBe("headless");
