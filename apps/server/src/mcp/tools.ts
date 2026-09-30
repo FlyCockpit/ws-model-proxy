@@ -206,21 +206,16 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
     // OutputArgs when no outputSchema is passed (tools deliberately declare
     // none — no output validation, no SEP-2106 result wrapping), and InputArgs
     // is the erased descriptor schema. The callback receives `unknown` args
-    // (already validated by the schema) and returns the SDK's own
-    // CallToolResult shape.
+    // (audited tools defer their schema validation to the wrapper) and
+    // returns the SDK's own CallToolResult shape.
     server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
       descriptor.name,
       {
         title: descriptor.name,
         description: toolDescription(descriptor),
         inputSchema:
-          descriptor.auditInputRefusal !== undefined && dispatch !== undefined
-            ? auditRefusals(descriptor.inputSchema, (input) =>
-                descriptor.auditInputRefusal?.(input, {
-                  userId: dispatch.orpcContext.session.user.id,
-                  credential: dispatch.credential ?? { kind: "oauth" },
-                }),
-              )
+          descriptor.auditInputRefusal !== undefined
+            ? deferInputValidation(descriptor.inputSchema)
             : descriptor.inputSchema,
         annotations: {
           readOnlyHint: descriptor.scope === "read",
@@ -240,36 +235,18 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
 }
 
 /**
- * The same input schema, reporting every refusal to `onRefused` with the raw
- * input (SDK validation runs before any tool code, so this is the only place a
- * refused file call can be audited). Validation itself is unchanged.
+ * Advertise the same schema, but let the wrapper validate audited tools. The
+ * SDK's own validation errors have no stable structured code. The wrapper
+ * enforces the original validator before confirmation or invocation, audits
+ * its refusal once, and returns a sanitized in-band error.
  */
-function auditRefusals(
-  schema: StandardSchemaWithJSON,
-  onRefused: (input: unknown) => void,
-): StandardSchemaWithJSON {
-  const standard = schema["~standard"];
-  const report = (input: unknown, result: { issues?: unknown }) => {
-    if (result.issues !== undefined) {
-      try {
-        onRefused(input);
-      } catch {
-        // Auditing never changes the validation outcome.
-      }
-    }
-    return result;
-  };
+function deferInputValidation(schema: StandardSchemaWithJSON): StandardSchemaWithJSON {
   return {
     "~standard": {
-      ...standard,
-      validate: (input: unknown, options?: never) => {
-        const result = standard.validate(input, options);
-        return result instanceof Promise
-          ? result.then((resolved) => report(input, resolved))
-          : report(input, result);
-      },
+      ...schema["~standard"],
+      validate: (input: unknown) => ({ value: input }),
     },
-  } as StandardSchemaWithJSON;
+  };
 }
 
 function toolDescription(descriptor: McpToolDescriptor): string {
@@ -345,6 +322,33 @@ export async function runManifestTool(
       requestId,
     });
     return insufficientScopeError(descriptor);
+  }
+
+  // Audited tools enforce their original SDK validator here, including the
+  // first-stage size bound, so refusals also carry the stable error contract.
+  if (descriptor.auditInputRefusal !== undefined) {
+    let validationFailure: unknown;
+    try {
+      const validated = await descriptor.inputSchema["~standard"].validate(args);
+      if (validated.issues !== undefined) validationFailure = validated;
+    } catch {
+      // A validator/serializer exception is a refusal too. Do not let the
+      // SDK echo its message, or skip the metadata-only refusal audit.
+      validationFailure = {};
+    }
+    if (validationFailure !== undefined) {
+      descriptor.auditInputRefusal(args, {
+        userId: dispatch.orpcContext.session.user.id,
+        credential,
+      });
+      const issues = sanitizeValidationIssues(validationFailure, declaredInputKeys(descriptor));
+      return toolError(
+        issues === null ? "Invalid input" : `Invalid input: ${formatValidationIssues(issues)}`,
+        {
+          error: { code: "invalid_input", ...(issues === null ? {} : { issues }) },
+        },
+      );
+    }
   }
 
   // 3. Confirmation gate + field stripping.

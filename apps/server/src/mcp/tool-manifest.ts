@@ -130,10 +130,11 @@ export interface McpToolDescriptor {
    */
   descriptionNote?: string;
   /**
-   * Called when a call to this tool is refused before its core runs (the SDK
+   * Called when a call to this tool is refused before its core runs (the input
    * validator rejected the input, or the confirmation literal is missing), so
    * the refusal can be audited. Metadata only: it receives the raw input and
    * the verified user and credential, never a device it could trust.
+   * These tools validate in the wrapper so every refusal has a stable code.
    */
   auditInputRefusal?: (
     input: unknown,
