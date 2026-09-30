@@ -136,6 +136,7 @@ describe("discovered inference capacity", () => {
         kind: "DISCOVERED_MODEL",
         discoveredModelId: "model-bare",
         inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
       })
       .mockResolvedValueOnce({
         id: "kept-target",
@@ -170,6 +171,7 @@ describe("discovered inference capacity", () => {
     expect(db.executionTarget.findMany).toHaveBeenCalledWith({
       where: {
         inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
         kind: "DISCOVERED_MODEL",
         discoveredModelId: { not: null },
       },
@@ -197,7 +199,12 @@ describe("discovered inference capacity", () => {
     );
     expect(db.executionTarget.updateMany).toHaveBeenCalledTimes(1);
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
-      where: { id: "bare-target", userId: "user-id", inferenceCapacityId: null },
+      where: {
+        id: "bare-target",
+        userId: "user-id",
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
       data: { inferenceCapacityId: "new-capacity" },
     });
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
@@ -226,6 +233,52 @@ describe("discovered inference capacity", () => {
     expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
   });
 
+  it("does not fill an existing destination during automatic move preflight", async () => {
+    db.inferenceCapacity.findUnique.mockResolvedValue({ id: "existing" });
+    expect(
+      await ensureDiscoveredInferenceCapacity(prisma, {
+        userId: "user-id",
+        discoveredModelId: "model",
+        executionTargetId: "target",
+        upstreamModelId: "a",
+        fillExistingLimit: false,
+      }),
+    ).toBe("existing");
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    db.inferenceCapacity.findUnique.mockResolvedValue(null);
+    await ensureDiscoveredInferenceCapacity(prisma, {
+      userId: "user-id",
+      discoveredModelId: "model",
+      upstreamModelId: "a",
+      fillExistingLimit: false,
+    });
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rechecks durable owner detach after the startup scan", async () => {
+    db.executionTarget.findMany
+      .mockResolvedValueOnce([
+        {
+          id: "target",
+          userId: "user-id",
+          discoveredModelId: "model",
+          DiscoveredModel: { upstreamModelId: "a" },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      userId: "user-id",
+      kind: "DISCOVERED_MODEL",
+      discoveredModelId: "model",
+      inferenceCapacityId: null,
+      capacityAssignmentSource: "OWNER",
+    });
+    expect(await backfillDiscoveredInferenceCapacities()).toEqual({ attached: 0, unchanged: 1 });
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
+  });
+
   it("reuses a schema-hardening capacity instead of creating another", async () => {
     db.executionTarget.findMany.mockResolvedValue([
       {
@@ -241,6 +294,7 @@ describe("discovered inference capacity", () => {
       kind: "DISCOVERED_MODEL",
       discoveredModelId: "model-bare",
       inferenceCapacityId: null,
+      capacityAssignmentSource: "AUTO",
     });
     db.inferenceCapacity.findUnique.mockResolvedValue({ id: "legacy-capacity" });
     db.inferenceCapacity.findMany.mockResolvedValue([{ id: "legacy-capacity" }]);
@@ -276,7 +330,12 @@ describe("discovered inference capacity", () => {
     });
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
-      where: { id: "bare-target", userId: "user-id", inferenceCapacityId: null },
+      where: {
+        id: "bare-target",
+        userId: "user-id",
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
       data: { inferenceCapacityId: "legacy-capacity" },
     });
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
@@ -410,8 +469,9 @@ describe("discovered inference capacity", () => {
             hardConcurrencyLimit: null,
             hardConcurrencyLimitSource: "AUTO",
             OR: [
-              { runtimeIdentityKey: { startsWith: "execution-target:" } },
               { runtimeIdentityKey: { startsWith: "discovered-model:" } },
+              { runtimeIdentityKey: { startsWith: "execution-target:" } },
+              { runtimeIdentityKey: { startsWith: "engine-process:" } },
             ],
           },
         },
@@ -421,6 +481,7 @@ describe("discovered inference capacity", () => {
         userId: true,
         discoveredModelId: true,
         inferenceCapacityId: true,
+        DiscoveredModel: { select: { endpointId: true } },
         InferenceCapacity: {
           select: {
             runtimeIdentityKey: true,
@@ -430,6 +491,44 @@ describe("discovered inference capacity", () => {
         },
       },
     });
+  });
+
+  it("leaves every shared limit for the inventory aggregate at startup", async () => {
+    for (const [key, source, expected] of [
+      ["engine-process:ep", "AUTO", null],
+      ["engine-process:other", "AUTO", null],
+      ["engine-process:ep", "USER", null],
+    ] as const) {
+      const row = {
+        id: "shared",
+        userId: "user-id",
+        runtimeIdentityKey: key,
+        hardConcurrencyLimit: null as number | null,
+        hardConcurrencyLimitSource: source,
+      };
+      db.executionTarget.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+        {
+          id: "target",
+          userId: "user-id",
+          discoveredModelId: "model",
+          inferenceCapacityId: "shared",
+          DiscoveredModel: { endpointId: "ep" },
+          InferenceCapacity: row,
+        },
+      ]);
+      db.executionTarget.findUnique.mockResolvedValue({
+        id: "target",
+        userId: "user-id",
+        kind: "DISCOVERED_MODEL",
+        discoveredModelId: "model",
+        inferenceCapacityId: "shared",
+      });
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+      await backfillDiscoveredInferenceCapacities();
+      expect(row.hardConcurrencyLimit).toBe(expected);
+    }
   });
 
   it("does not rewrite a pre-attached auto capacity whose hard limit is 4", async () => {

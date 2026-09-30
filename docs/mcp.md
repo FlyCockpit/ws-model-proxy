@@ -22,6 +22,31 @@ every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
+Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
+when the CLI proves that at least two inventory model ids are aliases served
+by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
+capacities. Model-swapping front ends are excluded only through engine detection
+and router-role proof. Owner assignments are recorded per target only when the
+capacity FK changes, including a real detach to null or a move to an existing AUTO
+capacity. Equal-FK and policy-only inputs preserve provenance; an untouched web
+attachment field preserves the target's current capacity. USER limits remain owner
+controlled. Removed aliases split on a later idle inventory. Discovery defers each
+connected move group while its source or destination capacities have ACTIVE leases
+or WAITING waiters. Unrelated capacities and independent endpoint groups do not block
+it. Every later inventory retries deferred groups; the CLI sends inventory on reconnect
+or operator reload, so an involved busy capacity can defer moves until an idle inventory.
+Existing handles keep their original capacity.
+Every join and split must fit direct and effective pool concurrency and context policies.
+Shared AUTO limits follow engine slots, otherwise the sum of current automatic member
+limits; incompatible lowerings wait for a policy change and the next inventory.
+Startup leaves unknown shared AUTO limits for that complete inventory aggregate.
+Empty AUTO discovery capacities are removed with model, endpoint, and device
+deletes, and an idempotent startup sweep repairs existing idle orphans. The sweep skips
+contended owners and capacities for the next registration or startup.
+Owner-created empty capacities remain visible in `capacity_records_list`.
+Automatic capacity labels get a numeric suffix when an owner's existing label
+collides; repeated discovery preserves the capacity identity and its label.
+
 `forwarder_device_metrics_get` also lists `series`: every metric a pool routing
 rule can name on that device (built-in `node.*` series such as
 `node.cpu.usage_percent`, `node.memory.used_percent` or

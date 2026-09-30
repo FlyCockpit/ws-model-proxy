@@ -8,7 +8,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  const { Prisma } = await import("../../../../packages/db/prisma/generated/client");
+  return { default: mockDeep(), Prisma };
 });
 
 const { persistRelayRegistration, shouldPreserveDashboardCapabilityOverride } = await import(
@@ -23,7 +24,12 @@ const db = prisma as unknown as {
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
+  endpoint: {
+    findMany: MockInstance;
+    upsert: MockInstance;
+    findUnique: MockInstance;
+    updateMany: MockInstance;
+  };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
@@ -113,6 +119,13 @@ const identity: CliWebsocketIdentity = {
   lookupPrefix: "wsmp_cli_lookup",
 };
 
+function capacityAssignmentWrites() {
+  return db.executionTarget.updateMany.mock.calls.filter((call) => {
+    const args = call[0] as { data?: { inferenceCapacityId?: string } };
+    return args.data && Object.hasOwn(args.data, "inferenceCapacityId");
+  });
+}
+
 const now = new Date("2026-01-01T00:00:00.000Z");
 
 const cliOverride = {
@@ -171,6 +184,7 @@ describe("capability override origin", () => {
       inventoryAcknowledgedAt: now,
     });
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
     db.endpoint.updateMany.mockResolvedValue({ count: 0 });
     db.discoveredModel.findUnique.mockResolvedValue(null);
@@ -498,8 +512,7 @@ describe("capability override origin", () => {
         userId: "user-id",
         DiscoveredModel: {
           is: {
-            Endpoint: { cliDeviceId: "cli-device-id" },
-            OR: [{ Endpoint: { slug: "local-openai" }, upstreamModelId: { in: ["llava/local"] } }],
+            Endpoint: { cliDeviceId: "cli-device-id", slug: { in: ["local-openai"] } },
           },
         },
       },
@@ -508,6 +521,94 @@ describe("capability override origin", () => {
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
       isolationLevel: "ReadCommitted",
     });
+  });
+
+  it("fences shared, own-key and orphan rows, including an unlisted target, before writing", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-device-id" });
+    db.endpoint.findMany.mockResolvedValue([{ id: "endpoint-id" }]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "execution-target-id",
+        discoveredModelId: "model-id",
+        inferenceCapacityId: "capacity-id",
+      },
+      { id: "unlisted", discoveredModelId: "missing-model", inferenceCapacityId: "shared" },
+    ]);
+    db.inferenceCapacity.findMany.mockImplementation(
+      async (args: {
+        where?: { runtimeIdentityKey?: { in?: string[] }; ExecutionTargets?: object };
+      }) => {
+        const keys = args.where?.runtimeIdentityKey?.in;
+        if (keys?.includes("engine-process:endpoint-id")) return [{ id: "shared" }];
+        if (keys?.includes("discovered-model:model-id")) return [{ id: "own" }];
+        if (keys?.includes("discovered-model:missing-model")) return [{ id: "missing-own" }];
+        if (args.where?.ExecutionTargets) return [{ id: "orphan" }];
+        return [];
+      },
+    );
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints(),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const fenceCalls = db.$queryRaw.mock.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) =>
+        (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+      );
+    expect(fenceCalls.map(({ call }) => call[1])).toEqual([
+      ["00:owner:user-id"],
+      [
+        "06:capacity-policy:execution-target-id",
+        "06:capacity-policy:unlisted",
+        "08:capacity:capacity-id",
+        "08:capacity:missing-own",
+        "08:capacity:orphan",
+        "08:capacity:own",
+        "08:capacity:shared",
+      ],
+    ]);
+    expect(db.$queryRaw.mock.invocationCallOrder[fenceCalls[1]!.index]).toBeLessThan(
+      db.cliDevice.upsert.mock.invocationCallOrder[0]!,
+    );
+    expect(db.inferenceCapacity.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        take: 200,
+        orderBy: { id: "asc" },
+        where: expect.objectContaining({
+          userId: "user-id",
+          hardConcurrencyLimitSource: "AUTO",
+          ExecutionTargets: { none: {} },
+        }),
+      }),
+    );
+  });
+
+  it("fences an empty shared destination independently of the orphan batch", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-device-id" });
+    db.endpoint.findMany.mockResolvedValue([{ id: "endpoint-id" }]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockImplementation(
+      async (args: { where?: { runtimeIdentityKey?: { in?: string[] } } }) =>
+        args.where?.runtimeIdentityKey?.in?.includes("engine-process:endpoint-id")
+          ? [{ id: "shared" }]
+          : [],
+    );
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: inventoryEndpoints(),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    const calls = db.$queryRaw.mock.calls.filter((call) =>
+      (call[0] as TemplateStringsArray).join("?").includes("wsmp_acquire_fences"),
+    );
+    expect(calls.map((call) => call[1])).toEqual([["00:owner:user-id"], ["08:capacity:shared"]]);
   });
 
   it("fences only the owner for a device it has never seen", async () => {
@@ -699,7 +800,7 @@ describe("capability override origin", () => {
     // upserted with a SET of the key column "userId" (DL-1).
     expect(db.executionTarget.findUnique).toHaveBeenCalledWith({
       where: { discoveredModelId: "model-id" },
-      select: { id: true, inferenceCapacityId: true },
+      select: { id: true, inferenceCapacityId: true, capacityAssignmentSource: true },
     });
     expect(db.executionTarget.create).not.toHaveBeenCalled();
   });
@@ -871,7 +972,12 @@ describe("capability override origin", () => {
       select: { id: true },
     });
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
-      where: { id: "execution-target-id", userId: "user-id", inferenceCapacityId: null },
+      where: {
+        id: "execution-target-id",
+        userId: "user-id",
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
       data: { inferenceCapacityId: "new-capacity" },
     });
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
@@ -940,7 +1046,7 @@ describe("capability override origin", () => {
     await persistRelayRegistration(registration);
 
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(1);
-    expect(db.executionTarget.updateMany).toHaveBeenCalledTimes(1);
+    expect(capacityAssignmentWrites()).toHaveLength(1);
   });
 
   it("keeps an execution target capacity that is already attached", async () => {
@@ -994,7 +1100,7 @@ describe("capability override origin", () => {
     });
 
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: { id: "kept-capacity", userId: "user-id", physicalMaxContext: null },
       data: { physicalMaxContext: 4_096 },
@@ -1053,7 +1159,7 @@ describe("capability override origin", () => {
     expect(row.hardConcurrencyLimit).toBe(4);
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: {
         id: "trigger-capacity",
@@ -1086,7 +1192,7 @@ describe("capability override origin", () => {
     await persistRelayRegistration(preAttachedRegistration());
 
     expect(row.hardConcurrencyLimit).toBe(1);
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
   });
 
   it("does not rewrite a pre-attached capacity whose hard limit is already 4", async () => {
@@ -1109,7 +1215,7 @@ describe("capability override origin", () => {
     expect(row.hardConcurrencyLimit).toBe(4);
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
     for (const call of db.inferenceCapacity.updateMany.mock.calls) {
       const args = call[0] as CapacityWriteArgs;
       if (args.data && "hardConcurrencyLimit" in args.data) {
@@ -1163,7 +1269,7 @@ describe("capability override origin", () => {
 
     expect(row.hardConcurrencyLimit).toBeNull();
     expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
-    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(capacityAssignmentWrites()).toHaveLength(0);
   });
   function engineRegistration(engineFacts: Record<string, unknown>, concurrencyLimit?: number) {
     const registration = preAttachedRegistration(concurrencyLimit);

@@ -182,6 +182,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/model-pool-routing.ts":
     "H status: pool member health, one row per statement",
   "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
+  "packages/api/src/lib/engine-process-capacity.ts":
+    "M: process capacity lifecycle and orphan cleanup",
   "packages/api/src/lib/discovered-inference-capacity.ts": "M: capacity discovery and backfill",
   "packages/api/src/lib/engine-facts.ts":
     "M: relay engine facts and AUTO limit refresh (registration holds the capacity fences)",

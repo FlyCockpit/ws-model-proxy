@@ -669,6 +669,46 @@ describe("providerManagementRouter security boundary", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it.each([
+    { index: "inference_capacity_userId_label_key", retry: true },
+    { index: "provider_model_providerAccountId_upstreamModelId_key", retry: false },
+  ])(
+    "retries only automatic capacity label collisions in createModel: $index",
+    async ({ index, retry }) => {
+      envMock.enabled = true;
+      db.$queryRaw.mockResolvedValue([]);
+      db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+      db.providerModel.create.mockResolvedValue({ id: "model" });
+      db.executionTarget.create.mockResolvedValue({ id: "target" });
+      db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+      const error = {
+        code: "P2002",
+        meta: {
+          driverAdapterError: {
+            cause: {
+              kind: "UniqueConstraintViolation",
+              constraint: { index },
+            },
+          },
+        },
+      };
+      db.$transaction.mockRejectedValueOnce(error);
+      const client = createRouterClient(providerManagementRouter, { context });
+      const call = client.createModel({
+        providerAccountId: "account",
+        upstreamModelId: "L".repeat(150),
+      });
+      if (retry) await expect(call).resolves.toMatchObject({ id: "model" });
+      else await expect(call).rejects.toBe(error);
+      expect(db.$transaction).toHaveBeenCalledTimes(retry ? 2 : 1);
+      expect(db.$transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+        isolationLevel: "Serializable",
+        maxWait: 5_000,
+        timeout: 10_000,
+      });
+    },
+  );
+
   it("creates, reads, updates, and clears an owner capability inventory", async () => {
     envMock.enabled = true;
     db.$queryRaw.mockResolvedValue([]);

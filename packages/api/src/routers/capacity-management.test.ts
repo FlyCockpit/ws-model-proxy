@@ -119,6 +119,8 @@ function httpClient(captures?: Array<{ status: number; body: string }>) {
 describe("capacityManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockResolvedValue([]);
     db.appSetting.findUnique.mockResolvedValue(null);
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
@@ -534,6 +536,91 @@ describe("capacityManagementRouter", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { current: "auto", supplied: "auto", provenance: "AUTO", changed: false },
+    { current: null, supplied: null, provenance: "AUTO", changed: false },
+    { current: "auto", supplied: "auto", provenance: "OWNER", changed: false },
+    { current: "auto", supplied: null, provenance: "AUTO", changed: true },
+    { current: "auto", supplied: "other", provenance: "AUTO", changed: true },
+  ])(
+    "assignment provenance depends on actual FK change: %#",
+    async ({ current, supplied, provenance, changed }) => {
+      db.executionTarget.findUnique.mockResolvedValue({
+        id: "target",
+        userId: "owner",
+        inferenceCapacityId: current,
+        capacityAssignmentSource: provenance,
+        directPriority: 16,
+        directConcurrencyLimit: null,
+        directReservedSlots: 0,
+        directContextCeiling: null,
+        directContextMargin: 0,
+        PoolMembers: [],
+      });
+      db.inferenceCapacity.findUnique.mockResolvedValue({
+        userId: "owner",
+        hardConcurrencyLimit: 3,
+        physicalMaxContext: null,
+      });
+      const client = createRouterClient(capacityManagementRouter, { context });
+      await client.updateDirectPolicy({
+        executionTargetId: "target",
+        inferenceCapacityId: supplied,
+        directPriority: 20,
+      });
+      expect(db.executionTarget.update).toHaveBeenCalledWith({
+        where: { id: "target" },
+        data: {
+          directPriority: 20,
+          ...(changed ? { inferenceCapacityId: supplied, capacityAssignmentSource: "OWNER" } : {}),
+        },
+      });
+      expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+      expect(db.capacityAuditEvent.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            after: { directPriority: 20, ...(changed ? { inferenceCapacityId: supplied } : {}) },
+          }),
+        }),
+      );
+    },
+  );
+
+  it("fences every dependent when an owner changes shared membership", async () => {
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      userId: "owner",
+      inferenceCapacityId: "old",
+      directPriority: 16,
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      directContextCeiling: null,
+      directContextMargin: 0,
+      PoolMembers: [],
+    });
+    db.executionTarget.findMany.mockResolvedValue([{ id: "sibling" }]);
+    db.inferenceCapacity.findUnique.mockResolvedValue({
+      userId: "owner",
+      hardConcurrencyLimit: 3,
+      physicalMaxContext: null,
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await client.updateDirectPolicy({ executionTargetId: "target", inferenceCapacityId: "new" });
+    expect(fenceCalls()).toEqual([
+      ["00:owner:owner"],
+      [
+        "06:capacity-policy:sibling",
+        "06:capacity-policy:target",
+        "08:capacity:new",
+        "08:capacity:old",
+      ],
+    ]);
+    expect(db.executionTarget.update).toHaveBeenCalledWith({
+      where: { id: "target" },
+      data: { inferenceCapacityId: "new", capacityAssignmentSource: "OWNER" },
+    });
   });
 
   it("marks every user-authored hard limit USER, including explicit unlimited", async () => {

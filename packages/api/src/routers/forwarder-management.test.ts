@@ -20,7 +20,7 @@ const testEnv = vi.hoisted(() => ({
 // The parent-delete fence prelude runs against real PostgreSQL
 // (capacity-lock-order.postgres.integration.test.ts); here it is observed.
 const { fenceParentDelete } = vi.hoisted(() => ({
-  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+  fenceParentDelete: vi.fn(async (_tx: unknown, _scope: unknown): Promise<string[]> => []),
 }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
@@ -910,9 +910,13 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
-    expect(db.executionTarget.update).toHaveBeenCalledWith({
-      where: { id: expect.stringMatching(/^provider-target-/) },
-      data: { inferenceCapacityId: "provider-capacity-id" },
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: expect.stringMatching(/^provider-target-/),
+        inferenceCapacityId: null,
+        capacityAssignmentSource: "AUTO",
+      },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
     });
     // Writer class M: the owner fence, then the provider identity fences and
     // the capacity-policy fences of every existing target it changes (one
@@ -3763,6 +3767,10 @@ describe("forwarderManagementRouter", () => {
       where: { id: "provider-member" },
       data: { publicOrder: 0 },
     });
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: { id: "provider-target", capacityAssignmentSource: "AUTO" },
+      data: { inferenceCapacityId: "provider-capacity-id", capacityAssignmentSource: "OWNER" },
+    });
   });
 
   it("rejects attaching an external member when inherited pool capacity exceeds its hard limit", async () => {
@@ -5016,7 +5024,7 @@ describe("forwarderManagementRouter", () => {
           });
         } finally {
           fenceParentDelete.mockReset();
-          fenceParentDelete.mockImplementation(async () => undefined);
+          fenceParentDelete.mockImplementation(async () => []);
         }
         // Retried with a fresh plan each time, never deleting.
         expect(db.$transaction).toHaveBeenCalledTimes(5);

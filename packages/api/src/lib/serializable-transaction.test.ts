@@ -8,6 +8,7 @@ vi.mock("@ws-model-proxy/db", () => ({
 
 import {
   retryableSerializableTransactionCode,
+  runSerializableCapacityCreationTransaction,
   runSerializableTransaction,
 } from "./serializable-transaction";
 
@@ -52,7 +53,60 @@ describe("serializable transaction retry", () => {
   });
 
   it.each([
+    { code: "23505", constraint: "inference_capacity_userId_label_key" },
+    { code: "P2002", meta: { target: "inference_capacity_userId_label_key" } },
+    {
+      code: "P2002",
+      meta: {
+        modelName: "DiscoveredModel",
+        driverAdapterError: {
+          cause: {
+            originalCode: "23505",
+            constraint: { index: "inference_capacity_userId_label_key" },
+          },
+        },
+      },
+    },
+    {
+      code: "P2010",
+      meta: {
+        code: "23505",
+        driverAdapterError: {
+          cause: { constraint: { index: "inference_capacity_userId_label_key" } },
+        },
+      },
+    },
+  ])("retries only the capacity label unique index with a fresh transaction %#", async (error) => {
+    transaction.mockRejectedValueOnce(error).mockResolvedValueOnce("allocated suffix");
+    expect(retryableSerializableTransactionCode(error)).toBe("23505");
+    await expect(runSerializableCapacityCreationTransaction(async () => "unused")).resolves.toBe(
+      "allocated suffix",
+    );
+    expect(transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry explicit owner label conflicts in policy transactions", async () => {
+    const error = { code: "P2002", meta: { target: "inference_capacity_userId_label_key" } };
+    transaction.mockRejectedValueOnce(error);
+    await expect(runSerializableTransaction(async () => "unused")).rejects.toBe(error);
+    expect(transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
     null,
+    { code: "23505", constraint: "inference_capacity_userId_runtimeIdentityKey_key" },
+    { code: "P2002", meta: { target: "provider_account_userId_label_key" } },
+    {
+      code: "P2002",
+      meta: {
+        driverAdapterError: {
+          cause: {
+            originalCode: "23505",
+            constraint: { index: "provider_model_providerAccountId_upstreamModelId_key" },
+          },
+        },
+      },
+    },
     "40001",
     {},
     { code: "P2010" },
@@ -69,5 +123,10 @@ describe("serializable transaction retry", () => {
     transaction.mockRejectedValueOnce(error);
     await expect(runSerializableTransaction(async () => "unused")).rejects.toBe(error);
     expect(transaction).toHaveBeenCalledTimes(1);
+    transaction.mockRejectedValueOnce(error);
+    await expect(runSerializableCapacityCreationTransaction(async () => "unused")).rejects.toBe(
+      error,
+    );
+    expect(transaction).toHaveBeenCalledTimes(2);
   });
 });

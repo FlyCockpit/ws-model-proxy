@@ -53,7 +53,7 @@ const db = prisma as unknown as {
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
   cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { findUnique: MockInstance };
+  endpoint: { findUnique: MockInstance; findMany: MockInstance };
   discoveredModel: { findMany: MockInstance };
   executionTarget: { findMany: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
@@ -269,6 +269,7 @@ describe("supervised commands", () => {
     });
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken("Build agent"));
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);

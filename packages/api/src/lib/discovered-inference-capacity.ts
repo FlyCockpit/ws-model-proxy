@@ -1,5 +1,9 @@
 import prisma, { type Prisma } from "@ws-model-proxy/db";
-import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  AUTO_CAPACITY_RUNTIME_KEY_PREFIXES,
+  acquireFences,
+  fences,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { retryableSerializableTransactionCode } from "./serializable-transaction";
 
 /**
@@ -12,6 +16,12 @@ const HARD_CONCURRENCY_MAX = 10_000;
 const CAPACITY_LABEL_MAX = 120;
 const RUNTIME_MODEL_MAX = 500;
 const BACKFILL_ATTEMPTS = 3;
+
+export { AUTO_CAPACITY_RUNTIME_KEY_PREFIXES };
+
+export function engineProcessRuntimeIdentityKey(endpointId: string): string {
+  return `engine-process:${endpointId}`;
+}
 
 export function discoveredRuntimeIdentityKey(discoveredModelId: string): string {
   return `discovered-model:${discoveredModelId}`;
@@ -26,12 +36,14 @@ export function legacyExecutionTargetRuntimeIdentityKey(executionTargetId: strin
 function autoDiscoveredCapacityRuntimeKeys(input: {
   discoveredModelId: string;
   executionTargetId?: string | null;
+  endpointId?: string;
 }): string[] {
   const keys: string[] = [];
   if (input.executionTargetId) {
     keys.push(legacyExecutionTargetRuntimeIdentityKey(input.executionTargetId));
   }
   keys.push(discoveredRuntimeIdentityKey(input.discoveredModelId));
+  if (input.endpointId) keys.push(engineProcessRuntimeIdentityKey(input.endpointId));
   return keys;
 }
 
@@ -39,6 +51,7 @@ function isExactAutoDiscoveredRuntimeKey(input: {
   runtimeIdentityKey: string;
   discoveredModelId: string;
   executionTargetId: string;
+  endpointId?: string;
 }): boolean {
   return autoDiscoveredCapacityRuntimeKeys(input).includes(input.runtimeIdentityKey);
 }
@@ -102,6 +115,7 @@ export async function fillNullAutoDiscoveredCapacityLimit(
     discoveredModelId: string;
     executionTargetId?: string | null;
     reportedConcurrency?: number | null;
+    endpointId?: string;
   },
 ): Promise<number> {
   const updated = await tx.inferenceCapacity.updateMany({
@@ -114,6 +128,8 @@ export async function fillNullAutoDiscoveredCapacityLimit(
         in: autoDiscoveredCapacityRuntimeKeys({
           discoveredModelId: input.discoveredModelId,
           executionTargetId: input.executionTargetId,
+          // Shared limits require the complete membership aggregate, never
+          // this singleton seed. Inventory's coordinator owns that refresh.
         }),
       },
     },
@@ -142,6 +158,8 @@ export async function ensureDiscoveredInferenceCapacity(
     upstreamModelId: string;
     reportedConcurrency?: number | null;
     executionTargetId?: string | null;
+    /** Move preflight must not alter an existing destination before validation. */
+    fillExistingLimit?: boolean;
   },
 ): Promise<string> {
   if (input.executionTargetId) {
@@ -155,13 +173,14 @@ export async function ensureDiscoveredInferenceCapacity(
       select: { id: true },
     });
     if (legacy) {
-      await fillNullAutoDiscoveredCapacityLimit(tx, {
-        userId: input.userId,
-        capacityId: legacy.id,
-        discoveredModelId: input.discoveredModelId,
-        executionTargetId: input.executionTargetId,
-        reportedConcurrency: input.reportedConcurrency,
-      });
+      if (input.fillExistingLimit !== false)
+        await fillNullAutoDiscoveredCapacityLimit(tx, {
+          userId: input.userId,
+          capacityId: legacy.id,
+          discoveredModelId: input.discoveredModelId,
+          executionTargetId: input.executionTargetId,
+          reportedConcurrency: input.reportedConcurrency,
+        });
       return legacy.id;
     }
   }
@@ -185,13 +204,14 @@ export async function ensureDiscoveredInferenceCapacity(
     },
     select: { id: true },
   });
-  await fillNullAutoDiscoveredCapacityLimit(tx, {
-    userId: input.userId,
-    capacityId: capacity.id,
-    discoveredModelId: input.discoveredModelId,
-    executionTargetId: input.executionTargetId,
-    reportedConcurrency: input.reportedConcurrency,
-  });
+  if (input.fillExistingLimit !== false)
+    await fillNullAutoDiscoveredCapacityLimit(tx, {
+      userId: input.userId,
+      capacityId: capacity.id,
+      discoveredModelId: input.discoveredModelId,
+      executionTargetId: input.executionTargetId,
+      reportedConcurrency: input.reportedConcurrency,
+    });
   return capacity.id;
 }
 
@@ -225,6 +245,7 @@ export async function linkExecutionTargetCapacity(
       id: input.executionTargetId,
       userId: input.userId,
       inferenceCapacityId: null,
+      capacityAssignmentSource: "AUTO",
     },
     data: { inferenceCapacityId: input.inferenceCapacityId },
   });
@@ -260,6 +281,7 @@ async function attachBackfillTarget(input: {
         kind: true,
         discoveredModelId: true,
         inferenceCapacityId: true,
+        capacityAssignmentSource: true,
       },
     });
     if (
@@ -267,7 +289,8 @@ async function attachBackfillTarget(input: {
       current.userId !== input.userId ||
       current.kind !== "DISCOVERED_MODEL" ||
       current.discoveredModelId !== input.discoveredModelId ||
-      current.inferenceCapacityId
+      current.inferenceCapacityId ||
+      current.capacityAssignmentSource !== "AUTO"
     ) {
       return 0;
     }
@@ -291,6 +314,7 @@ async function fillAttachedAutoCapacityLimit(input: {
   userId: string;
   discoveredModelId: string;
   inferenceCapacityId: string;
+  endpointId?: string;
 }): Promise<number> {
   return prisma.$transaction(async (tx) => {
     // Same fences as attach: owner, then the target's capacity-policy fence
@@ -323,6 +347,7 @@ async function fillAttachedAutoCapacityLimit(input: {
     return fillNullAutoDiscoveredCapacityLimit(tx, {
       userId: current.userId,
       capacityId: input.inferenceCapacityId,
+      endpointId: input.endpointId,
       discoveredModelId: input.discoveredModelId,
       executionTargetId: current.id,
       reportedConcurrency: null,
@@ -346,7 +371,8 @@ async function withCapacityWriteRetries(work: () => Promise<number>): Promise<nu
  * keys are attached. An attached auto capacity (`execution-target:<id>` or
  * `discovered-model:<id>`) whose hard limit is still null and AUTO-sourced is
  * set to the discovered default, because startup has no CLI report. Does not
- * delete rows, does not replace a foreign key that is already set, and does
+ * delete rows; shared engine-process limits wait for the next inventory aggregate.
+ * Does not replace a foreign key that is already set, and does
  * not change a non-null limit, a USER-sourced limit (a USER null is an
  * explicit "unlimited"), or a different runtime key.
  */
@@ -357,6 +383,7 @@ export async function backfillDiscoveredInferenceCapacities(): Promise<{
   const targets = await prisma.executionTarget.findMany({
     where: {
       inferenceCapacityId: null,
+      capacityAssignmentSource: "AUTO",
       kind: "DISCOVERED_MODEL",
       discoveredModelId: { not: null },
     },
@@ -400,10 +427,9 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         is: {
           hardConcurrencyLimit: null,
           hardConcurrencyLimitSource: "AUTO",
-          OR: [
-            { runtimeIdentityKey: { startsWith: "execution-target:" } },
-            { runtimeIdentityKey: { startsWith: "discovered-model:" } },
-          ],
+          OR: AUTO_CAPACITY_RUNTIME_KEY_PREFIXES.map((prefix) => ({
+            runtimeIdentityKey: { startsWith: prefix },
+          })),
         },
       },
     },
@@ -412,6 +438,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
       userId: true,
       discoveredModelId: true,
       inferenceCapacityId: true,
+      DiscoveredModel: { select: { endpointId: true } },
       InferenceCapacity: {
         select: {
           runtimeIdentityKey: true,
@@ -433,6 +460,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         runtimeIdentityKey: capacity.runtimeIdentityKey,
         discoveredModelId,
         executionTargetId: target.id,
+        endpointId: target.DiscoveredModel?.endpointId,
       })
     ) {
       continue;
@@ -443,6 +471,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
         userId: target.userId,
         discoveredModelId,
         inferenceCapacityId: capacityId,
+        endpointId: target.DiscoveredModel?.endpointId,
       }),
     );
   }

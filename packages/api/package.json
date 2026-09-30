@@ -97,6 +97,9 @@
     },
     "./routers/index": {
       "default": "./src/routers/index.ts"
+    },
+    "./lib/engine-process-capacity": {
+      "default": "./src/lib/engine-process-capacity.ts"
     }
   },
   "scripts": {

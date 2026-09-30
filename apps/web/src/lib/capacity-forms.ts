@@ -131,9 +131,17 @@ export const advancedDisclosureProps = {
   triggerClassName: "min-h-11 cursor-pointer py-2 text-sm font-medium",
 } as const;
 
+/** Undefined means untouched; equal values never express a new assignment. */
+export function capacityAttachmentChange(capacityId: string | undefined, currentId: string | null) {
+  return capacityId !== undefined && (capacityId || null) !== currentId
+    ? { inferenceCapacityId: capacityId || null }
+    : {};
+}
+
 export function directPolicyPayload(input: {
   executionTargetId: string;
-  capacityId: string;
+  capacityId?: string;
+  currentCapacityId: string | null;
   priority: string;
   concurrency: string;
   reserved: string;
@@ -147,7 +155,7 @@ export function directPolicyPayload(input: {
 }) {
   return {
     executionTargetId: input.executionTargetId,
-    inferenceCapacityId: input.capacityId || null,
+    ...capacityAttachmentChange(input.capacityId, input.currentCapacityId),
     directPriority: Number(input.priority),
     directConcurrencyLimit:
       (input.concurrencyMode ?? "LIMITED") === "LIMITED" ? Number(input.concurrency) : null,
@@ -199,7 +207,8 @@ export function memberPolicyPayload(input: {
 export function createMemberFollowUps(input: {
   memberId: string;
   executionTargetId: string;
-  capacityId: string;
+  capacityId?: string;
+  currentCapacityId: string | null;
   priority: string;
   reserved: string;
   wait: string;
@@ -215,13 +224,17 @@ export function createMemberFollowUps(input: {
         ceilingMode: "LIMITED",
       }),
     },
-    {
-      kind: "capacity-attachment" as const,
-      input: {
-        executionTargetId: input.executionTargetId,
-        inferenceCapacityId: input.capacityId || null,
-      },
-    },
+    ...(Object.keys(capacityAttachmentChange(input.capacityId, input.currentCapacityId)).length
+      ? [
+          {
+            kind: "capacity-attachment" as const,
+            input: {
+              executionTargetId: input.executionTargetId,
+              ...capacityAttachmentChange(input.capacityId, input.currentCapacityId),
+            },
+          },
+        ]
+      : []),
   ] as const;
 }
 
