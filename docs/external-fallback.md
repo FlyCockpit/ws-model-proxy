@@ -123,7 +123,7 @@ The request goes external only after local routing could not serve it:
   while a cold local member is free. Pre-commit retry rounds keep the original
   external deadline instead of waiting another `externalAfterWaitMs` each;
 - no local member is free for a new conversation because the members with an
-  idle slot hold protected warm sessions (including your own) (see
+  idle slot hold protected warm sessions (including your own; see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
   free: a new `:external` conversation may go external at once while a local
@@ -238,11 +238,15 @@ A session is identified by the session id its routing records carry
 (`cache_affinity_record.sessionId`). A request stamps every record it writes
 with the session it continues (an explicit conversation's own record, else the
 deepest cumulative prefix its history still shares with an earlier turn) or with
-a fresh id, so the session keeps one identity across turns and its newest turn
-sets its age and size. An active lease is tied to its session through the
+a fresh id, so its newest turn sets its age and size. An active lease is tied to its session through the
 admission request (`admission_request.warmSessionIds`, the sessions the request
-continues on any candidate member). Rows written before session ids existed are
-one session each. The records of
+continues on its candidate members; a lease serves only the sessions of its own
+execution target). Rows written before session ids existed are one session each.
+Known limits, handled in #160: an implicit conversation (no conversation id) that
+edits or shortens its history, or changes tools, instructions or request
+parameters between turns, can leave the earlier turn counted as a second session
+until the window ends; and two implicit conversations that open with the same
+message can be counted as one session. The records of
 every pool of the owner on the member count; each session's override comes from
 its own pool (grant, or the owner's percent), each distinct override is its own
 budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`

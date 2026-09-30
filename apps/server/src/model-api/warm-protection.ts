@@ -426,7 +426,7 @@ export async function loadWarmSessions({
     WITH candidate AS (
       SELECT r.id, COALESCE(r."sessionId", r.id) AS "sessionKey",
              r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
-             r."estimatedTokens", t."inferenceCapacityId" AS "capacityId"
+             r."estimatedTokens", r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
        WHERE r."userId" = ${ownerId}
@@ -445,14 +445,15 @@ export async function loadWarmSessions({
       -- its records; the largest estimate among that instant's records, since
       -- every record of a request carries the whole prompt estimate).
       SELECT DISTINCT ON (c."sessionKey")
-             c."sessionKey", c."capacityId", c."tenantUserId", c."poolId", c."userId",
+             c."sessionKey", c."capacityId", c."executionTargetId", c."tenantUserId", c."poolId", c."userId",
              c."lastUsedAt", c."estimatedTokens" AS tokens
         FROM candidate c
        ORDER BY c."sessionKey", c."lastUsedAt" DESC, c."estimatedTokens" DESC
     ),
     served AS (
-      -- Sessions an active lease of the same member is serving right now.
-      SELECT DISTINCT l."capacityId", served_session AS "sessionKey"
+      -- Sessions an active lease of the same capacity AND execution target is
+      -- serving right now (targets sharing a capacity keep separate sessions).
+      SELECT DISTINCT l."capacityId", l."executionTargetId", served_session AS "sessionKey"
         FROM capacity_lease l
         JOIN admission_request a ON a.id = l."admissionRequestId"
         CROSS JOIN LATERAL unnest(a."warmSessionIds") AS served_session
@@ -465,6 +466,7 @@ export async function loadWarmSessions({
              s.tokens::int AS tokens,
              EXISTS (SELECT 1 FROM served v
                       WHERE v."capacityId" = s."capacityId"
+                        AND v."executionTargetId" = s."executionTargetId"
                         AND v."sessionKey" = s."sessionKey") AS "inFlight",
              CASE WHEN s."tenantUserId" = s."userId"
                   THEN p."ownerProtectionPercent"

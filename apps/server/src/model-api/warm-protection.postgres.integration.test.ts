@@ -744,6 +744,8 @@ integration("warm-session protection with real PostgreSQL", () => {
       const capacityA = await capacity("a");
       const capacityB = await capacity("b");
       const targetA = await target("a", capacityA.id);
+      // Same capacity as A: a sibling target's session is not served by A's lease.
+      const targetA2 = await target("a2", capacityA.id);
       const targetB = await target("b", capacityB.id);
       const now = new Date("2026-09-29T12:00:00.000Z");
       const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
@@ -801,6 +803,12 @@ integration("warm-session protection with real PostgreSQL", () => {
           record({ sessionId: "on-other-member", lastUsedAt: ago(33), tokens: 18_000 }),
           record({ sessionId: "idle", lastUsedAt: ago(34), tokens: 19_000 }),
           record({
+            sessionId: "shared-capacity-sibling",
+            lastUsedAt: ago(36),
+            tokens: 13_000,
+            targetId: targetA2.id,
+          }),
+          record({
             sessionId: "b-only",
             lastUsedAt: ago(35),
             tokens: 14_000,
@@ -855,7 +863,13 @@ integration("warm-session protection with real PostgreSQL", () => {
           },
         });
       };
-      await lease({ capacityId: capacityA.id, targetId: targetA.id, warmSessionIds: ["busy"] });
+      // The request matched a session on each target of the capacity but its
+      // lease serves target A only: the sibling target's session stays idle.
+      await lease({
+        capacityId: capacityA.id,
+        targetId: targetA.id,
+        warmSessionIds: ["busy", "shared-capacity-sibling"],
+      });
       await lease({
         capacityId: capacityA.id,
         targetId: targetA.id,
@@ -894,6 +908,8 @@ integration("warm-session protection with real PostgreSQL", () => {
         { age: 32, tokens: 17_000, inFlight: false },
         { age: 33, tokens: 18_000, inFlight: false },
         { age: 34, tokens: 19_000, inFlight: false },
+        // Named by A's lease but living on a sibling target of the capacity.
+        { age: 36, tokens: 13_000, inFlight: false },
         // Rows from before session ids existed: one session each.
         { age: 40, tokens: 9_000, inFlight: false },
         { age: 40, tokens: 9_500, inFlight: false },

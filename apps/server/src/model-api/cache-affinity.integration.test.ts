@@ -209,7 +209,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     expect(runtimeIsolated.conversationMatches[changedRuntime.executionTargetId]).toBe(false);
   });
 
-  it("keeps one warm-session id across edited and shortened history and changed parameters", async () => {
+  it("keeps one warm-session id for an explicit conversation across edited and shortened history and changed parameters", async () => {
     if (!db) return;
     const row = await fixture();
     const base = {
