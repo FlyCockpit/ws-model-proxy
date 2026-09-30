@@ -231,15 +231,18 @@ NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slo
 unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
 (b2) overwrite rename's SOURCE name is vacant from its initial capture until the
 operation ends. A concurrent create remains there on success; if it prevents a
-restore, it is kept and reported with `uncertain_outcome`. (c) exchange-less
-filesystems (for example NFS, WSL2 `/mnt/c`, FAT, most FUSE) retain the pre-existing
-plain-rename replace race: a save by another process that lands after the final
-etag re-check and before the rename is overwritten (this replaces, it does not
-retain; it is the same behavior as before recovery existed, and is the one window
-where a replace cannot keep a concurrent write); overwrite rename
+restore, it is kept and reported with `uncertain_outcome`. (c) filesystems (or Unix platforms) without atomic exchange
+(commonly network and some FUSE filesystems; every Unix other than Linux and macOS)
+keep the pre-existing plain-rename replace: a save by another process that lands
+between the re-check's name check (before its etag read) and the rename is
+overwritten. This replaces rather than retains. Independently of the filesystem, an
+in-place write into the original file after the etag read is lost, because the etag
+only proves content up to that read. On such filesystems overwrite rename
 restores its source and returns `unsupported` (or `uncertain_outcome` if restoration
 cannot settle). (d) a crash leaves `.wsmp-recover-*`, including a partial replace
-temp, or both links; (e) unheld objects are never deleted and remain reported in recovery. Public
+temp, or both links; (e) unheld objects are never deleted and remain reported in recovery;
+(f) on NFS a file that another process still holds open keeps a `.nfs*` entry in the
+recovery directory after its unlink, so the directory is retained and listed in `recovered`. Public
 compensation names are never unlinked on an earlier stat's authority.
 
 **Case-only renames.** `rename` with `overwrite` refuses a destination that is the same

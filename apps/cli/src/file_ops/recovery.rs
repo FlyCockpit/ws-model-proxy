@@ -5,8 +5,9 @@
 //! vacates and verifies the source before exchanging its private slot with the
 //! destination. Each slot records its origin dirfd and name; restore accepts no
 //! free-form target. A proven moved object may reclaim its recorded pre-move
-//! origin, while the newest foreign write returns to its captured origin.
-//! Every disposal
+//! origin. For edit, write and overwrite rename the newest foreign write returns
+//! to its captured origin on undo (plain rename verification and exclusive-create
+//! cleanup instead keep a foreign object in recovery and report it). Every disposal
 //! requires a held fd: a pathname's dev+ino snapshot cannot prove ownership.
 //! Unsettled operations return uncertain_outcome; successful operations may
 //! report recovered paths. Retained locations are logged; recovery is manual
@@ -27,11 +28,19 @@
 //! (b2) overwrite rename's source is vacant between its initial capture and the
 //! operation's end. A concurrent create stays at source on success; when it
 //! blocks a restore, it is kept and reported with uncertain_outcome.
-//! (c) exchange-less filesystems retain the pre-existing cross-directory plain-rename
-//! replace race (a save landing after the final re-check is overwritten: the one
-//! window where a replace cannot keep a concurrent write); overwrite rename restores the vacated source and returns Unsupported.
+//! (c) filesystems (or Unix platforms) without atomic exchange keep the pre-existing
+//! cross-directory plain-rename replace: a save by another process that lands
+//! between the re-check's name check (before its etag read) and the rename is
+//! overwritten. This replaces rather than retains. Independently of the
+//! filesystem, an in-place write into the original file after the etag read is
+//! lost, because the etag only ever proves content up to that read. Overwrite
+//! rename on such filesystems restores the vacated source and returns Unsupported.
+//! Closing (c) would need a vacate-first publish (see the issue tracker).
 //! (d) a crash leaves `.wsmp-recover-*` (including a partial replace tmp) or both links.
 //! (e) unheld objects are never deleted; they remain reported in recovery.
+//! (f) on NFS a file that ANOTHER process still holds open keeps a `.nfs*` entry in
+//! the recovery directory after its unlink: the directory is then retained and
+//! reported in `recovered` (nothing is lost; remove it by hand).
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, OwnedFd};

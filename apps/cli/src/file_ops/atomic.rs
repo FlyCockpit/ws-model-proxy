@@ -13,7 +13,9 @@
 //!    dispose our proven temp and restore the displaced object, or restore the
 //!    newest external write and keep the older object with uncertain_outcome;
 //! 7. if exchange is unsupported, plain cross-directory rename `R/tmp -> name`
-//!    retains the documented replace race; then rmdir R and fsync the parent;
+//!    retains the documented replace race. The parent directory is fsynced after
+//!    the commit and R is removed last (an unreported empty R after a power loss is
+//!    harmless);
 //! 8. precommit failure disposes the already-private temp by its held fd,
 //!    without capturing any public name. A crash leaves a discoverable R/tmp.
 //!
@@ -26,7 +28,8 @@
 //! vacant during undo, so concurrent creates prevent NOREPLACE restoration;
 //! (b2) overwrite rename's source is vacant from capture through operation end,
 //! and a concurrent create is kept and reported when it blocks restoration;
-//! (c) exchange-less replace's cross-directory plain-rename race; (d) crash
+//! (c) exchange-less replace's cross-directory plain-rename race (window exact
+//! in `recovery`); (d) crash
 //! residue in `.wsmp-recover-*` (including replace's partial tmp) or both links;
 //! (e) unheld objects are never deleted. See `recovery` for restore fallbacks,
 //! manual recovery and bounds.
