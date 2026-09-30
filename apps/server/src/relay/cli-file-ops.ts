@@ -180,6 +180,12 @@ type FileAudit = {
   etagBefore: string | null;
   bytes: number | null;
   startedAt: Date;
+  /**
+   * The admission verdict resolved `cliDeviceId` to one of the caller's own
+   * devices. Before that the id is caller-supplied text, so the row stores
+   * {@link CLI_AGENT_ACTION_UNKNOWN_DEVICE} instead (as the command audit does).
+   */
+  deviceVerified: boolean;
   /** The op was registered: `settle` records it. */
   registered: boolean;
   recorded: boolean;
@@ -213,6 +219,7 @@ function newFileAudit(input: RunFileOpInput): FileAudit {
     etagBefore: stringField(input.args, "expectedEtag"),
     bytes: input.op === "write" && input.body ? input.body.byteLength : null,
     startedAt: new Date(),
+    deviceVerified: false,
     registered: false,
     recorded: false,
   };
@@ -228,9 +235,6 @@ const CANCELLED_CODES: ReadonlySet<string> = new Set([
   "feature_disabled",
   "supervised_only",
 ]);
-
-/** Refusals before an op is verified against the caller's own device. */
-const UNVERIFIED_DEVICE_CODES: ReadonlySet<string> = new Set(["not_found", "token_inactive"]);
 
 function auditOutcomeOf(
   audit: FileAudit,
@@ -259,10 +263,7 @@ function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
   }
   recordCliAgentAction({
     userId: audit.userId,
-    cliDeviceId:
-      !outcome.ok && UNVERIFIED_DEVICE_CODES.has(outcome.code)
-        ? CLI_AGENT_ACTION_UNKNOWN_DEVICE
-        : audit.cliDeviceId,
+    cliDeviceId: audit.deviceVerified ? audit.cliDeviceId : CLI_AGENT_ACTION_UNKNOWN_DEVICE,
     mcpTokenId: audit.tokenId,
     kind: audit.kind,
     path: audit.path,
@@ -433,6 +434,10 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
     mutating ? "file_write" : "file_read",
   );
   // From the verdict to the dispatch nothing awaits (see `Admission`).
+  // The verdict resolved the device to one of the caller's own unless it said
+  // the device is unknown or the token/owner is out (checked before ownership).
+  audit.deviceVerified =
+    verdict.ok || (verdict.error !== "not_found" && verdict.error !== "token_inactive");
   if (!verdict.ok) {
     return {
       ok: false,

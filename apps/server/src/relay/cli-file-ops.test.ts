@@ -397,14 +397,61 @@ describe("cli file ops", () => {
       });
     });
 
-    it("records a read that timed out or was revoked as cancelled", async () => {
+    it("keeps the verified device on a file not_found and on a mid-flight revoke", async () => {
       const socket = await connect();
-      const revoked = start(socket, "read", readArgs);
+      const missing = start(socket, "read", readArgs);
       await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "not_found" }),
+      );
+      await missing;
+      const revoked = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
       cancelFileOpsForToken("token");
       await revoked;
+      expect(events()).toHaveLength(2);
+      expect(events()[0]).toMatchObject({
+        outcome: "failed",
+        reason: "not_found",
+        cliDeviceId: "desktop",
+      });
+      expect(events()[1]).toMatchObject({
+        outcome: "cancelled",
+        reason: "token_inactive",
+        cliDeviceId: "desktop",
+      });
+    });
+
+    it("stores the unknown device when admission itself throws", async () => {
+      await connect();
+      db.user.findUnique.mockRejectedValue(new Error("db down"));
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "spoofed-device-text", op: "read", args: readArgs }),
+      ).rejects.toThrow("db down");
       expect(events()).toHaveLength(1);
-      expect(events()[0]).toMatchObject({ outcome: "cancelled", reason: "token_inactive" });
+      expect(events()[0]).toMatchObject({ cliDeviceId: "unknown", reason: "io_error" });
+    });
+
+    it("records a read that timed out or lost its session as cancelled", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const socket = await connect();
+      const timedOut = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await flush();
+      await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS);
+      await timedOut;
+      const lost = runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs });
+      await flush();
+      await relaySessionManager.removeSession(socket);
+      await lost;
+      expect(events()).toHaveLength(2);
+      expect(events()[0]).toMatchObject({ outcome: "cancelled", reason: "timeout" });
+      expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "offline" });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {
