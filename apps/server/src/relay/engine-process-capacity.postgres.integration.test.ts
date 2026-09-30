@@ -714,6 +714,7 @@ integration("engine process capacity lifecycle", () => {
     { choice: "detach", ownerChange: false },
     { choice: "stale-after", ownerChange: false },
     { choice: "superseded-null", ownerChange: false },
+    { choice: "move-then-policy", ownerChange: true },
     { choice: "auto", ownerChange: true },
     { choice: "same-auto", ownerChange: false },
     { choice: "priority-only", ownerChange: false },
@@ -728,7 +729,10 @@ integration("engine process capacity lifecycle", () => {
       const chosen =
         choice === "detach"
           ? null
-          : choice === "auto" || choice === "missing-before" || choice === "superseded-null"
+          : choice === "auto" ||
+              choice === "missing-before" ||
+              choice === "superseded-null" ||
+              choice === "move-then-policy"
             ? b.inferenceCapacityId
             : a.inferenceCapacityId;
       // Simulate adding the new column to old rows: AUTO default, but the
@@ -753,6 +757,22 @@ integration("engine process capacity lifecycle", () => {
               : { inferenceCapacityId: choice === "stale-after" ? b.inferenceCapacityId : chosen },
         },
       });
+      if (choice === "move-then-policy") {
+        // A later policy-only save that re-sends the same capacity is not a change and must
+        // not hide the earlier real move.
+        await fixture.capacityAuditEvent.create({
+          data: {
+            userId: user.id,
+            actorUserId: user.id,
+            action: "UPDATE_POLICY",
+            resourceType: "EXECUTION_TARGET",
+            resourceId: a.id,
+            before: { inferenceCapacityId: chosen },
+            after: { inferenceCapacityId: chosen, directPriority: 20 },
+            createdAt: new Date(Date.now() + 60_000),
+          },
+        });
+      }
       if (choice === "superseded-null") {
         // A later legacy "Not attached" save superseded the assignment; inventory re-attached it.
         await fixture.capacityAuditEvent.create({
