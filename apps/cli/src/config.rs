@@ -88,14 +88,6 @@ pub(crate) fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
         roots.len() <= MAX_FILE_ROOTS,
         "at most {MAX_FILE_ROOTS} file roots are allowed"
     );
-    let serialized: usize = roots
-        .iter()
-        .map(|root| serde_json::to_string(root).map_or(usize::MAX, |json| json.len() + 1))
-        .fold(0, usize::saturating_add);
-    anyhow::ensure!(
-        serialized <= MAX_FILE_ROOTS_SERIALIZED_BYTES,
-        "the file roots are too long in total (at most {MAX_FILE_ROOTS_SERIALIZED_BYTES} bytes once serialized, control characters counting as escapes)"
-    );
     let mut seen = std::collections::HashSet::new();
     for root in roots {
         let text = root.to_str().context("file root is not UTF-8")?;
@@ -111,6 +103,15 @@ pub(crate) fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
         );
         anyhow::ensure!(seen.insert(root), "duplicate file root");
     }
+    // After the per-root checks, so a non-UTF-8 root reports its own error.
+    let serialized: usize = roots
+        .iter()
+        .map(|root| serde_json::to_string(root).map_or(usize::MAX, |json| json.len() + 1))
+        .fold(0, usize::saturating_add);
+    anyhow::ensure!(
+        serialized <= MAX_FILE_ROOTS_SERIALIZED_BYTES,
+        "the file roots are too long in total (at most {MAX_FILE_ROOTS_SERIALIZED_BYTES} bytes once serialized, control characters counting as escapes)"
+    );
     Ok(())
 }
 
@@ -125,7 +126,7 @@ pub fn validate_file_roots(paths: &[PathBuf], home: Option<&Path>) -> Result<Vec
         paths.len() <= MAX_FILE_ROOTS,
         "at most {MAX_FILE_ROOTS} file roots are allowed"
     );
-    let mut roots = Vec::with_capacity(paths.len());
+    let mut expanded_roots = Vec::with_capacity(paths.len());
     for path in paths {
         let text = path.to_str().context("file root is not UTF-8")?;
         let expanded = if text == "~" {
@@ -140,7 +141,14 @@ pub fn validate_file_roots(paths: &[PathBuf], home: Option<&Path>) -> Result<Vec
             path.clone()
         };
         validate_file_root_shape(std::slice::from_ref(&expanded))?;
-        let physical = std::fs::canonicalize(&expanded).context("file root must exist")?;
+        expanded_roots.push(expanded);
+    }
+    // The bound applies to the list as accepted (before symlinks shrink it) and,
+    // below, to the resolved list that is saved, loaded and sent to the child.
+    validate_file_root_shape(&expanded_roots)?;
+    let mut roots = Vec::with_capacity(expanded_roots.len());
+    for expanded in &expanded_roots {
+        let physical = std::fs::canonicalize(expanded).context("file root must exist")?;
         anyhow::ensure!(physical.is_dir(), "file root must be a directory");
         roots.push(physical);
     }
@@ -2541,5 +2549,43 @@ mod tests {
         validate_file_root_shape(&roots).expect("exactly at the bound");
         roots.last_mut().unwrap().push("c");
         assert!(validate_file_root_shape(&roots).is_err(), "one byte over");
+    }
+
+    /// The aggregate bound also covers the list as accepted (before symlinks
+    /// shrink it) and puts a non-UTF-8 root's own error first.
+    #[cfg(unix)]
+    #[test]
+    fn file_roots_bound_covers_the_expanded_list_and_error_order() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let target = base.join("short");
+        std::fs::create_dir(&target).unwrap();
+        // 17 aliases whose typed names are long (control characters) but resolve short.
+        let mut long_dir = base.clone();
+        for _ in 0..4 {
+            long_dir.push("\u{1}".repeat(200));
+        }
+        std::fs::create_dir_all(&long_dir).unwrap();
+        let aliases: Vec<PathBuf> = (0..17)
+            .map(|n| {
+                let link = long_dir.join(format!("{n}{}", "\u{1}".repeat(200)));
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                link
+            })
+            .collect();
+        let error = validate_file_roots(&aliases, None).expect_err("expanded list over bound");
+        assert!(error.to_string().contains("too long in total"), "{error}");
+        // Within both bounds: ordinary aliases resolve and are accepted.
+        let ordinary = base.join("alias");
+        std::os::unix::fs::symlink(&target, &ordinary).unwrap();
+        assert_eq!(
+            validate_file_roots(&[ordinary], None).unwrap(),
+            vec![target]
+        );
+        // A non-UTF-8 root reports its own error, not the size error.
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
+        let error = validate_file_root_shape(&[bad]).expect_err("non-utf8");
+        assert!(error.to_string().contains("not UTF-8"), "{error}");
     }
 }
