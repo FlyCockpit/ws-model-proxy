@@ -216,6 +216,18 @@ makes restoration fail EEXIST, retaining displaced data with `uncertain_outcome`
 is refused); (d) a crash between steps leaves recovery/staging names without deleting
 data. Public compensation names are never unlinked on an earlier stat's authority.
 
+**Case-only renames.** `rename` with `overwrite` refuses a destination that is the same
+file as the source (`invalid_input`), except a case-only respelling of one directory
+entry (for example `Foo.txt` to `foo.txt` on a case-insensitive macOS volume: same
+directory, one hard link, names equal after case folding), which is done by a plain
+atomic rename that replaces nothing. A real hard-link alias (link count above 1) is
+still refused. The one residual window: a same-user process that creates a second entry
+under the other spelling between the check and the rename can lose that entry.
+
+**Version skew.** `uncertain_outcome` is a new file error code of relay 2.8. Upgrade the
+server before the `wsmp` CLI: a server that predates it treats the CLI's rejection frame
+as malformed and drops the relay session (the retained files stay on disk).
+
 **Limits.** 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
 Operations are never queued and time out after 30 seconds (search and hashing have shorter

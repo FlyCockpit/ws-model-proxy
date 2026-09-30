@@ -31,6 +31,9 @@ use super::exchange::{Primitive, fault, no_replace};
 use super::resolve::Stat;
 use super::{FileOps, Step};
 
+/// Longest path list carried in a result or error detail (server schema bound).
+const MAX_REPORTED: usize = 4;
+
 pub(super) struct Slot(OsString);
 
 pub(super) struct RecoveryDir {
@@ -236,8 +239,11 @@ impl RecoveryDir {
                 tracing::warn!(recovery = %self.path.display(), kept = ?self.kept, "file recovery retained; manual recovery required");
             }
         }
+        // The wire schema bounds the list (`recovered` <= 4); the warning above
+        // names every retained path, so nothing is lost by the clamp.
         self.kept
             .iter()
+            .take(MAX_REPORTED)
             .map(|p| p.to_string_lossy().into_owned())
             .collect()
     }
@@ -248,9 +254,7 @@ impl RecoveryDir {
             ErrorCode::UncertainOutcome,
             "file outcome is uncertain; inspect recovery",
         )
-        .with_detail(
-            json!({ "recovery": self.path.to_string_lossy(), "kept": kept.into_iter().take(4).collect::<Vec<_>>() }),
-        )
+        .with_detail(json!({ "recovery": self.path.to_string_lossy(), "kept": kept }))
     }
 
     pub(super) fn settled(&self) -> bool {

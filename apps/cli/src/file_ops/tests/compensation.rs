@@ -733,7 +733,7 @@ fn compensation_recovery_dir_is_private_and_holds_at_most_two_objects() {
     use crate::file_ops::recovery::RecoveryDir;
 
     let fx = Fx::new();
-    for name in ["a", "b", "c"] {
+    for name in ["a", "b", "c", "d", "e"] {
         fx.put(name, name);
     }
     let root = open(
@@ -768,7 +768,87 @@ fn compensation_recovery_dir_is_private_and_holds_at_most_two_objects() {
     );
     assert_eq!(fx.get("c"), "c");
     assert!(!recovery.settled());
+    for name in ["d", "e"] {
+        assert!(
+            recovery
+                .capture(&root, name.as_ref(), &fx.root.join(name))
+                .is_none()
+        );
+    }
+    // five retained locations (two slots, three refused names): the reported list
+    // is clamped to the wire bound, the first entries being the slots
     let kept = recovery.finish();
-    assert!(kept.iter().any(|p| p.ends_with("c")), "{kept:?}");
+    assert_eq!(kept.len(), 4, "{kept:?}");
+    assert!(
+        kept[0].ends_with("slot-1") && kept[1].ends_with("slot-2"),
+        "{kept:?}"
+    );
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+}
+
+thread_local! {
+    static LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Routes the process-wide test subscriber's output to the CALLING thread's buffer, so
+/// parallel tests never see each other's lines (a scoped `with_default` subscriber
+/// is unreliable here: other threads hit these callsites first with none installed,
+/// and tracing caches that "disabled" interest).
+struct ThreadLog;
+impl std::io::Write for ThreadLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        LOG.with(|log| log.borrow_mut().extend_from_slice(bytes));
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
+    type Writer = ThreadLog;
+    fn make_writer(&'a self) -> ThreadLog {
+        ThreadLog
+    }
+}
+
+/// Retained recovery locations reach the daemon log, on the success path (only
+/// the cleanup failed) and on the uncertain-outcome path.
+#[test]
+fn compensation_retention_is_logged_with_the_recovery_paths() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLog)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("no other test installs one");
+    });
+    for op in OPS {
+        for retained_by_error in [false, true] {
+            let fx = Fx::new();
+            let etag = op.prepare(&fx);
+            LOG.with(|log| log.borrow_mut().clear());
+            let primitive = if retained_by_error {
+                Primitive::Capture
+            } else {
+                Primitive::Unlink
+            };
+            let _scope = FaultScope::new(&[(primitive, 1, Errno::EIO)]);
+            let result = op.run(&fx, &etag);
+            let kept = if retained_by_error {
+                uncertain(&result.unwrap_err())
+            } else {
+                paths(&result.unwrap()["recovered"])
+            };
+            let log = LOG.with(|log| String::from_utf8(log.borrow().clone()).unwrap());
+            assert!(log.contains("WARN"), "{op:?}: {log}");
+            assert!(log.contains("file recovery retained"), "{op:?}: {log}");
+            for path in &kept {
+                assert!(
+                    log.contains(path.to_string_lossy().as_ref()),
+                    "{op:?}: the log names {path:?}: {log}"
+                );
+            }
+        }
+    }
 }
