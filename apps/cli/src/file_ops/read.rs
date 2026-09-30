@@ -360,7 +360,7 @@ pub(crate) fn assemble(
         } else {
             String::new()
         };
-        let separator = usize::from(!out.is_empty());
+        let separator = usize::from(emitted > 0);
         if out.len() + separator + prefix.len() + slice.len() > opts.max_bytes {
             if emitted == 0 {
                 let room = opts.max_bytes.saturating_sub(prefix.len());

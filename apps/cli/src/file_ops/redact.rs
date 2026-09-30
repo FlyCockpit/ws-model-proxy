@@ -761,7 +761,7 @@ impl LineMasker {
             let kinds = indent_kinds(line);
             self.blocks.retain(|block| {
                 block.indent < indent
-                    || mixed_indent(block.ws, kinds)
+                    || (indent > 0 && mixed_indent(block.ws, kinds))
                     || Some(block.opener) == self.token_at
             });
             masked_by = self
@@ -1326,6 +1326,16 @@ mod tests {
                 "folded with keep",
                 "signing_key: >+2\n  a\n  probe-b\nnext: 1\n",
                 "probe-b",
+            ),
+            (
+                "gnu style mixed indent ends at column 0",
+                "\t    x_key: 1\n\t      probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "nested mixed-kind token lines of equal width",
+                "    a_key:\n        probe-q0\n\t\t\t\tb_key: x\n\t\tprobe-q1\nnext: 1\n",
+                "probe-q1",
             ),
             ("tabs", "x_key:\n\ta\n\tprobe-b\nnext: 1\n", "probe-b"),
             (

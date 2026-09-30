@@ -90,6 +90,14 @@ fn window_parameter_table() {
 }
 
 #[test]
+fn unnumbered_window_keeps_leading_blank_lines_aligned_with_start_line() {
+    let fx = Fx::new();
+    fx.put("g.txt", "one\n\n\nfour\nfive\n".to_string());
+    let r = fx.read_with(json!({ "path": fx.p("g.txt"), "startLine": 2, "lineNumbers": false }));
+    assert!(r.text.starts_with("\n\nfour\nfive"), "{:?}", r.text);
+}
+
+#[test]
 fn byte_cap_stops_at_a_line_boundary_with_next_call_hint() {
     let fx = Fx::new();
     fx.put("f.txt", numbered(1000));
