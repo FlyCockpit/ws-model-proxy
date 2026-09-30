@@ -17,6 +17,8 @@ pub mod display_escape;
 pub mod engine;
 pub mod exit;
 pub mod hostname;
+#[cfg(windows)]
+mod job_tree;
 pub mod logging;
 pub mod media;
 pub mod metric_sources;
@@ -38,3 +40,7 @@ pub mod terminal_identity;
 pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;
+
+#[cfg(all(test, windows))]
+#[path = "../tests/support/windows_tree.rs"]
+mod windows_test_tree;
