@@ -44,9 +44,10 @@
 //! stdout itself (non-blocking, polled), so no thread or descriptor outlives
 //! a run; a helper that left the group holding the pipe cannot leak either.
 //!
-//! Windows has no process groups: the tree is ended with `taskkill /T` while
-//! the direct child (`cmd`) is still alive. Helpers that outlive an already
-//! exited root cannot be found (no job objects without a new dependency).
+//! Windows assigns each suspended child to a job object before it can run.
+//! Terminating the job kills the whole tree, including detached helpers and
+//! helpers whose root already exited. Owner drop also terminates leftovers,
+//! and closing the last job handle kills the tree even on abrupt CLI exit.
 //!
 //! # Daemon exit
 //! Each live run's process group is in a process-wide registry.
@@ -57,11 +58,18 @@
 //! mid-spawn (each kills its own group at registration), so an exiting daemon does not orphan the group of
 //! a command that was running. A panic in a release build (which aborts)
 //! ends the runs in flight first ([`kill_all_active_for_panic`], installed by
-//! `main`). `SIGKILL` of the daemon itself cannot be caught and can leave a
-//! command running until it exits by itself.
+//! `main`). On Unix, `SIGKILL` of the daemon itself cannot be caught and can
+//! leave a command running until it exits by itself.
 
+#[cfg(windows)]
+use crate::job_tree::{Child, JobTree};
+#[cfg(windows)]
+use std::collections::BTreeMap;
+#[cfg(not(windows))]
 use std::collections::BTreeSet;
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -138,10 +146,15 @@ impl Drop for Permit {
     }
 }
 
+#[cfg(windows)]
+type Groups = BTreeMap<u32, JobTree>;
+#[cfg(not(windows))]
+type Groups = BTreeSet<u32>;
+
 #[derive(Default)]
 struct Registry {
     closed: bool,
-    groups: BTreeSet<u32>,
+    groups: Groups,
     /// Runs between the shutdown check and their registration: shutdown
     /// waits for them, so none can start a command it never signals.
     spawning: usize,
@@ -149,7 +162,7 @@ struct Registry {
 
 static ACTIVE: Mutex<Registry> = Mutex::new(Registry {
     closed: false,
-    groups: BTreeSet::new(),
+    groups: Groups::new(),
     spawning: 0,
 });
 
@@ -185,21 +198,18 @@ fn spawn_failed() {
 /// Record a live run. `false` when the process began exiting after
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
+#[cfg(unix)]
 fn register(pid: u32) -> bool {
     register_in(&ACTIVE, pid)
 }
 
+#[cfg(unix)]
 fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
     let mut registry = lock_registry(shared);
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
         kill_run(pid);
-        #[cfg(not(unix))]
-        {
-            drop(registry);
-            kill_group(pid);
-        }
         return false;
     }
     registry.groups.insert(pid);
@@ -208,6 +218,57 @@ fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
 
 fn unregister(pid: u32) {
     registry().groups.remove(&pid);
+}
+
+/// Ownership: the run owns the child and the registry owns a job handle clone
+/// until `finish`. Lock order on Windows: release the registry before touching
+/// a job. No job operation acquires the registry or budget lock. Job operations
+/// hold their lock only for nonblocking OS calls, never for a wait or pipe read.
+#[cfg(windows)]
+fn register_job_in(shared: &'static Mutex<Registry>, pid: u32, job: JobTree) -> bool {
+    let mut registry = lock_registry(shared);
+    if registry.closed {
+        drop(registry);
+        kill_group(&job);
+        // Keep this run counted as spawning until its job has been signalled.
+        lock_registry(shared).spawning -= 1;
+        return false;
+    }
+    registry.groups.insert(pid, job);
+    registry.spawning -= 1;
+    true
+}
+
+/// Shutdown and panic share one deadline for lock retries across every job.
+/// A stuck lock cannot block shutdown, nor prevent signalling accessible jobs.
+#[cfg(windows)]
+fn close_jobs_in(shared: &'static Mutex<Registry>, until: Instant) -> bool {
+    let Ok(mut registry) = crate::job_tree::lock_until(shared, until) else {
+        return false;
+    };
+    registry.closed = true;
+    // Retain handles until each owner unregisters: shutdown never relies on a
+    // recycled PID, and panic/abort still closes every live kernel job handle.
+    let jobs = registry.groups.values().cloned().collect::<Vec<_>>();
+    let spawning = registry.spawning;
+    drop(registry);
+    for job in jobs {
+        let _ = job.terminate_until(until);
+    }
+    spawning == 0
+}
+
+#[cfg(windows)]
+fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
+    close_jobs_in(shared, Instant::now() + Duration::from_millis(200));
+}
+
+#[cfg(windows)]
+fn kill_all_in(shared: &'static Mutex<Registry>) {
+    let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+    while !close_jobs_in(shared, until) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Runs in flight (registered and not yet finished).
@@ -231,6 +292,7 @@ pub fn kill_all_active_for_panic() {
     kill_all_for_panic_in(&ACTIVE);
 }
 
+#[cfg(unix)]
 fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     let mut registry = match shared.try_lock() {
         Ok(registry) => registry,
@@ -256,15 +318,9 @@ fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     for pid in groups {
         kill_run(pid);
     }
-    #[cfg(not(unix))]
-    {
-        drop(registry);
-        for pid in groups {
-            kill_group(pid);
-        }
-    }
 }
 
+#[cfg(unix)]
 fn kill_all_in(shared: &'static Mutex<Registry>) {
     {
         let mut registry = lock_registry(shared);
@@ -276,14 +332,6 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
         #[cfg(unix)]
         for pid in groups {
             kill_run(pid);
-        }
-        // Elsewhere `taskkill` blocks: signal after unlocking.
-        #[cfg(not(unix))]
-        {
-            drop(registry);
-            for pid in groups {
-                kill_group(pid);
-            }
         }
     }
     // A run past its shutdown check but not yet registered is killed by its
@@ -330,6 +378,7 @@ pub fn run(
         // Its own group, so the deadline kills everything it started.
         command.process_group(0);
     }
+    #[cfg(not(windows))]
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -337,8 +386,20 @@ pub fn run(
             return Err(RunError::Spawn);
         }
     };
+    #[cfg(windows)]
+    let mut child = match crate::job_tree::spawn(command) {
+        Ok(child) => child,
+        Err(_) => {
+            spawn_failed();
+            return Err(RunError::Spawn);
+        }
+    };
     let pid = child.id();
-    if !register(pid) {
+    #[cfg(not(windows))]
+    let registered = register(pid);
+    #[cfg(windows)]
+    let registered = register_job_in(&ACTIVE, pid, child.job());
+    if !registered {
         finish(child, Instant::now(), permit, &|| true);
         return Err(RunError::Cancelled);
     }
@@ -461,7 +522,7 @@ fn collect(
 
 /// Windows has no pollable pipe here: a reader thread owns the pipe and the
 /// result arrives on a channel, so a leaked pipe never blocks the caller
-/// (`taskkill /T` at the deadline ends the tree that holds it).
+/// (terminating the Windows job at the deadline closes every writer).
 #[cfg(not(unix))]
 fn collect(
     stdout: ChildStdout,
@@ -613,24 +674,9 @@ fn kill_run(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_group(pid: u32) {
-    // No process groups: end the whole tree, bounded so a stuck `taskkill`
-    // cannot stall the deadline or shutdown. Needs the root alive (a tree
-    // whose root already exited cannot be found; see the module docs).
-    let Ok(mut taskkill) = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    if reap_within(&mut taskkill, Instant::now() + REAP_GRACE).is_none() {
-        let _ = taskkill.kill();
-        let _ = taskkill.wait();
-    }
+#[cfg(windows)]
+fn kill_group(job: &JobTree) {
+    let _ = job.terminate();
 }
 
 /// Kill everything the run started: the group, then the direct child itself
@@ -642,13 +688,10 @@ fn kill_group_or_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// The tree first (`taskkill /T` needs the root alive), then the child.
-#[cfg(not(unix))]
+/// The job survives root exit, so termination always covers its descendants.
+#[cfg(windows)]
 fn kill_group_or_child(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        kill_group(child.id());
-        let _ = child.kill();
-    }
+    kill_group(&child.job());
 }
 
 /// Poll until the child has exited, `until` passes or the caller cancels,
@@ -687,6 +730,92 @@ fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn fresh_job_registry() -> &'static Mutex<Registry> {
+        Box::leak(Box::new(Mutex::new(Registry::default())))
+    }
+
+    #[cfg(windows)]
+    fn job_tree(tree: &crate::windows_test_tree::Tree) -> Child {
+        let mut command = Command::new("cmd");
+        command.args(tree.command("hang"));
+        crate::job_tree::spawn(command).expect("job spawn")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_and_panic_terminate_registered_jobs_from_another_thread() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        for panic_hook in [false, true] {
+            let tree = Tree::new();
+            let shared = fresh_job_registry();
+            assert!(begin_spawn_in(shared));
+            let child = job_tree(&tree);
+            let grandchild = tree.read_marker().parse().expect("grandchild PID");
+            assert!(register_job_in(shared, child.id(), child.job()));
+            thread::spawn(move || {
+                if panic_hook {
+                    kill_all_for_panic_in(shared);
+                } else {
+                    kill_all_in(shared);
+                }
+            })
+            .join()
+            .expect("shutdown thread");
+            assert_dead(grandchild);
+            assert_dead(child.id());
+            assert!(!begin_spawn_in(shared));
+            // The owner is still live: its Drop did not cause the tree kill.
+            drop(child);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_waits_for_and_kills_a_run_mid_spawn() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        let tree = Tree::new();
+        let shared = fresh_job_registry();
+        assert!(begin_spawn_in(shared));
+        let child = job_tree(&tree);
+        let grandchild = tree.read_marker().parse().expect("grandchild PID");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let exiting = thread::spawn(move || {
+            kill_all_in(shared);
+            done_tx.send(()).expect("shutdown notification");
+        });
+        let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+        while !lock_registry(shared).closed {
+            assert!(Instant::now() < until, "shutdown did not close admission");
+            thread::sleep(REAP_POLL);
+        }
+        assert!(done_rx.try_recv().is_err(), "shutdown missed mid-spawn run");
+        assert!(!register_job_in(shared, child.id(), child.job()));
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown bounded");
+        exiting.join().expect("shutdown thread");
+        assert_dead(grandchild);
+        assert_dead(child.id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_and_panic_never_block_on_a_held_registry_lock() {
+        for panic_hook in [false, true] {
+            let shared = fresh_job_registry();
+            let guard = lock_registry(shared);
+            let started = Instant::now();
+            if panic_hook {
+                kill_all_for_panic_in(shared);
+            } else {
+                kill_all_in(shared);
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(guard);
+        }
+    }
 
     fn fresh() -> &'static Mutex<Budget> {
         Box::leak(Box::new(Mutex::new(Budget { held: 0, stuck: 0 })))

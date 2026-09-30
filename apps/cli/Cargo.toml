@@ -111,6 +111,16 @@ filedescriptor = "0.8"
 terminal_size = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+# Watchexec's maintained command-group successor (MSRV 1.87): safe job objects
+# assign suspended children before resuming, without unsafe FFI in this crate.
+# The std wrapper cannot set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; the Tokio
+# wrapper honours KillOnDrop. Its tokio1 feature enables Tokio's process API.
+# We use it synchronously, without a runtime: Tokio 1.53's Windows spawn only
+# wraps std handles, and we call only start_kill/try_wait, never async wait/kill.
+# Pipes become std ChildStdout/ChildStderr via into_owned_handle before reading;
+# that conversion needs no extra Tokio feature. Windows kill-on-drop is also
+# synchronous and does not wait (ChildDropGuard delegates to std Child::kill).
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
 # Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same
 # bounded relay shutdown as SIGINT/SIGTERM on Unix. Unix keeps `sigwait`.
 tokio = { version = "1", features = ["signal"] }
