@@ -1102,6 +1102,34 @@ describe("cli file ops", () => {
     await expect(conflict).resolves.toEqual({ ok: false, code: "no_match" });
   });
 
+  it("keeps uncertain_outcome recovery facts and marks mutations unknown", async () => {
+    const socket = await connect();
+    const detail = {
+      recovery: "/workspace/.wsmp-recover-a1b2c3d4e5",
+      kept: ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"],
+    };
+    for (const op of ["edit", "read"] as const) {
+      const outcome = start(socket, op, op === "edit" ? editArgs : readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "uncertain_outcome",
+          detail,
+        }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "uncertain_outcome",
+        detail,
+        ...(op === "edit" ? { outcome: "unknown" } : {}),
+      });
+      socket.sends.length = 0;
+    }
+  });
+
   it("gives the rate slot back for an op that was never sent", async () => {
     const socket = await connect();
     // A send that throws leaves nothing at the CLI; the slot must not stay spent.

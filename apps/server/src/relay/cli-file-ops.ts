@@ -374,14 +374,23 @@ function rejectionFailure(
   // was made, so the outcome is unknown and the agent must file_stat first.
   // Ops whose cleanup runs after the commit can also fail with `not_found`
   // (the source vanished): for rename and delete that code is ambiguous.
-  // A `replaced` conflict on a mutation can also follow a committed exchange
-  // whose undo failed, so it is not definitive either.
+  // Older CLIs can report a failed exchange undo as a `replaced` conflict.
+  // Keep that conservative mapping; new CLIs report uncertain_outcome and
+  // include the locations needed for manual recovery.
   const replacedConflict = reason === "conflict" && detail?.currentEtag === "replaced";
   if (
     mutating &&
-    (reason === "io_error" || replacedConflict || (ambiguousNotFound && reason === "not_found"))
+    (reason === "io_error" ||
+      reason === "uncertain_outcome" ||
+      replacedConflict ||
+      (ambiguousNotFound && reason === "not_found"))
   ) {
-    return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
+    return cliAnswered({
+      ok: false,
+      code: reason,
+      outcome: "unknown",
+      ...(reason === "uncertain_outcome" && detail ? { detail } : {}),
+    });
   }
   if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
   return cliAnswered({ ok: false, code: reason, ...(detail ? { detail } : {}) });

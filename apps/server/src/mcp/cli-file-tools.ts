@@ -176,6 +176,7 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   setuid: "Refused: the file is setuid or setgid",
   special_file: "Refused: not a regular file or directory",
   io_error: "The file operation failed",
+  uncertain_outcome: "The file outcome is uncertain; inspect recovery",
   timeout: "The file operation timed out",
   cancelled: "The file operation was cancelled",
 };
@@ -368,9 +369,19 @@ const PROJECT_FIELDS: Readonly<Record<FileOp, readonly string[]>> = {
   stat: ["entries"],
   list: ["entries", "count", "more", "resolvedPath"],
   search: ["matches", "files", "count", "scannedFiles", "more"],
-  edit: ["etag", "previousEtag", "added", "removed", "applied", "diff", "hunks", "resolvedPath"],
-  write: ["etag", "size", "created", "added", "removed", "diff", "resolvedPath"],
-  rename: ["etag"],
+  edit: [
+    "etag",
+    "previousEtag",
+    "added",
+    "removed",
+    "applied",
+    "diff",
+    "hunks",
+    "resolvedPath",
+    "recovered",
+  ],
+  write: ["etag", "size", "created", "added", "removed", "diff", "resolvedPath", "recovered"],
+  rename: ["etag", "recovered"],
   mkdir: ["created"],
   delete: ["deleted", "type"],
 };
@@ -434,7 +445,7 @@ export const FILE_ETAG_NOTICE =
   "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, not_found on rename/delete, or conflict meaning the file was swapped during the change), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; the currentEtag of a conflict is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first.';
+  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict meaning the file was swapped during the change), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; the currentEtag of a conflict is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. An uncertain_outcome includes recovery and kept absolute paths: use the shell to inspect and recover them before retrying. Successful edit/write/rename results may include recovered paths for retained cleanup objects. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; recovery is manual and retained objects are never automatically deleted.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";

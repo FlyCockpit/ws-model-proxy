@@ -240,6 +240,11 @@ fn is_etag(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
+/// An absolute recovery path as the server schema accepts it (`recoveryPathSchema`).
+fn is_recovery_path(text: &str) -> bool {
+    text.starts_with('/') && text.len() <= 8192 && !text.contains('\0')
+}
+
 pub fn filter_detail(detail: &Value) -> Option<Value> {
     let object = detail.as_object()?;
     let mut out = Map::new();
@@ -257,11 +262,24 @@ pub fn filter_detail(detail: &Value) -> Option<Value> {
             "lines" => value.as_array().is_some_and(|items| {
                 items.len() <= 5 && items.iter().all(|i| i.as_u64().is_some())
             }),
+            "recovery" => value.as_str().is_some_and(is_recovery_path),
+            "kept" => value.as_array().is_some_and(|items| {
+                items.len() <= 4
+                    && items
+                        .iter()
+                        .all(|i| i.as_str().is_some_and(is_recovery_path))
+            }),
             _ => false,
         };
         if keep {
             out.insert(key.clone(), value.clone());
         }
+    }
+    // The server accepts the recovery facts only as a pair (`uncertain_outcome`
+    // requires both): a lone half is dropped rather than failing the frame.
+    if out.contains_key("recovery") != out.contains_key("kept") {
+        out.remove("recovery");
+        out.remove("kept");
     }
     (!out.is_empty()).then_some(Value::Object(out))
 }
