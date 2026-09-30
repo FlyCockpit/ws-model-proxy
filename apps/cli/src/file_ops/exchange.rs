@@ -5,12 +5,23 @@ use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 
+/// Test seam: make the next exchange on THIS thread fail with an errno, so the
+/// callers' handling of each errno class is exercised on any platform.
+#[cfg(test)]
+thread_local! {
+    pub(super) static INJECTED: std::cell::Cell<Option<Errno>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn exchange(
     dir_from: impl AsFd,
     from: &OsStr,
     dir_to: impl AsFd,
     to: &OsStr,
 ) -> Result<(), Errno> {
+    #[cfg(test)]
+    if let Some(errno) = INJECTED.with(std::cell::Cell::take) {
+        return Err(errno);
+    }
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{RenameFlags, renameat2};

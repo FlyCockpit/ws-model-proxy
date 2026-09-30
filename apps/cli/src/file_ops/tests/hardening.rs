@@ -1431,3 +1431,73 @@ fn staging_names_are_refused_under_every_folded_spelling() {
         assert_eq!(code(r), ErrorCode::PathDenied, "{staged:?}");
     }
 }
+
+// ---- the callers of the exchange treat each errno class as documented ---------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod exchange_callers {
+    use super::*;
+    use crate::file_ops::exchange::INJECTED;
+    use nix::errno::Errno;
+
+    fn inject(errno: Errno) {
+        INJECTED.with(|slot| slot.set(Some(errno)));
+    }
+
+    fn edit(fx: &Fx) -> FileResult<super::super::super::edit::EditResult> {
+        fx.ops.edit(
+            &args(json!({ "path": fx.p("doc.txt"), "edits": [{ "oldText": "original", "newText": "edited" }] })),
+            &fx.cancel,
+        )
+    }
+
+    fn overwrite(fx: &Fx) -> FileResult<super::super::super::mutate::RenameResult> {
+        fx.put("src.txt", "mine");
+        fx.put("dst.txt", "old");
+        let etag = fx.etag("dst.txt");
+        rename(
+            fx,
+            json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+        )
+    }
+
+    #[test]
+    fn a_replace_falls_back_to_the_checked_rename_only_for_unsupported_errors() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            let fx = Fx::new();
+            fx.put("doc.txt", "original\n");
+            inject(errno);
+            edit(&fx).unwrap_or_else(|e| panic!("{errno}: {e:?}"));
+            assert_eq!(fx.get("doc.txt"), "edited\n", "{errno}");
+            assert!(fx.leftovers("").is_empty(), "{errno}");
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
+            let fx = Fx::new();
+            fx.put("doc.txt", "original\n");
+            inject(errno);
+            assert!(
+                edit(&fx).is_err(),
+                "{errno} must not fall back to a plain rename"
+            );
+            assert_eq!(fx.get("doc.txt"), "original\n", "{errno}");
+            assert!(fx.leftovers("").is_empty(), "{errno}");
+        }
+    }
+
+    #[test]
+    fn an_overwrite_maps_unsupported_errors_to_unsupported_and_others_to_their_own_error() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            let fx = Fx::new();
+            inject(errno);
+            assert_eq!(code(overwrite(&fx)), ErrorCode::Unsupported, "{errno}");
+            assert_eq!(fx.get("dst.txt"), "old", "{errno}");
+            assert_eq!(fx.get("src.txt"), "mine", "{errno}");
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
+            let fx = Fx::new();
+            inject(errno);
+            assert_eq!(code(overwrite(&fx)), ErrorCode::IoError, "{errno}");
+            assert_eq!(fx.get("dst.txt"), "old", "{errno}");
+        }
+    }
+}
