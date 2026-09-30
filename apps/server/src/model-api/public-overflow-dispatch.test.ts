@@ -4341,6 +4341,82 @@ describe("OpenRouter owner-paid settlement", () => {
     }
   });
 
+  // Round 3 (#140): the catch path's own conservative settlement. When the
+  // decode-error catch path is parked on a `reconcile(false)` that then
+  // REJECTS while the client cancels during that await, the terminal must
+  // resolve once and the already-cancelled client controller must never be
+  // errored (the settlement failure is not deliverable to a cancelled client).
+  it("settles once and never errors the cancelled client controller when a rejecting reconciliation races a client cancel", async () => {
+    vi.useFakeTimers();
+    const upstream = new Readable({ objectMode: true, read() {} });
+    const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+    const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+    const processErrors: unknown[] = [];
+    const captureError = (error_: unknown) => processErrors.push(error_);
+    process.on("uncaughtException", captureError);
+    process.on("unhandledRejection", captureError);
+    let rejectSettlement!: (reason: unknown) => void;
+    const declined = new Promise<void>((_resolve, reject) => {
+      rejectSettlement = reject;
+    });
+    let clientReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let cancellation: Promise<void> | undefined;
+    try {
+      upstream.push(
+        Buffer.from(
+          'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        ),
+      );
+      const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+      clientReader = result.response.body!.getReader();
+      const firstOutcome = clientReader.read().then(
+        (chunk) => ({ chunk, failure: undefined }),
+        (failure: unknown) => ({ chunk: undefined, failure }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      // Park the catch path's reconcile(false) on a promise that will reject,
+      // then cancel the client while it is pending, then push the malformed
+      // record whose invalid UTF-8 throws out of the decoder.
+      reconcileProviderBudget.mockImplementation(() => declined);
+      upstream.push(
+        Buffer.concat([Buffer.from("data: "), Buffer.from([0xff]), Buffer.from("\n\n")]),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      cancellation = clientReader.cancel("client disconnected on rejecting settlement");
+      rejectSettlement(new Error("budget settlement rejected"));
+      await cancellation.catch(() => undefined);
+      const firstResult = await firstOutcome;
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ observationComplete: false }),
+      );
+      vi.useRealTimers();
+      for (let turn = 0; turn < 3; turn++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(firstResult.failure === undefined || firstResult.failure instanceof Error).toBe(true);
+      const upstreamController = enqueue.mock.contexts[0];
+      expect(upstreamController).toBeDefined();
+      // The rejection is resolved before this gated error, and the cancelled
+      // client controller must never be errored.
+      expect(error.mock.contexts.filter((context) => context !== upstreamController)).toEqual([]);
+      expect(processErrors).toEqual([]);
+    } finally {
+      rejectSettlement(new Error("cleanup"));
+      upstream.pause();
+      upstream.destroy();
+      await cancellation;
+      await clientReader?.cancel().catch(() => undefined);
+      reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+      enqueue.mockRestore();
+      error.mockRestore();
+      process.off("uncaughtException", captureError);
+      process.off("unhandledRejection", captureError);
+      vi.useRealTimers();
+    }
+  });
+
   // Round 2 (#140): the reader-less helper callers. The shared teardown's
   // synchronous pause and always-destroy are the only cleanup on these paths
   // (there is no web reader whose cancel could destroy the source), so a
