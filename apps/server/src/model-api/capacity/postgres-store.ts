@@ -27,6 +27,13 @@ import type {
 
 type Db = typeof prisma;
 
+// Bound Prisma relation assembly and multi-row insert parameter construction.
+// All batches belong to the same fenced transaction and admission snapshot.
+// The lease INSERT binds 13 array parameters plus 3 scalars per statement
+// (arrays travel as one parameter each), so the batch size bounds array length
+// and statement duration, not the bind-parameter count.
+export const ADMISSION_ROW_BATCH_SIZE = 500;
+
 export { isRetryableCapacityTransactionError };
 
 /**
@@ -223,14 +230,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           );
       // Every shared scope fence sorts before every physical-capacity fence,
       // so release/reclaim and acquire take them in the same order (no fence
-      // inversion). KNOWN LIMITATION (pre-existing, carried in from master's
-      // lockCapacityAdmissionResources): `fenceCapacityAdmission` derives the
-      // durable scope set BEFORE it waits on the capacity fence. A scope
-      // fence for a waiter committed while this transaction waits for the
-      // capacity fence therefore cannot be taken afterwards (WMPF2 monotonic
-      // order), so two fill-mode passes on different capacities that share
-      // such a scope can briefly over-admit one lease, bounded by one lease
-      // lifetime. See fenceCapacityAdmission's doc comment.
+      // inversion). fenceCapacityAdmission re-derives the durable scope set
+      // under the capacity fences; growth restarts this transaction within
+      // the bounded retry loop before any row lock or write.
       const capacityIds = [...orderedCapacityIds].sort();
       await fenceCapacityAdmission(tx, capacityIds, candidateScopeFences);
       // The initial graph read only discovers locks for an idempotent retry.
@@ -863,20 +865,38 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     });
     // Time filtering (candidate/request deadlines, the creating and last-chance
     // exceptions) is the planner's job, so it is decided in one place.
-    const queuedWaiters = await tx.capacityWaiter.findMany({
-      where: { capacityId, state: "WAITING", AdmissionRequest: { state: "WAITING" } },
-      include: {
-        AdmissionRequest: {
-          select: {
-            requestId: true,
-            attemptId: true,
-            enqueueSequence: true,
-            deadlineAt: true,
-            metricFailOpen: true,
+    const queuedIds = await tx.capacityWaiter.findMany({
+      where: { capacityId, state: "WAITING" },
+      select: { id: true },
+    });
+    // Bound both the request-state join and Prisma's relation assembly.
+    // An unbounded join can choose a nested-loop plan over the entire queue;
+    // ids first, then small primary-key batches, keep that work bounded.
+    // Rows the plan can grant are stable under the held fences; batches may
+    // use separate READ COMMITTED snapshots, and #persistGrants re-validates winners.
+    const readBatch = (ids: string[]) =>
+      tx.capacityWaiter.findMany({
+        where: { id: { in: ids }, AdmissionRequest: { state: "WAITING" } },
+        include: {
+          AdmissionRequest: {
+            select: {
+              requestId: true,
+              attemptId: true,
+              enqueueSequence: true,
+              deadlineAt: true,
+              metricFailOpen: true,
+            },
           },
         },
-      },
-    });
+      });
+    const queuedWaiters: Awaited<ReturnType<typeof readBatch>> = [];
+    for (let start = 0; start < queuedIds.length; start += ADMISSION_ROW_BATCH_SIZE) {
+      queuedWaiters.push(
+        ...(await readBatch(
+          queuedIds.slice(start, start + ADMISSION_ROW_BATCH_SIZE).map((row) => row.id),
+        )),
+      );
+    }
     // No foreign key keeps the graph behind a waiter (DL-1 design (d)): a
     // candidate whose target, member or pool was deleted, or whose target
     // moved to another capacity, is cancelled here instead of planned.
@@ -1158,7 +1178,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   /**
-   * WRITE phase: persists a plan in a few batched statements.
+   * WRITE phase: persists a plan in bounded batched statements.
    *
    * Winners are serialized at their durable request rows (one sorted
    * `FOR UPDATE` statement, then a re-read): the unique attemptId lease
@@ -1215,29 +1235,46 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       },
     });
     const firstToken = updatedRuntime.nextFencingToken - BigInt(persisted.length);
-    await tx.capacityLease.createMany({
-      data: persisted.map((grant, index) => {
-        const row = rows.get(grant.waiterId);
-        if (!row) throw new Error("Planned grant has no waiter row.");
-        return {
-          userId: row.userId,
-          requestId: row.requestId,
-          attemptId: row.attemptId,
-          admissionRequestId: row.admissionRequestId,
-          capacityId,
-          executionTargetId: row.executionTargetId,
-          poolId: row.poolId,
-          poolMemberId: row.poolMemberId,
-          priority: row.priority,
-          reservationClass: grant.reservationClass,
-          borrowed: grant.borrowed,
-          fencingToken: firstToken + BigInt(index),
-          ownerServerInstance: this.serverInstance,
-          heartbeatAt: now,
-          expiresAt: new Date(now.getTime() + 30_000),
-        };
-      }),
+    const leaseRows = persisted.map((grant, index) => {
+      const row = rows.get(grant.waiterId);
+      if (!row) throw new Error("Planned grant has no waiter row.");
+      return { row, grant, fencingToken: firstToken + BigInt(index) };
     });
+    // One INSERT ... SELECT over unnested arrays: Prisma's createMany spends
+    // seconds of client CPU assembling thousands of rows (about 10 s for 5000
+    // grants), while the database needs about a second. Column defaults
+    // (state ACTIVE, acquiredAt) apply; ids and updatedAt are Prisma-side
+    // defaults, so they are supplied here. The array parameters are bounded by
+    // ADMISSION_ROW_BATCH_SIZE per statement; tokens and order are unchanged.
+    const expiresAt = new Date(now.getTime() + 30_000);
+    for (let start = 0; start < leaseRows.length; start += ADMISSION_ROW_BATCH_SIZE) {
+      const chunk = leaseRows.slice(start, start + ADMISSION_ROW_BATCH_SIZE);
+      await tx.$executeRaw`
+        INSERT INTO capacity_lease (
+          id, "updatedAt", "userId", "admissionRequestId", "requestId", "attemptId",
+          "capacityId", "executionTargetId", "poolId", "poolMemberId", priority,
+          "reservationClass", borrowed, "fencingToken", "ownerServerInstance",
+          "heartbeatAt", "expiresAt")
+        SELECT gen_random_uuid()::text, (${now}::timestamptz AT TIME ZONE 'UTC'), lease.*,
+               (${now}::timestamptz AT TIME ZONE 'UTC'), (${expiresAt}::timestamptz AT TIME ZONE 'UTC')
+          FROM unnest(
+          ${chunk.map((item) => item.row.userId)}::text[],
+          ${chunk.map((item) => item.row.admissionRequestId)}::text[],
+          ${chunk.map((item) => item.row.requestId)}::text[],
+          ${chunk.map((item) => item.row.attemptId)}::text[],
+          ${chunk.map(() => capacityId)}::text[],
+          ${chunk.map((item) => item.row.executionTargetId)}::text[],
+          ${chunk.map((item) => item.row.poolId)}::text[],
+          ${chunk.map((item) => item.row.poolMemberId)}::text[],
+          ${chunk.map((item) => item.row.priority)}::int[],
+          ${chunk.map((item) => item.grant.reservationClass)}::int[],
+          ${chunk.map((item) => item.grant.borrowed)}::boolean[],
+          ${chunk.map((item) => item.fencingToken)}::bigint[],
+          ${chunk.map(() => this.serverInstance)}::text[]
+        ) AS lease("userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
+          "executionTargetId", "poolId", "poolMemberId", priority, "reservationClass",
+          borrowed, "fencingToken", "ownerServerInstance")`;
+    }
     const winnerRequestIds = persisted.map((grant) => grant.admissionRequestId);
     const winnerWaiterIds = persisted.map((grant) => grant.waiterId);
     await tx.admissionRequest.updateMany({

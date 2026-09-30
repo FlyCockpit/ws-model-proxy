@@ -38,7 +38,17 @@ Metric routing rules (S-B part 2):
   (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
   `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
   `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
-  device.
+  device. Each member also carries `engineLoad` (S-D): its override `mode`
+  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
+  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
+  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
+  `full_deferred`, `clear`, `stale`, `none`, `off`).
+- `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
+  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
+  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  load only adds FULL (lease counts stay authoritative), a stale reading is
+  ignored, and when every candidate is FULL a plain-name request is admitted by
+  leases alone. Classified `cost` like the rules.
 - `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
   replaces the whole list (at most 16). A rule is a flat record
   `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
@@ -536,6 +546,40 @@ starts an immediate sweep that will remove artifacts already past eligibility
   scans). Unrelated email/OTP verification records are never swept.
 - Automatic CIMD-client deletion and JWKS key deletion are deliberately
   deferred pending a separately reviewed policy.
+
+## Agent audit log
+
+Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
+`forwarder_cli_supervised_command_start`), including refused ones, is recorded
+in `cli_agent_action_event` (file operations join it with the file tools). The
+log is **metadata only**: who (user, device, token), what (kind, and for a
+command a keyed HMAC-SHA256 of the command text plus its program name — never
+the command text itself), when, and how it ended (`completed`, `refused`, `failed`,
+`cancelled`, `declined`, `expired`, `unknown`, with a stable reason such as
+`exit:1` or `limit`). The reason is a stable machine code: a CLI rejection frame
+(`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
+stored as `rejected`, so CLI-supplied text never reaches the column. File
+content, diffs and command output are never stored, and the command's arguments
+are never stored: the server reduces the command text to its program (the
+first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
+`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
+command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
+flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
+for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
+(fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
+used to check a guessed command; when the key cannot be derived the hash is
+stored as `hmac-sha256:unavailable` and still leaks nothing. Writing an
+event never blocks or fails the operation (a bounded in-process queue, dropped
+and counted when the database cannot keep up). Rows are deleted after **90
+days** by the hourly retention sweep, and with the user on account deletion
+(the deletion drain removes them; a row recorded or skipped after that drain,
+such as the cancellation of a command still running when the account is
+deleted, is removed by the deleted-user purge within its grace period, and the
+hourly retention sweep deletes any event whose user no longer exists).
+The owner reads them under `Dashboard → CLIs → Agent activity` and through
+`forwarder_cli_activity_list` (read scope; visible only to a personal token
+minted with CLI commands, like the other CLI tools).
 
 ## Rate limits (process-local)
 

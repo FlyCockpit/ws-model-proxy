@@ -89,6 +89,44 @@
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
     },
+    "activity": {
+      "title": "Agent activity",
+      "show": "Show agent activity for {{name}}",
+      "hide": "Hide agent activity for {{name}}",
+      "description": "What MCP agents did on this CLI, newest first, kept for 90 days. Only metadata is recorded: file contents and command output are never stored.",
+      "empty": "No agent activity has been recorded for this CLI.",
+      "loadFailed": "Couldn't load agent activity.",
+      "loadMore": "Load more",
+      "loadingMore": "Loading…",
+      "listLabel": "Agent activity on {{name}}",
+      "reason": "Reason: {{value}}",
+      "bytes": "{{value}} bytes",
+      "commandHash": "Command hash {{value}}",
+      "program": "Program: {{value}}",
+      "kinds": {
+        "command": "Command",
+        "supervised_command": "Supervised command",
+        "file_read": "Read file",
+        "file_stat": "File info",
+        "file_list": "List folder",
+        "file_search": "Search files",
+        "file_edit": "Edit file",
+        "file_write": "Write file",
+        "file_rename": "Rename",
+        "file_mkdir": "Create folder",
+        "file_delete": "Delete",
+        "supervised_file_write": "Supervised file write"
+      },
+      "outcomes": {
+        "completed": "Completed",
+        "refused": "Refused",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "declined": "Declined",
+        "expired": "Expired",
+        "unknown": "Unknown"
+      }
+    },
     "serverUpgradeRequired": "Server upgrade required: CLI protocol {{protocol}} is newer than this server supports",
     "serverUpgradeRequiredDetail": "wsmp {{version}} was refused on {{value}} because it is newer than this server. Ask the server administrator to upgrade the server, or install an older wsmp on this machine.",
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
@@ -971,6 +1009,33 @@
       "summary": "Protected share: {{protection}} · Queue priority: {{priority}}",
       "saved": "Routing settings saved.",
       "failed": "Could not save the routing settings."
+    },
+    "engineLoad": {
+      "title": "Live engine load",
+      "description": "Engines that report load (llama.cpp, vLLM, SGLang) can mark a member FULL from what they see right now, including traffic that bypasses the proxy. It only adds to FULL: capacity counts stay authoritative, a stale reading is ignored, and when every member is FULL requests are still served.",
+      "use": "Use engine load",
+      "saved": "Engine load setting saved",
+      "saveFailed": "Could not save the engine load setting.",
+      "badges": {
+        "off": "Engine load ignored",
+        "noSignal": "No engine signal",
+        "stale": "Load stale",
+        "clear": "Engine has room"
+      },
+      "states": {
+        "full_waiting": "Engine FULL: requests waiting",
+        "full_kv": "Engine FULL: KV cache nearly full",
+        "full_slots": "Engine FULL: all slots busy",
+        "full_deferred": "Engine FULL: requests deferred"
+      },
+      "running_one": "{{count}} running",
+      "running_other": "{{count}} running",
+      "waiting_one": "{{count}} waiting",
+      "waiting_other": "{{count}} waiting",
+      "kv": "KV {{value}}",
+      "slots": "{{busy}}/{{total}} slots",
+      "prefixHit": "prefix hits {{value}}",
+      "noReading": "No reading from the engine yet."
     }
   },
   "relay": {
