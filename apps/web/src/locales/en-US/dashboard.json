@@ -59,9 +59,16 @@
       "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:",
       "fileTools": "File tools: read {{read}}, write {{write}}. They follow the MCP command mode.",
       "fileToolAccess": {
-        "headless": "runs headless",
-        "supervised": "not available yet (needs a person)",
-        "off": "off"
+        "read": {
+          "headless": "runs headless",
+          "supervised": "not available yet (needs a read grant)",
+          "off": "off"
+        },
+        "write": {
+          "headless": "runs headless",
+          "supervised": "needs a person to confirm on the CLI",
+          "off": "off"
+        }
       },
       "fileToolsAsRoot": "This CLI allows MCP file tools to run as root (allowFileToolsAsRoot is on). An agent could read or change any file on this machine. Turn it off with wsmp config set-file-tools-as-root off.",
       "effective": "Agents can run now",
@@ -1612,7 +1619,7 @@
     "badge_other": "{{count}} agent requests waiting",
     "noticeTitle_one": "An agent is waiting for you",
     "noticeTitle_other": "{{count}} agent requests are waiting for you",
-    "noticeBody": "{{requester}} asked to run a command on one of your CLIs. Nothing runs until you press Enter on the CLI's confirm screen.",
+    "noticeBody": "{{requester}} asked to run a command or change a file on one of your CLIs. Nothing happens until you press Enter on the CLI's confirm screen.",
     "open": "Open Terminals",
     "title": "Agent request",
     "tabLabel": "Agent request · {{cli}}",
