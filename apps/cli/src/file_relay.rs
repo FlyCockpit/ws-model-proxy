@@ -121,6 +121,27 @@ pub struct FilePermission {
     pub read_grant: bool,
 }
 
+/// Every reason `refuse` can pass: the wire reasons from `admit`/framing plus
+/// the file error codes the pending cap and the root check use. Mirrored by
+/// `FILE_WIRE_REASONS` + `FILE_ERROR_CODES` in
+/// `apps/server/src/relay/file-protocol.ts`; a reason outside that union fails
+/// the server's strict schema, which settles the op as io_error.
+pub const WIRE_REFUSAL_REASONS: [&str; 4] = [
+    "bad_frame",
+    "supervised_only",
+    "grant_disabled",
+    "feature_disabled",
+];
+/// {@link WIRE_REFUSAL_REASONS} plus the two file error codes `refuse` passes.
+pub const REFUSE_REASONS: [&str; 6] = [
+    "bad_frame",
+    "supervised_only",
+    "grant_disabled",
+    "feature_disabled",
+    "unsupported",
+    "limit",
+];
+
 /// Pure admission table. Unknown classes fail closed; writes can never use
 /// the read grant. Root UID consent remains independent of modes/grants.
 pub fn admit(
@@ -548,8 +569,13 @@ impl FileRelay {
     }
 
     fn refuse(&mut self, op_id: &str, summary: &OpSummary, reason: &str) -> Vec<FileFrame> {
-        // Wire-level refusals (`bad_frame`, `supervised_only`,
-        // `feature_disabled`) are not `ErrorCode`s: same log line as `settle`.
+        // Not all of these are `ErrorCode`s; same log line as `settle`.
+        debug_assert!(
+            REFUSE_REASONS.contains(&reason),
+            "refuse() reason {reason:?} is outside REFUSE_REASONS, mirrored by \
+             FILE_WIRE_REASONS/FILE_ERROR_CODES in \
+             apps/server/src/relay/file-protocol.ts"
+        );
         tracing::info!(
             op = %summary.op,
             target = %summary.target,

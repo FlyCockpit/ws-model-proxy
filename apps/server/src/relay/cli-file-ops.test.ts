@@ -729,6 +729,41 @@ describe("cli file ops", () => {
       expect(socket.frames("file.op")).toEqual([]);
     });
 
+    it("refuses every op offline when the live 2.8 session does not run file ops", async () => {
+      // A live 2.8 session whose features lack `fileOps` (the flag is ANDed into
+      // `getLiveCliFeatures().fileOps`, and the server's strict hello schema
+      // pins it true today) must dispatch nothing, even with the grant and the
+      // read switch on. Reached by dropping the recorded feature on the live
+      // session.
+      db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED", { mcpFileRead: true }));
+      const socket = await connect("desktop", "unsupervised", true, true);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "unsupervised",
+        mcpFileRead: true,
+      });
+      const session = (
+        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
+          string,
+          { features: Record<string, unknown> | null }
+        >
+      ).get("desktop");
+      expect(session?.features?.fileOps).toBe(true);
+      if (session) session.features = { ...session.features, fileOps: false };
+      expect(relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop")?.fileOps).toBe(
+        false,
+      );
+      for (const [op, args] of [
+        ["read", readArgs],
+        ["edit", editArgs],
+      ] as const) {
+        await expect(runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op, args })).resolves.toEqual(
+          { ok: false, code: "offline" },
+        );
+      }
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
     it("uses one not-found for an unknown device and another user's device", async () => {
       const unknown = await runFileOp({
         ...OP_TOKEN,
@@ -1024,6 +1059,51 @@ describe("cli file ops", () => {
         }),
       );
       await expect(edit).resolves.toEqual({ ok: false, code: "io_error" });
+    });
+
+    // Every reason the CLI's own dispatcher can put in `file.rejected`:
+    // `grant_disabled`/`feature_disabled`/`supervised_only`/`bad_frame` from
+    // `admit`/`refuse` (apps/cli/src/file_relay.rs) and the file error codes
+    // (apps/cli/src/file_ops/error.rs). A reason outside the wire enum would
+    // fail the schema, settle as io_error and send a pointless file.cancel.
+    it.each([
+      ["grant_disabled", "grant_disabled"],
+      ["feature_disabled", "feature_disabled"],
+      ["supervised_only", "supervised_only"],
+      ["limit", "limit"],
+      ["unsupported", "unsupported"],
+      ["not_found", "not_found"],
+      ["bad_frame", "io_error"],
+    ])(
+      "passes the CLI's %s refusal through as %s without a malformed-frame cancel",
+      async (reason, code) => {
+        const socket = await connect();
+        const outcome = start(socket, "read", readArgs);
+        await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+        await answer(
+          socket,
+          JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+        );
+        await expect(outcome).resolves.toEqual({ ok: false, code });
+        expect(socket.frames("file.cancel")).toEqual([]);
+        expect(socket.closes).toEqual([]);
+      },
+    );
+
+    it.each([
+      ["grant_disabled", "grant_disabled"],
+      ["feature_disabled", "feature_disabled"],
+      ["supervised_only", "supervised_only"],
+    ])("settles a mutation refused with %s as %s, never as unknown", async (reason, code) => {
+      const socket = await connect();
+      const outcome = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(outcome).resolves.toEqual({ ok: false, code });
+      expect(socket.frames("file.cancel")).toEqual([]);
     });
 
     it("drops answers for unknown ops and answers from another session, without closing", async () => {

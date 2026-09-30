@@ -56,6 +56,8 @@ describe("settings locale key parity (en-US / es-MX)", () => {
       "tokens.allowWrite",
       "tokens.allowWriteHelp",
       "tokens.allowCliCommands",
+      "tokens.allowCliFileRead",
+      "tokens.allowCliFileReadHelp",
       "tokens.allowCliCommandsHelp",
       "tokens.allowCliCommandsBadge",
       "tokens.allowCliCommandsNoExpiryWarning",

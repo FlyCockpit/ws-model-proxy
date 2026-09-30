@@ -8,14 +8,18 @@ import { z } from "zod";
  * `apps/cli/src/file_ops` (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
  *
  * Wire shape recap (control frames stay <= 64 KiB):
- * - S->C `file.op {opId, op, args, bodyBytes?}`; write content is NOT in
- *   `args`, it follows as one binary `file.body {opId}` frame (<= 1 MiB).
+ * - S->C `file.op {opId, op, args, bodyBytes?, mode, readGrant}`: `mode` and
+ *   `readGrant` are the admission verdict the CLI re-checks locally; write
+ *   content is NOT in `args`, it follows as one binary `file.body {opId}` frame
+ *   (<= 1 MiB).
  * - S->C `file.cancel {opId}`.
  * - C->S `file.result {opId, op, result, dataField?, bodyBytes?}`: when the
  *   large text field of the result is over 48 KiB the CLI sends it as a binary
  *   `file.data {opId}` frame and leaves that field empty in `result`;
  *   `dataField` names it (`text` | `matches` | `entries` | `diff`).
- * - C->S `file.rejected {opId, reason, detail?}`.
+ * - C->S `file.rejected {opId, reason, detail?}`: `reason` is a file error
+ *   code or one of {@link FILE_WIRE_REASONS} (`bad_frame`, `supervised_only`,
+ *   `grant_disabled`, `feature_disabled`) that the CLI's own admission emits.
  */
 
 export const FILE_INLINE_TEXT_MAX_BYTES = 48 * 1024;
@@ -75,8 +79,18 @@ export const FILE_ERROR_CODES = [
 ] as const;
 export type FileErrorCode = (typeof FILE_ERROR_CODES)[number];
 
-/** Reasons only the CLI dispatcher produces (frame and mode re-checks). */
-export const FILE_WIRE_REASONS = ["bad_frame", "supervised_only", "feature_disabled"] as const;
+/**
+ * Reasons only the CLI dispatcher produces (frame and mode re-checks). `admit`
+ * in `apps/cli/src/file_relay.rs` chooses between `supervised_only`,
+ * `grant_disabled` (the server's grant is off) and `feature_disabled` (the
+ * CLI's own mode is off), so all three travel on the wire.
+ */
+export const FILE_WIRE_REASONS = [
+  "bad_frame",
+  "supervised_only",
+  "grant_disabled",
+  "feature_disabled",
+] as const;
 
 export const fileRejectReasonSchema = z.enum([...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]);
 export type FileRejectReason = z.infer<typeof fileRejectReasonSchema>;

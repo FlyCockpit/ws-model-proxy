@@ -162,7 +162,12 @@ in-band `isError` results with a stable `error.code`: the command codes
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
 `too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
+`cancelled`). The CLI re-checks its own startup mode, read switch and roots on every
+op and can refuse one itself; its `file.rejected` reason is either a file code above or
+one of `bad_frame`, `supervised_only`, `grant_disabled` (the dashboard grant is off) and
+`feature_disabled` (the CLI's `wsmp config set-mcp-commands` mode is off), and the
+server passes that reason through as the same `error.code`. A CLI that speaks an older
+relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup

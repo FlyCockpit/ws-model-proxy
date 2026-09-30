@@ -1116,4 +1116,43 @@ describe("read-only file token consent", () => {
       }),
     );
   });
+
+  it("leaves the file-read checkbox uncheckable at edit for a token that has the flag while MCP is disabled", async () => {
+    // The create dialog is hidden while MCP is disabled, so the narrowing rule
+    // is only observable in edit: a token that already holds the flag may keep
+    // it or narrow it, and unchecking is accepted.
+    state.listPending = false;
+    state.listResult = [
+      { ...token, allowCliFileRead: true, allowCliCommands: false, scopes: ["mcp:read"] },
+    ];
+    const user = userEvent.setup();
+    renderPanel(false);
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    expect(checkbox.hasAttribute("data-disabled")).toBe(false);
+    await user.click(checkbox);
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() => expect(state.updateCalls[0]).toMatchObject({ allowCliFileRead: false }));
+  });
+
+  it("disables the file-read checkbox at edit for a token without the flag while MCP is disabled", async () => {
+    state.listPending = false;
+    state.listResult = [
+      { ...token, allowCliFileRead: false, allowCliCommands: false, scopes: ["mcp:read"] },
+    ];
+    const user = userEvent.setup();
+    renderPanel(false);
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    expect(checkbox.hasAttribute("data-disabled")).toBe(true);
+  });
 });

@@ -2038,6 +2038,29 @@ describe("relay terminal and exec sessions", () => {
     });
   });
 
+  it("reports fileOps live only when the 2.8 hello's own capability says so", async () => {
+    // The live snapshot ANDs `protocolVersion >= 2.8` with the hello's own
+    // `capabilities.fileOps`. A real 2.8 hello pins fileOps true (the strict
+    // schema requires `z.literal(true)`), so the false side is reached by
+    // clearing the recorded feature, exactly as a degraded/absent capability
+    // would leave it.
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    await register(manager, socket);
+    const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: true, mcpFileRead: false });
+
+    const session = (
+      Reflect.get(manager, "sessionsByCliDeviceId") as Map<
+        string,
+        { features: Record<string, unknown> | null }
+      >
+    ).get("cli-device-id");
+    if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
+    // The read switch reports true, yet the capability term withdraws fileOps.
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: false, mcpFileRead: true });
+  });
+
   it("drops file frames for an unknown op and refuses them before registration", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

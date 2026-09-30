@@ -5636,6 +5636,21 @@ describe("setCliDeviceFeatureGrants", () => {
   });
 
   it("grants no file tools when the dashboard grant is off, whatever the CLI reports", async () => {
+    const liveRow = (overrides: Record<string, unknown>) => ({
+      protocolVersion: "2.8",
+      cliVersion: "0.5.0",
+      humanTerminal: false,
+      mcpCommandMode: "unsupervised" as const,
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+      ...overrides,
+    });
     db.cliDevice.findMany.mockResolvedValue([
       {
         id: "cli-id",
@@ -5658,35 +5673,94 @@ describe("setCliDeviceFeatureGrants", () => {
         Endpoints: [],
       },
     ]);
+    // Dashboard grant off: no read tool whatever the live CLI switch reports.
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: {
         ...buildContext(),
         services: {
-          getLiveCliFeatures: () =>
-            new Map([
-              [
-                "cli-id",
-                {
-                  protocolVersion: "2.8",
-                  cliVersion: "0.5.0",
-                  humanTerminal: false,
-                  mcpCommandMode: "unsupervised" as const,
-                  supervisedCommands: true,
-                  terminalSupported: true,
-                  terminalApproval: false,
-                  fileOps: true,
-                  mcpFileRead: false,
-                  fileRootsConfigured: false,
-                  allowFileToolsAsRoot: false,
-                  terminalPublicKey: null,
-                },
-              ],
-            ]),
+          getLiveCliFeatures: () => new Map([["cli-id", liveRow({})]]),
         },
       },
     }).listCliDevices();
     expect(devices[0]?.fileTools).toEqual({ read: "off", write: "off" });
     expect(devices[0]?.allowFileToolsAsRoot).toBe(false);
+  });
+
+  it("withdraws the file-tool claim when the live 2.8 session does not report fileOps", async () => {
+    // `listCliDevices.fileTools` requires `live.fileOps` in addition to the
+    // grant, the CLI's read switch and its roots; a session that reports
+    // fileOps false runs no file op and must be summarized as off.
+    const liveRow = (overrides: Record<string, unknown>) => ({
+      protocolVersion: "2.8",
+      cliVersion: "0.5.0",
+      humanTerminal: false,
+      mcpCommandMode: "supervised" as const,
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+      ...overrides,
+    });
+    const row = (mode: string) => ({
+      id: "cli-id",
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: "desk",
+      name: null,
+      reportedHostname: null,
+      status: "CONNECTED",
+      allowHumanTerminal: false,
+      mcpCommandMode: mode,
+      cliVersion: "0.5.0",
+      relayProtocolVersion: "2.8",
+      reportedHumanTerminal: false,
+      reportedMcpCommandMode: "UNSUPERVISED",
+      reportedTerminalApproval: false,
+      reportedTerminalSupported: true,
+      reportedAllowFileToolsAsRoot: null,
+      mcpFileRead: true,
+      User: { slug: "owner" },
+      Endpoints: [],
+    });
+    const summaryFor = async (mode: string, features: Record<string, unknown>) => {
+      db.cliDevice.findMany.mockResolvedValue([row(mode)]);
+      const liveMode = mode === "SUPERVISED" ? "supervised" : "unsupervised";
+      const devices = await createRouterClient(forwarderManagementRouter, {
+        context: {
+          ...buildContext(),
+          services: {
+            getLiveCliFeatures: () =>
+              new Map([["cli-id", liveRow({ mcpCommandMode: liveMode, ...features })]]),
+          },
+        },
+      }).listCliDevices();
+      return devices[0]!.fileTools;
+    };
+    // Everything live: headless reads, supervised writes.
+    expect(await summaryFor("SUPERVISED", {})).toEqual({ read: "headless", write: "supervised" });
+    // fileOps:false withdraws the whole claim, even with every switch on.
+    expect(await summaryFor("SUPERVISED", { fileOps: false })).toEqual({
+      read: "off",
+      write: "off",
+    });
+    // The CLI's own read switch off, or roots unset, drops the read grant back
+    // to the mode matrix (a person must confirm).
+    for (const withdrawn of [{ mcpFileRead: false }, { fileRootsConfigured: false }]) {
+      expect(await summaryFor("SUPERVISED", withdrawn)).toEqual({
+        read: "supervised",
+        write: "supervised",
+      });
+    }
+    // An unsupervised grant needs the same fileOps term for any claim.
+    expect(await summaryFor("UNSUPERVISED", {})).toEqual({ read: "headless", write: "headless" });
+    expect(await summaryFor("UNSUPERVISED", { fileOps: false })).toEqual({
+      read: "off",
+      write: "off",
+    });
   });
 
   it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {

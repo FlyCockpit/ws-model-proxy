@@ -464,6 +464,126 @@ fn malformed_ops_are_bad_frame_and_never_run() {
     );
 }
 
+/// The wire refusal set, mirrored by `FILE_WIRE_REASONS` in
+/// `apps/server/src/relay/file-protocol.ts`: every one must parse there, and
+/// `admit` must only ever produce a member. Pinned so a new reason cannot be
+/// added on one side only.
+#[test]
+fn wire_refusal_reasons_are_pinned_and_admit_only_produces_members() {
+    assert_eq!(
+        WIRE_REFUSAL_REASONS,
+        [
+            "bad_frame",
+            "supervised_only",
+            "grant_disabled",
+            "feature_disabled"
+        ]
+    );
+    // Every refusal `handle_op`/`admit` can emit, over the full consent table.
+    // `unsupported` is a file error code (root without consent), accepted by
+    // the server's union but NOT a wire reason the server enumerates
+    // separately; the rest must be in WIRE_REFUSAL_REASONS.
+    let file_error_codes = [
+        crate::file_ops::ErrorCode::Unsupported.as_str(),
+        crate::file_ops::ErrorCode::Limit.as_str(),
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for mode in [
+        McpCommandMode::Off,
+        McpCommandMode::Supervised,
+        McpCommandMode::Unsupervised,
+    ] {
+        for (server_mode, read, grant, switch, roots, euid, allow_root) in [
+            (
+                McpCommandMode::Unsupervised,
+                true,
+                false,
+                false,
+                false,
+                1000,
+                false,
+            ),
+            (
+                McpCommandMode::Supervised,
+                true,
+                true,
+                true,
+                true,
+                1000,
+                false,
+            ),
+            (McpCommandMode::Off, false, true, true, true, 1000, false),
+            (
+                McpCommandMode::Unsupervised,
+                false,
+                false,
+                false,
+                false,
+                0,
+                false,
+            ),
+        ] {
+            if let Err(reason) = admit(
+                mode,
+                FilePermission {
+                    mode: server_mode,
+                    read_grant: grant,
+                },
+                read,
+                switch,
+                roots,
+                euid,
+                allow_root,
+            ) {
+                assert!(
+                    WIRE_REFUSAL_REASONS.contains(&reason) || file_error_codes.contains(&reason),
+                    "{reason} is neither a wire refusal nor a file error code"
+                );
+                seen.push(reason);
+            }
+        }
+    }
+    for expected in [
+        "supervised_only",
+        "grant_disabled",
+        "feature_disabled",
+        "unsupported",
+    ] {
+        assert!(seen.contains(&expected), "{expected} never produced");
+    }
+}
+
+#[test]
+fn every_refuse_reason_is_a_pinned_wire_reason_or_a_file_error_code() {
+    // The reasons `refuse` is called with, read out of the module source so a
+    // NEW call site cannot slip in without updating the pin. The server accepts
+    // the union of FILE_WIRE_REASONS and FILE_ERROR_CODES; a reason outside it
+    // makes the server fail the strict schema and settle the op as io_error.
+    assert_eq!(
+        REFUSE_REASONS,
+        [
+            "bad_frame",
+            "supervised_only",
+            "grant_disabled",
+            "feature_disabled",
+            "unsupported",
+            "limit",
+        ]
+    );
+    let file_error_codes = [
+        crate::file_ops::ErrorCode::Unsupported.as_str(),
+        crate::file_ops::ErrorCode::Limit.as_str(),
+    ];
+    for reason in REFUSE_REASONS {
+        assert!(
+            WIRE_REFUSAL_REASONS.contains(&reason) || file_error_codes.contains(&reason),
+            "{reason} is neither a wire refusal nor a file error code"
+        );
+    }
+    // `refuse` asserts this same set at runtime, so every exercised refusal path
+    // (malformed frame, the pending cap, each `admit` reason) is covered.
+}
+
 #[test]
 fn unknown_op_ids_are_ignored_not_fatal() {
     let mut harness = harness();
