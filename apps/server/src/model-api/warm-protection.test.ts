@@ -30,7 +30,8 @@ const session = (
   ageSeconds: number,
   tokens = 10_000,
   overridePercent: number | null = null,
-): WarmSession => ({ userId, ageMs: ageSeconds * 1000, tokens, overridePercent });
+  inFlight = false,
+): WarmSession => ({ userId, ageMs: ageSeconds * 1000, tokens, overridePercent, inFlight });
 const slots = (slotCount: number, active = 0) => ({
   slots: slotCount,
   active,
@@ -280,6 +281,97 @@ describe("S-C member state", () => {
     expect(verdict(0, [])).toBe("FREE");
   });
 
+  // Slot mode compares the IDLE slots (C - a) with the protected sessions no
+  // active lease is serving. Literal rows, C = 4: [protected sessions idle,
+  // protected sessions in flight] -> the verdict for a = 0..4 active leases.
+  // An in-flight session is served by one of the `a` leases, so it never
+  // fills an idle slot; `p >= C` (or the old `min(p, C) >= idle`) gets the
+  // in-flight rows wrong in opposite directions.
+  const slotTable: {
+    idle: number;
+    inFlight: number;
+    byActive: [
+      MemberProtectionState,
+      MemberProtectionState,
+      MemberProtectionState,
+      MemberProtectionState,
+      MemberProtectionState,
+    ];
+  }[] = [
+    { idle: 0, inFlight: 0, byActive: ["FREE", "FREE", "FREE", "FREE", "FULL"] },
+    { idle: 1, inFlight: 0, byActive: ["FREE", "FREE", "FREE", "PROTECTED", "FULL"] },
+    { idle: 2, inFlight: 0, byActive: ["FREE", "FREE", "PROTECTED", "PROTECTED", "FULL"] },
+    {
+      idle: 4,
+      inFlight: 0,
+      byActive: ["PROTECTED", "PROTECTED", "PROTECTED", "PROTECTED", "FULL"],
+    },
+    // Only in-flight sessions: every idle slot is empty, whatever `a` is.
+    { idle: 0, inFlight: 2, byActive: ["FREE", "FREE", "FREE", "FREE", "FULL"] },
+    { idle: 0, inFlight: 4, byActive: ["FREE", "FREE", "FREE", "FREE", "FULL"] },
+    { idle: 2, inFlight: 2, byActive: ["FREE", "FREE", "PROTECTED", "PROTECTED", "FULL"] },
+    { idle: 3, inFlight: 1, byActive: ["FREE", "PROTECTED", "PROTECTED", "PROTECTED", "FULL"] },
+    { idle: 1, inFlight: 3, byActive: ["FREE", "FREE", "FREE", "PROTECTED", "FULL"] },
+  ];
+  it.each(
+    slotTable.flatMap(({ idle, inFlight, byActive }) =>
+      byActive.map((expected, active) => ({ idle, inFlight, active, expected })),
+    ),
+  )(
+    "slot mode C=4 a=$active with $idle idle and $inFlight in-flight protected: $expected",
+    ({ idle, inFlight, active, expected }) => {
+      const sessions = [
+        ...Array.from({ length: idle }, (_, index) => session(`idle${index}`, 10 + index)),
+        ...Array.from({ length: inFlight }, (_, index) =>
+          session(`busy${index}`, 5 + index, 10_000, null, true),
+        ),
+      ];
+      const result = memberProtectionVerdict({
+        load: slots(4, active),
+        protectedSessions: sessions,
+        requestTokens: 1_000,
+        affine: false,
+      });
+      expect(result.state).toBe(expected);
+      // The count the verdict compared is reported too.
+      expect(result.idleProtectedSessions).toBe(idle);
+      expect(result.protectedSessions).toBe(idle + inFlight);
+    },
+  );
+
+  it("C1b-1: two conversations mid-turn do not make a half-busy member PROTECTED", () => {
+    // C=4, a=2: alice's and bob's warm conversations are running right now.
+    // Both idle slots are empty, so a new :external session is admitted there
+    // instead of going external.
+    const load = slots(4, 2);
+    const busy = [session("alice", 10, 10_000, null, true), session("bob", 12, 10_000, null, true)];
+    const verdict = memberProtectionVerdict({
+      load,
+      protectedSessions: protectedWarmSessions(busy, load, policy()),
+      requestTokens: 1_000,
+      affine: false,
+    });
+    expect(verdict.state).toBe("FREE");
+    expect(
+      protectionRouting({
+        candidates: [{ poolMemberId: "only", affine: false }],
+        verdicts: new Map([["only", verdict]]),
+        externalPlan: true,
+      }),
+    ).toEqual({ order: ["only"], initial: ["only"], externalFirst: false });
+  });
+
+  it("token mode counts in-flight sessions: their KV is still in the pool", () => {
+    expect(
+      memberProtectionVerdict({
+        load: { slots: 8, active: 1, kvBudgetTokens: 100_000 },
+        protectedSessions: [session("alice", 1, 85_000, null, true)],
+        requestTokens: 10_000,
+        affine: false,
+      }).state,
+    ).toBe("PROTECTED");
+  });
+
   it("a continuation (affinity hit) is never PROTECTED", () => {
     expect(
       memberProtectionVerdict({
@@ -323,6 +415,7 @@ describe("S-C decision procedure", () => {
   ): ProtectionVerdict => ({
     state,
     protectedSessions: state === "PROTECTED" ? 1 : 0,
+    idleProtectedSessions: state === "PROTECTED" ? 1 : 0,
     protectedTokens,
     newestProtectedAgeMs,
   });

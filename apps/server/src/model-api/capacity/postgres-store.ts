@@ -449,6 +449,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             // The schema trigger accepts the grant priority as the waiters'
             // policy snapshot only when the request names its grant.
             priorityGrantId: grantQueuePriority === null ? null : attempt.accessGrantId,
+            warmSessionIds: [...new Set(attempt.warmSessionIds ?? [])],
             enqueueSequence,
             // The database-clock schedule anchor of this attempt (see
             // AdmissionAttempt.schedule); never a process clock. The hardening

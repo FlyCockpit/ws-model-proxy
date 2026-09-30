@@ -83,7 +83,7 @@ export type PublicOverflowReason =
   | "LOCAL_WAIT_EXPIRED"
   /**
    * Saturation S-C: no local member is FREE for this new session; the ones
-   * with an idle slot hold other conversations' protected warm sessions.
+   * with an idle slot hold protected warm sessions (including the caller's own).
    */
   | "LOCAL_SATURATED_PROTECTED"
   | "LOCAL_CONTEXT_CEILING"

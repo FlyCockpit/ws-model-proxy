@@ -142,6 +142,7 @@ const NON_SECRET_COLUMNS: Readonly<Record<string, string>> = {
   prefixDigest: "Cache-affinity routing digest.",
   conversationDigest: "Cache-affinity routing digest.",
   routingKeyDigest: "Response-stickiness routing digest.",
+  warmBindingDigest: "Scoped cache-affinity binding digest for native Responses, not a credential.",
   upstreamResponseIdDigest: "Digest of an upstream response id.",
   runtimeIdentityKey: "Capacity identity key (endpoint/runtime), not a credential.",
   tokenizer: "Tokenizer name.",

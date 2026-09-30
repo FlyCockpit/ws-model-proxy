@@ -112,6 +112,8 @@ false and retry on the next run. A shrinking set needs no retry; extra fences ar
   null, the owner (no grant) and a grant of another pool inherit. It is read once, when the
   attempt is created, with a plain `pool_grant` read after the L2 fences: no row lock, so no
   lock-order edge. The DRR scheduler is unchanged; the grant only moves the waiter's class.
+- `warmSessionIds` (advisory, warm protection S-C) is recorded on the request at insert and never
+  read by admission.
 - Warm-session protection (`../warm-protection.ts`) never touches the store: it reorders and
   filters candidates before the attempt is built, so it adds no waiter state and no lock.
 

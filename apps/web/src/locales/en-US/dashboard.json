@@ -531,7 +531,7 @@
     },
     "protection": {
       "title": "Protect active conversations",
-      "description": "A new conversation avoids a member whose free capacity still holds other conversations' recent, large prompt caches when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
+      "description": "A new conversation avoids a member whose free capacity still holds the recent, large prompt caches of protected warm sessions (including your own) when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
       "enabled": "Protect active conversations",
       "windowSeconds": "Protection window (seconds)",
       "minTokens": "Minimum conversation size (tokens)",
