@@ -252,7 +252,7 @@ describe("McpTokensPanel CLI commands", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     expect(
       within(dialog).queryByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
@@ -286,7 +286,7 @@ describe("McpTokensPanel CLI commands", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).queryByRole("status")).not.toBeTruthy();
     await user.click(
@@ -310,11 +310,11 @@ describe("McpTokensPanel CLI commands", () => {
 
   it("sends allowCliCommands only with write and badges tokens that have it", async () => {
     state.listPending = false;
-    state.listResult = [{ ...token, allowCliCommands: true }];
+    state.listResult = [{ ...token, allowCliCommands: true, allowCliFileRead: false }];
     const user = userEvent.setup();
     renderPanel();
     expect(await screen.findByText("settings:mcp.tokens.allowCliCommandsBadge")).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(within(dialog).getByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     await user.click(
@@ -365,7 +365,7 @@ describe("McpTokensPanel CLI command switches", () => {
     state.listResult = [];
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.click(
       within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
@@ -536,7 +536,7 @@ describe("McpTokensPanel edit capabilities", () => {
 
   it("widens a read-only token and saves through updateMine", async () => {
     state.listPending = false;
-    state.listResult = [{ ...expiringToken, allowCliCommands: false }];
+    state.listResult = [{ ...expiringToken, allowCliCommands: false, allowCliFileRead: false }];
     const user = userEvent.setup();
     renderPanel();
     const dialog = await openEdit(user);
@@ -558,7 +558,7 @@ describe("McpTokensPanel edit capabilities", () => {
     await user.click(save);
     await waitFor(() => {
       expect(state.updateCalls).toEqual([
-        { id: "token-3", allowWrite: true, allowCliCommands: true },
+        { id: "token-3", allowWrite: true, allowCliCommands: true, allowCliFileRead: false },
       ]);
     });
     await waitFor(() => {
@@ -568,7 +568,14 @@ describe("McpTokensPanel edit capabilities", () => {
 
   it("clears CLI commands when write is removed before saving", async () => {
     state.listPending = false;
-    state.listResult = [{ ...token, scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }];
+    state.listResult = [
+      {
+        ...token,
+        scopes: ["mcp:read", "mcp:write"],
+        allowCliCommands: true,
+        allowCliFileRead: false,
+      },
+    ];
     const user = userEvent.setup();
     renderPanel();
     const dialog = await openEdit(user);
@@ -578,14 +585,21 @@ describe("McpTokensPanel edit capabilities", () => {
     await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
     await waitFor(() => {
       expect(state.updateCalls).toEqual([
-        { id: "token-1", allowWrite: false, allowCliCommands: false },
+        { id: "token-1", allowWrite: false, allowCliCommands: false, allowCliFileRead: false },
       ]);
     });
   });
 
   it("allows only narrowing while MCP is disabled", async () => {
     state.listPending = false;
-    state.listResult = [{ ...token, scopes: ["mcp:read", "mcp:write"], allowCliCommands: false }];
+    state.listResult = [
+      {
+        ...token,
+        scopes: ["mcp:read", "mcp:write"],
+        allowCliCommands: false,
+        allowCliFileRead: false,
+      },
+    ];
     const user = userEvent.setup();
     renderPanel(false);
     const dialog = await openEdit(user);
@@ -605,14 +619,14 @@ describe("McpTokensPanel edit capabilities", () => {
     await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
     await waitFor(() => {
       expect(state.updateCalls).toEqual([
-        { id: "token-1", allowWrite: false, allowCliCommands: false },
+        { id: "token-1", allowWrite: false, allowCliCommands: false, allowCliFileRead: false },
       ]);
     });
   });
 
   it("maps a FORBIDDEN update to the expand-refused toast and keeps the dialog open", async () => {
     state.listPending = false;
-    state.listResult = [{ ...token, allowCliCommands: false }];
+    state.listResult = [{ ...token, allowCliCommands: false, allowCliFileRead: false }];
     state.updateError = Object.assign(new Error("forbidden"), { code: "FORBIDDEN", status: 403 });
     const user = userEvent.setup();
     renderPanel();
@@ -658,7 +672,7 @@ describe("McpTokensPanel", () => {
   });
 
   async function openDialogTypeAndSubmit(user: ReturnType<typeof userEvent.setup>) {
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     const dialog = screen.getByRole("dialog");
     await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.create" }));
@@ -785,7 +799,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "   ");
     expect(screen.getByText("settings:mcp.tokens.nameInvalid")).toBeTruthy();
@@ -802,7 +816,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     const trigger = within(dialog).getByRole("combobox");
@@ -832,7 +846,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     await chooseExpiryOption(user, "settings:mcp.tokens.noExpiryOption");
@@ -850,7 +864,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel(true, false);
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     const trigger = within(dialog).getByRole("combobox");
     expect(trigger.textContent).toContain("settings:mcp.tokens.days90");
@@ -875,7 +889,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     await chooseExpiryOption(user, "settings:mcp.tokens.customOption");
@@ -904,7 +918,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     await chooseExpiryOption(user, "settings:mcp.tokens.customOption");
@@ -947,7 +961,7 @@ describe("McpTokensPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
-    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     await chooseExpiryOption(user, "settings:mcp.tokens.days365");
@@ -1063,5 +1077,96 @@ describe("CliCommandDevices account isolation", () => {
     expect(screen.queryByText("alice-desk")).toBeNull();
     expect(queryClient.getQueryCache().getAll()).toHaveLength(1);
     expect(queryClient.getQueryCache().getAll()[0]?.state.fetchStatus).toBe("idle");
+  });
+});
+
+describe("read-only file token consent", () => {
+  it("defaults consent off and submits a read-only file token without command or write access", async () => {
+    state.listPending = false;
+    const user = userEvent.setup();
+    renderPanel();
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    await user.click(checkbox);
+    const write = within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" });
+    await user.click(write);
+    await user.click(write);
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    await user.type(within(dialog).getByLabelText("settings:mcp.tokens.name"), "monitor");
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await waitFor(() =>
+      expect(state.createCalls[0]).toMatchObject({
+        allowCliFileRead: true,
+        allowCliCommands: false,
+        allowWrite: false,
+      }),
+    );
+  });
+  it("edit preserves file consent and can narrow it while MCP is disabled", async () => {
+    state.listPending = false;
+    state.listResult = [
+      { ...token, allowCliFileRead: true, allowCliCommands: false, scopes: ["mcp:read"] },
+    ];
+    const user = userEvent.setup();
+    renderPanel(false);
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    expect(checkbox.hasAttribute("disabled")).toBe(false);
+    await user.click(checkbox);
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() =>
+      expect(state.updateCalls[0]).toMatchObject({
+        allowCliFileRead: false,
+        allowWrite: false,
+        allowCliCommands: false,
+      }),
+    );
+  });
+
+  it("leaves the file-read checkbox uncheckable at edit for a token that has the flag while MCP is disabled", async () => {
+    // The create dialog is hidden while MCP is disabled, so the narrowing rule
+    // is only observable in edit: a token that already holds the flag may keep
+    // it or narrow it, and unchecking is accepted.
+    state.listPending = false;
+    state.listResult = [
+      { ...token, allowCliFileRead: true, allowCliCommands: false, scopes: ["mcp:read"] },
+    ];
+    const user = userEvent.setup();
+    renderPanel(false);
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    expect(checkbox.hasAttribute("data-disabled")).toBe(false);
+    await user.click(checkbox);
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() => expect(state.updateCalls[0]).toMatchObject({ allowCliFileRead: false }));
+  });
+
+  it("disables the file-read checkbox at edit for a token without the flag while MCP is disabled", async () => {
+    state.listPending = false;
+    state.listResult = [
+      { ...token, allowCliFileRead: false, allowCliCommands: false, scopes: ["mcp:read"] },
+    ];
+    const user = userEvent.setup();
+    renderPanel(false);
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliFileRead",
+    });
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    expect(checkbox.hasAttribute("data-disabled")).toBe(true);
   });
 });

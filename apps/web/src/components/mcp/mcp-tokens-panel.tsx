@@ -70,6 +70,7 @@ type EditTarget = {
   expiresAt: Date | string | null;
   allowWrite: boolean;
   allowCliCommands: boolean;
+  allowCliFileRead: boolean;
 };
 
 function copyToClipboard(value: string, message: string) {
@@ -163,6 +164,7 @@ export function McpTokensPanel({
   const [name, setName] = useState("");
   const [allowWrite, setAllowWrite] = useState(false);
   const [allowCliCommands, setAllowCliCommands] = useState(false);
+  const [allowCliFileRead, setAllowCliFileRead] = useState(false);
   const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(DEFAULT_EXPIRY_CHOICE);
   const [customDate, setCustomDate] = useState("");
   const [secret, setSecret] = useState("");
@@ -174,6 +176,7 @@ export function McpTokensPanel({
   const [editOpen, setEditOpen] = useState(false);
   const [editAllowWrite, setEditAllowWrite] = useState(false);
   const [editAllowCliCommands, setEditAllowCliCommands] = useState(false);
+  const [editAllowCliFileRead, setEditAllowCliFileRead] = useState(false);
 
   const {
     data: tokens,
@@ -290,6 +293,7 @@ export function McpTokensPanel({
                   setName("");
                   setAllowWrite(false);
                   setAllowCliCommands(false);
+                  setAllowCliFileRead(false);
                   setExpiryChoice(DEFAULT_EXPIRY_CHOICE);
                   setCustomDate("");
                   setSecret("");
@@ -322,6 +326,7 @@ export function McpTokensPanel({
                       name: trimmedName,
                       allowWrite,
                       allowCliCommands: allowWrite && allowCliCommands,
+                      allowCliFileRead,
                       expiresAt,
                     };
                     create.mutate(createInput);
@@ -354,6 +359,8 @@ export function McpTokensPanel({
                         idPrefix="mcp-token"
                         allowWrite={allowWrite}
                         allowCliCommands={allowCliCommands}
+                        allowCliFileRead={allowCliFileRead}
+                        onAllowCliFileReadChange={setAllowCliFileRead}
                         lang={lang}
                         onAllowWriteChange={(next) => {
                           setAllowWrite(next);
@@ -531,9 +538,11 @@ export function McpTokensPanel({
                               expiresAt: token.expiresAt,
                               allowWrite: tokenWrite,
                               allowCliCommands: tokenCli,
+                              allowCliFileRead: token.allowCliFileRead === true,
                             });
                             setEditAllowWrite(tokenWrite);
                             setEditAllowCliCommands(tokenCli);
+                            setEditAllowCliFileRead(token.allowCliFileRead === true);
                             setEditOpen(true);
                           }}
                         >
@@ -604,6 +613,7 @@ export function McpTokensPanel({
                 id: editTarget.id,
                 allowWrite: editAllowWrite,
                 allowCliCommands: editAllowWrite && editAllowCliCommands,
+                allowCliFileRead: editAllowCliFileRead,
               });
             }}
           >
@@ -616,6 +626,9 @@ export function McpTokensPanel({
               idPrefix="mcp-token-edit"
               allowWrite={editAllowWrite}
               allowCliCommands={editAllowCliCommands}
+              allowCliFileRead={editAllowCliFileRead}
+              onAllowCliFileReadChange={setEditAllowCliFileRead}
+              canEnableCliFileRead={createEnabled || editTarget?.allowCliFileRead === true}
               lang={lang}
               // While MCP is disabled only the capabilities the token already
               // had may stay on; the server refuses any widening.
@@ -700,6 +713,9 @@ function TokenCapabilityFields({
   idPrefix,
   allowWrite,
   allowCliCommands,
+  allowCliFileRead,
+  onAllowCliFileReadChange,
+  canEnableCliFileRead = true,
   lang,
   canEnableWrite = true,
   canEnableCliCommands = true,
@@ -709,9 +725,12 @@ function TokenCapabilityFields({
   idPrefix: string;
   allowWrite: boolean;
   allowCliCommands: boolean;
+  allowCliFileRead: boolean;
   lang: string;
   canEnableWrite?: boolean;
   canEnableCliCommands?: boolean;
+  canEnableCliFileRead?: boolean;
+  onAllowCliFileReadChange: (next: boolean) => void;
   onAllowWriteChange: (next: boolean) => void;
   onAllowCliCommandsChange: (next: boolean) => void;
 }) {
@@ -750,6 +769,22 @@ function TokenCapabilityFields({
           </div>
         </div>
       ) : null}
+      <div className="flex min-h-[44px] items-start gap-3">
+        <Checkbox
+          id={`${idPrefix}-cli-file-read`}
+          checked={allowCliFileRead}
+          disabled={!allowCliFileRead && !canEnableCliFileRead}
+          onCheckedChange={(checked) => onAllowCliFileReadChange(checked === true)}
+        />
+        <div className="space-y-1">
+          <Label htmlFor={`${idPrefix}-cli-file-read`} className="min-h-11">
+            {t("settings:mcp.tokens.allowCliFileRead")}
+          </Label>
+          <p className="text-sm text-muted-foreground">
+            {t("settings:mcp.tokens.allowCliFileReadHelp")}
+          </p>
+        </div>
+      </div>
       {allowWrite && allowCliCommands ? <CliCommandDevices lang={lang} /> : null}
     </>
   );

@@ -573,6 +573,8 @@ async function handleAdmittedRequest(
           kind: "pat",
           tokenId: identity.id,
           allowCliCommands: identity.allowCliCommands === true,
+          allowCliFileRead: identity.allowCliFileRead === true,
+          scopes: identity.scopes,
           expiresAt: identity.expiresAt,
         },
       });

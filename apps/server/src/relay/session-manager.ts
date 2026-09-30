@@ -127,10 +127,11 @@ export type CliReportedFeatures = {
   mcpCommandMode: McpCommandModeName;
   terminalApproval: boolean;
   terminalSupported: boolean;
-  /** 2.8: the CLI's read-only file grant (false until P4). */
+  /** 2.8: the CLI's read-only file grant. */
   mcpFileRead: boolean;
-  /** 2.8: the CLI has `fileRoots` configured (false until P4). */
+  /** 2.8: the CLI has `fileRoots` configured. */
   fileRootsConfigured: boolean;
+  fileOps: boolean;
   /** 2.8: `wsmp config set-file-tools-as-root on`. */
   allowFileToolsAsRoot: boolean;
 };
@@ -404,6 +405,7 @@ type SessionState = {
   /** 2.5 CLI identity proof, relayed to browsers as is. */
   terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
+  mcpFileRead: boolean;
   /** Server grant for MCP commands (dashboard). The CLI's own mode is in `features`. */
   mcpCommandMode: McpCommandModeName;
   terminalsById: Map<string, TerminalRecord>;
@@ -455,7 +457,7 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   terminalIdentity: CliTerminalIdentity | null;
 } {
   return {
-    features: capabilities.features,
+    features: { ...capabilities.features, fileOps: capabilities.fileOps === true },
     terminalPublicKey: capabilities.terminalPublicKey,
     terminalViewers: capabilities.terminalViewers === true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
@@ -545,6 +547,8 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     relayProtocolVersion: message.protocolVersion,
     reportedHumanTerminal: features.humanTerminal,
     reportedMcpCommandMode: mcpCommandModeToDb(features.mcpCommandMode),
+    reportedMcpFileRead: features.mcpFileRead,
+    reportedFileRoots: features.fileRootsConfigured,
     reportedTerminalApproval: features.terminalApproval,
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
@@ -689,6 +693,7 @@ export class RelaySessionManager {
       terminalIdentity: null,
       allowHumanTerminal: false,
       mcpCommandMode: "off",
+      mcpFileRead: false,
       terminalsById: new Map(),
       commandsById: new Map(),
       filesById: new Map(),
@@ -791,6 +796,7 @@ export class RelaySessionManager {
         session.cliVersion = message.cli.version ?? null;
         session.allowHumanTerminal = registration.allowHumanTerminal;
         session.mcpCommandMode = registration.mcpCommandMode;
+        session.mcpFileRead = registration.mcpFileRead;
         const interactive = interactiveCapabilities(message.cli.capabilities);
         session.features = interactive.features;
         session.terminalPublicKey = interactive.terminalPublicKey;
@@ -1375,11 +1381,12 @@ export class RelaySessionManager {
     try {
       const device = await prisma.cliDevice.findUnique({
         where: { id: cliDeviceId },
-        select: { allowHumanTerminal: true, mcpCommandMode: true },
+        select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
       });
       this.applyFeatureGrants(cliDeviceId, {
         allowHumanTerminal: device?.allowHumanTerminal === true,
         mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
+        mcpFileRead: device?.mcpFileRead === true,
       });
     } finally {
       // Leaving `unsupervised` withdraws remote metric sources at once, even
@@ -1487,12 +1494,17 @@ export class RelaySessionManager {
 
   applyFeatureGrants(
     cliDeviceId: string,
-    grants: { allowHumanTerminal: boolean; mcpCommandMode: McpCommandModeName },
+    grants: {
+      allowHumanTerminal: boolean;
+      mcpCommandMode: McpCommandModeName;
+      mcpFileRead: boolean;
+    },
   ) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
     session.allowHumanTerminal = grants.allowHumanTerminal;
     session.mcpCommandMode = grants.mcpCommandMode;
+    session.mcpFileRead = grants.mcpFileRead === true;
     this.reconcileInteractiveGrants(session);
   }
 
@@ -1764,7 +1776,9 @@ export class RelaySessionManager {
         supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        fileOps: relayProtocolAtLeast(session.protocolVersion, "2.8"),
+        fileOps:
+          relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+          session.features?.fileOps === true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
@@ -2271,9 +2285,21 @@ export class RelaySessionManager {
   ): "grant_disabled" | "feature_disabled" | "supervised_only" | null {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return null;
-    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass);
+    const readGrant = {
+      server: session.mcpFileRead === true,
+      live:
+        session.features?.mcpFileRead === true &&
+        session.features.fileOps === true &&
+        relayProtocolAtLeast(session.protocolVersion, "2.8"),
+      roots: session.features?.fileRootsConfigured === true,
+    };
+    const grantAccess = fileToolAccess(session.mcpCommandMode, opClass, readGrant);
     if (grantAccess !== "headless") return fileAccessRefusal(grantAccess, "grant");
-    const liveAccess = fileToolAccess(session.features?.mcpCommandMode ?? "off", opClass);
+    const liveAccess = fileToolAccess(
+      session.features?.mcpCommandMode ?? "off",
+      opClass,
+      readGrant,
+    );
     if (liveAccess !== "headless") return fileAccessRefusal(liveAccess, "live");
     return null;
   }
@@ -2613,7 +2639,9 @@ export class RelaySessionManager {
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
       relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-      fileToolAccess(this.effectiveCommandMode(session), opClass) === "headless" &&
+      session.cliDeviceId !== null &&
+      this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
+      session.features?.fileOps === true &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }

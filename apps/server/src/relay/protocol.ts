@@ -154,11 +154,11 @@ const v28FeatureSchema = z
      */
     remoteMetricSources: z.boolean(),
     /**
-     * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`). False
-     * until the read grant ships (P4); reported now so the fleet upgrades once.
+     * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`), read
+     * from the CLI's own startup switch and reported on every hello.
      */
     mcpFileRead: z.boolean(),
-    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). False until P4. */
+    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). */
     fileRootsConfigured: z.boolean(),
     /** 2.8: `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),
@@ -886,12 +886,18 @@ export type RelayServerControlMessage =
       sources: RemoteMetricSource[];
     }
   | {
-      /** 2.8: run one node file op. Write content follows as one `file.body` binary frame. */
+      /**
+       * 2.8: run one node file op. `mode` and `readGrant` are the server's
+       * admission verdict, re-checked by the CLI against its own startup
+       * config; write content follows as one `file.body` binary frame.
+       */
       type: "file.op";
       opId: string;
       op: FileOp;
       args: FileOpFrame["args"];
       bodyBytes?: number;
+      mode: FileOpFrame["mode"];
+      readGrant: boolean;
     }
   | { type: "file.cancel"; opId: string };
 

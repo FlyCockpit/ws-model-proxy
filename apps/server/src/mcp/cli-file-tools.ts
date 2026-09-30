@@ -1,3 +1,4 @@
+import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import { z } from "zod";
 import {
   auditRefusedFileInput,
@@ -36,6 +37,9 @@ export const FILE_TOOLS = [
 ] as const satisfies ReadonlyArray<{ name: string; op: FileOp; target: string }>;
 
 export type FileToolName = (typeof FILE_TOOLS)[number]["name"];
+
+/** Read-class ops change nothing; they alone may run under the read-only file grant. */
+export const FILE_READ_OPS: ReadonlySet<FileOp> = new Set(["read", "stat", "list", "search"]);
 
 /**
  * Largest read window the MCP layer asks for. The CLI's own cap is 128 KiB,
@@ -147,12 +151,12 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   offline: "The CLI is offline or does not support file tools",
   feature_disabled: "The CLI has MCP commands disabled in wsmp config",
   supervised_only:
-    "File tools run headless only on an unsupervised node; this device requires a person to confirm each action",
+    "This device requires supervision; headless reads need the read-only grant with roots, or use cat via a supervised command",
   unsupported:
     "The CLI cannot run this file operation (it refuses file tools as root unless allowFileToolsAsRoot is set)",
   limit: "Too many file operations; retry after retryAfterMs",
   token_inactive:
-    "This MCP token was revoked, has expired, or no longer allows CLI commands (mcp:write and CLI commands are required)",
+    "This MCP token was revoked, has expired, or no longer grants this file capability",
   upgrade_required: "This CLI speaks an older relay protocol; upgrade wsmp",
   invalid_input: "Invalid input for this file operation",
   path_denied: "That path is not allowed",
@@ -219,11 +223,17 @@ type FileToolDeps = {
   credential: McpRequestCredential;
 };
 
-function requireFilePat(credential: McpRequestCredential): {
+function requireFilePat(
+  credential: McpRequestCredential,
+  op: FileOp,
+): {
   tokenId: string;
   expiresAt: Date | null;
 } {
-  if (credential.kind === "pat" && credential.allowCliCommands === true) {
+  if (
+    credential.kind === "pat" &&
+    cliTokenAllows(credential, FILE_READ_OPS.has(op) ? "file_read" : "file_write")
+  ) {
     return { tokenId: credential.tokenId, expiresAt: credential.expiresAt };
   }
   // A credential that may not see the tool gets the same answer as an unknown one.
@@ -270,7 +280,7 @@ export async function runForwarderCliFileTool(
   input: unknown,
   deps: FileToolDeps,
 ): Promise<FileOpSuccess> {
-  const pat = requireFilePat(deps.credential);
+  const pat = requireFilePat(deps.credential, op);
   // The SDK validator is the loose generated one (#117): the strict per-op
   // shape is enforced here, and its issues reach the agent as named fields.
   const checked = strictInput(op).safeParse(input);
@@ -415,10 +425,10 @@ export function projectFileToolOutput(output: unknown): unknown {
 // Descriptions
 
 export const FILE_MASKING_NOTICE =
-  "Masking is bounded and shown in the text: dotenv values as KEY=⟦redacted:N⟧; in other files any line containing a secret-name word (…_TOKEN, …_KEY, …_SECRET, …_PASSWORD, apikey, api-key, hf-token, PASSWORD), the next non-blank line and every deeper-indented continuation as ⟦redacted line⟧; --api-key/--hf-token flag values; private-key blocks and SSH private key files; Hugging Face token files. There is no vendor-prefix scanner and a construct opened before the bounded lookback of a windowed read is a documented residual. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
+  "Masking is bounded and shown in the text: dotenv values as KEY=⟦redacted:N⟧; in other files any line containing a secret-name word (…_TOKEN, …_KEY, …_SECRET, …_PASSWORD, apikey, api-key, hf-token, PASSWORD), the next non-blank line and every deeper-indented continuation as ⟦redacted line⟧; --api-key/--hf-token flag values; private-key blocks and SSH private key files; Hugging Face token files. There is no vendor-prefix scanner and a construct opened before the bounded lookback of a windowed read is a documented residual. On a read-grant-only node without exec, masking plus configured roots IS the security boundary. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
 
 export const FILE_ACCESS_NOTICE =
-  "Runs headless only on a CLI whose MCP command mode is unsupervised (the lowest of the dashboard grant and the CLI config); a supervised or off node refuses. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
+  "File tools follow the lowest of the dashboard and CLI command modes: unsupervised admits read and write; supervised/off admit only reads with the read-only grant (dashboard mcpFileRead AND live CLI mcpFileRead AND fileRootsConfigured). Write tools remain supervised_only or grant_disabled/feature_disabled. Read tools need a PAT with allowCliCommands + mcp:write OR allowCliFileRead + mcp:read; writes require allowCliCommands + mcp:write. OAuth is denied. Configured fileRoots confine every operation including rename destinations; roots are mandatory for reads through the grant. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
 
 export const FILE_ETAG_NOTICE =
   "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";

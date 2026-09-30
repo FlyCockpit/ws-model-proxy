@@ -22,9 +22,9 @@ export type LiveCliFeatureSnapshot = {
   terminalApproval: boolean;
   /** 2.8: the CLI implements `file.op`. */
   fileOps: boolean;
-  /** 2.8: the CLI's own read-only file grant (false until the read grant ships). */
+  /** 2.8: the CLI's own read-only file grant. */
   mcpFileRead: boolean;
-  /** 2.8: the CLI has `fileRoots` configured (false until the read grant ships). */
+  /** 2.8: the CLI has `fileRoots` configured. */
   fileRootsConfigured: boolean;
   /** 2.8: the CLI's `allowFileToolsAsRoot` config. */
   allowFileToolsAsRoot: boolean;

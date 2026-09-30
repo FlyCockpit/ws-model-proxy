@@ -2185,6 +2185,74 @@ fn a_tall_command_fits_the_screen_and_follows_a_resize() {
     assert_eq!(child.exit_code(), 0);
 }
 
+#[test]
+fn config_read_grant_is_explicit_and_roots_are_validated() {
+    let tmp = tempfile::tempdir().expect("home");
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let models = tmp.path().join("models");
+    fs::create_dir(&models).expect("models");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let value = json_stdout(show);
+    assert_eq!(value["mcpFileRead"], false);
+    assert_eq!(value["fileRoots"], json!([]));
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert!(disk.get("mcpFileRead").is_none());
+    assert!(disk.get("fileRoots").is_none());
+    cli(&config, &state)
+        .args(["config", "set-file-read", "on"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .env("HOME", tmp.path())
+        .args(["config", "set-file-roots", "~/models"])
+        .assert()
+        .success();
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert_eq!(disk["mcpFileRead"], true);
+    assert_eq!(
+        disk["fileRoots"],
+        json!([fs::canonicalize(&models).expect("root")])
+    );
+    for args in [
+        vec!["config", "set-file-roots"],
+        vec!["config", "set-file-roots", "/"],
+        vec!["config", "set-file-roots", "relative"],
+        vec!["config", "set-file-read", "maybe"],
+    ] {
+        cli(&config, &state).args(args).assert().failure();
+        let unchanged: Value =
+            serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+        assert_eq!(unchanged, disk);
+    }
+    cli(&config, &state)
+        .args(["config", "set-file-roots", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~/models"))
+        .stdout(predicate::str::contains("~/deploy"))
+        .stdout(predicate::str::contains("~/.config/llama-swap"))
+        .stdout(predicate::str::contains("~/.local/state/wsmp/logs"));
+    cli(&config, &state)
+        .args(["config", "clear-file-roots"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["config", "set-file-read", "off"])
+        .assert()
+        .success();
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let value = json_stdout(show);
+    assert_eq!(value["mcpFileRead"], false);
+    assert_eq!(value["fileRoots"], json!([]));
+}
+
 fn sha256_hex(text: &str) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(text.as_bytes())

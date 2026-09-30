@@ -64,6 +64,81 @@ where
     Ok(None)
 }
 
+pub const MAX_FILE_ROOTS: usize = 32;
+
+fn deserialize_file_roots<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let roots = Vec::<PathBuf>::deserialize(deserializer)?;
+    validate_file_root_shape(&roots).map_err(serde::de::Error::custom)?;
+    Ok(roots)
+}
+
+/// Validate disk shape without requiring existence: disappeared roots must
+/// still reach the confined, unusable startup policy rather than disappear.
+fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
+    anyhow::ensure!(
+        roots.len() <= MAX_FILE_ROOTS,
+        "at most {MAX_FILE_ROOTS} file roots are allowed"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        let text = root.to_str().context("file root is not UTF-8")?;
+        anyhow::ensure!(
+            text.len() <= 4096 && root.is_absolute() && root.parent().is_some(),
+            "file root must be an absolute directory other than `/`"
+        );
+        anyhow::ensure!(
+            !root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "file root must not contain `..`"
+        );
+        anyhow::ensure!(seen.insert(root), "duplicate file root");
+    }
+    Ok(())
+}
+
+/// Set-file-roots validation, with an explicit home input for isolated tests.
+/// Suggested roots are help text only; nothing is implicitly added.
+pub fn validate_file_roots(paths: &[PathBuf], home: Option<&Path>) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "at least one file root is required; use clear-file-roots to clear them"
+    );
+    anyhow::ensure!(
+        paths.len() <= MAX_FILE_ROOTS,
+        "at most {MAX_FILE_ROOTS} file roots are allowed"
+    );
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = path.to_str().context("file root is not UTF-8")?;
+        let expanded = if text == "~" {
+            home.context("home directory is unavailable")?.to_path_buf()
+        } else if let Some(rest) = text.strip_prefix("~/") {
+            home.context("home directory is unavailable")?.join(rest)
+        } else {
+            anyhow::ensure!(
+                !text.starts_with('~'),
+                "only `~` and `~/` expansion are supported"
+            );
+            path.clone()
+        };
+        validate_file_root_shape(std::slice::from_ref(&expanded))?;
+        let physical = std::fs::canonicalize(&expanded).context("file root must exist")?;
+        anyhow::ensure!(physical.is_dir(), "file root must be a directory");
+        roots.push(physical);
+    }
+    validate_file_root_shape(&roots)?;
+    Ok(roots)
+}
+
+/// False if any configured root is unusable; never invent an unrestricted fallback.
+pub fn file_roots_usable(roots: &[PathBuf]) -> bool {
+    validate_file_roots(roots, None).is_ok()
+}
+
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
@@ -177,6 +252,12 @@ pub struct Config {
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_file_tools_as_root: bool,
+    /// Local read grant. Restart applies; off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mcp_file_read: bool,
+    /// Explicit directory allowlist for every file operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_roots: Vec<PathBuf>,
     /// Accept remotely defined metric sources (`metrics.sources.set`). Only
     /// settable locally; read once when the relay starts. Each remote source
     /// still needs `wsmp metrics approve` of its exact command.
@@ -246,6 +327,9 @@ struct ConfigWire {
     allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
     allow_file_tools_as_root: bool,
+    mcp_file_read: bool,
+    #[serde(deserialize_with = "deserialize_file_roots")]
+    file_roots: Vec<PathBuf>,
     allow_remote_metric_sources: bool,
     metrics: MetricsConfig,
 }
@@ -265,6 +349,8 @@ impl Default for ConfigWire {
             allow_mcp_commands: None,
             require_terminal_approval: false,
             allow_file_tools_as_root: false,
+            mcp_file_read: false,
+            file_roots: Vec::new(),
             allow_remote_metric_sources: false,
             metrics: MetricsConfig::default(),
         }
@@ -290,6 +376,8 @@ impl From<ConfigWire> for Config {
             mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
+            mcp_file_read: wire.mcp_file_read,
+            file_roots: wire.file_roots,
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
             metrics: wire.metrics,
         }
@@ -309,6 +397,8 @@ impl Default for Config {
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
             allow_file_tools_as_root: false,
+            mcp_file_read: false,
+            file_roots: Vec::new(),
             allow_remote_metric_sources: false,
             metrics: MetricsConfig::default(),
         }
@@ -1424,6 +1514,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        validate_file_root_shape(&self.file_roots)?;
         if let Some(slug) = &self.cli_slug {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
         }
@@ -1638,6 +1729,102 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_grant_config_adversarial_table() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("home");
+        let home = std::fs::canonicalize(dir.path()).expect("home");
+        let models = home.join("models");
+        std::fs::create_dir(&models).expect("models");
+        let file = home.join("a-file");
+        std::fs::write(&file, "plain").expect("file");
+        let alias = home.join("models-alias");
+        std::os::unix::fs::symlink(&models, &alias).expect("root alias");
+        let good = validate_file_roots(&[PathBuf::from("~/models")], Some(&home)).expect("tilde");
+        assert_eq!(good, vec![models.clone()]);
+        let non_utf8 = home.join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
+        std::fs::create_dir(&non_utf8).expect("non-UTF-8 directory");
+        let many: Vec<_> = (0..=MAX_FILE_ROOTS)
+            .map(|n| {
+                let p = home.join(format!("root-{n}"));
+                std::fs::create_dir(&p).expect("root");
+                p
+            })
+            .collect();
+        let cases = vec![
+            vec![],
+            vec![PathBuf::from("models")],
+            vec![PathBuf::from("/")],
+            vec![home.join("missing")],
+            vec![file],
+            vec![PathBuf::from("~someone/models")],
+            vec![models.clone(), models.clone()],
+            vec![models.clone(), alias.clone()],
+            vec![home.join("models/../models")],
+            many,
+            vec![non_utf8],
+            vec![PathBuf::from(format!("/{}", "x".repeat(4096)))],
+        ];
+        for paths in cases {
+            assert!(
+                validate_file_roots(&paths, Some(&home)).is_err(),
+                "{paths:?}"
+            );
+        }
+        assert!(file_roots_usable(&good));
+        assert!(!file_roots_usable(&[models, alias]));
+        let default: Config = serde_json::from_str("{}").expect("default");
+        assert!(!default.mcp_file_read);
+        assert!(default.file_roots.is_empty());
+        let sparse = serde_json::to_value(&default).expect("serialize");
+        assert!(sparse.get("mcpFileRead").is_none());
+        assert!(sparse.get("fileRoots").is_none());
+        let enabled = Config {
+            mcp_file_read: true,
+            file_roots: good,
+            ..Config::default()
+        };
+        let reordered: Config = serde_json::from_str(&format!(
+            r#"{{"fileRoots":{},"mcpFileRead":true}}"#,
+            serde_json::to_string(&enabled.file_roots).expect("roots")
+        ))
+        .expect("field order");
+        assert_eq!(reordered, enabled);
+        let value = serde_json::to_value(&enabled).expect("serialize");
+        assert_eq!(value["mcpFileRead"], true);
+        assert_eq!(
+            serde_json::from_value::<Config>(value).expect("roundtrip"),
+            enabled
+        );
+        for text in [
+            r#"{"mcpFileRead":"true"}"#,
+            r#"{"fileRoots":"/tmp"}"#,
+            r#"{"fileRoots":[{"path":"/tmp"}]}"#,
+            r#"{"fileRoots":[["/tmp"]]}"#,
+            r#"{"fileRoots":null}"#,
+            r#"{"fileRoots":["relative"]}"#,
+            r#"{"fileRoots":["/"]}"#,
+            r#"{"fileRoots":["/tmp/../tmp"]}"#,
+            r#"{"fileRoots":["/tmp","/tmp/"]}"#,
+            r#"{"mcpFileRead":true,"mcpFileRead":false}"#,
+        ] {
+            assert!(serde_json::from_str::<Config>(text).is_err(), "{text}");
+        }
+        assert!(
+            serde_json::from_value::<Config>(
+                serde_json::json!({"fileRoots":[format!("/{}", "x".repeat(4096))]})
+            )
+            .is_err()
+        );
+        // A disappeared directory remains configured intent on disk.
+        let missing: Config =
+            serde_json::from_value(serde_json::json!({"fileRoots":[home.join("gone")]}))
+                .expect("missing root shape");
+        assert!(!file_roots_usable(&missing.file_roots));
+        assert!(!file_roots_usable(&[]));
+    }
 
     #[test]
     fn validates_and_round_trips_reasoning_config() {
