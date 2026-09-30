@@ -1,0 +1,29 @@
+{
+  "type": "file.result",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "stat",
+  "result": {
+    "entries": [
+      {
+        "path": "~/models/q4.gguf",
+        "type": "file",
+        "size": 16492345344,
+        "mtime": "2026-09-01T00:00:00Z",
+        "mode": "0644",
+        "owner": "hermes",
+        "etag": "h:AAAAAAAAAAAAAAAAAAAAAA"
+      },
+      {
+        "path": "~/llama",
+        "type": "symlink",
+        "target": "x",
+        "targetType": "dir",
+        "resolvedPath": "/home/u/x"
+      },
+      {
+        "path": "~/x",
+        "error": "not_found"
+      }
+    ]
+  }
+}

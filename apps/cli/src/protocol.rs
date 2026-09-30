@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.7";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.8";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -69,6 +69,13 @@ fn parse_relay_protocol_version(version: &str) -> Option<(u32, u32)> {
 
 fn local_relay_protocol_version() -> (u32, u32) {
     parse_relay_protocol_version(RELAY_PROTOCOL_VERSION).expect("RELAY_PROTOCOL_VERSION is X.Y")
+}
+
+/// A supervised file op's result (`supervised.done.fileResult`), 2.8.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileOpResult {
+    pub op: String,
+    pub result: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +217,10 @@ pub enum ClientControlMessage {
         review: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_bytes: Option<u64>,
+        /// 2.8: the result of a supervised file op (`term.spawn` `kind:"file"`).
+        /// Answered `unsupported` until P5, so never set today.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_result: Option<FileOpResult>,
     },
     #[serde(rename = "exec.started")]
     ExecStarted { command_id: String },
@@ -223,6 +234,28 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
         timed_out: bool,
+    },
+    /// 2.8: a node file op finished. When `data_field` is set, that (emptied)
+    /// result field's text follows as a binary `file.data` frame of
+    /// `body_bytes` bytes.
+    #[serde(rename = "file.result")]
+    FileResult {
+        op_id: String,
+        op: String,
+        result: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_field: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_bytes: Option<usize>,
+    },
+    /// 2.8: a node file op was refused or failed (`reason` is a file error
+    /// code or `bad_frame` / `supervised_only` / `feature_disabled`).
+    #[serde(rename = "file.rejected")]
+    FileRejected {
+        op_id: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<Value>,
     },
     /// 2.7: static node facts, once per connection after `hello.ok`.
     #[serde(rename = "node.info")]
@@ -293,6 +326,8 @@ pub struct TerminalFeatureSnapshot {
     pub allow_human_terminal: bool,
     pub mcp_command_mode: McpCommandMode,
     pub require_terminal_approval: bool,
+    /// `allowFileToolsAsRoot` from config (2.8).
+    pub allow_file_tools_as_root: bool,
     /// The local `allowRemoteMetricSources` opt-in, read at startup.
     pub allow_remote_metric_sources: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
@@ -312,6 +347,12 @@ pub struct CliReportedFeatures {
     /// 2.7: whether this CLI accepts remotely defined metric sources
     /// (`metrics.sources.set`): the local `allowRemoteMetricSources` opt-in.
     pub remote_metric_sources: bool,
+    /// 2.8: the CLI's read-only file grant. Always false until the grant ships (P4).
+    pub mcp_file_read: bool,
+    /// 2.8: `fileRoots` are configured. Always false until P4.
+    pub file_roots_configured: bool,
+    /// 2.8: `allowFileToolsAsRoot` (config-backed, default false).
+    pub allow_file_tools_as_root: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,6 +378,8 @@ pub struct CliCapabilities {
     pub supervised_commands: bool,
     /// 2.7: this CLI sends `node.info`, `node.metrics` and `endpoint.load`.
     pub node_telemetry: bool,
+    /// 2.8: this CLI runs `file.op` (ops it has not implemented answer `unsupported`).
+    pub file_ops: bool,
     /// The browser pins this key and checks the signature before any
     /// terminal handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,11 +408,15 @@ impl CliCapabilities {
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
                 remote_metric_sources: snapshot.allow_remote_metric_sources,
+                mcp_file_read: false,
+                file_roots_configured: false,
+                allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
             terminal_viewers: true,
             supervised_commands: true,
             node_telemetry: true,
+            file_ops: true,
             terminal_identity: snapshot.terminal_identity.clone(),
         }
     }
@@ -893,6 +940,12 @@ enum KnownServerControlMessage {
         reason: Option<String>,
         requester: String,
         share_output: bool,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        file_op: Option<FileSpawnOp>,
+        #[serde(default)]
+        body_bytes: Option<usize>,
     },
     #[serde(rename = "supervised.cancel")]
     SupervisedCancel {
@@ -905,6 +958,24 @@ enum KnownServerControlMessage {
         id: String,
         sources: Vec<RemoteMetricSource>,
     },
+    #[serde(rename = "file.op")]
+    FileOp {
+        op_id: String,
+        op: String,
+        args: Value,
+        #[serde(default)]
+        body_bytes: Option<usize>,
+    },
+    #[serde(rename = "file.cancel")]
+    FileCancel { op_id: String },
+}
+
+/// The supervised-file payload of `term.spawn` (`kind:"file"`), 2.8.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSpawnOp {
+    pub op: String,
+    pub args: Value,
 }
 
 /// A supervised command request, as `term.spawn` carries it.
@@ -917,6 +988,18 @@ pub struct SupervisedSpawn {
     pub reason: Option<String>,
     pub requester: String,
     pub share_output: bool,
+    /// 2.8: `Some("file")` for a supervised file op (answered `unsupported`
+    /// until P5); `None`/`Some("command")` for a command.
+    pub kind: Option<String>,
+    pub file_op: Option<FileSpawnOp>,
+    pub body_bytes: Option<usize>,
+}
+
+impl SupervisedSpawn {
+    /// True for a supervised file op, which this CLI does not run yet.
+    pub fn is_file(&self) -> bool {
+        self.kind.as_deref() == Some("file") || self.file_op.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1092,17 @@ pub enum ServerControlMessage {
         id: String,
         sources: Vec<RemoteMetricSource>,
     },
+    /// 2.8: run one node file op (`args` is validated by `FileOps::execute`).
+    FileOp {
+        op_id: String,
+        op: String,
+        args: Value,
+        body_bytes: Option<usize>,
+    },
+    /// 2.8: cancel a pending file op.
+    FileCancel {
+        op_id: String,
+    },
     Unknown {
         type_name: String,
     },
@@ -1074,6 +1168,12 @@ pub enum RelayBinaryFrameMetadata {
         part: SupervisedOutputPart,
         seq: u64,
     },
+    /// 2.8, server to CLI: the content of a file write (one frame, <= 1 MiB).
+    #[serde(rename = "file.body")]
+    FileBody { op_id: String },
+    /// 2.8, CLI to server: a `file.result` text field above the inline 48 KiB.
+    #[serde(rename = "file.data")]
+    FileData { op_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,6 +1193,7 @@ impl RelayBinaryFrameMetadata {
             Self::ExecStdout { command_id, .. }
             | Self::ExecStderr { command_id, .. }
             | Self::SupervisedOutput { command_id, .. } => command_id,
+            Self::FileBody { op_id } | Self::FileData { op_id } => op_id,
         }
     }
 }
@@ -1410,6 +1511,8 @@ fn known_server_frame(type_name: &str) -> bool {
             | "term.spawn"
             | "supervised.cancel"
             | "metrics.sources.set"
+            | "file.op"
+            | "file.cancel"
     )
 }
 
@@ -1538,6 +1641,9 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 reason,
                 requester,
                 share_output,
+                kind,
+                file_op,
+                body_bytes,
             } => Self::TermSpawn(SupervisedSpawn {
                 terminal_id,
                 command_id,
@@ -1546,6 +1652,9 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 reason,
                 requester,
                 share_output,
+                kind,
+                file_op,
+                body_bytes,
             }),
             KnownServerControlMessage::SupervisedCancel { command_id, reason } => {
                 Self::SupervisedCancel {
@@ -1556,6 +1665,18 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
             KnownServerControlMessage::MetricsSourcesSet { id, sources } => {
                 Self::MetricsSourcesSet { id, sources }
             }
+            KnownServerControlMessage::FileOp {
+                op_id,
+                op,
+                args,
+                body_bytes,
+            } => Self::FileOp {
+                op_id,
+                op,
+                args,
+                body_bytes,
+            },
+            KnownServerControlMessage::FileCancel { op_id } => Self::FileCancel { op_id },
         }
     }
 }
@@ -1672,6 +1793,10 @@ pub enum FrameFault {
     /// A malformed `supervised.*` that names a command: end that command.
     CancelSupervised {
         command_id: String,
+    },
+    /// 2.8: a malformed `file.op` that names an op: answer `file.rejected bad_frame`.
+    RejectFile {
+        op_id: String,
     },
 }
 
@@ -1819,6 +1944,7 @@ fn known_binary_type(type_name: &str) -> bool {
             | "exec.stdout"
             | "exec.stderr"
             | "supervised.output"
+            | "file.body"
     )
 }
 
@@ -1830,6 +1956,16 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     // 2.7 telemetry control is advisory: a malformed definition list is
     // dropped and the relay keeps running.
     if type_name == "metrics.sources.set" {
+        return FrameFault::Ignore;
+    }
+    // 2.8 file frames: a bad `file.op` is refused by name; any other bad
+    // `file.*` frame is dropped (an unknown opId is never fatal).
+    if type_name == "file.op"
+        && let Some(op_id) = string_field(value, "opId").filter(|id| is_op_id_shaped(id))
+    {
+        return FrameFault::RejectFile { op_id };
+    }
+    if type_name.starts_with("file.") {
         return FrameFault::Ignore;
     }
     if type_name == "term.spawn"
@@ -1872,6 +2008,15 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
         return FrameFault::Fatal;
     }
     FrameFault::Ignore
+}
+
+/// 22 base64url characters: the shape of a 16-byte `opId`. A rejection only
+/// echoes ids of this shape, so a hostile frame cannot make one huge.
+fn is_op_id_shaped(id: &str) -> bool {
+    id.len() == 22
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -1987,6 +2132,7 @@ mod tests {
                 allow_human_terminal: false,
                 mcp_command_mode: McpCommandMode::Off,
                 require_terminal_approval: false,
+                allow_file_tools_as_root: false,
                 allow_remote_metric_sources: false,
                 terminal_public_key_b64url: "AQID".to_string(),
                 terminal_identity: None,
@@ -2010,6 +2156,7 @@ mod tests {
                     allow_human_terminal: false,
                     mcp_command_mode: McpCommandMode::Supervised,
                     require_terminal_approval: false,
+                    allow_file_tools_as_root: false,
                     allow_remote_metric_sources: false,
                     terminal_public_key_b64url: "AQID".to_string(),
                     terminal_identity: Some(TerminalIdentityProof {
@@ -2032,8 +2179,12 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.7""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.8""#));
         assert!(encoded.contains(r#""nodeTelemetry":true"#));
+        assert!(encoded.contains(r#""fileOps":true"#));
+        assert!(encoded.contains(r#""mcpFileRead":false"#));
+        assert!(encoded.contains(r#""fileRootsConfigured":false"#));
+        assert!(encoded.contains(r#""allowFileToolsAsRoot":false"#));
         assert!(encoded.contains(r#""remoteMetricSources":false"#));
         assert!(encoded.contains(r#""supervisedCommands":true"#));
         assert!(encoded.contains(r#""hostname":"desk-01.local""#));
@@ -2275,7 +2426,7 @@ mod tests {
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
-        assert!(message.contains("rejected relay protocol 2.7"), "{message}");
+        assert!(message.contains("rejected relay protocol 2.8"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -2300,11 +2451,22 @@ mod tests {
     }
 
     #[test]
+    fn a_27_server_upgrade_required_reply_says_to_upgrade_the_server() {
+        let message = hello_rejection_message(
+            "This server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart it.",
+        );
+        assert!(
+            message.contains("upgrade the WS Model Proxy server"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
-        // A 2.8 server's genuine "upgrade wsmp" must pass through: the CLI is
+        // A 2.9 server's genuine "upgrade wsmp" must pass through: the CLI is
         // the one behind, so do not tell the person to upgrade the server.
         let reply =
-            "This server requires a newer wsmp (relay protocol 2.8). Upgrade wsmp and restart it.";
+            "This server requires a newer wsmp (relay protocol 2.9). Upgrade wsmp and restart it.";
         assert_eq!(
             hello_rejection_message(reply),
             format!("relay protocol error: {reply}")
@@ -2388,6 +2550,7 @@ mod tests {
                 signal: None,
                 review: false,
                 output_bytes: Some(12),
+                file_result: None,
             })
             .expect("done"),
             r#"{"type":"supervised.done","commandId":"c","exitCode":0,"review":false,"outputBytes":12}"#
@@ -2399,6 +2562,7 @@ mod tests {
                 signal: Some("9".to_string()),
                 review: true,
                 output_bytes: None,
+                file_result: None,
             })
             .expect("done review"),
             r#"{"type":"supervised.done","commandId":"c","signal":"9","review":true}"#
@@ -2728,6 +2892,7 @@ mod relay_27_vectors {
             allow_human_terminal: false,
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
+            allow_file_tools_as_root: false,
             allow_remote_metric_sources: false,
             terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
             terminal_identity: None,
@@ -2746,7 +2911,7 @@ mod relay_27_vectors {
         };
         assert_eq!(
             encoded(&hello),
-            vector(include_str!("../tests/fixtures/relay-2.7/hello.json"))
+            vector(include_str!("../tests/fixtures/relay-2.8/hello.json"))
         );
     }
 
@@ -3081,5 +3246,225 @@ mod relay_27_vectors {
             control_frame_fault(r#"{"type":"metrics.sources.set","id":"x","sources":"nope"}"#),
             FrameFault::Ignore
         );
+    }
+}
+
+/// Relay 2.8 file frames, checked against the shared vectors in
+/// `tests/fixtures/relay-2.8/` that `apps/server/src/relay/file-protocol.test.ts`
+/// parses with its strict schemas: server-to-CLI frames must decode to exactly
+/// the vector's values, CLI-to-server frames must encode to exactly them.
+#[cfg(test)]
+mod relay_28_vectors {
+    use super::*;
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relay-2.8");
+    const OPS: [&str; 9] = [
+        "read", "stat", "list", "search", "edit", "write", "rename", "mkdir", "delete",
+    ];
+
+    fn vector(name: &str) -> Value {
+        let text = std::fs::read_to_string(format!("{FIXTURES}/{name}.json")).expect("fixture");
+        serde_json::from_str(&text).expect("vector is JSON")
+    }
+
+    fn text_of(name: &str) -> String {
+        std::fs::read_to_string(format!("{FIXTURES}/{name}.json")).expect("fixture")
+    }
+
+    fn encoded(message: &ClientControlMessage) -> Value {
+        serde_json::from_str(&encode_control(message).expect("encode")).expect("json")
+    }
+
+    fn str_field(value: &Value, key: &str) -> String {
+        value[key].as_str().expect(key).to_string()
+    }
+
+    #[test]
+    fn every_file_op_vector_decodes_to_its_values() {
+        for op in OPS {
+            let name = format!("file-op-{op}");
+            let frame = vector(&name);
+            let ServerControlMessage::FileOp {
+                op_id,
+                op: decoded_op,
+                args,
+                body_bytes,
+            } = parse_server_control(&text_of(&name)).expect("parse")
+            else {
+                panic!("{name} is not a file.op");
+            };
+            assert_eq!(op_id, str_field(&frame, "opId"), "{name}");
+            assert_eq!(decoded_op, op, "{name}");
+            assert_eq!(args, frame["args"], "{name}");
+            assert_eq!(
+                body_bytes,
+                frame
+                    .get("bodyBytes")
+                    .map(|v| v.as_u64().expect("n") as usize)
+            );
+            assert_eq!(body_bytes.is_some(), op == "write", "{name}");
+        }
+    }
+
+    #[test]
+    fn file_cancel_and_the_supervised_file_spawn_decode() {
+        let cancel = vector("file-cancel");
+        assert!(matches!(
+            parse_server_control(&text_of("file-cancel")).expect("parse"),
+            ServerControlMessage::FileCancel { op_id } if op_id == str_field(&cancel, "opId")
+        ));
+        let spawn = vector("file-term-spawn");
+        let ServerControlMessage::TermSpawn(decoded) =
+            parse_server_control(&text_of("file-term-spawn")).expect("parse")
+        else {
+            panic!("not a term.spawn");
+        };
+        assert!(decoded.is_file());
+        assert_eq!(decoded.kind.as_deref(), Some("file"));
+        let file_op = decoded.file_op.expect("fileOp");
+        assert_eq!(file_op.op, "edit");
+        assert_eq!(file_op.args, spawn["fileOp"]["args"]);
+        assert_eq!(decoded.command, str_field(&spawn, "command"));
+        // A plain command spawn is not a file op.
+        let command = r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls","requester":"a","shareOutput":false}"#;
+        let ServerControlMessage::TermSpawn(plain) = parse_server_control(command).expect("parse")
+        else {
+            panic!("not a term.spawn");
+        };
+        assert!(!plain.is_file());
+        // An unknown field inside `fileOp` refuses the whole frame.
+        let loose =
+            text_of("file-term-spawn").replace("\"op\": \"edit\"", "\"op\": \"edit\", \"x\": 1");
+        assert!(parse_server_control(&loose).is_err());
+    }
+
+    #[test]
+    fn binary_metadata_vectors_round_trip() {
+        for (name, is_body) in [("file-body-metadata", true), ("file-data-metadata", false)] {
+            let frame = vector(name);
+            let op_id = str_field(&frame, "opId");
+            let metadata = if is_body {
+                RelayBinaryFrameMetadata::FileBody {
+                    op_id: op_id.clone(),
+                }
+            } else {
+                RelayBinaryFrameMetadata::FileData {
+                    op_id: op_id.clone(),
+                }
+            };
+            assert_eq!(
+                serde_json::to_value(&metadata).expect("json"),
+                frame,
+                "{name}"
+            );
+            let encoded = encode_binary_frame(&metadata, b"payload").expect("encode");
+            let (decoded, body) = parse_binary_frame(&encoded).expect("parse");
+            assert_eq!(decoded, metadata);
+            assert_eq!(decoded.routing_id(), op_id);
+            assert_eq!(body, b"payload");
+        }
+        // One frame carries at most 1 MiB.
+        let metadata = RelayBinaryFrameMetadata::FileData {
+            op_id: "x".to_string(),
+        };
+        assert!(encode_binary_frame(&metadata, &vec![0; RELAY_BINARY_CHUNK_MAX_BYTES]).is_ok());
+        assert!(
+            encode_binary_frame(&metadata, &vec![0; RELAY_BINARY_CHUNK_MAX_BYTES + 1]).is_err()
+        );
+    }
+
+    fn result_message(frame: &Value) -> ClientControlMessage {
+        ClientControlMessage::FileResult {
+            op_id: str_field(frame, "opId"),
+            op: str_field(frame, "op"),
+            result: frame["result"].clone(),
+            data_field: frame
+                .get("dataField")
+                .map(|v| v.as_str().expect("s").to_string()),
+            body_bytes: frame
+                .get("bodyBytes")
+                .map(|v| v.as_u64().expect("n") as usize),
+        }
+    }
+
+    #[test]
+    fn every_file_result_and_rejection_vector_encodes_exactly() {
+        let mut names: Vec<String> = OPS.iter().map(|op| format!("file-result-{op}")).collect();
+        names
+            .extend(["file-result-read-unchanged", "file-result-read-spilled"].map(str::to_string));
+        for name in names {
+            let frame = vector(&name);
+            assert_eq!(encoded(&result_message(&frame)), frame, "{name}");
+        }
+        for name in [
+            "file-rejected-conflict",
+            "file-rejected-bad-frame",
+            "file-rejected-match-count",
+        ] {
+            let frame = vector(name);
+            let message = ClientControlMessage::FileRejected {
+                op_id: str_field(&frame, "opId"),
+                reason: str_field(&frame, "reason"),
+                detail: frame.get("detail").cloned(),
+            };
+            assert_eq!(encoded(&message), frame, "{name}");
+        }
+    }
+
+    #[test]
+    fn supervised_done_carries_a_file_result_only_when_set() {
+        let frame = vector("file-supervised-done");
+        let message = ClientControlMessage::SupervisedDone {
+            command_id: str_field(&frame, "commandId"),
+            exit_code: None,
+            signal: None,
+            review: false,
+            output_bytes: None,
+            file_result: Some(FileOpResult {
+                op: str_field(&frame["fileResult"], "op"),
+                result: frame["fileResult"]["result"].clone(),
+            }),
+        };
+        assert_eq!(encoded(&message), frame);
+    }
+
+    #[test]
+    fn a_malformed_file_op_is_rejected_by_name_and_other_bad_file_frames_are_ignored() {
+        let id = "AAECAwQFBgcICQoLDA0ODw";
+        // Missing `args`: unparsable, but it names its op.
+        let missing = format!(r#"{{"type":"file.op","opId":"{id}","op":"read"}}"#);
+        assert!(parse_server_control(&missing).is_err());
+        assert!(matches!(
+            control_frame_fault(&missing),
+            FrameFault::RejectFile { op_id } if op_id == id
+        ));
+        // Wrong types and a lone-surrogate escape in the args still name it.
+        let wrong = format!(r#"{{"type":"file.op","opId":"{id}","op":5,"args":{{}}}}"#);
+        assert!(matches!(
+            control_frame_fault(&wrong),
+            FrameFault::RejectFile { .. }
+        ));
+        // A frame with no usable opId, and a bad file.cancel, are dropped.
+        for text in [
+            r#"{"type":"file.op","op":"read"}"#,
+            r#"{"type":"file.op","opId":"short","op":"read"}"#,
+            r#"{"type":"file.op","opId":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#,
+            r#"{"type":"file.cancel"}"#,
+            r#"{"type":"file.cancel","opId":7}"#,
+        ] {
+            assert!(
+                matches!(control_frame_fault(text), FrameFault::Ignore),
+                "{text}"
+            );
+        }
+        // Bad `file.body` metadata is ignored, never fatal.
+        let metadata = br#"{"type":"file.body"}"#;
+        let mut frame = (metadata.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(metadata);
+        frame.extend_from_slice(b"x");
+        assert!(matches!(
+            binary_frame_fault(&frame),
+            Err(FrameFault::Ignore)
+        ));
     }
 }

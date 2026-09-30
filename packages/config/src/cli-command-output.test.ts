@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   appendRollingTail,
+  byteTransitionTableBuildCount,
   CLI_OUTPUT_ELLIPSIS,
   CLI_STREAM_HEAD_MAX_BYTES,
   CLI_STREAM_TAIL_MAX_BYTES,
@@ -270,9 +271,10 @@ describe("appendRollingTail", () => {
   // The tracker runs on the server's event loop for every byte of headless
   // output: its cost per byte must not depend on what the output looks like
   // (C3b-1/C4-1/C5-1 found shapes 10-40x slower than plain text).
-  it("costs the same work per byte for every output shape", () => {
+  it("does the same work per byte for every output shape", () => {
     const shape = (prefix: string, unit: number[]) => {
-      const body = new Uint8Array(1 << 20);
+      // 64 KiB is plenty: the check counts reads, and a Proxy trap per byte is slow.
+      const body = new Uint8Array(1 << 16);
       for (let at = 0; at < body.length; at += 1) body[at] = unit[at % unit.length] ?? 0;
       return { prefix: bytes(prefix), body };
     };
@@ -291,29 +293,33 @@ describe("appendRollingTail", () => {
         Array.from({ length: 251 }, (_, n) => (n * 37) & 0xff),
       ),
     };
-    const timeOnce = (value: { prefix: Uint8Array; body: Uint8Array }) => {
-      const state = new TerminalByteState();
-      state.consume(value.prefix, 0, value.prefix.length);
-      const started = performance.now();
-      state.consume(value.body, 0, value.body.length);
-      return ((performance.now() - started) * 1e6) / value.body.length;
+    // Work is counted, not timed: a wall-clock ratio over ~1 ms windows flaked
+    // whenever another process preempted one shape's window. `consume` must read
+    // each input byte exactly once and never rebuild the transition table, whatever
+    // the shape, and stepping byte by byte must land on the same state.
+    const countedReads = (body: Uint8Array) => {
+      let reads = 0;
+      const counted = new Proxy(body, {
+        get(target, key) {
+          if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+          return Reflect.get(target, key, target) as unknown;
+        },
+      });
+      return { counted, reads: () => reads };
     };
-    // Interleaved rounds, each shape's minimum: a burst of contention during
-    // one shape's window cannot single it out.
-    const costs: Record<string, number> = {};
-    for (let round = 0; round < 7; round += 1) {
-      for (const [name, value] of Object.entries(shapes)) {
-        const cost = timeOnce(value);
-        costs[name] = Math.min(costs[name] ?? Number.POSITIVE_INFINITY, cost);
-      }
-    }
-    const cheapest = Math.min(...Object.values(costs));
-    for (const [name, cost] of Object.entries(costs)) {
-      // One table load per byte: every shape within a small factor of the
-      // cheapest (the regressions this guards were 10-40x), and far above the
-      // event-loop-blocking rates measured before.
-      expect(cost, `${name} ${JSON.stringify(costs)}`).toBeLessThan(Math.max(6 * cheapest, 2));
-      expect(cost, name).toBeLessThan(50);
+    for (const [name, value] of Object.entries(shapes)) {
+      const bounded = new TerminalByteState();
+      bounded.consume(value.prefix, 0, value.prefix.length);
+      const builds = byteTransitionTableBuildCount();
+      const { counted, reads } = countedReads(value.body);
+      expect(bounded.consume(counted, 0, value.body.length), name).toBe(value.body.length);
+      expect(reads(), `${name} reads each input byte once`).toBe(value.body.length);
+      expect(byteTransitionTableBuildCount(), `${name} does not rebuild the table`).toBe(builds);
+
+      const stepped = new TerminalByteState();
+      for (const byte of value.prefix) stepped.feed(byte);
+      for (const byte of value.body) stepped.feed(byte);
+      expect(stepped.atBoundary, `${name} feed/consume agree`).toBe(bounded.atBoundary);
     }
   });
 

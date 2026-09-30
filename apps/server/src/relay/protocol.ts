@@ -10,6 +10,16 @@ import {
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
+import {
+  type FileOp,
+  type FileOpFrame,
+  fileBodyMetadataSchema,
+  fileDataMetadataSchema,
+  fileOpResultSchema,
+  fileRejectedFrameSchema,
+  fileResultFrameSchema,
+  fileSpawnSpecSchema,
+} from "./file-protocol.js";
 import { isWellFormedText, stringifyWellFormed } from "./wire-text.js";
 
 export {
@@ -19,11 +29,13 @@ export {
   relayProtocolAtLeast,
 };
 
+type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
+
 /**
- * Sent as `protocol.error` to a CLI whose hello is older than 2.7. Every
+ * Sent as `protocol.error` to a CLI whose hello is older than 2.8. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
  * text is what the person sees. It names the protocol rather than a wsmp
- * version: the first release that speaks 2.7 is cut separately.
+ * version: the first release that speaks 2.8 is cut separately.
  */
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
@@ -129,7 +141,7 @@ const terminalIdentitySchema = z
 
 const mcpCommandModeSchema = z.enum(["off", "supervised", "unsupervised"]);
 
-const v27FeatureSchema = z
+const v28FeatureSchema = z
   .object({
     humanTerminal: z.boolean(),
     /** The CLI's own MCP command policy (`wsmp config set-mcp-commands`). */
@@ -141,17 +153,26 @@ const v27FeatureSchema = z
      * (`metrics.sources.set`): its local opt-in is on. False until S-B part 2.
      */
     remoteMetricSources: z.boolean(),
+    /**
+     * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`). False
+     * until the read grant ships (P4); reported now so the fleet upgrades once.
+     */
+    mcpFileRead: z.boolean(),
+    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). False until P4. */
+    fileRootsConfigured: z.boolean(),
+    /** 2.8: `wsmp config set-file-tools-as-root on` (default off). */
+    allowFileToolsAsRoot: z.boolean(),
   })
   .strict();
 
 /**
  * 2.6: multi-viewer terminals (server-minted viewer ids, broadcast output),
  * CLI identity proof, and supervised terminals (`term.spawn`). 2.7: node
- * telemetry.
+ * telemetry. 2.8: node file tools.
  */
-const v27CliCapabilitiesSchema = z
+const v28CliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.literal("2.7"),
+    protocolVersion: z.literal("2.8"),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -164,12 +185,14 @@ const v27CliCapabilitiesSchema = z
     standardizedMetrics: z.literal(true),
     terminal: z.literal(true),
     exec: z.literal(true),
-    features: v27FeatureSchema,
+    features: v28FeatureSchema,
     terminalPublicKey: uncompressedP256PublicKeySchema,
     terminalViewers: z.literal(true),
     supervisedCommands: z.literal(true),
     /** 2.7: the CLI sends `node.info`, `node.metrics` and `endpoint.load`. */
     nodeTelemetry: z.literal(true),
+    /** 2.8: the CLI runs `file.op` (answers `unsupported` for ops it has not implemented). */
+    fileOps: z.literal(true),
     /** Absent when the CLI could not load its identity; browsers then refuse it. */
     terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
@@ -530,7 +553,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.literal("2.7"),
+      protocolVersion: z.literal("2.8"),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -538,7 +561,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
           version: z.string().trim().max(80).optional(),
-          capabilities: v27CliCapabilitiesSchema,
+          capabilities: v28CliCapabilitiesSchema,
         })
         .strict(),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
@@ -713,6 +736,8 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       review: z.boolean(),
       /** Total output bytes after Enter; present only when output frames were sent. */
       outputBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      /** 2.8: the result of a supervised file op (`term.spawn kind:"file"`); answered `unsupported` until P5. */
+      fileResult: fileOpResultSchema.optional(),
     })
     .strict(),
   z
@@ -740,6 +765,8 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   nodeInfoSchema,
   nodeMetricsSchema,
   endpointLoadSchema,
+  fileResultFrameSchema,
+  fileRejectedFrameSchema,
 ]);
 export type RelayClientControlMessage = z.infer<typeof relayClientControlMessageSchema>;
 
@@ -833,6 +860,10 @@ export type RelayServerControlMessage =
       /** Server-asserted: the requesting MCP token's name. */
       requester: string;
       shareOutput: boolean;
+      /** 2.8: `"file"` carries `fileOp` (and `bodyBytes` for a write); the CLI answers `unsupported` until P5. */
+      kind?: "command" | "file";
+      fileOp?: FileSpawnSpec;
+      bodyBytes?: number;
     }
   | {
       type: "supervised.cancel";
@@ -853,7 +884,16 @@ export type RelayServerControlMessage =
       type: "metrics.sources.set";
       id: string;
       sources: RemoteMetricSource[];
-    };
+    }
+  | {
+      /** 2.8: run one node file op. Write content follows as one `file.body` binary frame. */
+      type: "file.op";
+      opId: string;
+      op: FileOp;
+      args: FileOpFrame["args"];
+      bodyBytes?: number;
+    }
+  | { type: "file.cancel"; opId: string };
 
 const relayBodyMetadataFields = {
   requestId: requestIdSchema,
@@ -906,6 +946,10 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
       seq: sealedSeqSchema,
     })
     .strict(),
+  /** 2.8: write content, server to CLI, one frame of at most 1 MiB. */
+  fileBodyMetadataSchema,
+  /** 2.8: a `file.result` text field above the inline 48 KiB, CLI to server. */
+  fileDataMetadataSchema,
 ]);
 
 export type RelayBinaryFrameMetadata = z.infer<typeof relayBinaryFrameMetadataSchema>;
@@ -964,8 +1008,8 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello that is not the minimum protocol 2.7: a different protocol
- * version (older than 2.7, or newer than this server speaks), or the
+ * True for a hello that is not the minimum protocol 2.8: a different protocol
+ * version (older than 2.8, or newer than this server speaks), or the
  * pre-naming `cli.label` field. Checked before the strict schema so such a CLI
  * gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed
  * message".

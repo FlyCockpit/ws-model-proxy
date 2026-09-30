@@ -75,6 +75,15 @@ vi.mock("./cli-command-tools.js", async (importOriginal) => {
   };
 });
 
+vi.mock("./cli-file-tools.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cli-file-tools.js")>();
+  return {
+    ...actual,
+    // The core hands the projector `{op, result}`; here `result` is the poison.
+    runForwarderCliFileTool: vi.fn(async (op: string) => ({ op, result: poison.output })),
+  };
+});
+
 const { runManifestTool } = await import("./tools");
 const { MCP_TOOL_MANIFEST } = await import("./tool-manifest");
 const { createMcpContext } = await import("./context");

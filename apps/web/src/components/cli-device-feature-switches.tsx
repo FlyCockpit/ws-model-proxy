@@ -320,6 +320,20 @@ export function CliDeviceFeatureSwitches({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {features.fileTools ? (
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:clis.features.fileTools", {
+            read: t(`dashboard:clis.features.fileToolAccess.${features.fileTools.read}`),
+            write: t(`dashboard:clis.features.fileToolAccess.${features.fileTools.write}`),
+          })}
+        </p>
+      ) : null}
+      {features.allowFileToolsAsRoot === true ? (
+        <div className="flex min-w-0 gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" />
+          <p className="min-w-0">{t("dashboard:clis.features.fileToolsAsRoot")}</p>
+        </div>
+      ) : null}
       {showApproval ? (
         <div className="flex min-w-0 gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
           <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />

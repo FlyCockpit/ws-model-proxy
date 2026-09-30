@@ -35,6 +35,12 @@ vi.mock("../relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
 }));
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
 
 const { MCP_TOOL_MANIFEST, MCP_TOOL_EXCLUSIONS } = await import("./tool-manifest");
 const { appRouter } = await import("@ws-model-proxy/api/routers/index");
@@ -70,6 +76,10 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "relay_requests_list",
   "overview_metrics",
   "overview_health",
+  "forwarder_cli_file_read",
+  "forwarder_cli_file_stat",
+  "forwarder_cli_dir_list",
+  "forwarder_cli_file_search",
 ];
 
 /** Write catalog — exact names, verbatim. */
@@ -129,6 +139,11 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
+  "forwarder_cli_file_edit",
+  "forwarder_cli_file_write",
+  "forwarder_cli_file_rename",
+  "forwarder_cli_dir_create",
+  "forwarder_cli_file_delete",
 ];
 
 /** Confirmation literals for the write catalog. */
@@ -155,6 +170,11 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_chat_completion_test: "RUN",
   forwarder_cli_command_run: "RUN",
   forwarder_cli_supervised_command_start: "RUN",
+  forwarder_cli_file_edit: "RUN",
+  forwarder_cli_file_write: "RUN",
+  forwarder_cli_file_rename: "RUN",
+  forwarder_cli_dir_create: "RUN",
+  forwarder_cli_file_delete: "DELETE",
   forwarder_pool_routing_rules_set: "RUN",
   forwarder_pool_member_engine_load_set: "RUN",
   forwarder_device_metric_sources_set: "RUN",
@@ -247,6 +267,15 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_cli_command_run: "core:forwarderCliCommandRun",
   forwarder_cli_supervised_command_start: "core:forwarderCliSupervisedCommandStart",
   forwarder_cli_command_result: "core:forwarderCliCommandResult",
+  forwarder_cli_file_read: "core:forwarderCliFileRead",
+  forwarder_cli_file_stat: "core:forwarderCliFileStat",
+  forwarder_cli_dir_list: "core:forwarderCliFileList",
+  forwarder_cli_file_search: "core:forwarderCliFileSearch",
+  forwarder_cli_file_edit: "core:forwarderCliFileEdit",
+  forwarder_cli_file_write: "core:forwarderCliFileWrite",
+  forwarder_cli_file_rename: "core:forwarderCliFileRename",
+  forwarder_cli_dir_create: "core:forwarderCliFileMkdir",
+  forwarder_cli_file_delete: "core:forwarderCliFileDelete",
 });
 
 /**
@@ -303,13 +332,13 @@ describe("MCP tool manifest — exact catalog", () => {
     }
   });
 
-  it("contains exactly 29 read + 55 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 33 read + 60 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(29);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(55);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(84);
+    expect(PLAN_READ_TOOLS).toHaveLength(33);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(60);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(93);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -507,7 +536,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 84 catalog entries − 5 extracted cores = 79 procedure dispatches.
+    // 93 catalog entries − 14 extracted cores = 79 procedure dispatches.
     expect(dispatched).toBe(79);
     expect(invoked).toHaveLength(79);
 

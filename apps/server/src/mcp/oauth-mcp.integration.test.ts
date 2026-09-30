@@ -129,6 +129,12 @@ vi.mock("../relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
 }));
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
 
 vi.mock("@ws-model-proxy/env/server", () => {
   const env = {
@@ -524,7 +530,10 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
       create: { identifier: CANONICAL, name: "WS Model Proxy MCP" },
       update: {},
     });
-  });
+    // The hook cold-imports the whole production auth graph (Vite transforms it on
+    // first use) and builds the app; on a contended host that alone can outlast
+    // vitest's 10 s default hook timeout, which is a bound on a hang, not on speed.
+  }, 120_000);
 
   afterAll(async () => {
     listener?.close();

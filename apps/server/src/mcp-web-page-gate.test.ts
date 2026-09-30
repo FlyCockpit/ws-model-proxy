@@ -12,6 +12,12 @@ vi.mock("./relay/cli-commands.js", () => ({
   listPendingSupervised: vi.fn(() => []),
   submitSupervisedOutput: vi.fn(),
 }));
+vi.mock("./relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
 
 /**
  * MCP web login/consent page gate tests (Phase 6; invariant 13).

@@ -1,0 +1,9 @@
+{
+  "type": "file.result",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "delete",
+  "result": {
+    "deleted": true,
+    "type": "file"
+  }
+}
