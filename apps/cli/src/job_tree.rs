@@ -306,7 +306,9 @@ mod tests {
                     lock_until(&job.child, Instant::now() + Duration::from_millis(100))
                         .expect("job lock released between polls"),
                 );
-                thread::sleep(Duration::from_millis(1));
+                // Probe rarely: a probe that collides with a poll makes the
+                // reaper skip one, which would distort the measured interval.
+                thread::sleep(Duration::from_millis(25));
             }
             assert!(waiter.join().expect("reaper thread").success());
             let polls = lock_until(&polls, Instant::now()).expect("poll log");

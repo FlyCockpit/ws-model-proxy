@@ -946,6 +946,7 @@ mod tests {
                 Duration::from_secs(30)
             };
             let args = tree.command(if path == "eof" { "eof" } else { "detach" });
+            let run_started = Instant::now();
             thread::scope(|scope| {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();
                 let args = &args;
@@ -994,7 +995,8 @@ mod tests {
                     if path == "cancel" {
                         cancel.store(true, Ordering::SeqCst);
                     } else {
-                        thread::sleep(timeout);
+                        // The deadline runs from run() entry, not from fixture startup.
+                        thread::sleep(timeout.saturating_sub(run_started.elapsed()));
                     }
                     if !pending_handoff {
                         assert!(
