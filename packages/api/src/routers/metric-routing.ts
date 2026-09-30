@@ -283,8 +283,10 @@ export const metricRoutingProcedures = {
    * Per-member live engine load override (S-D). `auto` lets the engine's live
    * load (`endpoint.load`) mark the member FULL; `off` ignores it. The optional
    * `kvFullThreshold` (0-1) overrides the 0.95 default for vLLM/SGLang; null
-   * clears it. The pool's stored verdicts are cleared by the relay (H) so the
-   * change applies at the device's next `endpoint.load` frame.
+   * clears it. The relay (H) clears the pool's stored verdicts. A changed
+   * override invalidates this member's cache in every process, so it is
+   * re-published at the device's next evaluation. Unchanged siblings follow
+   * the regular refresh budget when their session is on another process.
    */
   setPoolMemberEngineLoad: protectedProcedure
     .input(

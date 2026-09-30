@@ -3416,10 +3416,12 @@ describe("relay 2.7 telemetry", () => {
       deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
       const { manager, socket } = await registered();
       // The first accepted waiting frame is streak 1: below the sustained
-      // threshold, the evaluation writes nothing.
+      // threshold, the evaluation publishes only the successor NONE fence.
       await manager.handleTextFrame(socket, waitingLoad(2), now);
       await vi.advanceTimersByTimeAsync(0);
-      expect(deep.poolMemberRoutingVerdict.create).not.toHaveBeenCalled();
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ verdict: "NONE", engineState: "clear" }),
+      });
       // A second accepted frame within the staleness window makes streak 2.
       vi.setSystemTime(at(3_000));
       await manager.handleTextFrame(socket, waitingLoad(2), at(3_000));

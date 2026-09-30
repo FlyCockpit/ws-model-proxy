@@ -159,6 +159,241 @@ async function verdictOf(db: Db, poolMemberId: string) {
 }
 
 integration("PostgreSQL live engine load at candidate build and grant time", () => {
+  it.each(["sequential", "delayed create", "rules control"])(
+    "successor fence: %s restores candidate and queued admission",
+    async (scenario) => {
+      if (!databaseUrl) return;
+      const db = createFixturePrismaClient(databaseUrl);
+      const f = await fixture(db);
+      let release: () => void = () => undefined;
+      let entered: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let pending: Promise<void> | undefined;
+      try {
+        const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+          "../../relay/metric-routing-evaluator.js"
+        );
+        const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+        const { applyMetricRoutingVerdicts } = await import("../metric-routing-order.js");
+        if (scenario === "rules control") {
+          await db.modelPool.update({
+            where: { id: f.pool.id },
+            data: {
+              routingRules: [
+                { metric: "endpoint.waiting", op: ">=", threshold: 2, effect: "full" },
+              ],
+            },
+          });
+        }
+        let now = new Date();
+        const a = createRoutingEvaluationState(f.user.id, f.device.id);
+        const b = createRoutingEvaluationState(f.user.id, f.device.id);
+        // Pause before a real PostgreSQL CREATE through Prisma's query hook;
+        // the successor uses its own client path and can publish meanwhile.
+        const predecessorDb = db.$extends({
+          query: {
+            poolMemberRoutingVerdict: {
+              async create({ args, query }) {
+                if (scenario === "delayed create" && args.data.poolMemberId === f.a.id) {
+                  entered();
+                  await gate;
+                }
+                return query(args);
+              },
+            },
+          },
+        });
+        const predecessor = new MetricRoutingEvaluator(predecessorDb as never, () => now);
+        const successor = new MetricRoutingEvaluator(db as never, () => now);
+        const store = new PostgresCapacityAdmissionStore(db, "successor-proof");
+        const holdA = admitted(await store.acquire(f.attempt([f.a])));
+        admitted(await store.acquire(f.attempt([f.b])));
+        const queued = f.attempt([f.a, f.b]);
+        expect((await store.acquire(queued)).state).toBe("WAITING");
+        const hotInputs = {
+          nodeMetrics: null,
+          endpointLoad: [
+            f.reading(f.a, { kvUsage: 0.99, receivedAt: now }),
+            f.reading(f.b, { receivedAt: now }),
+          ],
+        };
+        if (scenario === "delayed create") {
+          pending = predecessor.evaluate(a, hotInputs);
+          await started;
+          expect(await verdictOf(db, f.a.id)).toBeNull();
+        } else {
+          await predecessor.evaluate(a, hotInputs);
+          expect(await verdictOf(db, f.a.id)).toMatchObject({
+            verdict: "FULL",
+            engineState: "full_kv",
+          });
+          const blocked = await applyMetricRoutingVerdicts([
+            { poolMemberId: f.a.id },
+            { poolMemberId: f.b.id },
+          ]);
+          expect(blocked.candidates.map((candidate) => candidate.poolMemberId)).toEqual([f.b.id]);
+        }
+        predecessor.cancel(a);
+        now = new Date(now.getTime() + 1_000);
+        await successor.evaluate(b, {
+          nodeMetrics: null,
+          endpointLoad: [
+            f.reading(f.a, { kvUsage: 0.2, receivedAt: now }),
+            f.reading(f.b, { receivedAt: now }),
+          ],
+        });
+        expect(await verdictOf(db, f.a.id)).toMatchObject({
+          verdict: "NONE",
+          engineState: "clear",
+          publisherId: b.publisherId,
+          evaluatedAt: now,
+          ruleStates: scenario === "rules control" ? ["clear"] : [],
+        });
+        release();
+        await pending;
+        expect(await verdictOf(db, f.a.id)).toMatchObject({
+          verdict: "NONE",
+          publisherId: b.publisherId,
+        });
+        const built = await applyMetricRoutingVerdicts([
+          { poolMemberId: f.a.id },
+          { poolMemberId: f.b.id },
+        ]);
+        expect(built.candidates).toHaveLength(2);
+        await store.release(holdA);
+        expect(await requestState(db, queued.attemptId)).toEqual({
+          state: "ADMITTED",
+          poolMemberId: f.a.id,
+        });
+      } finally {
+        release();
+        await pending;
+        await f.cleanup();
+        await db.$disconnect();
+      }
+    },
+  );
+
+  it.each([0.2, 0.99])(
+    "successor fence: KV %s obeys the idle and FULL refresh budgets",
+    async (kvUsage) => {
+      if (!databaseUrl) return;
+      const db = createFixturePrismaClient(databaseUrl);
+      const f = await fixture(db);
+      const create = vi.spyOn(db.poolMemberRoutingVerdict, "create");
+      const update = vi.spyOn(db.poolMemberRoutingVerdict, "updateMany");
+      try {
+        const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+          "../../relay/metric-routing-evaluator.js"
+        );
+        let now = new Date();
+        const evaluator = new MetricRoutingEvaluator(db as never, () => now);
+        const state = createRoutingEvaluationState(f.user.id, f.device.id);
+        for (let frame = 0; frame < 6; frame += 1) {
+          await evaluator.evaluate(state, {
+            nodeMetrics: null,
+            endpointLoad: [f.reading(f.a, { kvUsage, receivedAt: now })],
+          });
+          expect(
+            create.mock.calls.filter(([args]) => args.data.poolMemberId === f.a.id),
+          ).toHaveLength(1);
+          expect(
+            update.mock.calls.filter(([args]) => args.where?.poolMemberId === f.a.id),
+          ).toHaveLength(kvUsage === 0.99 && frame === 5 ? 2 : 1);
+          now = new Date(now.getTime() + 1_000);
+        }
+      } finally {
+        create.mockRestore();
+        update.mockRestore();
+        await f.cleanup();
+        await db.$disconnect();
+      }
+    },
+  );
+
+  it("successor fence: another process's override edit restores an unchanged FULL at the next frame", async () => {
+    if (!databaseUrl) return;
+    const db = createFixturePrismaClient(databaseUrl);
+    const f = await fixture(db);
+    try {
+      const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+        "../../relay/metric-routing-evaluator.js"
+      );
+      let now = new Date();
+      const evaluator = new MetricRoutingEvaluator(db as never, () => now);
+      const state = createRoutingEvaluationState(f.user.id, f.device.id);
+      await db.poolMember.update({ where: { id: f.a.id }, data: { kvFullThreshold: 0.95 } });
+      await evaluator.evaluate(state, {
+        nodeMetrics: null,
+        endpointLoad: [f.reading(f.a, { kvUsage: 0.97, receivedAt: now })],
+      });
+      await db.poolMember.update({ where: { id: f.a.id }, data: { kvFullThreshold: 0.96 } });
+      await new MetricRoutingEvaluator(db as never, () => now).clearPool(f.pool.id);
+      expect(await verdictOf(db, f.a.id)).toBeNull();
+      now = new Date(now.getTime() + 1_000);
+      await evaluator.evaluate(state, {
+        nodeMetrics: null,
+        endpointLoad: [f.reading(f.a, { kvUsage: 0.97, receivedAt: now })],
+      });
+      expect(await verdictOf(db, f.a.id)).toMatchObject({
+        verdict: "FULL",
+        engineState: "full_kv",
+        evaluatedAt: now,
+      });
+    } finally {
+      await f.cleanup();
+      await db.$disconnect();
+    }
+  });
+
+  it.each(["member leaves", "local clear"])(
+    "successor fence: %s resets the probe",
+    async (event) => {
+      if (!databaseUrl) return;
+      const db = createFixturePrismaClient(databaseUrl);
+      const f = await fixture(db);
+      try {
+        const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
+          "../../relay/metric-routing-evaluator.js"
+        );
+        let now = new Date();
+        const evaluator = new MetricRoutingEvaluator(db as never, () => now);
+        const state = createRoutingEvaluationState(f.user.id, f.device.id);
+        const inputs = () => ({
+          nodeMetrics: null,
+          endpointLoad: [f.reading(f.a, { kvUsage: 0.2, receivedAt: now })],
+        });
+        await evaluator.evaluate(state, inputs());
+        now = new Date(now.getTime() + 1_000);
+        if (event === "member leaves") {
+          const otherDevice = await db.cliDevice.create({
+            data: { userId: f.user.id, slug: `other-${crypto.randomUUID()}` },
+          });
+          const endpoint = { userId: f.user.id, slug: f.a.endpointSlug };
+          await db.endpoint.updateMany({ where: endpoint, data: { cliDeviceId: otherDevice.id } });
+          await evaluator.evaluate(state, inputs());
+          expect(state.probed.has(f.a.id)).toBe(false);
+          await db.endpoint.updateMany({ where: endpoint, data: { cliDeviceId: f.device.id } });
+        } else {
+          await evaluator.clearPool(f.pool.id);
+        }
+        await evaluator.evaluate(state, inputs());
+        expect(await verdictOf(db, f.a.id)).toMatchObject({ verdict: "NONE", evaluatedAt: now });
+        now = new Date(now.getTime() + 1_000);
+        await evaluator.evaluate(state, inputs());
+        expect((await verdictOf(db, f.a.id))?.evaluatedAt.getTime()).toBe(now.getTime() - 1_000);
+      } finally {
+        await f.cleanup();
+        await db.$disconnect();
+      }
+    },
+  );
+
   it("a sustained-waiting vLLM member is FULL: a queued waiter is not granted on it, only elsewhere", async () => {
     if (!databaseUrl) return;
     const db = createFixturePrismaClient(databaseUrl);
@@ -186,8 +421,8 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
         engineState: "full_waiting",
         cliDeviceId: f.device.id,
       });
-      // Idle B and rule-less members get no row at all.
-      expect(await verdictOf(db, f.b.id)).toBeNull();
+      // Idle B gets one successor fence, which never gates admission.
+      expect(await verdictOf(db, f.b.id)).toMatchObject({ verdict: "NONE" });
 
       // Candidate build drops A (B is free of engine pressure).
       const built = await applyMetricRoutingVerdicts([
@@ -237,8 +472,8 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
           f.reading(f.b, { waiting: 5, waitingStreak: 5, kvUsage: 1 }),
         ],
       });
-      expect(await verdictOf(db, f.a.id)).toBeNull();
-      expect(await verdictOf(db, f.b.id)).toBeNull();
+      expect(await verdictOf(db, f.a.id)).toMatchObject({ verdict: "NONE", engineState: "stale" });
+      expect(await verdictOf(db, f.b.id)).toMatchObject({ verdict: "NONE", engineState: "off" });
       // Lease counts decide: A takes the first request, B the second.
       expect(admitted(await store.acquire(f.attempt([f.a, f.b]))).poolMemberId).toBe(f.a.id);
       expect(admitted(await store.acquire(f.attempt([f.a, f.b]))).poolMemberId).toBe(f.b.id);
@@ -248,7 +483,7 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
         nodeMetrics: null,
         endpointLoad: [f.reading(f.a, { waiting: 5, waitingStreak: 1 })],
       });
-      expect(await verdictOf(db, f.a.id)).toBeNull();
+      expect(await verdictOf(db, f.a.id)).toMatchObject({ verdict: "NONE" });
     } finally {
       await f.cleanup();
       await db.$disconnect();
@@ -355,9 +590,10 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
         });
       }
       // 30 frames inside one refresh window: one write for A (the fenced
-      // publish tries the conditional update once, then creates), none for B.
-      expect(create).toHaveBeenCalledTimes(1);
-      expect(update).toHaveBeenCalledTimes(1);
+      // publish tries the conditional update once, then creates), one NONE
+      // successor fence for B. Neither member writes on every frame.
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(update).toHaveBeenCalledTimes(2);
     } finally {
       await f.cleanup();
       await db.$disconnect();

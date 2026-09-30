@@ -2,8 +2,8 @@
  * Per-device evaluation of metric routing rules (S-B part 2).
  *
  * On each accepted `node.metrics` or `endpoint.load` frame the relay session
- * schedules an evaluation of every pool member served by that device whose
- * pool has rules. At most one evaluation runs per device per second (a frame
+ * schedules an evaluation of every pool member served by that device.
+ * At most one evaluation runs per device per second (a frame
  * inside the window schedules one trailing run). Each member's verdict is
  * upserted into the H-class `pool_member_routing_verdict` table when it
  * changes, and otherwise refreshed at most every {@link VERDICT_REFRESH_MS}
@@ -14,9 +14,10 @@
  * S-D: the same run also turns the member's live engine load (vLLM/SGLang
  * waiting or KV pressure, llama.cpp busy slots or deferred requests) into a
  * FULL verdict, OR-combined with the rules (engine load only ever adds FULL).
- * A member without rules gets a row only while engine load holds it FULL, plus
- * one clearing write, so a busy device with many members does not write on
- * every frame.
+ * A member without rules gets a row while engine load holds it FULL, plus
+ * one clearing write. Each session also publishes once per member to fence
+ * inherited or in-flight predecessor verdicts, including on reconnect. Idle
+ * frames then stay quiet until membership or the local clear epoch changes.
  *
  * The inputs are numbers, names and labels only; no prompt text reaches here.
  */
@@ -63,6 +64,10 @@ export type RoutingEvaluationState = {
   rerun: boolean;
   closed: boolean;
   written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
+  /** Members successfully published by this session, including idle successor fences. */
+  probed: Set<string>;
+  /** A local clear invalidates the probes as well as the cached FULL verdicts. */
+  probedEpoch: number;
 };
 
 /** Rule verdict OR engine-load verdict: engine load only adds FULL. */
@@ -92,6 +97,8 @@ export function createRoutingEvaluationState(
     rerun: false,
     closed: false,
     written: new Map(),
+    probed: new Set(),
+    probedEpoch: 0,
   };
 }
 
@@ -193,6 +200,13 @@ export class MetricRoutingEvaluator {
     // `publish`), so a run that stalls in a query cannot later overwrite a
     // verdict a newer run already wrote.
     const now = this.clock();
+    // Probes and cached writes belong to the epoch captured before reads:
+    // a clear during publication must invalidate them on the next run.
+    const epoch = this.clearEpoch;
+    if (state.probedEpoch !== epoch) {
+      state.probed.clear();
+      state.probedEpoch = epoch;
+    }
     const members = await this.db.poolMember.findMany({
       where: {
         tier: "PRIMARY",
@@ -248,9 +262,10 @@ export class MetricRoutingEvaluator {
         now,
       );
       const previous = state.written.get(member.id);
-      // Nothing to say: no rules, no engine hold, and nothing to clear.
-      if (rules.length === 0 && !engine.full && !previous) continue;
       seen.add(member.id);
+      // Empty session memory may hide inherited FULL or an older publication
+      // still in flight. Publish one NONE fence before skipping idle frames.
+      if (rules.length === 0 && !engine.full && !previous && state.probed.has(member.id)) continue;
       const series = [...nodeSeries, ...endpointLoadSeries(inputs.endpointLoad, memberRef, now)];
       const evaluation = combineWithEngineLoad(
         rules.length === 0
@@ -258,12 +273,12 @@ export class MetricRoutingEvaluator {
           : evaluateRoutingRules(rules, series, now),
         engine,
       );
-      // The rules are part of the key: an edited rule set is always re-written.
-      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${rulesKey(rules)}`;
+      // Rules and overrides invalidate the cache even when edited on another process.
+      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${rulesKey(rules)}:${overrideKey(facts.mode, facts.kvFullThreshold)}`;
       if (
         previous &&
         previous.key === key &&
-        previous.epoch === this.clearEpoch &&
+        previous.epoch === epoch &&
         nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS
       ) {
         continue;
@@ -282,10 +297,11 @@ export class MetricRoutingEvaluator {
       // The session ended while an earlier write was in flight: publish nothing more.
       if (state.closed) break;
       if (await this.publish(member.id, data)) {
+        state.probed.add(member.id);
         // A rule-less member's row only exists to hold FULL; once cleared it
         // is not tracked (a NONE row never gates and needs no refresh).
         if (rules.length === 0 && evaluation.verdict === "none") state.written.delete(member.id);
-        else state.written.set(member.id, { key, writtenAtMs: nowMs, epoch: this.clearEpoch });
+        else state.written.set(member.id, { key, writtenAtMs: nowMs, epoch });
         published.push({
           memberId: member.id,
           poolId: member.poolId,
@@ -297,6 +313,9 @@ export class MetricRoutingEvaluator {
     await this.retractIfRulesChanged(state, published, now);
     for (const memberId of state.written.keys()) {
       if (!seen.has(memberId)) state.written.delete(memberId);
+    }
+    for (const memberId of state.probed) {
+      if (!seen.has(memberId)) state.probed.delete(memberId);
     }
   }
   /**
@@ -384,7 +403,10 @@ export class MetricRoutingEvaluator {
         publisherId: state.publisherId,
       },
     });
-    for (const entry of stale) state.written.delete(entry.memberId);
+    for (const entry of stale) {
+      state.written.delete(entry.memberId);
+      state.probed.delete(entry.memberId);
+    }
   }
 
   /**
