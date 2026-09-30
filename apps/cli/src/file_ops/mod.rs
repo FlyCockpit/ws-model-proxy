@@ -89,6 +89,7 @@ pub enum Step {
     Chowned,
     Chmodded,
     EtagRechecked,
+    Vacated,
     Exchanged,
     Captured,
     Restored,

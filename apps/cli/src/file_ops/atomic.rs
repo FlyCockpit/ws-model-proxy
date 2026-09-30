@@ -1,23 +1,35 @@
 //! Atomic replace and exclusive create (plan section 3.3).
 //!
-//! Replace, on the held parent dirfd:
-//! 1. `openat(dirfd, ".<name>.wsmp-<rand>", O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY, 0600)`;
-//! 2. write the content, then `fsync`;
-//! 3. `fchown` to the original uid/gid, **then** `fchmod` to the original mode
-//!    (in that order, so a chown cannot strip bits after chmod);
-//! 4. re-check the etag on the still-open original fd, and that the name still
-//!    refers to the same file;
+//! Replace, on held directory fds:
+//! 1. create mode-0600 `tmp` INSIDE a mode-0700 `.wsmp-recover-*` directory
+//!    beside the target; no public staging name exists;
+//! 2. write the content, then fsync the held temp;
+//! 3. fchown to the original uid/gid, THEN fchmod to its mode;
+//! 4. re-check the etag on the still-open original and its public-name identity;
 //! 5. honor cancellation (the last point where it is honored);
-//! 6. exchange tmp with name where supported and remove the checked original,
-//!    otherwise `renameat(dirfd, tmp, dirfd, name)`; then `fsync(dirfd)`;
-//! 7. on failure, capture the temp into recovery and dispose only its identity.
+//! 6. cross-directory exchange `R/tmp <-> dir/name`. The displaced object in
+//!    `R/tmp` came from `name` by construction. Dispose it only with the original
+//!    held fd. On mismatch, capture the destination and undo to recorded origins:
+//!    dispose our proven temp and restore the displaced object, or restore the
+//!    newest external write and keep the older object with uncertain_outcome;
+//! 7. if exchange is unsupported, plain cross-directory rename `R/tmp -> name`
+//!    retains the documented replace race; then rmdir R and fsync the parent;
+//! 8. precommit failure disposes the already-private temp by its held fd,
+//!    without capturing any public name. A crash leaves a discoverable R/tmp.
 //!
-//! Recovery and exact POSIX residual windows: (a) a same-user writer discovering
-//! the private random directory can replace a slot between its identity check
-//! and unlink (the only deleting window); (b) a concurrent create during the
-//! vacant-name undo window keeps the displaced object in recovery; (c) plain
-//! rename on exchange-less filesystems retains its precommit race; (d) crashes
-//! leave recovery/staging names. See `recovery` for manual recovery and bounds.
+//! Replace and exclusive create use recovery and can return uncertain_outcome
+//! or successful results with recovered paths. Exclusive-create cleanup still
+//! captures the public created name and disposes only its held identity.
+//! Exact recovery residuals: (a) a guessed private-slot replacement between
+//! held-fd proof and unlinkat; (a2) plain-rename capture fallback overwriting a
+//! squatter after the private slot was checked absent; (b) public names briefly
+//! vacant during undo, so concurrent creates prevent NOREPLACE restoration;
+//! (b2) overwrite rename's source is vacant from capture through operation end,
+//! and a concurrent create is kept and reported when it blocks restoration;
+//! (c) exchange-less replace's cross-directory plain-rename race; (d) crash
+//! residue in `.wsmp-recover-*` (including replace's partial tmp) or both links;
+//! (e) unheld objects are never deleted. See `recovery` for restore fallbacks,
+//! manual recovery and bounds.
 //!
 //! Refused up front: files owned by another uid (a non-root rename would change
 //! the owner), hard-linked files (the rename would break the link), and
@@ -31,26 +43,20 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{Mode, fchmod, fstatat, mode_t};
 use nix::unistd::{Gid, Uid, fchown, fsync};
-use rand::distr::{Alphanumeric, SampleString};
 
 use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::exchange::{exchange, is_unsupported};
+use super::exchange::is_unsupported;
 use super::read::current_etag;
-use super::recovery::RecoveryDir;
+use super::recovery::{Held, RecoveryDir, Slot};
 use super::resolve::Stat;
-use super::text::floor_boundary;
 use super::{Cancel, FileOps, Step};
-
-/// Longest base name kept in the temp name (NAME_MAX is 255).
-const TEMP_BASE_MAX: usize = 200;
 
 /// Permission bits as a [`Mode`]. `mode_t` is `u32` on Linux and `u16` on macOS,
 /// so the cast is what makes `Mode::from_bits_truncate` portable.
@@ -87,7 +93,7 @@ struct TempGuard<'a> {
     dir: &'a OwnedFd,
     path: std::path::PathBuf,
     name: OsString,
-    identity: Stat,
+    identity: Held,
     recovery: &'a mut RecoveryDir,
     armed: bool,
 }
@@ -114,13 +120,6 @@ impl Drop for TempGuard<'_> {
             let _ = self.recovery.capture(self.dir, &self.name, &self.path);
         }
     }
-}
-
-fn temp_name(name: &OsStr) -> OsString {
-    let lossy = name.to_string_lossy();
-    let base = &lossy[..floor_boundary(&lossy, TEMP_BASE_MAX)];
-    let suffix = Alphanumeric.sample_string(&mut rand::rng(), 10);
-    OsString::from_vec(format!(".{base}.wsmp-{suffix}").into_bytes())
 }
 
 /// Replace `name` in `dir` with `content`. `orig` is the open original and
@@ -176,32 +175,15 @@ fn replace_inner(
     cancel: &Cancel,
     recovery: &mut RecoveryDir,
 ) -> FileResult<Stat> {
-    let tmp = temp_name(name);
-    let fd = openat(
-        dir.as_fd(),
-        tmp.as_os_str(),
-        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-        perm_mode(0o600),
-    )
-    .map_err(FileError::errno)?;
-    let mut tmp_file = File::from(fd);
-    // fstat is on the held fd, never a sampled public pathname. If it fails,
-    // capture without disposal: there is no proven identity to authorize unlink.
-    let identity = match nix::sys::stat::fstat(tmp_file.as_fd()) {
-        Ok(raw) => Stat::from_raw(&raw),
-        Err(_) => {
-            let _ = recovery.capture(dir, &tmp, &dir_path.join(&tmp));
-            return Err(recovery.uncertain());
-        }
+    let original = Held::from_file(orig)?;
+    let (mut tmp, mut tmp_file) = recovery.create_temp(dir, name, &dir_path.join(name))?;
+    // A failed fd proof retains the already-private temp; it is never captured
+    // through a public staging name.
+    let identity = match Held::from_file(&tmp_file) {
+        Ok(held) => held,
+        Err(_) => return Err(recovery.uncertain()),
     };
-    let mut guard = TempGuard {
-        dir,
-        path: dir_path.join(&tmp),
-        name: tmp,
-        identity,
-        recovery,
-        armed: true,
-    };
+    let mut armed = true;
     let result = (|| -> FileResult<Stat> {
         ops.step(Step::TempCreated)?;
         tmp_file.write_all(content)?;
@@ -221,76 +203,70 @@ fn replace_inner(
         recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
         ops.step(Step::EtagRechecked)?;
         cancel.check()?;
-        commit_stage(ops, &mut guard, name, dir_path, orig_stat, &new_stat)?;
-        guard.armed = false;
+        commit_stage(ops, recovery, &mut tmp, &original, &identity, &mut armed)?;
+        armed = false;
         let _ = ops.step(Step::Renamed);
+        recovery.finish();
         fsync(dir.as_fd()).map_err(FileError::errno)?;
         let _ = ops.step(Step::DirSynced);
         Ok(new_stat)
     })();
-    if !guard.cleanup(ops) {
-        Err(guard.recovery.uncertain())
+    if armed && !recovery.dispose(ops, &tmp, &identity) {
+        Err(recovery.uncertain())
     } else {
         result
     }
 }
 
-/// Exchange first, then capture the displaced object; NEVER unlink or swap back
-/// a public name using an earlier stat. Undo captures both objects and restores
-/// using NOREPLACE. Unproven objects are retained, with an uncertain outcome.
+/// Exchange the private temp with its recorded destination. X can only have
+/// come from that destination; no public staging name can admit a foreign origin.
+/// Undo restores each captured object to its recorded origin, newest write first.
 fn commit_stage(
     ops: &FileOps,
-    guard: &mut TempGuard<'_>,
-    name: &OsStr,
-    dir_path: &Path,
-    orig_stat: &Stat,
-    staged_stat: &Stat,
+    recovery: &mut RecoveryDir,
+    tmp: &mut Slot,
+    original: &Held,
+    identity: &Held,
+    armed: &mut bool,
 ) -> FileResult<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = (ops, dir_path, orig_stat, staged_stat);
+    let _ = (ops, original, identity, armed);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        match exchange(
-            guard.dir.as_fd(),
-            guard.name.as_os_str(),
-            guard.dir.as_fd(),
-            name,
-        ) {
+        match recovery.exchange_temp(tmp) {
             Ok(()) => {
-                guard.armed = false;
+                *armed = false;
                 let _ = ops.step(Step::Exchanged);
-                let Some(x) = guard.recovery.capture(guard.dir, &guard.name, &guard.path) else {
-                    guard
-                        .recovery
-                        .record_public(guard.dir, name, &dir_path.join(name));
-                    return Err(guard.recovery.uncertain());
-                };
                 let _ = ops.step(Step::Captured);
-                if guard.recovery.holds(&x, orig_stat) {
-                    // Committed: retention is a successful edit with recovered paths.
-                    guard.recovery.dispose(ops, &x, orig_stat);
+                if recovery.holds(tmp, original) {
+                    // Committed: cleanup failure is reported in recovered.
+                    recovery.dispose(ops, tmp, original);
                     return Ok(());
                 }
-                let y = guard
-                    .recovery
-                    .capture(guard.dir, name, &dir_path.join(name));
+                let y = recovery.capture_origin(tmp);
                 if y.is_some() {
                     let _ = ops.step(Step::Captured);
                 }
-                if guard
-                    .recovery
-                    .restore(&x, guard.dir, name, &dir_path.join(name))
+                if let Some(y) = &y
+                    && !recovery.holds(y, identity)
                 {
-                    let _ = ops.step(Step::Restored);
+                    // Newest foreign write wins; X remains named in recovery.
+                    if recovery.restore(ops, y) {
+                        let _ = ops.step(Step::Restored);
+                    }
+                } else {
+                    if let Some(y) = y {
+                        recovery.dispose(ops, &y, identity);
+                    }
+                    if recovery.restore(ops, tmp) {
+                        let _ = ops.step(Step::Restored);
+                    }
                 }
-                if let Some(y) = y {
-                    guard.recovery.dispose(ops, &y, staged_stat);
-                }
-                guard.recovery.finish();
-                return if guard.recovery.settled() {
+                recovery.finish();
+                return if recovery.settled() {
                     Err(FileError::conflict("replaced"))
                 } else {
-                    Err(guard.recovery.uncertain())
+                    Err(recovery.uncertain())
                 };
             }
             Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
@@ -298,14 +274,7 @@ fn commit_stage(
             Err(errno) => return Err(FileError::errno(errno)),
         }
     }
-    // The unchanged exchange-less plain-rename race is documented above.
-    renameat(
-        guard.dir.as_fd(),
-        guard.name.as_os_str(),
-        guard.dir.as_fd(),
-        name,
-    )
-    .map_err(FileError::errno)
+    recovery.commit_temp(tmp).map_err(FileError::errno)
 }
 
 /// The name must still point at the file we read, and that file must still
@@ -366,8 +335,8 @@ pub(crate) fn create_new(
         )
         .map_err(FileError::errno)?;
         let mut file = File::from(fd);
-        let identity = match nix::sys::stat::fstat(file.as_fd()) {
-            Ok(raw) => Stat::from_raw(&raw),
+        let identity = match Held::from_file(&file) {
+            Ok(held) => held,
             Err(_) => {
                 let _ = recovery.capture(dir, name, &dir_path.join(name));
                 return Err(recovery.uncertain());

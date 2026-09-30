@@ -13,6 +13,7 @@ pub(super) enum Primitive {
     Exchange,
     Capture,
     Restore,
+    RestoreLink,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Move,
     Unlink,
@@ -89,7 +90,7 @@ pub(super) fn exchange(
     }
 }
 
-/// Never fall back to a replacing rename for compensation.
+/// NOREPLACE primitive; callers own the capture/restore fallback policy.
 pub(super) fn no_replace(
     dir_from: impl AsFd,
     from: &OsStr,
@@ -117,7 +118,6 @@ pub(super) fn no_replace(
 }
 
 /// Only these errors permit the caller's unsupported-exchange policy.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn is_unsupported(errno: Errno) -> bool {
     matches!(errno, Errno::EINVAL | Errno::ENOSYS)
         || (cfg!(target_os = "macos") && errno == Errno::ENOTSUP)

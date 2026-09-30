@@ -74,12 +74,16 @@ fn successor(path: &Path, bytes: &str) {
     std::fs::rename(incoming, path).unwrap();
 }
 
-fn stage(root: &Path) -> PathBuf {
+fn private_temp(root: &Path) -> PathBuf {
+    recovery_dirs(root).pop().unwrap().join("tmp")
+}
+
+fn public_stages(root: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(root)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.is_file() && p.file_name().unwrap().to_string_lossy().contains(".wsmp-"))
-        .unwrap()
+        .filter(|p| p.is_file() && p.file_name().unwrap().to_string_lossy().contains(".wsmp-"))
+        .collect()
 }
 
 fn recovery_dirs(root: &Path) -> Vec<PathBuf> {
@@ -139,6 +143,7 @@ fn compensation_fault_table_is_off_by_default_nth_and_thread_local() {
         Primitive::Exchange,
         Primitive::Capture,
         Primitive::Restore,
+        Primitive::RestoreLink,
         Primitive::Move,
         Primitive::Unlink,
         Primitive::Rmdir,
@@ -196,29 +201,131 @@ fn compensation_clean_success_and_conflict_leave_no_recovery() {
     }
 }
 
+/// Opus p9: an editor saves the public source after vacate/exchange. The
+/// checked destination never visits that name, so the save cannot be captured
+/// as a destination object. Also exercise conflict undo with both objects saved.
 #[test]
-fn compensation_c1a1_successor_before_capture_survives_replace_and_rename() {
+fn compensation_c1a1_source_save_after_vacate_or_exchange_never_moves_to_destination() {
+    for phase in [Step::Vacated, Step::Exchanged] {
+        for conflict in [false, true] {
+            let fx = Fx::new();
+            let etag = Op::Rename.prepare(&fx);
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if conflict && step == Step::EtagRechecked {
+                    std::fs::rename(root.join("dst.txt"), root.join("checked-destination")).unwrap();
+                    std::fs::write(root.join("dst.txt"), "unchecked destination").unwrap();
+                }
+                if step == phase {
+                    assert!(!root.join("src.txt").exists());
+                    // A separate writer process, as in Opus's executed probe.
+                    assert!(std::process::Command::new("sh").args([
+                        "-c", "printf %s C-saved-to-src > incoming-save; mv -f incoming-save src.txt",
+                    ]).current_dir(&root).status().unwrap().success());
+                }
+                Ok(())
+            });
+            if conflict {
+                let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
+                assert_eq!(fx.get("dst.txt"), "unchecked destination");
+                assert_eq!(fx.get("checked-destination"), "original");
+                assert!(contains_bytes(&kept, "mine"));
+                assert!(contains_bytes(&kept, "C-saved-to-src"));
+            } else {
+                Op::Rename.run(&fx, &etag).unwrap();
+                assert_eq!(fx.get("dst.txt"), "mine");
+                // Only the held, checked destination was disposed.
+                assert!(!contains_bytes(&[fx.root.join("dst.txt")], "original"));
+                clean(&fx);
+            }
+            assert_eq!(fx.get("src.txt"), "C-saved-to-src");
+        }
+    }
+}
+
+/// Opus p9b has no public stage to overwrite now. A save to the former stage
+/// shape remains at that name through both a normal commit and conflict undo.
+#[test]
+fn compensation_replace_has_only_a_private_temp_and_no_public_stage_to_race() {
+    for op in [Op::Replace, Op::Write] {
+        for conflict in [false, true] {
+            let fx = Fx::new();
+            let etag = op.prepare(&fx);
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if step == Step::TempCreated {
+                    assert!(public_stages(&root).is_empty(), "no public staging name");
+                    assert!(private_temp(&root).is_file());
+                    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+                }
+                if conflict && step == Step::EtagRechecked {
+                    std::fs::rename(root.join("doc.txt"), root.join("checked-destination"))
+                        .unwrap();
+                    std::fs::write(root.join("doc.txt"), "unchecked destination").unwrap();
+                }
+                if step == Step::Exchanged {
+                    assert!(public_stages(&root).is_empty());
+                    std::fs::write(root.join(".doc.txt.wsmp-racer00000"), "C-at-would-be-stage")
+                        .unwrap();
+                }
+                Ok(())
+            });
+            if conflict {
+                assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+                assert_eq!(fx.get("doc.txt"), "unchecked destination");
+                assert_eq!(fx.get("checked-destination"), "original");
+            } else {
+                op.run(&fx, &etag).unwrap();
+                assert_eq!(fx.get("doc.txt"), "edited");
+            }
+            assert_eq!(fx.get(".doc.txt.wsmp-racer00000"), "C-at-would-be-stage");
+            assert!(recovery_dirs(&fx.root).is_empty());
+        }
+    }
+}
+
+/// Unlike successor(), this releases the last NAME before allocating the new
+/// file. The operation's Held fd must pin the old inode, so reuse is impossible
+/// during this hook even on ext4. Survival is deterministic on every filesystem.
+#[test]
+fn compensation_c1b1_unlink_then_recreate_before_private_dispose_survives() {
+    use std::os::unix::fs::MetadataExt;
+
     for op in OPS {
         let fx = Fx::new();
         let etag = op.prepare(&fx);
         let root = fx.root.clone();
         let fx = fx.with_hook(move |step| {
-            if step == Step::Exchanged {
-                let public = if matches!(op, Op::Rename) {
-                    root.join("src.txt")
-                } else {
-                    stage(&root)
-                };
-                successor(&public, "successor only copy");
+            if step == Step::Disposing {
+                let dir = recovery_dirs(&root).pop().unwrap();
+                let private = std::fs::read_dir(dir)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let old = std::fs::symlink_metadata(&private).unwrap();
+                std::fs::remove_file(&private).unwrap();
+                std::fs::write(&private, "recreated only copy").unwrap();
+                let new = std::fs::symlink_metadata(&private).unwrap();
+                assert_eq!(old.dev(), new.dev(), "same filesystem");
+                assert_ne!(old.ino(), new.ino(), "Held pins the unlinked inode");
             }
             Ok(())
         });
-        assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
-        assert_eq!(fx.get(op.destination()), "successor only copy");
-        if matches!(op, Op::Rename) {
-            assert_eq!(fx.get("src.txt"), "mine");
-        }
-        clean(&fx);
+        let result = op.run(&fx, &etag).unwrap();
+        assert!(contains_bytes(
+            &paths(&result["recovered"]),
+            "recreated only copy"
+        ));
+        assert_eq!(
+            fx.get(op.destination()),
+            if matches!(op, Op::Rename) {
+                "mine"
+            } else {
+                "edited"
+            }
+        );
     }
 }
 
@@ -243,7 +350,7 @@ fn compensation_c1a1_successor_at_public_name_before_private_unlink_is_untouched
                 *observed.lock().unwrap() = if matches!(op, Op::Rename) {
                     root.join("src.txt")
                 } else {
-                    stage(&root)
+                    root.join(".doc.txt.wsmp-racer00000")
                 };
             }
             if step == Step::Disposing {
@@ -271,19 +378,18 @@ fn compensation_c1a2_newer_destination_before_undo_is_reported_and_kept() {
         let fx = Fx::new();
         let etag = op.prepare(&fx);
         let destination = fx.root.join(op.destination());
-        let captures = AtomicUsize::new(0);
         let fx = fx.with_hook(move |step| {
             if step == Step::EtagRechecked {
                 successor(&destination, "concurrent update");
             }
-            if step == Step::Captured && captures.fetch_add(1, Ordering::SeqCst) == 0 {
+            if step == Step::Exchanged {
                 successor(&destination, "later update");
             }
             Ok(())
         });
         let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
-        assert!(contains_bytes(&kept, "later update"));
-        assert_eq!(fx.get(op.destination()), "concurrent update");
+        assert!(contains_bytes(&kept, "concurrent update"));
+        assert_eq!(fx.get(op.destination()), "later update");
     }
 }
 
@@ -292,13 +398,13 @@ fn compensation_c1a3_each_failed_capture_restore_dispose_rmdir_reports_surviving
     for op in OPS {
         let mut faults = vec![
             (Primitive::Capture, 1),
-            (Primitive::Capture, 2),
             (Primitive::Restore, 1),
             (Primitive::Rmdir, 1),
         ];
         if matches!(op, Op::Replace) {
             faults.push((Primitive::Unlink, 1));
         } else {
+            faults.push((Primitive::Capture, 2));
             faults.push((Primitive::Restore, 2));
         }
         for (primitive, nth) in faults {
@@ -342,22 +448,192 @@ fn compensation_c1a3_each_failed_capture_restore_dispose_rmdir_reports_surviving
 }
 
 #[test]
-fn compensation_unsupported_capture_never_falls_back_to_overwriting() {
+fn compensation_capture_falls_back_only_for_unsupported_errors() {
     for op in OPS {
         for errno in [Errno::EINVAL, Errno::ENOSYS, Errno::ENOTSUP] {
             let fx = Fx::new();
             let etag = op.prepare(&fx);
-            let _scope = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
-            let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
-            assert!(contains_bytes(&kept, "original"));
-            assert!(contains_bytes(
-                &kept,
-                if matches!(op, Op::Rename) {
-                    "mine"
-                } else {
-                    "edited"
+            let destination = fx.root.join(op.destination());
+            let fx = fx.with_hook(move |step| {
+                if matches!(op, Op::Replace) && step == Step::EtagRechecked {
+                    successor(&destination, "unchecked destination");
                 }
-            ));
+                Ok(())
+            });
+            let _scope = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
+            if errno != Errno::ENOTSUP || cfg!(target_os = "macos") {
+                if matches!(op, Op::Replace) {
+                    assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+                    assert_eq!(fx.get(op.destination()), "unchecked destination");
+                } else {
+                    assert!(op.run(&fx, &etag).unwrap().get("recovered").is_none());
+                }
+                clean(&fx);
+            } else {
+                let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
+                let mut locations = kept;
+                locations.push(fx.root.join(op.destination()));
+                locations.push(fx.root.join("src.txt"));
+                assert!(contains_bytes(
+                    &locations,
+                    if matches!(op, Op::Rename) {
+                        "mine"
+                    } else {
+                        "unchecked destination"
+                    }
+                ));
+            }
+        }
+    }
+}
+
+/// Model a filesystem rejecting flags at every relevant call, rather than the
+/// former Capture-only capability seam. Include both restore calls on undo.
+fn no_flags() -> FaultScope {
+    FaultScope::new(&[
+        (Primitive::Move, 1, Errno::EINVAL),
+        (Primitive::Capture, 1, Errno::EINVAL),
+        (Primitive::Capture, 2, Errno::EINVAL),
+        (Primitive::Restore, 1, Errno::EINVAL),
+        (Primitive::Restore, 2, Errno::EINVAL),
+    ])
+}
+
+#[test]
+fn compensation_no_flags_precommit_errors_and_cancel_clean_temps() {
+    for code in [
+        ErrorCode::IoError,
+        ErrorCode::Cancelled,
+        ErrorCode::Conflict,
+    ] {
+        let fx = Fx::new();
+        let etag = Op::Replace.prepare(&fx);
+        let destination = fx.root.join("doc.txt");
+        let cancel = fx.cancel.clone();
+        let fx = fx.with_hook(move |step| {
+            if step == Step::TempSynced {
+                match code {
+                    ErrorCode::IoError => return Err(FileError::errno(Errno::EIO)),
+                    ErrorCode::Cancelled => cancel.cancel(),
+                    _ => std::fs::write(&destination, "concurrent update").unwrap(),
+                }
+            }
+            Ok(())
+        });
+        let _scope = no_flags();
+        assert_eq!(Op::Replace.run(&fx, &etag).unwrap_err().code, code);
+        assert_eq!(
+            fx.get("doc.txt"),
+            if code == ErrorCode::Conflict {
+                "concurrent update"
+            } else {
+                "original"
+            }
+        );
+        clean(&fx);
+    }
+}
+
+#[test]
+fn compensation_no_flags_plain_rename_has_one_link_and_no_leftovers() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fx::new();
+    fx.put("src.txt", "mine");
+    let _scope = no_flags();
+    let result = fx
+        .ops
+        .rename(
+            &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert!(result.recovered.is_empty());
+    assert_eq!(fx.get("dst.txt"), "mine");
+    assert_eq!(
+        std::fs::metadata(fx.root.join("dst.txt")).unwrap().nlink(),
+        1
+    );
+    assert!(!fx.root.join("src.txt").exists());
+    clean(&fx);
+}
+
+#[test]
+fn compensation_no_flags_undo_conflict_settles_without_extra_links() {
+    for op in OPS {
+        let fx = Fx::new();
+        let etag = op.prepare(&fx);
+        let destination = fx.root.join(op.destination());
+        let fx = fx.with_hook(move |step| {
+            if step == Step::EtagRechecked {
+                successor(&destination, "concurrent update");
+            }
+            Ok(())
+        });
+        let _scope = no_flags();
+        assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+        assert_eq!(fx.get(op.destination()), "concurrent update");
+        if matches!(op, Op::Rename) {
+            assert_eq!(fx.get("src.txt"), "mine");
+        }
+        clean(&fx);
+    }
+    let fx = Fx::new();
+    fx.put("src.txt", "mine");
+    let source = fx.root.join("src.txt");
+    let fx = fx.with_hook(move |step| {
+        if step == Step::Linked {
+            successor(&source, "source successor");
+        }
+        Ok(())
+    });
+    let _scope = no_flags();
+    assert_eq!(
+        fx.ops
+            .rename(
+                &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
+                &fx.cancel
+            )
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(fx.get("src.txt"), "source successor");
+    assert!(!fx.root.join("dst.txt").exists());
+    clean(&fx);
+}
+
+#[test]
+fn compensation_no_flags_successor_races_keep_every_external_object() {
+    for collide in [false, true] {
+        let fx = Fx::new();
+        fx.put("src.txt", "mine");
+        let source = fx.root.join("src.txt");
+        let target = fx.root.join("dst.txt");
+        let fx = fx.with_hook(move |step| {
+            if step == Step::Linked {
+                successor(&source, "source successor");
+                successor(&target, "destination successor");
+            }
+            if collide && step == Step::Captured && !source.exists() {
+                std::fs::write(&source, "created during vacant undo").unwrap();
+            }
+            Ok(())
+        });
+        let _scope = no_flags();
+        let kept = uncertain(
+            &fx.ops
+                .rename(
+                    &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
+                    &fx.cancel,
+                )
+                .unwrap_err(),
+        );
+        assert!(contains_bytes(&kept, "destination successor"));
+        if collide {
+            assert_eq!(fx.get("src.txt"), "created during vacant undo");
+            assert!(contains_bytes(&kept, "source successor"));
+        } else {
+            assert_eq!(fx.get("src.txt"), "source successor");
         }
     }
 }
@@ -373,7 +649,10 @@ fn compensation_restore_collision_keeps_both_generations_and_names_them() {
             if step == Step::EtagRechecked {
                 successor(&destination, "concurrent update");
             }
-            if step == Step::Captured && captures.fetch_add(1, Ordering::SeqCst) == 1 {
+            if step == Step::Captured
+                && captures.fetch_add(1, Ordering::SeqCst)
+                    == if matches!(op, Op::Rename) { 2 } else { 1 }
+            {
                 successor(&destination, "created during vacant undo");
             }
             Ok(())
@@ -424,7 +703,7 @@ fn compensation_precommit_temp_and_create_squatters_are_captured_not_deleted() {
                 let name = if create {
                     root.join("new.txt")
                 } else {
-                    stage(&root)
+                    private_temp(&root)
                 };
                 successor(&name, "squatter only copy");
                 return Err(FileError::errno(Errno::EIO));
@@ -607,51 +886,83 @@ fn compensation_link_fallback_cleanup_and_verify_moved_keep_successors() {
 
 #[test]
 fn compensation_capture_collision_never_replaces_a_private_slot_squatter() {
-    for op in OPS {
-        let fx = Fx::new();
-        let etag = op.prepare(&fx);
-        let root = fx.root.clone();
-        let fx = fx.with_hook(move |step| {
-            if step == Step::Exchanged {
-                let dir = recovery_dirs(&root).pop().unwrap();
-                std::fs::write(dir.join("slot-1"), "slot squatter only copy").unwrap();
-            }
-            Ok(())
-        });
-        let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
-        assert!(contains_bytes(&kept, "slot squatter only copy"));
-        assert!(contains_bytes(&kept, "original"));
-        assert!(contains_bytes(
-            &kept,
-            if matches!(op, Op::Rename) {
-                "mine"
-            } else {
-                "edited"
-            }
-        ));
+    for unsupported in [false, true] {
+        for op in OPS {
+            let fx = Fx::new();
+            let etag = op.prepare(&fx);
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if step == Step::EtagRechecked {
+                    std::fs::rename(
+                        root.join(op.destination()),
+                        root.join("checked-destination"),
+                    )
+                    .unwrap();
+                    std::fs::write(root.join(op.destination()), "unchecked destination").unwrap();
+                }
+                if step == Step::Exchanged {
+                    let dir = recovery_dirs(&root).pop().unwrap();
+                    std::fs::write(dir.join("slot-2"), "slot squatter only copy").unwrap();
+                }
+                Ok(())
+            });
+            let faults = [(
+                Primitive::Capture,
+                if matches!(op, Op::Rename) { 2 } else { 1 },
+                Errno::EINVAL,
+            )];
+            let _scope = FaultScope::new(if unsupported { &faults } else { &[] });
+            let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
+            let mut locations = kept;
+            locations.push(fx.root.join(op.destination()));
+            locations.push(fx.root.join("checked-destination"));
+            assert!(contains_bytes(&locations, "slot squatter only copy"));
+            assert!(contains_bytes(&locations, "original"));
+            assert!(contains_bytes(&locations, "unchecked destination"));
+            assert!(contains_bytes(
+                &locations,
+                if matches!(op, Op::Rename) {
+                    "mine"
+                } else {
+                    "edited"
+                }
+            ));
+        }
     }
 }
 
 #[test]
-fn compensation_rename_unchecked_source_is_kept_in_recovery() {
+fn compensation_rename_vacate_verification_restores_unchecked_source_to_source() {
     let fx = Fx::new();
     let etag = Op::Rename.prepare(&fx);
-    let source = fx.root.join("src.txt");
+    let root = fx.root.clone();
     let fx = fx.with_hook(move |step| {
         if step == Step::EtagRechecked {
-            successor(&source, "unchecked source");
+            std::fs::rename(root.join("src.txt"), root.join("checked-source")).unwrap();
+            std::fs::write(root.join("src.txt"), "unchecked source").unwrap();
         }
         Ok(())
     });
-    let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
-    assert!(contains_bytes(&kept, "unchecked source"));
+    assert_eq!(
+        Op::Rename.run(&fx, &etag).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(fx.get("src.txt"), "unchecked source");
     assert_eq!(fx.get("dst.txt"), "original");
+    assert_eq!(fx.get("checked-source"), "mine");
+    assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
+    clean(&fx);
 }
 
 #[test]
 fn compensation_precommit_and_create_faults_prefer_uncertainty_to_the_initial_error() {
     for create in [false, true] {
         for primitive in [Primitive::Capture, Primitive::Unlink, Primitive::Rmdir] {
+            // A replace temp is already private: capture faults cannot affect
+            // its precommit cleanup. Exclusive create still needs capture.
+            if !create && primitive == Primitive::Capture {
+                continue;
+            }
             let fx = Fx::new();
             let etag = Op::Replace.prepare(&fx);
             let fx = fx.with_hook(move |step| {
@@ -827,6 +1138,13 @@ fn compensation_retention_is_logged_with_the_recovery_paths() {
         for retained_by_error in [false, true] {
             let fx = Fx::new();
             let etag = op.prepare(&fx);
+            let destination = fx.root.join(op.destination());
+            let fx = fx.with_hook(move |step| {
+                if retained_by_error && matches!(op, Op::Replace) && step == Step::EtagRechecked {
+                    successor(&destination, "unchecked destination");
+                }
+                Ok(())
+            });
             LOG.with(|log| log.borrow_mut().clear());
             let primitive = if retained_by_error {
                 Primitive::Capture
@@ -851,4 +1169,239 @@ fn compensation_retention_is_logged_with_the_recovery_paths() {
             }
         }
     }
+}
+
+#[test]
+fn compensation_exchange_error_restores_vacated_source_without_plain_overwrite() {
+    for errno in [
+        Errno::EINVAL,
+        Errno::ENOSYS,
+        Errno::ENOTSUP,
+        Errno::EIO,
+        Errno::EXDEV,
+        Errno::EPERM,
+    ] {
+        for collide in [false, true] {
+            let fx = Fx::new();
+            let etag = Op::Rename.prepare(&fx);
+            let source = fx.root.join("src.txt");
+            let fx = fx.with_hook(move |step| {
+                if step == Step::Vacated {
+                    assert!(!source.exists());
+                    if collide {
+                        std::fs::write(&source, "created in vacant source window").unwrap();
+                    }
+                }
+                Ok(())
+            });
+            let _scope = FaultScope::new(&[(Primitive::Exchange, 1, errno)]);
+            let error = Op::Rename.run(&fx, &etag).unwrap_err();
+            if collide {
+                let kept = uncertain(&error);
+                assert!(contains_bytes(&kept, "mine"));
+                assert!(contains_bytes(&kept, "created in vacant source window"));
+                assert_eq!(fx.get("src.txt"), "created in vacant source window");
+            } else {
+                assert_eq!(
+                    error.code,
+                    if crate::file_ops::exchange::is_unsupported(errno) {
+                        ErrorCode::Unsupported
+                    } else {
+                        ErrorCode::IoError
+                    },
+                    "{errno}"
+                );
+                assert_eq!(fx.get("src.txt"), "mine");
+                clean(&fx);
+            }
+            assert_eq!(fx.get("dst.txt"), "original");
+            assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
+        }
+    }
+}
+
+#[test]
+fn compensation_vacate_mismatch_and_restore_collision_keep_every_object() {
+    let fx = Fx::new();
+    let etag = Op::Rename.prepare(&fx);
+    let root = fx.root.clone();
+    let fx = fx.with_hook(move |step| {
+        if step == Step::EtagRechecked {
+            std::fs::rename(root.join("src.txt"), root.join("checked-source")).unwrap();
+            std::fs::write(root.join("src.txt"), "unchecked source").unwrap();
+        }
+        if step == Step::Captured {
+            std::fs::write(root.join("src.txt"), "newest source").unwrap();
+        }
+        Ok(())
+    });
+    let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
+    assert!(contains_bytes(&kept, "unchecked source"));
+    assert!(contains_bytes(&kept, "newest source"));
+    assert_eq!(fx.get("checked-source"), "mine");
+    assert_eq!(fx.get("src.txt"), "newest source");
+    assert_eq!(fx.get("dst.txt"), "original");
+    assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
+}
+
+#[test]
+fn compensation_replace_cross_directory_exchange_errors_use_only_supported_fallbacks() {
+    for op in [Op::Replace, Op::Write] {
+        for errno in [
+            Errno::EINVAL,
+            Errno::ENOSYS,
+            Errno::ENOTSUP,
+            Errno::EIO,
+            Errno::EXDEV,
+            Errno::EPERM,
+            Errno::ENOENT,
+        ] {
+            let fx = Fx::new();
+            let etag = op.prepare(&fx);
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if step == Step::TempCreated {
+                    assert!(public_stages(&root).is_empty());
+                    assert!(private_temp(&root).exists());
+                }
+                Ok(())
+            });
+            let _scope = FaultScope::new(&[(Primitive::Exchange, 1, errno)]);
+            let result = op.run(&fx, &etag);
+            if crate::file_ops::exchange::is_unsupported(errno) {
+                assert!(result.unwrap().get("recovered").is_none());
+                assert_eq!(fx.get("doc.txt"), "edited");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    if errno == Errno::ENOENT {
+                        ErrorCode::Conflict
+                    } else {
+                        ErrorCode::IoError
+                    }
+                );
+                assert_eq!(fx.get("doc.txt"), "original");
+            }
+            clean(&fx);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
+    use crate::file_ops::{atomic, read, resolve::Stat};
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+    use std::os::fd::AsFd;
+
+    // /dev is deliberately denied by file-tool policy. Exercise the exact shared
+    // atomic commit used by edit and write-replace through held fds, without
+    // changing that policy. Their API flows are covered on the ordinary fixture.
+    let mut fx = Fx::new();
+    fx._dir = tempfile::tempdir_in("/dev/shm").expect("Linux tmpfs fixture");
+    fx.root = std::fs::canonicalize(fx._dir.path()).unwrap();
+    assert_eq!(
+        nix::sys::statfs::statfs(&fx.root)
+            .unwrap()
+            .filesystem_type(),
+        nix::sys::statfs::TMPFS_MAGIC
+    );
+    fx.put("doc.txt", "original");
+    let mut original = std::fs::File::open(fx.root.join("doc.txt")).unwrap();
+    let stat = Stat::from_metadata(&original.metadata().unwrap());
+    let etag = read::current_etag(&fx.ops, &mut original, &stat, &fx.cancel).unwrap();
+    let dir = open(
+        &fx.root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    let fx = fx.with_hook(move |step| {
+        if step == Step::TempCreated {
+            assert!(public_stages(&root).is_empty());
+            assert!(private_temp(&root).exists());
+        }
+        if step == Step::Exchanged {
+            assert_eq!(
+                std::fs::read_to_string(private_temp(&root)).unwrap(),
+                "original"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("doc.txt")).unwrap(),
+                "edited"
+            );
+        }
+        Ok(())
+    });
+    let (_, recovered) = atomic::replace(
+        &fx.ops,
+        &dir,
+        "doc.txt".as_ref(),
+        &fx.root,
+        &mut original,
+        &stat,
+        &etag,
+        b"edited",
+        &fx.cancel,
+    )
+    .unwrap();
+    assert!(recovered.is_empty());
+    assert_eq!(
+        nix::sys::stat::fstat(dir.as_fd()).unwrap().st_dev,
+        std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(fx.root.join("doc.txt")).unwrap())
+    );
+    assert!(
+        fx.steps.lock().unwrap().contains(&Step::Exchanged),
+        "real cross-directory exchange"
+    );
+    clean(&fx);
+}
+
+#[test]
+fn compensation_replace_precommit_cleanup_never_captures_a_public_name() {
+    let fx = Fx::new();
+    let etag = Op::Replace.prepare(&fx);
+    let fx = fx.with_hook(|step| {
+        if step == Step::TempWritten {
+            return Err(FileError::cancelled());
+        }
+        Ok(())
+    });
+    let _scope = FaultScope::new(&[(Primitive::Capture, 1, Errno::EIO)]);
+    assert_eq!(
+        Op::Replace.run(&fx, &etag).unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+    assert_eq!(
+        fault(Primitive::Capture),
+        Err(Errno::EIO),
+        "cleanup never attempts capture"
+    );
+    assert_eq!(fx.get("doc.txt"), "original");
+    clean(&fx);
+}
+
+#[test]
+fn compensation_no_flags_exchange_less_rename_restores_source_with_one_link() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fx::new();
+    let etag = Op::Rename.prepare(&fx);
+    let _scope = FaultScope::new(&[
+        (Primitive::Capture, 1, Errno::EINVAL),
+        (Primitive::Exchange, 1, Errno::EINVAL),
+        (Primitive::Restore, 1, Errno::EINVAL),
+    ]);
+    assert_eq!(
+        Op::Rename.run(&fx, &etag).unwrap_err().code,
+        ErrorCode::Unsupported
+    );
+    assert_eq!(fx.get("src.txt"), "mine");
+    assert_eq!(fx.get("dst.txt"), "original");
+    assert_eq!(
+        std::fs::metadata(fx.root.join("src.txt")).unwrap().nlink(),
+        1
+    );
+    clean(&fx);
 }

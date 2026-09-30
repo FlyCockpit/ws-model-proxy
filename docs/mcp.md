@@ -194,27 +194,47 @@ fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelle
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
-**Manual file recovery.** Atomic replace and overwrite rename on Linux/macOS capture
+**Manual file recovery.** Atomic replace, exclusive create, plain rename and
+overwrite rename use recovery (overwrite requires Linux/macOS). They capture
 compensation objects into one mode-0700 `.wsmp-recover-<10 alnum>` directory beside
-the destination, with at most two objects per operation. An unsettled compensation
-returns `uncertain_outcome` with `error.outcome: "unknown"`, `recovery` (an absolute
+the destination, with at most two objects per operation. Replace creates its temp
+inside this directory and exchanges it across directories with the destination;
+no public staging name exists. Overwrite rename first captures and verifies the
+source, then exchanges that private slot with the destination. Every captured
+object has a recorded origin; undo restores only to that origin, using identity
+proof to return a moved source to its original source name. An unsettled
+compensation returns `uncertain_outcome` with `error.outcome: "unknown"`, `recovery` (an absolute
 directory path) and `kept` (up to four absolute paths, including public names when
 capture failed). Successful edit/write/rename results may include `recovered` paths
 if only cleanup failed. Every retained location is also in the daemon warning log.
 Inspect those paths using a shell, compare file contents, and restore them manually
 without overwriting newer files before retrying. Find crash leftovers by listing
-`.wsmp-recover-*` and staging names beside the target. File tools permit reads and
-listing, but refuse writes, deletes, renames and creates inside recovery directories.
+`.wsmp-recover-*` beside the target (a partial replace temp is inside it). File tools
+permit reads and listing, but refuse writes, deletes, renames and creates inside recovery directories.
 Recovered objects are never automatically deleted; no startup recovery sweep runs.
 
-POSIX does not exclude other same-user processes. The exact remaining windows are:
-(a) a process that discovers the unpredictable private recovery name and replaces
-a slot between its identity check and final unlink can lose that replacement (the
-only deleting window); (b) undo briefly vacates public names, and a concurrent create
-makes restoration fail EEXIST, retaining displaced data with `uncertain_outcome`;
-(c) exchange-less filesystems retain the plain-rename replace race (overwrite rename
-is refused); (d) a crash between steps leaves recovery/staging names without deleting
-data. Public compensation names are never unlinked on an earlier stat's authority.
+POSIX does not exclude other same-user processes. Every disposal compares the
+private slot with a live held fd, which pins the inode even after its names are
+removed; a path-derived dev+ino snapshot alone never authorizes deletion. The
+exact remaining windows are: (a) a same-user process that guessed the unpredictable
+private directory can rename a new object onto a slot between the held-fd fstat
+comparison and final unlinkat and lose that replacement; (a2) on filesystems without
+NOREPLACE, capture uses plain rename into a private slot checked absent, and a
+squatter arriving between the check and rename can be overwritten. These are the
+only deleting windows in recovery compensation. (b) undo briefly vacates public
+names, and a concurrent create makes restoration fail EEXIST, retaining displaced
+data with `uncertain_outcome`; the newest captured external write is restored to
+its public name while an older displaced object stays in recovery. Unsupported
+NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
+unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
+(b2) overwrite rename's SOURCE name is vacant from its initial capture until the
+operation ends. A concurrent create remains there on success; if it prevents a
+restore, it is kept and reported with `uncertain_outcome`. (c) exchange-less
+filesystems retain the cross-directory plain-rename replace race; overwrite rename
+restores its source and returns `unsupported` (or `uncertain_outcome` if restoration
+cannot settle). (d) a crash leaves `.wsmp-recover-*`, including a partial replace
+temp, or both links; (e) unheld objects are never deleted and remain reported in recovery. Public
+compensation names are never unlinked on an earlier stat's authority.
 
 **Case-only renames.** `rename` with `overwrite` refuses a destination that is the same
 file as the source (`invalid_input`), except a case-only respelling of one directory

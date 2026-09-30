@@ -1,5 +1,25 @@
 //! `forwarder_cli_file_rename`, `forwarder_cli_dir_create`,
 //! `forwarder_cli_file_delete`: the small mutating tools.
+//!
+//! Plain and overwrite rename use recovery and can return uncertain_outcome
+//! or recovered paths on success. Overwrite vacates the source into a private
+//! slot, verifies its held fd, then exchanges that slot with the destination.
+//! The exchanged-out object therefore has destination origin by construction.
+//! A proven source captured during undo returns to its recorded source origin;
+//! a newer destination writer returns to destination, keeping the older object
+//! in recovery. Exchange failure restores source; unsupported exchange returns
+//! Unsupported without a plain overwrite fallback.
+//!
+//! Recovery residuals: (a) a guessed private-slot replacement between held-fd
+//! proof and unlinkat; (a2) plain-rename capture fallback overwriting a squatter
+//! after the private slot was checked absent; (b) public names briefly vacant
+//! during undo; (b2) overwrite's source is vacant from capture through operation
+//! end, so a concurrent source create survives on success and is kept/reported
+//! with uncertainty if it blocks restoration; (c) exchange-less replace retains
+//! its cross-directory plain-rename race; (d) crashes leave `.wsmp-recover-*`
+//! (also the home of replace's partial temp) or both links; (e) unheld objects
+//! are never deleted. See `recovery` for manual recovery and restore fallbacks;
+//! case-only rename and link-less fallback retain their separate residual races.
 
 use std::ffi::OsStr;
 use std::os::fd::AsFd;
@@ -13,10 +33,10 @@ use serde::{Deserialize, Serialize};
 use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::exchange::{Primitive, exchange, is_unsupported, no_replace};
+use super::exchange::{Primitive, is_unsupported, no_replace};
 use super::policy::Access;
 use super::read::current_etag;
-use super::recovery::RecoveryDir;
+use super::recovery::{Held, Origin, RecoveryDir};
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
@@ -153,8 +173,9 @@ pub(crate) fn rename(
             "special files are not moved",
         ));
     }
-    ops.policy.check_identity(Access::Remove, &src)?;
-    let src_etag = object_etag(ops, &from, &src, cancel)?;
+    let src = Held::open(&from.dir, &from.name, src)?;
+    ops.policy.check_identity(Access::Remove, &src.stat)?;
+    let src_etag = object_etag(ops, &from, &src.stat, cancel)?;
     if !overwrite && let Some(expected) = &args.expected_etag {
         match &src_etag {
             Some(current) if current == expected => {}
@@ -163,7 +184,10 @@ pub(crate) fn rename(
         }
     }
 
-    let dst = to.lstat()?;
+    let dst = to
+        .lstat()?
+        .map(|stat| Held::open(&to.dir, &to.name, stat))
+        .transpose()?;
     if let Some(dst) = &dst {
         if !overwrite {
             return Err(FileError::new(
@@ -171,20 +195,20 @@ pub(crate) fn rename(
                 "the destination already exists",
             ));
         }
-        if dst.kind() != src.kind() {
+        if dst.stat.kind() != src.stat.kind() {
             return Err(FileError::new(
                 ErrorCode::Exists,
                 "overwrite replaces a file with a file (or a symlink with a symlink), not across kinds",
             ));
         }
-        if dst.kind() == Kind::Dir || dst.kind() == Kind::Other {
+        if dst.stat.kind() == Kind::Dir || dst.stat.kind() == Kind::Other {
             return Err(FileError::new(
                 ErrorCode::Exists,
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
-        ops.policy.check_identity(Access::Write, dst)?;
-        let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
+        ops.policy.check_identity(Access::Write, &dst.stat)?;
+        let current = object_etag(ops, &to, &dst.stat, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
         }
@@ -239,6 +263,7 @@ fn same_object_rename(
     if src.kind() == Kind::File
         && dst.kind() == Kind::File
         && src.nlink == 1
+        && dst.nlink == 1
         && from_dir.same_object(to_dir)
         && from_name != to_name
         && matches!((from_name.to_str(), to_name.to_str()), (Some(from), Some(to))
@@ -317,6 +342,18 @@ mod same_object_rename_tests {
                 label: "case-differing hard links on a case-sensitive volume",
                 src: Stat { nlink: 2, ..src },
                 dst: Stat { nlink: 2, ..src },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "destination acquired a link after source was sampled",
+                dst: Stat { nlink: 2, ..src },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "source has extra links despite a single-link destination snapshot",
+                src: Stat { nlink: 2, ..src },
                 expected: SameObjectRename::Refuse,
                 ..base
             },
@@ -466,14 +503,10 @@ mod same_object_rename_tests {
 /// other commits allocate one private recovery directory before mutation. Public
 /// names are never unlinked or blindly swapped during compensation.
 ///
-/// Exact residual windows: (a) a same-user process discovering the random private
-/// directory can replace a slot between its identity check and final unlink;
-/// (b) public names are briefly vacant during undo, so concurrent creates keep
-/// displaced objects in recovery with uncertain_outcome; (c) exchange-less
-/// plain-rename replace retains its race (overwrite rename is refused); (d) a
-/// crash leaves recovery/staging names (or both links during link fallback).
-/// Other Unix no-replace fallbacks retain their precommit existence-check race.
-/// See `recovery` for bounds and manual recovery; no automatic sweep runs.
+/// Plain rename also uses recovery. Both paths can return uncertain_outcome or
+/// recovered on success. The module docs and `recovery` describe the held-fd
+/// proof, fallback behavior and exact residual windows. Other Unix directory
+/// moves and link-less no-replace fallbacks retain their precommit check race.
 /// Case-only rename has the separate check-to-rename residual in
 /// `same_object_rename`; it neither replaces a checked object nor compensates.
 fn commit_rename(
@@ -481,13 +514,15 @@ fn commit_rename(
     from: &Resolved,
     to: &Resolved,
     overwrite: bool,
-    src: &Stat,
-    dst: Option<&Stat>,
+    src: &Held,
+    dst: Option<&Held>,
 ) -> FileResult<Vec<String>> {
     if overwrite && let Some(dst) = dst {
         let from_dir = Stat::from_raw(&fstat(from.dir.as_fd()).map_err(FileError::errno)?);
         let to_dir = Stat::from_raw(&fstat(to.dir.as_fd()).map_err(FileError::errno)?);
-        match same_object_rename(src, dst, &from_dir, &from.name, &to_dir, &to.name) {
+        match same_object_rename(
+            &src.stat, &dst.stat, &from_dir, &from.name, &to_dir, &to.name,
+        ) {
             SameObjectRename::Refuse => {
                 return Err(FileError::invalid(
                     "source and destination are the same file",
@@ -513,10 +548,18 @@ fn commit_rename(
             // Track the actual candidate after the final hook as well as the
             // checked source. This snapshot is never authority to unlink a
             // public name; it only permits NOREPLACE restoration from recovery.
-            let candidate = from.lstat();
+            let candidate = from.lstat().and_then(|stat| {
+                stat.map(|stat| Held::open(&from.dir, &from.name, stat))
+                    .transpose()
+            });
             match candidate {
-                Ok(Some(candidate)) => move_no_replace(ops, &mut recovery, from, to, src)
-                    .and_then(|()| verify_moved(ops, &mut recovery, from, to, src, &candidate)),
+                Ok(Some(candidate)) => {
+                    let origin = Origin::new(&from.dir, &from.name, &from.full_path())
+                        .map_err(FileError::errno)?;
+                    move_no_replace(ops, &mut recovery, from, to, src).and_then(|()| {
+                        verify_moved(ops, &mut recovery, to, src, &candidate, origin)
+                    })
+                }
                 Ok(None) => Err(FileError::conflict("gone")),
                 Err(error) => Err(error),
             }
@@ -537,19 +580,19 @@ fn commit_rename(
 fn verify_moved(
     ops: &FileOps,
     recovery: &mut RecoveryDir,
-    from: &Resolved,
     to: &Resolved,
-    src: &Stat,
-    candidate: &Stat,
+    src: &Held,
+    candidate: &Held,
+    origin: Origin,
 ) -> FileResult<()> {
     let _ = ops.step(Step::Moved);
     match to.lstat() {
-        Ok(Some(now)) if now.same_object(src) => Ok(()),
+        Ok(Some(now)) if src.matches_for_restore(&now) => Ok(()),
         _ => {
-            if let Some(slot) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
+            if let Some(mut slot) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
                 let _ = ops.step(Step::Captured);
-                if recovery.holds(&slot, candidate)
-                    && recovery.restore(&slot, &from.dir, &from.name, &from.full_path())
+                if recovery.reclaim_origin(&mut slot, candidate, origin)
+                    && recovery.restore(ops, &slot)
                 {
                     let _ = ops.step(Step::Restored);
                     recovery.finish();
@@ -570,7 +613,7 @@ fn move_no_replace(
     recovery: &mut RecoveryDir,
     from: &Resolved,
     to: &Resolved,
-    src: &Stat,
+    src: &Held,
 ) -> FileResult<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     match no_replace(
@@ -585,7 +628,7 @@ fn move_no_replace(
         Err(errno) if is_unsupported(errno) => {}
         Err(errno) => return Err(FileError::errno(errno)),
     }
-    if src.kind() == Kind::Dir {
+    if src.stat.kind() == Kind::Dir {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return Err(FileError::new(
             ErrorCode::Unsupported,
@@ -626,13 +669,15 @@ fn move_no_replace(
         return Err(recovery.uncertain());
     };
     let _ = ops.step(Step::Captured);
-    if recovery.holds(&x, src) && matches!(to.lstat(), Ok(Some(now)) if now.same_object(src)) {
+    if recovery.matches_for_restore(&x, src)
+        && matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now))
+    {
         recovery.dispose(ops, &x, src);
         return Ok(());
     }
     // Keep the actual source under its original name if still vacant. Remove
     // the new link only when the captured object proves it is our source.
-    if recovery.restore(&x, &from.dir, &from.name, &from.full_path()) {
+    if recovery.restore(ops, &x) {
         let _ = ops.step(Step::Restored);
     }
     if let Some(y) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
@@ -690,19 +735,42 @@ fn exchange_over(
     recovery: &mut RecoveryDir,
     from: &Resolved,
     to: &Resolved,
-    src: &Stat,
-    dst: &Stat,
+    src: &Held,
+    dst: &Held,
 ) -> FileResult<()> {
-    exchange(from.dir.as_fd(), &from.name, to.dir.as_fd(), &to.name)
-        .map_err(overwrite_exchange_error)?;
-    let _ = ops.step(Step::Exchanged);
-    let Some(x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
-        recovery.record_public(&to.dir, &to.name, &to.full_path());
+    // Capture before exchanging: the public source is never used as a staging
+    // slot for the destination. Its vacancy is the documented window (b2).
+    let Some(mut x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
         return Err(recovery.uncertain());
     };
     let _ = ops.step(Step::Captured);
-    let moved_ok = matches!(to.lstat(), Ok(Some(now)) if now.same_object(src));
-    if recovery.holds(&x, dst) && moved_ok {
+    if !recovery.holds(&x, src) {
+        if recovery.restore(ops, &x) {
+            let _ = ops.step(Step::Restored);
+        }
+        recovery.finish();
+        return if recovery.settled() {
+            Err(FileError::conflict("replaced"))
+        } else {
+            Err(recovery.uncertain())
+        };
+    }
+    let _ = ops.step(Step::Vacated);
+    let destination = Origin::new(&to.dir, &to.name, &to.full_path());
+    let source_origin = match destination.and_then(|origin| recovery.exchange(&mut x, origin)) {
+        Ok(origin) => origin,
+        Err(errno) => {
+            if recovery.restore(ops, &x) {
+                let _ = ops.step(Step::Restored);
+            }
+            // No plain overwrite fallback. The outer wrapper reports uncertainty
+            // if a concurrent source create or restore failure kept the source.
+            return Err(overwrite_exchange_error(errno));
+        }
+    };
+    let _ = ops.step(Step::Exchanged);
+    let _ = ops.step(Step::Captured);
+    if recovery.holds(&x, dst) {
         recovery.dispose(ops, &x, dst);
         return Ok(());
     }
@@ -710,14 +778,19 @@ fn exchange_over(
     if y.is_some() {
         let _ = ops.step(Step::Captured);
     }
-    if recovery.restore(&x, &to.dir, &to.name, &to.full_path()) {
-        let _ = ops.step(Step::Restored);
-    }
-    if let Some(y) = y
-        && recovery.holds(&y, src)
-        && recovery.restore(&y, &from.dir, &from.name, &from.full_path())
-    {
-        let _ = ops.step(Step::Restored);
+    if let Some(mut y) = y {
+        if recovery.holds(&y, src) {
+            // Proven S can reclaim only its recorded source origin from step 1.
+            if recovery.restore(ops, &x) {
+                let _ = ops.step(Step::Restored);
+            }
+            if recovery.reclaim_origin(&mut y, src, source_origin) && recovery.restore(ops, &y) {
+                let _ = ops.step(Step::Restored);
+            }
+        } else if recovery.restore(ops, &y) {
+            // Newest writer returns to its captured destination origin; X stays.
+            let _ = ops.step(Step::Restored);
+        }
     }
     recovery.finish();
     if recovery.settled() {
@@ -733,8 +806,8 @@ fn exchange_over(
     _recovery: &mut RecoveryDir,
     _from: &Resolved,
     _to: &Resolved,
-    _src: &Stat,
-    _dst: &Stat,
+    _src: &Held,
+    _dst: &Held,
 ) -> FileResult<()> {
     Err(FileError::new(
         ErrorCode::Unsupported,
