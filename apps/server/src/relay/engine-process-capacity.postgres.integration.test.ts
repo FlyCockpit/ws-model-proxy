@@ -713,6 +713,7 @@ integration("engine process capacity lifecycle", () => {
   it.each([
     { choice: "detach", ownerChange: false },
     { choice: "stale-after", ownerChange: false },
+    { choice: "superseded-null", ownerChange: false },
     { choice: "auto", ownerChange: true },
     { choice: "same-auto", ownerChange: false },
     { choice: "priority-only", ownerChange: false },
@@ -727,7 +728,7 @@ integration("engine process capacity lifecycle", () => {
       const chosen =
         choice === "detach"
           ? null
-          : choice === "auto" || choice === "missing-before"
+          : choice === "auto" || choice === "missing-before" || choice === "superseded-null"
             ? b.inferenceCapacityId
             : a.inferenceCapacityId;
       // Simulate adding the new column to old rows: AUTO default, but the
@@ -752,15 +753,32 @@ integration("engine process capacity lifecycle", () => {
               : { inferenceCapacityId: choice === "stale-after" ? b.inferenceCapacityId : chosen },
         },
       });
+      if (choice === "superseded-null") {
+        // A later legacy "Not attached" save superseded the assignment; inventory re-attached it.
+        await fixture.capacityAuditEvent.create({
+          data: {
+            userId: user.id,
+            actorUserId: user.id,
+            action: "UPDATE_POLICY",
+            resourceType: "EXECUTION_TARGET",
+            resourceId: a.id,
+            before: { inferenceCapacityId: chosen },
+            after: { inferenceCapacityId: null },
+            createdAt: new Date(Date.now() + 60_000),
+          },
+        });
+      }
       await fixture.executionTarget.update({
         where: { id: b.id },
         data: { inferenceCapacityId: null },
       });
-      await promisify(execFile)(
-        process.execPath,
-        ["../../packages/db/scripts/apply-schema-hardening.mjs"],
-        { env: { ...process.env, SCHEMA_HARDENING_FORCE: "1" } },
-      );
+      // Deployment recovery must be idempotent: a rerun may not promote what run one left AUTO.
+      for (let run = 0; run < 2; run++)
+        await promisify(execFile)(
+          process.execPath,
+          ["../../packages/db/scripts/apply-schema-hardening.mjs"],
+          { env: { ...process.env, SCHEMA_HARDENING_FORCE: "1" } },
+        );
       const recovered = await targets();
       // A legacy null is never an owner detach: the backfill re-attaches the target.
       if (choice === "detach") expect(recovered[0]?.inferenceCapacityId).not.toBeNull();

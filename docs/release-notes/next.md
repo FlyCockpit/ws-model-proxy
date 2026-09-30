@@ -16,7 +16,7 @@ CLI reports multiple served aliases. Owner assignments and explicit detach choic
 are durable per target when the capacity FK actually changes, including changes to
 existing AUTO capacities. Saving the same capacity or only a policy keeps the target's
 provenance. Untouched pool-member attachment fields preserve the target's current
-capacity; deployment recovers only audited before/after FK changes. Removed aliases
+capacity; deployment marks a target owner-assigned only when its latest audited capacity change (to a non-null capacity) is still in effect; legacy "Not attached" saves are re-attached automatically. Removed aliases
 split once idle. Only a connected move group's source and destination capacities gate
 its ACTIVE lease / WAITING waiter preflight; unrelated capacities and independent
 endpoint groups keep progressing. A busy involved group retries on each later

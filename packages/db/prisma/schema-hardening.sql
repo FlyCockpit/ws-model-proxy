@@ -960,18 +960,21 @@ ON CONFLICT ("discoveredModelId") DO NOTHING;
 -- D holds graph tables exclusively; reruns only promote AUTO to OWNER.
 UPDATE execution_target target SET "capacityAssignmentSource" = 'OWNER'
  WHERE target."capacityAssignmentSource" = 'AUTO'
-   AND EXISTS (SELECT 1 FROM capacity_audit_event edit
-     WHERE edit."resourceType" = 'EXECUTION_TARGET' AND edit.action = 'UPDATE_POLICY'
-       AND edit."resourceId" = target.id AND edit."userId" = target."userId"
-       AND jsonb_typeof(edit.before) = 'object' AND edit.before ? 'inferenceCapacityId'
-       AND jsonb_typeof(edit.after) = 'object' AND edit.after ? 'inferenceCapacityId'
-       AND edit.after ->> 'inferenceCapacityId'
-         IS DISTINCT FROM edit.before ->> 'inferenceCapacityId'
-       -- Legacy forms recorded "Not attached" (null) on pool-member creates and the next
-       -- inventory re-attached the target, so a null after is never proof of a detach choice.
-       AND edit.after ->> 'inferenceCapacityId' IS NOT NULL
-       -- A stale audit whose destination is no longer the current FK proves nothing.
-       AND edit.after ->> 'inferenceCapacityId' = target."inferenceCapacityId");
+   -- Only the LATEST audited FK change counts: an older assignment that a later legacy
+   -- "Not attached" save superseded (and inventory re-attached) is not an owner choice,
+   -- so a rerun cannot promote a target the first run left AUTO.
+   AND (
+     SELECT edit.after ->> 'inferenceCapacityId'
+       FROM capacity_audit_event edit
+      WHERE edit."resourceType" = 'EXECUTION_TARGET' AND edit.action = 'UPDATE_POLICY'
+        AND edit."resourceId" = target.id AND edit."userId" = target."userId"
+        AND jsonb_typeof(edit.before) = 'object' AND edit.before ? 'inferenceCapacityId'
+        AND jsonb_typeof(edit.after) = 'object' AND edit.after ? 'inferenceCapacityId'
+        AND edit.after ->> 'inferenceCapacityId'
+          IS DISTINCT FROM edit.before ->> 'inferenceCapacityId'
+      ORDER BY edit."createdAt" DESC, edit.id DESC
+      LIMIT 1
+   ) = target."inferenceCapacityId";
 
 -- Give every pre-capacity execution target a conservative private identity.
 -- We cannot safely infer that two independently published targets share a
