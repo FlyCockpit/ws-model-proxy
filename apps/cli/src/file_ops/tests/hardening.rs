@@ -1413,3 +1413,21 @@ fn a_large_file_tail_marks_lines_cut_by_the_output_cap_and_refuses_an_unscannabl
     assert_eq!(err.code, ErrorCode::TooLarge);
     assert!(err.message.contains("scan bound"), "{}", err.message);
 }
+
+#[test]
+fn staging_names_are_refused_under_every_folded_spelling() {
+    let fx = Fx::new();
+    for staged in [
+        ".doc.txt.wsmp-a1b2c3d4e5",
+        ".doc.txt.WSMP-a1b2c3d4e5",
+        ".doc.txt.w\u{17F}mp-a1b2c3d4e5",
+        ".doc.txt.wsmp-a1b2c3d4e5.",
+        ".doc.txt.wsmp-a1b2c3d4e5 ",
+    ] {
+        let r = fx.ops.write(
+            &args(json!({ "path": fx.p(staged), "content": "x" })),
+            &fx.cancel,
+        );
+        assert_eq!(code(r), ErrorCode::PathDenied, "{staged:?}");
+    }
+}

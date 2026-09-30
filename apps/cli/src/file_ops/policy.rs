@@ -187,14 +187,13 @@ impl Policy {
 /// (`.<name>.wsmp-<10 alphanumerics>`): another tool call must not be able to
 /// swap the staged object between its fsync and its rename.
 fn is_staging_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    // folded like every path classification: Unicode case variants (`.wſmp-`) and
+    // trailing dots or spaces name the same staged object on a casefold volume
+    let folded = super::redact::fold(&path.to_string_lossy());
+    let name = folded.rsplit('/').next().unwrap_or_default();
+    let Some(rest) = name.strip_prefix('.') else {
         return false;
     };
-    let lower = name.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix('.') else {
-        return false;
-    };
-    // (case-insensitive: a casefold directory resolves `.WSMP-` to the staged name)
     rest.rsplit_once(".wsmp-").is_some_and(|(_, suffix)| {
         suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
     })

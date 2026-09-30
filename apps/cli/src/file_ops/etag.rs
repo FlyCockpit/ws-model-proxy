@@ -147,6 +147,11 @@ mod tests {
             a.strong(&s2, b"HF_TOKEN=hunter2\n"),
             "the same bytes in another file must not share an etag (no guess oracle)"
         );
+        // the same device, inode and bytes with another modification time (a recycled inode
+        // number is a different file) is a different etag
+        let mut later = s1;
+        later.mtime_secs += 1;
+        assert_ne!(one, a.strong(&later, b"HF_TOKEN=hunter2\n"));
         assert!(one.starts_with("h:"));
         assert_eq!(one.len(), 2 + ETAG_CHARS);
         assert_ne!(one, EtagKey::random().strong(&s1, b"HF_TOKEN=hunter2\n"));

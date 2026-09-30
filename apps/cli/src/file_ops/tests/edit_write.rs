@@ -461,7 +461,7 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
     let fx = Fx::new();
     fx.put(
         "cfg.yaml",
-        "API_KEY: sk-live-plainsecret\nnext: masked\nother: 1\n",
+        "API_KEY: plainsecret-value\nnext: masked\nother: 1\n",
     );
     fx.put("multi.txt", "X_TOKEN=\"line1\nline2-multisecret\"\ntail\n");
     let cases: [(&str, serde_json::Value); 4] = [
@@ -502,7 +502,7 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
     assert_eq!(code(r), ErrorCode::RedactedSpan);
     assert_eq!(
         fx.get("cfg.yaml"),
-        "API_KEY: sk-live-plainsecret\nnext: masked\nother: 1\n"
+        "API_KEY: plainsecret-value\nnext: masked\nother: 1\n"
     );
     // one masked value is unmasked while the others stay masked: still refused
     fx.put(

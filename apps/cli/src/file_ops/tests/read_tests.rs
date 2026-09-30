@@ -292,7 +292,7 @@ fn ssh_keys_pem_keys_and_hf_token_files_are_masked() {
             pem("PRIVATE KEY", "KEYBODY\n")
         ),
     );
-    fx.put(".cache/huggingface/token", "hf_abcdefghijklmnop\n");
+    fx.put(".cache/huggingface/token", "fake-hf-value\n");
     assert!(!fx.read(".ssh/id_ed25519").text.contains("SECRETBODY"));
     assert!(fx.read(".ssh/id_ed25519.pub").text.contains("AAAAPUBLIC"));
     let pem = fx.read("tls/server.pem").text;

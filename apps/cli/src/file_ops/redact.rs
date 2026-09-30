@@ -77,7 +77,7 @@ impl FileClass {
 /// filesystems apply (`ſ` -> `s`, `ß`/`ẞ` -> `ss`), and no trailing dots or spaces. Everything is compared folded,
 /// so a spelling that a casefold or normalization-insensitive volume resolves to
 /// the secret file is classified as the secret file.
-fn fold(name: &str) -> String {
+pub(crate) fn fold(name: &str) -> String {
     let lowered =
         name.to_lowercase()
             .chars()
@@ -653,6 +653,9 @@ pub struct LineMasker {
     /// their BEGIN lines. An END closes the innermost block of the SAME label. No
     /// cap: a dropped BEGIN would leave its body visible.
     pem_open: std::collections::BTreeMap<String, Vec<usize>>,
+    /// Offsets of every open BEGIN with their counts: the latest one is an O(log n)
+    /// lookup, so a file with thousands of distinct labels stays linear.
+    pem_latest: std::collections::BTreeMap<usize, usize>,
     pending_flag_value: bool,
     /// Offset of the latest opener of the run that masks lines until a blank line.
     until_blank: Option<usize>,
@@ -674,6 +677,7 @@ impl LineMasker {
             class,
             lookback,
             pem_open: std::collections::BTreeMap::new(),
+            pem_latest: std::collections::BTreeMap::new(),
             pending_flag_value: false,
             until_blank: None,
             blocks: Vec::new(),
@@ -745,19 +749,22 @@ impl LineMasker {
         // same label. The markers of a line apply in byte order (`END CERT-----BEGIN
         // KEY` opens one); a mismatched END closes nothing (fail closed); several
         // blocks may be open at once, and the latest opener charges the lookback.
-        let pem_open_at_start = self
-            .pem_open
-            .values()
-            .filter_map(|openers| openers.last())
-            .max()
-            .copied();
+        let pem_open_at_start = self.pem_latest.keys().next_back().copied();
         let mut pem_touched = pem_open_at_start.is_some();
         for (begin, label) in pem_events(line) {
             pem_touched = true;
             if begin {
                 self.pem_open.entry(label.to_string()).or_default().push(at);
+                *self.pem_latest.entry(at).or_insert(0) += 1;
             } else if let Some(openers) = self.pem_open.get_mut(label) {
-                openers.pop();
+                if let Some(opener) = openers.pop()
+                    && let Some(count) = self.pem_latest.get_mut(&opener)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.pem_latest.remove(&opener);
+                    }
+                }
                 if openers.is_empty() {
                     self.pem_open.remove(label);
                 }
@@ -870,6 +877,20 @@ impl LineMasker {
                 }
                 if self.pending_token_line && !line.trim().is_empty() {
                     masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
+                    // the line after a token line is the value's line (`value: |` after
+                    // `name: API_KEY`): a multi-line value that it opens goes on to a
+                    // structural end (blank line, dedent), like a value on the token line
+                    construct = match line.find(':') {
+                        Some(colon) => construct_for_tail(
+                            &line[colon + 1..],
+                            true,
+                            indent_of(line),
+                            quote_left_open(line),
+                        ),
+                        None => {
+                            construct_for_tail(line, false, indent_of(line), quote_left_open(line))
+                        }
+                    };
                 }
                 self.pending_token_line = false;
             }
@@ -1064,6 +1085,44 @@ mod tests {
                 input.matches('\n').count(),
                 "{sample}"
             );
+        }
+    }
+
+    /// The line after a token line is the value's line; a multi-line value that it
+    /// opens keeps masking to a structural end (Kubernetes `value: |`, folded, quoted).
+    #[test]
+    fn a_token_line_followed_by_a_multi_line_value_masks_the_whole_value() {
+        for (sample, input, secrets, visible) in [
+            (
+                "literal block",
+                "env:\n  - name: API_KEY\n    value: |\n      value-one\n      value-two\n  - name: PORT\n    value: \"8080\"\n",
+                &["value-one", "value-two"][..],
+                "PORT",
+            ),
+            (
+                "folded block",
+                "env:\n  - name: DB_PASSWORD\n    value: >-\n      value-one\n      value-two\nnext: 1\n",
+                &["value-one", "value-two"][..],
+                "next: 1",
+            ),
+            (
+                "quoted multi-line",
+                "- name: X_TOKEN\n  value: \"value-one\n    value-two\"\n\nnext: 1\n",
+                &["value-one", "value-two"][..],
+                "next: 1",
+            ),
+            (
+                "JSON separate lines",
+                "{\"name\": \"HF_TOKEN\",\n \"value\": \"value-one\"}\n",
+                &["value-one"][..],
+                "",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            for secret in secrets {
+                assert!(!view.contains(secret), "{sample}: {view:?}");
+            }
+            assert!(view.contains(visible), "{sample}: {view:?}");
         }
     }
 
@@ -1487,8 +1546,8 @@ mod tests {
             model: /models/qwen3/qwen3-27b-q4_k_m.gguf\n\
             MAX_TOKENS=4096\n\
             the quick brown fox jumps over the lazy dog, again and again and again\n\
-            export HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123456789\n\
-            run --api-key sk-live-abcdef0123456789 --verbose\n\
+            export HF_TOKEN=fake-value-one-two-three\n\
+            run --api-key fake-value-four --verbose\n\
             [Service]\nEnvironment=\"DB_PASSWORD=correct horse\"\nLimitNOFILE=65535\n\
             timeout: 30s\nretries: 3\nlog_level: debug\nlisten: 0.0.0.0:8000\n\
             just a plain line of documentation text without anything special in it at all\n";
