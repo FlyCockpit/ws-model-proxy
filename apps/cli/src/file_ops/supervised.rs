@@ -547,7 +547,7 @@ fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> File
     let diff = result
         .diff
         .unwrap_or_default()
-        .lines()
+        .split_terminator('\n')
         .map(str::to_string)
         .collect();
     args.dry_run = Some(false);
@@ -685,7 +685,7 @@ fn build_write(
     let mut consent = super::diff::ConsentText::new(&before);
     consent.push_agent(after);
     let diff = consent_diff(&consent, class)?
-        .lines()
+        .split_terminator('\n')
         .map(str::to_string)
         .collect();
     Ok(Built {

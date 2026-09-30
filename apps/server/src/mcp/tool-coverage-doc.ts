@@ -43,8 +43,8 @@ additions stay visible with controls escaped. Diff and mask use LF-only lines; a
 lone CR stays escaped content, and unmappable line counts block with redacted_span.
 Details discloses creation mode, all preserved permission bits, parent creation,
 ifExists, overwrite and byte counts. Diffs exceeding
-the 8 KiB display cap are blocked with too_large after dismissal. macOS refuses
-supervised rename overwrite of an existing destination with unsupported. Poll \`forwarder_cli_command_result\` for
+the 8 KiB display cap are blocked with too_large after dismissal. A supervised directory
+rename without replacement is refused with unsupported on macOS. Poll \`forwarder_cli_command_result\` for
 \`file:{op,result}\` or \`error:{code,message,outcome?}\`. Approval implies no read grant.
 Server termination after dispatch without authoritative CLI settlement is unknown
 with started:true when the server received acceptance and started:null otherwise. CLI decline/rejection

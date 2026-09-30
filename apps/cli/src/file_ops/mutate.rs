@@ -910,3 +910,45 @@ mod portable_fallback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod supervised_capability_tests {
+    use super::*;
+
+    #[test]
+    fn platform_capability_pins_supervised_overwrite_and_directory_rules() {
+        // The production row for this platform, independent of the helper under test.
+        let expected = if cfg!(target_os = "linux") {
+            RenameAtomicCapability::Kernel
+        } else if cfg!(target_os = "macos") {
+            RenameAtomicCapability::LinksAndExchange
+        } else {
+            RenameAtomicCapability::HardLinksOnly
+        };
+        assert_eq!(platform_rename_capability(), expected);
+        assert_eq!(
+            supervised_overwrite_supported(platform_rename_capability()),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn macos_links_and_exchange_allows_overwrite_but_refuses_directory_moves() {
+        let cap = RenameAtomicCapability::LinksAndExchange;
+        assert!(check_supervised_rename_capability(cap, Kind::File, true, true).is_ok());
+        assert!(check_supervised_rename_capability(cap, Kind::File, false, false).is_ok());
+        assert_eq!(
+            check_supervised_rename_capability(cap, Kind::Dir, false, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Unsupported
+        );
+        let links = RenameAtomicCapability::HardLinksOnly;
+        assert_eq!(
+            check_supervised_rename_capability(links, Kind::File, true, true)
+                .unwrap_err()
+                .code,
+            ErrorCode::Unsupported
+        );
+    }
+}

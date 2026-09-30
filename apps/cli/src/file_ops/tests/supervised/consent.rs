@@ -404,3 +404,79 @@ fn consent_replacement_details_preserve_sticky_mode() {
     );
     assert_eq!(fx.get("plain.conf"), "new\n");
 }
+
+/// A carriage return is ordinary content: the preview lines keep every `\r`
+/// (the child escapes it), including one at the end of the file or next to the
+/// generated no-newline marker. `str::lines()` used to strip it silently.
+#[test]
+fn consent_preview_keeps_every_carriage_return() {
+    for (op, before, after) in [
+        ("write-new", None, "echo ok\r"),
+        ("write-replace", Some("a\n"), "a\r"),
+        ("edit", Some("a\n"), "a\r"),
+        ("edit", Some("a\n"), "a\r\n"),
+        ("edit", Some("x\r"), "y\r"),
+    ] {
+        let fx = Fx::new();
+        let (operation, args, body) = match (op, before) {
+            ("write-new", _) => (
+                "write",
+                json!({"path":fx.p("plain.conf")}),
+                Some(after.as_bytes().to_vec()),
+            ),
+            ("write-replace", Some(before)) => {
+                fx.put("plain.conf", before);
+                (
+                    "write",
+                    json!({"path":fx.p("plain.conf"),"ifExists":"replace","expectedEtag":fx.etag("plain.conf")}),
+                    Some(after.as_bytes().to_vec()),
+                )
+            }
+            (_, Some(before)) => {
+                fx.put("plain.conf", before);
+                (
+                    "edit",
+                    json!({"path":fx.p("plain.conf"),"edits":[{"oldText":before,"newText":after}]}),
+                    None,
+                )
+            }
+            _ => unreachable!(),
+        };
+        let prepared = prepare(&fx, operation, args, body.clone());
+        assert_eq!(prepared.child_input().blocked, None, "{op} {after:?}");
+        let preview = fx
+            .ops
+            .preview_supervised(
+                operation,
+                prepared.child_input().args.clone(),
+                body.as_deref(),
+                &key(),
+                &fx.cancel,
+            )
+            .unwrap();
+        let SupervisedPreview::Allowed(allowed) = preview else {
+            panic!("allowed: {preview:?}")
+        };
+        let shown = allowed
+            .diff
+            .iter()
+            .filter(|line| line.contains('\r'))
+            .count();
+        let expected = before
+            .iter()
+            .chain([&after])
+            .map(|text| text.matches('\r').count())
+            .sum::<usize>();
+        assert!(
+            shown >= 1,
+            "{op} {after:?}: no carriage return in {:?}",
+            allowed.diff
+        );
+        let total: usize = allowed
+            .diff
+            .iter()
+            .map(|line| line.matches('\r').count())
+            .sum();
+        assert_eq!(total, expected, "{op} {after:?}: {:?}", allowed.diff);
+    }
+}
