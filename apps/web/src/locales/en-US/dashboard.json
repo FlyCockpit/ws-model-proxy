@@ -61,7 +61,7 @@
       "fileToolAccess": {
         "read": {
           "headless": "runs headless",
-          "supervised": "not available yet (needs a read grant)",
+          "supervised": "needs the read grant",
           "off": "off"
         },
         "write": {
@@ -85,7 +85,11 @@
         "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it.",
         "grant_supervised_only": "refused: needs Unsupervised, and the dashboard grant above is Supervised. Raise the grant to allow it (this CLI's config must then allow it too).",
         "cli_supervised_only": "refused: needs Unsupervised, and this CLI's own config is Supervised. On that machine run wsmp config set-mcp-commands unsupervised and restart wsmp."
-      }
+      },
+      "fileRead": "Agents may read files (read-only)",
+      "fileReadDisabled": "Enable wsmp config set-file-read on and restart the CLI first.",
+      "fileRootsMissing": "Configure file roots with wsmp config set-file-roots and restart the CLI first.",
+      "fileToolsFollowMode": "File tools follow the command mode; the read-only grant also permits headless reads with configured roots."
     },
     "rename": {
       "action": "Rename",

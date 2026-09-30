@@ -57,9 +57,17 @@ export type CliDeviceFeatures = {
   fileTools: { read: FileToolAccess; write: FileToolAccess } | null;
   /** The CLI's `allowFileToolsAsRoot` config; null when not reported. */
   allowFileToolsAsRoot: boolean | null;
+  mcpFileRead: boolean;
+  reportedMcpFileRead: boolean | null;
+  reportedFileRoots: boolean | null;
 };
 
-export type FeatureSwitchReason = "windows" | "configDisabled" | "updateWsmp";
+export type FeatureSwitchReason =
+  | "windows"
+  | "configDisabled"
+  | "updateWsmp"
+  | "fileReadDisabled"
+  | "fileRootsMissing";
 
 export type TerminalOpenBlockReason =
   | FeatureSwitchReason
@@ -95,6 +103,9 @@ export function readCliDeviceFeatures(device: {
   } | null;
   fileTools?: { read: FileToolAccess; write: FileToolAccess } | null;
   allowFileToolsAsRoot?: boolean | null;
+  mcpFileRead?: boolean;
+  reportedMcpFileRead?: boolean | null;
+  reportedFileRoots?: boolean | null;
 }): CliDeviceFeatures {
   return {
     cliVersion: device.cliVersion ?? null,
@@ -105,6 +116,9 @@ export function readCliDeviceFeatures(device: {
     },
     fileTools: device.fileTools ?? null,
     allowFileToolsAsRoot: device.allowFileToolsAsRoot ?? null,
+    mcpFileRead: device.mcpFileRead === true,
+    reportedMcpFileRead: device.reportedMcpFileRead ?? null,
+    reportedFileRoots: device.reportedFileRoots ?? null,
   };
 }
 
@@ -159,6 +173,19 @@ export function featureSwitchState(
   return { disabled: reason !== null, reason };
 }
 
+/** Existing grants can always be revoked, even after a CLI config change. */
+export function fileReadSwitchState(
+  feature: Pick<CliDeviceFeatures, "mcpFileRead" | "reportedMcpFileRead" | "reportedFileRoots">,
+): { disabled: boolean; reason: FeatureSwitchReason | null } {
+  const reason =
+    feature.reportedMcpFileRead !== true
+      ? "fileReadDisabled"
+      : feature.reportedFileRoots !== true
+        ? "fileRootsMissing"
+        : null;
+  return { disabled: !feature.mcpFileRead && reason !== null, reason };
+}
+
 export function terminalOpenBlockReason(feature: TerminalFeature): TerminalOpenBlockReason | null {
   const gate = featureSwitchState(feature, "terminal");
   if (gate.reason) return gate.reason;
@@ -170,6 +197,10 @@ export function terminalOpenBlockReason(feature: TerminalFeature): TerminalOpenB
 
 export function featureReasonKey(reason: TerminalOpenBlockReason): string {
   switch (reason) {
+    case "fileReadDisabled":
+      return "dashboard:clis.features.fileReadDisabled";
+    case "fileRootsMissing":
+      return "dashboard:clis.features.fileRootsMissing";
     case "windows":
       return "dashboard:clis.features.windows";
     case "configDisabled":

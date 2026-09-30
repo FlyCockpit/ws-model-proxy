@@ -139,7 +139,10 @@ fn tilde_expands_to_home() {
 
 #[test]
 fn roots_confine_symlink_and_dotdot_escapes() {
-    let fx = Fx::with_policy(|root| Policy::new(vec![root.join("jail")], vec![], true));
+    let fx = Fx::with_policy(|root| {
+        std::fs::create_dir(root.join("jail")).expect("root exists before startup");
+        Policy::new(vec![root.join("jail")], vec![], true)
+    });
     fx.put("jail/in.txt", "inside");
     fx.put("outside/secret.txt", "outside");
     fx.link(fx.root.join("outside"), "jail/escape");
@@ -173,8 +176,10 @@ fn roots_confine_symlink_and_dotdot_escapes() {
 
 #[test]
 fn make_parents_never_creates_directories_outside_roots() {
-    let fx = Fx::with_policy(|root| Policy::new(vec![root.join("jail")], vec![], true));
-    std::fs::create_dir(fx.root.join("jail")).unwrap();
+    let fx = Fx::with_policy(|root| {
+        std::fs::create_dir(root.join("jail")).expect("root exists before startup");
+        Policy::new(vec![root.join("jail")], vec![], true)
+    });
     let err = fx.ops.write(
         &args(json!({ "path": fx.p("other/deep/f.txt"), "content": "x", "makeParents": true })),
         &fx.cancel,
@@ -392,7 +397,10 @@ fn resolve_rolls_back_created_parents() {
 /// see the inside file or fail; it must never return the outside content.
 #[test]
 fn symlink_swap_race_never_escapes_roots() {
-    let fx = Fx::with_policy(|root| Policy::new(vec![root.join("jail")], vec![], true));
+    let fx = Fx::with_policy(|root| {
+        std::fs::create_dir(root.join("jail")).expect("root exists before startup");
+        Policy::new(vec![root.join("jail")], vec![], true)
+    });
     fx.put("jail/dir/f", "inside");
     fx.put("outside/f", "SECRET-OUTSIDE");
     let stop = Arc::new(AtomicBool::new(false));

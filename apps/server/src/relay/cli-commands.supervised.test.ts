@@ -232,6 +232,8 @@ const encode = (text: string) => new TextEncoder().encode(text);
 
 describe("supervised commands", () => {
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
     resetCliCommandsForTests();
     resetFileOpsForTests();
     vi.clearAllMocks();
@@ -878,6 +880,12 @@ describe("supervised commands", () => {
       expect(snapshot(request.commandId)).toMatchObject({ status: "expired", started: false });
       await say(socket, { type: "term.exit", terminalId: request.terminalId });
       expect(snapshot(request.commandId)).toMatchObject({ status: "expired", started: false });
+      // Model the still-connected CLI heartbeat after the long confirm wait.
+      await relaySessionManager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "heartbeat", id: "after-confirm-wait" }),
+        new Date(),
+      );
       // The slot is free again.
       await expect(start()).resolves.toMatchObject({ ok: true });
     });
@@ -1162,6 +1170,7 @@ describe("supervised commands", () => {
       expect(exec.ok).toBe(true);
 
       relaySessionManager.applyFeatureGrants("desktop", {
+        mcpFileRead: false,
         allowHumanTerminal: false,
         mcpCommandMode: "supervised",
       });
@@ -1170,6 +1179,7 @@ describe("supervised commands", () => {
       expect(sent(socket, "term.close")).toEqual([]);
 
       relaySessionManager.applyFeatureGrants("desktop", {
+        mcpFileRead: false,
         allowHumanTerminal: true,
         mcpCommandMode: "off",
       });
@@ -1187,6 +1197,7 @@ describe("supervised commands", () => {
       const request = await started();
       await say(socket, { type: "term.spawned", ...request });
       relaySessionManager.applyFeatureGrants("desktop", {
+        mcpFileRead: false,
         allowHumanTerminal: false,
         mcpCommandMode: "supervised",
       });
@@ -1649,6 +1660,7 @@ describe("supervised commands", () => {
           relaySessionManager.applyFeatureGrants("desktop", {
             allowHumanTerminal: false,
             mcpCommandMode: "off",
+            mcpFileRead: false,
           });
         if (event === "stop-unanswered") {
           expect(tracker?.requestDecline()).toBe("requested");
@@ -2615,6 +2627,7 @@ describe("supervised commands", () => {
         relaySessionManager.applyFeatureGrants("desktop", {
           allowHumanTerminal: false,
           mcpCommandMode: "off",
+          mcpFileRead: false,
         });
       }
       release({ banned: false });
@@ -2711,6 +2724,7 @@ describe("supervised commands", () => {
         relaySessionManager.applyFeatureGrants("desktop", {
           allowHumanTerminal: false,
           mcpCommandMode: "off",
+          mcpFileRead: false,
         });
       const codes = {
         decline: "declined",

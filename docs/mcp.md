@@ -116,18 +116,31 @@ it does not compose shell commands. Every result that touches a file carries an
 (500 characters) that goes to the CLI log and is shown on the CLI confirm screen
 on a supervised node.
 
-**Who may call.** Like the CLI command tools, the file tools are visible and callable
-only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth
-is always denied and the tools are hidden from `tools/list`.
+**Who may call.** The four read tools accept a personal access token with either
+`allowCliCommands` + literal `mcp:write`, or `allowCliFileRead` + `mcp:read`.
+Write tools and command tools require `allowCliCommands` + literal `mcp:write`.
+OAuth never gets these tools. A read-grant-only PAT sees exactly the four read file
+tools; calling a hidden write or command tool returns unknown-tool. Token flags
+and scopes are reread at admission, and narrowing cancels pending operations.
 
-**Permission matrix.** What runs depends on the device's effective mode, the lowest of the
-dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live hello:
+**Permission matrix.** The effective mode is the lowest of the dashboard grant
+and the CLI's own `wsmp config set-mcp-commands` mode in its live hello.
+The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
+and live `fileRootsConfigured`; missing or stale features never authorize it.
+If a post-commit device-grant refresh cannot read the current policy, live terminal, command, and file authority (including unsupervised access) is withdrawn and pending work is cancelled until a successful refresh or reconnect.
+A reconnect whose hello began before a device policy change installs no terminal,
+command, or file authority until a serialized refresh establishes the current
+policy. Admissions opened before the change are refused even if a later enable
+restores authority; a fresh request may use the restored grant. Changes to another
+device do not affect these admissions or require an extra hello policy read.
 
-| Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
-| --- | --- | --- |
-| `unsupervised` | headless | headless |
-| `supervised` | refused `supervised_only` (read grant not implemented here) | CLI keypress required |
-| `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
+| Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
+| --- | --- | --- | --- |
+| `unsupervised` | either | headless | headless |
+| `supervised` | on | headless | CLI keypress required |
+| `supervised` | off | refused `supervised_only` | CLI keypress required |
+| `off` | on | headless | refused `grant_disabled` / `feature_disabled` |
+| `off` | off | refused `grant_disabled` / `feature_disabled` | refused (same) |
 
 Supervised writes return `{commandId, kind:"supervised", status:"awaiting_user", waitingUntil, next}`.
 A person opens the pending request in the dashboard Terminals screen and presses Enter
@@ -156,7 +169,7 @@ of a directory without replacement is refused `unsupported` (overwrite uses atom
 exchange). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
 is refused `unsupported` too: no unsafe rename fallback is used. Regular-file no-replace
 moves remain available when the filesystem supports hard links.
-No headless read grant is implied by supervised approval.
+Supervised approval implies no read grant.
 
 Poll `forwarder_cli_command_result` with the returned id. It reports the shared
 supervised statuses, plus `file:{op,result}` on success or `error:{code,message,outcome?}`.
@@ -186,18 +199,30 @@ before retrying an unknown result; use file_stat only if a read grant permits it
 The earliest expiry carried by the token row or the admitted credential ends a
 supervised file request immediately, with `token_inactive`; after acceptance its
 outcome is unknown. Results arriving at or after that expiry are not delivered.
-`listCliDevices` reports
-`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`.
-That summary is the mode permission only: a Windows CLI, or a root CLI without
-`allowFileToolsAsRoot`, still refuses every operation as `unsupported`.
-`supervised` writes need a person's keypress; an opt-in read grant is a later phase.
-The CLI refuses every file tool as
-`unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
-The CLI re-checks its own mode on every operation; a server request never overrides it.
-The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
-the terminal approval files, `instances.json` and `relay-control.sock`; `service.env`;
-`config.json` and its lock for writes; and the special trees `/proc`, `/sys` and `/dev`)
-is refused as `path_denied` or `special_file`.
+
+Enable `wsmp config set-file-read on` and choose explicit directories with
+`wsmp config set-file-roots <path>…`, restart wsmp, then grant “Agents may read
+files (read-only)” on the dashboard. Suggested roots `~/models`, `~/deploy`,
+`~/.config/llama-swap`, `~/.local/state/wsmp/logs` are help text only and never
+applied automatically. Roots must be absolute existing directories after `~`
+expansion, UTF-8, distinct, and other than `/`. `clear-file-roots` clears them.
+Restart applies both switches. A broken root reports roots unavailable and
+retains a denying confinement policy, with no whole-filesystem fallback.
+When roots are set, every operation, including rename destinations and list/search,
+is confined on physical paths; symlinks and `..` cannot escape them. Linux also
+uses a safe `openat2` RESOLVE_BENEATH/RESOLVE_NO_MAGICLINKS second guard where
+supported. A concurrent local process that moves directories can still race a
+held fd after resolution; these tools do not confine arbitrary local processes.
+Without roots, unsupervised retains whole-filesystem access minus the protected set.
+
+`listCliDevices` reports `fileTools: {read, write}` (`headless`, `supervised`, `off`),
+`mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and `allowFileToolsAsRoot`.
+`supervised` writes need a person's keypress. For a supervised read
+without the grant, request `cat` via a supervised command or enable the grant.
+The CLI independently checks local mode, read switch, roots and UID at every op;
+a server request never overrides local consent. Root refuses `unsupported` unless
+`wsmp config set-file-tools-as-root on`. The protected wsmp state files,
+`service.env`, writes to `config.json`, and special trees remain inaccessible.
 
 **Masking boundary.** The CLI masks, before anything is windowed: (1) in dotenv and env
 files (`.env`, `*.env`, `.envrc`, `service.env`) every value, shown as `KEY=⟦redacted:N⟧`
@@ -209,7 +234,7 @@ following non-blank line, and every line indented deeper than it, each shown as
 key blocks (PEM BEGIN to the matching END) and SSH private key files; (4) the Hugging Face
 token files. There is no vendor-prefix scanner. A construct that opens further back than
 the bounded lookback of a windowed read is a documented residual. Edits cannot target a
-masked span, and the etag is keyed. **On an `unsupervised` node masking is not a security
+masked span, and the etag is keyed. **On a read-grant-only node without exec, masking plus roots IS the security boundary.** **On an `unsupervised` node masking is not a security
 boundary**: an agent with command access can `cat .env`. It keeps those secrets out of
 transcripts on the normal path. Secret-class files (dotenv, key and token files, and their
 directories) are read-only masked views: every write, edit, rename, delete or mkdir that
@@ -256,7 +281,12 @@ completed supervised failures appear in the polled `result.error`. Both use a st
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
 `too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`, `declined`). A CLI that speaks an older relay protocol returns `upgrade_required`
+`cancelled`, `declined`). The CLI re-checks its own startup mode, read switch and roots on every
+op and can refuse one itself; its `file.rejected` reason is either a file code above or
+one of `bad_frame`, `supervised_only`, `grant_disabled` (the dashboard grant is off) and
+`feature_disabled` (the CLI's `wsmp config set-mcp-commands` mode is off), and the
+server passes that reason through as the same `error.code`, except `bad_frame`, which settles as `io_error` because the op never ran. A CLI that speaks an older
+relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
@@ -472,9 +502,66 @@ backup codes). Projections pick safe fields, a recursive redactor removes
 secret-bearing keys and product credentials under any key, and the serializer
 elides byte values. A test drives every tool with secret-laden results and
 searches the output for every seeded secret value in every encoding. The CLI
-command tools return what a command printed on your own CLI device (behind the
-separate `allowCliCommands` consent); WMP credentials in that text are
-scrubbed, but other device content is returned as printed.
+command tools return a masked copy of what a command printed on your own CLI
+device (behind the separate `allowCliCommands` consent). The CLI masks headless
+stdout/stderr and the shared/review capture of supervised output before it
+leaves the node; the person's encrypted terminal viewer is unchanged.
+
+Masking scans the terminal-cleaned view, including indentation. Terminal parser
+state carries across lines and chunks, including control strings containing LF.
+A line with any mask emits masked cleaned text with CR/LF terminators preserved;
+an unmasked line keeps its raw bytes. Control strings hiding LF are held through
+the next terminal ground-state LF so names cannot be joined after scanning.
+Masked groups spanning hidden LFs emit opaque physical-line markers with their
+CR/LF bytes preserved. The server's `cleanText` still runs afterwards.
+The person's encrypted terminal viewer keeps the original bytes.
+
+The file tools' restartable scanner masks private-key PEM blocks through the
+matching END label (missing or mismatched END stays masked); whole lines with
+secret-name tokens as `⟦redacted line⟧`, the following non-blank line and deeper
+indentation continuation (including blanks within the run); secret flag value
+tails such as `--api-key` / `--hf-token` and their continuation; and every
+non-blank output line when the command text names `.cache/huggingface/token`
+or `.huggingface/token`. Token words are case-insensitive and end in `_TOKEN`,
+`_KEY`, `_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `api_key`, `hf-token` or
+`hf_token`, or equal `PASSWORD`. Open quotes/backslashes on token/value lines
+continue until a blank line. Printed dotenv-style token lines are masked whole;
+`KEY=⟦redacted:N⟧` applies only to the file tools' dotenv view.
+
+Each normal line is scanned once, held until a terminal ground-state LF or
+EOF/completion, with at most
+64 KiB held per stream and no filesystem access. An overlong line is scanned
+in bounded pieces with retained private-key labels and overlap across piece boundaries,
+and masked whole, never emitting a prefix or unbroken token tail. When the overlong line begins inside a live multi-line
+secret run — an open private-key PEM block, an open quote or backslash
+continuation, an indentation run from the output itself — that run's remaining output is opaque through
+EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
+masks the lines that follow. Otherwise, at its terminating LF a fresh scanner is
+primed with every unclosed private-key BEGIN label from that line and an
+unconditional until-blank opener. Every non-blank output line stays masked until
+the next blank line, including output after an overlong public line or closed
+quote. (The recovery's own synthetic guard is exempt: a second overlong line right after it recovers again, masking at least as much.) A matching END closes the corresponding carried PEM block.
+Recovery also treats that line as a column-0 secret-name token line: the next
+non-blank line is masked whole, and subsequent lines indented deeper than column
+0 stay masked. Blank lines do not consume the next-line protection; PEM and other
+opener detection still run on protected lines. Normal scanning resumes after
+the blank unless PEM, indentation, or next-value protection extends masking. CR/LF
+bytes are preserved. Opaque fallbacks stay closed through EOF: more than
+1 MiB of input contributing live masking state bounds PEM/indentation state, and
+an over-long line inside a live run fails closed instead of dropping the opener.
+A PEM marker exceeding the 1 KiB recovery overlap on an overlong line stays
+opaque through EOF, since its exact label cannot safely be reconstructed.
+A cleaned LF inside an overlong terminal group, including LF executed inside
+unfinished CSI, also makes the remaining stream opaque through EOF.
+The latency bound is in bytes; a silent
+process has no wall-clock flush deadline. Invalid UTF-8 passes through when its
+cleaned lossy scan finds no mask. EOF flushes partial output; teardown flushes exec tails or
+discards unshared capture. Masking precedes the 8 KiB head / 40 KiB tail cuts,
+and `output_bytes`/stream totals count masked bytes. WMP credentials are still
+scrubbed by the server. Other secrets (vendor tokens, JWTs, cloud credentials)
+are returned as printed, and on an `unsupervised` node this masking is not a
+security boundary. The threat model is accidental disclosure, not crafted evasion.
+
 Three independent switches gate each command (the token, the device's dashboard
 grant and the CLI's own config); see [CLI command switches](cli-command-switches.md).
 

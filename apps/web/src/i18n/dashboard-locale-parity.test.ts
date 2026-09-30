@@ -190,6 +190,10 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "fileToolAccess.write.supervised",
       "fileToolAccess.write.off",
       "fileToolsAsRoot",
+      "fileRead",
+      "fileReadDisabled",
+      "fileRootsMissing",
+      "fileToolsFollowMode",
     ].sort();
     expect(keyTree(enDashboard.terminals).sort()).toEqual(terminalKeys);
     expect(keyTree(esDashboard.terminals).sort()).toEqual(terminalKeys);

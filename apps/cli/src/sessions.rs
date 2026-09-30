@@ -58,6 +58,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use crate::approvals::{approved_public_key, record_pending};
 use crate::child_env::{self, scrub_parent_env};
 use crate::config::Config;
+use crate::output_mask::StreamMasker;
 #[cfg(unix)]
 use crate::protocol::SupervisedOutputPart;
 use crate::protocol::{
@@ -1233,6 +1234,7 @@ impl Drop for OutputKey {
 struct Capture {
     head: Vec<u8>,
     tail: VecDeque<u8>,
+    /// Masked byte count, before head/tail retention.
     total: u64,
     /// The terminal parser across the bytes dropped from the tail's front.
     #[cfg_attr(
@@ -1374,6 +1376,9 @@ struct Supervised {
     #[cfg(unix)]
     child: supervised_pty::ChildLink,
     capture: Capture,
+    /// Only the shared/review copy is masked; the PTY display stays raw.
+    #[cfg(unix)]
+    mask: StreamMasker,
     spawned_at: Instant,
     finished_at: Option<Instant>,
     /// Kept for the `term.exit` of a finished session.
@@ -1416,6 +1421,16 @@ struct PendingFile {
 }
 
 impl Supervised {
+    #[cfg(unix)]
+    fn capture_bytes(&mut self, bytes: &[u8]) {
+        self.capture.push(&self.mask.push(bytes));
+    }
+
+    #[cfg(unix)]
+    fn finish_capture(&mut self) {
+        self.capture.push(&self.mask.finish());
+    }
+
     fn awaiting(&self) -> bool {
         matches!(
             self.phase,
@@ -1535,7 +1550,7 @@ impl TerminalSession {
                 match piece {
                     Piece::Bytes(bytes) => {
                         if supervised.phase == SupervisedPhase::Running {
-                            supervised.capture.push(&bytes);
+                            supervised.capture_bytes(&bytes);
                         }
                         display.extend(bytes);
                     }
@@ -2409,6 +2424,7 @@ impl TerminalRegistry {
                     phase: SupervisedPhase::Starting,
                     child: supervised_pty::ChildLink::new(&marker),
                     capture: Capture::default(),
+                    mask: StreamMasker::new(&spawn.command),
                     spawned_at: now,
                     finished_at: None,
                     exit_status: (None, None),
@@ -2602,6 +2618,7 @@ impl TerminalRegistry {
                     phase: SupervisedPhase::Starting,
                     child: supervised_pty::ChildLink::new(&marker),
                     capture: Capture::default(),
+                    mask: StreamMasker::new(""),
                     spawned_at: now,
                     finished_at: None,
                     exit_status: (None, None),
@@ -2842,6 +2859,7 @@ impl TerminalRegistry {
                 return Vec::new();
             };
             supervised.exit_status = status;
+            supervised.finish_capture();
             if phase == SupervisedPhase::Starting {
                 supervised.start_failed = true;
             }
@@ -3849,6 +3867,7 @@ impl TerminalRegistry {
             return self.close(terminal_id);
         };
         supervised.child.eof = true;
+        supervised.finish_capture();
         if session.pty.as_ref().is_some_and(|pty| pty.exited.is_some()) {
             return self.finish_supervised(terminal_id, Instant::now());
         }
@@ -4207,6 +4226,9 @@ struct ExecSession {
     started: Instant,
     stdout_seq: u64,
     stderr_seq: u64,
+    /// Independent restartable state: stdout cannot open a run on stderr.
+    stdout_mask: StreamMasker,
+    stderr_mask: StreamMasker,
     stdout_done: bool,
     stderr_done: bool,
     timed_out: bool,
@@ -4341,25 +4363,14 @@ impl ExecRegistry {
         if session.finished {
             return Vec::new();
         }
-        let seq = if stderr {
-            session.stderr_seq = session.stderr_seq.saturating_add(1);
-            session.stderr_seq
+        let masked = if stderr {
+            session.stderr_mask.push(bytes)
         } else {
-            session.stdout_seq = session.stdout_seq.saturating_add(1);
-            session.stdout_seq
+            session.stdout_mask.push(bytes)
         };
-        let metadata = if stderr {
-            RelayBinaryFrameMetadata::ExecStderr {
-                command_id: command_id.to_string(),
-                seq,
-            }
-        } else {
-            RelayBinaryFrameMetadata::ExecStdout {
-                command_id: command_id.to_string(),
-                seq,
-            }
-        };
-        vec![OutboundFrame::Binary(metadata, bytes.to_vec())]
+        exec_output_frame(command_id, session, stderr, masked)
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn on_eof(&mut self, command_id: &str, stderr: bool) -> Vec<OutboundFrame> {
@@ -4369,14 +4380,18 @@ impl ExecRegistry {
         if session.finished {
             return Vec::new();
         }
-        if stderr {
+        let masked = if stderr {
             session.stderr_done = true;
+            session.stderr_mask.finish()
         } else {
             session.stdout_done = true;
-        }
+            session.stdout_mask.finish()
+        };
         // Pipes can close while the process is still running (`sleep
         // >/dev/null`). Reaping happens on `poll` via `try_wait`.
-        Vec::new()
+        exec_output_frame(command_id, session, stderr, masked)
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
@@ -4458,6 +4473,17 @@ impl ExecRegistry {
         let Some(mut session) = self.sessions.remove(command_id) else {
             return Vec::new();
         };
+        // Completion/cancel/drain timeout can precede pipe EOF. Send every held
+        // masked tail before ExecDone; late worker bytes cannot reopen a stream.
+        let mut frames = Vec::new();
+        for stderr in [false, true] {
+            let masked = if stderr {
+                session.stderr_mask.finish()
+            } else {
+                session.stdout_mask.finish()
+            };
+            frames.extend(exec_output_frame(command_id, &mut session, stderr, masked));
+        }
         session.finished = true;
         session.stop.store(true, Ordering::SeqCst);
         // Reader threads exit on their own. Joining them can block if a
@@ -4465,12 +4491,13 @@ impl ExecRegistry {
         drop(session.stdout_thread.take());
         drop(session.stderr_thread.take());
         drop(session.child.take());
-        vec![exec_done(
+        frames.push(exec_done(
             command_id,
             status.0,
             status.1,
             timed_out || session.timed_out,
-        )]
+        ));
+        frames
     }
 
     #[cfg(test)]
@@ -4483,6 +4510,36 @@ impl Drop for ExecRegistry {
     fn drop(&mut self) {
         let _ = self.kill_all();
     }
+}
+
+/// Frame only masked bytes, allocating sequence numbers only for emitted data.
+fn exec_output_frame(
+    command_id: &str,
+    session: &mut ExecSession,
+    stderr: bool,
+    bytes: Vec<u8>,
+) -> Option<OutboundFrame> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let seq = if stderr {
+        &mut session.stderr_seq
+    } else {
+        &mut session.stdout_seq
+    };
+    *seq = seq.saturating_add(1);
+    let metadata = if stderr {
+        RelayBinaryFrameMetadata::ExecStderr {
+            command_id: command_id.to_string(),
+            seq: *seq,
+        }
+    } else {
+        RelayBinaryFrameMetadata::ExecStdout {
+            command_id: command_id.to_string(),
+            seq: *seq,
+        }
+    };
+    Some(OutboundFrame::Binary(metadata, bytes))
 }
 
 fn reap_child(child: Option<&mut ExecChild>) -> (Option<i32>, Option<i32>) {
@@ -4602,6 +4659,8 @@ fn spawn_exec(
         started: Instant::now(),
         stdout_seq: 0,
         stderr_seq: 0,
+        stdout_mask: StreamMasker::new(command),
+        stderr_mask: StreamMasker::new(command),
         stdout_done: false,
         stderr_done: false,
         timed_out: false,
@@ -6915,6 +6974,11 @@ exit 3
     /// then runs its "command" only once the daemon's `go` token arrives.
     #[cfg(unix)]
     fn fake_confirm(witness: Option<&Path>) -> String {
+        fake_confirm_output(witness, "printf 'after-accept\\n'")
+    }
+
+    #[cfg(unix)]
+    fn fake_confirm_output(witness: Option<&Path>, output: &str) -> String {
         let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
         let touch = witness.map_or(String::new(), |path| {
             format!("touch '{}'\n", path.display())
@@ -6934,7 +6998,7 @@ printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
 go=$(head -c {go_len})
 stty echo icanon
 [ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
-{touch}printf 'after-accept\n'
+{touch}{output}
 printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
 exit 3
 "#
@@ -6968,6 +7032,9 @@ exit 0
             ),
         }
     }
+
+    #[cfg(unix)]
+    mod output_mask_tests;
 
     /// Waits until the confirm child recorded next to `witness` can no longer
     /// run. A reaped or zombie child cannot create the witness later, so the

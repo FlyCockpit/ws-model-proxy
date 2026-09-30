@@ -5148,6 +5148,55 @@ describe("setCliDeviceFeatureGrants", () => {
     });
   });
 
+  it.each([
+    { reportedMcpFileRead: false, reportedFileRoots: true },
+    { reportedMcpFileRead: null, reportedFileRoots: true },
+    { reportedMcpFileRead: true, reportedFileRoots: false },
+    { reportedMcpFileRead: true, reportedFileRoots: null },
+    {},
+  ])("read grant refuses incomplete reports %j", async (reported) => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow(reported));
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("read grant is a human-only opt-in; complete reports enable it and missing reports still allow revocation", async () => {
+    const hook = vi.fn();
+    db.cliDevice.findUnique.mockResolvedValue(
+      deviceRow({ reportedMcpFileRead: true, reportedFileRoots: true }),
+    );
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      mcpFileRead: true,
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        fileRead: true,
+      }),
+    ).resolves.toMatchObject({ fileRead: true });
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { mcpFileRead: true } }),
+    );
+    expect(hook).toHaveBeenCalledWith("cli-id");
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+    await grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: false });
+    expect(db.cliDevice.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ data: { mcpFileRead: false } }),
+    );
+    const humanOnly = createRouterClient(forwarderManagementRouter, { context: { session: null } });
+    await expect(
+      humanOnly.setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", fileRead: true }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("uses the same not-found error for an unknown device and another user's device", async () => {
     db.cliDevice.findUnique
       .mockResolvedValueOnce(null)
@@ -5307,6 +5356,88 @@ describe("setCliDeviceFeatureGrants", () => {
       }),
     ).rejects.toBeInstanceOf(ORPCError);
     expect(hook).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "only invokes refresh after a successful commit (committed=%s)",
+    async (committed) => {
+      db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+      const hook = vi.fn(() => {
+        throw new Error("refresh failed");
+      });
+      if (committed) {
+        db.cliDevice.update.mockResolvedValue({
+          id: "cli-id",
+          allowHumanTerminal: false,
+          mcpCommandMode: "OFF",
+          mcpFileRead: false,
+        });
+      } else {
+        db.cliDevice.update.mockRejectedValueOnce(new Error("commit failed"));
+      }
+      await expect(
+        grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+          cliDeviceId: "cli-id",
+          fileRead: false,
+        }),
+      ).rejects.toThrow(committed ? "refresh failed" : "commit failed");
+      expect(db.cliDevice.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { mcpFileRead: false } }),
+      );
+      expect(hook).toHaveBeenCalledTimes(committed ? 1 : 0);
+    },
+  );
+
+  it("summarizes granted reads using live consent only, and preserves the reported fields", async () => {
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        id: "cli-id",
+        slug: "desk",
+        mcpCommandMode: "OFF",
+        mcpFileRead: true,
+        reportedMcpFileRead: true,
+        reportedFileRoots: true,
+        User: { slug: "owner" },
+        Endpoints: [],
+      },
+    ]);
+    const live = {
+      protocolVersion: "2.8",
+      cliVersion: "0.4.0",
+      humanTerminal: false,
+      mcpCommandMode: "off",
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+    } as const;
+    for (const snapshot of [
+      live,
+      { ...live, mcpFileRead: false },
+      { ...live, fileRootsConfigured: false },
+      null,
+    ]) {
+      const client = createRouterClient(forwarderManagementRouter, {
+        context: {
+          ...buildContext(),
+          services: { getLiveCliFeatures: () => new Map(snapshot ? [["cli-id", snapshot]] : []) },
+        },
+      });
+      const rows = await client.listCliDevices();
+      expect(rows[0]?.fileTools).toEqual({
+        read: snapshot?.mcpFileRead && snapshot.fileRootsConfigured ? "headless" : "off",
+        write: "off",
+      });
+      expect(rows[0]).toMatchObject({
+        mcpFileRead: true,
+        reportedMcpFileRead: true,
+        reportedFileRoots: true,
+      });
+    }
   });
 
   it("shows endpoints of disconnected or stale CLIs as OFFLINE and keeps the reported status", async () => {
@@ -5543,6 +5674,21 @@ describe("setCliDeviceFeatureGrants", () => {
   });
 
   it("grants no file tools when the dashboard grant is off, whatever the CLI reports", async () => {
+    const liveRow = (overrides: Record<string, unknown>) => ({
+      protocolVersion: "2.8",
+      cliVersion: "0.5.0",
+      humanTerminal: false,
+      mcpCommandMode: "unsupervised" as const,
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+      ...overrides,
+    });
     db.cliDevice.findMany.mockResolvedValue([
       {
         id: "cli-id",
@@ -5565,35 +5711,94 @@ describe("setCliDeviceFeatureGrants", () => {
         Endpoints: [],
       },
     ]);
+    // Dashboard grant off: no read tool whatever the live CLI switch reports.
     const devices = await createRouterClient(forwarderManagementRouter, {
       context: {
         ...buildContext(),
         services: {
-          getLiveCliFeatures: () =>
-            new Map([
-              [
-                "cli-id",
-                {
-                  protocolVersion: "2.8",
-                  cliVersion: "0.5.0",
-                  humanTerminal: false,
-                  mcpCommandMode: "unsupervised" as const,
-                  supervisedCommands: true,
-                  terminalSupported: true,
-                  terminalApproval: false,
-                  fileOps: true,
-                  mcpFileRead: false,
-                  fileRootsConfigured: false,
-                  allowFileToolsAsRoot: false,
-                  terminalPublicKey: null,
-                },
-              ],
-            ]),
+          getLiveCliFeatures: () => new Map([["cli-id", liveRow({})]]),
         },
       },
     }).listCliDevices();
     expect(devices[0]?.fileTools).toEqual({ read: "off", write: "off" });
     expect(devices[0]?.allowFileToolsAsRoot).toBe(false);
+  });
+
+  it("withdraws the file-tool claim when the live 2.8 session does not report fileOps", async () => {
+    // `listCliDevices.fileTools` requires `live.fileOps` in addition to the
+    // grant, the CLI's read switch and its roots; a session that reports
+    // fileOps false runs no file op and must be summarized as off.
+    const liveRow = (overrides: Record<string, unknown>) => ({
+      protocolVersion: "2.8",
+      cliVersion: "0.5.0",
+      humanTerminal: false,
+      mcpCommandMode: "supervised" as const,
+      supervisedCommands: true,
+      terminalSupported: true,
+      terminalApproval: false,
+      fileOps: true,
+      mcpFileRead: true,
+      fileRootsConfigured: true,
+      allowFileToolsAsRoot: false,
+      terminalPublicKey: null,
+      ...overrides,
+    });
+    const row = (mode: string) => ({
+      id: "cli-id",
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-02"),
+      slug: "desk",
+      name: null,
+      reportedHostname: null,
+      status: "CONNECTED",
+      allowHumanTerminal: false,
+      mcpCommandMode: mode,
+      cliVersion: "0.5.0",
+      relayProtocolVersion: "2.8",
+      reportedHumanTerminal: false,
+      reportedMcpCommandMode: "UNSUPERVISED",
+      reportedTerminalApproval: false,
+      reportedTerminalSupported: true,
+      reportedAllowFileToolsAsRoot: null,
+      mcpFileRead: true,
+      User: { slug: "owner" },
+      Endpoints: [],
+    });
+    const summaryFor = async (mode: string, features: Record<string, unknown>) => {
+      db.cliDevice.findMany.mockResolvedValue([row(mode)]);
+      const liveMode = mode === "SUPERVISED" ? "supervised" : "unsupervised";
+      const devices = await createRouterClient(forwarderManagementRouter, {
+        context: {
+          ...buildContext(),
+          services: {
+            getLiveCliFeatures: () =>
+              new Map([["cli-id", liveRow({ mcpCommandMode: liveMode, ...features })]]),
+          },
+        },
+      }).listCliDevices();
+      return devices[0]!.fileTools;
+    };
+    // Everything live: headless reads, supervised writes.
+    expect(await summaryFor("SUPERVISED", {})).toEqual({ read: "headless", write: "supervised" });
+    // fileOps:false withdraws the whole claim, even with every switch on.
+    expect(await summaryFor("SUPERVISED", { fileOps: false })).toEqual({
+      read: "off",
+      write: "off",
+    });
+    // The CLI's own read switch off, or roots unset, drops the read grant back
+    // to the mode matrix (a person must confirm).
+    for (const withdrawn of [{ mcpFileRead: false }, { fileRootsConfigured: false }]) {
+      expect(await summaryFor("SUPERVISED", withdrawn)).toEqual({
+        read: "supervised",
+        write: "supervised",
+      });
+    }
+    // An unsupervised grant needs the same fileOps term for any claim.
+    expect(await summaryFor("UNSUPERVISED", {})).toEqual({ read: "headless", write: "headless" });
+    expect(await summaryFor("UNSUPERVISED", { fileOps: false })).toEqual({
+      read: "off",
+      write: "off",
+    });
   });
 
   it("flags a device whose last hello was refused for an unsupported (older or newer) relay protocol", async () => {

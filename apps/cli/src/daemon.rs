@@ -848,13 +848,21 @@ fn run_relay_session(
     // relay keeps only the ops it has pending. Dropping it cancels them all.
     #[cfg(unix)]
     let mut files = {
-        let runtime = crate::file_relay::shared_runtime(startup.allow_file_tools_as_root());
+        let runtime = crate::file_relay::shared_runtime(
+            startup.allow_file_tools_as_root(),
+            startup.file_roots(),
+        );
         terminals.set_file_runtime(Arc::clone(&runtime));
         let tx = worker_tx.clone();
         let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
             let _ = tx.send(FromWorker::FileFrames { op_id, frames });
         });
-        crate::file_relay::FileRelay::new(runtime, startup.mcp_command_mode(), sink)
+        crate::file_relay::FileRelay::new(
+            runtime,
+            startup.mcp_command_mode(),
+            startup.mcp_file_read(),
+            sink,
+        )
     };
 
     let hello = ClientControlMessage::Hello {
@@ -1912,12 +1920,23 @@ where
             op,
             args,
             body_bytes,
+            mode,
+            read_grant,
         } => {
             #[cfg(unix)]
-            send_file_frames(socket, files.handle_op(&op_id, &op, args, body_bytes))?;
+            send_file_frames(
+                socket,
+                files.handle_op(
+                    &op_id,
+                    &op,
+                    args,
+                    body_bytes,
+                    crate::file_relay::FilePermission { mode, read_grant },
+                ),
+            )?;
             #[cfg(not(unix))]
             {
-                let _ = (&op, &args, &body_bytes);
+                let _ = (&op, &args, &body_bytes, mode, read_grant);
                 send_control(
                     socket,
                     &ClientControlMessage::FileRejected {

@@ -192,9 +192,9 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
 
   for (const descriptor of MCP_TOOL_MANIFEST) {
     // CLI tools (commands and node file tools) stay unregistered unless this
-    // request's credential is a personal token minted with allowCliCommands
-    // (file tools also need mcp:write). OAuth, a PAT without the flag, and an
-    // unbound dispatch (treated as OAuth) do not see them. Call time checks
+    // request's credential has the PAT consent and scopes for this capability.
+    // OAuth, a PAT without the required consent/scope, and an unbound
+    // dispatch do not see them. Call time checks
     // the same predicate again.
     if (
       isCliTool(descriptor.name) &&

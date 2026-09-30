@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   FILE_ERROR_CODES,
   FILE_OPS,
+  FILE_WIRE_REASONS,
   fileCancelFrameSchema,
   fileOpFrameSchema,
+  fileRejectedFrameSchema,
   fileSpawnSpecSchema,
   supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
@@ -133,7 +135,14 @@ describe("relay 2.8 file frames: server to CLI", () => {
       ["delete", { path: "~/a", expectedEtag: "" }],
     ];
     for (const [op, args] of bad) {
-      const frame: Record<string, unknown> = { type: "file.op", opId: OP_ID, op, args };
+      const frame: Record<string, unknown> = {
+        type: "file.op",
+        mode: "unsupervised",
+        readGrant: false,
+        opId: OP_ID,
+        op,
+        args,
+      };
       if (op === "write") frame.bodyBytes = 1;
       expect(
         () => fileOpFrameSchema.parse(frame),
@@ -181,9 +190,35 @@ describe("relay 2.8 file frames: CLI to server", () => {
       "file-rejected-conflict",
       "file-rejected-bad-frame",
       "file-rejected-match-count",
+      "file-rejected-grant-disabled",
     ]) {
       const frame = vector(name);
       expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+    }
+  });
+
+  it("accepts every reason the CLI dispatcher can emit, and nothing else", () => {
+    // Pinned to the Rust set: `FILE_WIRE_REASONS` mirrors `admit`/`refuse` in
+    // apps/cli/src/file_relay.rs; `FILE_ERROR_CODES` mirrors file_ops/error.rs.
+    expect(FILE_WIRE_REASONS).toEqual([
+      "bad_frame",
+      "supervised_only",
+      "grant_disabled",
+      "feature_disabled",
+    ]);
+    for (const reason of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
+      expect(
+        parseRelayClientControlFrame(
+          JSON.stringify({ type: "file.rejected", opId: OP_ID, reason }),
+        ),
+        reason,
+      ).toEqual({ type: "file.rejected", opId: OP_ID, reason });
+    }
+    for (const reason of ["explode", "grantDisabled", "feature_disabled ", "GRANT_DISABLED"]) {
+      expect(
+        fileRejectedFrameSchema.safeParse({ type: "file.rejected", opId: OP_ID, reason }).success,
+        reason,
+      ).toBe(false);
     }
   });
 
@@ -486,5 +521,30 @@ describe("supervised file pre-display rejection contract", () => {
     "future_internal_error",
   ])("rejects %s without widening the schema", (code) => {
     expect(supervisedFileRejectReasonSchema.safeParse(code).success).toBe(false);
+  });
+});
+
+describe("file permission frame inputs", () => {
+  it("requires explicit mode and grant intent and rejects malformed values", () => {
+    const valid = vector("file-op-read");
+    for (const field of ["mode", "readGrant"]) {
+      const absent = { ...valid };
+      delete absent[field];
+      expect(() => fileOpFrameSchema.parse(absent)).toThrow();
+    }
+    for (const patch of [
+      { mode: "on" },
+      { mode: null },
+      { mode: { mode: "unsupervised" } },
+      { readGrant: "true" },
+      { readGrant: null },
+      { readGrant: 1 },
+    ]) {
+      expect(() => fileOpFrameSchema.parse({ ...valid, ...patch })).toThrow();
+    }
+    expect(fileOpFrameSchema.parse({ ...valid, mode: "off", readGrant: true })).toMatchObject({
+      mode: "off",
+      readGrant: true,
+    });
   });
 });

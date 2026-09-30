@@ -1,0 +1,6 @@
+public-first
+APP_TO[31mKEN[0m=session-value-one-107
+next-session-value-107
+
+max_tokens=4096
+serve --api-[31mkey[0m session-flag-value-107

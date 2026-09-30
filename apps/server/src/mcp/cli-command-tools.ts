@@ -20,11 +20,8 @@ type CliCommandDeps = {
   credential: McpRequestCredential;
 };
 
-/**
- * Shown on CLI command tools: the CLI's narrow masking and server credential scrub.
- */
-export const CLI_COMMAND_OUTPUT_NOTICE =
-  "The CLI masks SSH private keys, environment-variable secrets, Hugging Face token files and --api-key/--hf-token flag values in supervised and unsupervised command output. Other secrets in command output are NOT redacted. The server additionally removes substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters.";
+// All command-tool descriptions share the CLI's masking and server scrubbing notice.
+export { CLI_COMMAND_OUTPUT_NOTICE } from "@ws-model-proxy/config/cli-command-output";
 
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the

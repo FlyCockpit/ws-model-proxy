@@ -1,0 +1,6 @@
+public-first
+APP_TOKEN=session-value-one-107
+next-session-value-107
+
+max_tokens=4096
+serve --api-key session-flag-value-107

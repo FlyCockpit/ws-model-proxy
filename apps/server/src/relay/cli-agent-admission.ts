@@ -1,4 +1,9 @@
-import { fileAccessRefusal, fileToolAccess } from "@ws-model-proxy/api/lib/cli-file-access";
+import {
+  fileGrantStageRefusal,
+  fileLiveStageRefusal,
+  fileToolAccess,
+} from "@ws-model-proxy/api/lib/cli-file-access";
+import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import {
   allowsHeadlessCommands,
   allowsSupervisedCommands,
@@ -77,11 +82,15 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
  *   record is ended with the session.
  * In memory, single process: the relay sockets and the sweeps live here.
  */
-type Admission = { tokenId: string; revoked: boolean };
+type Admission = { tokenId: string; revoked: boolean; grantChangeSeq: number };
 const openAdmissions = new Set<Admission>();
 
-function openAdmission(tokenId: string): Admission {
-  const admission = { tokenId, revoked: false };
+function openAdmission(tokenId: string, cliDeviceId: string): Admission {
+  const admission = {
+    tokenId,
+    revoked: false,
+    grantChangeSeq: relaySessionManager.featureGrantChangeSeq(cliDeviceId),
+  };
   openAdmissions.add(admission);
   return admission;
 }
@@ -103,21 +112,30 @@ export function resetCliAgentAdmissionsForTests(): void {
   openAdmissions.clear();
 }
 
-export type LiveCliToken = { name: string; expiresAt: Date | null };
+export type LiveCliToken = {
+  name: string;
+  expiresAt: Date | null;
+  allowCliCommands: boolean;
+  allowCliFileRead: boolean;
+  scopes: string[];
+};
 
 /**
  * The PAT as it is now: unrevoked (with its grant), unexpired, still minted
- * with CLI commands and mcp:write. Null when any of that no longer holds.
+ * with current flags/scopes. Capability-specific consent is checked at the verdict.
  */
 async function liveCliToken(tokenId: string, userId: string): Promise<LiveCliToken | null> {
   const token = await prisma.mcpPersonalToken.findFirst({
     where: { id: tokenId, ...activeMcpPersonalTokenWhere(userId, new Date()) },
-    select: { name: true, scopes: true, allowCliCommands: true, expiresAt: true },
+    select: {
+      name: true,
+      scopes: true,
+      allowCliCommands: true,
+      allowCliFileRead: true,
+      expiresAt: true,
+    },
   });
-  if (token?.allowCliCommands !== true || !token.scopes.includes("mcp:write")) {
-    return null;
-  }
-  return { name: token.name, expiresAt: token.expiresAt };
+  return token;
 }
 
 /**
@@ -139,6 +157,7 @@ type AdmissionDevice = {
   id: string;
   userId: string;
   mcpCommandMode: McpCommandModeDb;
+  mcpFileRead: boolean;
   rejectedRelayProtocolVersion: string | null;
 };
 
@@ -167,7 +186,7 @@ export type CliAgentAdmissionReads = {
 export async function readCliAgentAdmission(
   input: CliAgentAdmissionInput,
 ): Promise<CliAgentAdmissionReads> {
-  const admission = openAdmission(input.tokenId);
+  const admission = openAdmission(input.tokenId, input.cliDeviceId);
   let device: AdmissionDevice | null;
   let token: LiveCliToken | null;
   let owner: CliOwnerState | null;
@@ -179,6 +198,7 @@ export async function readCliAgentAdmission(
           id: true,
           userId: true,
           mcpCommandMode: true,
+          mcpFileRead: true,
           rejectedRelayProtocolVersion: true,
         },
       }),
@@ -250,8 +270,32 @@ export function judgeCliAgentAdmission(
   // Closing and judging are one synchronous step: no revoke can slip between them.
   openAdmissions.delete(admission);
   if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
+  if (
+    !cliTokenAllows(
+      token,
+      capability === "file_read" || capability === "file_write" ? capability : "command",
+    )
+  )
+    return { ok: false, error: "token_inactive" };
   if (!device || device.userId !== input.userId) return { ok: false, error: "not_found" };
   if (!ownerAllowsCliEffects(owner)) return { ok: false, error: "token_inactive" };
+  // A committed policy change invalidates reads opened before its notification,
+  // even if a reconnect or a later enable has already restored live authority.
+  if (admission.grantChangeSeq !== relaySessionManager.featureGrantChangeSeq(input.cliDeviceId)) {
+    // Preserve the dispatch gate's specific refusal (e.g. a headless command
+    // narrowed to supervised). A newer enable still cannot revive this admission.
+    const refusal =
+      capability === "file_read" || capability === "file_write"
+        ? relaySessionManager.fileOpModeRefusal(
+            input.cliDeviceId,
+            capability === "file_read" ? "read" : "write",
+          )
+        : relaySessionManager.commandModeRefusal(
+            input.cliDeviceId,
+            capability === "headless_exec" ? "headless" : "supervised",
+          );
+    return { ok: false, error: refusal ?? "grant_disabled" };
+  }
   const grant = mcpCommandModeFromDb(device.mcpCommandMode);
 
   if (capability === "headless_exec") {
@@ -271,11 +315,17 @@ export function judgeCliAgentAdmission(
 
   if (capability === "file_read" || capability === "file_write") {
     const opClass = capability === "file_read" ? "read" : "write";
-    const grantAccess = fileToolAccess(grant, opClass);
-    if (grantAccess !== "headless") {
-      return { ok: false, error: fileAccessRefusal(grantAccess, "grant") };
-    }
     const live = liveFeatures(input.cliDeviceId);
+    const readGrant = {
+      server: device.mcpFileRead === true,
+      live:
+        live?.mcpFileRead === true &&
+        relayProtocolAtLeast(live.protocolVersion, "2.8") &&
+        live.fileOps === true,
+      roots: live?.fileRootsConfigured === true,
+    };
+    const grantRefusal = fileGrantStageRefusal(grant, opClass, readGrant);
+    if (grantRefusal) return { ok: false, error: grantRefusal };
     if (!live) {
       // Not connected. A device whose last hello was refused for an old
       // protocol says so (#90) instead of a bare `offline`.
@@ -290,10 +340,8 @@ export function judgeCliAgentAdmission(
     if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
       return { ok: false, error: "offline" };
     }
-    const liveAccess = fileToolAccess(live.mcpCommandMode, opClass);
-    if (liveAccess !== "headless") {
-      return { ok: false, error: fileAccessRefusal(liveAccess, "live") };
-    }
+    const liveRefusal = fileLiveStageRefusal(grant, live.mcpCommandMode, opClass, readGrant);
+    if (liveRefusal) return { ok: false, error: liveRefusal };
     return { ok: true, token, device, live };
   }
 
