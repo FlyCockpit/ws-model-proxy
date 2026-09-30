@@ -8,7 +8,8 @@
 //! 4. re-check the etag on the still-open original fd, and that the name still
 //!    refers to the same file;
 //! 5. honor cancellation (the last point where it is honored);
-//! 6. `renameat(dirfd, tmp, dirfd, name)`, then `fsync(dirfd)`;
+//! 6. exchange tmp with name where supported and remove the checked original,
+//!    otherwise `renameat(dirfd, tmp, dirfd, name)`; then `fsync(dirfd)`;
 //! 7. on any failure before the rename, `unlinkat` the temp file.
 //!
 //! Refused up front: files owned by another uid (a non-root rename would change
@@ -32,6 +33,8 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat};
 use rand::distr::{Alphanumeric, SampleString};
 
 use super::error::{ErrorCode, FileError, FileResult};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::exchange::{exchange, is_unsupported};
 use super::read::current_etag;
 use super::resolve::Stat;
 use super::text::floor_boundary;
@@ -165,15 +168,15 @@ pub(crate) fn replace(
 
 /// Put the staged file at `name`, replacing only the object that was checked.
 ///
-/// Linux: `RENAME_EXCHANGE`, then the staged name holds whatever was at `name`;
+/// Linux and macOS: atomic exchange, then the staged name holds what was at `name`;
 /// if that is not the original object (a successor slipped in after the final
 /// re-check) the exchange is undone and the caller gets a conflict, so an
 /// unapproved successor is never overwritten. After an exchange the guard is
 /// disarmed: the staged name is unlinked here, and only when it still holds the
 /// object we put there (a double race must not delete a third object). Crash
 /// states: between the exchange and the unlink the old file is under the staging
-/// name (no data is lost). Elsewhere (and on filesystems without exchange) a plain
-/// rename is used and the re-check is the only guard: a documented residual.
+/// name (no data is lost). On other platforms and filesystems without exchange,
+/// a plain rename is used and a race remains after the final re-check.
 fn commit_stage(
     dir: &OwnedFd,
     stage: &OsStr,
@@ -182,20 +185,11 @@ fn commit_stage(
     staged_stat: &Stat,
     armed: &mut bool,
 ) -> FileResult<()> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = (orig_stat, staged_stat, &armed);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use nix::fcntl::{RenameFlags, renameat2};
-        let swap = || {
-            renameat2(
-                dir.as_fd(),
-                stage,
-                dir.as_fd(),
-                name,
-                RenameFlags::RENAME_EXCHANGE,
-            )
-        };
+        let swap = || exchange(dir.as_fd(), stage, dir.as_fd(), name);
         let holds = |expected: &Stat| {
             fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
                 .is_ok_and(|held| Stat::from_raw(&held).same_object(expected))
@@ -219,7 +213,7 @@ fn commit_stage(
                 return Err(FileError::conflict("replaced"));
             }
             Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
-            Err(Errno::EINVAL | Errno::ENOSYS) => {}
+            Err(errno) if is_unsupported(errno) => {}
             Err(errno) => return Err(FileError::errno(errno)),
         }
     }

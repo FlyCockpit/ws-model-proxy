@@ -128,8 +128,8 @@ fn rename_without_overwrite_never_replaces_a_destination_created_after_the_check
     assert_eq!(fx.get("src.txt"), "mine");
 }
 
-// Linux only: elsewhere an overwrite has no atomic exchange here (documented residual).
-#[cfg(target_os = "linux")]
+// Linux and macOS use atomic exchange to preserve an unchecked destination.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn rename_overwrite_never_replaces_a_destination_swapped_after_the_etag_check() {
     let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
@@ -1332,8 +1332,8 @@ fn another_tool_call_cannot_replace_a_staged_file() {
 
 // ---- an atomic replace never overwrites a successor inserted after the last check -----
 
-// Linux only: elsewhere the commit is a plain rename (documented residual in `commit_stage`).
-#[cfg(target_os = "linux")]
+// Linux and macOS use atomic exchange to restore a successor and clean up the stage.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_successor_inserted_before_the_commit_is_preserved_and_the_edit_conflicts() {
     let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
