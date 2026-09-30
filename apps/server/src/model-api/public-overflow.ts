@@ -3250,7 +3250,7 @@ export async function dispatchPublicOverflow(
         auth,
       );
       destroyAttempt = (error) => {
-        void teardownProviderBody(response, undefined, error);
+        void teardownProviderBody(response, undefined, error).catch(() => undefined);
       };
       const status = response.statusCode ?? 502;
       // Retry only before exposing headers/body to the caller.
@@ -3339,7 +3339,7 @@ export async function dispatchPublicOverflow(
       const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
       const reader = body.getReader();
       destroyAttempt = (error) => {
-        void teardownProviderBody(response, reader, error);
+        void teardownProviderBody(response, reader, error).catch(() => undefined);
       };
       let reconciliation: Promise<void> | undefined;
       let responseBytes = 0;

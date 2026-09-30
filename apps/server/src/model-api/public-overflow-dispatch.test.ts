@@ -4142,6 +4142,591 @@ describe("OpenRouter owner-paid settlement", () => {
     });
   });
 
+  // Round 2 (#140): the heartbeat/lease-loss abort runs the shared teardown
+  // helper. Reverting it to a bare `response.destroy(error)` leaves the
+  // upstream reader uncancelled and the source unpaused at destroy — the G1
+  // crash class the helper exists to close.
+  it.each(["object", "byte"] as const)(
+    "runs the shared teardown on heartbeat ownership loss with a buffered flood (%s mode)",
+    async (mode) => {
+      vi.useFakeTimers();
+      const upstream = new Readable({ objectMode: mode === "object", read() {} });
+      const processErrors: unknown[] = [];
+      const captureError = (error: unknown) => processErrors.push(error);
+      process.on("uncaughtException", captureError);
+      process.on("unhandledRejection", captureError);
+      const destroyPaused: boolean[] = [];
+      const originalDestroy = upstream.destroy.bind(upstream);
+      upstream.destroy = (...args: Parameters<Readable["destroy"]>) => {
+        destroyPaused.push(upstream.isPaused());
+        return originalDestroy(...args);
+      };
+      const clientCancel = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+      const upstreamCancelReasons: unknown[] = [];
+      let clientReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const originalCancel = ReadableStreamDefaultReader.prototype.cancel;
+      clientCancel.mockImplementation(function (
+        this: ReadableStreamDefaultReader<Uint8Array>,
+        reason,
+      ) {
+        if (this !== clientReader) upstreamCancelReasons.push(reason);
+        return originalCancel.call(this, reason);
+      });
+      let body: Promise<string> | undefined;
+      try {
+        // A buffered flood (no terminal): the abort fires mid-stream.
+        for (let i = 0; i < 16; i++) upstream.push(Buffer.from(`: ${"x".repeat(1022)}\n\n`));
+        const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        body = result.response.text();
+        void body.catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        heartbeatProviderAttempt.mockResolvedValueOnce(false);
+        await vi.advanceTimersByTimeAsync(10_000);
+        for (let i = 0; i < 12; i++) await vi.advanceTimersByTimeAsync(0);
+        await body.catch(() => undefined);
+        await result.terminal;
+        vi.useRealTimers();
+        for (let turn = 0; turn < 3; turn++)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        // The helper cancels the upstream reader with the abort reason before
+        // destroying a paused source. A bare destroy does neither of these.
+        expect(upstreamCancelReasons.map((reason) => (reason as Error)?.message)).toContain(
+          "provider attempt lease expired",
+        );
+        expect(destroyPaused[0]).toBe(true);
+        expect(upstream.destroyed).toBe(true);
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(processErrors).toEqual([]);
+      } finally {
+        upstream.pause();
+        upstream.destroy();
+        clientCancel.mockRestore();
+        process.off("uncaughtException", captureError);
+        process.off("unhandledRejection", captureError);
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  // Round 2 (#140): never touch the client controller after cancellation,
+  // including when the client cancels during the clean-EOF settlement await.
+  it("does not deliver a clean EOF terminal once the client cancelled during settlement", async () => {
+    vi.useFakeTimers();
+    const upstream = new Readable({ read() {} });
+    const eofTerminal = Buffer.from(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+    );
+    let releaseSettlement!: () => void;
+    const durable = new Promise<void>((resolve) => {
+      releaseSettlement = resolve;
+    });
+    const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+    const close = vi.spyOn(ReadableStreamDefaultController.prototype, "close");
+    const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+    const cancellationGrace = vi.spyOn(ReadableStreamDefaultReader.prototype, "cancel");
+    try {
+      const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+      vi.mocked(recordProviderAttemptEvent).mockClear();
+      reconcileProviderBudget.mockImplementationOnce(() => durable);
+      const reader = result.response.body!.getReader();
+      const first = reader.read();
+      upstream.push(eofTerminal);
+      upstream.push(null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      // Cancel the client while the clean-EOF settlement is still pending.
+      const cancellation = reader.cancel("client disconnected during EOF settlement");
+      releaseSettlement();
+      await cancellation;
+      await first;
+      // The cancel landed after the clean-EOF settlement was snapshotted, so
+      // the durable outcome stays COMPLETED; the terminal bytes, however, must
+      // never reach the cancelled client controller.
+      expect(await result.terminal).toMatchObject({ ok: true });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "COMPLETED" }),
+      );
+      vi.useRealTimers();
+      for (let turn = 0; turn < 3; turn++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      // Only the upstream adapter's own controller may act; the cancelled
+      // client controller must never be enqueued, closed or errored.
+      const upstreamController = enqueue.mock.contexts[0];
+      expect(upstreamController).toBeDefined();
+      for (const action of [enqueue, close, error]) {
+        expect(action.mock.contexts.filter((context) => context !== upstreamController)).toEqual(
+          [],
+        );
+      }
+    } finally {
+      releaseSettlement();
+      upstream.destroy();
+      cancellationGrace.mockRestore();
+      enqueue.mockRestore();
+      close.mockRestore();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  // Round 2 (#140): a decode error plus a client cancel must settle once and
+  // must not error the cancelled client controller.
+  it("does not error the client controller when a decode error races a client cancel", async () => {
+    vi.useFakeTimers();
+    const upstream = new Readable({ objectMode: true, read() {} });
+    const raceTerminal = Buffer.from(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+    );
+    const error = vi.spyOn(ReadableStreamDefaultController.prototype, "error");
+    const enqueue = vi.spyOn(ReadableStreamDefaultController.prototype, "enqueue");
+    const processErrors: unknown[] = [];
+    const captureError = (error_: unknown) => processErrors.push(error_);
+    process.on("uncaughtException", captureError);
+    process.on("unhandledRejection", captureError);
+    let releaseSettlement!: () => void;
+    const durable = new Promise<void>((resolve) => {
+      releaseSettlement = resolve;
+    });
+    let clientReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let cancellation: Promise<void> | undefined;
+    try {
+      upstream.push(raceTerminal);
+      const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+      clientReader = result.response.body!.getReader();
+      const firstOutcome = clientReader.read().then(
+        (chunk) => ({ chunk, failure: undefined }),
+        (failure: unknown) => ({ chunk: undefined, failure }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      // Park the catch path's reconcile(false), then cancel the client while it
+      // is pending, then push the malformed record that triggers the decode
+      // error. The catch path resumes with the client already cancelled.
+      reconcileProviderBudget.mockImplementation(() => durable);
+      upstream.push(
+        Buffer.concat([Buffer.from("data: "), Buffer.from([0xff]), Buffer.from("\n\n")]),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      cancellation = clientReader.cancel("client disconnected on decode error");
+      releaseSettlement();
+      await cancellation.catch(() => undefined);
+      const firstResult = await firstOutcome;
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ observationComplete: false }),
+      );
+      vi.useRealTimers();
+      for (let turn = 0; turn < 3; turn++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(firstResult.failure === undefined || firstResult.failure instanceof Error).toBe(true);
+      const upstreamController = enqueue.mock.contexts[0];
+      expect(upstreamController).toBeDefined();
+      // The cancelled client controller must never be errored.
+      expect(error.mock.contexts.filter((context) => context !== upstreamController)).toEqual([]);
+      expect(processErrors).toEqual([]);
+    } finally {
+      releaseSettlement();
+      upstream.pause();
+      upstream.destroy();
+      await cancellation;
+      await clientReader?.cancel().catch(() => undefined);
+      reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+      enqueue.mockRestore();
+      error.mockRestore();
+      process.off("uncaughtException", captureError);
+      process.off("unhandledRejection", captureError);
+      vi.useRealTimers();
+    }
+  });
+
+  // Round 2 (#140): the reader-less helper callers. The shared teardown's
+  // synchronous pause and always-destroy are the only cleanup on these paths
+  // (there is no web reader whose cancel could destroy the source), so a
+  // regression to an inline destroy would leak the upstream socket.
+  it("pauses and destroys the upstream for a retryable body over the accounting limit", async () => {
+    const upstream = new Readable({
+      read() {
+        this.push(Buffer.alloc(512 * 1024, 0x78));
+      },
+    });
+    Object.assign(upstream, { statusCode: 503, headers: {}, complete: true });
+    const pauses: boolean[] = [];
+    const sequence: string[] = [];
+    const destroyReasons: unknown[] = [];
+    const originalPause = upstream.pause.bind(upstream);
+    upstream.pause = () => {
+      pauses.push(upstream.isPaused());
+      sequence.push("pause");
+      return originalPause();
+    };
+    const originalDestroy = upstream.destroy.bind(upstream);
+    upstream.destroy = (...args: Parameters<Readable["destroy"]>) => {
+      destroyReasons.push(args[0]);
+      sequence.push(`destroy(paused=${upstream.isPaused()})`);
+      return originalDestroy(...args);
+    };
+    providerHttpsRequest.mockReset().mockResolvedValueOnce(upstream);
+    db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+    try {
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-retry-overflow",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: new AbortController().signal,
+        liability: { tokens: 5_000n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 10n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: true,
+        retrySingleTargetPrecommit: true,
+      });
+      expect(result).toMatchObject({ dispatched: false, providerIoStarted: true });
+      // The helper pauses the source synchronously before it destroys it, and
+      // the destroy carries the overflow reason (not just any destroy call).
+      expect(pauses.length).toBeGreaterThanOrEqual(1);
+      expect(sequence.indexOf("pause")).toBeLessThan(sequence.indexOf("destroy(paused=true)"));
+      expect(
+        destroyReasons.some(
+          (reason) =>
+            reason instanceof Error && reason.message.includes("exceeded accounting limit"),
+        ),
+      ).toBe(true);
+      expect(upstream.destroyed).toBe(true);
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "FAILED" }),
+      );
+    } finally {
+      upstream.pause();
+      upstream.destroy();
+    }
+  });
+
+  it.each([204, 205, 304])(
+    "pauses and destroys the upstream for a body-forbidden %i response",
+    async (status) => {
+      const upstream = new Readable({ objectMode: true, read() {} });
+      for (let index = 0; index < 64; index++) upstream.push(Buffer.from("x".repeat(1024)));
+      Object.assign(upstream, { statusCode: status, headers: {}, complete: true });
+      const pauses: boolean[] = [];
+      const sequence: string[] = [];
+      const originalPause = upstream.pause.bind(upstream);
+      upstream.pause = () => {
+        pauses.push(upstream.isPaused());
+        sequence.push("pause");
+        return originalPause();
+      };
+      const originalCancel = ReadableStreamDefaultReader.prototype.cancel;
+      const cancelSeen: string[] = [];
+      ReadableStreamDefaultReader.prototype.cancel = function (reason) {
+        cancelSeen.push(`cancel(paused=${upstream.isPaused()})`);
+        sequence.push("cancel");
+        return originalCancel.call(this, reason);
+      };
+      providerHttpsRequest.mockReset().mockResolvedValueOnce(upstream);
+      db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+      const tx = {
+        ...consentDelegates(),
+        $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+          mockRequesterValidityQuery(strings, values, consentDelegates()),
+        ),
+        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+      try {
+        const result = await dispatchPublicOverflow({
+          userId: "owner",
+          poolId: "pool",
+          requestId: `request-body-forbidden-${status}`,
+          reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+          ...ownerConsentFields(),
+          requestedProtocol: "openai",
+          requestedSurface: "openai-chat",
+          stream: false,
+          requiredFeatures: [],
+          path: "/v1/chat/completions",
+          headers: new Headers({ "content-type": "application/json" }),
+          body: new TextEncoder().encode('{"model":"pool"}'),
+          signal: new AbortController().signal,
+          liability: { tokens: 5_000n, accountingVersion: "provider-billing-v1" },
+          requestedOutputTokens: 10n,
+          releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+          adaptationEnabled: false,
+          retrySafe: false,
+        });
+        expect(result.dispatched).toBe(true);
+        expect(upstream.destroyed).toBe(true);
+        expect(pauses.length).toBeGreaterThanOrEqual(2); // adapter pause plus helper pause
+        expect(cancelSeen).toHaveLength(1);
+        expect(sequence.indexOf("pause")).toBeLessThan(sequence.indexOf("cancel"));
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      } finally {
+        upstream.pause();
+        upstream.destroy();
+        ReadableStreamDefaultReader.prototype.cancel = originalCancel;
+      }
+    },
+  );
+
+  // Round 2 (#140): the shared teardown absorbs a rejecting reader.cancel so
+  // the attempt still settles. Dropping the catch in the helper would abort it
+  // before reconcile(false), stranding the attempt with no settlement.
+  it("still settles once when the upstream reader cancels with a rejection", async () => {
+    const upstream = new Readable({ read() {} });
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "text/event-stream" },
+      complete: false,
+    });
+    providerHttpsRequest.mockReset().mockResolvedValueOnce(upstream);
+    db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+    const processErrors: unknown[] = [];
+    const captureError = (error: unknown) => processErrors.push(error);
+    process.on("unhandledRejection", captureError);
+    const originalCancel = ReadableStreamDefaultReader.prototype.cancel;
+    ReadableStreamDefaultReader.prototype.cancel = () =>
+      Promise.reject(new Error("reader cancellation failed"));
+    try {
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-reader-cancel-rejects",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: true,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+        signal: new AbortController().signal,
+        liability: { tokens: 5_000n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 10n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      if (!result.dispatched) throw new Error("expected dispatch");
+      // Nothing reads the body: only the cancel can settle the attempt.
+      await result.response.body?.cancel(new Error("client disconnected"));
+      await result.terminal;
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "CANCELLED" }),
+      );
+      expect(upstream.destroyed).toBe(true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(processErrors).toEqual([]);
+    } finally {
+      upstream.destroy();
+      ReadableStreamDefaultReader.prototype.cancel = originalCancel;
+      process.off("unhandledRejection", captureError);
+    }
+  });
+
+  // Round 2 (#140): a non-stream body that errors mid-read (socket reset after
+  // partial JSON) must tear down, fail closed, and surface the error on the
+  // controller. The r1 `if (terminalDecoder)` gate skipped all of that for
+  // non-stream requests, leaking the upstream socket.
+  it("fails closed when a non-stream body errors mid-read", async () => {
+    const upstream = new Readable({ read() {} });
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: false,
+    });
+    const sequence: string[] = [];
+    const originalDestroy = upstream.destroy.bind(upstream);
+    upstream.destroy = (...args: Parameters<Readable["destroy"]>) => {
+      sequence.push("destroy");
+      return originalDestroy(...args);
+    };
+    const originalPause = upstream.pause.bind(upstream);
+    upstream.pause = () => {
+      sequence.push("pause");
+      return originalPause();
+    };
+    providerHttpsRequest.mockReset().mockResolvedValueOnce(upstream);
+    db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    reconcileProviderBudget.mockReset().mockResolvedValue(undefined);
+    try {
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-nonstream-midbody-error",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        ...ownerConsentFields(),
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: new AbortController().signal,
+        liability: { tokens: 5_000n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 10n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      if (!result.dispatched) throw new Error("expected dispatch");
+      // Push partial JSON, then fail the source mid-read.
+      upstream.push(Buffer.from('{"choices":[{"delta":{"content":"partial'));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      upstream.destroy(new Error("socket reset after partial JSON"));
+      await expect(result.response.text()).rejects.toBeInstanceOf(Error);
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "FAILED", observationComplete: false }),
+      );
+      // The dispatch teardown runs on the non-stream catch path: it pauses the
+      // source and destroys it (one extra destroy beyond the caller's trigger).
+      expect(sequence.filter((entry) => entry === "pause").length).toBeGreaterThanOrEqual(1);
+      expect(sequence.filter((entry) => entry === "destroy").length).toBeGreaterThanOrEqual(2);
+      expect(upstream.destroyed).toBe(true);
+    } finally {
+      upstream.destroy();
+    }
+  });
+
+  // Round 2 (#140): a transport chunk holding two terminal-classified records
+  // must charge the post-terminal budget once, from the FIRST terminal. If a
+  // later terminal recomputed it, the bytes between the terminals would fall
+  // out of the drain budget and the read would run past the bound.
+  it("keeps the drain budget anchored to the first of two terminals in one chunk", async () => {
+    db.providerPricingVersion.findFirst.mockResolvedValue(pricingRow());
+    const firstTerminal = Buffer.from(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+    );
+    try {
+      const pad = Buffer.from(`: ${"x".repeat(1024 - 3)}\n\n`); // one 1024-byte comment
+      const padBytes = Array.from({ length: (256 * 1024) / pad.length + 16 }, () => pad);
+      // One transport chunk: terminal, then a >=256 KiB tail, then a second
+      // terminal. The budget must be consumed by the first terminal's offset.
+      const chunk = Buffer.concat([firstTerminal, ...padBytes, firstTerminal]);
+      expect(chunk.byteLength).toBeGreaterThan(256 * 1024);
+      const result = await startOwnerStream(
+        "openrouter",
+        [chunk],
+        "owner",
+        "openai-responses",
+        true,
+      );
+      const terminal = await result.terminal;
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      const settled = reconcileProviderBudget.mock.calls[0]![0];
+      // The bytes after the first terminal already exceed the bound, so the
+      // drain stops fail-closed instead of reading on to a clean EOF.
+      expect(settled.reason).toBe("COMPLETED");
+      expect(settled.observationComplete).toBe(false);
+      expect(terminal).toMatchObject({ ok: true, responseBytes: chunk.byteLength });
+    } finally {
+      db.providerPricingVersion.findFirst.mockReset();
+    }
+  });
+
   // #62 AC: pool fallback settles against the pool owner's budget even when a
   // grantee made the request (own-key settles against the requester, above).
   it("settles a grantee's OpenRouter pool fallback against the owner's budget", async () => {

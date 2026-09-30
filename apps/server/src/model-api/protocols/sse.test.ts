@@ -38,4 +38,38 @@ describe("SSE record byte offsets", () => {
       expect([...parser.push(bytes), ...parser.finish()]).toEqual(records);
     },
   );
+
+  // A real BOM is exactly three bytes and is credited once, however the
+  // transport splits it. Detecting it from the first byte alone would credit
+  // the +3 once per chunk until the third byte arrives.
+  it("credits a BOM exactly once when it is split one byte at a time", () => {
+    const bytes = Buffer.from("\uFEFFdata: tail\n\n");
+    const parser = new SseDecoder();
+    const offsets: number[] = [];
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      parser.push(bytes.subarray(index, index + 1), (_record, offset) => offsets.push(offset));
+    }
+    parser.finish();
+    expect(offsets).toEqual([bytes.byteLength]);
+  });
+
+  // A non-BOM stream whose first character's UTF-8 starts with 0xef (e.g.
+  // U+FFFD, ef bf bd) must not be credited as a BOM. Such a stream is not
+  // valid SSE: the leading character joins the first line's field name, so the
+  // decoder rejects it before emitting any offset — which is why the residual
+  // miscount this row guards cannot be observed through a record offset.
+  it.each(["\uFFFD", "\uFEBE", "\uF8FF"])(
+    "rejects a stream led by the non-BOM 0xef character %j",
+    (character) => {
+      expect(Buffer.from(character)[0]).toBe(0xef);
+      expect(character).not.toBe("\uFEFF");
+      const bytes = Buffer.from(`${character}data: tail\n\n`);
+      const parser = new SseDecoder();
+      const offsets: number[] = [];
+      expect(() => parser.push(bytes, (_record, offset) => offsets.push(offset))).toThrow(
+        "Unsupported SSE field",
+      );
+      expect(offsets).toEqual([]);
+    },
+  );
 });
