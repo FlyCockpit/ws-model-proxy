@@ -347,7 +347,7 @@ commands (`token_inactive` or `offline`; a write-class call carries `error.outco
 Banning a user (the dashboard archive action, the admin ban, or an admin update that sets the
 ban) does the same for every token the user holds and refuses calls still being admitted; the
 CLI's relay connection stays up. Everything ends on the server at once, including supervised
-commands and supervised file requests still waiting for a person's confirmation or already applying (a file request ends `token_inactive`/`offline`-style with `outcome: "unknown"` once dispatched, per the outcome contract): a call waiting for a headless command returns
+commands and supervised file requests still waiting for a person's confirmation or already applying (a file request ends `token_inactive`, with `outcome: "unknown"` once dispatched per the outcome contract; if its confirm deadline had already passed and the server was waiting for the CLI to stop, it ends `timeout`): a call waiting for a headless command returns
 `cancelled`, and the CLI's late output and exit are dropped and never reported as a success. The
 CLI is asked to stop the process, and the command keeps its execution slot only until the CLI
 answers or 15 seconds pass. The cancel runs in the server process that performed the ban: another
