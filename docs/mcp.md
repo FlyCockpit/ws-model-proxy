@@ -136,11 +136,16 @@ use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` exp
 the agent's intent; it does not replace the person's keypress. The screen shows the
 operation, resolved physical path, optional reason, and a unified diff with one context
 line computed independently from the real file on disk; the server cannot supply
-or forge it. Only disk-derived removed/context lines are masked. Requester-authored
-added lines are shown verbatim with controls/invisible characters escaped. A diff
+or forge it. Disk-derived removed/context lines are masked. Every after-side byte
+is tracked as requester-authored or carried from disk. If an added line carries
+any masked disk byte (including a whole-line or continuation mask), the request is
+blocked with `redacted_span` after the person dismisses the cannot-apply screen.
+Pure requester-authored additions stay verbatim, with controls/invisible characters
+escaped. Diff and mask lines split only on LF: a lone CR is escaped content; CRLF
+stays one line ending. Unmappable line counts block with `redacted_span`. A diff
 whose complete escaped display exceeds 8 KiB is blocked with `too_large` after the
 person dismisses the cannot-apply screen; no hidden hunk can be approved. Details
-show byte counts, mode in octal (explicit or effective default), `ifExists`, parent
+show byte counts, mode in octal (explicit, effective default, or all preserved permission bits), `ifExists`, parent
 creation and rename overwrite where applicable. Secret-class paths remain read-only and are
 refused `secret_file`. Path policy is checked before display and again at apply, and
 the daemon rechecks the etag: a file changed between display and approval returns
@@ -164,8 +169,9 @@ Confirm waits expire after 15 minutes, using the same stop grace as commands.
 After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
 sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
 Session loss reports `offline`. Once `term.spawn` was dispatched, server termination
-without authoritative CLI settlement carries `outcome:"unknown"` and `started:null`,
-even before the server receives acceptance: acceptance and apply may be in flight.
+without authoritative CLI settlement carries `outcome:"unknown"`. It reports
+`started:true` if the server received acceptance, otherwise `started:null`: acceptance
+and apply may be in flight.
 This includes confirm expiry/stop grace, token revoke/expiry, and grant changes.
 The audit records unknown exactly once; late frames cannot change a finished result.
 Every non-success after acceptance has `outcome:"unknown"`, including CLI

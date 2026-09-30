@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -115,6 +115,10 @@ impl Drop for PtyChild {
     }
 }
 
+fn canonical_root(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().canonicalize().expect("canonical tempdir")
+}
+
 fn prepare(root: &Path, op: &str, args: Value, body: Option<Vec<u8>>) -> SupervisedChildInput {
     let ops = FileOps::new(
         Policy::from_environment(vec![root.to_owned()], true),
@@ -135,11 +139,12 @@ fn prepare(root: &Path, op: &str, args: Value, body: Option<Vec<u8>>) -> Supervi
 #[test]
 fn real_child_masks_disk_diff_and_enter_never_applies() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let target = dir.path().join("settings.txt");
+    let root = canonical_root(&dir);
+    let target = root.join("settings.txt");
     let before = include_bytes!("fixtures/masking/supervised-file.txt");
     std::fs::write(&target, before).expect("write target");
     let input = prepare(
-        dir.path(),
+        &root,
         "edit",
         json!({
             "path": target,
@@ -181,9 +186,10 @@ fn real_child_masks_disk_diff_and_enter_never_applies() {
 #[test]
 fn blocked_real_child_allows_every_dismiss_key_and_never_accepts() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let missing = dir.path().join("missing.txt");
+    let root = canonical_root(&dir);
+    let missing = root.join("missing.txt");
     let input = prepare(
-        dir.path(),
+        &root,
         "delete",
         json!({"path": missing, "reason": "remove stale file"}),
         None,
@@ -213,10 +219,11 @@ fn blocked_real_child_allows_every_dismiss_key_and_never_accepts() {
 #[test]
 fn mismatched_preview_token_becomes_blocked_before_diff_is_drawn() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let target = dir.path().join("plain.txt");
+    let root = canonical_root(&dir);
+    let target = root.join("plain.txt");
     std::fs::write(&target, b"old\n").expect("write target");
     let mut input = prepare(
-        dir.path(),
+        &root,
         "edit",
         json!({
             "path": target,
@@ -252,8 +259,9 @@ fn gap_real_child_decline_keys_apply_nothing_for_all_five_operations() {
     for op in ["edit", "write", "rename", "mkdir", "delete"] {
         for key in [b'q', 3, 4] {
             let dir = tempfile::tempdir().unwrap();
-            let source = dir.path().join("source");
-            let destination = dir.path().join("destination");
+            let root = canonical_root(&dir);
+            let source = root.join("source");
+            let destination = root.join("destination");
             std::fs::write(&source, b"old\n").unwrap();
             let (args, body) = match op {
                 "edit" => (
@@ -265,7 +273,7 @@ fn gap_real_child_decline_keys_apply_nothing_for_all_five_operations() {
                 "mkdir" => (json!({"path":destination,"parents":false}), None),
                 _ => (json!({"path":source}), None),
             };
-            let input = prepare(dir.path(), op, args, body.clone());
+            let input = prepare(&root, op, args, body.clone());
             assert_eq!(input.blocked, None, "{op}");
             let body_dir = tempfile::tempdir().unwrap();
             std::fs::set_permissions(body_dir.path(), std::fs::Permissions::from_mode(0o700))
@@ -307,10 +315,11 @@ fn gap_real_child_decline_keys_apply_nothing_for_all_five_operations() {
 #[test]
 fn oversized_real_child_blocks_after_dismissal_without_accepting_or_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("plain.txt");
+    let root = canonical_root(&dir);
+    let target = root.join("plain.txt");
     std::fs::write(&target, b"old\n").unwrap();
     let input = prepare(
-        dir.path(),
+        &root,
         "edit",
         json!({"path":target,"edits":[{"oldText":"old","newText":"padding".repeat(1500)}]}),
         None,
@@ -331,4 +340,84 @@ fn oversized_real_child_blocks_after_dismissal_without_accepting_or_writing() {
     );
     child.child.wait().expect("blocked child exits");
     assert_eq!(std::fs::read(&target).unwrap(), b"old\n");
+}
+
+#[test]
+fn canonical_fixture_root_handles_a_symlinked_temp_base() {
+    let base = tempfile::tempdir().unwrap();
+    let alias = base.path().join("alias");
+    std::os::unix::fs::symlink(base.path(), &alias).unwrap();
+    let dir = tempfile::Builder::new().tempdir_in(&alias).unwrap();
+    let root = canonical_root(&dir);
+    let target = root.join("plain.txt");
+    std::fs::write(&target, "old\n").unwrap();
+    let input = prepare(
+        &root,
+        "edit",
+        json!({"path":target,"edits":[{"oldText":"old","newText":"new"}]}),
+        None,
+    );
+    assert_eq!(input.blocked, None);
+    assert_eq!(root, dir.path().canonicalize().unwrap());
+}
+
+#[test]
+fn real_child_blocks_carried_masked_bytes_before_drawing_any_diff() {
+    let rows: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/masking/consent-provenance.json")).unwrap();
+    for row in rows.iter().filter(|row| row["blocked"] == true) {
+        let name = row["name"].as_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let target = root.join("plain.txt");
+        let before = row["before"].as_str().unwrap();
+        std::fs::write(&target, before).unwrap();
+        let mut input = prepare(
+            &root,
+            "edit",
+            json!({"path":target,"expectedEtag":etag(&root, &target),"edits":row["edits"]}),
+            None,
+        );
+        // Do not let the daemon's blocked hint make this test pass: the real
+        // child must independently enforce the provenance rule from disk.
+        input.blocked = None;
+        let mut child = PtyChild::spawn(&input, None);
+        assert!(child.wait_for(&PtyChild::marker("ready")), "{name}");
+        let screen = String::from_utf8_lossy(&child.seen);
+        assert!(screen.contains("cannot be applied"), "{name}: {screen}");
+        assert!(screen.contains("redacted_span"), "{name}: {screen}");
+        assert!(!screen.contains("Unified diff"), "{name}: {screen}");
+        child.send(b"\r");
+        assert!(
+            child.wait_for(&PtyChild::marker("blocked;redacted_span")),
+            "{name}"
+        );
+        assert!(
+            !child
+                .seen
+                .windows(PtyChild::marker("accepted").len())
+                .any(|part| part == PtyChild::marker("accepted")),
+            "{name}"
+        );
+        child.child.wait().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before, "{name}");
+    }
+}
+
+fn etag(root: &Path, target: &Path) -> String {
+    let ops = FileOps::new(
+        Policy::from_environment(vec![root.to_owned()], true),
+        EtagKey::from_bytes([9; 32]),
+    );
+    ops.stat(
+        &serde_json::from_value(json!({"paths":[target],"hash":true})).expect("stat args"),
+        &Cancel::new(),
+    )
+    .expect("stat target")
+    .entries
+    .into_iter()
+    .next()
+    .expect("stat entry")
+    .etag
+    .expect("strong etag")
 }

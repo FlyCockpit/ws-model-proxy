@@ -264,3 +264,143 @@ fn consent_edit_preview_cannot_apply_regardless_of_caller_flags() {
         assert!(fx.leftovers("").is_empty());
     }
 }
+
+/// Binding addendum rows run through both daemon preparation and independent
+/// child preview. Collect failures so a baseline run reports every table row.
+#[test]
+fn consent_provenance_addendum_table() {
+    let rows: Vec<Value> = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/masking/consent-provenance.json"
+    ))
+    .unwrap();
+    let mut failures = Vec::new();
+    for row in rows {
+        let name = row["name"].as_str().unwrap();
+        let before = row["before"].as_str().unwrap();
+        let fx = Fx::new();
+        fx.put("plain.conf", before);
+        let op = row["op"].as_str().unwrap_or("edit");
+        let mut args = json!({"path":fx.p("plain.conf"),"expectedEtag":fx.etag("plain.conf")});
+        let body = if op == "write" {
+            args["ifExists"] = json!("replace");
+            Some(row["body"].as_str().unwrap().as_bytes().to_vec())
+        } else {
+            args["edits"] = row["edits"].clone();
+            None
+        };
+        let prepared = prepare(&fx, op, args.clone(), body.clone());
+        let preview = fx
+            .ops
+            .preview_supervised(
+                op,
+                prepared.child_input().args.clone(),
+                body.as_deref(),
+                &key(),
+                &fx.cancel,
+            )
+            .unwrap();
+        if row["blocked"].as_bool().unwrap_or(false) {
+            if prepared.child_input().blocked != Some(ErrorCode::RedactedSpan)
+                || !matches!(
+                    preview,
+                    SupervisedPreview::Blocked {
+                        code: ErrorCode::RedactedSpan,
+                        ..
+                    }
+                )
+            {
+                failures.push(format!(
+                    "{name}: expected redacted_span, got {:?}",
+                    prepared.child_input().blocked
+                ));
+                continue;
+            }
+            assert!(
+                fx.ops.execute_supervised(prepared, &fx.cancel).is_err(),
+                "{name}"
+            );
+            assert_eq!(fx.get("plain.conf"), before, "{name}");
+        } else {
+            assert_eq!(prepared.child_input().blocked, None, "{name}");
+            let SupervisedPreview::Allowed(allowed) = preview else {
+                panic!("{name}: {preview:?}")
+            };
+            let diff = allowed.diff.join("\n");
+            if let Some(removed) = row["removed"].as_str()
+                && !diff
+                    .lines()
+                    .any(|line| line.trim_end_matches('\r') == format!("-{removed}"))
+            {
+                failures.push(format!("{name}: wrong removal: {diff:?}"));
+            }
+            if let Some(not_removed) = row["notRemoved"].as_str()
+                && diff
+                    .lines()
+                    .any(|line| line.trim_end_matches('\r') == format!("-{not_removed}"))
+            {
+                failures.push(format!("{name}: neighbouring removal: {diff:?}"));
+            }
+            if let Some(added) = row["added"].as_str() {
+                assert!(diff.contains(&format!("+{added}")), "{name}: {diff}");
+            }
+            if let Some(hidden) = row["hidden"].as_str() {
+                assert!(!diff.contains(hidden), "{name}: exposed disk bytes");
+                assert!(diff.contains("redacted"), "{name}: {diff}");
+            }
+            // Accepted controls apply the exact displayed change, including EOLs.
+            fx.ops.execute_supervised(prepared, &fx.cancel).unwrap();
+            assert_eq!(
+                fx.get("plain.conf"),
+                row["after"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+        assert!(fx.leftovers("").is_empty(), "{name}");
+    }
+    assert!(failures.is_empty(), "table failures: {failures:#?}");
+}
+
+#[test]
+fn consent_replacement_details_preserve_sticky_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    fx.put("plain.conf", "old\n");
+    std::fs::set_permissions(
+        fx.root.join("plain.conf"),
+        std::fs::Permissions::from_mode(0o1755),
+    )
+    .unwrap();
+    let args = json!({"path":fx.p("plain.conf"),"ifExists":"replace","expectedEtag":fx.etag("plain.conf")});
+    let body = b"new\n".to_vec();
+    let prepared = prepare(&fx, "write", args.clone(), Some(body.clone()));
+    let SupervisedPreview::Allowed(allowed) = fx
+        .ops
+        .preview_supervised(
+            "write",
+            prepared.child_input().args.clone(),
+            Some(&body),
+            &key(),
+            &fx.cancel,
+        )
+        .unwrap()
+    else {
+        panic!("allowed replacement")
+    };
+    assert!(
+        allowed
+            .description
+            .contains(&"mode: 1755 (preserved)".to_owned()),
+        "{:?}",
+        allowed.description
+    );
+    fx.ops.execute_supervised(prepared, &fx.cancel).unwrap();
+    assert_eq!(
+        std::fs::metadata(fx.root.join("plain.conf"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o1755
+    );
+    assert_eq!(fx.get("plain.conf"), "new\n");
+}

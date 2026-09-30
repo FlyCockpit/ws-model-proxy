@@ -1,8 +1,10 @@
 //! Compact unified diffs for edit/write results (plan section 2.1): one line of
 //! context, hunks only (no file header), capped at 8 KiB. Callers pass the
 //! **masked** before/after views for MCP results. Consent previews instead use
-//! raw changes, mapping only disk-derived lines to their masked pre-image.
+//! byte provenance: disk context is masked, and additions carrying hidden disk
+//! bytes are blocked rather than rendered.
 
+use std::ops::Range;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -61,32 +63,124 @@ pub fn diff_lines(before: &str, after: &str) -> DiffSummary {
     }
 }
 
-/// A complete consent diff: additions are requester-authored, while deletions
-/// and context come only from the independently masked disk pre-image. Never
-/// re-diff masked text: that would turn unchanged disk secrets into additions.
+struct DiskCopy {
+    after: Range<usize>,
+    before: Range<usize>,
+}
+
+/// Builds the after side together with its provenance. Every append is either
+/// requester text or a checked slice of the disk pre-image; no caller can supply
+/// after text while forgetting the carried disk ranges.
+pub(crate) struct ConsentText<'a> {
+    before: &'a str,
+    after: String,
+    disk: Vec<DiskCopy>,
+}
+
+impl<'a> ConsentText<'a> {
+    pub(crate) fn new(before: &'a str) -> Self {
+        Self {
+            before,
+            after: String::new(),
+            disk: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_agent(&mut self, text: &str) {
+        self.after.push_str(text);
+    }
+
+    pub(crate) fn push_disk(&mut self, range: Range<usize>) -> super::error::FileResult<()> {
+        let text = self.before.get(range.clone()).ok_or_else(|| {
+            super::error::FileError::new(
+                super::error::ErrorCode::RedactedSpan,
+                "cannot map copied disk bytes",
+            )
+        })?;
+        if !text.is_empty() {
+            let start = self.after.len();
+            self.after.push_str(text);
+            self.disk.push(DiskCopy {
+                after: start..self.after.len(),
+                before: range,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.after
+    }
+
+    fn carries_hidden_disk(
+        &self,
+        line: Range<usize>,
+        before: &super::redact::MaskedView,
+        after: &super::redact::MaskedView,
+    ) -> bool {
+        fn hidden(view: &super::redact::MaskedView, range: Range<usize>) -> bool {
+            let at = view
+                .spans
+                .partition_point(|span| span.orig.end <= range.start);
+            view.spans
+                .get(at)
+                .is_some_and(|span| span.orig.start < range.end)
+        }
+        let at = self
+            .disk
+            .partition_point(|copy| copy.after.end <= line.start);
+        self.disk[at..]
+            .iter()
+            .take_while(|copy| copy.after.start < line.end)
+            .any(|copy| {
+                let start = copy.after.start.max(line.start);
+                let end = copy.after.end.min(line.end);
+                let original_start = copy.before.start + start - copy.after.start;
+                hidden(before, original_start..original_start + end - start)
+                    || hidden(after, start..end)
+            })
+    }
+}
+
+/// The sole consent content renderer. Raw LF slices drive the diff; masked LF
+/// slices supply disk deletions/context. An addition carrying hidden disk bytes
+/// blocks the entire preview, while agent bytes remain verbatim. Never re-diff
+/// masked text, which can turn unchanged disk secrets into additions.
 pub(crate) fn consent_diff(
-    before: &str,
-    after: &str,
-    masked: &super::redact::MaskedView,
+    text: &ConsentText<'_>,
+    class: super::redact::FileClass,
 ) -> super::error::FileResult<String> {
     use super::error::{ErrorCode, FileError};
-    if masked.long_construct {
+    let masked = super::redact::mask(class, text.before);
+    let after_masked = super::redact::mask(class, text.as_str());
+    if masked.long_construct || after_masked.long_construct {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,
             "cannot fully mask the disk pre-image",
         ));
     }
-    let lines: Vec<&str> = masked.text.split_inclusive('\n').collect();
-    if lines.len() != before.split_inclusive('\n').count() {
-        return Err(FileError::new(
-            ErrorCode::RedactedSpan,
-            "cannot map the disk pre-image",
-        ));
-    }
+    let (before_lines, lines) = consent_lines(text.before, &masked)?;
+    let (after_lines, _) = consent_lines(text.as_str(), &after_masked)?;
     let diff = TextDiff::configure()
         .algorithm(Algorithm::Myers)
         .timeout(DIFF_TIMEOUT)
-        .diff_lines(before, after);
+        .newline_terminated(true)
+        .diff_slices(&before_lines, &after_lines);
+    if diff.old_len() != lines.len() || diff.new_len() != after_lines.len() {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "cannot map diff lines",
+        ));
+    }
+    let mut offset = 0;
+    let after_ranges: Vec<_> = after_lines
+        .iter()
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            start..offset
+        })
+        .collect();
     let mut out = String::new();
     for hunk in diff.unified_diff().context_radius(1).iter_hunks() {
         out.push_str(&format!("{}\n", hunk.header()));
@@ -95,7 +189,21 @@ pub(crate) fn consent_diff(
                 Some(index) => *lines.get(index).ok_or_else(|| {
                     FileError::new(ErrorCode::RedactedSpan, "cannot map a disk diff line")
                 })?,
-                None => change.value(),
+                None => {
+                    let range = change
+                        .new_index()
+                        .and_then(|index| after_ranges.get(index))
+                        .ok_or_else(|| {
+                            FileError::new(ErrorCode::RedactedSpan, "cannot map an added line")
+                        })?;
+                    if text.carries_hidden_disk(range.clone(), &masked, &after_masked) {
+                        return Err(FileError::new(
+                            ErrorCode::RedactedSpan,
+                            "an added approval line carries masked disk bytes",
+                        ));
+                    }
+                    change.value()
+                }
             };
             out.push_str(&change.tag().to_string());
             out.push_str(value);
@@ -113,6 +221,21 @@ pub(crate) fn consent_diff(
         }
     }
     Ok(out)
+}
+
+fn consent_lines<'a>(
+    raw: &'a str,
+    masked: &'a super::redact::MaskedView,
+) -> super::error::FileResult<(Vec<&'a str>, Vec<&'a str>)> {
+    let raw: Vec<_> = super::text::lf_lines(raw).collect();
+    let masked: Vec<_> = super::text::lf_lines(&masked.text).collect();
+    if raw.len() != masked.len() {
+        return Err(super::error::FileError::new(
+            super::error::ErrorCode::RedactedSpan,
+            "cannot map masked consent lines",
+        ));
+    }
+    Ok((raw, masked))
 }
 
 fn cap_hunks(hunks: &[String]) -> String {
@@ -147,6 +270,25 @@ fn cap_hunks(hunks: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consent_line_count_guard_fails_closed_for_either_side() {
+        use super::super::redact::{FileClass, mask};
+        for raw in ["a\rb\nc\n", "a\r\nb\r\n", "a\nb"] {
+            let mut masked = mask(FileClass::Plain, raw);
+            assert!(consent_lines(raw, &masked).is_ok());
+            masked.text = "one line\n".to_owned();
+            assert_eq!(
+                consent_lines(raw, &masked).unwrap_err().code,
+                super::super::error::ErrorCode::RedactedSpan
+            );
+            masked.text = format!("{raw}\nextra\n");
+            assert_eq!(
+                consent_lines(raw, &masked).unwrap_err().code,
+                super::super::error::ErrorCode::RedactedSpan
+            );
+        }
+    }
 
     #[test]
     fn single_line_change_matches_plan_shape() {

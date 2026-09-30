@@ -283,22 +283,21 @@ fn edit_validated(
     }
 
     budget.check()?;
-    let mut updated: Vec<u8> = Vec::with_capacity(original.len());
+    let mut updated = super::diff::ConsentText::new(original_text);
     let mut cursor = 0;
     for plan in &planned {
-        updated.extend_from_slice(&original[cursor..plan.orig.start]);
-        updated.extend_from_slice(new_texts[plan.edit].as_bytes());
+        updated.push_disk(cursor..plan.orig.start)?;
+        updated.push_agent(&new_texts[plan.edit]);
         cursor = plan.orig.end;
     }
-    updated.extend_from_slice(&original[cursor..]);
-    if updated.len() as u64 > MAX_EDIT_FILE_BYTES {
+    updated.push_disk(cursor..original.len())?;
+    if updated.as_str().len() as u64 > MAX_EDIT_FILE_BYTES {
         return Err(FileError::new(
             ErrorCode::TooLarge,
             "the edited file would exceed 16 MiB",
         ));
     }
-    let updated_text = std::str::from_utf8(&updated)
-        .map_err(|_| FileError::invalid("the edit would produce invalid UTF-8"))?;
+    let updated_text = updated.as_str();
 
     let after_view = redact::mask(class, updated_text);
     // Masking depends on context (the name, the assignment shape, an open quote).
@@ -319,7 +318,7 @@ fn edit_validated(
     }
     let mut summary = diff_lines(&view.text, &after_view.text);
     if matches!(audience, DiffAudience::Consent) {
-        summary.diff = super::diff::consent_diff(original_text, updated_text, &view)?;
+        summary.diff = super::diff::consent_diff(&updated, class)?;
     }
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
@@ -328,7 +327,7 @@ fn edit_validated(
     };
     let echo = resolved.echo(&args.path);
 
-    if updated == original {
+    if updated_text.as_bytes() == original {
         if let Some(pin) = pin {
             pin.verify(ops, &resolved, Access::Write, cancel)?;
         }
@@ -343,7 +342,7 @@ fn edit_validated(
                 hunks,
                 resolved_path: echo,
             },
-            updated.len(),
+            updated.as_str().len(),
         ));
     }
     if args.dry_run.unwrap_or(false) {
@@ -358,7 +357,7 @@ fn edit_validated(
                 hunks,
                 resolved_path: echo,
             },
-            updated.len(),
+            updated.as_str().len(),
         ));
     }
 
@@ -371,7 +370,7 @@ fn edit_validated(
             &mut file,
             &stat,
             &previous_etag,
-            &updated,
+            updated_text.as_bytes(),
             pin,
             cancel,
         )?,
@@ -382,13 +381,13 @@ fn edit_validated(
             &mut file,
             &stat,
             &previous_etag,
-            &updated,
+            updated_text.as_bytes(),
             cancel,
         )?,
     };
     Ok((
         EditResult {
-            etag: ops.key.strong(&new_stat, &updated),
+            etag: ops.key.strong(&new_stat, updated_text.as_bytes()),
             previous_etag,
             added: summary.added,
             removed: summary.removed,
@@ -397,7 +396,7 @@ fn edit_validated(
             hunks,
             resolved_path: echo,
         },
-        updated.len(),
+        updated.as_str().len(),
     ))
 }
 

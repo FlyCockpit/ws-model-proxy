@@ -2727,6 +2727,9 @@ describe("supervised commands", () => {
         code: codes[event],
         ...(event !== "decline" ? { outcome: "unknown" } : {}),
       });
+      expect(snapshot(commandId)?.started).toBe(
+        event.startsWith("accepted") ? true : event === "decline" ? false : null,
+      );
       expect(socket.json().some((frame) => frame.type === "go")).toBe(false);
     });
 
@@ -2945,7 +2948,7 @@ describe("supervised commands", () => {
         );
         expect(snapshot(request.commandId)).toMatchObject({
           status: "cancelled",
-          started: null,
+          started: true,
           file: null,
           fileError: { code: "token_inactive", outcome: "unknown" },
         });

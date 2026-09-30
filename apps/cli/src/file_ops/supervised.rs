@@ -682,7 +682,9 @@ fn build_write(
         )
     })?;
     let class = redact::classify(&pin.physical);
-    let diff = consent_diff(&before, after, &redact::mask(class, &before))?
+    let mut consent = super::diff::ConsentText::new(&before);
+    consent.push_agent(after);
+    let diff = consent_diff(&consent, class)?
         .lines()
         .map(str::to_string)
         .collect();
@@ -700,7 +702,7 @@ fn build_write(
                     .object
                     .as_ref()
                     .map_or(write::DEFAULT_CREATE_MODE, |object| object.stat.mode
-                        & 0o777)),
+                        & 0o7777)),
                 if if_exists == IfExists::Replace {
                     " (preserved)"
                 } else {
@@ -1033,6 +1035,8 @@ fn build(
     cancel: &Cancel,
 ) -> FileResult<Built> {
     ops.policy.check_process()?;
+    // Every consent screen goes through this builder. Edit/write content must
+    // use consent_diff; the other operations disclose metadata without content.
     match op {
         "edit" if body.is_none() => build_edit(ops, args, key, cancel),
         "write" => build_write(ops, args, body, key, cancel),

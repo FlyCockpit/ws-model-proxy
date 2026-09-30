@@ -877,6 +877,7 @@ function requestSupervisedStop(record: SupervisedRecord, why: "expire" | "declin
 }
 
 function startedOf(record: SupervisedRecord): boolean | null {
+  if (record.acceptedAt !== null) return true;
   if (record.requestKind === "file" && !isActiveSupervised(record.status)) {
     if (record.dispatched && !record.cliSettled) return null;
     return record.acceptedAt !== null;

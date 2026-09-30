@@ -721,6 +721,35 @@ fn gap_registry_child_screen_ignores_spawn_summary_and_masks_only_disk_content()
 }
 
 #[test]
+fn gap_registry_child_screen_blocks_carried_masked_bytes() {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/masking/consent-provenance.json"
+    )).unwrap();
+    let row = &rows[0];
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("plain.conf");
+    std::fs::write(&target, row["before"].as_str().unwrap()).unwrap();
+    let before = gap_disk_tree(dir.path());
+    let (tx, rx) = channel();
+    let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
+    let startup = supervised_startup(McpCommandMode::Supervised, false);
+    let request = file_spawn_request("edit", serde_json::json!({"path":target,"edits":row["edits"]}), None);
+    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+    pump_file_until(&mut terminals, &rx, &startup, &mut frames, |terminals, _| {
+        phase(terminals) == Some(SupervisedPhase::Confirm)
+    });
+    let screen = crate::supervised_file::screen_from_registry_env(&terminals.file_child_env).unwrap();
+    assert!(screen.contains("redacted_span"), "{screen}");
+    assert!(!screen.contains("Unified diff"), "{screen}");
+    // Confirmation remains available for dismissal, with no early file error
+    // or acceptance, and cancelling it cannot apply or leave a body behind.
+    assert!(!outcome_kinds(&frames).contains(&"accepted"));
+    frames.extend(terminals.cancel_supervised(&request.command_id, true));
+    assert_eq!(gap_disk_tree(dir.path()), before);
+    assert!(!outcome_kinds(&frames).contains(&"accepted"));
+}
+
+#[test]
 fn gap_mask_token_write_body_is_rejected_before_any_screen() {
     for body in ["⟦redacted:1⟧", "prefix ⟦redacted:99⟧ suffix"] {
         let dir = tempfile::tempdir().unwrap();
