@@ -20,6 +20,9 @@ pub struct TerminalStartup {
     mcp_command_mode: McpCommandMode,
     require_terminal_approval: bool,
     allow_file_tools_as_root: bool,
+    mcp_file_read: bool,
+    file_roots: Vec<std::path::PathBuf>,
+    file_roots_configured: bool,
     allow_remote_metric_sources: bool,
 }
 
@@ -54,6 +57,9 @@ impl TerminalStartup {
             mcp_command_mode: config.mcp_command_mode,
             require_terminal_approval: config.require_terminal_approval,
             allow_file_tools_as_root: config.allow_file_tools_as_root,
+            mcp_file_read: config.mcp_file_read,
+            file_roots: config.file_roots.clone(),
+            file_roots_configured: crate::config::file_roots_usable(&config.file_roots),
             allow_remote_metric_sources: config.allow_remote_metric_sources,
         }
     }
@@ -88,6 +94,12 @@ impl TerminalStartup {
         self.allow_file_tools_as_root
     }
 
+    pub fn mcp_file_read(&self) -> bool {
+        self.mcp_file_read
+    }
+    pub fn file_roots(&self) -> &[std::path::PathBuf] {
+        &self.file_roots
+    }
     /// The local remote-metric-source opt-in, fixed for the daemon's lifetime.
     pub fn allow_remote_metric_sources(&self) -> bool {
         self.allow_remote_metric_sources
@@ -109,6 +121,8 @@ impl TerminalStartup {
             mcp_command_mode: self.mcp_command_mode,
             require_terminal_approval: self.require_terminal_approval,
             allow_file_tools_as_root: self.allow_file_tools_as_root,
+            mcp_file_read: self.mcp_file_read,
+            file_roots_configured: self.file_roots_configured,
             allow_remote_metric_sources: self.allow_remote_metric_sources,
             terminal_public_key_b64url: self.key.public_b64url().to_string(),
             terminal_identity,
@@ -131,7 +145,10 @@ mod tests {
 
     #[test]
     fn capabilities_ignore_config_changes_after_startup() {
+        let dir = tempfile::tempdir().expect("roots");
         let mut config = Config {
+            mcp_file_read: true,
+            file_roots: vec![dir.path().to_path_buf()],
             allow_human_terminal: true,
             mcp_command_mode: McpCommandMode::Unsupervised,
             require_terminal_approval: true,
@@ -145,6 +162,8 @@ mod tests {
         config.mcp_command_mode = McpCommandMode::Off;
         config.require_terminal_approval = false;
         config.allow_file_tools_as_root = false;
+        config.mcp_file_read = false;
+        config.file_roots.clear();
         config.allow_remote_metric_sources = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
         assert!(capabilities.features.human_terminal);
@@ -173,11 +192,40 @@ mod tests {
         assert!(capabilities.exec);
         assert_eq!(capabilities.protocol_version, "2.8");
         assert!(capabilities.file_ops);
-        assert!(!capabilities.features.mcp_file_read);
-        assert!(!capabilities.features.file_roots_configured);
+        assert!(capabilities.features.mcp_file_read);
+        assert!(startup.mcp_file_read());
+        assert_eq!(startup.file_roots(), &[dir.path().to_path_buf()]);
+        assert!(capabilities.features.file_roots_configured);
         assert!(capabilities.features.allow_file_tools_as_root);
         assert!(capabilities.terminal_viewers);
         assert!(capabilities.supervised_commands);
+    }
+
+    #[test]
+    fn broken_roots_are_not_reported_as_configured() {
+        let dir = tempfile::tempdir().expect("dir");
+        let config = Config {
+            mcp_file_read: true,
+            file_roots: vec![dir.path().join("missing")],
+            ..Config::default()
+        };
+        let startup = TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config);
+        assert!(
+            !startup
+                .capabilities("test-cli")
+                .features
+                .file_roots_configured
+        );
+        assert_eq!(startup.file_roots(), config.file_roots);
+        assert!(
+            !TerminalStartup::from_key(
+                CliTerminalKey::generate().expect("key"),
+                &Config::default()
+            )
+            .capabilities("test-cli")
+            .features
+            .mcp_file_read
+        );
     }
 
     #[test]

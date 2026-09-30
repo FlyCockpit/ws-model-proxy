@@ -413,6 +413,8 @@ describe("MCP secret-output contract (every tool)", () => {
               kind: "pat",
               tokenId: "pat-1",
               allowCliCommands: true,
+              allowCliFileRead: false,
+              scopes: ["mcp:read", "mcp:write"],
               expiresAt: null,
             },
           },

@@ -11,7 +11,7 @@
 //!
 //! Admission ([`admit`]) is a pure function re-checked on every op: the CLI's
 //! own `mcpCommandMode` (`off` -> `feature_disabled`, `supervised` ->
-//! `supervised_only`; the P5 confirm path and the P4 read grant are later) and
+//! `supervised_only`; the P5 confirm path is later; read grants are checked independently) and
 //! the root refusal (`unsupported` at euid 0 unless `allowFileToolsAsRoot`).
 //! The server's admission is a separate, independent check.
 //!
@@ -57,6 +57,12 @@ pub const OPS: [&str; 9] = [
     "read", "stat", "list", "search", "edit", "write", "rename", "mkdir", "delete",
 ];
 
+/// The read class: the only ops the read grant can admit. Anything else,
+/// including an unknown name, is write-class and fails closed.
+pub fn is_read_op(op: &str) -> bool {
+    matches!(op, "read" | "stat" | "list" | "search")
+}
+
 /// A frame a settled op wants sent, in order.
 #[derive(Debug, Clone)]
 pub enum FileFrame {
@@ -99,29 +105,70 @@ impl FileRuntime {
 
 static SHARED: OnceLock<Arc<FileRuntime>> = OnceLock::new();
 
-/// The daemon-lifetime runtime: whole filesystem minus the protected set (no
-/// roots until P4), one random etag key. `allow_root` is the startup snapshot
-/// of `allowFileToolsAsRoot`; the first call wins.
-pub fn shared_runtime(allow_root: bool) -> Arc<FileRuntime> {
+/// Daemon-lifetime policy and etag key, confined by the startup roots.
+pub fn shared_runtime(allow_root: bool, roots: &[std::path::PathBuf]) -> Arc<FileRuntime> {
     Arc::clone(SHARED.get_or_init(|| {
         Arc::new(FileRuntime::new(FileOps::new(
-            Policy::from_environment(Vec::new(), allow_root),
+            Policy::from_environment(roots.to_vec(), allow_root),
             EtagKey::random(),
         )))
     }))
 }
 
-/// Why an op is refused before it runs.
-pub fn admit(mode: McpCommandMode, policy: &Policy) -> Result<(), &'static str> {
-    match mode {
-        McpCommandMode::Off => return Err("feature_disabled"),
-        McpCommandMode::Supervised => return Err("supervised_only"),
-        McpCommandMode::Unsupervised => {}
+#[derive(Debug, Clone, Copy)]
+pub struct FilePermission {
+    pub mode: McpCommandMode,
+    pub read_grant: bool,
+}
+
+/// Every reason `refuse` can pass: the wire reasons from `admit`/framing plus
+/// the file error codes the pending cap and the root check use. Mirrored by
+/// `FILE_WIRE_REASONS` + `FILE_ERROR_CODES` in
+/// `apps/server/src/relay/file-protocol.ts`; a reason outside that union fails
+/// the server's strict schema, which settles the op as io_error.
+pub const WIRE_REFUSAL_REASONS: [&str; 4] = [
+    "bad_frame",
+    "supervised_only",
+    "grant_disabled",
+    "feature_disabled",
+];
+/// {@link WIRE_REFUSAL_REASONS} plus the two file error codes `refuse` passes.
+pub const REFUSE_REASONS: [&str; 6] = [
+    "bad_frame",
+    "supervised_only",
+    "grant_disabled",
+    "feature_disabled",
+    "unsupported",
+    "limit",
+];
+
+/// Pure admission table. Unknown classes fail closed; writes can never use
+/// the read grant. Root UID consent remains independent of modes/grants.
+pub fn admit(
+    local_mode: McpCommandMode,
+    permission: FilePermission,
+    read: bool,
+    read_switch: bool,
+    roots: bool,
+    euid: u32,
+    allow_root: bool,
+) -> Result<(), &'static str> {
+    let mode = local_mode.min(permission.mode);
+    if mode != McpCommandMode::Unsupervised
+        && !(read && permission.read_grant && read_switch && roots)
+    {
+        return Err(if mode == McpCommandMode::Supervised {
+            "supervised_only"
+        } else if permission.mode == McpCommandMode::Off {
+            "grant_disabled"
+        } else {
+            "feature_disabled"
+        });
     }
-    match policy.check_process() {
-        Ok(()) => Ok(()),
-        Err(error) => Err(error.code.as_str()),
+    if euid == 0 && !allow_root {
+        return Err("unsupported");
     }
+    Ok(())
 }
 
 /// What is logged about one op: never any content.
@@ -377,6 +424,7 @@ struct Pending {
 pub struct FileRelay {
     runtime: Arc<FileRuntime>,
     mode: McpCommandMode,
+    read_switch: bool,
     sink: FileSink,
     pending: HashMap<String, Pending>,
 }
@@ -384,10 +432,16 @@ pub struct FileRelay {
 impl FileRelay {
     /// `mode` is the startup snapshot of `mcpCommandMode` (config changes need
     /// a restart, like commands); it is checked again on every op.
-    pub fn new(runtime: Arc<FileRuntime>, mode: McpCommandMode, sink: FileSink) -> Self {
+    pub fn new(
+        runtime: Arc<FileRuntime>,
+        mode: McpCommandMode,
+        read_switch: bool,
+        sink: FileSink,
+    ) -> Self {
         Self {
             runtime,
             mode,
+            read_switch,
             sink,
             pending: HashMap::new(),
         }
@@ -405,6 +459,7 @@ impl FileRelay {
         op: &str,
         args: Value,
         body_bytes: Option<usize>,
+        permission: FilePermission,
     ) -> Vec<FileFrame> {
         if !valid_op_id(op_id) {
             tracing::warn!("dropping a file.op with an invalid opId");
@@ -439,7 +494,16 @@ impl FileRelay {
         if malformed.is_err() {
             return self.refuse(op_id, &summary, "bad_frame");
         }
-        if let Err(reason) = admit(self.mode, self.runtime.policy()) {
+        let policy = self.runtime.policy();
+        if let Err(reason) = admit(
+            self.mode,
+            permission,
+            is_read_op(op),
+            self.read_switch,
+            policy.roots_configured(),
+            policy.euid(),
+            policy.allow_root(),
+        ) {
             return self.refuse(op_id, &summary, reason);
         }
         if self.pending.len() >= MAX_PENDING {
@@ -543,8 +607,13 @@ impl FileRelay {
     }
 
     fn refuse(&mut self, op_id: &str, summary: &OpSummary, reason: &str) -> Vec<FileFrame> {
-        // Wire-level refusals (`bad_frame`, `supervised_only`,
-        // `feature_disabled`) are not `ErrorCode`s: same log line as `settle`.
+        // Not all of these are `ErrorCode`s; same log line as `settle`.
+        debug_assert!(
+            REFUSE_REASONS.contains(&reason),
+            "refuse() reason {reason:?} is outside REFUSE_REASONS, mirrored by \
+             FILE_WIRE_REASONS/FILE_ERROR_CODES in \
+             apps/server/src/relay/file-protocol.ts"
+        );
         tracing::info!(
             op = %summary.op,
             target = %summary.target,

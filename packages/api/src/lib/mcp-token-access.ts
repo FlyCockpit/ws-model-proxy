@@ -16,6 +16,7 @@ export type McpPersonalTokenIdentity = {
   expiresAt: Date | null;
   lookupPrefix: string;
   allowCliCommands: boolean;
+  allowCliFileRead: boolean;
 };
 
 const tokenCredentialSelect = {
@@ -28,6 +29,7 @@ const tokenCredentialSelect = {
   revokedAt: true,
   expiresAt: true,
   allowCliCommands: true,
+  allowCliFileRead: true,
 } satisfies Prisma.McpPersonalTokenSelect;
 
 type TokenCredentialRow = Prisma.McpPersonalTokenGetPayload<{
@@ -50,6 +52,7 @@ export const mcpPersonalTokenSelection = {
   revokedAt: true,
   expiresAt: true,
   allowCliCommands: true,
+  allowCliFileRead: true,
 } satisfies Prisma.McpPersonalTokenSelect;
 
 export type McpPersonalTokenRow = Prisma.McpPersonalTokenGetPayload<{
@@ -111,6 +114,7 @@ export async function authenticateMcpPersonalToken(
     expiresAt: token.expiresAt,
     lookupPrefix: token.lookupPrefix,
     allowCliCommands: token.allowCliCommands,
+    allowCliFileRead: token.allowCliFileRead,
   };
 }
 
